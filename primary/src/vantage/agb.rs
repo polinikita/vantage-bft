@@ -8,7 +8,7 @@ use crate::primary::View;
 use crate::vantage::block::{self, BlockRef};
 use crate::vantage::lanes::LaneManager;
 use crate::vantage::repair::Repairer;
-use crate::vantage::Effect;
+use crate::vantage::{Effect, Thresholds};
 use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
@@ -311,7 +311,7 @@ pub struct AgbEngine {
 impl AgbEngine {
     pub fn new(name: PublicKey, committee: Committee, sid: Digest, delta_ms: u64) -> Self {
         let n = committee.size();
-        let f_plus_1_parties = (n - 1) / 3 + 1;
+        let f_plus_1_parties = Thresholds::from_party_count(n).f_plus_1_parties;
         let quorum = committee.quorum_threshold();
         Self {
             name,
@@ -392,6 +392,20 @@ impl AgbEngine {
         self.views.contains_key(&view)
     }
 
+    /// Counted echo statements for `view` matching `pred` (0 if `view` has no state
+    /// yet). Shared shape behind every `echo_*_count*` query below -- these query
+    /// accessors differ only in `pred`, never in how the per-view census is read.
+    fn echo_count(&self, view: View, pred: impl Fn(&EchoStatement) -> bool) -> usize {
+        self.views.get(&view).map_or(0, |s| s.echo_statements.values().filter(|stmt| pred(stmt)).count())
+    }
+
+    /// Counted ready-stage statements for `view` matching `pred` (0 if `view` has no
+    /// state yet). Shared shape behind every `ready_stage_*`/`noready_count` query
+    /// below.
+    fn ready_count(&self, view: View, pred: impl Fn(&ReadyStatement) -> bool) -> usize {
+        self.views.get(&view).map_or(0, |s| s.ready_statements.values().filter(|stmt| pred(stmt)).count())
+    }
+
     /// Total counted ready-stage statements for `view` (any kind, noready included) --
     /// §4's prerequisite for ANY candidate: `>= 2f+1` (party count) of these.
     pub fn ready_stage_total(&self, view: View) -> usize {
@@ -401,43 +415,24 @@ impl AgbEngine {
     /// Counted ready-stage statements for `view` that are NOT grade-1 proposal-readies
     /// (noready + grade-0/mix readies) -- §4's `Core` justification second clause.
     pub fn ready_stage_non_grade1_count(&self, view: View) -> usize {
-        self.views
-            .get(&view)
-            .map_or(0, |s| {
-                s.ready_statements
-                    .values()
-                    .filter(|stmt| !matches!(stmt, ReadyStatement::Graded(_, _, ReadyGrade::One)))
-                    .count()
-            })
+        self.ready_count(view, |stmt| !matches!(stmt, ReadyStatement::Graded(_, _, ReadyGrade::One)))
     }
 
     /// Counted noready statements for `view` -- §4's `Skip` justification (`>= 2f+1`).
     pub fn noready_count(&self, view: View) -> usize {
-        self.views
-            .get(&view)
-            .map_or(0, |s| s.ready_statements.values().filter(|stmt| matches!(stmt, ReadyStatement::NoReady)).count())
+        self.ready_count(view, |stmt| matches!(stmt, ReadyStatement::NoReady))
     }
 
     /// Counted grade-1 echoes for `view` naming exactly payload `(c,t)` -- §4's `Full`
     /// justification (`>= f+1`).
     pub fn echo_grade1_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
-        self.views.get(&view).map_or(0, |s| {
-            s.echo_statements
-                .values()
-                .filter(|stmt| matches!(stmt, EchoStatement::Graded(p, _, 1, _) if p.c == *c && p.t == *t))
-                .count()
-        })
+        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Graded(p, _, 1, _) if p.c == *c && p.t == *t))
     }
 
     /// Counted echoes (any grade) for `view` naming exactly payload `(c,t)` -- §4's
     /// `Core` justification (`>= f+1`).
     pub fn echo_any_grade_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
-        self.views.get(&view).map_or(0, |s| {
-            s.echo_statements
-                .values()
-                .filter(|stmt| matches!(stmt, EchoStatement::Graded(p, _, _, _) if p.c == *c && p.t == *t))
-                .count()
-        })
+        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Graded(p, _, _, _) if p.c == *c && p.t == *t))
     }
 
     /// Every distinct payload named by a counted (graded) echo for `view` -- the
@@ -947,30 +942,14 @@ impl AgbEngine {
     }
 
     fn nonmatching_echo_count(&self, view: View, locked_digest: &Digest) -> usize {
-        self.views
-            .get(&view)
-            .map(|s| {
-                s.echo_statements
-                    .values()
-                    .filter(|stmt| match stmt {
-                        EchoStatement::Graded(_, d, g, _) => !(*g == 1 && d == locked_digest),
-                        EchoStatement::Skip => true,
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
+        self.echo_count(view, |stmt| match stmt {
+            EchoStatement::Graded(_, d, g, _) => !(*g == 1 && d == locked_digest),
+            EchoStatement::Skip => true,
+        })
     }
 
     fn matching_echo_count(&self, view: View, locked_digest: &Digest) -> usize {
-        self.views
-            .get(&view)
-            .map(|s| {
-                s.echo_statements
-                    .values()
-                    .filter(|stmt| matches!(stmt, EchoStatement::Graded(_, d, g, _) if *g == 1 && d == locked_digest))
-                    .count()
-            })
-            .unwrap_or(0)
+        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Graded(_, d, g, _) if *g == 1 && d == locked_digest))
     }
 
     /// First-hand ready-stage dedup: at most one counted statement per (view, sender),

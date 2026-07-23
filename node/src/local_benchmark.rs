@@ -12,7 +12,7 @@ use crate::CHANNEL_CAPACITY;
 use anyhow::{Context, Result};
 use clap::ArgMatches;
 use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol, WorkerId};
-use crypto::SignatureService;
+use crypto::{PublicKey, SignatureService};
 use metrics::{aggregate_latency_snapshots, read_latency_snapshot, read_vantage_progress, LatencySnapshot, MetricReporter};
 use primary::Primary;
 use std::fs;
@@ -213,84 +213,25 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         let node_dir = data_dir.join(format!("node-{}", i));
         fs::create_dir_all(&node_dir)?;
 
-        let signature_service = SignatureService::new(keypair.secret);
-
-        let primary_store = Store::new_with_profile(
-            node_dir.join("primary-db").to_str().unwrap(),
-            StoreProfile::Metadata,
-        )
-        .context("Failed to create primary store")?;
-
-        let (tx_output, mut rx_output) = channel(CHANNEL_CAPACITY);
-        let (tx_new_certificates, _rx_new_certificates) = channel(CHANNEL_CAPACITY);
-        let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-        let (tx_committer, rx_committer) = channel(CHANNEL_CAPACITY);
-        let (_tx_pushdown_cert, rx_pushdown_cert) = channel(CHANNEL_CAPACITY);
-        let (_tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
-        let (tx_sailfish, _rx_sailfish) = channel(CHANNEL_CAPACITY);
-
-        let (_primary_metrics, primary_reporter, primary_registry) = Primary::spawn(
-            name,
-            committee.clone(),
-            parameters.clone(),
-            signature_service,
-            primary_store,
-            tx_new_certificates,
-            tx_committer,
-            rx_committer,
-            rx_feedback,
-            tx_sailfish,
-            rx_pushdown_cert,
-            rx_request_header_sync,
-            tx_output,
-        );
+        let (primary_registry, primary_reporter, primary_target) =
+            spawn_node_primary(i, keypair, &node_dir, &committee, &parameters)?;
         primary_metrics.push((i, primary_registry, primary_reporter));
-        // Application logic no-op, matching node/src/main.rs::analyze.
-        tokio::spawn(async move { while rx_output.recv().await.is_some() {} });
-        metrics_targets.push((
-            format!("node-{}-primary", i),
-            committee.primary(&name).unwrap().metrics,
-        ));
+        metrics_targets.push(primary_target);
 
-        for j in 0..workers {
-            let worker_id = j as WorkerId;
-            let worker_store = Store::new_with_profile(
-                node_dir
-                    .join(format!("worker-{}-db", j))
-                    .to_str()
-                    .unwrap(),
-                StoreProfile::Data,
-            )
-            .context("Failed to create worker store")?;
-
-            let (metrics, reporter, registry) = Worker::spawn(
-                name,
-                worker_id,
-                committee.clone(),
-                parameters.clone(),
-                worker_store,
-            );
-            let _ = &metrics; // kept alive by `reporter`/`registry`; not read directly here
-            worker_metrics.push((registry, reporter));
-            metrics_targets.push((
-                format!("node-{}-worker-{}", i, j),
-                committee.worker(&name, &worker_id).unwrap().metrics,
-            ));
-
-            let target = committee.worker(&name, &worker_id).unwrap().transactions;
-            let client = Client {
-                target,
-                size: tx_size,
-                rate: rate_share,
-                nodes: all_worker_addresses.clone(),
-                mode,
-            };
-            tokio::spawn(async move {
-                client.wait().await;
-                if let Err(e) = client.send().await {
-                    log::warn!("Client for node {} worker {} exited: {}", i, j, e);
-                }
-            });
+        for (worker_registry, worker_reporter, worker_target) in spawn_node_workers(
+            i,
+            name,
+            &node_dir,
+            workers,
+            &committee,
+            &parameters,
+            tx_size,
+            rate_share,
+            mode,
+            &all_worker_addresses,
+        )? {
+            worker_metrics.push((worker_registry, worker_reporter));
+            metrics_targets.push(worker_target);
         }
     }
 
@@ -348,6 +289,109 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
 
     print_results(&worker_metrics, &primary_metrics, duration).await;
     Ok(())
+}
+
+/// Spawns one live node's primary in-process -- the exact same `Primary::spawn`
+/// wiring `node run ... primary` uses standalone (PHASE2-SPEC.md #8: "reuses the
+/// exact same spawn paths ... no parallel reimplementation"). The `tx_output`/
+/// `rx_output` channel is a same-process no-op consumer, matching
+/// `node/src/main.rs::analyze` (there is no separate application here). Returns
+/// the primary's metrics registry/reporter and its own metrics-scrape target
+/// (label, address) for `prometheus.yaml`.
+fn spawn_node_primary(
+    i: usize,
+    keypair: KeyPair,
+    node_dir: &std::path::Path,
+    committee: &Committee,
+    parameters: &Parameters,
+) -> Result<(prometheus::Registry, Arc<MetricReporter>, (String, SocketAddr))> {
+    let name = keypair.name;
+    let signature_service = SignatureService::new(keypair.secret);
+
+    let primary_store = Store::new_with_profile(
+        node_dir.join("primary-db").to_str().unwrap(),
+        StoreProfile::Metadata,
+    )
+    .context("Failed to create primary store")?;
+
+    let (tx_output, mut rx_output) = channel(CHANNEL_CAPACITY);
+    let (tx_new_certificates, _rx_new_certificates) = channel(CHANNEL_CAPACITY);
+    let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+    let (tx_committer, rx_committer) = channel(CHANNEL_CAPACITY);
+    let (_tx_pushdown_cert, rx_pushdown_cert) = channel(CHANNEL_CAPACITY);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
+    let (tx_sailfish, _rx_sailfish) = channel(CHANNEL_CAPACITY);
+
+    let (_primary_metrics, primary_reporter, primary_registry) = Primary::spawn(
+        name,
+        committee.clone(),
+        parameters.clone(),
+        signature_service,
+        primary_store,
+        tx_new_certificates,
+        tx_committer,
+        rx_committer,
+        rx_feedback,
+        tx_sailfish,
+        rx_pushdown_cert,
+        rx_request_header_sync,
+        tx_output,
+    );
+    // Application logic no-op, matching node/src/main.rs::analyze.
+    tokio::spawn(async move { while rx_output.recv().await.is_some() {} });
+    let target = (format!("node-{}-primary", i), committee.primary(&name).unwrap().metrics);
+    Ok((primary_registry, primary_reporter, target))
+}
+
+/// Spawns one live node's `workers` workers in-process -- the exact same
+/// `Worker::spawn` wiring `node run ... worker` uses standalone -- plus one
+/// client task per worker, waiting for every live node's worker addresses
+/// before sending (mirrors `benchmark_client --nodes`). Returns each worker's
+/// metrics registry/reporter alongside its own metrics-scrape target for
+/// `prometheus.yaml`, in worker-id order.
+#[allow(clippy::too_many_arguments)]
+fn spawn_node_workers(
+    i: usize,
+    name: PublicKey,
+    node_dir: &std::path::Path,
+    workers: usize,
+    committee: &Committee,
+    parameters: &Parameters,
+    tx_size: usize,
+    rate_share: u64,
+    mode: TransactionMode,
+    all_worker_addresses: &[SocketAddr],
+) -> Result<Vec<(prometheus::Registry, Arc<MetricReporter>, (String, SocketAddr))>> {
+    let mut spawned = Vec::with_capacity(workers);
+    for j in 0..workers {
+        let worker_id = j as WorkerId;
+        let worker_store = Store::new_with_profile(
+            node_dir.join(format!("worker-{}-db", j)).to_str().unwrap(),
+            StoreProfile::Data,
+        )
+        .context("Failed to create worker store")?;
+
+        let (metrics, reporter, registry) = Worker::spawn(name, worker_id, committee.clone(), parameters.clone(), worker_store);
+        let _ = &metrics; // kept alive by `reporter`/`registry`; not read directly here
+        let target = (format!("node-{}-worker-{}", i, j), committee.worker(&name, &worker_id).unwrap().metrics);
+        spawned.push((registry, reporter, target));
+
+        let target_addr = committee.worker(&name, &worker_id).unwrap().transactions;
+        let client = Client {
+            target: target_addr,
+            size: tx_size,
+            rate: rate_share,
+            nodes: all_worker_addresses.to_vec(),
+            mode,
+        };
+        tokio::spawn(async move {
+            client.wait().await;
+            if let Err(e) = client.send().await {
+                log::warn!("Client for node {} worker {} exited: {}", i, j, e);
+            }
+        });
+    }
+    Ok(spawned)
 }
 
 /// Computed in-process from each worker's own `Registry` -- no scraping, no log

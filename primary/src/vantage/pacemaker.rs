@@ -5,7 +5,7 @@
 // tests can drive it without a live node (PHASE5-SPEC.md §4).
 
 use crate::primary::View;
-use crate::vantage::Effect;
+use crate::vantage::{Effect, Thresholds};
 use config::Committee;
 use crypto::PublicKey;
 use std::collections::HashMap;
@@ -39,8 +39,9 @@ impl Pacemaker {
     pub fn new(name: PublicKey, committee: &Committee) -> Self {
         let names: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
         let n = names.len();
-        let f_plus_1_parties = (n - 1) / 3 + 1;
-        let two_f_plus_1_parties = 2 * ((n - 1) / 3) + 1;
+        let thresholds = Thresholds::from_party_count(n);
+        let f_plus_1_parties = thresholds.f_plus_1_parties;
+        let two_f_plus_1_parties = thresholds.two_f_plus_1_parties;
         let index_of: HashMap<PublicKey, usize> = names.iter().enumerate().map(|(i, pk)| (*pk, i)).collect();
         let own_index = *index_of.get(&name).expect("self must be a committee member");
         Self {

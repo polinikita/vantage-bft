@@ -12,7 +12,7 @@
 use crate::primary::View;
 use crate::vantage::agb::{self, Outcome, ResolutionEntry, ViewProposal};
 use crate::vantage::block::BlockRef;
-use crate::vantage::Effect;
+use crate::vantage::{Effect, Thresholds};
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use std::collections::{HashMap, HashSet};
@@ -67,7 +67,6 @@ pub struct ControlLog {
     sid: Digest,
     delta: Duration,
     n: usize,
-    f_parties: usize,
     f_plus_1_parties: usize,
     two_f_plus_1_parties: usize,
     n_minus_f_parties: usize,
@@ -129,17 +128,16 @@ pub struct ControlLog {
 impl ControlLog {
     pub fn new(name: PublicKey, committee: Committee, sid: Digest, delta_ms: u64) -> Self {
         let n = committee.size();
-        let f_parties = (n - 1) / 3;
+        let thresholds = Thresholds::from_party_count(n);
         Self {
             name,
             committee,
             sid,
             delta: Duration::from_millis(delta_ms),
             n,
-            f_parties,
-            f_plus_1_parties: f_parties + 1,
-            two_f_plus_1_parties: 2 * f_parties + 1,
-            n_minus_f_parties: n - f_parties,
+            f_plus_1_parties: thresholds.f_plus_1_parties,
+            two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
+            n_minus_f_parties: thresholds.n_minus_f_parties,
             reports: HashMap::new(),
             blocks: HashMap::new(),
             reported: HashSet::new(),

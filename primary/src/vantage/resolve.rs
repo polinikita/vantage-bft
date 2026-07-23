@@ -8,6 +8,7 @@
 
 use crate::primary::View;
 use crate::vantage::agb::{AgbEngine, ResolutionEntry};
+use crate::vantage::Thresholds;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -47,16 +48,15 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// `n` = committee size (`Committee::size()`); the AGB engine's own
-    /// `f_plus_1_parties` formula, duplicated here (each component derives its own
-    /// committee-based threshold constants, same pattern as `AgbEngine`/`Pacemaker` --
-    /// this is a threshold constant, not counting state, so it doesn't violate the
-    /// reuse rule). `delta_ms` -- D7-1's 12Δ expiry (same Δ every other Vantage timing
-    /// constant derives from).
+    /// `n` = committee size (`Committee::size()`); thresholds derived via the shared
+    /// `Thresholds` type, same as every other Vantage component (`AgbEngine`/
+    /// `Pacemaker`/`ControlLog`). `delta_ms` -- D7-1's 12Δ expiry (same Δ every other
+    /// Vantage timing constant derives from).
     pub fn new(n: usize, delta_ms: u64) -> Self {
+        let thresholds = Thresholds::from_party_count(n);
         Self {
-            f_plus_1_parties: (n - 1) / 3 + 1,
-            two_f_plus_1_parties: 2 * ((n - 1) / 3) + 1,
+            f_plus_1_parties: thresholds.f_plus_1_parties,
+            two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
             next_is_recovery: false,
             candidate_pointer: HashMap::new(),
             in_flight: HashMap::new(),

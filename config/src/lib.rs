@@ -410,9 +410,9 @@ impl Committee {
     }
 
     /// Generates an in-memory committee (fresh keys, all addresses on 127.0.0.1) for
-    /// `node local-benchmark` (PHASE2-SPEC.md §8) -- the in-process analog of
-    /// `config.py::LocalCommittee`. Port layout is identical to that harness's: per
-    /// authority, one `consensus_to_consensus` port, three primary ports
+    /// `node local-benchmark` (PHASE2-SPEC.md §8). Port layout matches `fab remote`'s
+    /// `config.py::Committee`: per authority, one `consensus_to_consensus` port, three
+    /// primary ports
     /// (`primary_to_primary`, `worker_to_primary`, `metrics`), then four ports per
     /// worker (`primary_to_worker`, `transactions`, `worker_to_worker`, `metrics`).
     /// Returns the committee alongside each authority's freshly generated keypair, in

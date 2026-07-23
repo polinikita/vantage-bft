@@ -6,7 +6,7 @@
 //! `benchmark/benchmark/logs.py`'s audited rules exactly (max for count/misses, since
 //! every node's committer processes the whole replicated commit stream; summed sum/
 //! sum-of-squares for the avg/stddev ratio, which is invariant to that same scaling;
-//! median across nodes for percentiles) so a `local-benchmark` run and a `fab local` run
+//! median across nodes for percentiles) so a `local-benchmark` run and a `fab remote` run
 //! report comparable numbers.
 
 use prometheus::Registry;

@@ -336,102 +336,32 @@ impl VantageCore {
                 }
 
                 Some((header_digest, digest, worker_id)) = rx_payload_ready.recv() => {
-                    let now = Instant::now();
-                    let mut resolved = false;
-                    if let Some(set) = self.pending_payload.get_mut(&header_digest) {
-                        set.remove(&(digest, worker_id));
-                        resolved = set.is_empty();
-                    }
-                    if resolved {
-                        self.pending_payload.remove(&header_digest);
-                        // P4-4: payload arriving can be the event that flips
-                        // `direct_pub`/`author_ok` for a C/T entry the positive gate is
-                        // waiting on -- re-poll it, same reasoning as the `Ack` arm.
-                        let mut effects = self.lm.set_payload_ready(&header_digest);
-                        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
-                        self.execute(effects, now).await;
-                    }
+                    self.on_payload_ready(header_digest, digest, worker_id).await;
                 }
 
                 Some((digest, worker_id)) = rx_our_digests.recv() => {
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                     if self.payload_size >= self.header_size {
-                        let now = Instant::now();
-                        let payload = self.digests.drain(..).collect();
-                        self.payload_size = 0;
-                        let (_, effects) = self.lm.publish_own(payload).await;
-                        self.execute(effects, now).await;
+                        self.seal_own_header(Instant::now()).await;
                         header_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(self.max_header_delay));
                     }
                 }
 
                 () = &mut header_timer => {
-                    let now = Instant::now();
-                    let payload = self.digests.drain(..).collect();
-                    self.payload_size = 0;
-                    let (_, effects) = self.lm.publish_own(payload).await;
-                    self.execute(effects, now).await;
+                    self.seal_own_header(Instant::now()).await;
                     header_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(self.max_header_delay));
                 }
 
                 () = &mut agb_sleep, if next_deadline.is_some() => {
                     let now = Instant::now();
-                    // D7-4: pop-based firing (O(log n) per pop, vs. the previous O(n)
-                    // `retain` scan) + lazy stale discard -- if the timer's underlying
-                    // one-shot event already happened organically (echo/ready already
-                    // sent for this view), its dispatch would be a no-op through the
-                    // handler's own guard anyway (see `AgbEngine::echo_sent`/
-                    // `ready_sent`'s doc comments); skip constructing/dispatching it
-                    // entirely rather than paying for a call that immediately returns
-                    // an empty `Vec`. Deterministic-equivalent: identical effects
-                    // either way, since the discarded call was always going to return
-                    // nothing.
-                    let mut effects = Vec::new();
-                    while let Some(&Reverse((d, view, kind))) = self.timers.peek() {
-                        if d > now {
-                            break;
-                        }
-                        self.timers.pop();
-                        let moot = match kind {
-                            TimerKind::EchoFallback | TimerKind::EchoAbsolute => self.agb.echo_sent(view),
-                            TimerKind::ReadyAbsolute => self.agb.ready_sent(view),
-                        };
-                        if moot {
-                            continue;
-                        }
-                        match kind {
-                            TimerKind::EchoFallback => effects.extend(self.agb.on_echo_fallback_timer(view, &mut self.lm, &mut self.rep)),
-                            TimerKind::EchoAbsolute => effects.extend(self.agb.on_echo_absolute_timer(view, &mut self.rep)),
-                            TimerKind::ReadyAbsolute => effects.extend(self.agb.on_ready_timer(view)),
-                        }
-                    }
-                    // PHASE6-SPEC.md §2 `MetaOK`: "persistent -- re-evaluate on state
-                    // change like the rest of the gate". A pending view w's MetaOK can
-                    // depend on THIS party's own echo/ready for an earlier view u that
-                    // just changed here -- retry every pending positive gate.
-                    effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                    let effects = self.fire_agb_timers(now);
                     self.execute(effects, now).await;
                 }
 
                 () = &mut control_sleep, if next_control_deadline.is_some() => {
                     let now = Instant::now();
-                    // D7-4: pop-based firing + lazy stale discard, same reasoning as
-                    // the `agb_sleep` branch above -- a round timer whose round has
-                    // already advanced/voted is moot through `on_control_round_timer`'s
-                    // own `r != self.curr_round || self.voted` guard; skip dispatching
-                    // it.
-                    let mut effects = Vec::new();
-                    while let Some(&Reverse((d, round))) = self.control_timers.peek() {
-                        if d > now {
-                            break;
-                        }
-                        self.control_timers.pop();
-                        if round != self.control.curr_round() || self.control.voted() {
-                            continue;
-                        }
-                        effects.extend(self.control.on_control_round_timer(round));
-                    }
+                    let effects = self.fire_control_timers(now);
                     self.execute(effects, now).await;
                 }
 
@@ -440,6 +370,99 @@ impl VantageCore {
                 }
             }
         }
+    }
+
+    /// Seals whatever's accumulated in `self.digests` into our own header via
+    /// `LaneManager::publish_own` and executes the resulting effects -- the shared
+    /// tail of `run`'s two header-sealing triggers ("header full" on
+    /// `rx_our_digests`, and "max header delay elapsed" on `header_timer`). Callers
+    /// reset `header_timer` themselves afterwards (a local pinned future owned by
+    /// `run`, not a struct field, so it can't be reset from here).
+    async fn seal_own_header(&mut self, now: Instant) {
+        let payload = self.digests.drain(..).collect();
+        self.payload_size = 0;
+        let (_, effects) = self.lm.publish_own(payload).await;
+        self.execute(effects, now).await;
+    }
+
+    /// D1 payload-sync bookkeeping: one of `header_digest`'s outstanding
+    /// `(digest, worker_id)` keys just arrived. Only the call that empties
+    /// `pending_payload[header_digest]` (every missing batch for that header now
+    /// present) actually marks the block payload-ready and re-polls the gate --
+    /// `LaneManager::set_payload_ready` unconditionally marks payload presence once
+    /// called (see its own doc comment), so this must fire exactly once, on the
+    /// LAST missing key, never on an earlier one.
+    async fn on_payload_ready(&mut self, header_digest: Digest, digest: Digest, worker_id: WorkerId) {
+        let now = Instant::now();
+        let mut resolved = false;
+        if let Some(set) = self.pending_payload.get_mut(&header_digest) {
+            set.remove(&(digest, worker_id));
+            resolved = set.is_empty();
+        }
+        if resolved {
+            self.pending_payload.remove(&header_digest);
+            // P4-4: payload arriving can be the event that flips
+            // `direct_pub`/`author_ok` for a C/T entry the positive gate is
+            // waiting on -- re-poll it, same reasoning as the `Ack` arm.
+            let mut effects = self.lm.set_payload_ready(&header_digest);
+            effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+            self.execute(effects, now).await;
+        }
+    }
+
+    /// D7-4: pop-based AGB timer firing (O(log n) per pop, vs. the previous O(n)
+    /// `retain` scan) + lazy stale discard -- if the timer's underlying one-shot
+    /// event already happened organically (echo/ready already sent for this view),
+    /// its dispatch would be a no-op through the handler's own guard anyway (see
+    /// `AgbEngine::echo_sent`/`ready_sent`'s doc comments); skip
+    /// constructing/dispatching it entirely rather than paying for a call that
+    /// immediately returns an empty `Vec`. Deterministic-equivalent: identical
+    /// effects either way, since the discarded call was always going to return
+    /// nothing. Also re-checks every pending positive gate afterwards
+    /// (PHASE6-SPEC.md §2 `MetaOK`: "persistent -- re-evaluate on state change like
+    /// the rest of the gate" -- a pending view w's `MetaOK` can depend on THIS
+    /// party's own echo/ready for an earlier view u that just changed here).
+    fn fire_agb_timers(&mut self, now: Instant) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        while let Some(&Reverse((d, view, kind))) = self.timers.peek() {
+            if d > now {
+                break;
+            }
+            self.timers.pop();
+            let moot = match kind {
+                TimerKind::EchoFallback | TimerKind::EchoAbsolute => self.agb.echo_sent(view),
+                TimerKind::ReadyAbsolute => self.agb.ready_sent(view),
+            };
+            if moot {
+                continue;
+            }
+            match kind {
+                TimerKind::EchoFallback => effects.extend(self.agb.on_echo_fallback_timer(view, &mut self.lm, &mut self.rep)),
+                TimerKind::EchoAbsolute => effects.extend(self.agb.on_echo_absolute_timer(view, &mut self.rep)),
+                TimerKind::ReadyAbsolute => effects.extend(self.agb.on_ready_timer(view)),
+            }
+        }
+        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+        effects
+    }
+
+    /// D7-4: pop-based control-round timer firing + lazy stale discard, same
+    /// reasoning as `fire_agb_timers` -- a round timer whose round has already
+    /// advanced/voted is moot through `on_control_round_timer`'s own `r !=
+    /// self.curr_round || self.voted` guard; skip dispatching it.
+    fn fire_control_timers(&mut self, now: Instant) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        while let Some(&Reverse((d, round))) = self.control_timers.peek() {
+            if d > now {
+                break;
+            }
+            self.control_timers.pop();
+            if round != self.control.curr_round() || self.control.voted() {
+                continue;
+            }
+            effects.extend(self.control.on_control_round_timer(round));
+        }
+        effects
     }
 
     /// PHASE7-PREP-NOTES.md Finding A: publish the six progress gauges from each
@@ -589,34 +612,21 @@ impl VantageCore {
         let mut queue: VecDeque<Effect> = initial.into();
         while let Some(effect) = queue.pop_front() {
             match effect {
-                Effect::BroadcastPublish(header) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::Header(header, false)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
-                }
-                Effect::BroadcastAck(ack) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::VantageAck(ack)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
-                }
+                Effect::BroadcastPublish(header) => self.broadcast_message(PrimaryMessage::Header(header, false)).await,
+                Effect::BroadcastAck(ack) => self.broadcast_message(PrimaryMessage::VantageAck(ack)).await,
                 Effect::SyncBatches(author, header_digest, missing) => {
                     self.sync_batches(author, header_digest, missing).await;
                 }
                 Effect::RequestTo(peer, digest) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::HeadersRequest(vec![digest], self.name)).expect("serializes");
-                    self.send_to(peer, Bytes::from(bytes)).await;
+                    self.send_message(peer, PrimaryMessage::HeadersRequest(vec![digest], self.name)).await;
                 }
-                Effect::ServeTo(peer, header) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::Header(header, true)).expect("serializes");
-                    self.send_to(peer, Bytes::from(bytes)).await;
-                }
+                Effect::ServeTo(peer, header) => self.send_message(peer, PrimaryMessage::Header(header, true)).await,
                 Effect::BlockCached(digest) => {
                     queue.extend(self.rep.on_block_available(digest));
                     queue.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                     queue.extend(self.cursor.retry());
                 }
-                Effect::BroadcastPropose(p) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::VantagePropose(p)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
-                }
+                Effect::BroadcastPropose(p) => self.broadcast_message(PrimaryMessage::VantagePropose(p)).await,
                 // PHASE5-SPEC.md §3/D5-3: every response effect is stamped with our
                 // current wish watermark here, at serialization time -- `AgbEngine`
                 // itself stays watermark-free (its own construction sites use a `0`
@@ -624,23 +634,19 @@ impl VantageCore {
                 // effects carrying just a `View` to begin with).
                 Effect::BroadcastEcho(mut e) => {
                     e.wish = self.pacemaker.own_watermark();
-                    let bytes = bincode::serialize(&PrimaryMessage::VantageEcho(e)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::VantageEcho(e)).await;
                 }
                 Effect::BroadcastEchoSkip(view) => {
                     let wish = self.pacemaker.own_watermark();
-                    let bytes = bincode::serialize(&PrimaryMessage::VantageEchoSkip(view, self.name, wish)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::VantageEchoSkip(view, self.name, wish)).await;
                 }
                 Effect::BroadcastReady(mut r) => {
                     r.wish = self.pacemaker.own_watermark();
-                    let bytes = bincode::serialize(&PrimaryMessage::VantageReady(r)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::VantageReady(r)).await;
                 }
                 Effect::BroadcastNoReady(view) => {
                     let wish = self.pacemaker.own_watermark();
-                    let bytes = bincode::serialize(&PrimaryMessage::VantageNoReady(view, self.name, wish)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::VantageNoReady(view, self.name, wish)).await;
                 }
                 Effect::Fixed(view, well_formed) => {
                     let activated = self.frontier.record_fixed(view, well_formed);
@@ -661,10 +667,7 @@ impl VantageCore {
                 Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
                     self.notify_committed(commit_millis, by_worker, headers).await;
                 }
-                Effect::BroadcastWish(view) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::VantageWish(view, self.name)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
-                }
+                Effect::BroadcastWish(view) => self.broadcast_message(PrimaryMessage::VantageWish(view, self.name)).await,
                 Effect::Enter(view) => {
                     queue.extend(self.enter_view_effects(view, now));
                 }
@@ -687,40 +690,31 @@ impl VantageCore {
                     queue.extend(self.control.on_completion_reportable(view, proposal));
                 }
                 Effect::BroadcastCompReport(view, digest) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::CompReport(view, digest, self.name)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::CompReport(view, digest, self.name)).await;
                 }
                 Effect::BroadcastControlInit(proposal, b_w) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlInit(proposal, b_w)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::ControlInit(proposal, b_w)).await;
                 }
                 Effect::BroadcastControlEcho(proposal) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlEcho(proposal, self.name)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::ControlEcho(proposal, self.name)).await;
                 }
                 Effect::BroadcastControlReady(proposal) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlReady(proposal, self.name)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::ControlReady(proposal, self.name)).await;
                 }
                 Effect::BroadcastControlCommit(round) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlCommit(round, self.name)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::ControlCommit(round, self.name)).await;
                 }
                 Effect::BroadcastControlTimeoutVote(round) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlTimeoutVote(round, self.name)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::ControlTimeoutVote(round, self.name)).await;
                 }
                 Effect::BroadcastControlTimeoutAccept(round) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlTimeoutAccept(round, self.name)).expect("serializes");
-                    self.broadcast(Bytes::from(bytes)).await;
+                    self.broadcast_message(PrimaryMessage::ControlTimeoutAccept(round, self.name)).await;
                 }
                 Effect::ControlFetchTo(peer, view, digest) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlFetch(view, digest, self.name)).expect("serializes");
-                    self.send_to(peer, Bytes::from(bytes)).await;
+                    self.send_message(peer, PrimaryMessage::ControlFetch(view, digest, self.name)).await;
                 }
                 Effect::ControlServeTo(peer, view, proposal) => {
-                    let bytes = bincode::serialize(&PrimaryMessage::ControlServe(view, proposal)).expect("serializes");
-                    self.send_to(peer, Bytes::from(bytes)).await;
+                    self.send_message(peer, PrimaryMessage::ControlServe(view, proposal)).await;
                 }
                 Effect::ArmControlTimer(round, deadline) => {
                     self.control_timers.push(Reverse((deadline, round)));
@@ -745,6 +739,21 @@ impl VantageCore {
     /// drop one that's genuinely still pending).
     fn prune_cancel_handlers(&mut self) {
         self.cancel_handlers.retain_mut(|handler| matches!(handler.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
+    /// and broadcasts it verbatim (`bincode::serialize` never fails on our own wire
+    /// types, hence the `expect`).
+    async fn broadcast_message(&mut self, message: PrimaryMessage) {
+        let bytes = bincode::serialize(&message).expect("serializes");
+        self.broadcast(Bytes::from(bytes)).await;
+    }
+
+    /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
+    /// and unicasts it verbatim to one peer.
+    async fn send_message(&mut self, peer: PublicKey, message: PrimaryMessage) {
+        let bytes = bincode::serialize(&message).expect("serializes");
+        self.send_to(peer, Bytes::from(bytes)).await;
     }
 
     async fn broadcast(&mut self, data: Bytes) {

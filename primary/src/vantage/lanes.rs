@@ -53,6 +53,19 @@ pub struct BlockEntry {
     pub chain_verified: bool,
 }
 
+impl BlockEntry {
+    /// Author-pin + consecutive-height check shared by every author-pinned chain
+    /// walk in this file (`direct_prefix_ok`/`verified_prefix_through_genesis`/
+    /// `collect_verified_chain`/`collect_verified_suffix`): `true` iff this entry
+    /// belongs to `author` and sits at exactly `expected_height` (§1 "one author
+    /// index" + "consecutive heights" -- see `direct_prefix_ok`'s doc comment for
+    /// why a Byzantine parent-pointer graft/cycle needs both checks to terminate
+    /// the walk safely).
+    fn pinned_at(&self, author: PublicKey, expected_height: Height) -> bool {
+        self.block.author == author && self.block.height == expected_height
+    }
+}
+
 /// Shared block cache: every block this node has ever obtained, keyed by its digest
 /// (`Header.id`, which folds `sid` -- §3.1). Forks are representable (multiple digests
 /// per (author, height)).
@@ -193,11 +206,8 @@ impl BlockCache {
             let Some(entry) = self.by_digest.get(&cur) else {
                 return false;
             };
-            if entry.block.author != author {
-                return false; // cross-author graft (§1 "one author index")
-            }
-            if entry.block.height != expected_height {
-                return false;
+            if !entry.pinned_at(author, expected_height) {
+                return false; // cross-author graft (§1 "one author index") or height gap
             }
             if !(entry.direct && entry.payload_ok) {
                 return false;
@@ -265,11 +275,8 @@ impl BlockCache {
             let Some(entry) = self.by_digest.get(&cur) else {
                 return false;
             };
-            if entry.block.author != author {
-                return false; // cross-author graft (§1 "one author index")
-            }
-            if entry.block.height != expected_height {
-                return false;
+            if !entry.pinned_at(author, expected_height) {
+                return false; // cross-author graft (§1 "one author index") or height gap
             }
             if !block_ok(&entry.block, committee, sid, max_block_payload) {
                 return false;
@@ -292,8 +299,14 @@ impl BlockCache {
     /// PHASE4-SPEC.md §9: like `verified_prefix_through_genesis`, but returns the actual
     /// verified chain (genesis first, `h` last) instead of a bare bool -- the output
     /// cursor's `Expand_D` needs the hashes themselves, not just a validity bit.
-    /// `verified_prefix_through_genesis` is now a thin wrapper over this (no logic
-    /// duplication between the two).
+    /// `verified_prefix_through_genesis` is NOT a thin wrapper over this (this doc used
+    /// to say it was): the D6-7 gate amendment below gave it its own `chain_verified`
+    /// memoization and its own copy of the walk with an early-break this function
+    /// doesn't need (this one has no memo to stop at -- every call walks all the way to
+    /// genesis). No caller in this workspace currently needs the actual hash sequence
+    /// (only `collect_verified_suffix`'s incremental sibling is called, by
+    /// `cursor.rs`) -- kept as public API per the original PHASE4-SPEC.md #9 design for
+    /// whichever future caller needs it.
     pub fn collect_verified_chain(
         &self,
         committee: &Committee,
@@ -320,11 +333,8 @@ impl BlockCache {
                 return None;
             }
             let entry = self.by_digest.get(&cur)?;
-            if entry.block.author != author {
-                return None; // cross-author graft (§1 "one author index")
-            }
-            if entry.block.height != expected_height {
-                return None;
+            if !entry.pinned_at(author, expected_height) {
+                return None; // cross-author graft (§1 "one author index") or height gap
             }
             if !block_ok(&entry.block, committee, sid, max_block_payload) {
                 return None;
@@ -373,11 +383,8 @@ impl BlockCache {
                 return None; // ran out of height before reaching the watermark
             }
             let entry = self.by_digest.get(&cur)?;
-            if entry.block.author != author {
-                return None;
-            }
-            if entry.block.height != expected_height {
-                return None;
+            if !entry.pinned_at(author, expected_height) {
+                return None; // cross-author graft (§1 "one author index") or height gap
             }
             if !block_ok(&entry.block, committee, sid, max_block_payload) {
                 return None;

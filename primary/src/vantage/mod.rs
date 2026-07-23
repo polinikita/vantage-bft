@@ -16,6 +16,7 @@ pub mod node;
 pub mod pacemaker;
 pub mod repair;
 pub mod resolve;
+pub mod threshold;
 
 pub use agb::{AgbEngine, Echo, Manifest, Outcome, Ready, ReadyGrade, ResolutionEntry, TimerKind, ViewProposal};
 pub use block::BlockRef;
@@ -26,6 +27,7 @@ pub use node::VantageCore;
 pub use pacemaker::Pacemaker;
 pub use repair::Repairer;
 pub use resolve::Resolver;
+pub use threshold::Thresholds;
 
 use crate::messages::{Ack, Header};
 use crate::primary::View;
