@@ -23,7 +23,8 @@ use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use metrics::Metrics;
 use network::{CancelHandler, MessageHandler, ReliableSender, SimpleSender, Writer};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -145,13 +146,20 @@ pub struct VantageCore {
 
     /// §10 timer queue: (deadline, view, kind), drained by the run loop's `sleep_until`
     /// branch (message channels are checked first every iteration -- §5's tie-break
-    /// rule: "drain message queues before taking a timer branch").
-    timers: Vec<(Instant, View, TimerKind)>,
+    /// rule: "drain message queues before taking a timer branch"). D7-4 (PHASE7-PREP-
+    /// NOTES.md): a min-heap by deadline (`Reverse` makes `BinaryHeap`, a max-heap by
+    /// default, pop smallest-`Instant`-first) -- `peek()`/`pop()` are O(1)/O(log n),
+    /// replacing the previous plain `Vec`'s O(n) `next_deadline` rescan on every
+    /// single message the node processes. Deterministic-equivalent: the identical
+    /// timers still fire at the identical deadlines producing the identical effects
+    /// (once past the lazy stale-discard below, itself also a no-op-preserving
+    /// optimization) -- only the internal data structure's complexity changes.
+    timers: BinaryHeap<Reverse<(Instant, View, TimerKind)>>,
     /// PHASE6-SPEC.md §5: the control-round timer queue, mirroring `timers` exactly
     /// (kept separate rather than folding `Round` into the `View`-typed queue above --
     /// the two counters are semantically distinct and this avoids a confusing shared
-    /// currency).
-    control_timers: Vec<(Instant, Round)>,
+    /// currency). D7-4: same min-heap fix as `timers`.
+    control_timers: BinaryHeap<Reverse<(Instant, Round)>>,
 
     /// D1 payload-sync bookkeeping: outstanding `(digest, worker_id)` keys per header
     /// digest, so `LaneManager::set_payload_ready` (which unconditionally marks a block
@@ -242,8 +250,8 @@ impl VantageCore {
             max_header_delay: parameters.max_header_delay,
             digests: Vec::new(),
             payload_size: 0,
-            timers: Vec::new(),
-            control_timers: Vec::new(),
+            timers: BinaryHeap::new(),
+            control_timers: BinaryHeap::new(),
             pending_payload: HashMap::new(),
             store,
             tx_payload_ready,
@@ -287,7 +295,8 @@ impl VantageCore {
             // (or its connection died and it'll never resolve) and is dropped.
             self.prune_cancel_handlers();
 
-            let next_deadline = self.timers.iter().map(|(d, _, _)| *d).min();
+            // D7-4: O(1) peek instead of the previous O(n) full-`Vec` rescan.
+            let next_deadline = self.timers.peek().map(|Reverse((d, _, _))| *d);
             let agb_sleep = async {
                 match next_deadline {
                     Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
@@ -296,7 +305,8 @@ impl VantageCore {
             };
             tokio::pin!(agb_sleep);
 
-            let next_control_deadline = self.control_timers.iter().map(|(d, _)| *d).min();
+            // D7-4: O(1) peek instead of the previous O(n) full-`Vec` rescan.
+            let next_control_deadline = self.control_timers.peek().map(|Reverse((d, _))| *d);
             let control_sleep = async {
                 match next_control_deadline {
                     Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
@@ -356,17 +366,29 @@ impl VantageCore {
 
                 () = &mut agb_sleep, if next_deadline.is_some() => {
                     let now = Instant::now();
-                    let mut due = Vec::new();
-                    self.timers.retain(|(d, v, k)| {
-                        if *d <= now {
-                            due.push((*v, *k));
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    // D7-4: pop-based firing (O(log n) per pop, vs. the previous O(n)
+                    // `retain` scan) + lazy stale discard -- if the timer's underlying
+                    // one-shot event already happened organically (echo/ready already
+                    // sent for this view), its dispatch would be a no-op through the
+                    // handler's own guard anyway (see `AgbEngine::echo_sent`/
+                    // `ready_sent`'s doc comments); skip constructing/dispatching it
+                    // entirely rather than paying for a call that immediately returns
+                    // an empty `Vec`. Deterministic-equivalent: identical effects
+                    // either way, since the discarded call was always going to return
+                    // nothing.
                     let mut effects = Vec::new();
-                    for (view, kind) in due {
+                    while let Some(&Reverse((d, view, kind))) = self.timers.peek() {
+                        if d > now {
+                            break;
+                        }
+                        self.timers.pop();
+                        let moot = match kind {
+                            TimerKind::EchoFallback | TimerKind::EchoAbsolute => self.agb.echo_sent(view),
+                            TimerKind::ReadyAbsolute => self.agb.ready_sent(view),
+                        };
+                        if moot {
+                            continue;
+                        }
                         match kind {
                             TimerKind::EchoFallback => effects.extend(self.agb.on_echo_fallback_timer(view, &mut self.lm, &mut self.rep)),
                             TimerKind::EchoAbsolute => effects.extend(self.agb.on_echo_absolute_timer(view, &mut self.rep)),
@@ -383,17 +405,20 @@ impl VantageCore {
 
                 () = &mut control_sleep, if next_control_deadline.is_some() => {
                     let now = Instant::now();
-                    let mut due = Vec::new();
-                    self.control_timers.retain(|(d, r)| {
-                        if *d <= now {
-                            due.push(*r);
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    // D7-4: pop-based firing + lazy stale discard, same reasoning as
+                    // the `agb_sleep` branch above -- a round timer whose round has
+                    // already advanced/voted is moot through `on_control_round_timer`'s
+                    // own `r != self.curr_round || self.voted` guard; skip dispatching
+                    // it.
                     let mut effects = Vec::new();
-                    for round in due {
+                    while let Some(&Reverse((d, round))) = self.control_timers.peek() {
+                        if d > now {
+                            break;
+                        }
+                        self.control_timers.pop();
+                        if round != self.control.curr_round() || self.control.voted() {
+                            continue;
+                        }
                         effects.extend(self.control.on_control_round_timer(round));
                     }
                     self.execute(effects, now).await;
@@ -620,7 +645,7 @@ impl VantageCore {
                     queue.extend(self.cursor.on_sealed(view, outcome));
                 }
                 Effect::ArmTimer(view, kind, deadline) => {
-                    self.timers.push((deadline, view, kind));
+                    self.timers.push(Reverse((deadline, view, kind)));
                 }
                 Effect::NotifyCommitted(commit_millis, by_worker) => {
                     self.notify_committed(commit_millis, by_worker).await;
@@ -687,7 +712,7 @@ impl VantageCore {
                     self.send_to(peer, Bytes::from(bytes)).await;
                 }
                 Effect::ArmControlTimer(round, deadline) => {
-                    self.control_timers.push((deadline, round));
+                    self.control_timers.push(Reverse((deadline, round)));
                 }
 
                 // --- PHASE6-SPEC.md §6 (anchors) ---

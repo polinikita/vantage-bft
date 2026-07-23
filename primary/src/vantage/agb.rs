@@ -110,8 +110,12 @@ pub enum Outcome {
     Skip,
 }
 
-/// §10: which deadline an `Effect::ArmTimer` names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// §10: which deadline an `Effect::ArmTimer` names. `PartialOrd`/`Ord` (D7-4,
+/// PHASE7-PREP-NOTES.md: the timer-queue min-heap fix) carry no protocol meaning --
+/// only needed so `(Instant, View, TimerKind)` tuples are orderable for the heap; ties
+/// on `Instant` are broken arbitrarily by variant declaration order, which is fine
+/// since firing order among same-deadline entries was never specified either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TimerKind {
     /// R2's `min(t + Δ, e_i + θE)` fallback deadline (armed once `ρ_i` is known).
     EchoFallback,
@@ -463,6 +467,22 @@ impl AgbEngine {
     /// lands).
     pub fn is_sealed(&self, view: View) -> bool {
         self.views.get(&view).map_or(false, |s| s.sealed.is_some())
+    }
+
+    /// D7-4 (PHASE7-PREP-NOTES.md): read-only mirror of the exact guard
+    /// `on_echo_fallback_timer`/`on_echo_absolute_timer` already check internally --
+    /// used by the timer-queue's lazy stale-discard at pop time, so a superseded timer
+    /// (its echo already sent organically) is dropped without ever constructing/
+    /// dispatching the handler call, instead of dispatching into a guard that would
+    /// have returned an empty `Vec` anyway. Same value, same meaning, no `&mut self`.
+    pub fn echo_sent(&self, view: View) -> bool {
+        self.views.get(&view).map_or(false, |s| s.echo_sent)
+    }
+
+    /// D7-4: read-only mirror of `on_ready_timer`'s guard, same reasoning as
+    /// `echo_sent` above.
+    pub fn ready_sent(&self, view: View) -> bool {
+        self.views.get(&view).map_or(false, |s| s.ready_sent)
     }
 
     /// PHASE6-SPEC.md §6: submit an anchor-derived outcome `X_u` to the SAME try-seal

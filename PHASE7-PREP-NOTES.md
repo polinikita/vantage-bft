@@ -1068,3 +1068,101 @@ processes run concurrently. New data dirs (`.local-bench-d73-*`,
 `.local-bench-delta1000-*`, `.local-bench-findingA-fixed`, `.local-bench-timerlen-*`)
 left on disk (gitignored). New logs under
 `/private/tmp/claude-501/.../scratchpad/{d73,delta1000,findingA-fixed,timerlen}*.log`.
+
+---
+
+## §delta-1000-fix — D7-4: timer-queue min-heap + lazy stale discard, SANCTIONED and implemented
+
+**Ruling**: fix the §delta-1000-investigation mechanism — replace `timers`/
+`control_timers` with a min-heap by deadline, pop-based firing, and lazy stale
+discard at pop time (drop a timer without dispatch if its purpose is already moot).
+Deterministic-equivalent: every stale timer was already a no-op through its handler's
+own one-shot guard when it fired; pruning removes that no-op work and the O(n) rescan,
+changing no observable protocol behavior.
+
+### Implementation
+
+- **`primary/src/vantage/node.rs`** — `timers: Vec<(Instant, View, TimerKind)>` →
+  `BinaryHeap<Reverse<(Instant, View, TimerKind)>>`; `control_timers: Vec<(Instant,
+  Round)>` → `BinaryHeap<Reverse<(Instant, Round)>>` (`Reverse` turns `BinaryHeap`'s
+  default max-heap into a min-heap by `Instant`, giving O(1) `peek()` and O(log n)
+  `push`/`pop`).
+  - `next_deadline`/`next_control_deadline`: `self.timers.iter().map(..).min()` (O(n),
+    on EVERY loop iteration) → `self.timers.peek().map(|Reverse((d, ..))| *d)` (O(1)).
+  - The two firing branches: the previous `retain`-based "collect everything due, then
+    dispatch" became a `while let Some(&Reverse((d, ..))) = self.timers.peek() { if d
+    > now { break } .. }` pop loop — pops (and only pops) entries whose deadline has
+    actually arrived, same as before, just O(log n) per entry instead of one O(n)
+    `retain` scan per firing.
+  - **Lazy stale discard**: at each pop, BEFORE calling the handler, check the exact
+    same one-shot condition the handler's own guard already checks (`AgbEngine::
+    echo_sent`/`ready_sent` for `EchoFallback`/`EchoAbsolute`/`ReadyAbsolute`;
+    `ControlLog::curr_round() != round || ControlLog::voted()` for the control-round
+    timer, mirroring `on_control_round_timer`'s own `r != self.curr_round ||
+    self.voted` check) — if moot, `continue` without ever constructing/dispatching the
+    call. Deterministic-equivalent by construction: the discarded call was always
+    going to hit that SAME guard and return an empty `Vec` anyway.
+- **`primary/src/vantage/agb.rs`** — two new read-only accessors, `echo_sent(view)`/
+  `ready_sent(view)`, exact mirrors of the private mutable-state fields the handlers
+  already read (no new state, no behavior change); `TimerKind` gained a `PartialOrd`/
+  `Ord` derive (needed only so `(Instant, View, TimerKind)` tuples are orderable for
+  the heap — carries no protocol meaning, ties on `Instant` broken arbitrarily by
+  declaration order).
+- **`primary/src/vantage/control.rs`** — one new read-only accessor, `voted()`, same
+  reasoning.
+
+### Verification
+
+**(a) Full suite**: `CARGO_BUILD_JOBS=4 cargo test --workspace -j 4 -- --test-threads=4`
+— all green, identical counts to every prior run this session (`primary` 161 passed /
+6 ignored, `crypto` 7/7, `network` 6/6, `store` 4/4, `worker` 6/6, `config`/`metrics`/
+`node` 0). **0 failed anywhere.**
+
+**(b) Δ=1000 fault-free, 60s, `--rate 240000`** — the gap has fully closed, not just
+"largely":
+
+| | Before D7-4 | After D7-4 | Δ=150 (for comparison) |
+|---|---|---|---|
+| Consensus TPS | 175,696 tx/s (−27%) | **240,871 tx/s** | 240,875 tx/s |
+| Avg latency | 2,301.07 ms (stddev 0.00) | **52.21 ms** (stddev 22.06) | 53.00 ms (stddev 22.22) |
+| Seal routes | `direct_full`-dominant | `fast_full`-dominant (route flip also gone) | `fast_full`-dominant |
+
+Δ=1000 now matches Δ=150 almost exactly on every metric — TPS, latency, AND the
+seal-route mix (the `direct_full`-over-`fast_full` flip, itself a symptom of the same
+CPU contention per the investigation write-up, is gone too).
+
+**Steady-state heap size** (`timers.len()`, sampled once/sec via the existing metrics
+tick, same run): still grows large in absolute terms — peaks in the high 30,000s
+(`36,551`–`39,021` observed) in roughly the first ~10-13s — but now DECREASES
+afterward as the run continues (`14,937 → 8,611 → 6,160 → 4,973` at the 1s/13s/26s/38s
+marks), because throughput no longer throttles down from the per-event scan cost, so
+the (now O(log n)-cheap) reap rate catches up with and then exceeds the arm rate. The
+heap still gets large — Δ still determines how long an entry lives before its own
+deadline naturally reaps it — but a large heap is now cheap to operate on (O(log n)
+per push/pop/peek) rather than being rescanned in full on every single message, which
+is exactly the complexity change the ruling's deterministic-equivalent argument
+describes.
+
+**(c) Δ=150 fault-free, 60s, `--rate 240000` (no-regression check)**: **240,875 tx/s**,
+avg 53.00 ms (stddev 22.22) — matches every other Δ=150 run this session (240-241k
+tx/s, ~46-56 ms avg) within normal run-to-run noise. No regression at the standard
+setting.
+
+### Changes (this section)
+
+- `primary/src/vantage/node.rs` — `timers`/`control_timers` fields retyped to
+  `BinaryHeap<Reverse<..>>`; `ArmTimer`/`ArmControlTimer` push sites wrap in
+  `Reverse(..)`; `next_deadline`/`next_control_deadline` use `peek()`; both firing
+  branches rewritten as pop-loops with the lazy stale-discard check inline.
+- `primary/src/vantage/agb.rs` — `echo_sent`/`ready_sent` read-only accessors;
+  `TimerKind` gained `PartialOrd`/`Ord`.
+- `primary/src/vantage/control.rs` — `voted()` read-only accessor.
+
+No `tex-projects`/`starfish` file touched. No git command run. `CARGO_BUILD_JOBS=4`
+builds throughout; no two builds/benchmark processes run concurrently. New data dirs
+(`.local-bench-d74-*`) left on disk (gitignored); new logs under
+`/private/tmp/claude-501/.../scratchpad/d74-*.log`.
+
+This closes the coordinator's outstanding items for this task (the crash-fault
+control-round-latency follow-on finding is explicitly deferred to the coordinator's
+strategic discussion with the user — no further fix attempted here, per instruction).

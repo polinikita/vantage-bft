@@ -853,6 +853,14 @@ impl ControlLog {
         self.curr_round
     }
 
+    /// D7-4 (PHASE7-PREP-NOTES.md): read-only mirror of `on_control_round_timer`'s own
+    /// `self.voted` check -- combined with `curr_round()` at the call site, reproduces
+    /// that handler's exact `r != self.curr_round || self.voted` guard for the
+    /// timer-queue's lazy stale-discard at pop time.
+    pub fn voted(&self) -> bool {
+        self.voted
+    }
+
     pub fn delivered_log_len(&self) -> usize {
         self.delivered_log.len()
     }
