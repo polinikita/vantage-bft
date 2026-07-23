@@ -1,0 +1,17 @@
+[package]
+name = "metrics"
+version = "0.1.0"
+edition = "2021"
+
+# Starfish-parity measurement substrate (PHASE2-SPEC.md #5): a precise, in-process
+# latency histogram fed over a channel, drained and published as Prometheus gauges by
+# a periodic reporter, served over HTTP. Ported minimally from
+# `~/code/starfish/crates/starfish-core/src/{stat,metrics,prometheus}.rs` -- only the
+# transaction-commit-latency slice Phase 2 needs; Phase 3+ (the Vantage core) adds
+# further counters to the same `Metrics` struct rather than building a parallel crate.
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "net", "time", "sync"] }
+prometheus = { workspace = true }
+axum = { workspace = true }
+log = { workspace = true }
