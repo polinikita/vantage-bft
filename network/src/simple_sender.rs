@@ -9,6 +9,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -24,6 +25,10 @@ pub struct SimpleSender {
     connections: HashMap<SocketAddr, Sender<Bytes>>,
     /// Small RNG just used to shuffle nodes and randomize connections (not crypto related).
     rng: SmallRng,
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): per-destination artificial send
+    /// latency, empty by default (current behavior, byte-identical). See
+    /// `network/src/lib.rs`'s module doc for the injection point/semantics.
+    latency: HashMap<SocketAddr, Duration>,
 }
 
 impl std::default::Default for SimpleSender {
@@ -37,13 +42,23 @@ impl SimpleSender {
         Self {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
+            latency: HashMap::new(),
         }
     }
 
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): attach a per-destination
+    /// artificial latency map (same contract as `ReliableSender::with_latency`) --
+    /// call BEFORE any connection to an address in the map is spawned.
+    pub fn with_latency(mut self, map: HashMap<SocketAddr, Duration>) -> Self {
+        self.latency = map;
+        self
+    }
+
     /// Helper function to spawn a new connection.
-    fn spawn_connection(address: SocketAddr) -> Sender<Bytes> {
+    fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(1_000);
-        Connection::spawn(address, rx);
+        let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
+        Connection::spawn(address, rx, extra_latency);
         tx
     }
 
@@ -58,7 +73,7 @@ impl SimpleSender {
         }
 
         // Otherwise make a new connection.
-        let tx = Self::spawn_connection(address);
+        let tx = self.spawn_connection(address);
         if tx.send(data).await.is_ok() {
             self.connections.insert(address, tx);
         }
@@ -91,16 +106,22 @@ struct Connection {
     address: SocketAddr,
     /// Channel from which the connection receives its commands.
     receiver: Receiver<Bytes>,
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): this connection's own fixed
+    /// artificial one-way delay to `address` (`Duration::ZERO` = off, the default).
+    extra_latency: Duration,
 }
 
 impl Connection {
-    fn spawn(address: SocketAddr, receiver: Receiver<Bytes>) {
+    fn spawn(address: SocketAddr, receiver: Receiver<Bytes>, extra_latency: Duration) {
         tokio::spawn(async move {
-            Self { address, receiver }.run().await;
+            Self { address, receiver, extra_latency }.run().await;
         });
     }
 
-    /// Main loop trying to connect to the peer and transmit messages.
+    /// Main loop trying to connect to the peer and transmit messages. D7-3 (PHASE7-
+    /// PREP-NOTES.md): the default (`extra_latency.is_zero()`) path is untouched
+    /// (current behavior, byte-identical) -- delayed delivery only applies when a
+    /// per-destination latency is actually configured.
     async fn run(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
@@ -115,21 +136,35 @@ impl Connection {
         };
         info!("Outgoing connection established with {}", self.address);
 
+        // D7-3: a plain FIFO delay queue, same reasoning as `ReliableSender::
+        // keep_alive_delayed` (every message on this link gets the identical fixed
+        // delay, so arrival order implies release-order -- no jitter, no concurrency,
+        // strict ordering preserved by construction) -- empty and inert whenever
+        // `extra_latency` is zero (the default), since nothing is ever scheduled with
+        // a nonzero wait in that case (`Instant::now() + Duration::ZERO` is due
+        // immediately on the very next poll).
+        let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> = std::collections::VecDeque::new();
+
         // Transmit messages once we have established a connection.
         loop {
+            let due = async {
+                match delay_queue.front() {
+                    Some((release_at, _)) => tokio::time::sleep_until(*release_at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
             // Check if there are any new messages to send or if we get an ACK for messages we already sent.
             tokio::select! {
-                Some(data) = self.receiver.recv() => {
-                    // PHASE7-PREP-NOTES.md (optional harness addition):
-                    // `--mimic-latency-ms` artificial delay, a no-op when unset (default).
-                    let mimic = crate::mimic_latency();
-                    if !mimic.is_zero() {
-                        tokio::time::sleep(mimic).await;
-                    }
+                () = due, if !delay_queue.is_empty() => {
+                    let (_, data) = delay_queue.pop_front().unwrap();
                     if let Err(e) = writer.send(data).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                         return;
                     }
+                },
+                Some(data) = self.receiver.recv() => {
+                    delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, data));
                 },
                 response = reader.next() => {
                     match response {

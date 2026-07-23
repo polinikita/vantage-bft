@@ -24,10 +24,11 @@ use core::panic;
 use std::borrow::BorrowMut;
 //use tokio::time::error::Elapsed;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 //use std::task::Poll;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -172,6 +173,14 @@ impl Core {
         simulate_asynchrony: bool,
         asynchrony_start: u64,
         asynchrony_duration: u64,
+
+        // PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item): this node's own
+        // per-destination artificial latency map, already resolved by the caller
+        // (`Primary::spawn`, via `Committee::latency_map`) -- empty (== current
+        // behavior, byte-identical) unless `--latency-table`/`--mimic-latency-ms` was
+        // passed. Resolved by the caller rather than here since `Core::spawn` (unlike
+        // `vantage::node::VantageCore::spawn`) doesn't otherwise take a `Parameters`.
+        latency_map: HashMap<SocketAddr, Duration>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -198,7 +207,7 @@ impl Core {
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 current_header: Header::default(),
                 votes_aggregator: VotesAggregator::new(),
-                network: ReliableSender::new(),
+                network: ReliableSender::new().with_latency(latency_map),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 already_proposed_slots: HashSet::new(),

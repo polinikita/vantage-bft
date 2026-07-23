@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, sleep_until, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[cfg(test)]
@@ -33,6 +33,10 @@ pub struct ReliableSender {
     connections: HashMap<SocketAddr, Sender<InnerMessage>>,
     /// Small RNG just used to shuffle nodes and randomize connections (not crypto related).
     rng: SmallRng,
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): per-destination artificial send
+    /// latency, empty by default (current behavior, byte-identical). See
+    /// `network/src/lib.rs`'s module doc for the injection point/semantics.
+    latency: HashMap<SocketAddr, Duration>,
 }
 
 impl std::default::Default for ReliableSender {
@@ -46,22 +50,39 @@ impl ReliableSender {
         Self {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
+            latency: HashMap::new(),
         }
     }
 
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): attach a per-destination
+    /// artificial latency map, built by the caller (typically `Committee::
+    /// latency_map`) BEFORE any connection to an address in the map is spawned --
+    /// each `Connection` reads its own entry once, at spawn time (`spawn_connection`).
+    /// A no-op (current behavior) if never called, or if a given destination address
+    /// simply isn't a key in `map`.
+    pub fn with_latency(mut self, map: HashMap<SocketAddr, Duration>) -> Self {
+        self.latency = map;
+        self
+    }
+
     /// Helper function to spawn a new connection.
-    fn spawn_connection(address: SocketAddr) -> Sender<InnerMessage> {
+    fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(1_000);
-        Connection::spawn(address, rx);
+        let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
+        Connection::spawn(address, rx, extra_latency);
         tx
     }
 
     /// Reliably send a message to a specific address.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) -> CancelHandler {
         let (sender, receiver) = oneshot::channel();
+        if !self.connections.contains_key(&address) {
+            let tx = self.spawn_connection(address);
+            self.connections.insert(address, tx);
+        }
         self.connections
-            .entry(address)
-            .or_insert_with(|| Self::spawn_connection(address))
+            .get(&address)
+            .unwrap()
             .send(InnerMessage {
                 data,
                 cancel_handler: sender,
@@ -120,16 +141,22 @@ struct Connection {
     retry_delay: u64,
     /// Buffer keeping all messages that need to be re-transmitted.
     buffer: VecDeque<(Bytes, oneshot::Sender<Bytes>)>,
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): this connection's own fixed
+    /// artificial one-way delay to `address` (`Duration::ZERO` = off, the default),
+    /// resolved once at spawn time and applied before every real send for this
+    /// connection's whole life -- see `keep_alive`.
+    extra_latency: Duration,
 }
 
 impl Connection {
-    fn spawn(address: SocketAddr, receiver: Receiver<InnerMessage>) {
+    fn spawn(address: SocketAddr, receiver: Receiver<InnerMessage>, extra_latency: Duration) {
         tokio::spawn(async move {
             Self {
                 address,
                 receiver,
                 retry_delay: 200,
                 buffer: VecDeque::new(),
+                extra_latency,
             }
             .run()
             .await;
@@ -181,8 +208,21 @@ impl Connection {
         }
     }
 
-    /// Transmit messages once we have established a connection.
+    /// Transmit messages once we have established a connection. D7-3 (PHASE7-PREP-
+    /// NOTES.md): the default (`extra_latency.is_zero()`) path is BYTE-IDENTICAL to
+    /// the pre-existing code (no scheduling overhead at all, not even one extra
+    /// `Instant::now()` call) -- the WAN-shaped-run path is a separate method.
     async fn keep_alive(&mut self, stream: TcpStream) -> NetworkError {
+        if self.extra_latency.is_zero() {
+            self.keep_alive_immediate(stream).await
+        } else {
+            self.keep_alive_delayed(stream).await
+        }
+    }
+
+    /// The original, unmodified transmit loop -- used whenever no artificial latency
+    /// is configured for this connection (current behavior, unchanged).
+    async fn keep_alive_immediate(&mut self, stream: TcpStream) -> NetworkError {
         // This buffer keeps all messages and handlers that we have successfully transmitted but for
         // which we are still waiting to receive an ACK.
         let mut pending_replies = VecDeque::new();
@@ -196,12 +236,6 @@ impl Connection {
                     continue;
                 }
 
-                // PHASE7-PREP-NOTES.md (optional harness addition): `--mimic-latency-ms`
-                // artificial delay, a no-op sleep(0) when unset (default).
-                let mimic = crate::mimic_latency();
-                if !mimic.is_zero() {
-                    sleep(mimic).await;
-                }
                 // Try to send the message.
                 match writer.send(data.clone()).await {
                     Ok(()) => {
@@ -248,6 +282,95 @@ impl Connection {
         // back into the sending buffer, we will try to send them again once we manage to establish a new connection.
         while let Some(message) = pending_replies.pop_back() {
             self.buffer.push_front(message);
+        }
+        error
+    }
+
+    /// D7-3 (PHASE7-PREP-NOTES.md, coordinator-mandated fix for the earlier
+    /// serial-FIFO-ceiling finding): a starfish-style "many messages in flight"
+    /// pipeline, without starfish's own per-message concurrent tasks (which would risk
+    /// `pending_replies`' strict send/ack correlation under jitter/scheduling races --
+    /// see the notes for why that was rejected here). Because every message on this
+    /// connection gets the IDENTICAL fixed `extra_latency`, and messages are scheduled
+    /// in arrival order, their release times are ALSO strictly increasing in that same
+    /// order (`t2 > t1 => t2+d > t1+d` for a constant `d`) -- so a single, plain FIFO
+    /// delay queue (`delay_queue`, gated on ONLY its own front's scheduled release
+    /// instant) preserves strict per-link order by construction, with no jitter and no
+    /// concurrency needed. This decouples ARRIVAL (buffering, immediate) from the
+    /// actual WRITE (gated on the queue's own due time), restoring the "many in
+    /// flight" pipelined throughput a real network link has (latency doesn't reduce a
+    /// link's bandwidth) instead of capping this link at `1 / extra_latency`
+    /// messages/sec the way the earlier "sleep synchronously before each write"
+    /// version did.
+    async fn keep_alive_delayed(&mut self, stream: TcpStream) -> NetworkError {
+        let mut pending_replies = VecDeque::new();
+        let mut delay_queue: VecDeque<(Instant, Bytes, oneshot::Sender<Bytes>)> = VecDeque::new();
+
+        let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
+        let error = 'connection: loop {
+            // Schedule everything newly arrived (or re-queued after a previous
+            // connection attempt's failure) -- cheap, no sends/sleeps happen here, so
+            // this never blocks a NEW arrival on an EARLIER message's still-pending
+            // delay.
+            while let Some((data, handler)) = self.buffer.pop_front() {
+                if handler.is_closed() {
+                    continue;
+                }
+                delay_queue.push_back((Instant::now() + self.extra_latency, data, handler));
+            }
+
+            let due = async {
+                match delay_queue.front() {
+                    Some((release_at, _, _)) => sleep_until(*release_at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
+            tokio::select! {
+                () = due, if !delay_queue.is_empty() => {
+                    let (_, data, handler) = delay_queue.pop_front().unwrap();
+                    if handler.is_closed() {
+                        continue;
+                    }
+                    match writer.send(data.clone()).await {
+                        Ok(()) => {
+                            pending_replies.push_back((data, handler));
+                        }
+                        Err(e) => {
+                            self.buffer.push_front((data, handler));
+                            break 'connection NetworkError::FailedToSendMessage(self.address, e);
+                        }
+                    }
+                },
+                Some(InnerMessage{data, cancel_handler}) = self.receiver.recv() => {
+                    self.buffer.push_back((data, cancel_handler));
+                },
+                response = reader.next() => {
+                    let (data, handler) = match pending_replies.pop_front() {
+                        Some(message) => message,
+                        None => break 'connection NetworkError::UnexpectedAck(self.address)
+                    };
+                    match response {
+                        Some(Ok(bytes)) => {
+                            let _ = handler.send(bytes.freeze());
+                        },
+                        _ => {
+                            pending_replies.push_front((data, handler));
+                            break 'connection NetworkError::FailedToReceiveAck(self.address);
+                        }
+                    }
+                },
+            }
+        };
+
+        // Everything still awaiting an ack, AND everything still sitting in the delay
+        // queue (scheduled but never actually written), goes back to `buffer` for
+        // retry after the next reconnect -- nothing silently dropped.
+        while let Some(message) = pending_replies.pop_back() {
+            self.buffer.push_front(message);
+        }
+        while let Some((_, data, handler)) = delay_queue.pop_back() {
+            self.buffer.push_front((data, handler));
         }
         error
     }

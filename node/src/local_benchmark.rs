@@ -11,7 +11,7 @@ use crate::client::{Client, TransactionMode};
 use crate::CHANNEL_CAPACITY;
 use anyhow::{Context, Result};
 use clap::ArgMatches;
-use config::{Committee, Export as _, KeyPair, Parameters, Protocol, WorkerId};
+use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol, WorkerId};
 use crypto::SignatureService;
 use metrics::{aggregate_latency_snapshots, read_latency_snapshot, read_vantage_progress, LatencySnapshot, MetricReporter};
 use primary::Primary;
@@ -81,17 +81,32 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .context("--max-header-delay-ms must be a non-negative integer")?;
     // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default.
     let timeline: bool = matches.get_flag("timeline");
-    // PHASE7-PREP-NOTES.md (optional): starfish-style fixed artificial inter-node send
-    // delay, off (0) by default -- current behavior, unchanged.
+    // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `--latency-table <csv>` (an n x n
+    // RTT-ms matrix, node index = committee order) takes precedence; `--mimic-latency
+    // -ms <u64>` is the uniform shorthand (defined as exactly the trivial table whose
+    // every cell is that value -- see `LatencyTable::uniform`). Neither set (both
+    // default/0) => `None`, i.e. zero injected delay, current behavior unchanged.
     let mimic_latency_ms: u64 = matches
         .get_one::<String>("mimic-latency-ms")
         .unwrap()
         .parse()
         .context("--mimic-latency-ms must be a non-negative integer")?;
-    if mimic_latency_ms > 0 {
-        network::set_mimic_latency_ms(mimic_latency_ms);
-        println!("Mimic latency: {} ms artificial delay on every inter-node send", mimic_latency_ms);
-    }
+    let latency_table_path = matches.get_one::<String>("latency-table").cloned();
+    let latency_table: Option<LatencyTable> = if let Some(path) = &latency_table_path {
+        let table = LatencyTable::from_rtt_csv(path, nodes)
+            .with_context(|| format!("Failed to parse --latency-table '{}' as a {n}x{n} RTT-ms CSV matrix", path, n = nodes))?;
+        println!("Latency table: loaded from {} ({}x{} RTT-ms matrix, node index = committee order)", path, nodes, nodes);
+        Some(table)
+    } else if mimic_latency_ms > 0 {
+        println!(
+            "Latency table: uniform {} ms RTT ({} ms one-way) on every inter-authority link (--mimic-latency-ms)",
+            mimic_latency_ms,
+            mimic_latency_ms / 2
+        );
+        Some(LatencyTable::uniform(nodes, mimic_latency_ms as f64))
+    } else {
+        None
+    };
 
     let protocol = match protocol_str.as_str() {
         "autobahn-optimistic" => Protocol::AutobahnOptimistic,
@@ -143,6 +158,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     parameters.delta_ms = delta_ms;
     parameters.max_batch_delay = max_batch_delay_ms;
     parameters.max_header_delay = max_header_delay_ms;
+    // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
+    // means it never round-trips through the `parameters.json` export just below --
+    // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
+    // is all `Core::spawn`/`vantage::node::VantageCore::spawn` ever read it from.
+    parameters.latency_table = latency_table.map(Arc::new);
     parameters.reconcile_protocol();
     parameters
         .export(data_dir.join("parameters.json").to_str().unwrap())

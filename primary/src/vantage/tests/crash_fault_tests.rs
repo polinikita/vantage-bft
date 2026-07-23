@@ -125,8 +125,8 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
         let control = &node.control;
         // Consume the (initially data-only) next-turn bit first, exactly like
         // `Node::try_propose_effects` would at this party's own proposer turn.
-        node.resolver.decide(agb, carrying_view, |u| agb.is_sealed(u) || control.is_anchor_resolved(u));
-        node.resolver.decide(agb, carrying_view, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+        node.resolver.decide(agb, carrying_view, entry_instant, |u| agb.is_sealed(u) || control.is_anchor_resolved(u));
+        node.resolver.decide(agb, carrying_view, entry_instant, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
     };
     assert_eq!(m, Some(ResolutionEntry::Skip(dead_view)), "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate");
 

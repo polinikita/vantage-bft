@@ -337,6 +337,17 @@ impl Primary {
                     parameters.simulate_asynchrony,
                     parameters.asynchrony_start,
                     parameters.asynchrony_duration,
+                    // PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item):
+                    // resolved once here (empty == current behavior, byte-identical,
+                    // unless `--latency-table`/`--mimic-latency-ms` set
+                    // `parameters.latency_table`) -- the fairness point: the exact
+                    // same `Committee::latency_map` call `Protocol::Vantage`'s arm
+                    // above makes for `VantageCore::spawn`.
+                    parameters
+                        .latency_table
+                        .as_deref()
+                        .map(|table| committee.latency_map(&name, table))
+                        .unwrap_or_default(),
                 );
 
                 Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer);

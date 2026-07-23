@@ -145,10 +145,21 @@ async fn main() -> Result<()> {
                         the run -- diagnostic only, off by default (verbose)"))
                 .arg(Arg::new("mimic-latency-ms").long("mimic-latency-ms").value_name("INT")
                     .default_value("0").action(ArgAction::Set)
-                    .help("PHASE7-PREP-NOTES.md (optional): starfish-style fixed artificial \
-                        delay (ms) injected on every inter-node send, both primary-to-primary \
-                        and primary-to-worker/worker-to-worker (network crate, process-wide); \
-                        0 = off (default, current behavior)")),
+                    .help("PHASE7-PREP-NOTES.md (WAN-shaped local runs): uniform shorthand for \
+                        --latency-table -- an RTT-ms value applied to every inter-authority \
+                        link (one-way = value/2), as if every cell of a --latency-table CSV \
+                        held this same number; 0 = off (default, current behavior). Ignored if \
+                        --latency-table is also given."))
+                .arg(Arg::new("latency-table").long("latency-table").value_name("PATH")
+                    .action(ArgAction::Set)
+                    .help("PHASE7-PREP-NOTES.md (WAN-shaped local runs): path to an NxN \
+                        RTT-ms CSV matrix (N = --nodes, no header row, node index = committee \
+                        order), applied one-way (RTT/2) to each node's own inter-authority \
+                        primary-to-primary/-worker connections (starfish-style per-connection \
+                        injection, read-only reference: \
+                        ~/code/starfish/crates/starfish-core/src/network.rs). Takes precedence \
+                        over --mimic-latency-ms. Unset (default) = zero injected delay, \
+                        current behavior unchanged for both protocols.")),
         )
         .subcommand_required(true)
         .arg_required_else_help(true)

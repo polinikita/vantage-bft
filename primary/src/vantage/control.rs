@@ -271,6 +271,16 @@ impl ControlLog {
             if self.delivered_set.contains(&pair) || in_chain.contains(&pair) {
                 continue;
             }
+            // D7-2: leader-side "smallest STILL-USEFUL view" -- a reported view here
+            // always carries a resolution entry (reports are only ever populated for
+            // M != None proposals); if its target is already anchored, some earlier
+            // carrier already resolved it, so this pair is moot -- skip it to avoid
+            // burning this leader's own per-round bandwidth re-delivering a no-op.
+            if let Some(entry) = &proposal.m {
+                if self.anchored.contains(&entry.target_view()) {
+                    continue;
+                }
+            }
             if best.as_ref().map_or(true, |(bv, _)| view < *bv) {
                 best = Some(pair);
             }

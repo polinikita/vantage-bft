@@ -118,18 +118,19 @@ async fn drive_control_rounds(nodes: &mut [Node], outbox: &mut VecDeque<(usize, 
 fn resolve_carrying_entry(nodes: &mut [Node], carrying_view: View, target_view: View) -> (usize, ResolutionEntry) {
     let carrier_name = agb::proposer(&test_committee(), carrying_view);
     let carrier_idx = nodes.iter().position(|n| n.name == carrier_name).unwrap();
+    let now = Instant::now();
     let first = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
         let control = &node.control;
-        node.resolver.decide(agb, carrying_view, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
     };
     assert_eq!(first, None, "the next-turn bit starts data-only");
     let m = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
         let control = &node.control;
-        node.resolver.decide(agb, carrying_view, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
     };
     let entry = m.expect("the target view must be justified for recovery");
     assert_eq!(entry.target_view(), target_view);
@@ -215,16 +216,17 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     let carrier_name = crate::vantage::agb::proposer(&test_committee(), carrying_view);
     let carrier_idx = live.iter().find(|&&i| nodes[i].name == carrier_name).copied().expect("a live party must lead the carrying view");
 
+    let now = Instant::now();
     let first = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
-        node.resolver.decide(agb, carrying_view, |u| agb.is_sealed(u))
+        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u))
     };
     assert_eq!(first, None, "the next-turn bit starts data-only");
     let m = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
-        node.resolver.decide(agb, carrying_view, |u| agb.is_sealed(u))
+        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u))
     };
     assert_eq!(m, Some(ResolutionEntry::Skip(dead_view)), "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate");
 

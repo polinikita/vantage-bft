@@ -9,6 +9,7 @@
 use crate::primary::View;
 use crate::vantage::agb::{AgbEngine, ResolutionEntry};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 pub struct Resolver {
     f_plus_1_parties: usize,
@@ -25,6 +26,24 @@ pub struct Resolver {
     /// remove an already-qualified entry, but new smaller-order entries can shift
     /// positions).
     candidate_pointer: HashMap<View, ResolutionEntry>,
+    /// D7-1 (PHASE7-PREP-NOTES.md; coordinator-sanctioned WITH this time bound;
+    /// Finding A's root-cause fix): the last time this party either (a) itself minted
+    /// a recovery attempt for `u`, or (b) observed (via `note_carrier_report`, at the
+    /// first genuine completion of some carrier `w` with `M_w` targeting `u`) evidence
+    /// that an attempt for `u` is already in flight. While the marker is younger than
+    /// `expiry`, `decide` treats `u` like an empty-candidate view (never blocks a
+    /// later target); once it ages past `expiry` it is eligible again. Time-BOUNDED
+    /// deliberately, never open-ended: O3's progress argument only guarantees
+    /// anchoring for proposals that complete at EVERY correct party, so a carrier that
+    /// completed non-universally could look permanently "in flight" from this party's
+    /// view -- open-ended suppression would then extinguish the attempt stream for
+    /// `u`, a liveness loss. Bounding by `expiry` keeps attempts infinitely-often in
+    /// the limit (this only throttles the mint rate, never which entries are ever
+    /// chosen), so the liveness argument survives; the paper author should still rule
+    /// on this.
+    in_flight: HashMap<View, Instant>,
+    /// 12Δ, per the coordinator's ruling (D7-1).
+    expiry: Duration,
 }
 
 impl Resolver {
@@ -32,14 +51,30 @@ impl Resolver {
     /// `f_plus_1_parties` formula, duplicated here (each component derives its own
     /// committee-based threshold constants, same pattern as `AgbEngine`/`Pacemaker` --
     /// this is a threshold constant, not counting state, so it doesn't violate the
-    /// reuse rule).
-    pub fn new(n: usize) -> Self {
+    /// reuse rule). `delta_ms` -- D7-1's 12Δ expiry (same Δ every other Vantage timing
+    /// constant derives from).
+    pub fn new(n: usize, delta_ms: u64) -> Self {
         Self {
             f_plus_1_parties: (n - 1) / 3 + 1,
             two_f_plus_1_parties: 2 * ((n - 1) / 3) + 1,
             next_is_recovery: false,
             candidate_pointer: HashMap::new(),
+            in_flight: HashMap::new(),
+            expiry: Duration::from_millis(12 * delta_ms),
         }
+    }
+
+    /// D7-1: is `u` currently suppressed (an in-flight marker younger than `expiry`)?
+    fn is_in_flight(&self, u: View, now: Instant) -> bool {
+        self.in_flight.get(&u).is_some_and(|t| now.saturating_duration_since(*t) < self.expiry)
+    }
+
+    /// D7-1: record fresh in-flight evidence for `u` at `now` -- called both by
+    /// `decide` (our own attempt, immediately) and by the caller when this party
+    /// observes (via `Effect::CompletionReportable`) a carrier -- ours or another
+    /// party's -- whose `M` targets `u`, at that carrier's first genuine completion.
+    pub fn note_carrier_report(&mut self, u: View, now: Instant) {
+        self.in_flight.insert(u, now);
     }
 
     /// §4's canonical sort key: payloads sorted lexicographically by `bincode(C,T)`,
@@ -105,11 +140,13 @@ impl Resolver {
     /// §4's full per-turn decision: scan unsealed/un-anchor-resolved views `u <= w-3`
     /// ascending (`resolved` folds in both "sealed at the AGB layer" and, once §6
     /// lands, "already anchor-resolved"), skipping any view whose justified set is
-    /// empty (never blocks a later target). Returns `None` for a data-only proposal
-    /// (either no target qualifies at all -- bit left untouched -- or the bit selected
-    /// data-only this turn at the first qualifying target, which still flips the bit);
-    /// `Some(entry)` for a recovery proposal targeting the first qualifying view.
-    pub fn decide(&mut self, agb: &AgbEngine, w: View, resolved: impl Fn(View) -> bool) -> Option<ResolutionEntry> {
+    /// empty (never blocks a later target) OR whose D7-1 in-flight marker hasn't yet
+    /// expired (same "never blocks a later target" treatment). Returns `None` for a
+    /// data-only proposal (either no target qualifies at all -- bit left untouched --
+    /// or the bit selected data-only this turn at the first qualifying target, which
+    /// still flips the bit); `Some(entry)` for a recovery proposal targeting the first
+    /// qualifying view. `now` -- D7-1's in-flight age check and marker refresh.
+    pub fn decide(&mut self, agb: &AgbEngine, w: View, now: Instant, resolved: impl Fn(View) -> bool) -> Option<ResolutionEntry> {
         for u in 1..=w.saturating_sub(3) {
             if resolved(u) {
                 continue;
@@ -118,6 +155,9 @@ impl Resolver {
             if candidates.is_empty() {
                 continue; // no-evidence view never blocks a later target
             }
+            if self.is_in_flight(u, now) {
+                continue; // D7-1: suppressed, not yet expired -- never blocks a later target
+            }
             // A qualifying target was found -- the bit decides, then flips (§4 step 3).
             if !self.next_is_recovery {
                 self.next_is_recovery = true;
@@ -125,6 +165,8 @@ impl Resolver {
             }
             self.next_is_recovery = false;
             let entry = self.pick_and_advance(u, &candidates);
+            // D7-1: our own attempt is itself in-flight evidence, immediately.
+            self.in_flight.insert(u, now);
             // PHASE7-PREP-NOTES.md Finding A: diagnostic-only observational log (no
             // behavior change) -- every recovery attempt actually attached to a
             // proposal, so a run's log can show how many carrier views ever attempt a

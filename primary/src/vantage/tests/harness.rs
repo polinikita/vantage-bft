@@ -74,7 +74,7 @@ impl Node {
         let frontier = Frontier::new(name, test_committee());
         let cursor = Cursor::new(test_committee(), lm.sid().clone(), lm.genesis().clone(), MAX_BLOCK_PAYLOAD, lm.blocks_handle());
         let pacemaker = Pacemaker::new(name, &test_committee());
-        let resolver = Resolver::new(test_committee().size());
+        let resolver = Resolver::new(test_committee().size(), TEST_DELTA_MS);
         let mut control = ControlLog::new(name, test_committee(), lm.sid().clone(), TEST_DELTA_MS);
         // See `ControlLog::max_rounds_for_test`'s doc comment: nothing throttles a
         // `⊥`-valued control round's instantaneous advance in this synchronous
@@ -120,7 +120,7 @@ impl Node {
         let m = if self.agb.proposer(view) == self.name && !self.frontier.already_proposed(view) {
             let agb = &self.agb;
             let control = &self.control;
-            self.resolver.decide(agb, view, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+            self.resolver.decide(agb, view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
         } else {
             None
         };

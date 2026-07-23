@@ -8,6 +8,8 @@ use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -166,6 +168,21 @@ pub struct Parameters {
     /// keeps pre-Phase-4 parameter files valid.
     #[serde(default = "default_delta_ms")]
     pub delta_ms: u64,
+
+    /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
+    /// per-authority-pair one-way latency table, applied to THIS node's own
+    /// primary-to-primary connections at spawn time via `Committee::latency_map`
+    /// (`Core::spawn`/`vantage::node::VantageCore::spawn`, both protocols
+    /// identically). Never round-trips through `parameters.json`/`fab`
+    /// (`#[serde(skip)]`) -- it is a benchmark-diagnostic-only, in-process value built
+    /// by `node local-benchmark` from `--latency-table`/`--mimic-latency-ms`, not a
+    /// deployable setting. `None` (the default -- also what every EXISTING
+    /// `parameters.json` deserializes to, since the field is entirely absent from
+    /// their JSON) means zero injected delay, i.e. byte-identical current behavior --
+    /// required for invariant 4 (both Autobahn paths) and for Vantage's own
+    /// already-recorded fault-free/crash-fault gate numbers to stay reproducible.
+    #[serde(skip)]
+    pub latency_table: Option<Arc<LatencyTable>>,
 }
 
 fn default_max_block_payload() -> usize {
@@ -174,6 +191,79 @@ fn default_max_block_payload() -> usize {
 
 fn default_delta_ms() -> u64 {
     1000
+}
+
+/// PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item): an n x n one-way
+/// inter-authority latency table, indexed by committee order (`Committee::index_of`
+/// -- the same deterministic `BTreeMap<PublicKey, _>` order `Pacemaker`/
+/// `ControlLog::control_leader`/`Resolver` already rely on for their own
+/// party-indexed arrays/rotations, so a CSV's rows/columns line up with committee.json
+/// the same way every node in a run sees it). Reference (read-only):
+/// `~/code/starfish/crates/starfish-core/src/network.rs`'s `generate_latency_table` +
+/// per-connection `extra_connection_latency` application build an analogous per-pair
+/// table for starfish's own injection point; this is the much smaller subset this
+/// workspace's harness needs -- a fixed table (no adversarial ramp/per-call jitter).
+#[derive(Clone, Debug)]
+pub struct LatencyTable {
+    /// `one_way_ms[i][j]` = one-way latency (ms) from committee-order index `i` to
+    /// `j`. Symmetric by construction (halved from an RTT matrix), diagonal 0.
+    one_way_ms: Vec<Vec<f64>>,
+}
+
+impl LatencyTable {
+    /// The trivial uniform table `--mimic-latency-ms` builds: same RTT-ms/halving
+    /// convention as `from_rtt_csv` (every off-diagonal pair gets the same one-way
+    /// delay, `rtt_ms / 2`) so both flags are governed by the identical construction --
+    /// `--mimic-latency-ms X` is defined as exactly equivalent to a uniform `--latency
+    /// -table` CSV whose every cell is `X`. Diagonal (self-to-self, never looked up by
+    /// `Committee::latency_map`, which always skips `other == myself`) is 0.
+    pub fn uniform(n: usize, rtt_ms: f64) -> Self {
+        let one_way = rtt_ms / 2.0;
+        let mut t = vec![vec![one_way; n]; n];
+        for (i, row) in t.iter_mut().enumerate() {
+            row[i] = 0.0;
+        }
+        Self { one_way_ms: t }
+    }
+
+    /// Parses an n x n ROUND-TRIP-ms CSV matrix (rows/columns in committee order, no
+    /// header row, comma-separated, blank lines skipped), halving every entry on load
+    /// to the one-way latency this table stores (RTT is the natural unit to
+    /// measure/specify a link in; the network layer only ever needs to delay one
+    /// direction of a send, hence the one-way half). `n` must match the parsed
+    /// matrix's own row/column count exactly (checked, not assumed).
+    pub fn from_rtt_csv(path: &str, n: usize) -> Result<Self, ConfigError> {
+        let err = |message: String| ConfigError::ImportError { file: path.to_string(), message };
+        let data = fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        for line in data.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let row: Result<Vec<f64>, _> = line.split(',').map(|cell| cell.trim().parse::<f64>()).collect();
+            rows.push(row.map_err(|e| err(format!("non-numeric cell in row {}: {}", rows.len(), e)))?);
+        }
+        if rows.len() != n || rows.iter().any(|r| r.len() != n) {
+            return Err(err(format!(
+                "expected a {n}x{n} RTT matrix, got {} data row(s) with lengths {:?}",
+                rows.len(),
+                rows.iter().map(|r| r.len()).collect::<Vec<_>>()
+            )));
+        }
+        let one_way_ms = rows.into_iter().map(|row| row.into_iter().map(|rtt_ms| rtt_ms / 2.0).collect()).collect();
+        Ok(Self { one_way_ms })
+    }
+
+    /// The one-way latency between committee-order indices `i` and `j` (`Duration::
+    /// ZERO` for an out-of-range index -- defensive; unreachable given callers always
+    /// build `i`/`j` from `Committee::index_of` over the SAME committee this table was
+    /// sized against).
+    pub fn one_way(&self, i: usize, j: usize) -> Duration {
+        self.one_way_ms
+            .get(i)
+            .and_then(|row| row.get(j))
+            .map_or(Duration::ZERO, |ms| Duration::from_secs_f64(ms.max(0.0) / 1000.0))
+    }
 }
 
 impl Default for Parameters {
@@ -205,6 +295,7 @@ impl Default for Parameters {
             protocol: Protocol::default(),
             max_block_payload: default_max_block_payload(),
             delta_ms: default_delta_ms(),
+            latency_table: None,
         }
     }
 }
@@ -248,6 +339,9 @@ impl Parameters {
         info!("Ride share enabled? {}. Car timeout: {}", self.use_ride_share, self.car_timeout);
         info!("Max block payload set to {} entries", self.max_block_payload);
         info!("Vantage delta set to {} ms", self.delta_ms);
+        if self.latency_table.is_some() {
+            info!("Mimic latency table active (PHASE7-PREP-NOTES.md)");
+        }
     }
 }
 
@@ -444,6 +538,64 @@ impl Committee {
             .filter(|(name, _)| name != &myself)
             .map(|(name, authority)| (*name, authority.primary.clone()))
             .collect()
+    }
+
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): `name`'s position in the
+    /// committee's own deterministic order (`authorities`' `BTreeMap<PublicKey, _>`
+    /// iteration order -- the same canonical ordering `Pacemaker`/`ControlLog::
+    /// control_leader`/`Resolver` already rely on internally for their own
+    /// party-indexed arrays/rotations, now exposed for `LatencyTable` indexing).
+    /// `None` if `name` isn't a committee member.
+    pub fn index_of(&self, name: &PublicKey) -> Option<usize> {
+        self.authorities.keys().position(|k| k == name)
+    }
+
+    /// Every socket address `name`'s authority listens on -- its primary's three
+    /// addresses, its consensus address, and every one of its workers' four
+    /// addresses. The full set of endpoints one `LatencyTable` pair-entry should
+    /// cover, since latency is modeled per AUTHORITY pair, not per individual service
+    /// port. Empty if `name` isn't a committee member.
+    pub fn addresses_of(&self, name: &PublicKey) -> Vec<SocketAddr> {
+        let Some(a) = self.authorities.get(name) else {
+            return Vec::new();
+        };
+        let mut out = vec![
+            a.primary.primary_to_primary,
+            a.primary.worker_to_primary,
+            a.primary.metrics,
+            a.consensus.consensus_to_consensus,
+        ];
+        for w in a.workers.values() {
+            out.extend([w.primary_to_worker, w.transactions, w.worker_to_worker, w.metrics]);
+        }
+        out
+    }
+
+    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): builds `myself`'s own
+    /// per-destination one-way latency map from `table` -- every socket address
+    /// belonging to every OTHER authority maps to `table.one_way(index_of(myself),
+    /// index_of(other))`. Feeds `ReliableSender`/`SimpleSender::with_latency(..)` at
+    /// each protocol's own primary-to-primary spawn site (`Core::spawn`/
+    /// `vantage::node::VantageCore::spawn`) -- the SAME table, resolved relative to
+    /// whichever node calls this, applied identically to both protocols (the
+    /// fairness point: a WAN-shaped run models the same network for either
+    /// assembly). Empty (no entries -- equivalent to zero injected delay everywhere)
+    /// if `myself` isn't a committee member.
+    pub fn latency_map(&self, myself: &PublicKey, table: &LatencyTable) -> HashMap<SocketAddr, Duration> {
+        let mut out = HashMap::new();
+        let Some(i) = self.index_of(myself) else {
+            return out;
+        };
+        for (j, other) in self.authorities.keys().enumerate() {
+            if other == myself {
+                continue;
+            }
+            let delay = table.one_way(i, j);
+            for addr in self.addresses_of(other) {
+                out.insert(addr, delay);
+            }
+        }
+        out
     }
 
     /// Returns the addresses of a specific worker (`id`) of a specific authority (`to`).

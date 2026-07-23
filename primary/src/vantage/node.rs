@@ -197,7 +197,7 @@ impl VantageCore {
         let frontier = Frontier::new(name, committee.clone());
         let cursor = Cursor::new(committee.clone(), sid.clone(), genesis, parameters.max_block_payload, blocks);
         let pacemaker = Pacemaker::new(name, &committee);
-        let resolver = Resolver::new(committee.size());
+        let resolver = Resolver::new(committee.size(), parameters.delta_ms);
         let control = ControlLog::new(name, committee.clone(), sid, parameters.delta_ms);
 
         let other_primaries: Vec<(PublicKey, SocketAddr)> = committee
@@ -212,6 +212,17 @@ impl VantageCore {
             .map(|(id, addr)| (id, addr.primary_to_worker))
             .collect();
 
+        // PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item): resolved once,
+        // relative to OUR OWN committee index -- empty (== current behavior) unless
+        // `--latency-table`/`--mimic-latency-ms` set `parameters.latency_table`. Our
+        // own worker addresses are never keys in this map (`Committee::latency_map`
+        // always skips `other == myself`), so `worker_network` below stays undelayed.
+        let latency_map = parameters
+            .latency_table
+            .as_deref()
+            .map(|table| committee.latency_map(&name, table))
+            .unwrap_or_default();
+
         let core = Self {
             name,
             lm,
@@ -222,8 +233,8 @@ impl VantageCore {
             pacemaker,
             resolver,
             control,
-            network: ReliableSender::new(),
-            worker_network: SimpleSender::new(),
+            network: ReliableSender::new().with_latency(latency_map.clone()),
+            worker_network: SimpleSender::new().with_latency(latency_map),
             cancel_handlers: Vec::new(),
             other_primaries,
             worker_addresses,
@@ -406,6 +417,9 @@ impl VantageCore {
         metrics.vantage_control_round.set(self.control.curr_round() as i64);
         metrics.vantage_control_delivered_len.set(self.control.delivered_log_len() as i64);
         metrics.vantage_control_consume_pos.set(self.control.consume_pos() as i64);
+        // PHASE7-PREP-NOTES.md Delta=1000 investigation: diagnostic-only observational
+        // log (no behavior change) -- the linearly-scanned timer queues' current sizes.
+        log::info!("vantage node: timers.len()={} control_timers.len()={} cancel_handlers.len()={}", self.timers.len(), self.control_timers.len(), self.cancel_handlers.len());
     }
 
     /// R1's "should we propose next" check (§4), as a pure effect-producing step so it
@@ -421,7 +435,7 @@ impl VantageCore {
         let m = if self.agb.proposer(view) == self.name && !self.frontier.already_proposed(view) {
             let agb = &self.agb;
             let control = &self.control;
-            self.resolver.decide(agb, view, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+            self.resolver.decide(agb, view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
         } else {
             None
         };
@@ -624,6 +638,16 @@ impl VantageCore {
 
                 // --- PHASE6-SPEC.md §5 (reports + control log) ---
                 Effect::CompletionReportable(view, proposal) => {
+                    // D7-1 (PHASE7-PREP-NOTES.md): this is the FIRST genuine
+                    // completion of a carrier with M != None -- whether we proposed
+                    // it ourselves or another party did -- so it's exactly the
+                    // "observed CompReport for a carrier resolving u" evidence the
+                    // in-flight marker should refresh on, independent of (and in
+                    // addition to) `Resolver::decide`'s own immediate refresh for its
+                    // own attempts.
+                    if let Some(entry) = &proposal.m {
+                        self.resolver.note_carrier_report(entry.target_view(), now);
+                    }
                     queue.extend(self.control.on_completion_reportable(view, proposal));
                 }
                 Effect::BroadcastCompReport(view, digest) => {

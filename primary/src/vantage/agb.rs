@@ -650,6 +650,9 @@ impl AgbEngine {
         if !self.positive_gate_holds(&proposal, lm) {
             return effects;
         }
+        // PHASE7-PREP-NOTES.md Delta=1000 investigation: diagnostic-only observational
+        // log (no behavior change) -- the organic grade-1 (positive-gate) echo path.
+        log::info!("vantage agb: organic grade-1 echo view={}", view);
         // Record the fast-seal lock immediately before sending our own matching echo.
         self.record_lock(view, &proposal, &digest);
         self.state_mut(view).echo_sent = true;
@@ -834,6 +837,9 @@ impl AgbEngine {
             return effects; // fixed is still ⊥ or Reject -- defer to the absolute deadline
         };
         self.state_mut(view).echo_sent = true;
+        // PHASE7-PREP-NOTES.md Delta=1000 investigation: diagnostic-only observational
+        // log (no behavior change) -- the Delta-scaled fallback (grade-0) echo path.
+        log::info!("vantage agb: FALLBACK grade-0 echo view={}", view);
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
         if Self::core_ok(&proposal.c, lm) && self.meta_ok(&proposal.m, lm) {
             let origin = self.compute_origin(&proposal.m);

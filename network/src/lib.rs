@@ -12,33 +12,17 @@ pub use crate::receiver::{MessageHandler, Receiver, Writer};
 pub use crate::reliable_sender::{CancelHandler, ReliableSender};
 pub use crate::simple_sender::SimpleSender;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// PHASE7-PREP-NOTES.md (optional harness addition): a starfish-style artificial
-/// per-send delay (`starfish`'s `mimic_extra_latency`/`uniform_latency_ms` pattern in
-/// `~/code/starfish/crates/starfish-core/src/network.rs`, read-only reference),
-/// deliberately reduced to the single knob `local-benchmark --mimic-latency-ms`
-/// actually needs: one process-wide fixed delay (ms), default 0 = off (current
-/// behavior, byte-identical), applied uniformly to every outbound send on both
-/// senders below. Not starfish's full per-connection geodistributed latency table
-/// (adversarial ramp, per-peer randomized jitter) -- out of scope for a harness-only
-/// diagnostic knob; a real per-peer table would be a much larger, separate change.
-/// Global rather than threaded through every `ReliableSender`/`SimpleSender`/
-/// `Primary::spawn`/`Worker::spawn` call site (all unchanged) -- a single process-wide
-/// benchmark run has exactly one intended mimic delay, so a `static` avoids a
-/// signature change rippling through every spawn path for a diagnostic-only knob.
-static MIMIC_LATENCY_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Sets the process-wide artificial per-send delay. Call once, before spawning any
-/// node (`local-benchmark`'s own startup, if `--mimic-latency-ms` > 0); every
-/// `ReliableSender`/`SimpleSender` connection already running (or spawned after) reads
-/// the current value on every send, so later calls take effect immediately too.
-pub fn set_mimic_latency_ms(ms: u64) {
-    MIMIC_LATENCY_MS.store(ms, Ordering::Relaxed);
-}
-
-/// Reads the current artificial per-send delay; `Duration::ZERO` (no sleep) when unset
-/// (the default) -- current behavior, unchanged.
-fn mimic_latency() -> std::time::Duration {
-    std::time::Duration::from_millis(MIMIC_LATENCY_MS.load(Ordering::Relaxed))
-}
+// PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item): per-destination
+// artificial send latency, starfish-style (reference, read-only:
+// `~/code/starfish/crates/starfish-core/src/network.rs`'s `generate_latency_table` +
+// its per-connection `extra_connection_latency` field/application). `ReliableSender`/
+// `SimpleSender` each carry an OPTIONAL `HashMap<SocketAddr, Duration>` (default
+// empty), set once via `with_latency(..)` right after construction; a `Connection`
+// spawned for a given address looks up its own entry ONCE at spawn time and sleeps it
+// (a no-op when zero/absent) immediately before every real `writer.send(..)` for the
+// rest of that connection's life. This is per-connection, exactly like starfish's own
+// injection point: each destination's dedicated task applies its own fixed delay to
+// its own FIFO message stream, so per-link ordering is preserved and unrelated links
+// (any address absent from the map, which is every address when the map is empty) are
+// completely unaffected -- the default (empty map) is byte-identical to pre-existing
+// behavior, satisfying invariant 4 for both Autobahn paths.
