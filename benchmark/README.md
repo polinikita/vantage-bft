@@ -2,87 +2,62 @@
 This document explains how to benchmark the codebase and read benchmarks' results. It also provides a step-by-step tutorial to run benchmarks on [Amazon Web Services (AWS)](https://aws.amazon.com) accross multiple data centers (WAN).
 
 ## Local Benchmarks
-When running benchmarks, the codebase is automatically compiled with the feature flag `benchmark`. This enables the node to print some special log entries that are then read by the python scripts and used to compute performance. These special log entries are clearly indicated with comments in the code: make sure to not alter them (otherwise the benchmark scripts will fail to interpret the logs).
+When running benchmarks, the codebase is automatically compiled with the feature flag `benchmark`.
 
-### Parametrize the benchmark
-After cloning the repo and [installing all dependencies](https://github.com/facebookresearch/narwhal#quick-start), you can use [Fabric](http://www.fabfile.org/) to run benchmarks on your local machine.  Locate the task called `local` in the file [fabfile.py](https://github.com/facebookresearch/narwhal/blob/master/benchmark/fabfile.py):
-```python
-@task
-def local(ctx):
-    ...
-```
-The task specifies two types of parameters, the *benchmark parameters* and the *nodes parameters*. The benchmark parameters look as follows:
-```python
-bench_params = {
-    'nodes': 4,
-    'workers': 1,
-    'rate': 50_000,
-    'tx_size': 512,
-    'faults': 0,
-    'duration': 20,
-}
-```
-They specify the number of primaries (`nodes`) and workers per primary (`workers`) to deploy, the input rate (tx/s) at which the clients submits transactions to the system (`rate`), the size of each transaction in bytes (`tx_size`), the number of faulty nodes ('faults), and the duration of the benchmark in seconds (`duration`). The minimum transaction size is 9 bytes, this ensure that the transactions of a client are all different. The benchmarking script will deploy as many clients as workers and divide the input rate equally amongst each client. For instance, if you configure the testbed with 4 nodes, 1 worker per node, and an input rate of 1,000 tx/s (as in the example above), the scripts will deploy 4 clients each submitting transactions to one node at a rate of 250 tx/s. When the parameters `faults` is set to `f > 0`, the last `f` nodes and clients are not booted; the system will thus run with `n-f` nodes (and `n-f` clients). 
-
-The nodes parameters determine the configuration for the primaries and workers:
-```python
-node_params = {
-    'header_size': 1_000,
-    'max_header_delay': 100,
-    'gc_depth': 50,
-    'sync_retry_delay': 10_000,
-    'sync_retry_nodes': 3,
-    'batch_size': 500_000,
-    'max_batch_delay': 100
-}
-```
-They are defined as follows:
-* `header_size`: The preferred header size. The primary creates a new header when it has enough parents and enough batches' digests to reach `header_size`. Denominated in bytes.
-* `max_header_delay`: The maximum delay that the primary waits between generating two headers, even if the header did not reach `max_header_size`. Denominated in ms.
-* `gc_depth`: The depth of the garbage collection (Denominated in number of rounds).
-* `sync_retry_delay`: The delay after which the synchronizer retries to send sync requests. Denominated in ms.
-* `sync_retry_nodes`: Determine with how many nodes to sync when re-trying to send sync-request. These nodes are picked at random from the committee.
-* `batch_size`: The preferred batch size. The workers seal a batch of transactions when it reaches this size. Denominated in bytes.
-* `max_batch_delay`: The delay after which the workers seal a batch of transactions, even if `max_batch_size` is not reached. Denominated in ms.
+The local vehicle is the `node` binary's `local-benchmark` subcommand
+(`node/src/local_benchmark.rs`): it self-hosts an entire run — every primary, every
+worker, and one client task per worker — in a single OS process, reusing the exact
+same `Primary::spawn`/`Worker::spawn`/`Client` code paths the standalone binaries
+use. There is no Python/fabric/tmux orchestration on the local path; `fab` is used
+only for the AWS/remote harness (see [AWS Benchmarks](#aws-benchmarks) below).
 
 ### Run the benchmark
-Once you specified both `bench_params` and `node_params` as desired, run:
+Build once with the `benchmark` feature flag, then run:
 ```
-$ fab local
+$ cargo build --release --features benchmark
+$ ./target/release/node local-benchmark --nodes 4 --workers 1 --rate 240000 \
+      --tx-size 512 --protocol autobahn-optimistic --duration 60
 ```
-This command first recompiles your code in `release` mode (and with the `benchmark` feature flag activated), thus ensuring you always benchmark the latest version of your code. This may take a long time the first time you run it. It then generates the configuration files and keys for each node, and runs the benchmarks with the specified parameters. It finally parses the logs and displays a summary of the execution similarly to the one below. All the configuration and key files are hidden JSON files; i.e., their name starts with a dot (`.`), such as `.committee.json`.
+Key flags (all have defaults — see `node local-benchmark --help`):
+* `--nodes`: number of primaries (authorities) to spawn.
+* `--workers`: workers per primary.
+* `--rate`: aggregate input rate (tx/s), divided equally amongst the per-worker
+  clients.
+* `--tx-size`: transaction size in bytes.
+* `--protocol`: `autobahn-optimistic`, `autobahn-seamless`, or `vantage`.
+* `--duration`: benchmark duration in seconds.
+* `--crash`: number of trailing nodes to leave unspawned (a true crash fault —
+  committee membership is unchanged, only those nodes' tasks never start).
+* `--delta-ms`, `--max-batch-delay-ms`, `--max-header-delay-ms`: protocol timing
+  parameters (see `--help` for the exact semantics of each).
+* `--mimic-latency-ms` / `--latency-table`: inject uniform or WAN-shaped
+  (NxN RTT-ms CSV matrix) artificial network latency between authorities.
+
+It generates keys, an in-memory committee, and `parameters.json`/`committee.json`
+(written under `--data-dir`, default `.local-bench/`, for reference — nothing
+re-reads them), runs the benchmark for `--duration` seconds, and prints a summary
+computed in-process from each node's own Prometheus registry (no log parsing, no
+scraping):
 ```
 -----------------------------------------
  SUMMARY:
 -----------------------------------------
- + CONFIG:
- Faults: 0 node(s)
- Committee size: 4 node(s)
- Worker(s) per node: 1 worker(s)
- Collocate primary and workers: True
- Input rate: 50,000 tx/s
- Transaction size: 512 B
- Execution time: 19 s
-
- Header size: 1,000 B
- Max header delay: 100 ms
- GC depth: 50 round(s)
- Sync retry delay: 10,000 ms
- Sync retry nodes: 3 node(s)
- batch size: 500,000 B
- Max batch delay: 100 ms
-
  + RESULTS:
- Consensus TPS: 46,478 tx/s
- Consensus BPS: 23,796,531 B/s
- Consensus latency: 464 ms
+ Consensus TPS: 240071 tx/s
+ Consensus BPS: 122916352 B/s
 
- End-to-end TPS: 46,149 tx/s
- End-to-end BPS: 23,628,541 B/s
- End-to-end latency: 557 ms
+ Real transaction latency: avg 416.32 ms (stddev 58.10), p50/p90/p99 410.00/480.00/610.00 ms (14401920 txs, 0 misses)
 -----------------------------------------
 ```
-The 'Consensus TPS' and 'Consensus latency' respectively report the average throughput and latency without considering the client. The consensus latency thus refers to the time elapsed between the block's creation and its commit. In contrast, 'End-to-end TPS' and 'End-to-end latency' report the performance of the whole system, starting from when the client submits the transaction. The end-to-end latency is often called 'client-perceived latency'. To accurately measure this value without degrading performance, the client periodically submits 'sample' transactions that are tracked across all the modules until they get committed into a block; the benchmark scripts use sample transactions to estimate the end-to-end latency.
+'Consensus TPS'/'Consensus BPS' report the committed throughput. 'Real transaction
+latency' is the true end-to-end client-perceived latency, aggregated across every
+node's own committed-transaction histogram (max for count/misses since every node
+observes the same replicated commit stream, summed sum/sum-of-squares for the
+avg/stddev ratio, median across nodes for percentiles).
+
+An optional `monitoring/docker-compose.yml` Prometheus+Grafana stack can scrape the
+running nodes live; `local-benchmark` prints the generated `prometheus.yaml` path
+and the Grafana URL on startup.
 
 ## AWS Benchmarks
 This repo integrates various python scripts to deploy and benchmark the codebase on [Amazon Web Services (AWS)](https://aws.amazon.com). They are particularly useful to run benchmarks in the WAN, across multiple data centers. This section provides a step-by-step tutorial explaining how to use them.
@@ -189,13 +164,13 @@ This may take a long time as the command will first update all instances.
 The commands `fab stop` and `fab start` respectively stop and start the testbed without destroying it (it is good practice to stop the testbed when not in use as AWS can be quite expensive); and `fab destroy` terminates all instances and destroys the testbed. Note that, depending on the instance types, AWS instances may take up to several minutes to fully start or stop. The command `fab info` displays a nice summary of all available machines and information to manually connect to them (for debug).
 
 ### Step 5. Run a benchmark
-After setting up the testbed, running a benchmark on AWS is similar to running it locally (see [Run Local Benchmarks](https://github.com/facebookresearch/narwhal/tree/master/benchmark#local-benchmarks)). Locate the task `remote` in [fabfile.py](https://github.com/facebookresearch/narwhal/blob/master/benchmark/fabfile.py):
+After setting up the testbed, running a benchmark on AWS uses the same concepts as [Local Benchmarks](#local-benchmarks) above (nodes, workers, rate, tx size, faults, duration), just via the `fab` fabric harness instead of the `node local-benchmark` subcommand. Locate the task `remote` in [fabfile.py](https://github.com/facebookresearch/narwhal/blob/master/benchmark/fabfile.py):
 ```python
 @task
 def remote(ctx):
     ...
 ```
-The benchmark parameters are similar to [local benchmarks](https://github.com/facebookresearch/narwhal/tree/master/benchmark#local-benchmarks) but allow to specify the number of nodes and the input rate as arrays to automate multiple benchmarks with a single command. The parameter `runs` specifies the number of times to repeat each benchmark (to later compute the average and stdev of the results), and the parameter `collocate` specifies whether to collocate all the node's workers and the primary on the same machine. If `collocate` is set to `False`, the script will run one node per data center (AWS region), with its primary and each of its worker running on a dedicated instance.
+The benchmark parameters cover the same concepts as [local benchmarks](#local-benchmarks) but allow to specify the number of nodes and the input rate as arrays to automate multiple benchmarks with a single command. The parameter `runs` specifies the number of times to repeat each benchmark (to later compute the average and stdev of the results), and the parameter `collocate` specifies whether to collocate all the node's workers and the primary on the same machine. If `collocate` is set to `False`, the script will run one node per data center (AWS region), with its primary and each of its worker running on a dedicated instance.
 ```python
 bench_params = {
     'nodes': [10, 20, 30],
@@ -208,7 +183,7 @@ bench_params = {
     'runs': 2,
 }
 ```
-Similarly to local benchmarks, the scripts will deploy as many clients as workers and divide the input rate equally amongst each client. Each client is colocated with a worker, and only submit transactions to the worker with whom they share the machine.
+As with local benchmarks, the scripts will deploy as many clients as workers and divide the input rate equally amongst each client. Each client is colocated with a worker, and only submit transactions to the worker with whom they share the machine.
 
 Once you specified both `bench_params` and `node_params` as desired, run:
 ```

@@ -48,8 +48,8 @@ class Committee:
 
         Phase 2: each primary and each worker gains a "metrics" (Prometheus scrape)
         address, growing the per-authority port count from 6 to 8 (1 worker/authority,
-        the `fab local`/`fab remote` default). committee.json is regenerated every run,
-        so there is no back-compat concern with older committee files.
+        `fab remote`'s default). committee.json is regenerated every run, so there
+        is no back-compat concern with older committee files.
     '''
 
     def __init__(self, addresses, base_port):
@@ -195,16 +195,6 @@ class Committee:
     def ip(address):
         assert isinstance(address, str)
         return address.split(':')[0]
-
-
-class LocalCommittee(Committee):
-    def __init__(self, names, port, workers):
-        assert isinstance(names, list)
-        assert all(isinstance(x, str) for x in names)
-        assert isinstance(port, int)
-        assert isinstance(workers, int) and workers > 0
-        addresses = OrderedDict((x, ['127.0.0.1']*(1+workers)) for x in names)
-        super().__init__(addresses, port)
 
 
 class NodeParameters:

@@ -1,60 +1,11 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from fabric import task
 
-from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
 from benchmark.utils import Print
 from benchmark.plot import Ploter, PlotError
 from benchmark.instance import InstanceManager
 from benchmark.remote import Bench, BenchError
-
-
-@task
-def local(ctx, debug=True):
-    ''' Run benchmarks on localhost '''
-    bench_params = {
-        'faults': 0,
-        'nodes': [4],
-        'workers': 1,
-        'co-locate': True,
-        'rate': [240_000],
-        'tx_size': 512,
-        'tx_mode': 'all-zero',
-        'duration': 60,
-        'runs': 1,
-
-        # Unused
-        'simulate_partition': True,
-        'partition_start': 5,
-        'partition_duration': 5,
-        'partition_nodes': 1,
-    }
-    node_params = {
-        'timeout_delay': 5_000,  # ms
-        'header_size': 32,  # bytes
-        'max_header_delay': 5_000,  # ms
-        'gc_depth': 50,  # rounds
-        'sync_retry_delay': 5_000,  # ms
-        'sync_retry_nodes': 3,  # number of nodes
-        'batch_size': 500_000,  # bytes
-        'max_batch_delay': 20,  # ms
-        'protocol': 'autobahn-optimistic',
-        'use_parallel_proposals': True,
-        'k': 4,
-        'use_fast_path': True,
-        'fast_path_timeout': 5_000,
-        'use_ride_share': False,
-        'car_timeout': 5_000,
-
-        'simulate_asynchrony': False,
-        'asynchrony_start': 15_000, #ms
-        'asynchrony_duration': 3_000, #ms
-    }
-    try:
-        ret = LocalBench(bench_params, node_params).run(debug)
-        print(ret.result())
-    except BenchError as e:
-        Print.error(e)
 
 
 @task
