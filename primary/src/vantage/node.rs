@@ -174,6 +174,15 @@ pub struct VantageCore {
     /// (`Arc<Metrics>` is freely shareable; this is not new metrics plumbing, just one
     /// more clone of the same handle every node already builds).
     metrics: Option<Arc<Metrics>>,
+
+    /// PHASE7-PREP-NOTES.md: pays down PHASE4-NOTES.md §6's scope cut -- forwards each
+    /// cursor-committed `Header` to the top-level application, the same output-channel
+    /// shape `Committer` (Autobahn) already feeds. `Primary::spawn`'s `Vantage` arm
+    /// used to drop the `tx_output` it's handed (never referenced it), so this
+    /// channel's receiver (`node`/`local_benchmark`'s `rx_output`) closed immediately;
+    /// `node::main`'s `analyze(rx_output)` loop returning on a closed channel is what
+    /// hit the `unreachable!()` right after every primary's boot line.
+    tx_output: Sender<Header>,
 }
 
 impl VantageCore {
@@ -185,6 +194,7 @@ impl VantageCore {
         store: Store,
         metrics: Option<Arc<Metrics>>,
         rx_our_digests: Receiver<(Digest, WorkerId)>,
+        tx_output: Sender<Header>,
     ) -> Sender<Inbound> {
         let (tx_vantage, rx_vantage) = channel(CHANNEL_CAPACITY);
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
@@ -256,6 +266,7 @@ impl VantageCore {
             store,
             tx_payload_ready,
             metrics: core_metrics,
+            tx_output,
         };
         tokio::spawn(core.run(rx_vantage, rx_our_digests, rx_payload_ready));
         tx_vantage
@@ -647,8 +658,8 @@ impl VantageCore {
                 Effect::ArmTimer(view, kind, deadline) => {
                     self.timers.push(Reverse((deadline, view, kind)));
                 }
-                Effect::NotifyCommitted(commit_millis, by_worker) => {
-                    self.notify_committed(commit_millis, by_worker).await;
+                Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
+                    self.notify_committed(commit_millis, by_worker, headers).await;
                 }
                 Effect::BroadcastWish(view) => {
                     let bytes = bincode::serialize(&PrimaryMessage::VantageWish(view, self.name)).expect("serializes");
@@ -785,12 +796,27 @@ impl VantageCore {
 
     /// Commit metric (Phase-2 parity, §9): forward the cursor's per-`WorkerId`
     /// notification to our own workers -- the existing worker-side observe path
-    /// (`worker::synchronizer`) does the rest.
-    async fn notify_committed(&mut self, commit_millis: u64, by_worker: Vec<(WorkerId, Vec<Digest>)>) {
+    /// (`worker::synchronizer`) does the rest. Also (PHASE7-PREP-NOTES.md, paying down
+    /// PHASE4-NOTES.md §6's scope cut) forwards each committed `Header` to the
+    /// top-level application via `tx_output`, the same shape/tolerance as Autobahn's
+    /// `Committer` (`primary/src/committer.rs`): a closed or full receiver is logged,
+    /// not treated as fatal -- `node::main`'s `analyze` loop is a no-op consumer either
+    /// way, and other assemblies' equivalent sends already tolerate this identically.
+    async fn notify_committed(
+        &mut self,
+        commit_millis: u64,
+        by_worker: Vec<(WorkerId, Vec<Digest>)>,
+        headers: Vec<Header>,
+    ) {
         for (worker_id, digests) in by_worker {
             if let Some(addr) = self.worker_addresses.get(&worker_id) {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests)).expect("serializes");
                 self.worker_network.send(*addr, Bytes::from(bytes)).await;
+            }
+        }
+        for header in headers {
+            if let Err(e) = self.tx_output.send(header).await {
+                log::debug!("Failed to send block through the output channel: {}", e);
             }
         }
     }

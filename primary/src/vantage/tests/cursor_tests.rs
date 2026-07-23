@@ -27,7 +27,7 @@ async fn expansion_order_and_cross_view_dedup() {
     let expected: Vec<_> = std::iter::once(chain_a[0].id.clone()).chain(t.iter().map(|r| r.2.clone())).collect();
     cursor.on_completed(1, c.clone(), t.clone());
     let effects = cursor.on_sealed(1, Outcome::Full(c, t));
-    assert!(effects.iter().any(|e| matches!(e, crate::vantage::Effect::NotifyCommitted(_, _))));
+    assert!(effects.iter().any(|e| matches!(e, crate::vantage::Effect::NotifyCommitted(..))));
     assert_eq!(cursor.output_log(), expected.as_slice());
     assert_eq!(cursor.next_view(), 2);
 

@@ -98,7 +98,12 @@ pub enum Effect {
     // --- PHASE4-SPEC.md §9 (output cursor) ---
     /// Commit metric (Phase-2 parity): for every block just appended to the output log,
     /// notify our own workers (grouped by `WorkerId`) of the batches committed.
-    NotifyCommitted(u64 /* commit UTC-millis */, Vec<(WorkerId, Vec<Digest>)>),
+    /// Third field (PHASE7-PREP-NOTES.md, paying down the PHASE4-NOTES.md §6 scope
+    /// cut): the committed blocks' own `Header`s, in commit order, already looked up
+    /// from `BlockCache` by the cursor at emit time -- so `VantageCore` only has to
+    /// forward them to `tx_output`, matching the Autobahn `Committer`'s output-channel
+    /// shape without VantageCore needing its own `BlockCache` handle.
+    NotifyCommitted(u64 /* commit UTC-millis */, Vec<(WorkerId, Vec<Digest>)>, Vec<Header>),
 
     // --- PHASE5-SPEC.md §1-3 (WISH pacemaker) ---
     /// W2 amplification: broadcast a standalone `VantageWish` (sender filled in by the

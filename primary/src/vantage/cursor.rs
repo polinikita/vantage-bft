@@ -1,6 +1,7 @@
 // PHASE4-SPEC.md §9 -- output cursor: deterministic linearization of AGB per-view
 // outcomes into the committed block log, plus the Phase-2 Committed metric reuse.
 
+use crate::messages::Header;
 use crate::primary::{Height, View};
 use crate::vantage::agb::{Manifest, Outcome};
 use crate::vantage::lanes::SharedBlocks;
@@ -172,22 +173,31 @@ impl Cursor {
             self.output_log.push(h.clone());
             log::info!("Committed vantage block {}", h);
         }
-        let by_worker = self.batches_by_worker(&hashes);
+        let (by_worker, headers) = self.batches_by_worker_and_headers(&hashes);
         let commit_millis = now_millis();
-        vec![Effect::NotifyCommitted(commit_millis, by_worker.into_iter().collect())]
+        vec![Effect::NotifyCommitted(commit_millis, by_worker.into_iter().collect(), headers)]
     }
 
-    fn batches_by_worker(&self, hashes: &[Digest]) -> HashMap<WorkerId, Vec<Digest>> {
+    /// Same `BlockCache` lock/lookup `batches_by_worker` always did, plus (PHASE7-
+    /// PREP-NOTES.md, paying down PHASE4-NOTES.md §6's scope cut) collecting each
+    /// committed hash's own `Header` for `tx_output` -- the digest's `Header` is
+    /// already on hand at this exact call site, per that note's recommendation.
+    fn batches_by_worker_and_headers(
+        &self,
+        hashes: &[Digest],
+    ) -> (HashMap<WorkerId, Vec<Digest>>, Vec<Header>) {
         let mut out: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
+        let mut headers = Vec::with_capacity(hashes.len());
         let blocks = self.blocks.lock().unwrap();
         for h in hashes {
             if let Some(entry) = blocks.get(h) {
                 for (digest, worker_id) in &entry.block.payload {
                     out.entry(*worker_id).or_default().push(digest.clone());
                 }
+                headers.push(entry.block.clone());
             }
         }
-        out
+        (out, headers)
     }
 
     /// `Expand_D(X)` (§9): traverse `manifest` in encoded vector order; for each entry,

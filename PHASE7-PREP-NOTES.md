@@ -449,6 +449,176 @@ gate-verified as-is.
 
 ---
 
+## §remote — tx_output debt paid (PHASE4-NOTES.md §6), vantage re-verified clean end-to-end
+
+PHASE4-NOTES.md §6 had explicitly flagged this exact gap as a scope cut, not a fresh
+bug: *"the cursor does not forward committed blocks to `tx_output`/`analyze()` ...
+Recommend wiring it (look the digest up via `BlockCache`, `tx_output.send(header)`)
+whenever a real downstream consumer needs the committed stream; the digest is already
+on hand at every call site that would need it."* The consumer materialized this round
+(`node/main.rs`'s `analyze` loop treating channel closure as `unreachable!()`) — this
+addendum records the debt as **paid**.
+
+### Fix (sanctioned: implementation-only output plumbing, no protocol semantics)
+
+- **`primary/src/vantage/mod.rs`**: `Effect::NotifyCommitted` gained a third field,
+  `Vec<Header>` — the committed blocks' own headers, in commit order.
+- **`primary/src/vantage/cursor.rs`**: `emit()`'s helper (renamed
+  `batches_by_worker` → `batches_by_worker_and_headers`) now also collects
+  `entry.block.clone()` (the `Header` — `BlockEntry.block: Header`, already looked up
+  under the same `BlockCache` lock `batches_by_worker` always took) for every hash,
+  returned alongside the existing per-worker digest grouping. New `use
+  crate::messages::Header;`.
+- **`primary/src/vantage/node.rs`**: `VantageCore` gained a `tx_output: Sender<Header>`
+  field; `spawn()` gained a trailing `tx_output: Sender<Header>` parameter (mirroring
+  how `Core::spawn`'s latency-map parameter was added in an earlier round); the
+  `Effect::NotifyCommitted` dispatch arm and `notify_committed()` now take/forward the
+  `Vec<Header>`, sending each via `self.tx_output.send(header).await` with the exact
+  same tolerance as Autobahn's `Committer` (`primary/src/committer.rs:217`): a
+  closed/full receiver is `log::debug!`-logged, never panics or propagates.
+- **`primary/src/primary.rs`**: the `Protocol::Vantage` arm of `Primary::spawn` now
+  passes its `tx_output` parameter into `VantageCore::spawn(...)` instead of letting it
+  drop unused at the end of the match arm (the root cause).
+- **`primary/src/vantage/tests/cursor_tests.rs`**: one test's
+  `matches!(e, Effect::NotifyCommitted(_, _))` updated to `NotifyCommitted(..)` for the
+  new arity (E0023 otherwise — the only such site; `tests/harness.rs` already used
+  `..`).
+
+No other file touched; no protocol-semantic change (what gets committed, when, and via
+which route is completely unaffected — this only wires an existing, already-computed
+value out to a channel nothing previously drained on the Vantage side).
+
+### Verification ladder
+
+**(1) Full throttled workspace suite** (`CARGO_BUILD_JOBS=4 cargo test --workspace -j 4
+-- --test-threads=4`): first attempt failed to even compile (`error[E0023]`, the stale
+2-field `NotifyCommitted` pattern above) — fixed, re-ran, **all green**: `primary` 161
+passed / 6 ignored (up 2 from the 159 recorded in earlier rounds — additional tests
+added by the concurrent local-measurement work between rounds, unrelated to this fix,
+still 0 failed), every other crate 0 failed, exit 0.
+
+**(2) `fab local --protocol vantage`** (temporary edit to `benchmark/fabfile.py`'s
+`local` task, reverted immediately after — confirmed via `git diff HEAD --
+benchmark/fabfile.py`: zero diff, byte-identical to the committed version again).
+Pre-flight `tmux ls` → `no server running` (clean, proceeded per instruction). Result:
+**no panic** (`grep -il panic logs/primary-*.log` → empty, all 4 logs), ~67,000 lines
+in `primary-0.log` (a full, sustained 60s run, not an instant crash), and the
+Prometheus-scraped real-latency histogram shows **9,553,816 committed transactions**
+observed (avg 2,247.95 ms, p50/p90/p99 320.50/4,692.50/30,272.50 ms — this run used the
+`local` task's own defaults, rate 240,000 tx/s uncapped by any Δ-aware local-capacity
+tuning, so the high latency/backlog here is expected and not itself a regression
+signal; the point of this step was solely "does it commit sustained without panicking",
+which it does). Note: `Consensus TPS`/`Execution time` show `0` in the printed SUMMARY
+— this is a **pre-existing, separate, out-of-scope** gap: `LogParser._parse_primaries`'s
+regex looks for Autobahn's `"Created B\d+(...) -> ..."`/`"Committed B\d+(...) -> ..."`
+log-line shape, which Vantage's cursor never emits (it logs `"Committed vantage block
+{digest}"` instead, per `cursor.rs::emit`) — so the log-text-based throughput figure is
+always zero for Vantage regardless of this fix; the Prometheus-based real-latency
+figure is Vantage's actual working measurement path and is unaffected. Not fixed here
+(out of scope for this addendum; flagging for whoever next touches `logs.py` if the
+log-text-based TPS figure specifically is ever needed for Vantage).
+
+**(3) AWS re-run, vantage pass only** (autobahn-optimistic already gate-verified,
+not repeated): 4× `c5.xlarge`, eu-west-1 (key pair reused), `fab install` (rsync,
+already `.gitignore`-filtered from the prior round's fix) → clean → `fab remote
+--protocol=vantage` (rate 50,000, tx-size 512, duration 60s, delta_ms 150) → **clean,
+no panic, gate-verified**:
+
+```
+-----------------------------------------
+ SUMMARY:
+-----------------------------------------
+ + CONFIG:
+ Protocol: Vantage
+ Faults: 0 node(s)
+ Committee size: 4 node(s)
+ Worker(s) per node: 1 worker(s)
+ Collocate primary and workers: True
+ Input rate: 50,000 tx/s
+ Transaction size: 512 B
+ Execution time: 0 s
+
+ Header size: 32 B
+ Max header delay: 5,000 ms
+ GC depth: 50 round(s)
+ Sync retry delay: 5,000 ms
+ Sync retry nodes: 3 node(s)
+ batch size: 500,000 B
+ Max batch delay: 20 ms
+
+ + RESULTS:
+ Consensus TPS: 0 tx/s
+ Consensus BPS: 0 B/s
+ Consensus latency: 0 ms
+
+ End-to-end TPS: 0 tx/s
+ End-to-end BPS: 0 B/s
+ End-to-end latency: 0 ms
+
+ Real transaction latency: avg 240.31 ms (stddev 344.98), p50/p90/p99 35.00/681.50/806.00 ms (948,750 txs, 1 misses)
+-----------------------------------------
+```
+
+(`Consensus`/`End-to-end TPS` and `Execution time` are `0` for the same pre-existing
+log-text-parser reason noted in step 2 above — not a fix regression. The Prometheus
+real-latency figure, 948,750 committed transactions over the 60s window with 1 miss,
+is the meaningful, working signal here, and confirms sustained commits at this rate
+over the actual AWS testbed, not just locally.)
+
+**Metrics-scrape-through-security-group gate: PASSED again** (4/4 workers implicitly
+reporting — the aggregate real-latency figure above only populates when at least one
+worker's scrape succeeds; combined with zero scrape-warning lines in this run's raw
+output, all 4 scraped cleanly, same as the autobahn-optimistic pass).
+
+**Vantage seal-route distribution** (`vantage_seals`, per-primary, from
+`logs/metrics-primary-{0..3}.txt`):
+
+| Node | `direct_full` | `fast_full` | `direct_core` | `anchor_full` | `anchor_core` | `anchor_skip` |
+|---|---|---|---|---|---|---|
+| 0 | 13,927 | 11,837 | 0 | 0 | 0 | 0 |
+| 1 | 14,543 | 11,222 | 0 | 0 | 0 | 0 |
+| 2 | 14,854 | 10,911 | 0 | 0 | 0 | 0 |
+| 3 | 12,158 | 13,418 | 0 | 0 | 0 | 0 |
+
+Every sealed view went through one of the two happy-path routes
+(`direct_full`/`fast_full`); zero fallback/anchor routes fired anywhere —
+consistent with §findingB's fault-free local result (same pattern, no
+`anchor_core`/`anchor_skip`/`direct_core`/`anchor_full` ever observed fault-free) and
+expected here too (no faults injected, delta_ms 150 comfortable on `c5.xlarge`).
+
+### Outcome
+- **tx_output debt: PAID.** PHASE4-NOTES.md §6's scope cut is resolved; Vantage's
+  standalone `node run ... primary` process path (the one `fab remote`/`fab local`
+  actually exec, and presumably the eventual paper-campaign path) no longer panics.
+- Both protocols now have clean, gate-verified AWS RESULTS at the same settings (rate
+  50,000, tx-size 512, duration 60s, delta_ms 150): autobahn-optimistic from the prior
+  addendum, vantage from this one.
+- 4× `c5.xlarge` created, ran ~15.5 min, **terminated**; verified **0** non-terminated
+  instances in eu-west-1 via `describe_instances` after `fab destroy`.
+
+### Instance-hours
+- This round (vantage-only re-run, 4× `c5.xlarge`, ~17:03:46 UTC → ~17:19 UTC): **~1.04**
+  instance-hours.
+- **Grand total across all three smoke-test rounds this session: ~6.25 instance-hours**
+  (compile-break round ~3.21 + rsync/metrics-fix round ~2.0 + this vantage-only round
+  ~1.04).
+
+### Cleanup / current resource state (end of session)
+- **0 EC2 instances** anywhere (verified via `describe_instances`, eu-west-1, all
+  non-terminated states, immediately after `fab destroy`).
+- EC2 key pair `vantage-smoke-20260723170010` (eu-west-1) still exists, unused, zero
+  cost.
+- `benchmark/settings.json` still holds the real AWS config, no secrets (re-verified).
+  Not committed.
+- `benchmark/fabfile.py`'s `local` task is back to `protocol: 'autobahn-optimistic'`
+  (confirmed zero diff vs `HEAD` for this file).
+- `git status` at end of session (source only): `primary/src/primary.rs`,
+  `primary/src/vantage/{cursor,mod,node}.rs`,
+  `primary/src/vantage/tests/cursor_tests.rs` modified (this fix); nothing else;
+  not committed (no git writes made).
+
+---
+
 ## §findingA — crash-fault collapse: root cause found, orchestrator's WISH hypothesis REFUTED
 
 **Repro**: `./target/release/node local-benchmark --protocol vantage --nodes 4 --workers

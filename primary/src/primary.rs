@@ -190,6 +190,7 @@ impl Primary {
                     store.clone(),
                     Some(metrics.clone()),
                     rx_our_digests,
+                    tx_output,
                 );
 
                 // Spawn the network receiver listening to messages from the other
