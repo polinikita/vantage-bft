@@ -1,19 +1,17 @@
 {
     "key": {
-        "name": "gcp",
-        "path": "<KEY_PATH>"
+        "name": "vantage-smoke-20260723170010",
+        "path": "/private/tmp/claude-501/-Users-nikitapolianskii-code-tex-projects-signature-free/e3d22549-28b8-43f2-b3e6-5dbd87e1cdde/scratchpad/vantage-smoke.pem"
     },
-    "port": 5000,
+    "port": 6000,
     "repo": {
-        "name": "autobahn-artifact",
+        "name": "vantage",
         "url": "https://github.com/neilgiri/autobahn-artifact.git",
-        "branch": "autobahn"
+        "branch": "main"
     },
-    "project_id": "<PROJECT_ID>",
-    "username": "<USERNAME>",
+    "username": "ubuntu",
     "instances": {
-        "type": "t2d-standard-4",
-        "regions": ["us-east1-b", "us-east5-a", "us-west1-b", "us-west4-a"],
-        "templates": ["projects/<PROJECT_ID>/regions/us-east1/instanceTemplates/<TEMPLATE_NAME>", "projects/<PROJECT_ID>/regions/us-east5/instanceTemplates<TEMPLATE_NAME>", "projects/<PROJECT_ID>/regions/us-west1/instanceTemplates/<TEMPLATE_NAME>","projects/<PROJECT_ID>/regions/us-west4/instanceTemplates/<TEMPLATE_NAME>"]
+        "type": "c5.xlarge",
+        "regions": ["eu-west-1"]
     }
 }

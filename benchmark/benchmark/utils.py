@@ -1,5 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from os.path import join
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 class BenchError(Exception):
@@ -61,6 +63,17 @@ class PathMaker:
         return join(PathMaker.logs_path(), f'client-{i}-{j}.log')
 
     @staticmethod
+    def metrics_primary_file(i):
+        assert isinstance(i, int) and i >= 0
+        return join(PathMaker.logs_path(), f'metrics-primary-{i}.txt')
+
+    @staticmethod
+    def metrics_worker_file(i, j):
+        assert isinstance(i, int) and i >= 0
+        assert isinstance(j, int) and i >= 0
+        return join(PathMaker.logs_path(), f'metrics-worker-{i}-{j}.txt')
+
+    @staticmethod
     def results_path():
         return 'results'
 
@@ -86,6 +99,24 @@ class PathMaker:
     @staticmethod
     def plot_file(name, ext):
         return join(PathMaker.plots_path(), f'{name}.{ext}')
+
+
+def scrape_metrics(address, filename, timeout=5):
+    ''' Scrape a node's Prometheus /metrics endpoint (PHASE2-SPEC.md #5) and save the
+    raw text-exposition body to `filename`, so results stay re-analyzable offline.
+    Best-effort: a scrape failure (node down, port unreachable) prints a warning and
+    writes nothing rather than raising, so one bad node doesn't abort the whole run. '''
+    assert isinstance(address, str)
+    assert isinstance(filename, str)
+    url = f'http://{address}/metrics'
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            body = response.read().decode('utf-8')
+    except (URLError, OSError) as e:
+        Print.warn(f'Failed to scrape metrics from {url}: {e}')
+        return
+    with open(filename, 'w') as f:
+        f.write(body)
 
 
 class Color:

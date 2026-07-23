@@ -31,18 +31,25 @@ class Committee:
                 "primary: {
                     "primary_to_primary": x.x.x.x:x,
                     "worker_to_primary": x.x.x.x:x,
+                    "metrics": x.x.x.x:x,
                 },
                 "workers": {
                     "0": {
                         "primary_to_worker": x.x.x.x:x,
                         "worker_to_worker": x.x.x.x:x,
-                        "transactions": x.x.x.x:x
+                        "transactions": x.x.x.x:x,
+                        "metrics": x.x.x.x:x
                     },
                     ...
                 }
             },
             ...
         }
+
+        Phase 2: each primary and each worker gains a "metrics" (Prometheus scrape)
+        address, growing the per-authority port count from 6 to 8 (1 worker/authority,
+        the `fab local`/`fab remote` default). committee.json is regenerated every run,
+        so there is no back-compat concern with older committee files.
     '''
 
     def __init__(self, addresses, base_port):
@@ -75,9 +82,10 @@ class Committee:
 
             primary_addr = {
                 'primary_to_primary': f'{host}:{port}',
-                'worker_to_primary': f'{host}:{port + 1}'
+                'worker_to_primary': f'{host}:{port + 1}',
+                'metrics': f'{host}:{port + 2}',
             }
-            port += 2
+            port += 3
 
             workers_addr = OrderedDict()
             for j, host in enumerate(hosts):
@@ -85,8 +93,9 @@ class Committee:
                     'primary_to_worker': f'{host}:{port}',
                     'transactions': f'{host}:{port + 1}',
                     'worker_to_worker': f'{host}:{port + 2}',
+                    'metrics': f'{host}:{port + 3}',
                 }
-                port += 3
+                port += 4
 
             self.json['authorities'][name] = {
                 'stake': 1,
@@ -116,6 +125,28 @@ class Committee:
             addresses.append(authority_addresses)
         return addresses
 
+    def primary_metrics_addresses(self, faults=0):
+        ''' Returns an ordered list of primaries' Prometheus metrics addresses. '''
+        assert faults < self.size()
+        addresses = []
+        good_nodes = self.size() - faults
+        for authority in list(self.json['authorities'].values())[:good_nodes]:
+            addresses += [authority['primary']['metrics']]
+        return addresses
+
+    def workers_metrics_addresses(self, faults=0):
+        ''' Returns an ordered list of list of (id, metrics address) per authority's
+        workers. '''
+        assert faults < self.size()
+        addresses = []
+        good_nodes = self.size() - faults
+        for authority in list(self.json['authorities'].values())[:good_nodes]:
+            authority_addresses = []
+            for id, worker in authority['workers'].items():
+                authority_addresses += [(id, worker['metrics'])]
+            addresses.append(authority_addresses)
+        return addresses
+
     def ips(self, name=None):
         ''' Returns all the ips associated with an authority (in any order). '''
         if name is None:
@@ -131,11 +162,13 @@ class Committee:
             addresses = self.json['authorities'][name]['primary']
             ips.add(self.ip(addresses['primary_to_primary']))
             ips.add(self.ip(addresses['worker_to_primary']))
+            ips.add(self.ip(addresses['metrics']))
 
             for worker in self.json['authorities'][name]['workers'].values():
                 ips.add(self.ip(worker['primary_to_worker']))
                 ips.add(self.ip(worker['worker_to_worker']))
                 ips.add(self.ip(worker['transactions']))
+                ips.add(self.ip(worker['metrics']))
 
         return list(ips)
 
@@ -225,6 +258,14 @@ class BenchParameters:
                 self.collocate = True
 
             self.tx_size = int(json['tx_size'])
+
+            # Additive: pre-Phase-2 bench params without 'tx_mode' keep the
+            # upstream-equivalent all-zero payload.
+            self.tx_mode = str(json['tx_mode']) if 'tx_mode' in json else 'all-zero'
+            if self.tx_mode not in ('all-zero', 'random'):
+                raise ConfigError(
+                    f"Invalid tx_mode '{self.tx_mode}': expected 'all-zero' or 'random'"
+                )
 
             self.duration = int(json['duration'])
 

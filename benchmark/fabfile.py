@@ -19,6 +19,7 @@ def local(ctx, debug=True):
         'co-locate': True,
         'rate': [240_000],
         'tx_size': 512,
+        'tx_mode': 'all-zero',
         'duration': 60,
         'runs': 1,
 
@@ -37,7 +38,7 @@ def local(ctx, debug=True):
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 20,  # ms
-        'use_optimistic_tips': True,
+        'protocol': 'autobahn-optimistic',
         'use_parallel_proposals': True,
         'k': 4,
         'use_fast_path': True,
@@ -111,15 +112,25 @@ def install(ctx):
 
 
 @task
-def remote(ctx, debug=True):
-    ''' Run benchmarks on AWS '''
+def remote(ctx, debug=True, protocol='autobahn-optimistic'):
+    ''' Run benchmarks on AWS.
+
+    Phase-7 smoke test: checked-in defaults below, except `rate` set to
+    50,000 tx/s (conservative for an unknown/smaller instance size than
+    prior AWS runs) and `delta_ms: 150` added to node_params (passed
+    through NodeParameters/serde into Parameters.delta_ms). `protocol` is
+    exposed as a fab CLI arg (`--protocol=vantage`) so the same task runs
+    both the autobahn-optimistic and vantage smoke passes without editing
+    this file between runs.
+    '''
     bench_params = {
         'faults': 0,
         'nodes': [4],
         'workers': 1,
         'co-locate': True,
-        'rate': [240_000],
+        'rate': [50_000],
         'tx_size': 512,
+        'tx_mode': 'all-zero',
         'duration': 60,
         'runs': 1,
 
@@ -138,13 +149,14 @@ def remote(ctx, debug=True):
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 20,  # ms
-        'use_optimistic_tips': True,
+        'protocol': protocol,
         'use_parallel_proposals': True,
         'k': 4,
         'use_fast_path': True,
         'fast_path_timeout': 5_000,
         'use_ride_share': False,
         'car_timeout': 5_000,
+        'delta_ms': 150,  # ms -- Phase 7 smoke-test setting (Vantage's AGB/control-log delta)
 
         'simulate_asynchrony': False,
         'asynchrony_start': 15_000, #ms

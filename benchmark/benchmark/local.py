@@ -7,11 +7,13 @@ from time import sleep
 from benchmark.commands import CommandMaker
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
 from benchmark.logs import LogParser, ParseError
-from benchmark.utils import Print, BenchError, PathMaker
+from benchmark.utils import Print, BenchError, PathMaker, scrape_metrics
 
 
 class LocalBench:
-    BASE_PORT = 3000
+    # 4000 instead of upstream's 3000: on this machine Docker Desktop holds 3001
+    # and an ssh forward holds 3002, which crashed primary-0's receivers at boot.
+    BASE_PORT = 4000
 
     def __init__(self, bench_parameters_dict, node_parameters_dict):
         try:
@@ -88,7 +90,8 @@ class LocalBench:
                         address,
                         self.tx_size,
                         rate_share,
-                        [x for y in workers_addresses for _, x in y]
+                        [x for y in workers_addresses for _, x in y],
+                        mode=self.tx_mode
                     )
                     log_file = PathMaker.client_log_file(i, id)
                     self._background_run(cmd, log_file)
@@ -124,6 +127,16 @@ class LocalBench:
             # Wait for all transactions to be processed.
             Print.info(f'Running benchmark ({self.duration} sec)...')
             sleep(self.duration)
+
+            # Scrape every node's Prometheus endpoint before killing it (PHASE2-SPEC.md
+            # #5) -- real transaction latency lives only in-process, not in the logs.
+            Print.info('Scraping metrics...')
+            for i, address in enumerate(committee.primary_metrics_addresses(self.faults)):
+                scrape_metrics(address, PathMaker.metrics_primary_file(i))
+            for i, addresses in enumerate(committee.workers_metrics_addresses(self.faults)):
+                for (id, address) in addresses:
+                    scrape_metrics(address, PathMaker.metrics_worker_file(i, id))
+
             self._kill_nodes()
 
             # Parse logs and return the parser.

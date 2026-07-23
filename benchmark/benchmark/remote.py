@@ -4,17 +4,17 @@ from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
 from paramiko import RSAKey
 from paramiko.ssh_exception import PasswordRequiredException, SSHException
-from os.path import basename, splitext
+from os.path import basename, splitext, abspath, dirname, join
 from time import sleep
 from math import ceil
 from copy import deepcopy
 import subprocess
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
-from benchmark.utils import BenchError, Print, PathMaker, progress_bar
+from benchmark.utils import BenchError, Print, PathMaker, progress_bar, scrape_metrics
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
-from benchmark.gcp_instance import InstanceManager
+from benchmark.instance import InstanceManager
 
 
 class FabricError(Exception):
@@ -31,6 +31,32 @@ class ExecutionError(Exception):
 
 
 class Bench:
+    # --- Working-tree deploy (Phase 7 remote-harness repair) ---------------
+    # `git clone`/`git pull` (the original deploy mechanism) can only fetch
+    # code that's committed somewhere reachable by the hosts. The tree under
+    # test is routinely uncommitted (only the user commits, per their
+    # standing workflow), so `install`/`_update` instead rsync the local
+    # working tree straight to each host. This is intentionally scoped to
+    # these two methods and `_sync_tree`/`_repo_root`/`_ssh_opts` below --
+    # nothing else in the harness changes. The audited, citable paper
+    # campaign should still run from a tagged, committed revision (git
+    # clone), for provenance; this variant is for the smoke test and other
+    # pre-campaign runs against a dirty tree. See PHASE7-PREP-NOTES.md
+    # #remote.
+    RSYNC_EXCLUDES = [
+        '.git/',
+        'target/',
+        'benchmark/logs/',
+        'benchmark/results/',
+        'benchmark/data/',
+        '__pycache__/',
+        '*.pyc',
+        '.venv/',
+        'venv/',
+        'fabenv/',
+        '*.pem',
+    ]
+
     def __init__(self, ctx):
         self.manager = InstanceManager.make()
         self.settings = self.manager.settings
@@ -51,8 +77,72 @@ class Bench:
             if output.stderr:
                 raise ExecutionError(output.stderr)
 
+    def _repo_root(self):
+        ''' Absolute path to the local repo root: this file lives at
+        benchmark/benchmark/remote.py, so the root is two directories up. '''
+        return abspath(join(dirname(__file__), '..', '..'))
+
+    def _ssh_opts(self):
+        # Fresh instances have unknown host keys; Fabric's own Connection
+        # already auto-adds them (fabric.Connection.open sets
+        # AutoAddPolicy unconditionally), but the plain `ssh`/`rsync`
+        # subprocess calls below don't go through Fabric, so they need the
+        # same behaviour spelled out explicitly. accept-new (rather than
+        # disabling checking outright) still guards against a host key
+        # that *changes* after first contact.
+        return [
+            '-i', self.settings.key_path,
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'LogLevel=ERROR',
+        ]
+
+    def _sync_tree(self, ips):
+        ''' Working-tree deploy variant: rsync the local repo to each host
+        instead of `git clone`/`git pull` (see the class docstring above).
+        Incremental -- rsync only ships deltas on repeat runs -- and
+        excludes build artifacts, VCS metadata, prior run output, and
+        venv/scratch directories (RSYNC_EXCLUDES) so the transferred tree
+        stays small; hosts still compile from source as usual. '''
+        assert isinstance(ips, list)
+        root = self._repo_root()
+        exclude_args = []
+        for pattern in self.RSYNC_EXCLUDES:
+            exclude_args += ['--exclude', pattern]
+        ssh_cmd = 'ssh ' + ' '.join(self._ssh_opts())
+
+        Print.info(f'Syncing working tree ({root}) to {len(ips)} machine(s)...')
+        for ip in progress_bar(ips, prefix='Syncing working tree:'):
+            # Ensure the destination directory exists before rsyncing into it.
+            mkdir = subprocess.run(
+                [
+                    'ssh', *self._ssh_opts(),
+                    f'{self.settings.username}@{ip}',
+                    f'mkdir -p {self.settings.repo_name}',
+                ],
+                capture_output=True, text=True,
+            )
+            if mkdir.returncode != 0:
+                raise ExecutionError(
+                    f'Failed to prepare {ip} for rsync: {mkdir.stderr.strip()}'
+                )
+
+            cmd = [
+                'rsync', '-az', '--delete',
+                *exclude_args,
+                '-e', ssh_cmd,
+                f'{root}/',
+                f'{self.settings.username}@{ip}:{self.settings.repo_name}/',
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise ExecutionError(
+                    f'rsync to {ip} failed (exit {result.returncode}): '
+                    f'{result.stderr.strip()}'
+                )
+
     def install(self):
-        Print.info('Installing rust and cloning the repo...')
+        Print.info('Installing rust and syncing the working tree...')
         cmd = [
             'sudo apt-get update',
             'sudo apt-get -y upgrade',
@@ -69,15 +159,13 @@ class Bench:
 
             # This is missing from the Rocksdb installer (needed for Rocksdb).
             'sudo apt-get install -y clang',
-
-            # Clone the repo.
-            f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
         ]
         hosts = self.manager.hosts(flat=True)
         print(hosts)
         try:
             g = Group(*hosts, user=self.settings.username, connect_kwargs=self.connect)
             g.run(' && '.join(cmd), hide=True)
+            self._sync_tree(hosts)
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
         except (GroupException, ExecutionError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
@@ -180,13 +268,9 @@ class Bench:
         else:
             ips = list(set([x for y in hosts for x in y]))
 
-        Print.info(
-            f'Updating {len(ips)} machines (branch "{self.settings.branch}")...'
-        )
+        Print.info(f'Updating {len(ips)} machines (working tree deploy)...')
+        self._sync_tree(ips)
         cmd = [
-            f'(cd {self.settings.repo_name} && git fetch -f)',
-            f'(cd {self.settings.repo_name} && git checkout -f {self.settings.branch})',
-            f'(cd {self.settings.repo_name} && git pull -f)',
             'source $HOME/.cargo/env',
             f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
             CommandMaker.alias_binaries(
@@ -268,7 +352,8 @@ class Bench:
                     address,
                     bench_parameters.tx_size,
                     rate_share,
-                    [x for y in workers_addresses for _, x in y]
+                    [x for y in workers_addresses for _, x in y],
+                    mode=bench_parameters.tx_mode
                 )
                 print(cmd)
                 log_file = PathMaker.client_log_file(i, id)
@@ -318,6 +403,16 @@ class Bench:
                 self._delete_partition(bench_parameters, committee, faults)
 
             sleep(ceil(duration / 20))
+
+        # Scrape every node's Prometheus endpoint before killing it (PHASE2-SPEC.md #5)
+        # -- real transaction latency lives only in-process, not in the logs.
+        Print.info('Scraping metrics...')
+        for i, address in enumerate(committee.primary_metrics_addresses(faults)):
+            scrape_metrics(address, PathMaker.metrics_primary_file(i))
+        for i, addresses in enumerate(committee.workers_metrics_addresses(faults)):
+            for (id, address) in addresses:
+                scrape_metrics(address, PathMaker.metrics_worker_file(i, id))
+
         self.kill(hosts=hosts, delete_logs=False)
 
     def _simulate_partition(self, bench_parameters, committee, faults):

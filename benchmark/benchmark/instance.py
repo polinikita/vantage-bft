@@ -105,15 +105,37 @@ class InstanceManager:
             ]
         )
 
+    # Canonical's official AWS account id (stable across regions/time).
+    CANONICAL_OWNER_ID = '099720109477'
+
     def _get_ami(self, client):
-        # The AMI changes with regions.
+        # The AMI id changes per region and the old fixed build-date
+        # description (2020-10-26 focal) is long deregistered, so resolve
+        # the newest available Ubuntu 22.04 LTS amd64 HVM/EBS image by
+        # owner + name glob instead of pinning an ImageId or exact date.
         response = client.describe_images(
-            Filters=[{
-                'Name': 'description',
-                'Values': ['Canonical, Ubuntu, 20.04 LTS, amd64 focal image build on 2020-10-26']
-            }]
+            Owners=[self.CANONICAL_OWNER_ID],
+            Filters=[
+                {
+                    'Name': 'name',
+                    'Values': [
+                        'ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*'
+                    ]
+                },
+                {'Name': 'state', 'Values': ['available']},
+                {'Name': 'root-device-type', 'Values': ['ebs']},
+                {'Name': 'virtualization-type', 'Values': ['hvm']},
+            ]
         )
-        return response['Images'][0]['ImageId']
+        images = sorted(
+            response['Images'], key=lambda x: x['CreationDate'], reverse=True
+        )
+        if not images:
+            raise BenchError(
+                'AMI resolution',
+                Exception('No matching Ubuntu 22.04 AMI found in region')
+            )
+        return images[0]['ImageId']
 
     def create_instances(self, instances):
         assert isinstance(instances, int) and instances > 0

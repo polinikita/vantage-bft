@@ -1,10 +1,11 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from datetime import datetime
 from glob import glob
+from math import sqrt
 from multiprocessing import Pool
 from os.path import join
-from re import findall, search
-from statistics import mean
+from re import findall, search, MULTILINE
+from statistics import mean, median
 
 from benchmark.utils import Print
 
@@ -14,11 +15,13 @@ class ParseError(Exception):
 
 
 class LogParser:
-    def __init__(self, clients, primaries, workers, faults=0):
+    def __init__(self, clients, primaries, workers, metrics=None, faults=0):
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
         assert all(x for x in inputs)
+        metrics = metrics if metrics is not None else []
+        assert isinstance(metrics, list) and all(isinstance(x, str) for x in metrics)
 
         self.faults = faults
         if isinstance(faults, int):
@@ -58,6 +61,13 @@ class LogParser:
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
+
+        # Parse the saved metrics scrapes (PHASE2-SPEC.md #5): real transaction latency
+        # lives only in-process, so it's read from `metrics-worker-*.txt` snapshots
+        # (Prometheus text exposition), not from the logs above.
+        self.expected_metrics_nodes = len(workers)
+        parsed_metrics = [self._parse_worker_metrics(text) for text in metrics]
+        self.real_latency = [x for x in parsed_metrics if x is not None]
 
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
@@ -107,6 +117,7 @@ class LogParser:
         commits = self._merge_results([tmp])
 
         configs = {
+            'protocol': search(r'Protocol: (\w+)', log).group(1),
             #'timeout_delay': int(
             #    search(r'Timeout delay .* (\d+)', log).group(1)
             #),
@@ -150,6 +161,87 @@ class LogParser:
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
         return sizes, samples, ip
+
+    def _parse_worker_metrics(self, text):
+        ''' Extract a worker's real-transaction-latency gauges/counters from a saved
+        Prometheus text-exposition scrape (PHASE2-SPEC.md #5). Plain regex against the
+        exposition format, same approach starfish's own orchestrator uses. Returns
+        `None` for an empty/failed scrape (the `transaction_committed_latency` gauge
+        is absent until the worker's first observation). '''
+        def gauge(name, label):
+            m = search(name + r'\{v="' + label + r'"\} (\d+)', text, MULTILINE)
+            return int(m.group(1)) if m else None
+
+        def counter(name):
+            m = search(r'^' + name + r' (\d+)', text, MULTILINE)
+            return int(m.group(1)) if m else None
+
+        count = gauge('transaction_committed_latency', 'count')
+        if count is None:
+            return None
+        return {
+            'count': count,
+            'sum': gauge('transaction_committed_latency', 'sum') or 0,
+            'p50': gauge('transaction_committed_latency', 'p50') or 0,
+            'p90': gauge('transaction_committed_latency', 'p90') or 0,
+            'p99': gauge('transaction_committed_latency', 'p99') or 0,
+            'squared_sum':
+                counter('transaction_committed_latency_squared_micros') or 0,
+            'misses': counter('latency_misses') or 0,
+        }
+
+    def _real_transaction_latency(self):
+        ''' Cross-node aggregation, starfish-style (PHASE2-SPEC.md #5).
+
+        Every node's committer processes the *entire* replicated commit sequence (not
+        a disjoint partition of it), so every worker's `Committed` notifications --
+        and hence its `count`/`sum`/`squared_sum` -- cover (approximately) the same
+        global set of transactions, not `1/n` of it. Confirmed against starfish's own
+        aggregator (`orchestrator/src/measurements.rs::aggregate_rate`), which reduces
+        the analogous `count` field across scrapers with MAX, not sum, for exactly
+        this reason.
+
+        `avg`/`stddev` are still computed from the *summed* count/sum/sum-of-squares:
+        because every node's triple scales by the same (near-)constant factor (each
+        observes the same set, modulo a lagging node not yet having caught up), the
+        ratios sum/count and squared_sum/count are unaffected by summing first -- this
+        is actually preferable to reading a single node, since it blends every node's
+        independent measurement of the same distribution. `count`/`misses` are *not*
+        summed (that would misreport an n-times-inflated transaction count); each is
+        the max across nodes, matching starfish's own convention -- the most complete
+        single-node reading of a value every node is trying to observe in full.
+
+        Percentiles are the median across nodes of each node's own exact percentile
+        (what starfish's orchestrator reports), since a global exact percentile would
+        need the raw per-transaction samples, not just each node's already-reduced
+        quantiles. Returns `None` if no node's scrape produced this metric (e.g. every
+        scrape failed, or nothing was ever committed). '''
+        if not self.real_latency:
+            return None
+
+        max_count = max(x['count'] for x in self.real_latency)
+        if max_count == 0:
+            return None
+        total_count = sum(x['count'] for x in self.real_latency)
+        total_sum = sum(x['sum'] for x in self.real_latency)
+        total_squared_sum = sum(x['squared_sum'] for x in self.real_latency)
+        max_misses = max(x['misses'] for x in self.real_latency)
+
+        avg_micros = total_sum / total_count
+        variance = total_squared_sum / total_count - avg_micros ** 2
+        stddev_micros = sqrt(variance) if variance > 0 else 0.0
+
+        return {
+            'avg_ms': avg_micros / 1_000,
+            'stddev_ms': stddev_micros / 1_000,
+            'p50_ms': median(x['p50'] for x in self.real_latency) / 1_000,
+            'p90_ms': median(x['p90'] for x in self.real_latency) / 1_000,
+            'p99_ms': median(x['p99'] for x in self.real_latency) / 1_000,
+            'count': max_count,
+            'misses': max_misses,
+            'nodes_reporting': len(self.real_latency),
+            'nodes_expected': self.expected_metrics_nodes,
+        }
 
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
@@ -204,6 +296,7 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def result(self):
+        protocol = self.configs[0]['protocol']
         #timeout_delay = self.configs[0]['timeout_delay']
         header_size = self.configs[0]['header_size']
         max_header_delay = self.configs[0]['max_header_delay']
@@ -218,12 +311,35 @@ class LogParser:
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
 
+        real_latency = self._real_transaction_latency()
+        if real_latency is None:
+            real_latency_line = (
+                f' Real transaction latency: no metrics scraped '
+                f'(0/{self.expected_metrics_nodes} worker(s) reporting)\n'
+            )
+        else:
+            scrape_note = ''
+            if real_latency['nodes_reporting'] < real_latency['nodes_expected']:
+                scrape_note = (
+                    f" [WARNING: only {real_latency['nodes_reporting']}/"
+                    f"{real_latency['nodes_expected']} worker(s) scraped]"
+                )
+            real_latency_line = (
+                f" Real transaction latency: avg {real_latency['avg_ms']:.2f} ms "
+                f"(stddev {real_latency['stddev_ms']:.2f}), p50/p90/p99 "
+                f"{real_latency['p50_ms']:.2f}/{real_latency['p90_ms']:.2f}/"
+                f"{real_latency['p99_ms']:.2f} ms "
+                f"({real_latency['count']:,} txs, {real_latency['misses']:,} "
+                f"misses){scrape_note}\n"
+            )
+
         return (
             '\n'
             '-----------------------------------------\n'
             ' SUMMARY:\n'
             '-----------------------------------------\n'
             ' + CONFIG:\n'
+            f' Protocol: {protocol}\n'
             f' Faults: {self.faults} node(s)\n'
             f' Committee size: {self.committee_size} node(s)\n'
             f' Worker(s) per node: {self.workers} worker(s)\n'
@@ -249,6 +365,8 @@ class LogParser:
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            '\n'
+            f'{real_latency_line}'
             '-----------------------------------------\n'
         )
 
@@ -273,5 +391,9 @@ class LogParser:
         for filename in sorted(glob(join(directory, 'worker-*.log'))):
             with open(filename, 'r') as f:
                 workers += [f.read()]
+        metrics = []
+        for filename in sorted(glob(join(directory, 'metrics-worker-*.txt'))):
+            with open(filename, 'r') as f:
+                metrics += [f.read()]
 
-        return cls(clients, primaries, workers, faults=faults)
+        return cls(clients, primaries, workers, metrics=metrics, faults=faults)
