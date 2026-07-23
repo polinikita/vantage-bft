@@ -109,6 +109,13 @@ class Bench:
         exclude_args = []
         for pattern in self.RSYNC_EXCLUDES:
             exclude_args += ['--exclude', pattern]
+        # Also honor the repo's own (per-directory) .gitignore files -- this is
+        # what actually excludes the volatile `.local-bench*/`/`.db_test*`/etc.
+        # local-run scratch directories (config/data churned by concurrent
+        # local benchmarking) that RSYNC_EXCLUDES above doesn't enumerate.
+        # Without it, rsync's file-list scan can race a concurrent write/delete
+        # under one of those directories and abort with a transfer error.
+        exclude_args += ['--filter=:- .gitignore']
         ssh_cmd = 'ssh ' + ' '.join(self._ssh_opts())
 
         Print.info(f'Syncing working tree ({root}) to {len(ips)} machine(s)...')
@@ -339,6 +346,15 @@ class Bench:
         hosts = committee.ips()
         self.kill(hosts=hosts, delete_logs=True)
 
+        # Clear stale LOCAL logs/metrics from a previous run now, not in
+        # `_logs()` after this run's `scrape_metrics()` calls below have
+        # already written this run's metrics-*.txt into the same directory
+        # (Phase 2 added those writes; `_logs()`'s cleanup predates them and
+        # otherwise deletes them again before `LogParser.process()` ever
+        # reads them, silently zeroing "real transaction latency" every run).
+        cmd = CommandMaker.clean_logs()
+        subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
+
         # Run the clients (they will wait for the nodes to be ready).
         # Filter all faulty nodes from the client addresses (or they will wait
         # for the faulty nodes to be online).
@@ -479,9 +495,12 @@ class Bench:
         #    self._background_run(host, cmd, log_file)
 
     def _logs(self, committee, faults):
-        # Delete local logs (if any).
-        cmd = CommandMaker.clean_logs()
-        subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
+        # NOTE: local logs/metrics are cleared in `_run_single` now (before
+        # this run's `scrape_metrics()` writes its metrics-*.txt), not here
+        # -- doing it here would delete this run's own metrics files, which
+        # `_run_single` already wrote into the same `logs/` directory, before
+        # `LogParser.process()` below ever gets to read them. See the note
+        # in `_run_single`.
 
         # Download log files.
         workers_addresses = committee.workers_addresses(faults)

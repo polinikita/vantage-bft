@@ -274,6 +274,181 @@ above.
 
 ---
 
+## §remote — re-run (commit `c24a6f8`): autobahn-optimistic CLEAN, vantage FAILS on a real primary-boot bug
+
+**Pre-flight gate added per coordinator instruction**: before provisioning,
+`cd node && CARGO_BUILD_JOBS=4 cargo build -j 4 --release --features benchmark --quiet`
+locally, exit code captured *unpiped* (the earlier round's diagnostic mistakenly read
+`tail`'s exit code instead of cargo's — fixed this time by redirecting to a file and
+reading `$?` directly). **Exit 0**, both `target/release/node` (17 MB) and
+`target/release/benchmark_client` (3.2 MB) present. Proceeded to provision.
+
+**Sequence run**: `fab create --nodes=4` (4× `c5.xlarge`, eu-west-1, confirmed exactly
+4) → `fab install` → **failed** (see rsync fix below) → fixed → `fab install` retried,
+succeeded → `fab remote` (autobahn-optimistic) → succeeded but with an unverified
+metrics-scrape gate (see ordering-bug fix below) → fixed → `fab remote` re-run →
+**fully clean, gate-verified** → `fab remote --protocol=vantage` → **primaries panic
+immediately after boot** → `fab destroy` → verified 0 instances.
+
+### Bug 1 (harness): rsync raced the concurrent local-benchmark work's own scratch dirs
+
+First `fab install` attempt failed: `rsync ... exit 23`, `.local-bench-d74-1000/node-*/
+worker-0-db/000012.log: open (2) ... No such file or directory` — rsync's file-list
+scan found files under a `.local-bench-*` RocksDB data directory that were deleted (by
+the concurrently-running local-benchmark work in the same tree) before rsync got to
+actually transfer them. `RSYNC_EXCLUDES` didn't cover these (they aren't `target/`,
+`.git/`, or under `benchmark/`). **Fix**: `_sync_tree` now also passes
+`--filter=':- .gitignore'` (rsync's per-directory gitignore-merge filter, descends into
+nested `.gitignore`s the same way git does), on top of the existing static
+`RSYNC_EXCLUDES`. The repo's own root `.gitignore` already lists `.local-bench*/` and
+`.db_test*` (and `*.json`, `.venv/`, `target/`, etc. — checked for build-breaking
+overreach first: no tracked `.json` is `include_str!`'d or otherwise needed by
+`cargo build`, only `benchmark/settings*.json`, which the harness reads locally and
+never needs on the remote tree). More general/robust than hand-listing every scratch
+pattern, and automatically covers whatever the concurrent local work creates next.
+Retried `fab install` — succeeded cleanly on all 4 hosts.
+
+### Bug 2 (harness): local metrics-*.txt were being deleted before the parser ever read them
+
+First `fab remote` (autobahn-optimistic) pass completed with a clean RESULTS block
+(50,027 tx/s) but **"Real transaction latency: no metrics scraped (0/4 worker(s)
+reporting)"** — despite no scrape warnings printed and the run being otherwise healthy.
+Root cause: `_run_single()` writes `logs/metrics-primary-N.txt`/`metrics-worker-N-M.txt`
+locally as its *last* step (Phase 2's addition), but `run()` immediately calls `_logs()`
+next, whose *first* step was `rm -r logs ; mkdir -p logs` — deleting the metrics files
+`_run_single` had just written, before `LogParser.process('logs', ...)` (called at the
+end of `_logs()`) ever globs for `metrics-worker-*.txt`. A pre-existing sequencing bug
+(the local cleanup predates the Phase-2 metrics-scrape addition sharing the same
+directory), invisible before now because this is the first time `fab remote`'s
+metrics-scrape path has actually been exercised end-to-end. **Fix**
+(`benchmark/benchmark/remote.py`): moved the local `rm -r logs ; mkdir -p logs` wipe
+from the start of `_logs()` to the start of `_run_single()` (clearing the *previous*
+run's leftovers before *this* run writes anything, instead of clearing *this* run's
+own just-written output). Re-ran `fab remote` (autobahn-optimistic, no source changed,
+so the remote build was a fast incremental no-op) — now fully clean, see RESULTS below.
+
+### RESULTS — autobahn-optimistic (rate 50,000, tx-size 512, duration 60s, delta_ms 150)
+
+Two SUMMARY blocks are appended in `benchmark/results/bench-0-4-1-True-50000-512.txt`
+(append-mode file, both from this session): the first run (pre-fix, no metrics) and the
+second, fully clean, gate-verified run below. The second is canonical:
+
+```
+-----------------------------------------
+ SUMMARY:
+-----------------------------------------
+ + CONFIG:
+ Protocol: AutobahnOptimistic
+ Faults: 0 node(s)
+ Committee size: 4 node(s)
+ Worker(s) per node: 1 worker(s)
+ Collocate primary and workers: True
+ Input rate: 50,000 tx/s
+ Transaction size: 512 B
+ Execution time: 61 s
+
+ Header size: 32 B
+ Max header delay: 5,000 ms
+ GC depth: 50 round(s)
+ Sync retry delay: 5,000 ms
+ Sync retry nodes: 3 node(s)
+ batch size: 500,000 B
+ Max batch delay: 20 ms
+
+ + RESULTS:
+ Consensus TPS: 50,011 tx/s
+ Consensus BPS: 25,605,831 B/s
+ Consensus latency: 18 ms
+
+ End-to-end TPS: 50,006 tx/s
+ End-to-end BPS: 25,602,915 B/s
+ End-to-end latency: 32 ms
+
+ Real transaction latency: avg 32.05 ms (stddev 21.87), p50/p90/p99 24.00/68.00/77.00 ms (3,000,000 txs, 0 misses)
+-----------------------------------------
+```
+
+**Metrics-scrape-through-security-group gate: PASSED.** 4/4 workers reporting, 0
+misses, 3,000,000 committed txs observed — the Phase-2 metrics port range
+(`base_port`..`base_port+2000`) is confirmed open and reachable end-to-end over the
+public internet from the orchestrator, not just in-region.
+
+### vantage run: primaries panic immediately after boot — a real, previously-undiscovered protocol/binary bug (not fixed here)
+
+`fab remote --protocol=vantage` (same rate/tx-size/duration/delta_ms): all 4 primaries
+booted, logged `successfully booted`, then immediately panicked:
+
+```
+thread 'main' (16580) panicked at node/src/main.rs:318:5:
+internal error: entered unreachable code
+```
+
+`node/src/main.rs`'s `run()` matches on the subcommand, spawns `Primary`/`Worker`, then
+`analyze(rx_output).await` (an infinite loop draining `rx_output`) followed by a
+defensive `unreachable!()` that should only fire if `analyze` ever returns — which only
+happens if every `Sender<Header>` clone of `tx_output` is dropped, closing the channel.
+`grep -n "tx_output" primary/src/primary.rs` shows exactly one use of the `tx_output`
+parameter, at line 353, **inside the `Protocol::AutobahnOptimistic |
+Protocol::AutobahnSeamless` arm only** (passed to `Committer::spawn`) — the
+`Protocol::Vantage` arm (which spawns `VantageCore` instead) never references
+`tx_output` at all, so it's simply dropped when `Primary::spawn` returns, closing the
+channel immediately and triggering the panic on every node, every time, for Vantage
+specifically. This is a real, protocol-side bug (not a harness or deploy issue): the
+standalone `node run ... primary` process path (what `fab remote`/`fab local` actually
+exec) has apparently never been exercised end-to-end for the Vantage protocol before —
+all of §findingA/§findingB/§optional's local Vantage testing goes through `node
+local-benchmark`, a *separate* in-process entry point in the same binary that spawns
+`Primary`/`Worker` directly and never touches this `tx_output`/`analyze()` main-loop
+plumbing, which is presumably why this was never caught until now. **Not fixed here**
+(protocol-source file, out of this task's scope) — flagging back. The minimal-looking
+fix, for whoever picks this up, is almost certainly wiring `tx_output` (or an
+equivalent committed-header signal) into the `Protocol::Vantage` arm of
+`Primary::spawn`, or making `main.rs`'s post-`analyze` `unreachable!()` conditional on
+which protocol is running, rather than assuming every protocol drives the same
+`tx_output` channel forever.
+
+### Outcome
+- **autobahn-optimistic**: clean, gate-verified RESULTS block above; metrics scrape
+  through the security group confirmed working.
+- **vantage**: no RESULTS block — primaries panic before any header ever commits; no
+  seal-route distribution obtainable (nothing was ever sealed). This is the ordered
+  gate ("only run vantage if autobahn-optimistic was clean") being satisfied on the
+  autobahn-optimistic side and then vantage itself failing on a genuine, distinct
+  source bug — teardown followed per the failure-path rule.
+- 4× `c5.xlarge` created, ran for this whole sequence (both harness fixes + both
+  benchmark passes), **terminated**; verified **0** non-terminated instances in
+  eu-west-1 via `describe_instances` after `fab destroy`.
+
+### Instance-hours
+- This round (4× `c5.xlarge`, ~16:20:47 UTC → ~16:50:48 UTC, ~30 min): **~2.0**
+  instance-hours.
+- Combined with the earlier compile-break round (~3.21 instance-hours): **~5.2
+  instance-hours total across both smoke-test attempts this session.**
+
+### Cleanup / current resource state (end of session)
+- **0 EC2 instances** anywhere (verified via `describe_instances`, eu-west-1, all
+  non-terminated states).
+- EC2 key pair `vantage-smoke-20260723170010` (eu-west-1) still exists, unused, zero
+  cost — kept for any future attempt (delete with `aws ec2 delete-key-pair --key-name
+  vantage-smoke-20260723170010 --region eu-west-1` if no longer wanted).
+- `benchmark/settings.json` still holds the real AWS config (no secrets — re-verified
+  by direct read this round too). Not committed.
+- `benchmark/results/bench-0-4-1-True-50000-512.txt` and `benchmark/logs/*` (client/
+  primary/worker logs + `metrics-primary-*.txt`/`metrics-worker-*.txt`) on disk
+  locally, reflecting the final (vantage-panic) run's downloaded logs plus the
+  autobahn-optimistic results appended earlier — left in place, not `.gitignore`'d
+  by default (`benchmark/logs/`, `benchmark/results/`, `benchmark/data/` are only
+  excluded from the *rsync upload*, not from local disk / git).
+
+### Recommended next step
+Once `primary/src/primary.rs`'s `Protocol::Vantage` arm is fixed to keep `tx_output`
+(or equivalent) alive so `node run ... primary` doesn't immediately panic, the vantage
+pass can be re-run with the harness exactly as it stands now — no further AWS/Python
+changes expected. The autobahn-optimistic pass needs no rework; it is clean and
+gate-verified as-is.
+
+---
+
 ## §findingA — crash-fault collapse: root cause found, orchestrator's WISH hypothesis REFUTED
 
 **Repro**: `./target/release/node local-benchmark --protocol vantage --nodes 4 --workers
