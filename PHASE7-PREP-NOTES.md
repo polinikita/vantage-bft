@@ -1637,3 +1637,185 @@ than build. Not attempted.
 No other files touched. No `tex-projects`/`starfish` file touched. No git command run.
 New data dirs (`.local-bench-wan-*`) left on disk (gitignored); new logs under
 `/private/tmp/claude-501/.../scratchpad/wan-*.log`.
+
+---
+
+## §latency-3proto — local latency floor, 3 protocols, n=10, starfish-sourced 10×10 latency matrix
+
+Final user-directed experiment: characterize the LOCAL transaction-latency floor (not
+throughput — total offered rate 1,000 tx/s, deliberately low) of all three protocol
+assemblies (`autobahn-optimistic`, `autobahn-seamless`, `vantage`) at n=10, plus a
+vehicle-fidelity cross-check (`node local-benchmark` vs. `fab local`) at the SAME
+config. Scope narrowed twice by the user mid-task (final config, superseding
+everything printed here): **no WAN network-mode sweep** — one matrix-applied run per
+protocol (not loopback-and-WAN both), plus exactly one loopback cross-check pair
+(`autobahn-optimistic` via both vehicles). 5 runs total, matching that final scope.
+
+### The 10×10 latency matrix (printed in full, per the user's explicit ask, for review/veto)
+
+Per the user's refined instruction: NOT the Autobahn-paper testbed table from
+§wan-shaped-runs — reproduced starfish's OWN latency-generation scheme instead,
+read-only, cited exactly:
+
+- `~/code/starfish/crates/starfish-core/src/network.rs:51-62` — `const REGIONS:
+  [&str; 10]` (10 AWS regions: `us-east-1, us-west-1, ca-central-1, eu-west-1,
+  eu-south-1, eu-north-1, sa-east-1, ap-south-1, ap-southeast-1, ap-northeast-1`).
+- `~/code/starfish/crates/starfish-core/src/network.rs:65-76` — `const
+  RTT_LATENCY_TABLE: [[u32; 10]; 10]`, the fixed real-AWS-measured RTT-ms matrix for
+  those 10 regions (diagonal `1` — a same-region placeholder, not a claim of exactly
+  1 ms).
+- `~/code/starfish/crates/starfish-core/src/network.rs:813-843` (`generate_latency_
+  table`), specifically line 840: `RTT_LATENCY_TABLE[index_i][index_j] as f64 / 2.0`
+  — starfish converts its RTT table to ONE-WAY latency by halving, with `index_i = i
+  % RTT_LATENCY_TABLE.len()` (line 838) for wraparound at n > 10.
+
+**n=10 here is an EXACT match to `RTT_LATENCY_TABLE`'s own size** — `i % 10 = i` for
+every `i` in `0..10`, so there is no wraparound ambiguity to resolve at all: every one
+of our 10 validators gets exactly one distinct row of the REAL table, used verbatim,
+in the array's own declared order. This is the cleanest possible case (no invented
+assignment, no synthetic choice) — per the user's own conditional ("stop and show me
+only if ambiguous or it doesn't extend cleanly"), nothing needed resolving, but the
+full matrix is printed below anyway, as asked, for visibility/veto.
+
+`wan-testbed-latency-10node.csv` (repo root) — the RAW `RTT_LATENCY_TABLE` values,
+un-halved (this repo's own `LatencyTable::from_rtt_csv` already halves RTT→one-way
+itself, D7-3/§optional — feeding it starfish's raw table produces the IDENTICAL
+one-way values starfish's own halving would, with no double-halving):
+
+```
+       (row/col order = REGIONS: e1,w1,ca,ew,es,en,sa,as,ase,an)
+row 0 (us-east-1):      1,  14, 104, 112, 198,  65,  68, 110, 201, 146
+row 1 (us-west-1):     14,   1, 106, 122, 196,  78,  67, 103, 189, 142
+row 2 (ca-central-1): 104, 106,   1, 215, 281, 163,  29,  50, 143, 238
+row 3 (eu-west-1):    112, 122, 215,   1, 309, 175, 176, 220, 299, 254
+row 4 (eu-south-1):   198, 196, 281, 309,   1, 137, 254, 268, 150, 101
+row 5 (eu-north-1):    65,  78, 163, 175, 137,   1, 127, 172, 226, 108
+row 6 (sa-east-1):     68,  67,  29, 176, 254, 127,   1,  38, 125, 199
+row 7 (ap-south-1):   110, 103,  50, 220, 268, 172,  38,   1, 148, 245
+row 8 (ap-southeast-1):201,189, 143, 299, 150, 226, 125, 148,   1, 140
+row 9 (ap-northeast-1):146,142, 238, 254, 101, 108, 199, 245, 140,   1
+```
+
+(RTT-ms; one-way = /2, applied automatically by `--latency-table`. As with the 4-node
+table, committee order — which random keypair draws which row — isn't controllable
+run to run; the aggregate character, a genuine globally-distributed AWS RTT spread, is
+present in every row regardless.)
+
+### Runs (60 s each, tx-size 512, `--delta-ms 150 --max-batch-delay-ms 20
+--max-header-delay-ms 50`, 1 worker/node, n=10, total rate 1,000 tx/s)
+
+| Protocol | Network mode | Sustained tx/s | Real-latency avg / p50 / p90 / p99 (ms) | Extra |
+|---|---|---|---|---|
+| `vantage` | matrix-applied | 993 | 415.97 / 413.00 / 520.50 / 618.50 | seal routes: `direct_full=2,907, fast_full=5,635` (**zero fallback routes** — expected at this load, confirmed) |
+| `autobahn-optimistic` | matrix-applied | 990 | 543.09 / 537.50 / 681.00 / 800.00 | (no seal-route metric on this path — Autobahn-only, expected) |
+| `autobahn-seamless` | matrix-applied | 992 | 650.79 / 640.50 / 837.00 / 995.00 | ran cleanly at n=10 — **no misbehavior** (first run since Phase 2) |
+| `autobahn-optimistic` | loopback (fidelity baseline) | 1,000 | 59.29 / 59.00 / 88.00 / 108.00 | in-process vehicle (`node local-benchmark`) |
+
+All three matrix-applied runs sustained essentially the full offered 1,000 tx/s (990-993,
+within normal noise) — at this load, throughput is never the constraint, exactly the
+"latency floor, not throughput" framing the experiment asked for.
+
+**Vantage's seal routes stayed entirely on the two happy-path routes** — no
+`direct_core`/`anchor_*` ever appeared, at any of the 10 nodes, across the whole 60 s
+run. Per the task's own framing, this ITSELF is the (negative, expected) finding: a
+fallback route at this load would have been noteworthy; none appeared.
+
+**`autobahn-seamless` misbehavior check**: none observed. It ran the full 60 s,
+sustained throughput, produced a normal latency distribution, and shut down cleanly
+(the process panics at teardown — `Failed to send batch`/`internal message: SendError`
+— are the SAME benign network-task-cleanup noise every run in this session has shown at
+shutdown, not specific to seamless or to this run). No debugging attempted, per
+instruction; reported as-is.
+
+### Vehicle-fidelity cross-check: `node local-benchmark` vs. `fab local` (autobahn-optimistic, loopback) — **EXCEEDS THE 20% THRESHOLD, FLAGGED**
+
+Guard steps taken first: `tmux ls` confirmed no server running before starting; used
+the existing session venv (`scratchpad/fabenv`, fabric 3.2.3, already provisioned by
+an earlier §remote session); `benchmark/fabfile.py`'s `local()` task parameters were
+TEMPORARILY overridden (n=10, rate=1,000, `max_header_delay=50`, added `'delta_ms':
+150` — `NodeParameters` passes unlisted keys through to `parameters.json` verbatim, so
+this is a clean, additive override) to match this experiment's exact config, then
+reverted immediately after (byte-identical `md5` before/after — `6b80fde0ee6e32cd
+94a36efa0ee4491a`); `CARGO_BUILD_JOBS=4` set for the `cargo build --release --features
+benchmark` step `fab local` runs internally.
+
+| Metric | `node local-benchmark` (in-process) | `fab local` (separate OS processes) |
+|---|---|---|
+| Real transaction latency avg | **59.29 ms** | **37.81 ms** |
+| p50 / p90 / p99 | 59.00 / 88.00 / 108.00 | 27.00 / 71.00 / 79.00 |
+| stddev | 21.55 | 22.24 |
+| Consensus/e2e TPS | 1,000 | 1,000 (both) |
+| Classic log-based consensus latency | n/a (no per-node log files) | 22.33 ms |
+| Classic log-based end-to-end latency | n/a | 36.90 ms |
+
+**Delta (real-transaction-latency avg, the apples-to-apples metric both vehicles
+compute identically from the same Prometheus histogram): (59.29 − 37.81) / 37.81 ≈
+56.8%** — well over the ~20% threshold. **Flagged, per the standing instruction, for
+discussion before trusting the absolute latency figures in the 3-protocol table above
+as vehicle-independent.** PHASE2-NOTES.md's own R3 finding (~116 ms vs. ~20 ms at 240k
+saturation, a ~480% relative / ~96 ms absolute gap) predicted the ABSOLUTE distortion
+should shrink at 1,000 tx/s with mostly-idle loops — and it did (~21.5 ms absolute gap
+here, vs. ~96 ms there) — but the RELATIVE percentage is actually WORSE at this low
+load (56.8% vs. R3's own ~480%... note R3's ratio is dominated by a much larger
+absolute gap over a much smaller baseline too, so the two percentages aren't
+directly comparable in kind, but the qualitative point holds): a smaller absolute
+in-process co-scheduling overhead is a LARGER fraction of a smaller baseline latency,
+so relative fidelity does not improve monotonically with load the way the hypothesis
+implied. Recommend treating the 3-protocol table's absolute latency numbers as
+qualitatively (relative-ordering, cross-protocol-structure) informative but NOT
+quantitatively validated against a separate-process baseline, until this is discussed.
+
+**Minor operational note, reported not debugged**: the FIRST `fab local` invocation's
+own built-in `ret.result()` call crashed with `KeyError` inside `logs.py`'s
+`_consensus_latency()` (`self.proposals[d]` missing for one commit digest `d`) —
+immediately re-parsing the SAME, by-then-fully-flushed log files directly via
+`LogParser.process(...)` (a scratch-only script, not a repo change) succeeded with
+ZERO missing proposal/commit correlations (`0 / 12,136`), so this reads as a narrow
+timing race between `_kill_nodes()` and `Print.info('Parsing logs...')` in `fab
+local`'s own immediate-parse-after-kill sequence (a primary's log file possibly still
+mid-flush at the moment `fab local` reads it) rather than a genuine data
+inconsistency — the numbers reported above come from the successful re-parse.
+
+### Interpretation: protocol-structure differences, and whether the numbers show it
+
+The three protocols' latency floors under the SAME starfish-sourced, globally-
+distributed WAN emulation come out exactly ordered by their own message-round-trip
+structure: **vantage (415.97 ms) < autobahn-optimistic (543.09 ms) <
+autobahn-seamless (650.79 ms)**. Vantage's fast/direct seal routes are built around a
+2δ-shaped round trip (an echo stage then a ready stage, each one network hop, gated by
+local quorum thresholds rather than a fixed protocol-level delay budget) — the
+lightest structure of the three, and it shows: roughly 127 ms lower than optimistic
+Autobahn's own QC-based path (which needs a header-vote-QC cycle — more like a
+classical 3-4 message-delay round trip before a value is final) and roughly 235 ms
+lower than seamless Autobahn (certified-tips-only cut formation adds a further
+certification step atop the optimistic path's own round trip before a cut is even
+eligible to form, consistent with it being the slowest of the three here). None of the
+three protocols is anywhere near saturating (fault-free, 1,000 tx/s against
+each one's own multi-thousand-tx/s ceiling per this session's earlier findings), so
+these numbers are close to a clean "structural round-trip cost under WAN latency"
+comparison, undiluted by queueing — exactly the point of running this experiment at
+low offered load. The vehicle-fidelity caveat above means the ABSOLUTE millisecond
+values likely carry some in-process inflation common to all three (same vehicle, same
+host, same run), but the ORDERING and the roughly-2:1 spread between vantage and
+autobahn-seamless is unlikely to be an artifact of that inflation alone, since the
+inflation mechanism (co-scheduled tokio tasks on one runtime) does not obviously favor
+one protocol's message pattern over another's.
+
+### Changes (this section)
+
+- `wan-testbed-latency-10node.csv` (repo root) — the 10×10 RTT-ms matrix above, a
+  plain data file, not code.
+- `benchmark/fabfile.py` — TEMPORARILY edited (`local()` task parameters) for the
+  fidelity cross-check run, then reverted to byte-identical original content
+  (`md5` verified before/after).
+
+No other repo files touched (the log-reparse script lives only in the session
+scratchpad, never in the repo). No `tex-projects` file touched. `~/code/starfish`
+read only (`network.rs`, cited above). No git command run. `CARGO_BUILD_JOBS=4`
+throughout; no two builds/benchmark processes run concurrently; `tmux kill-server`
+(fab's own teardown) confirmed clean afterward (`tmux ls` → no server running). New
+data dirs (`.local-bench-3proto-*`) and `benchmark/logs/`/`benchmark/latencies.txt`
+(fab's own output — already-untracked/gitignored-equivalent artifacts, not new to
+this session's pattern) left on disk; new logs under
+`/private/tmp/claude-501/.../scratchpad/{3proto,fab-local-run}*.log` and the scratch
+`parse_fab_logs.py`.
