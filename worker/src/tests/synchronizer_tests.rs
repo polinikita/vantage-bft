@@ -19,6 +19,8 @@ async fn synchronize() {
     let store = Store::new(path).unwrap();
 
     // Spawn a `Synchronizer` instance.
+    let registry = prometheus::Registry::new();
+    let (metrics, _reporter) = Metrics::new(&registry);
     Synchronizer::spawn(
         name,
         id,
@@ -28,6 +30,7 @@ async fn synchronize() {
         /* sync_retry_delay */ 1_000_000, // Ensure it is not triggered.
         /* sync_retry_nodes */ 3, // Not used in this test.
         rx_message,
+        metrics,
     );
 
     // Spawn a listener to receive our batch requests.

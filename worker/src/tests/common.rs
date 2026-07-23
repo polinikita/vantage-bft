@@ -3,14 +3,11 @@ use crate::batch_maker::{Batch, Transaction};
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses, ConsensusAddresses};
-use crypto::{generate_keypair, Digest, PublicKey, SecretKey};
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
+use crypto::{generate_keypair, Blake3Hasher, Digest, PublicKey, SecretKey};
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
-use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -35,6 +32,7 @@ pub fn committee() -> Committee {
                 let primary = PrimaryAddresses {
                     primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
                     worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
+                    metrics: format!("127.0.0.1:{}", 600 + i).parse().unwrap(),
                 };
                 let workers = vec![(
                     0,
@@ -42,6 +40,7 @@ pub fn committee() -> Committee {
                         primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
                         transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
                         worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
+                        metrics: format!("127.0.0.1:{}", 700 + i).parse().unwrap(),
                     },
                 )]
                 .iter()
@@ -73,6 +72,9 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
         let port = primary.worker_to_primary.port();
         primary.worker_to_primary.set_port(base_port + port);
 
+        let port = primary.metrics.port();
+        primary.metrics.set_port(base_port + port);
+
         for worker in authority.workers.values_mut() {
             let port = worker.primary_to_worker.port();
             worker.primary_to_worker.set_port(base_port + port);
@@ -82,6 +84,9 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
 
             let port = worker.worker_to_worker.port();
             worker.worker_to_worker.set_port(base_port + port);
+
+            let port = worker.metrics.port();
+            worker.metrics.set_port(base_port + port);
         }
     }
     committee
@@ -105,11 +110,9 @@ pub fn serialized_batch() -> Vec<u8> {
 
 // Fixture
 pub fn batch_digest() -> Digest {
-    Digest(
-        Sha512::digest(&serialized_batch()).as_slice()[..32]
-            .try_into()
-            .unwrap(),
-    )
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(&serialized_batch());
+    Digest(hasher.finalize().into())
 }
 
 // Fixture

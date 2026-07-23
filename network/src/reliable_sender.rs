@@ -196,6 +196,12 @@ impl Connection {
                     continue;
                 }
 
+                // PHASE7-PREP-NOTES.md (optional harness addition): `--mimic-latency-ms`
+                // artificial delay, a no-op sleep(0) when unset (default).
+                let mimic = crate::mimic_latency();
+                if !mimic.is_zero() {
+                    sleep(mimic).await;
+                }
                 // Try to send the message.
                 match writer.send(data.clone()).await {
                     Ok(()) => {

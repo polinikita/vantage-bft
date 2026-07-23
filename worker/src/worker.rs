@@ -5,7 +5,6 @@ use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
-use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,10 +12,13 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use log::{error, info, warn};
+use metrics::{start_prometheus_server, MetricReporter, Metrics};
 use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
+use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 
@@ -52,6 +54,10 @@ pub struct Worker {
     parameters: Parameters,
     /// The persistent storage.
     store: Store,
+    /// Starfish-parity metrics (PHASE2-SPEC.md #5): the registry is always served, this
+    /// worker's own real-transaction-latency counters are only observed into under the
+    /// `benchmark` feature (see `Synchronizer::observe_committed`).
+    metrics: Arc<Metrics>,
 }
 
 impl Worker {
@@ -61,7 +67,20 @@ impl Worker {
         committee: Committee,
         parameters: Parameters,
         store: Store,
-    ) {
+    ) -> (Arc<Metrics>, Arc<MetricReporter>, Registry) {
+        // Boot the (always-on, starfish-parity) Prometheus metrics server.
+        let metrics_address = committee
+            .worker(&name, &id)
+            .expect("Our public key or worker id is not in the committee")
+            .metrics;
+        let mut binding_metrics_address = metrics_address;
+        binding_metrics_address.set_ip("0.0.0.0".parse().unwrap());
+        let registry = Registry::new();
+        let (metrics, reporter) = Metrics::new(&registry);
+        reporter.clone().start();
+        start_prometheus_server(binding_metrics_address, &registry);
+        info!("Worker {} metrics listening on {}", id, metrics_address);
+
         // Define a worker instance.
         let worker = Self {
             name,
@@ -69,6 +88,7 @@ impl Worker {
             committee,
             parameters,
             store,
+            metrics: metrics.clone(),
         };
 
         // Spawn all worker tasks.
@@ -98,6 +118,8 @@ impl Worker {
                 .transactions
                 .ip()
         );
+
+        (metrics, reporter, registry)
     }
 
 ///////////////////////// TASK INSTANTIATORS ///////////////////////////////////
@@ -130,7 +152,8 @@ impl Worker {
             self.parameters.gc_depth,
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
-            /* rx_message */ rx_synchronizer,   
+            /* rx_message */ rx_synchronizer,
+            self.metrics.clone(),
         );
 
         info!(

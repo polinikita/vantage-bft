@@ -120,6 +120,12 @@ impl Connection {
             // Check if there are any new messages to send or if we get an ACK for messages we already sent.
             tokio::select! {
                 Some(data) = self.receiver.recv() => {
+                    // PHASE7-PREP-NOTES.md (optional harness addition):
+                    // `--mimic-latency-ms` artificial delay, a no-op when unset (default).
+                    let mimic = crate::mimic_latency();
+                    if !mimic.is_zero() {
+                        tokio::time::sleep(mimic).await;
+                    }
                     if let Err(e) = writer.send(data).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                         return;

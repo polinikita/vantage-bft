@@ -1,11 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::worker::SerializedBatchDigestMessage;
 use config::WorkerId;
-use crypto::Digest;
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
+use crypto::{Blake3Hasher, Digest};
 use primary::WorkerPrimaryMessage;
-use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -35,7 +32,9 @@ impl Processor {
         tokio::spawn(async move {
             while let Some(batch) = rx_batch.recv().await {
                 // Hash the batch.
-                let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
+                let mut hasher = Blake3Hasher::new();
+                hasher.update(&batch);
+                let digest = Digest(hasher.finalize().into());
 
                 // Store the batch.
                 store.write(digest.to_vec(), batch).await;

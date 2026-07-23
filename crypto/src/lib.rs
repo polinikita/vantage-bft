@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use ed25519_dalek as dalek;
 use ed25519_dalek::ed25519;
 use ed25519_dalek::Signer as _;
@@ -17,6 +18,10 @@ pub mod crypto_tests;
 
 pub type CryptoError = ed25519::Error;
 
+/// The hasher used for all content digests (Starfish parity). blake3 produces a
+/// 32-byte output directly, matching `Digest`'s width with no truncation.
+pub type Blake3Hasher = blake3::Hasher;
+
 /// Represents a hash digest (32 bytes).
 #[derive(Hash, PartialEq, Default, Eq, Clone, Deserialize, Serialize, Ord, PartialOrd)]
 pub struct Digest(pub [u8; 32]);
@@ -33,13 +38,13 @@ impl Digest {
 
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", base64::encode(&self.0))
+        write!(f, "{}", BASE64_STANDARD.encode(&self.0))
     }
 }
 
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", base64::encode(&self.0).get(0..16).unwrap())
+        write!(f, "{}", BASE64_STANDARD.encode(&self.0).get(0..16).unwrap())
     }
 }
 
@@ -67,14 +72,14 @@ pub struct PublicKey(pub [u8; 32]);
 
 impl PublicKey {
     pub fn encode_base64(&self) -> String {
-        base64::encode(&self.0[..])
+        BASE64_STANDARD.encode(&self.0[..])
     }
 
     pub fn decode_base64(s: &str) -> Result<Self, base64::DecodeError> {
-        let bytes = base64::decode(s)?;
+        let bytes = BASE64_STANDARD.decode(s)?;
         let array = bytes[..32]
             .try_into()
-            .map_err(|_| base64::DecodeError::InvalidLength)?;
+            .map_err(|_| base64::DecodeError::InvalidLength(bytes.len()))?;
         Ok(Self(array))
     }
 }
@@ -122,14 +127,14 @@ pub struct SecretKey([u8; 64]);
 
 impl SecretKey {
     pub fn encode_base64(&self) -> String {
-        base64::encode(&self.0[..])
+        BASE64_STANDARD.encode(&self.0[..])
     }
 
     pub fn decode_base64(s: &str) -> Result<Self, base64::DecodeError> {
-        let bytes = base64::decode(s)?;
+        let bytes = BASE64_STANDARD.decode(s)?;
         let array = bytes[..64]
             .try_into()
-            .map_err(|_| base64::DecodeError::InvalidLength)?;
+            .map_err(|_| base64::DecodeError::InvalidLength(bytes.len()))?;
         Ok(Self(array))
     }
 }
@@ -168,9 +173,9 @@ pub fn generate_keypair<R>(csprng: &mut R) -> (PublicKey, SecretKey)
 where
     R: CryptoRng + RngCore,
 {
-    let keypair = dalek::Keypair::generate(csprng);
-    let public = PublicKey(keypair.public.to_bytes());
-    let secret = SecretKey(keypair.to_bytes());
+    let keypair = dalek::SigningKey::generate(csprng);
+    let public = PublicKey(keypair.verifying_key().to_bytes());
+    let secret = SecretKey(keypair.to_keypair_bytes());
     (public, secret)
 }
 
@@ -183,7 +188,8 @@ pub struct Signature {
 
 impl Signature {
     pub fn new(digest: &Digest, secret: &SecretKey) -> Self {
-        let keypair = dalek::Keypair::from_bytes(&secret.0).expect("Unable to load secret key");
+        let keypair =
+            dalek::SigningKey::from_keypair_bytes(&secret.0).expect("Unable to load secret key");
         let sig = keypair.sign(&digest.0).to_bytes();
         let part1 = sig[..32].try_into().expect("Unexpected signature length");
         let part2 = sig[32..64].try_into().expect("Unexpected signature length");
@@ -198,8 +204,8 @@ impl Signature {
     }
 
     pub fn verify(&self, digest: &Digest, public_key: &PublicKey) -> Result<(), CryptoError> {
-        let signature = ed25519::signature::Signature::from_bytes(&self.flatten())?;
-        let key = dalek::PublicKey::from_bytes(&public_key.0)?;
+        let signature = dalek::Signature::from_bytes(&self.flatten());
+        let key = dalek::VerifyingKey::from_bytes(&public_key.0)?;
         key.verify_strict(&digest.0, &signature)
     }
 
@@ -209,11 +215,11 @@ impl Signature {
     {
         let mut messages: Vec<&[u8]> = Vec::new();
         let mut signatures: Vec<dalek::Signature> = Vec::new();
-        let mut keys: Vec<dalek::PublicKey> = Vec::new();
+        let mut keys: Vec<dalek::VerifyingKey> = Vec::new();
         for (key, sig) in votes.into_iter() {
             messages.push(&digest.0[..]);
-            signatures.push(ed25519::signature::Signature::from_bytes(&sig.flatten())?);
-            keys.push(dalek::PublicKey::from_bytes(&key.0)?);
+            signatures.push(dalek::Signature::from_bytes(&sig.flatten()));
+            keys.push(dalek::VerifyingKey::from_bytes(&key.0)?);
         }
         dalek::verify_batch(&messages[..], &signatures[..], &keys[..])
     }
@@ -224,11 +230,11 @@ impl Signature {
     {
         let mut messages: Vec<&[u8]> = Vec::new();
         let mut signatures: Vec<dalek::Signature> = Vec::new();
-        let mut keys: Vec<dalek::PublicKey> = Vec::new();
+        let mut keys: Vec<dalek::VerifyingKey> = Vec::new();
         for (i, (key, sig)) in votes.into_iter().enumerate() {
             messages.push(&digests[i].0[..]);
-            signatures.push(ed25519::signature::Signature::from_bytes(&sig.flatten())?);
-            keys.push(dalek::PublicKey::from_bytes(&key.0)?);
+            signatures.push(dalek::Signature::from_bytes(&sig.flatten()));
+            keys.push(dalek::VerifyingKey::from_bytes(&key.0)?);
         }
         dalek::verify_batch(&messages[..], &signatures[..], &keys[..])
     }

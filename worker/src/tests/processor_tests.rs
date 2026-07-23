@@ -32,11 +32,9 @@ async fn hash_and_store() {
 
     // Ensure the `Processor` outputs the batch's digest.
     let output = rx_digest.recv().await.unwrap();
-    let digest = Digest(
-        Sha512::digest(&serialized).as_slice()[..32]
-            .try_into()
-            .unwrap(),
-    );
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(&serialized);
+    let digest = Digest(hasher.finalize().into());
     let expected = bincode::serialize(&WorkerPrimaryMessage::OurBatch(digest.clone(), id)).unwrap();
     assert_eq!(output, expected);
 

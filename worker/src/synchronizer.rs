@@ -6,9 +6,11 @@ use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
+use metrics::Metrics;
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -48,6 +50,17 @@ pub struct Synchronizer {
     /// processing will resume when we get the missing batches in the store or we no longer need them.
     /// It also keeps the round number and a timestamp (`u128`) of each request we sent.
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
+    /// Starfish-parity real transaction latency (PHASE2-SPEC.md #5). Always present
+    /// (the metrics server and its registered gauge shape are always on), but only
+    /// observed into under the `benchmark` feature.
+    #[allow(dead_code)]
+    metrics: Arc<Metrics>,
+    /// Batch digests already accounted for in `metrics`, so a `Committed` notification
+    /// for the same digest (should one ever arrive twice) is not double-counted.
+    /// Benchmark-only; unbounded for the run's duration, which is fine at benchmark
+    /// batch-count scale (a run is seconds to minutes, not committed-batches-forever).
+    #[cfg(feature = "benchmark")]
+    observed_commits: HashSet<Digest>,
 }
 
 impl Synchronizer {
@@ -61,6 +74,7 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
+        metrics: Arc<Metrics>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -75,6 +89,9 @@ impl Synchronizer {
                 network: SimpleSender::new(),
                 round: Round::default(),
                 pending: HashMap::new(),
+                metrics,
+                #[cfg(feature = "benchmark")]
+                observed_commits: HashSet::new(),
             }
             .run()
             .await;
@@ -174,6 +191,13 @@ impl Synchronizer {
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
                     }
+                    PrimaryWorkerMessage::Committed(commit_millis, digests) => {
+                        // Starfish-parity real transaction latency (PHASE2-SPEC.md #5).
+                        // Benchmark-only: extracting/observing per-tx timestamps on every
+                        // committed batch is pure overhead outside instrumented runs.
+                        #[cfg(feature = "benchmark")]
+                        self.observe_committed(commit_millis, digests).await;
+                    }
                 },
 
                 // Stream out the futures of the `FuturesUnordered` that completed.
@@ -221,6 +245,88 @@ impl Synchronizer {
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
                 },
             }
+        }
+    }
+
+    /// Starfish-parity real transaction latency (PHASE2-SPEC.md #5, amended): for each
+    /// batch the primary just told us was committed, read it from our local store (a
+    /// miss -- possible even for our own batches under GC, and expected for a remote
+    /// author's batch we never received a worker-to-worker gossip copy of -- is
+    /// skipped, counted, never blocked on), then observe every transaction's
+    /// (`commit_millis` - embedded submission timestamp) into the latency histogram.
+    /// `commit_millis` is the primary's own instant, taken once at its "Committed"
+    /// log site and carried in the notification -- not `SystemTime::now()` read here,
+    /// which would additionally include the primary->worker notification hop and this
+    /// task's own queueing delay under load (exactly the bias that made the first
+    /// version of this metric run measurably hotter than the legacy sample metric).
+    #[cfg(feature = "benchmark")]
+    async fn observe_committed(&mut self, commit_millis: u64, digests: Vec<Digest>) {
+        // Accumulated locally and flushed once at the end of the call (one atomic
+        // `inc_by` per counter instead of one per transaction) -- at 240k tx/s that's
+        // the difference between a handful of atomic ops per `Committed` message and
+        // one per transaction. Only the histogram observation is inherently
+        // per-transaction (each has its own latency value); it's already a lock-free
+        // channel push, not an atomic increment, so batching it wouldn't help.
+        let mut squared_micros_sum: u64 = 0;
+        let mut tx_count: u64 = 0;
+        let mut tx_bytes: u64 = 0;
+
+        for digest in digests {
+            // Dedup: a digest we've already accounted for is a no-op.
+            if !self.observed_commits.insert(digest.clone()) {
+                continue;
+            }
+
+            let bytes = match self.store.read(digest.to_vec()).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    self.metrics.latency_misses.inc();
+                    continue;
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    continue;
+                }
+            };
+
+            let message: WorkerMessage = match bincode::deserialize(&bytes) {
+                Ok(message) => message,
+                Err(e) => {
+                    error!("Failed to deserialize committed batch {}: {}", digest, e);
+                    continue;
+                }
+            };
+            let WorkerMessage::Batch(transactions) = message else {
+                continue;
+            };
+
+            for tx in transactions {
+                // §4 wire format: [1 B marker][8 B id, BE][8 B submission timestamp, LE].
+                // A transaction shorter than the header (should not happen once every
+                // client is on the Phase-2 format) is skipped rather than indexed into.
+                if tx.len() < 17 {
+                    continue;
+                }
+                let submitted_millis = u64::from_le_bytes(tx[9..17].try_into().unwrap());
+                // saturating_sub: tolerate any clock skew between client and node
+                // instead of panicking (NTP-grade sync is assumed, not enforced).
+                let latency = Duration::from_millis(commit_millis.saturating_sub(submitted_millis));
+
+                self.metrics.transaction_committed_latency.observe(latency);
+                let latency_micros = latency.as_micros() as u64;
+                squared_micros_sum = squared_micros_sum
+                    .saturating_add(latency_micros.saturating_mul(latency_micros));
+                tx_count += 1;
+                tx_bytes += tx.len() as u64;
+            }
+        }
+
+        if tx_count > 0 {
+            self.metrics
+                .transaction_committed_latency_squared_micros
+                .inc_by(squared_micros_sum);
+            self.metrics.committed_transactions.inc_by(tx_count);
+            self.metrics.committed_bytes.inc_by(tx_bytes);
         }
     }
 }

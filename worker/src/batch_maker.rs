@@ -1,14 +1,11 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
-use crypto::Digest;
+use crypto::{Blake3Hasher, Digest};
 use crypto::PublicKey;
-#[cfg(feature = "benchmark")]
-use ed25519_dalek::{Digest as _, Sha512};
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
@@ -138,11 +135,9 @@ impl BatchMaker {
         #[cfg(feature = "benchmark")]
         {
             // NOTE: This is one extra hash that is only needed to print the following log entries.
-            let digest = Digest(
-                Sha512::digest(&serialized).as_slice()[..32]
-                    .try_into()
-                    .unwrap(),
-            );
+            let mut hasher = Blake3Hasher::new();
+            hasher.update(&serialized);
+            let digest = Digest(hasher.finalize().into());
 
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.

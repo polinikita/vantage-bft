@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crypto::{generate_production_keypair, PublicKey, SecretKey, Hash};
-use log::info;
+use log::{info, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -58,7 +58,51 @@ pub trait Export: Serialize {
 pub type Stake = u32;
 pub type WorkerId = u32;
 
-#[derive(Deserialize, Clone)]
+/// The consensus protocol selected for this node's assembly. One binary, three
+/// protocols; the fab harness picks one via the `protocol` parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Protocol {
+    /// Autobahn as shipped/evaluated (`use_optimistic_tips = true`).
+    AutobahnOptimistic,
+    /// Autobahn with certified-tips-only cut formation (`use_optimistic_tips = false`).
+    AutobahnSeamless,
+    /// Signature-free AGB protocol (implemented in Phase 3+).
+    Vantage,
+}
+
+impl Default for Protocol {
+    fn default() -> Self {
+        Self::AutobahnOptimistic
+    }
+}
+
+impl Protocol {
+    /// The `use_optimistic_tips` value implied by this protocol when the
+    /// Autobahn code paths run. `None` for Vantage (the flag is irrelevant on
+    /// that path).
+    pub fn implied_optimistic_tips(&self) -> Option<bool> {
+        match self {
+            Protocol::AutobahnOptimistic => Some(true),
+            Protocol::AutobahnSeamless => Some(false),
+            Protocol::Vantage => None,
+        }
+    }
+}
+
+/// `protocol` now subsumes `use_optimistic_tips` (see `reconcile_protocol`), so the
+/// fab harness no longer writes the raw flag into generated parameter files (Phase-2
+/// §1: "Remove `use_optimistic_tips` from fabfile node_params"). The field itself
+/// stays required-shaped everywhere else in this struct's docs/semantics, but needs a
+/// `#[serde(default)]` fallback to keep deserializing those now-`protocol`-only files;
+/// `true` matches `Parameters::default()` and is inert either way, since
+/// `reconcile_protocol` overwrites it from `protocol` whenever the latter is present
+/// (every reachable Autobahn path always sets `protocol`).
+fn default_use_optimistic_tips() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Parameters {
     /// The timeout delay of the consensus protocol.
     pub timeout_delay: u64,
@@ -83,8 +127,9 @@ pub struct Parameters {
     pub max_batch_delay: u64,
 
     //Autobahn protocol config parameters
+    #[serde(default = "default_use_optimistic_tips")]
     pub use_optimistic_tips: bool,     //default = true (TODO: implement non optimistic tip option)
-    
+
     pub use_parallel_proposals: bool,  //default = true (TODO: implement sequential slot option)
     pub k: u64, //Max open conensus instances at a time.
 
@@ -98,6 +143,37 @@ pub struct Parameters {
     pub simulate_asynchrony: bool,
     pub asynchrony_start: u64,
     pub asynchrony_duration: u64,
+
+    /// The consensus protocol assembly to run. Authoritative over
+    /// `use_optimistic_tips` (see `reconcile_protocol`). `#[serde(default)]`
+    /// keeps pre-Phase-2 parameter files valid.
+    #[serde(default)]
+    pub protocol: Protocol,
+
+    /// Vantage only (PHASE3-SPEC.md §3.1): the maximum number of payload entries
+    /// (worker-batch digests) a single data block may carry -- part of `BlockOK`.
+    /// Irrelevant on the two Autobahn paths. Rust-side default is a conservative
+    /// constant; the harness/config generator is expected to size it as
+    /// `workers_per_authority * 4` per the spec note, the same way other int
+    /// parameters are sized by `config.py`. `#[serde(default)]` keeps pre-Phase-3
+    /// parameter files valid.
+    #[serde(default = "default_max_block_payload")]
+    pub max_block_payload: usize,
+
+    /// Vantage only (PHASE4-SPEC.md §10): the AGB base delay unit "Δ" (milliseconds).
+    /// The fallback deadlines θE = 5Δ, θR = 6Δ are paper-fixed constants derived from
+    /// this. Irrelevant on the two Autobahn paths. `#[serde(default)]` (D4-5: 1000ms)
+    /// keeps pre-Phase-4 parameter files valid.
+    #[serde(default = "default_delta_ms")]
+    pub delta_ms: u64,
+}
+
+fn default_max_block_payload() -> usize {
+    16
+}
+
+fn default_delta_ms() -> u64 {
+    1000
 }
 
 impl Default for Parameters {
@@ -125,15 +201,38 @@ impl Default for Parameters {
             simulate_asynchrony: false,
             asynchrony_start: 20_000, //20 second in
             asynchrony_duration: 10_000, //10 seconds
+
+            protocol: Protocol::default(),
+            max_block_payload: default_max_block_payload(),
+            delta_ms: default_delta_ms(),
         }
     }
 }
 
 impl Import for Parameters {}
+impl Export for Parameters {}
 
 impl Parameters {
+    /// Reconcile the legacy `use_optimistic_tips` knob with `protocol`.
+    /// `protocol` is authoritative: if an imported parameter file set the raw
+    /// flag inconsistently with `protocol`, `protocol` wins and we warn. Called
+    /// once after import, before the Core reads `use_optimistic_tips`.
+    pub fn reconcile_protocol(&mut self) {
+        if let Some(implied) = self.protocol.implied_optimistic_tips() {
+            if self.use_optimistic_tips != implied {
+                warn!(
+                    "use_optimistic_tips={} is inconsistent with protocol {:?}; \
+                     protocol wins, using use_optimistic_tips={}",
+                    self.use_optimistic_tips, self.protocol, implied
+                );
+                self.use_optimistic_tips = implied;
+            }
+        }
+    }
+
     pub fn log(&self) {
         // NOTE: These log entries are needed to compute performance.
+        info!("Protocol: {:?}", self.protocol);
         info!("Timeout delay set to {} ms", self.timeout_delay);
         info!("Header size set to {} B", self.header_size);
         info!("Max header delay set to {} ms", self.max_header_delay);
@@ -147,24 +246,29 @@ impl Parameters {
         info!("Optimistic tips enabled? {}", self.use_optimistic_tips);
         info!("Parallel Proposals enabled? {}. K: {}", self.use_parallel_proposals, self.k);
         info!("Ride share enabled? {}. Car timeout: {}", self.use_ride_share, self.car_timeout);
+        info!("Max block payload set to {} entries", self.max_block_payload);
+        info!("Vantage delta set to {} ms", self.delta_ms);
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ConsensusAddresses {
     /// Address to receive messages from other consensus nodes (WAN).
     pub consensus_to_consensus: SocketAddr,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PrimaryAddresses {
     /// Address to receive messages from other primaries (WAN).
     pub primary_to_primary: SocketAddr,
     /// Address to receive messages from our workers (LAN).
     pub worker_to_primary: SocketAddr,
+    /// Address serving this primary's Prometheus metrics (LAN; scraped by the
+    /// benchmark harness at run end).
+    pub metrics: SocketAddr,
 }
 
-#[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Eq, Hash, PartialEq)]
 pub struct WorkerAddresses {
     /// Address to receive client transactions (WAN).
     pub transactions: SocketAddr,
@@ -172,9 +276,12 @@ pub struct WorkerAddresses {
     pub worker_to_worker: SocketAddr,
     /// Address to receive messages from our primary (LAN).
     pub primary_to_worker: SocketAddr,
+    /// Address serving this worker's Prometheus metrics (LAN; scraped by the
+    /// benchmark harness at run end).
+    pub metrics: SocketAddr,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Authority {
     /// The voting power of this authority.
     pub stake: Stake,
@@ -186,13 +293,14 @@ pub struct Authority {
     pub workers: HashMap<WorkerId, WorkerAddresses>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
     //pub id_map: HashMap<PublicKey, u64>, //position 
 }
 
 impl Import for Committee {}
+impl Export for Committee {}
 
 impl Committee {
     pub fn new(info: Vec<(PublicKey, Stake, SocketAddr)>) -> Self {
@@ -200,11 +308,68 @@ impl Committee {
             authorities: info
                 .into_iter()
                 .map(|(name, stake, address)| {
-                    let authority = Authority { stake, consensus: ConsensusAddresses { consensus_to_consensus: address }, primary: PrimaryAddresses { primary_to_primary: address, worker_to_primary: address }, workers: HashMap::new() };
+                    let authority = Authority { stake, consensus: ConsensusAddresses { consensus_to_consensus: address }, primary: PrimaryAddresses { primary_to_primary: address, worker_to_primary: address, metrics: address }, workers: HashMap::new() };
                     (name, authority)
                 })
                 .collect(),
         }
+    }
+
+    /// Generates an in-memory committee (fresh keys, all addresses on 127.0.0.1) for
+    /// `node local-benchmark` (PHASE2-SPEC.md §8) -- the in-process analog of
+    /// `config.py::LocalCommittee`. Port layout is identical to that harness's: per
+    /// authority, one `consensus_to_consensus` port, three primary ports
+    /// (`primary_to_primary`, `worker_to_primary`, `metrics`), then four ports per
+    /// worker (`primary_to_worker`, `transactions`, `worker_to_worker`, `metrics`).
+    /// Returns the committee alongside each authority's freshly generated keypair, in
+    /// the same order, since the caller (not this constructor) owns spawning nodes.
+    pub fn local_benchmark(nodes: usize, workers: usize, base_port: u16) -> (Self, Vec<KeyPair>) {
+        let mut authorities = BTreeMap::new();
+        let mut keypairs = Vec::with_capacity(nodes);
+        let mut port = base_port;
+
+        for _ in 0..nodes {
+            let keypair = KeyPair::new();
+
+            let consensus = ConsensusAddresses {
+                consensus_to_consensus: format!("127.0.0.1:{}", port).parse().unwrap(),
+            };
+            port += 1;
+
+            let primary = PrimaryAddresses {
+                primary_to_primary: format!("127.0.0.1:{}", port).parse().unwrap(),
+                worker_to_primary: format!("127.0.0.1:{}", port + 1).parse().unwrap(),
+                metrics: format!("127.0.0.1:{}", port + 2).parse().unwrap(),
+            };
+            port += 3;
+
+            let mut worker_addresses = HashMap::new();
+            for j in 0..workers {
+                worker_addresses.insert(
+                    j as WorkerId,
+                    WorkerAddresses {
+                        primary_to_worker: format!("127.0.0.1:{}", port).parse().unwrap(),
+                        transactions: format!("127.0.0.1:{}", port + 1).parse().unwrap(),
+                        worker_to_worker: format!("127.0.0.1:{}", port + 2).parse().unwrap(),
+                        metrics: format!("127.0.0.1:{}", port + 3).parse().unwrap(),
+                    },
+                );
+                port += 4;
+            }
+
+            authorities.insert(
+                keypair.name,
+                Authority {
+                    stake: 1,
+                    consensus,
+                    primary,
+                    workers: worker_addresses,
+                },
+            );
+            keypairs.push(keypair);
+        }
+
+        (Self { authorities }, keypairs)
     }
 
     /// Returns the number of authorities.
@@ -307,6 +472,19 @@ impl Committee {
             .cloned()
             .map(Ok)
             .collect()
+    }
+
+    /// Returns the addresses of all our workers, keyed by `WorkerId` (unlike
+    /// `our_workers`, which discards the id). Used to route a message to a specific
+    /// local worker.
+    pub fn our_workers_by_id(
+        &self,
+        myself: &PublicKey,
+    ) -> Result<HashMap<WorkerId, WorkerAddresses>, ConfigError> {
+        self.authorities
+            .get(myself)
+            .map(|x| x.workers.clone())
+            .ok_or_else(|| ConfigError::NotInCommittee(*myself))
     }
 
     /// Returns the addresses of all workers with a specific id except the ones of the authority

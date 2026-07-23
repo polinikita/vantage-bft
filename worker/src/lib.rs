@@ -3,7 +3,6 @@ mod batch_maker;
 mod helper;
 mod primary_connector;
 mod processor;
-mod quorum_waiter;
 mod synchronizer;
 mod worker;
 
