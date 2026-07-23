@@ -1,5 +1,3 @@
-use core::time;
-use std::collections::{BTreeMap, HashMap};
 
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
@@ -180,7 +178,7 @@ async fn propose_special_ticket_first() {
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
-    let(tx_ticket, rx_ticket) = channel(1);
+    let(_tx_ticket, rx_ticket) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
@@ -203,7 +201,7 @@ async fn propose_special_ticket_first() {
         .expect("failed to send cert to proposer");
 
     //Send ticket to form a special header
-    let gen_header = Header::genesis(&committee());
+    let _gen_header = Header::genesis(&committee());
 
     //let ticket: Ticket = Ticket::new(Some(gen_header), None, 1, HashMap::new()).await;
     /*let consensus_info: InstanceInfo = InstanceInfo { slot: 2, view: 1 };
@@ -245,7 +243,7 @@ async fn propose_confirm_message() {
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
-    let(tx_ticket, rx_ticket) = channel(1);
+    let(_tx_ticket, rx_ticket) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
@@ -269,7 +267,7 @@ async fn propose_confirm_message() {
 
 
     //Send ticket to form a special header
-    let gen_header = Header::genesis(&committee());
+    let _gen_header = Header::genesis(&committee());
 
     //let ticket: Ticket = Ticket::new(Some(gen_header), None, 1, HashMap::new()).await;
     /*let consensus_info: InstanceInfo = InstanceInfo { slot: 2, view: 1 };

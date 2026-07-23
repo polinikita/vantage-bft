@@ -3,7 +3,9 @@ use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
+use metrics::Metrics;
 use network::SimpleSender;
+use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -31,6 +33,11 @@ impl Helper {
         committee: Committee,
         store: Store,
         rx_request: Receiver<(Vec<Digest>, PublicKey)>,
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as primary-side
+        // `::spawn` functions.
+        metrics: Arc<Metrics>,
+        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
+        compress_network: bool,
     ) {
         tokio::spawn(async move {
             Self {
@@ -38,7 +45,7 @@ impl Helper {
                 committee,
                 store,
                 rx_request,
-                network: SimpleSender::new(),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
             }
             .run()
             .await;
@@ -61,7 +68,7 @@ impl Helper {
             // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
+                    Ok(Some(data)) => self.network.send_typed(address, Bytes::from(data), "Batch").await,
                     Ok(None) => (),
                     Err(e) => error!("{}", e),
                 }

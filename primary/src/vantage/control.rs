@@ -22,9 +22,9 @@ pub type Round = u64;
 
 /// A control proposal's identity: round + parent + value (§5's "identity covers round
 /// + parent + block x"). `parent` is a plain `Round` (0 is a legitimate, non-optional
-/// value -- the genesis root; `SafeParent`'s own `0 <= r' < r` bound is the only place
-/// "no real parent" is expressible, and it's already satisfied by `parent = 0`).
-/// `value = None` is `⊥`.
+///   value -- the genesis root; `SafeParent`'s own `0 <= r' < r` bound is the only place
+///   "no real parent" is expressible, and it's already satisfied by `parent = 0`).
+///   `value = None` is `⊥`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ControlProposal {
     pub round: Round,
@@ -279,7 +279,7 @@ impl ControlLog {
                     continue;
                 }
             }
-            if best.as_ref().map_or(true, |(bv, _)| view < *bv) {
+            if best.as_ref().is_none_or(|(bv, _)| view < *bv) {
                 best = Some(pair);
             }
         }
@@ -348,7 +348,7 @@ impl ControlLog {
             None => true, // ⊥ passes immediately
             Some((w, h)) => {
                 let reports_ok = self.report_count_for(*w, h) >= self.f_plus_1_parties;
-                let b_w_ok = b_w.as_ref().map_or(false, |p| self.verify_b_w(*w, h, p));
+                let b_w_ok = b_w.as_ref().is_some_and(|p| self.verify_b_w(*w, h, p));
                 reports_ok && b_w_ok
             }
         };
@@ -695,7 +695,7 @@ impl ControlLog {
         }
         for state in self.bracha.values() {
             for (sender, p) in &state.echo_statements {
-                if p.value.as_ref().map_or(false, |(pw, ph)| pw == &w && ph == h) {
+                if p.value.as_ref().is_some_and(|(pw, ph)| pw == &w && ph == h) {
                     out.insert(*sender);
                 }
             }
@@ -775,6 +775,13 @@ impl ControlLog {
     /// which is itself gated on `AgbEngine::on_propose`'s `formed(...)` check at
     /// fixing time). So by the time `pump_log` reads `proposal.m` here, `formed_v`
     /// already holds for it, transitively.
+    // clippy::while_let_loop: this `loop` has 4 distinct `continue`/`break` exits
+    // (missing entry, digest mismatch, no recovery target, already-anchored) plus the
+    // extensively audited invariant argument in the doc comment above ("Fable audit
+    // pass 1, P6-2") -- restructuring the loop shape, even via clippy's own
+    // mechanically-equivalent suggestion, is exactly the kind of touch this
+    // cleanup pass avoids in control-log delivery code; not done.
+    #[allow(clippy::while_let_loop)]
     fn pump_log(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         loop {

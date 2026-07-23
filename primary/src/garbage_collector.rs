@@ -5,6 +5,7 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::PublicKey;
+use metrics::Metrics;
 use network::SimpleSender;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +30,8 @@ pub struct GarbageCollector {
 }
 
 impl GarbageCollector {
+    // clippy::too_many_arguments: see `Committer::spawn`'s identical justification.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: &PublicKey,
         committee: &Committee,
@@ -36,6 +39,10 @@ impl GarbageCollector {
         consensus_round: Arc<AtomicU64>,
         rx_consensus: Receiver<Certificate>,
         tx_loopback: Sender<Certificate>,
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        metrics: Arc<Metrics>,
+        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
+        compress_network: bool,
     ) {
         let addresses = committee
             .our_workers(name)
@@ -51,7 +58,7 @@ impl GarbageCollector {
                 rx_consensus,
                 tx_loopback,
                 addresses,
-                network: SimpleSender::new(),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
             }
             .run()
             .await;
@@ -89,7 +96,7 @@ impl GarbageCollector {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
                     .expect("Failed to serialize our own message");
                 self.network
-                    .broadcast(self.addresses.clone(), Bytes::from(bytes))
+                    .broadcast_typed(self.addresses.clone(), Bytes::from(bytes), "Cleanup")
                     .await;
             }
         }

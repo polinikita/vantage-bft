@@ -1,8 +1,5 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::{primary::{Height, View}, messages::{TC, Timeout}};
+use crate::{primary::{Height, View}, messages::Timeout};
 use crypto::{CryptoError, Digest, PublicKey};
 use store::StoreError;
 use thiserror::Error;
@@ -91,6 +88,15 @@ pub enum DagError {
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
 
+// clippy::large_enum_variant / clippy::result_large_err: `InvalidTimeout(Timeout)`
+// (~560 B) makes this enum, and every `ConsensusResult<T>` return type, large --
+// boxing it would touch every construction site (`ConsensusError::X(...)`) and every
+// `match`/`if let` arm across the audited Autobahn consensus path for a pure
+// stack-size optimization with no functional benefit at this workspace's message
+// volumes; not done. Applies to every `ConsensusResult<T>`-returning fn too
+// (messages.rs's `verify`/`validate_winning_proposal`), so allowed here rather than
+// separately at each call site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Error, Debug)]
 pub enum ConsensusError {
     #[error("Network error: {0}")]

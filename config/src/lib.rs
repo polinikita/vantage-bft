@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crypto::{generate_production_keypair, PublicKey, SecretKey, Hash};
+use crypto::{generate_production_keypair, PublicKey, SecretKey};
 use log::{info, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,12 @@ pub trait Import: DeserializeOwned {
 pub trait Export: Serialize {
     fn export(&self, path: &str) -> Result<(), ConfigError> {
         let writer = || -> Result<(), std::io::Error> {
-            let file = OpenOptions::new().create(true).write(true).open(path)?;
+            // clippy::suspicious_open_options: explicit truncate (this always writes
+            // the WHOLE serialized struct, so a shorter new write must not leave
+            // trailing bytes from a longer previous file -- without this, a stale
+            // longer parameters.json/committee.json from an earlier run could corrupt
+            // the JSON a later, shorter write produces).
+            let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
             let mut writer = BufWriter::new(file);
             let data = serde_json::to_string_pretty(self).unwrap();
             writer.write_all(data.as_ref())?;
@@ -64,8 +69,10 @@ pub type WorkerId = u32;
 /// protocols; the fab harness picks one via the `protocol` parameter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum Protocol {
     /// Autobahn as shipped/evaluated (`use_optimistic_tips = true`).
+    #[default]
     AutobahnOptimistic,
     /// Autobahn with certified-tips-only cut formation (`use_optimistic_tips = false`).
     AutobahnSeamless,
@@ -73,11 +80,6 @@ pub enum Protocol {
     Vantage,
 }
 
-impl Default for Protocol {
-    fn default() -> Self {
-        Self::AutobahnOptimistic
-    }
-}
 
 impl Protocol {
     /// The `use_optimistic_tips` value implied by this protocol when the
@@ -88,6 +90,17 @@ impl Protocol {
             Protocol::AutobahnOptimistic => Some(true),
             Protocol::AutobahnSeamless => Some(false),
             Protocol::Vantage => None,
+        }
+    }
+
+    /// METRICS-DASHBOARD-SPEC.md §8: canonical string label for `protocol_info`
+    /// (dashboard) and the `--protocol` CLI value -- the exact strings already used by
+    /// `node local-benchmark --protocol`/`fab remote --protocol`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Protocol::AutobahnOptimistic => "autobahn-optimistic",
+            Protocol::AutobahnSeamless => "autobahn-seamless",
+            Protocol::Vantage => "vantage",
         }
     }
 }
@@ -183,6 +196,17 @@ pub struct Parameters {
     /// already-recorded fault-free/crash-fault gate numbers to stay reproducible.
     #[serde(skip)]
     pub latency_table: Option<Arc<LatencyTable>>,
+
+    /// METRICS-DASHBOARD-SPEC.md §8: network-level lz4 compression, off by default
+    /// (`#[serde(default)]` = `false`) -- byte-identical framing when off (no
+    /// compress/decompress call is even made, see `network` crate). Applied uniformly
+    /// by the `network` crate to every sender/receiver, all three protocols
+    /// identically. Committee-wide consistent by construction: every node's
+    /// `Parameters` comes from the same generated config, so a mixed on/off committee
+    /// isn't a supported configuration (a node expecting compressed frames would fail
+    /// to decode an uncompressed peer's traffic, and vice versa).
+    #[serde(default)]
+    pub compress_network: bool,
 }
 
 fn default_max_block_payload() -> usize {
@@ -296,6 +320,7 @@ impl Default for Parameters {
             max_block_payload: default_max_block_payload(),
             delta_ms: default_delta_ms(),
             latency_table: None,
+            compress_network: false,
         }
     }
 }
@@ -473,7 +498,7 @@ impl Committee {
 
     /// Return the stake of a specific authority.
     pub fn stake(&self, name: &PublicKey) -> Stake {
-        self.authorities.get(&name).map_or_else(|| 0, |x| x.stake)
+        self.authorities.get(name).map_or_else(|| 0, |x| x.stake)
     }
 
     /// Returns the stake of all authorities except `myself`.
@@ -498,7 +523,7 @@ impl Committee {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (N + 2) / 3 = f + 1 + k/3 = f + 1
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        (total_votes + 2) / 3
+        total_votes.div_ceil(3)
     }
 
     pub fn fast_threshold(&self) -> Stake {
@@ -511,7 +536,7 @@ impl Committee {
         self.authorities
             .get(to)
             .map(|x| x.consensus.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee(*to))
+            .ok_or(ConfigError::NotInCommittee(*to))
     }
 
     /// Returns the addresses of all consensus nodes except `myself`.
@@ -528,7 +553,7 @@ impl Committee {
         self.authorities
             .get(to)
             .map(|x| x.primary.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee(*to))
+            .ok_or(ConfigError::NotInCommittee(*to))
     }
 
     /// Returns the addresses of all primaries except `myself`.
@@ -604,12 +629,12 @@ impl Committee {
             .iter()
             .find(|(name, _)| name == &to)
             .map(|(_, authority)| authority)
-            .ok_or_else(|| ConfigError::NotInCommittee(*to))?
+            .ok_or(ConfigError::NotInCommittee(*to))?
             .workers
             .iter()
             .find(|(worker_id, _)| worker_id == &id)
             .map(|(_, worker)| worker.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee(*to))
+            .ok_or(ConfigError::NotInCommittee(*to))
     }
 
     /// Returns the addresses of all our workers.
@@ -618,7 +643,7 @@ impl Committee {
             .iter()
             .find(|(name, _)| name == &myself)
             .map(|(_, authority)| authority)
-            .ok_or_else(|| ConfigError::NotInCommittee(*myself))?
+            .ok_or(ConfigError::NotInCommittee(*myself))?
             .workers
             .values()
             .cloned()
@@ -636,7 +661,7 @@ impl Committee {
         self.authorities
             .get(myself)
             .map(|x| x.workers.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee(*myself))
+            .ok_or(ConfigError::NotInCommittee(*myself))
     }
 
     /// Returns the addresses of all workers with a specific id except the ones of the authority

@@ -428,7 +428,7 @@ async fn positive_gate_fires_when_final_enabling_event_is_a_payload_ready() {
 #[tokio::test]
 async fn echo_with_out_of_range_grade_is_dropped_not_counted() {
     let (name, _) = authors()[3];
-    let (mut lm, _store) = new_lane_manager(name, ".db_test_agb_echo_bad_grade");
+    let (lm, _store) = new_lane_manager(name, ".db_test_agb_echo_bad_grade");
     let mut rep = new_repairer(name, &lm);
     let mut agb = new_agb_engine(name);
     let (a0, _) = authors()[0];

@@ -186,6 +186,37 @@ pub fn read_vantage_progress(registry: &Registry) -> Option<VantageProgress> {
     })
 }
 
+/// METRICS-DASHBOARD-SPEC.md §2: reads a single unlabeled `IntCounter`'s current
+/// value from `registry`. `0` if the metric doesn't exist on this registry (e.g. a
+/// worker registry queried for a primary-only counter).
+pub fn read_counter(registry: &Registry, name: &str) -> u64 {
+    registry
+        .gather()
+        .iter()
+        .find(|f| f.get_name() == name)
+        .and_then(|f| f.get_metric().first())
+        .map(|m| m.get_counter().get_value() as u64)
+        .unwrap_or(0)
+}
+
+/// METRICS-DASHBOARD-SPEC.md §1/§2: reads a labeled `IntCounterVec`'s current values
+/// from `registry`, keyed by the value of `label` (e.g. `type` or `proc`). Empty if
+/// the metric family doesn't exist on this registry.
+pub fn read_counter_vec(registry: &Registry, name: &str, label: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    let families = registry.gather();
+    let Some(family) = families.iter().find(|f| f.get_name() == name) else {
+        return out;
+    };
+    for m in family.get_metric() {
+        let Some(l) = m.get_label().iter().find(|l| l.get_name() == label) else {
+            continue;
+        };
+        *out.entry(l.get_value().to_string()).or_insert(0) += m.get_counter().get_value() as u64;
+    }
+    out
+}
+
 /// Median of an unordered `u64` iterator (even-length: average of the two middle
 /// values, rounded down -- consistent with reporting in whole microseconds).
 fn median(values: impl Iterator<Item = u64>) -> u64 {

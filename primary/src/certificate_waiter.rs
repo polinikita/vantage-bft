@@ -1,9 +1,6 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-//use crate::Header;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::Certificate; // {Certificate, ConsensusMessage};
+use crate::messages::Certificate;
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
@@ -12,8 +9,8 @@ use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Waits to receive all the ancestors of a certificate before looping it back to the `Core`
-/// for further processing.
-// NOTE: THIS IS DEPRECATED, NOT USED
+/// for further processing. Autobahn-only (spawned from `Primary::spawn`'s
+/// `AutobahnOptimistic`/`AutobahnSeamless` arm).
 pub struct CertificateWaiter {
     /// The persistent storage.
     store: Store,
@@ -57,51 +54,6 @@ impl CertificateWaiter {
             .map_err(DagError::from)
     }
 
-    /// Helper function. It waits for particular data to become available in the storage
-    /// and then delivers the specified header.
-    /*async fn parent_waiter(
-        mut missing: (Vec<u8>, Store),
-        deliver: Certificate,
-    ) -> DagResult<Certificate> {
-        let waiting: Vec<_> = missing
-            .iter_mut()
-            .map(|(x, y)| y.notify_read(x.to_vec()))
-            .collect();
-
-        try_join_all(waiting)
-            .await
-            .map(|_| deliver)
-            .map_err(DagError::from)
-    }*/
-
-    /// Helper function. It waits for particular data to become available in the storage
-    /// and then delivers the specified header.
-    // async fn parent_waiter(
-    //     missing: (Vec<u8>, Store),
-    //     deliver: Certificate,
-    // ) -> DagResult<Certificate> {
-    //     /*let waiting: Vec<_> = missing
-    //         .iter_mut()
-    //         .map(|(x, y)| y.notify_read(x.to_vec()))
-    //         .collect();*/
-
-    //     let (digest, mut store) = missing;
-    //     tokio::select! {
-    //         result = store.notify_read(digest.to_vec()) => {
-    //             match result {
-    //                 Ok(_) => Ok(deliver),
-    //                 Err(e) => Err(DagError::from(e)),
-    //             }
-    //         },
-    //         /*result = try_join_all(waiting) => {
-    //             result.map(|_| Some(deliver)).map_err(DagError::from)
-    //         }*/
-    //         //_ = handler.recv() => Ok(None),
-    //     }
-    // }
-
-
-
 
     async fn run(&mut self) {
         let mut waiting = FuturesUnordered::new();
@@ -112,8 +64,7 @@ impl CertificateWaiter {
                     // Add the certificate to the waiter pool. The waiter will return it to us
                     // when all its parents are in the store.
 
-                    let mut wait_for = Vec::new();
-                    wait_for.push((certificate.header_digest.to_vec(), self.store.clone()));
+                    let wait_for = vec![(certificate.header_digest.to_vec(), self.store.clone())];
                     let fut = Self::waiter(wait_for, certificate);
                     waiting.push(fut);
                 }

@@ -54,10 +54,11 @@ async fn main() -> Result<()> {
                 .long("mode")
                 .value_name("MODE")
                 .required(false)
-                .default_value("all-zero")
+                .default_value("random")
                 .value_parser(["all-zero", "random"])
                 .action(ArgAction::Set)
-                .help("Transaction payload mode: 'all-zero' (default) or 'random'"),
+                .help("Transaction payload mode: 'all-zero' or 'random' (default, as of \
+                    METRICS-DASHBOARD-SPEC.md §8)"),
         )
         .arg_required_else_help(true)
         .get_matches();
@@ -84,7 +85,6 @@ async fn main() -> Result<()> {
     let nodes = matches
         .get_many::<String>("nodes")
         .unwrap_or_default()
-        .into_iter()
         .map(|x| x.parse::<SocketAddr>())
         .collect::<Result<Vec<_>, _>>()
         .context("Invalid socket address format")?;

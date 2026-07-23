@@ -1,17 +1,15 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
 use crate::messages::{ConsensusMessage, Header, Proposal, proposal_digest};
 use crate::primary::{Height, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
-use crypto::{Digest, Hash, PublicKey};
+use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
+use metrics::Metrics;
 use network::SimpleSender;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +24,11 @@ use tokio::time::{sleep, Duration, Instant};
 const TIMER_RESOLUTION: u64 = 1_000;
 
 /// The commands that can be sent to the `Waiter`.
+// clippy::enum_variant_names: the shared `Sync` prefix is intentional/documentary
+// (every variant IS a sync command, per the doc comment above) -- renaming would
+// touch 8 call sites across this file and synchronizer.rs for a pure naming-style
+// lint with no behavior implication; not done.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub enum WaiterMessage {
     SyncBatches(HashMap<Digest, WorkerId>, Header, bool),
@@ -77,6 +80,7 @@ pub struct HeaderWaiter {
 }
 
 impl HeaderWaiter {
+    // clippy::too_many_arguments: see `Committer::spawn`'s identical justification.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -89,6 +93,10 @@ impl HeaderWaiter {
         rx_synchronizer: Receiver<WaiterMessage>,
         tx_core: Sender<Header>,
         tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        metrics: Arc<Metrics>,
+        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
+        compress_network: bool,
     ) {
         tokio::spawn(async move {
             Self {
@@ -102,7 +110,7 @@ impl HeaderWaiter {
                 rx_synchronizer,
                 tx_core,
                 tx_consensus_loopback,
-                network: SimpleSender::new(),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
                 parent_requests: HashMap::new(),
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
@@ -205,7 +213,7 @@ impl HeaderWaiter {
                                     let message = PrimaryWorkerMessage::Synchronize(digests, author);
                                     let bytes = bincode::serialize(&message)
                                         .expect("Failed to serialize batch sync request");
-                                    self.network.send(address, Bytes::from(bytes)).await;
+                                    self.network.send_typed(address, Bytes::from(bytes), "Synchronize").await;
                                 }
                             }
                         }
@@ -233,7 +241,7 @@ impl HeaderWaiter {
 
                                 let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await; //after timeout, re-broadcast again (technically not necessary)
+                                self.network.lucky_broadcast_typed(addresses, Bytes::from(bytes), self.sync_retry_nodes, "HeadersRequest").await; //after timeout, re-broadcast again (technically not necessary)
                             }
                         }
 
@@ -250,8 +258,7 @@ impl HeaderWaiter {
 
                             // Add the header to the waiter pool. The waiter will return it to us
                             // when all its parents are in the store.
-                            let mut wait_for = Vec::new();
-                            wait_for.push((missing.to_vec(), self.store.clone()));
+                            let wait_for = vec![(missing.to_vec(), self.store.clone())];
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (height, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
@@ -276,7 +283,7 @@ impl HeaderWaiter {
                                     .primary_to_primary;
                                 let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send(address, Bytes::from(bytes)).await;
+                                self.network.send_typed(address, Bytes::from(bytes), "HeadersRequest").await;
                             }
                         }
 
@@ -297,7 +304,6 @@ impl HeaderWaiter {
                             // when all its parents are in the store.
                             let wait_for = missing
                                 .iter()
-                                .cloned()
                                 .map(|x| (x.header_digest.to_vec(), self.store.clone()))
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
@@ -327,7 +333,7 @@ impl HeaderWaiter {
                                     .primary_to_primary;
                                 let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send(address, Bytes::from(bytes)).await;
+                                self.network.send_typed(address, Bytes::from(bytes), "HeadersRequest").await;
                             }
                         }
                     }
@@ -362,12 +368,11 @@ impl HeaderWaiter {
                             let _ = self.batch_requests.remove(x);
                         }
 
-                        let possibly_missing;
-                        match &deliver.0 {
-                            ConsensusMessage::Prepare {view: _, slot: _, tc: _, qc_ticket: _, proposals} => {possibly_missing = proposals},
-                            ConsensusMessage::Confirm {view: _, slot: _, qc: _, proposals} => {possibly_missing = proposals},
-                            ConsensusMessage::Commit {view: _, slot: _, qc: _, proposals} => {possibly_missing = proposals},
-                        }
+                        let possibly_missing = match &deliver.0 {
+                            ConsensusMessage::Prepare {view: _, slot: _, tc: _, qc_ticket: _, proposals} => proposals,
+                            ConsensusMessage::Confirm {view: _, slot: _, qc: _, proposals} => proposals,
+                            ConsensusMessage::Commit {view: _, slot: _, qc: _, proposals} => proposals,
+                        };
                         for (_, prop) in possibly_missing.iter() {
                             let _ = self.parent_requests.remove(&prop.header_digest);
                         }
@@ -416,7 +421,7 @@ impl HeaderWaiter {
                     let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
                     let message = PrimaryMessage::HeadersRequest(retry, self.name);
                     let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                    self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+                    self.network.lucky_broadcast_typed(addresses, Bytes::from(bytes), self.sync_retry_nodes, "HeadersRequest").await;
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));

@@ -35,6 +35,21 @@ impl TransactionMode {
             )),
         }
     }
+
+    /// METRICS-DASHBOARD-SPEC.md §8: canonical string label for `transaction_mode_info`
+    /// -- the exact strings `--mode` already accepts. Only called from
+    /// `local_benchmark.rs`, which is compiled into the `node` binary target, not
+    /// `benchmark_client` (both share this file via `#[path = "client.rs"]`, so
+    /// clippy's per-binary dead-code analysis flags it as unused from
+    /// `benchmark_client`'s own compilation unit) -- genuinely used from the `node`
+    /// binary, not dead code.
+    #[allow(dead_code)]
+    pub fn label(&self) -> &'static str {
+        match self {
+            TransactionMode::AllZero => "all-zero",
+            TransactionMode::Random => "random",
+        }
+    }
 }
 
 pub struct Client {

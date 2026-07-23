@@ -4,7 +4,9 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
+use metrics::Metrics;
 use network::SimpleSender;
+use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -29,6 +31,10 @@ impl Helper {
         store: Store,
         rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
         rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        metrics: Arc<Metrics>,
+        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
+        compress_network: bool,
     ) {
         tokio::spawn(async move {
             Self {
@@ -36,7 +42,7 @@ impl Helper {
                 store,
                 rx_primaries_certs,
                 rx_primaries_headers,
-                network: SimpleSender::new(),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
             }
             .run()
             .await;
@@ -67,7 +73,7 @@ impl Helper {
                                     .expect("Failed to deserialize our own certificate");
                                 let bytes = bincode::serialize(&PrimaryMessage::Certificate(certificate))
                                     .expect("Failed to serialize our own certificate");
-                                self.network.send(address, Bytes::from(bytes)).await;
+                                self.network.send_typed(address, Bytes::from(bytes), "Certificate").await;
                             }
                             Ok(None) => (),
                             Err(e) => error!("{}", e),
@@ -95,7 +101,7 @@ impl Helper {
                                         .expect("Failed to deserialize our own certificate");
                                     let bytes = bincode::serialize(&PrimaryMessage::Header(header, true))  //sync = true
                                         .expect("Failed to serialize our own certificate");
-                                    self.network.send(address, Bytes::from(bytes)).await;
+                                    self.network.send_typed(address, Bytes::from(bytes), "Header").await;
                                 }
                                 Ok(None) => (),
                                 Err(e) => error!("{}", e),

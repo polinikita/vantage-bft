@@ -254,7 +254,7 @@ async fn pointer_cycles_over_the_canonical_list_across_recovery_attempts() {
     let mut resolver = Resolver::new(4, 0); // D7-1: delta_ms=0 disables in-flight suppression (unrelated here)
     let all = authors();
     let (c1, t1) = payload(1);
-    let (c2, t2) = payload(9);
+    let (_c2, _t2) = payload(9);
 
     for (pk, _) in &all[0..3] {
         agb.on_noready(1, *pk);

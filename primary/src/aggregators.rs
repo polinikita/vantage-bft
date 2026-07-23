@@ -1,7 +1,5 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::error::{DagError, DagResult, ConsensusError};
+use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Vote, QC, Timeout, TC};
 use config::{Committee, Stake};
 use crypto::{PublicKey, Signature, Digest};
@@ -34,7 +32,7 @@ impl VotesAggregator {
         &mut self,
         vote: Vote,
         committee: &Committee,
-        header: &Header,
+        _header: &Header,
     ) -> DagResult<(bool, bool)> {
         if self.complete {
             return Ok((true, false));
@@ -158,7 +156,7 @@ impl QCMaker {
             self.qc_dig != Digest::default(),  //I.e. SlowQC is ready!
             DagError::InvalidSlowQCRequest
         );
-        return Ok((true, Some(QC { id: self.qc_dig.clone(), votes: self.votes.clone() })));
+        Ok((true, Some(QC { id: self.qc_dig.clone(), votes: self.votes.clone() })))
     }
 }
 

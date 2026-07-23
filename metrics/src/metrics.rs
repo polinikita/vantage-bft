@@ -21,6 +21,39 @@ use prometheus::{
 };
 use tokio::time::Instant;
 
+/// METRICS-DASHBOARD-SPEC.md §3: starfish-style (`metrics.rs:1325-1376`) Drop-guard
+/// busy-time timer, ported minimally (only the `IntCounterVec`-labeled, owned variant
+/// -- `VantageCore` is a single long-lived task with no borrow-lifetime constraints
+/// that would need the borrowed `UtilizationTimer<'a>` starfish also defines). Adds
+/// its elapsed wall time (microseconds) to the labeled counter when dropped, whether
+/// via normal fall-through or an early `?`/`return` -- so a section's busy time is
+/// counted even on its error paths, same as starfish's own guarantee.
+pub struct UtilizationTimer {
+    metric: IntCounter,
+    start: Instant,
+}
+
+impl Drop for UtilizationTimer {
+    fn drop(&mut self) {
+        self.metric.inc_by(self.start.elapsed().as_micros() as u64);
+    }
+}
+
+pub trait UtilizationTimerVecExt {
+    /// Start a timer for `label`; the accumulated busy time is committed to the
+    /// counter when the returned guard is dropped.
+    fn utilization_timer(&self, label: &str) -> UtilizationTimer;
+}
+
+impl UtilizationTimerVecExt for IntCounterVec {
+    fn utilization_timer(&self, label: &str) -> UtilizationTimer {
+        UtilizationTimer {
+            metric: self.with_label_values(&[label]),
+            start: Instant::now(),
+        }
+    }
+}
+
 use crate::stat::{histogram, DivUsize, HistogramSender, PreciseHistogram};
 
 /// Phase-2 metrics: the real (submission-to-commit) transaction latency distribution,
@@ -96,6 +129,74 @@ pub struct Metrics {
     /// (a persistent gap between this and `delivered_len` means every subsequent anchor
     /// is blocked on a still-missing `B_w`, not on delivery itself).
     pub vantage_control_consume_pos: IntGauge,
+
+    // --- Metrics/dashboard expansion (METRICS-DASHBOARD-SPEC.md §1): wire-layer
+    // counters, hooked in the `network` crate itself so every protocol (Autobahn
+    // Optimistic/Seamless and Vantage) and every direction is covered by construction,
+    // not by remembering to instrument each call site separately. Untyped totals
+    // mirror starfish's own hook (`network.rs:614-691`) and include the 4-byte
+    // length-delimited-codec frame prefix; the typed vectors go beyond starfish
+    // (serialized length is already in hand at the same call sites) and are labeled
+    // with the wire variant name of every `PrimaryMessage`/`PrimaryWorkerMessage`/
+    // `WorkerPrimaryMessage`/`WorkerMessage` variant. No per-peer labels (starfish
+    // parity -- committee size is small).
+    /// Total bytes physically written to the wire across every outbound connection
+    /// this node's senders (`ReliableSender`/`SimpleSender`) own, length prefix
+    /// included. Zero-cost when no sender attaches a metrics handle (`with_metrics`
+    /// is never called, e.g. in any test harness that doesn't wire it up).
+    pub bytes_sent_total: IntCounter,
+    /// Total bytes physically read off the wire by every inbound connection this
+    /// node's `network::Receiver`s own, length prefix included.
+    pub bytes_received_total: IntCounter,
+    /// Wire messages sent, by `type` (the wire variant name), counted at the
+    /// send/broadcast call site where the variant is known -- once per physical
+    /// unicast transmission (a broadcast to n peers increments this n times, same
+    /// convention as `bytes_sent_total`).
+    pub network_messages_sent_total: IntCounterVec,
+    /// Wire messages received, by `type`, counted at receiver dispatch post-deserialize.
+    pub network_messages_received_total: IntCounterVec,
+    /// Serialized (pre-frame-prefix) bytes sent, by `type`.
+    pub network_bytes_sent_total: IntCounterVec,
+    /// Serialized (pre-frame-prefix) bytes received, by `type`.
+    pub network_bytes_received_total: IntCounterVec,
+
+    // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
+    /// Transactions the worker's `BatchMaker` received from a client, before batching
+    /// (the numerator for submission-side throughput; `committed_transactions` above
+    /// remains the sequenced-goodput denominator, unchanged).
+    pub submitted_transactions: IntCounter,
+    /// Bytes of transactions the worker's `BatchMaker` received from a client.
+    pub submitted_transactions_bytes: IntCounter,
+
+    // --- METRICS-DASHBOARD-SPEC.md §3: consensus quality / utilization.
+    /// Vantage block serialized size at publish time (self-authored blocks only),
+    /// reported via the same `HistogramReporter` pattern as
+    /// `transaction_committed_latency`.
+    pub proposed_block_size_bytes: HistogramSender<usize>,
+    /// Starfish-style (`metrics.rs:1325-1376`) busy-time accounting around
+    /// `VantageCore`'s own major sections, in accumulated microseconds, labeled by
+    /// `proc` (section name). A `Drop`-guard timer (see `stat::UtilizationTimer`)
+    /// adds its elapsed wall time to this counter when it goes out of scope, whether
+    /// via normal fall-through or an early return/`?`.
+    pub utilization_timer: IntCounterVec,
+    /// `VantageCore`'s own inbound-message channel depth, sampled the same way as
+    /// the Finding-A progress gauges (once/sec, in `VantageCore::run`'s own select
+    /// loop) -- `rx_vantage.len()` (a `tokio::sync::mpsc::Receiver` exposes this
+    /// cheaply without contorting the channel type). `0` on the two Autobahn paths.
+    pub core_queue_length: IntGauge,
+
+    // --- METRICS-DASHBOARD-SPEC.md §8 addenda.
+    /// Write-once at boot: which protocol this node is running (starfish pattern --
+    /// `consensus_protocol_info`). Always exactly one label value set to `1`.
+    pub protocol_info: IntGaugeVec,
+    /// Write-once (where known -- see `set_transaction_mode_info`'s doc): which
+    /// client transaction-payload mode this run uses.
+    pub transaction_mode_info: IntGaugeVec,
+    /// Starfish's own counter, reinstated (§1 had omitted it as N/A without
+    /// compression): sum of pre-compression serialized sizes, incremented only when
+    /// `compress_network` is on (mirrors starfish's own conditional exactly -- when
+    /// compression is off this would just duplicate `bytes_sent_total`).
+    pub bytes_uncompressed_sent_total: IntCounter,
 }
 
 /// Owns the receiving half of the latency histogram and periodically drains + publishes
@@ -104,6 +205,7 @@ pub struct Metrics {
 /// background task other than via `start`.
 pub struct MetricReporter {
     transaction_committed_latency: Mutex<HistogramReporter<Duration>>,
+    proposed_block_size_bytes: Mutex<HistogramReporter<usize>>,
 }
 
 /// Publishes a `PreciseHistogram<T>` as a `name{v="..."}` gauge vector: exact count, sum,
@@ -121,6 +223,12 @@ pub trait AsPrometheusMetric {
 impl AsPrometheusMetric for Duration {
     fn as_prometheus_metric(&self) -> i64 {
         self.as_micros() as i64
+    }
+}
+
+impl AsPrometheusMetric for usize {
+    fn as_prometheus_metric(&self) -> i64 {
+        *self as i64
     }
 }
 
@@ -167,12 +275,18 @@ impl Metrics {
     /// only worker's copy is ever observed into in Phase 2 (see PHASE2-NOTES.md).
     pub fn new(registry: &Registry) -> (Arc<Self>, Arc<MetricReporter>) {
         let (transaction_committed_latency_hist, transaction_committed_latency) = histogram();
+        let (proposed_block_size_bytes_hist, proposed_block_size_bytes) = histogram();
 
         let reporter = MetricReporter {
             transaction_committed_latency: Mutex::new(HistogramReporter::new_in_registry(
                 transaction_committed_latency_hist,
                 registry,
                 "transaction_committed_latency",
+            )),
+            proposed_block_size_bytes: Mutex::new(HistogramReporter::new_in_registry(
+                proposed_block_size_bytes_hist,
+                registry,
+                "proposed_block_size_bytes",
             )),
         };
 
@@ -287,9 +401,113 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            bytes_sent_total: register_int_counter_with_registry!(
+                "bytes_sent_total",
+                "Total bytes physically written to the wire (length prefix included)",
+                registry,
+            )
+            .unwrap(),
+            bytes_received_total: register_int_counter_with_registry!(
+                "bytes_received_total",
+                "Total bytes physically read from the wire (length prefix included)",
+                registry,
+            )
+            .unwrap(),
+            network_messages_sent_total: register_int_counter_vec_with_registry!(
+                "network_messages_sent_total",
+                "Wire messages sent, by type",
+                &["type"],
+                registry,
+            )
+            .unwrap(),
+            network_messages_received_total: register_int_counter_vec_with_registry!(
+                "network_messages_received_total",
+                "Wire messages received, by type",
+                &["type"],
+                registry,
+            )
+            .unwrap(),
+            network_bytes_sent_total: register_int_counter_vec_with_registry!(
+                "network_bytes_sent_total",
+                "Serialized bytes sent, by type (no frame prefix)",
+                &["type"],
+                registry,
+            )
+            .unwrap(),
+            network_bytes_received_total: register_int_counter_vec_with_registry!(
+                "network_bytes_received_total",
+                "Serialized bytes received, by type (no frame prefix)",
+                &["type"],
+                registry,
+            )
+            .unwrap(),
+            submitted_transactions: register_int_counter_with_registry!(
+                "submitted_transactions",
+                "Total transactions received by the worker's BatchMaker from a client",
+                registry,
+            )
+            .unwrap(),
+            submitted_transactions_bytes: register_int_counter_with_registry!(
+                "submitted_transactions_bytes",
+                "Total bytes of transactions received by the worker's BatchMaker from a client",
+                registry,
+            )
+            .unwrap(),
+            proposed_block_size_bytes,
+            utilization_timer: register_int_counter_vec_with_registry!(
+                "utilization_timer",
+                "VantageCore busy time in microseconds, by proc (section name)",
+                &["proc"],
+                registry,
+            )
+            .unwrap(),
+            core_queue_length: register_int_gauge_with_registry!(
+                "core_queue_length",
+                "VantageCore's own inbound-message channel depth",
+                registry,
+            )
+            .unwrap(),
+            protocol_info: register_int_gauge_vec_with_registry!(
+                "protocol_info",
+                "Write-once at boot: which protocol this node is running (value always 1)",
+                &["protocol"],
+                registry,
+            )
+            .unwrap(),
+            transaction_mode_info: register_int_gauge_vec_with_registry!(
+                "transaction_mode_info",
+                "Write-once: which client transaction-payload mode this run uses (value always 1)",
+                &["mode"],
+                registry,
+            )
+            .unwrap(),
+            bytes_uncompressed_sent_total: register_int_counter_with_registry!(
+                "bytes_uncompressed_sent_total",
+                "Sum of pre-compression serialized sizes (only incremented when compress_network is on)",
+                registry,
+            )
+            .unwrap(),
         };
 
         (Arc::new(metrics), Arc::new(reporter))
+    }
+
+    /// METRICS-DASHBOARD-SPEC.md §8: write-once at boot (`Primary::spawn`/
+    /// `Worker::spawn`, both always know `parameters.protocol`).
+    pub fn set_protocol_info(&self, protocol: &str) {
+        self.protocol_info.with_label_values(&[protocol]).set(1);
+    }
+
+    /// METRICS-DASHBOARD-SPEC.md §8: write-once, where the caller knows the client's
+    /// tx-generation mode. Only `node local-benchmark` (the in-process vehicle) has
+    /// this in scope at registry-construction time -- the standalone `node run
+    /// primary`/`node run worker` path (what `fab remote` execs) has no channel
+    /// carrying the separate `benchmark_client` process's `--mode` into a primary/
+    /// worker's own registry, so this simply isn't called there and the gauge family
+    /// stays absent (not a misleading zero) on that path. Documented scope decision,
+    /// METRICS-NOTES.md.
+    pub fn set_transaction_mode_info(&self, mode: &str) {
+        self.transaction_mode_info.with_label_values(&[mode]).set(1);
     }
 }
 
@@ -321,5 +539,9 @@ impl MetricReporter {
         let mut latency = self.transaction_committed_latency.lock().unwrap();
         latency.receive_all();
         latency.report();
+
+        let mut block_size = self.proposed_block_size_bytes.lock().unwrap();
+        block_size.receive_all();
+        block_size.report();
     }
 }

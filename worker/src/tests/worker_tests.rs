@@ -31,7 +31,10 @@ async fn handle_clients_transactions() {
     // Spawn enough workers' listeners to acknowledge our batches.
     for (_, addresses) in committee.others_workers(&name, &id) {
         let address = addresses.worker_to_worker;
-        let _ = listener(address, /* expected */ None);
+        // Fire-and-forget: `tokio::spawn` inside `listener` already scheduled the task
+        // by the time it returns the handle, so dropping the handle doesn't cancel it
+        // -- we just don't need to await this one's completion.
+        drop(listener(address, /* expected */ None));
     }
 
     // Send enough transactions to create a batch.

@@ -6,6 +6,14 @@
 // sockets or sleeps) so tests are fast and deterministic. Shared by
 // `integration_tests.rs`, `crash_fault_tests.rs`, and `convergence_tests.rs`.
 
+// clippy::needless_range_loop: this harness builds N-party fixtures with `for i in
+// 0..n` throughout, indexing several parallel per-party collections (nodes, keys,
+// addresses) at once inside each loop body -- clippy's own iterator rewrite handles
+// one collection at a time and would need `.zip()`-chaining several iterators per
+// loop for no real readability gain over the current explicit index; test-only code,
+// not hiding any dead logic.
+#![allow(clippy::needless_range_loop)]
+
 use super::common::*;
 use crate::primary::View;
 use crate::vantage::agb::{AgbEngine, TimerKind};

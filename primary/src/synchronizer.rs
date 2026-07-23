@@ -1,7 +1,4 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-use crate::{DagError, Height};
+use crate::Height;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
@@ -12,7 +9,7 @@ use crypto::{Digest, PublicKey};
 use log::debug;
 use std::collections::HashMap;
 use store::Store;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 
 /// The `Synchronizer` checks if we have all batches and parents referenced by a header. If we don't, it sends
 /// a command to the `Waiter` to request the missing data.
@@ -24,7 +21,16 @@ pub struct Synchronizer {
     store: Store,
     /// Send commands to the `HeaderWaiter`.
     tx_header_waiter: Sender<WaiterMessage>,
-    /// Send commands to the `CertificateWaiter`.
+    /// Send commands to the `CertificateWaiter`. Currently never sent on (no call site
+    /// in this file constructs a message for it) -- kept as a stored, live channel
+    /// handle rather than deleted: dropping it here would drop the sole `Sender` this
+    /// constructor is handed at the one call site (`primary.rs`), closing
+    /// `CertificateWaiter`'s receiver early. Since the channel is genuinely never fed
+    /// either way, this is a no-op-preserving choice, not a functional change; removing
+    /// the field cleanly would mean also removing the parameter and its call site
+    /// plumbing, which is out of this cleanup's scope (touches cross-file wiring for a
+    /// field with no correctness weight either way).
+    #[allow(dead_code)]
     tx_certificate_waiter: Sender<Certificate>,
     /// Genesis header
     genesis_headers: HashMap<PublicKey, Header>,
@@ -108,8 +114,8 @@ impl Synchronizer {
                 for (pk, proposal) in proposals {
                     //println!("proposal inside prepare");
 
-                    if proposal.header_digest == self.genesis_headers.get(&pk).unwrap().digest() {
-                        proposals_vector.push(self.genesis_headers.get(&pk).unwrap().clone());
+                    if proposal.header_digest == self.genesis_headers.get(pk).unwrap().digest() {
+                        proposals_vector.push(self.genesis_headers.get(pk).unwrap().clone());
                         continue;
                     }
 
@@ -131,8 +137,8 @@ impl Synchronizer {
             ConsensusMessage::Confirm { slot: _, view: _, qc: _, proposals } => {
                 for (pk, proposal) in proposals {
 
-                    if proposal.header_digest == self.genesis_headers.get(&pk).unwrap().digest() {
-                        proposals_vector.push(self.genesis_headers.get(&pk).unwrap().clone());
+                    if proposal.header_digest == self.genesis_headers.get(pk).unwrap().digest() {
+                        proposals_vector.push(self.genesis_headers.get(pk).unwrap().clone());
                         continue;
                     }
 
@@ -148,8 +154,8 @@ impl Synchronizer {
                     if proposal.height == 0 {
                         continue;
                     }
-                    if proposal.header_digest == self.genesis_headers.get(&pk).unwrap().digest() {
-                        proposals_vector.push(self.genesis_headers.get(&pk).unwrap().clone());
+                    if proposal.header_digest == self.genesis_headers.get(pk).unwrap().digest() {
+                        proposals_vector.push(self.genesis_headers.get(pk).unwrap().clone());
                         continue;
                     }
 

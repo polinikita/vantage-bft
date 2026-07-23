@@ -1,12 +1,9 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 // Copyright(C) Facebook, Inc. and its affiliates.
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, Arg, ArgAction, ArgMatches, Command};
 use config::Export as _;
 use config::Import as _;
-use config::{Committee, KeyPair, Parameters, Protocol, WorkerId};
+use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::SignatureService;
 use env_logger::Env;
 use primary::Header;
@@ -116,11 +113,14 @@ async fn main() -> Result<()> {
                     .default_value("autobahn-optimistic")
                     .value_parser(["autobahn-optimistic", "autobahn-seamless", "vantage"])
                     .action(ArgAction::Set).help("Consensus protocol"))
-                .arg(Arg::new("mode").long("mode").value_name("MODE").default_value("all-zero")
+                .arg(Arg::new("mode").long("mode").value_name("MODE").default_value("random")
                     .value_parser(["all-zero", "random"])
-                    .action(ArgAction::Set).help("Transaction payload mode"))
+                    .action(ArgAction::Set).help("Transaction payload mode (default 'random' as \
+                        of METRICS-DASHBOARD-SPEC.md §8 -- pin '--mode all-zero' explicitly for \
+                        comparability with historical gate/sweep numbers, all of which are \
+                        all-zero)"))
                 .arg(Arg::new("duration").long("duration").value_name("INT").default_value("60")
-                    .action(ArgAction::Set).help("Benchmark duration in seconds"))
+                    .action(ArgAction::Set).help("Benchmark duration in seconds (0 = run until Ctrl-C)"))
                 .arg(Arg::new("base-port").long("base-port").value_name("INT").default_value("4000")
                     .action(ArgAction::Set).help("First port allocated (127.0.0.1)"))
                 .arg(Arg::new("data-dir").long("data-dir").value_name("PATH").default_value(".local-bench")
@@ -159,7 +159,11 @@ async fn main() -> Result<()> {
                         injection, read-only reference: \
                         ~/code/starfish/crates/starfish-core/src/network.rs). Takes precedence \
                         over --mimic-latency-ms. Unset (default) = zero injected delay, \
-                        current behavior unchanged for both protocols.")),
+                        current behavior unchanged for both protocols."))
+                .arg(Arg::new("compress-network").long("compress-network").action(ArgAction::SetTrue)
+                    .help("METRICS-DASHBOARD-SPEC.md §8: lz4-compress every wire message \
+                        (network crate, all protocols identically). Off by default -- \
+                        byte-identical framing when off.")),
         )
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -246,7 +250,7 @@ async fn run(matches: &ArgMatches) -> Result<()> {
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
     // Channel for sending headers between DAG and Consensus
-    let (tx_sailfish, rx_sailfish) = channel(CHANNEL_CAPACITY);
+    let (tx_sailfish, _rx_sailfish) = channel(CHANNEL_CAPACITY);
 
     // Channel for sending loopback headerds that completed validation between DAG and Consensus
     //let (tx_validation, rx_validation) = channel(CHANNEL_CAPACITY);
@@ -259,11 +263,11 @@ async fn run(matches: &ArgMatches) -> Result<()> {
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         Some(("primary", _)) => {
-            let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
-            let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+            let (tx_new_certificates, _rx_new_certificates) = channel(CHANNEL_CAPACITY);
+            let (_tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
             let (tx_committer, rx_committer) = channel(CHANNEL_CAPACITY);
-            let (tx_pushdown_cert, rx_pushdown_cert) = channel(CHANNEL_CAPACITY);
-            let(tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
+            let (_tx_pushdown_cert, rx_pushdown_cert) = channel(CHANNEL_CAPACITY);
+            let(_tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
 
             Primary::spawn(
                 name,

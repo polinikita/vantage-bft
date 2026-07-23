@@ -27,3 +27,11 @@ scripts/build_and_fab
 # `node local-benchmark` (PHASE2-SPEC.md #8) per-node stores/reference config.
 .local-bench/
 .local-bench*/
+
+# local-dryrun/ (METRICS-DASHBOARD-SPEC.md #5) default data dir: per-node
+# stores/prometheus.yaml from `local-dryrun/dryrun.py` runs.
+/local-dryrun/data/
+
+# `fab monitor` (METRICS-DASHBOARD-SPEC.md #4) generated Prometheus target list --
+# regenerated per committee, not committed.
+/monitoring/prometheus-remote.yaml

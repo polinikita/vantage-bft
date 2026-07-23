@@ -9,7 +9,9 @@ use log::{debug, error};
 use metrics::Metrics;
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "benchmark")]
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
@@ -52,8 +54,9 @@ pub struct Synchronizer {
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
     /// Starfish-parity real transaction latency (PHASE2-SPEC.md #5). Always present
     /// (the metrics server and its registered gauge shape are always on), but only
-    /// observed into under the `benchmark` feature.
-    #[allow(dead_code)]
+    /// observed into under the `benchmark` feature -- genuinely unused (not dead
+    /// code to delete) on the default build, hence the feature-scoped allow.
+    #[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
     metrics: Arc<Metrics>,
     /// Batch digests already accounted for in `metrics`, so a `Committed` notification
     /// for the same digest (should one ever arrive twice) is not double-counted.
@@ -64,6 +67,7 @@ pub struct Synchronizer {
 }
 
 impl Synchronizer {
+    // clippy::too_many_arguments: see primary/src/committer.rs's identical justification.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -75,6 +79,8 @@ impl Synchronizer {
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
         metrics: Arc<Metrics>,
+        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention as `metrics`.
+        compress_network: bool,
     ) {
         tokio::spawn(async move {
             Self {
@@ -86,7 +92,7 @@ impl Synchronizer {
                 sync_retry_delay,
                 sync_retry_nodes,
                 rx_message,
-                network: SimpleSender::new(),
+                network: SimpleSender::new().with_metrics(metrics.clone()).with_compression(compress_network),
                 round: Round::default(),
                 pending: HashMap::new(),
                 metrics,
@@ -172,7 +178,7 @@ impl Synchronizer {
                         };
                         let message = WorkerMessage::BatchRequest(missing, self.name);
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-                        self.network.send(address, Bytes::from(serialized)).await;
+                        self.network.send_typed(address, Bytes::from(serialized), "BatchRequest").await;
                     },
                     PrimaryWorkerMessage::Cleanup(round) => {
                         // Keep track of the primary's round number.
@@ -191,10 +197,13 @@ impl Synchronizer {
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
                     }
+                    // Benchmark-only: extracting/observing per-tx timestamps on every
+                    // committed batch is pure overhead outside instrumented runs --
+                    // both parameters genuinely go unused on the default build, hence
+                    // the feature-scoped allow (not dead code to delete).
+                    #[cfg_attr(not(feature = "benchmark"), allow(unused_variables))]
                     PrimaryWorkerMessage::Committed(commit_millis, digests) => {
                         // Starfish-parity real transaction latency (PHASE2-SPEC.md #5).
-                        // Benchmark-only: extracting/observing per-tx timestamps on every
-                        // committed batch is pure overhead outside instrumented runs.
                         #[cfg(feature = "benchmark")]
                         self.observe_committed(commit_millis, digests).await;
                     }
@@ -237,7 +246,7 @@ impl Synchronizer {
                         let message = WorkerMessage::BatchRequest(retry, self.name);
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
                         self.network
-                            .lucky_broadcast(addresses, Bytes::from(serialized), self.sync_retry_nodes)
+                            .lucky_broadcast_typed(addresses, Bytes::from(serialized), self.sync_retry_nodes, "BatchRequest")
                             .await;
                     }
 

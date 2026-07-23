@@ -3,12 +3,18 @@ use super::*;
 use super::panic;
 use crate::{common::{
     certificate, committee, committee_with_base_port, header, headers, keys, listener, votes, special_header, special_votes, header_from_cert,
-}, proposer::Proposer, header_waiter::HeaderWaiter};
+}, header_waiter::HeaderWaiter};
 use config::Parameters;
-use crypto::{Hash, Signature};
+use crypto::Hash;
 use std::{fs, time::Duration};
 use tokio::{sync::mpsc::channel, time::sleep};
 use serial_test::serial;
+
+/// METRICS-DASHBOARD-SPEC.md §1: a fresh, disposable metrics handle for tests that
+/// don't care about wire counters, matching every other `Core::spawn` caller's shape.
+fn test_metrics() -> std::sync::Arc<Metrics> {
+    Metrics::new(&prometheus::Registry::new()).0
+}
 
 #[tokio::test]
 #[ignore = "pre-existing: stale expectation that the Core's first broadcast is a bare Vote; the current ride-share/parallel-proposal path emits otherwise, so the assertion fails; predates Phase 2 (see PHASE2-NOTES.md core_tests inventory)"]
@@ -30,7 +36,7 @@ async fn process_header() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -59,7 +65,7 @@ async fn process_header() {
     let leader_elector = LeaderElector::new(committee.clone());
 
     let parameters = Parameters::default();
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     // Spawn the core.
     Core::spawn(
@@ -86,13 +92,15 @@ async fn process_header() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
     // Send a header to the core.
@@ -123,7 +131,7 @@ async fn process_header_missing_parent() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
@@ -137,7 +145,7 @@ async fn process_header_missing_parent() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -154,7 +162,7 @@ async fn process_header_missing_parent() {
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -183,13 +191,15 @@ async fn process_header_missing_parent() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
     let header_one = header();
@@ -225,7 +235,7 @@ async fn process_header_invalid_height() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header_missing_parent";
@@ -242,7 +252,7 @@ async fn process_header_invalid_height() {
     );
 
     let leader_elector = LeaderElector::new(committee().clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -271,13 +281,15 @@ async fn process_header_invalid_height() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
     // Send a header to the core.
@@ -315,7 +327,7 @@ async fn process_header_missing_payload() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
 
     // Create a new test store.
@@ -333,7 +345,7 @@ async fn process_header_missing_payload() {
     );
 
     let leader_elector = LeaderElector::new(committee().clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -362,13 +374,15 @@ async fn process_header_missing_payload() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
     // Send a header to the core.
@@ -403,14 +417,14 @@ async fn process_votes() {
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
-    let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_info, _rx_info) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
 
     // Create a new test store.
     let path = ".db_test_process_vote";
     let _ = fs::remove_dir_all(path);
-    let mut store = Store::new(path).unwrap();
+    let store = Store::new(path).unwrap();
 
     // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
@@ -422,7 +436,7 @@ async fn process_votes() {
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -451,13 +465,15 @@ async fn process_votes() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
@@ -514,13 +530,13 @@ async fn process_certificates() {
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(3);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
-    let (tx_headers, rx_headers) = channel(1);
-    let (tx_parents, mut rx_parents) = channel(1);
+    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, mut rx_committer) = channel(3);
+    let(tx_committer, _rx_committer) = channel(3);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_certificates";
@@ -537,7 +553,7 @@ async fn process_certificates() {
     );
 
     let leader_elector = LeaderElector::new(committee().clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -566,26 +582,28 @@ async fn process_certificates() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
     // Send enough certificates to the core.
     let certificates: Vec<Certificate> = headers()
         .iter()
-        .map(|header| certificate(header))
+        .map(certificate)
         .collect();
 
     // Send enough headers to the core.
     let headers_from_certs: Vec<Header> = certificates
         .iter()
-        .map(|cert| header_from_cert(cert))
+        .map(header_from_cert)
         .collect();
 
 
@@ -622,7 +640,7 @@ async fn process_prepare() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
@@ -636,7 +654,7 @@ async fn process_prepare() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -660,7 +678,7 @@ async fn process_prepare() {
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -689,13 +707,15 @@ async fn process_prepare() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
@@ -758,7 +778,7 @@ async fn generate_confirm() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
@@ -772,15 +792,15 @@ async fn generate_confirm() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
     let _ = fs::remove_dir_all(path);
-    let mut store = Store::new(path).unwrap();
+    let store = Store::new(path).unwrap();
 
     // Spawn a listener to receive the vote.
-    let address = committee
+    let _address = committee
         .primary(&header().author)
         .unwrap()
         .primary_to_primary;
@@ -796,7 +816,7 @@ async fn generate_confirm() {
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -825,13 +845,15 @@ async fn generate_confirm() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
@@ -910,7 +932,7 @@ async fn generate_commit() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
@@ -918,21 +940,21 @@ async fn generate_commit() {
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
-    let (tx_headers, mut rx_headers) = channel(1);
+    let (tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
     let(tx_committer, mut rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
     let _ = fs::remove_dir_all(path);
-    let mut store = Store::new(path).unwrap();
+    let store = Store::new(path).unwrap();
 
     // Spawn a listener to receive the vote.
-    let address = committee
+    let _address = committee
         .primary(&header().author)
         .unwrap()
         .primary_to_primary;
@@ -948,7 +970,7 @@ async fn generate_commit() {
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
 
     let parameters = Parameters::default();
@@ -978,13 +1000,15 @@ async fn generate_commit() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
@@ -1047,7 +1071,7 @@ async fn generate_commit() {
 
     let confirm_message = rx_info.recv().await.unwrap();
     match confirm_message.clone() {
-        ConsensusMessage::Confirm { slot, view, qc, proposals: _ } => {
+        ConsensusMessage::Confirm { slot: _, view: _, qc: _, proposals: _ } => {
             consensus_messages.clear();
             consensus_messages.insert(confirm_message.digest().clone(), confirm_message.clone());
             
@@ -1078,35 +1102,29 @@ async fn generate_commit() {
             let commit_message = rx_info.recv().await.unwrap();
             rx_parents.recv().await.unwrap();
 
-            match commit_message.clone() {
-                ConsensusMessage::Commit { slot: slot1, view: view1, qc: qc1, proposals: proposals1 } => {
-                    consensus_messages.clear();
-                    consensus_messages.insert(commit_message.digest().clone(), commit_message.clone());
-                    
-                    let commit_parent_cert = certificate(&confirm_header);
-                    let commit_header = special_header(commit_parent_cert, consensus_messages.clone());
+            if let ConsensusMessage::Commit { slot: slot1, view: view1, qc: _qc1, proposals: _proposals1 } = commit_message.clone() {
+                consensus_messages.clear();
+                consensus_messages.insert(commit_message.digest().clone(), commit_message.clone());
+                
+                let commit_parent_cert = certificate(&confirm_header);
+                let commit_header = special_header(commit_parent_cert, consensus_messages.clone());
 
-                    //println!("sending commit header: {:?}, {:?}", commit_header.height, commit_header.author);
-                    
-                    // Ensure that the confirm header is processed and received
-                    //sleep(Duration::from_millis(500)).await;
-                    tx_headers
-                        .send(commit_header)
-                        .await
-                        .unwrap();
+                //println!("sending commit header: {:?}, {:?}", commit_header.height, commit_header.author);
+                
+                // Ensure that the confirm header is processed and received
+                //sleep(Duration::from_millis(500)).await;
+                tx_headers
+                    .send(commit_header)
+                    .await
+                    .unwrap();
 
 
-                    //println!("awaiting committer");
-                    let receive_commit_message = rx_committer.recv().await.unwrap();
-                    match receive_commit_message {
-                        ConsensusMessage::Commit { slot: slot2, view: view2, qc: qc2, proposals: proposals2 } => {
-                            assert_eq!(slot1, slot2);
-                            assert_eq!(view1, view2);
-                        },
-                        _ => {},
-                    };
-                },
-                _ => {},
+                //println!("awaiting committer");
+                let receive_commit_message = rx_committer.recv().await.unwrap();
+                if let ConsensusMessage::Commit { slot: slot2, view: view2, qc: _qc2, proposals: _proposals2 } = receive_commit_message {
+                    assert_eq!(slot1, slot2);
+                    assert_eq!(view1, view2);
+                };
             };
         },
         _ => panic!("Wrong message type"),
@@ -1119,7 +1137,7 @@ async fn generate_pipelined_prepare() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
@@ -1133,7 +1151,7 @@ async fn generate_pipelined_prepare() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -1157,7 +1175,7 @@ async fn generate_pipelined_prepare() {
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -1186,13 +1204,15 @@ async fn generate_pipelined_prepare() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
@@ -1235,7 +1255,7 @@ async fn generate_pipelined_prepare() {
         .iter()
         .rev()
         .skip(1)
-        .map(|header| certificate(header))
+        .map(certificate)
         .collect();
 
     // Send enough headers to the core.
@@ -1243,7 +1263,7 @@ async fn generate_pipelined_prepare() {
         .iter()
         .rev()
         .skip(1)
-        .map(|cert| header_from_cert(cert))
+        .map(header_from_cert)
         .collect();
 
 
@@ -1267,12 +1287,9 @@ async fn generate_pipelined_prepare() {
     listener(address).await.unwrap();
     let output_message = rx_info.recv().await.unwrap();
 
-    match output_message {
-        ConsensusMessage::Prepare { slot, view, tc: _, qc_ticket: _, proposals: _ } => {
-            assert_eq!(slot, 2);
-            assert_eq!(view, 1);
-        },
-        _ => {}
+    if let ConsensusMessage::Prepare { slot, view, tc: _, qc_ticket: _, proposals: _ } = output_message {
+        assert_eq!(slot, 2);
+        assert_eq!(view, 1);
     };
 
 
@@ -1291,33 +1308,33 @@ async fn local_timeout_view() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
-    let (tx_primary_messages, rx_primary_messages) = channel(1);
+    let (_tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
-    let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_info, _rx_info) = channel(1);
+    let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
     let _ = fs::remove_dir_all(path);
-    let mut store = Store::new(path).unwrap();
+    let store = Store::new(path).unwrap();
 
     // Spawn a listener to receive the vote.
     let address = committee
         .primary(&header().author)
         .unwrap()
         .primary_to_primary;
-    let handle = listener(address);
+    let _handle = listener(address);
 
     // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
@@ -1329,7 +1346,7 @@ async fn local_timeout_view() {
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
-    let timeout_delay = 1000;
+    let _timeout_delay = 1000;
 
     let parameters = Parameters::default();
 
@@ -1358,13 +1375,15 @@ async fn local_timeout_view() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
@@ -1385,7 +1404,7 @@ async fn sync_missing_proposals() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
@@ -1407,7 +1426,7 @@ async fn sync_missing_proposals() {
     let mut store = Store::new(path).unwrap();
 
     // Spawn a listener to receive the vote.
-    let address = committee
+    let _address = committee
         .primary(&header().author)
         .unwrap()
         .primary_to_primary;
@@ -1452,13 +1471,15 @@ async fn sync_missing_proposals() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        test_metrics(),
+        false,
     );
 
 
@@ -1477,9 +1498,11 @@ async fn sync_missing_proposals() {
         50, 
         timeout_delay, 
         1, 
-        rx_sync_headers, 
-        tx_headers_loopback, 
+        rx_sync_headers,
+        tx_headers_loopback,
         tx_header_waiter_instances,
+        test_metrics(),
+        false,
     );
 
     // Send headers to the core, so they won't request sync

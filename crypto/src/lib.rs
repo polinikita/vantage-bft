@@ -38,13 +38,13 @@ impl Digest {
 
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", BASE64_STANDARD.encode(&self.0))
+        write!(f, "{}", BASE64_STANDARD.encode(self.0))
     }
 }
 
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", BASE64_STANDARD.encode(&self.0).get(0..16).unwrap())
+        write!(f, "{}", BASE64_STANDARD.encode(self.0).get(0..16).unwrap())
     }
 }
 
@@ -224,7 +224,7 @@ impl Signature {
         dalek::verify_batch(&messages[..], &signatures[..], &keys[..])
     }
 
-    pub fn verify_batch_multi<'a, I>(digests: &Vec<Digest>, votes: I) -> Result<(), CryptoError>
+    pub fn verify_batch_multi<'a, I>(digests: &[Digest], votes: I) -> Result<(), CryptoError>
     where
         I: IntoIterator<Item = &'a (PublicKey, Signature)>,
     {

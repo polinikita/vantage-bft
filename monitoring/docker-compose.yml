@@ -1,15 +1,26 @@
-# Optional monitoring stack for `node local-benchmark` (PHASE2-SPEC.md #8).
-# Deliberate deviation from starfish's own docker-compose: starfish also dockerizes the
-# node processes themselves (one `dry-run` container per authority); here the nodes run
-# natively in one process (`node local-benchmark`), so this compose file brings up only
-# the stock prometheus+grafana containers, reaching the native nodes' metrics endpoints
-# via `host.docker.internal` (see the generated `<data-dir>/prometheus.yaml`).
+# Optional monitoring stack for `node local-benchmark` (PHASE2-SPEC.md #8), also
+# reused unmodified for orchestration-mode (AWS) monitoring (METRICS-DASHBOARD-SPEC.md
+# §4). Deliberate deviation from starfish's own docker-compose: starfish also
+# dockerizes the node processes themselves (one `dry-run` container per authority);
+# here the nodes run natively in one process (`node local-benchmark`), so this compose
+# file brings up only the stock prometheus+grafana containers, reaching the native
+# nodes' metrics endpoints via `host.docker.internal` (see the generated
+# `<data-dir>/prometheus.yaml`).
 #
-# Usage (from the repository root, after starting `node local-benchmark` in another
-# terminal so `.local-bench/prometheus.yaml` exists):
+# Local mode usage (from the repository root, after starting `node local-benchmark` in
+# another terminal so `.local-bench/prometheus.yaml` exists):
 #   docker compose -f monitoring/docker-compose.yml up -d
 # Grafana: http://localhost:3003 (anonymous admin, no login needed).
 # Prometheus: http://localhost:9095
+#
+# Orchestration mode (AWS, after `fab remote` has written benchmark/.committee.json):
+#   cd benchmark && fab monitor   # writes ../monitoring/prometheus-remote.yaml
+#   PROMETHEUS_CONFIG=../monitoring/prometheus-remote.yaml \
+#       docker compose -f monitoring/docker-compose.yml up -d
+# Same containers, same dashboard, same ports -- only which target list prometheus
+# scrapes changes (`PROMETHEUS_CONFIG` defaults to the local-benchmark path below, so
+# plain `docker compose up -d` with no env var is unchanged local-mode behavior). See
+# monitoring/README.md for the full walkthrough of both flows.
 #
 # Host ports 3003/9095 (not starfish's own 3002/9093): this machine's Docker Desktop
 # already holds 3001/3002, and starfish's own local-dryrun compose collides with 9093.
@@ -20,7 +31,7 @@ services:
     ports:
       - "9095:9090"
     volumes:
-      - ../.local-bench/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ${PROMETHEUS_CONFIG:-../.local-bench/prometheus.yaml}:/etc/prometheus/prometheus.yml:ro
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"

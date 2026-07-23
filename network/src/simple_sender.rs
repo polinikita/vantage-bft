@@ -1,14 +1,17 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
+use crate::reliable_sender::record_typed_sent;
 use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use log::{info, warn};
+use metrics::Metrics;
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -29,6 +32,10 @@ pub struct SimpleSender {
     /// latency, empty by default (current behavior, byte-identical). See
     /// `network/src/lib.rs`'s module doc for the injection point/semantics.
     latency: HashMap<SocketAddr, Duration>,
+    /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::metrics`.
+    metrics: Option<Arc<Metrics>>,
+    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::compress`.
+    compress: bool,
 }
 
 impl std::default::Default for SimpleSender {
@@ -43,6 +50,8 @@ impl SimpleSender {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
             latency: HashMap::new(),
+            metrics: None,
+            compress: false,
         }
     }
 
@@ -54,11 +63,24 @@ impl SimpleSender {
         self
     }
 
+    /// METRICS-DASHBOARD-SPEC.md §1: attach a wire-metrics handle (same contract as
+    /// `ReliableSender::with_metrics`).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::with_compression`.
+    pub fn with_compression(mut self, enabled: bool) -> Self {
+        self.compress = enabled;
+        self
+    }
+
     /// Helper function to spawn a new connection.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(1_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        Connection::spawn(address, rx, extra_latency);
+        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.compress);
         tx
     }
 
@@ -98,6 +120,33 @@ impl SimpleSender {
         addresses.truncate(nodes);
         self.broadcast(addresses, data).await
     }
+
+    /// METRICS-DASHBOARD-SPEC.md §1: typed variant of `send` (see `ReliableSender::
+    /// send_typed`).
+    pub async fn send_typed(&mut self, address: SocketAddr, data: Bytes, msg_type: &'static str) {
+        record_typed_sent(&self.metrics, msg_type, data.len());
+        self.send(address, data).await;
+    }
+
+    /// Typed variant of `broadcast`.
+    pub async fn broadcast_typed(&mut self, addresses: Vec<SocketAddr>, data: Bytes, msg_type: &'static str) {
+        for address in addresses {
+            self.send_typed(address, data.clone(), msg_type).await;
+        }
+    }
+
+    /// Typed variant of `lucky_broadcast`.
+    pub async fn lucky_broadcast_typed(
+        &mut self,
+        mut addresses: Vec<SocketAddr>,
+        data: Bytes,
+        nodes: usize,
+        msg_type: &'static str,
+    ) {
+        addresses.shuffle(&mut self.rng);
+        addresses.truncate(nodes);
+        self.broadcast_typed(addresses, data, msg_type).await
+    }
 }
 
 /// A connection is responsible to establish and keep alive (if possible) a connection with a single peer.
@@ -109,13 +158,34 @@ struct Connection {
     /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): this connection's own fixed
     /// artificial one-way delay to `address` (`Duration::ZERO` = off, the default).
     extra_latency: Duration,
+    /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::Connection::metrics`.
+    metrics: Option<Arc<Metrics>>,
+    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::Connection::compress`.
+    compress: bool,
 }
 
 impl Connection {
-    fn spawn(address: SocketAddr, receiver: Receiver<Bytes>, extra_latency: Duration) {
+    fn spawn(
+        address: SocketAddr,
+        receiver: Receiver<Bytes>,
+        extra_latency: Duration,
+        metrics: Option<Arc<Metrics>>,
+        compress: bool,
+    ) {
         tokio::spawn(async move {
-            Self { address, receiver, extra_latency }.run().await;
+            Self { address, receiver, extra_latency, metrics, compress }.run().await;
         });
+    }
+
+    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::wire_bytes`.
+    fn wire_bytes(&self, data: &Bytes) -> Bytes {
+        if !self.compress {
+            return data.clone();
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.bytes_uncompressed_sent_total.inc_by(data.len() as u64);
+        }
+        Bytes::from(lz4_flex::compress_prepend_size(data))
     }
 
     /// Main loop trying to connect to the peer and transmit messages. D7-3 (PHASE7-
@@ -158,9 +228,14 @@ impl Connection {
             tokio::select! {
                 () = due, if !delay_queue.is_empty() => {
                     let (_, data) = delay_queue.pop_front().unwrap();
-                    if let Err(e) = writer.send(data).await {
+                    let wire = self.wire_bytes(&data);
+                    let len = wire.len();
+                    if let Err(e) = writer.send(wire).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                         return;
+                    }
+                    if let Some(metrics) = &self.metrics {
+                        metrics.bytes_sent_total.inc_by(len as u64 + 4);
                     }
                 },
                 Some(data) = self.receiver.recv() => {

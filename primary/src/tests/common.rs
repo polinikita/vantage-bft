@@ -10,7 +10,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::vec;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -31,14 +30,14 @@ pub fn committee() -> Committee {
             .enumerate()
             .map(|(i, (id, _))| {
                 let consensus = ConsensusAddresses {
-                    consensus_to_consensus: format!("127.0.0.1:{}", 0 + i).parse().unwrap(),
+                    consensus_to_consensus: format!("127.0.0.1:{}", i).parse().unwrap(),
                 };
                 let primary = PrimaryAddresses {
                     primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
                     worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
                     metrics: format!("127.0.0.1:{}", 600 + i).parse().unwrap(),
                 };
-                let workers = vec![(
+                let workers = [(
                     0,
                     WorkerAddresses {
                         primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
@@ -163,7 +162,7 @@ pub fn headers() -> Vec<Header> {
 }
 
 pub fn header_from_cert(certificate: &Certificate) -> Header {
-    let mut right_key: Vec<(PublicKey, SecretKey)> = keys().into_iter().filter(|(pk, sk)| *pk == certificate.author).collect();
+    let mut right_key: Vec<(PublicKey, SecretKey)> = keys().into_iter().filter(|(pk, _sk)| *pk == certificate.author).collect();
     let secret = right_key.pop().unwrap().1;
 
     let header = Header {
@@ -233,7 +232,7 @@ pub fn certificate(header: &Header) -> Certificate {
         author: header.origin(),
         header_digest: header.digest(),
         height: header.height,
-        votes: votes(&header)
+        votes: votes(header)
             .into_iter()
             .map(|x| (x.author, x.signature))
             .collect(),
@@ -272,19 +271,3 @@ pub fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
 
 
 //Consensus message_tests
-
-// Fixture.
-pub fn committee_basic() -> Committee {
-    Committee::new(
-        keys()
-            .into_iter()
-            .enumerate()
-            .map(|(i, (name, _))| {
-                let address = format!("127.0.0.1:{}", i).parse().unwrap();
-                let stake = 1;
-                (name, stake, address)
-            })
-            .collect(),
-        /* epoch */ //100,
-    )
-}

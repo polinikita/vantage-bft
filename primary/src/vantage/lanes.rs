@@ -675,7 +675,7 @@ impl LaneManager {
 
     fn exact_coordinate(&self, r: &BlockRef) -> bool {
         let blocks = self.blocks.lock().unwrap();
-        blocks.get(&r.2).map_or(false, |e| e.block.author == r.0 && e.block.height == r.1)
+        blocks.get(&r.2).is_some_and(|e| e.block.author == r.0 && e.block.height == r.1)
     }
 
     /// `DirectPub_i(a,k,h)` (§1 D1 / §2 N1-N3): whole prefix is both chain-valid

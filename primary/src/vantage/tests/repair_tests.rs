@@ -5,7 +5,7 @@ use crate::vantage::block::{genesis_digest, session_id};
 use crate::vantage::lanes::BlockCache;
 use crate::vantage::repair::Repairer;
 use crate::vantage::Effect;
-use crypto::{Digest, Hash as _, PublicKey};
+use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 

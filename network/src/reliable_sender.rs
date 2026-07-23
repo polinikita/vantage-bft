@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use log::{info, warn};
+use metrics::Metrics;
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -11,6 +12,7 @@ use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -37,6 +39,16 @@ pub struct ReliableSender {
     /// latency, empty by default (current behavior, byte-identical). See
     /// `network/src/lib.rs`'s module doc for the injection point/semantics.
     latency: HashMap<SocketAddr, Duration>,
+    /// METRICS-DASHBOARD-SPEC.md §1: optional wire-metrics handle, attached the same
+    /// way as `latency` (`with_metrics`, called once right after construction).
+    /// `None` by default -- every connection this sender spawns then skips the
+    /// `bytes_sent_total` accounting entirely (zero added cost on the untouched
+    /// path, mirroring `extra_latency`'s own zero-cost default).
+    metrics: Option<Arc<Metrics>>,
+    /// METRICS-DASHBOARD-SPEC.md §8: lz4 compression, off by default -- the default
+    /// (`false`) path never calls `lz4_flex::compress_prepend_size` at all, so it's
+    /// byte-identical to pre-compression behavior.
+    compress: bool,
 }
 
 impl std::default::Default for ReliableSender {
@@ -51,6 +63,8 @@ impl ReliableSender {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
             latency: HashMap::new(),
+            metrics: None,
+            compress: false,
         }
     }
 
@@ -65,11 +79,28 @@ impl ReliableSender {
         self
     }
 
+    /// METRICS-DASHBOARD-SPEC.md §8: enable lz4 compression for every connection this
+    /// sender spawns afterwards. Call before any connection is spawned (same contract
+    /// as `with_latency`/`with_metrics`).
+    pub fn with_compression(mut self, enabled: bool) -> Self {
+        self.compress = enabled;
+        self
+    }
+
+    /// METRICS-DASHBOARD-SPEC.md §1: attach a wire-metrics handle. Call once, right
+    /// after construction, before any connection is spawned -- same contract as
+    /// `with_latency`. Every `Connection` this sender spawns afterwards records its
+    /// own physical writes (length-prefix included) into `metrics.bytes_sent_total`.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Helper function to spawn a new connection.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(1_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        Connection::spawn(address, rx, extra_latency);
+        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.compress);
         tx
     }
 
@@ -119,6 +150,55 @@ impl ReliableSender {
         addresses.truncate(nodes);
         self.broadcast(addresses, data).await
     }
+
+    /// METRICS-DASHBOARD-SPEC.md §1: same as `send`, plus a `network_messages_sent_total`/
+    /// `network_bytes_sent_total` observation labeled `msg_type` (a no-op if this sender
+    /// has no metrics handle attached). `msg_type` is the wire variant name -- known at
+    /// the call site, not by this generic sender.
+    pub async fn send_typed(&mut self, address: SocketAddr, data: Bytes, msg_type: &'static str) -> CancelHandler {
+        record_typed_sent(&self.metrics, msg_type, data.len());
+        self.send(address, data).await
+    }
+
+    /// Typed variant of `broadcast` (see `send_typed`) -- records one observation per
+    /// destination, matching `bytes_sent_total`'s own per-connection counting.
+    pub async fn broadcast_typed(
+        &mut self,
+        addresses: Vec<SocketAddr>,
+        data: Bytes,
+        msg_type: &'static str,
+    ) -> Vec<CancelHandler> {
+        let mut handlers = Vec::new();
+        for address in addresses {
+            handlers.push(self.send_typed(address, data.clone(), msg_type).await);
+        }
+        handlers
+    }
+
+    /// Typed variant of `lucky_broadcast`.
+    pub async fn lucky_broadcast_typed(
+        &mut self,
+        mut addresses: Vec<SocketAddr>,
+        data: Bytes,
+        nodes: usize,
+        msg_type: &'static str,
+    ) -> Vec<CancelHandler> {
+        addresses.shuffle(&mut self.rng);
+        addresses.truncate(nodes);
+        self.broadcast_typed(addresses, data, msg_type).await
+    }
+}
+
+/// Shared by `ReliableSender`/`SimpleSender`'s `*_typed` methods: increments the two
+/// typed counters if `metrics` is attached, a no-op otherwise.
+pub(crate) fn record_typed_sent(metrics: &Option<Arc<Metrics>>, msg_type: &'static str, len: usize) {
+    if let Some(metrics) = metrics {
+        metrics.network_messages_sent_total.with_label_values(&[msg_type]).inc();
+        metrics
+            .network_bytes_sent_total
+            .with_label_values(&[msg_type])
+            .inc_by(len as u64);
+    }
 }
 
 /// Simple message used by `ReliableSender` to communicate with its connections.
@@ -146,10 +226,23 @@ struct Connection {
     /// resolved once at spawn time and applied before every real send for this
     /// connection's whole life -- see `keep_alive`.
     extra_latency: Duration,
+    /// METRICS-DASHBOARD-SPEC.md §1: resolved once at spawn time (mirrors
+    /// `extra_latency`); `bytes_sent_total` is incremented at every successful
+    /// physical write, length prefix included, whether the first attempt or a retry.
+    metrics: Option<Arc<Metrics>>,
+    /// METRICS-DASHBOARD-SPEC.md §8: resolved once at spawn time; `false` (the
+    /// default) never calls `lz4_flex::compress_prepend_size`.
+    compress: bool,
 }
 
 impl Connection {
-    fn spawn(address: SocketAddr, receiver: Receiver<InnerMessage>, extra_latency: Duration) {
+    fn spawn(
+        address: SocketAddr,
+        receiver: Receiver<InnerMessage>,
+        extra_latency: Duration,
+        metrics: Option<Arc<Metrics>>,
+        compress: bool,
+    ) {
         tokio::spawn(async move {
             Self {
                 address,
@@ -157,10 +250,36 @@ impl Connection {
                 retry_delay: 200,
                 buffer: VecDeque::new(),
                 extra_latency,
+                metrics,
+                compress,
             }
             .run()
             .await;
         });
+    }
+
+    /// Length-delimited-codec frame prefix: 4 bytes, fixed (`LengthDelimitedCodec::
+    /// new()`'s default `length_field_length`).
+    const FRAME_PREFIX_LEN: u64 = 4;
+
+    /// METRICS-DASHBOARD-SPEC.md §8: the actual bytes to hand to `writer.send` --
+    /// lz4-compressed (`bytes_uncompressed_sent_total` credited with the pre-
+    /// compression size) when `compress` is on, `data` verbatim otherwise (the
+    /// default, zero-cost path: no compression call is made at all).
+    fn wire_bytes(&self, data: &Bytes) -> Bytes {
+        if !self.compress {
+            return data.clone();
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.bytes_uncompressed_sent_total.inc_by(data.len() as u64);
+        }
+        Bytes::from(lz4_flex::compress_prepend_size(data))
+    }
+
+    fn record_bytes_sent(&self, len: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.bytes_sent_total.inc_by(len as u64 + Self::FRAME_PREFIX_LEN);
+        }
     }
 
     /// Main loop trying to connect to the peer and transmit messages.
@@ -237,10 +356,12 @@ impl Connection {
                 }
 
                 // Try to send the message.
-                match writer.send(data.clone()).await {
+                let wire = self.wire_bytes(&data);
+                match writer.send(wire.clone()).await {
                     Ok(()) => {
                         // The message has been sent, we remove it from the buffer and add it to
                         // `pending_replies` while we wait for an ACK.
+                        self.record_bytes_sent(wire.len());
                         pending_replies.push_back((data, handler));
                     }
                     Err(e) => {
@@ -332,8 +453,10 @@ impl Connection {
                     if handler.is_closed() {
                         continue;
                     }
-                    match writer.send(data.clone()).await {
+                    let wire = self.wire_bytes(&data);
+                    match writer.send(wire.clone()).await {
                         Ok(()) => {
+                            self.record_bytes_sent(wire.len());
                             pending_replies.push_back((data, handler));
                         }
                         Err(e) => {

@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::certificate_waiter::CertificateWaiter;
 use crate::committer::Committer;
@@ -28,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Duration;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -42,6 +38,13 @@ pub type View = u64;
 // The slot (sequence) number of consensus
 pub type Slot = u64;
 
+// clippy::large_enum_variant: `Timeout(Timeout)` (~560 B) makes this enum large --
+// boxing it is wire-compatible (serde's `Box<T>` impl serializes identically to `T`)
+// but would still touch every `PrimaryMessage::X(...)` construction and `match`/
+// `if let` destructuring site across the audited dispatch code in core.rs,
+// vantage/node.rs, primary.rs, committer.rs, header_waiter.rs, helper.rs for a pure
+// stack-size optimization; not done.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
     Header(Header, bool),
@@ -91,6 +94,54 @@ pub enum PrimaryMessage {
     ControlTimeoutAccept(crate::vantage::Round, /* sender */ PublicKey),
 }
 
+impl PrimaryMessage {
+    /// METRICS-DASHBOARD-SPEC.md §1: the wire variant name used as the `type` label
+    /// for `network_messages_received_total`/`network_bytes_received_total` at
+    /// receiver-dispatch sites whose match has a catch-all arm (so a literal string
+    /// per arm isn't available the way it is at send call sites, which construct one
+    /// specific variant at a time).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            PrimaryMessage::Header(..) => "Header",
+            PrimaryMessage::Vote(..) => "Vote",
+            PrimaryMessage::Certificate(..) => "Certificate",
+            PrimaryMessage::Timeout(..) => "Timeout",
+            PrimaryMessage::TC(..) => "TC",
+            PrimaryMessage::ConsensusMessage(..) => "ConsensusMessage",
+            PrimaryMessage::ConsensusRequest(..) => "ConsensusRequest",
+            PrimaryMessage::ConsensusVote(..) => "ConsensusVote",
+            PrimaryMessage::CertificatesRequest(..) => "CertificatesRequest",
+            PrimaryMessage::HeadersRequest(..) => "HeadersRequest",
+            PrimaryMessage::ProposalHeadersRequest(..) => "ProposalHeadersRequest",
+            PrimaryMessage::VantageAck(..) => "VantageAck",
+            PrimaryMessage::VantagePropose(..) => "VantagePropose",
+            PrimaryMessage::VantageEcho(..) => "VantageEcho",
+            PrimaryMessage::VantageEchoSkip(..) => "VantageEchoSkip",
+            PrimaryMessage::VantageReady(..) => "VantageReady",
+            PrimaryMessage::VantageNoReady(..) => "VantageNoReady",
+            PrimaryMessage::VantageWish(..) => "VantageWish",
+            PrimaryMessage::CompReport(..) => "CompReport",
+            PrimaryMessage::ControlInit(..) => "ControlInit",
+            PrimaryMessage::ControlEcho(..) => "ControlEcho",
+            PrimaryMessage::ControlReady(..) => "ControlReady",
+            PrimaryMessage::ControlFetch(..) => "ControlFetch",
+            PrimaryMessage::ControlServe(..) => "ControlServe",
+            PrimaryMessage::ControlCommit(..) => "ControlCommit",
+            PrimaryMessage::ControlTimeoutVote(..) => "ControlTimeoutVote",
+            PrimaryMessage::ControlTimeoutAccept(..) => "ControlTimeoutAccept",
+        }
+    }
+}
+
+/// METRICS-DASHBOARD-SPEC.md §1: shared by every `MessageHandler::dispatch` impl in
+/// this crate (a no-op if `metrics` is `None`). `len` is the serialized payload size
+/// (no frame prefix -- `network_bytes_received_total` is "beyond starfish", the
+/// serialized-length-is-in-hand convention noted in the spec).
+pub(crate) fn record_typed_received(metrics: &Arc<Metrics>, msg_type: &'static str, len: usize) {
+    metrics.network_messages_received_total.with_label_values(&[msg_type]).inc();
+    metrics.network_bytes_received_total.with_label_values(&[msg_type]).inc_by(len as u64);
+}
+
 /// The messages sent by the primary to its workers.
 // bincode wire compat: `Committed` must stay appended LAST -- it is a variant index,
 // not a named field, so inserting it anywhere else would shift every discriminant that
@@ -110,6 +161,17 @@ pub enum PrimaryWorkerMessage {
     Committed(u64 /* commit UTC-millis */, Vec<Digest>),
 }
 
+impl PrimaryWorkerMessage {
+    /// METRICS-DASHBOARD-SPEC.md §1: see `PrimaryMessage::type_name`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            PrimaryWorkerMessage::Synchronize(..) => "Synchronize",
+            PrimaryWorkerMessage::Cleanup(..) => "Cleanup",
+            PrimaryWorkerMessage::Committed(..) => "Committed",
+        }
+    }
+}
+
 /// The messages sent by the workers to their primary.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
@@ -119,9 +181,24 @@ pub enum WorkerPrimaryMessage {
     OthersBatch(Digest, WorkerId),
 }
 
+impl WorkerPrimaryMessage {
+    /// METRICS-DASHBOARD-SPEC.md §1: see `PrimaryMessage::type_name`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            WorkerPrimaryMessage::OurBatch(..) => "OurBatch",
+            WorkerPrimaryMessage::OthersBatch(..) => "OthersBatch",
+        }
+    }
+}
+
 pub struct Primary;
 
 impl Primary {
+    // clippy::too_many_arguments: see `Committer::spawn`'s identical justification --
+    // this is the top-level assembly constructor wiring every channel between the
+    // two protocol families; a params struct would only add indirection, not reduce
+    // the audited call site's actual argument count.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
         committee: Committee,
@@ -169,6 +246,8 @@ impl Primary {
         binding_metrics_address.set_ip("0.0.0.0".parse().unwrap());
         let registry = Registry::new();
         let (metrics, reporter) = Metrics::new(&registry);
+        // METRICS-DASHBOARD-SPEC.md §8: write-once at boot.
+        metrics.set_protocol_info(parameters.protocol.label());
         reporter.clone().start();
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Primary {} metrics listening on {}", name, metrics_address);
@@ -200,10 +279,12 @@ impl Primary {
                     .expect("Our public key or worker id is not in the committee")
                     .primary_to_primary;
                 address.set_ip("0.0.0.0".parse().unwrap());
-                NetworkReceiver::spawn(
+                NetworkReceiver::spawn_full(
                     address,
                     /* handler */
-                    crate::vantage::node::VantageReceiverHandler { tx: tx_vantage },
+                    crate::vantage::node::VantageReceiverHandler { tx: tx_vantage, metrics: Some(metrics.clone()) },
+                    Some(metrics.clone()),
+                    parameters.compress_network,
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -219,13 +300,16 @@ impl Primary {
                     .expect("Our public key or worker id is not in the committee")
                     .worker_to_primary;
                 address.set_ip("0.0.0.0".parse().unwrap());
-                NetworkReceiver::spawn(
+                NetworkReceiver::spawn_full(
                     address,
                     /* handler */
                     WorkerReceiverHandler {
                         tx_our_digests,
                         tx_others_digests,
+                        metrics: metrics.clone(),
                     },
+                    Some(metrics.clone()),
+                    parameters.compress_network,
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -253,14 +337,17 @@ impl Primary {
                     .expect("Our public key or worker id is not in the committee")
                     .primary_to_primary;
                 address.set_ip("0.0.0.0".parse().unwrap());
-                NetworkReceiver::spawn(
+                NetworkReceiver::spawn_full(
                     address,
                     /* handler */
                     PrimaryReceiverHandler {
                         tx_primary_messages,
                         tx_cert_requests,
                         tx_header_requests,
+                        metrics: metrics.clone(),
                     },
+                    Some(metrics.clone()),
+                    parameters.compress_network,
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -273,13 +360,16 @@ impl Primary {
                     .expect("Our public key or worker id is not in the committee")
                     .worker_to_primary;
                 address.set_ip("0.0.0.0".parse().unwrap());
-                NetworkReceiver::spawn(
+                NetworkReceiver::spawn_full(
                     address,
                     /* handler */
                     WorkerReceiverHandler {
                         tx_our_digests,
                         tx_others_digests,
+                        metrics: metrics.clone(),
                     },
+                    Some(metrics.clone()),
+                    parameters.compress_network,
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -294,9 +384,6 @@ impl Primary {
                     /* tx_header_waiter */ tx_sync_headers,
                     /* tx_certificate_waiter */ tx_sync_certificates,
                 );
-
-                let timeout_delay = 1000;
-
 
                 // use_optimistic_tips: bool,     //default = true (TODO: implement non optimistic tip option)
 
@@ -334,7 +421,6 @@ impl Primary {
                     parameters.use_fast_path,
                     parameters.fast_path_timeout,
                     parameters.use_ride_share,
-                    parameters.car_timeout,
                     parameters.simulate_asynchrony,
                     parameters.asynchrony_start,
                     parameters.asynchrony_duration,
@@ -349,9 +435,11 @@ impl Primary {
                         .as_deref()
                         .map(|table| committee.latency_map(&name, table))
                         .unwrap_or_default(),
+                    metrics.clone(),
+                    parameters.compress_network,
                 );
 
-                Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer);
+                Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer, metrics.clone(), parameters.compress_network);
 
                 // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
                 GarbageCollector::spawn(
@@ -361,6 +449,8 @@ impl Primary {
                     consensus_round.clone(),
                     rx_consensus,
                     tx_certificates_loopback.clone(),
+                    metrics.clone(),
+                    parameters.compress_network,
                 );
 
                 // Receives batch digests from other workers. They are only used to validate headers.
@@ -380,6 +470,8 @@ impl Primary {
                     /* rx_synchronizer */ rx_sync_headers,
                     /* tx_core */ tx_headers_loopback,
                     tx_header_waiter_instances,
+                    metrics.clone(),
+                    parameters.compress_network,
                 );
 
                 // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
@@ -405,7 +497,7 @@ impl Primary {
                 );
 
                 // The `Helper` is dedicated to reply to certificates requests from other primaries.
-                Helper::spawn(committee.clone(), store, rx_cert_requests, rx_header_requests);
+                Helper::spawn(committee.clone(), store, rx_cert_requests, rx_header_requests, metrics.clone(), parameters.compress_network);
 
                 // NOTE: This log entry is used to compute performance.
                 info!(
@@ -430,6 +522,7 @@ struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
     tx_header_requests: Sender<(Vec<Digest>, PublicKey)>,
+    metrics: Arc<Metrics>,
 }
 
 #[async_trait]
@@ -439,7 +532,9 @@ impl MessageHandler for PrimaryReceiverHandler {
         let _ = writer.send(Bytes::from("Ack")).await;
 
         // Deserialize and parse the message.
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
+        let message: PrimaryMessage = bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
+        record_typed_received(&self.metrics, message.type_name(), serialized.len());
+        match message {
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
                 .send((missing, requestor))
@@ -468,6 +563,7 @@ impl MessageHandler for PrimaryReceiverHandler {
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
+    metrics: Arc<Metrics>,
 }
 
 #[async_trait]
@@ -478,17 +574,22 @@ impl MessageHandler for WorkerReceiverHandler {
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
-                .tx_our_digests                                         //sender channel to Proposer
+        let message: WorkerPrimaryMessage = bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
+        match message {
+            WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
+                record_typed_received(&self.metrics, "OurBatch", serialized.len());
+                self.tx_our_digests                                         //sender channel to Proposer
                 .send((digest, worker_id))
                 .await
-                .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
-                .tx_others_digests                                      //sender channel to PayloadReceiver
+                .expect("Failed to send workers' digests")
+            },
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
+                record_typed_received(&self.metrics, "OthersBatch", serialized.len());
+                self.tx_others_digests                                      //sender channel to PayloadReceiver
                 .send((digest, worker_id))
                 .await
-                .expect("Failed to send workers' digests"),
+                .expect("Failed to send workers' digests")
+            },
         }
         Ok(())
     }

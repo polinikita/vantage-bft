@@ -1,5 +1,3 @@
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
@@ -77,6 +75,8 @@ impl Worker {
         binding_metrics_address.set_ip("0.0.0.0".parse().unwrap());
         let registry = Registry::new();
         let (metrics, reporter) = Metrics::new(&registry);
+        // METRICS-DASHBOARD-SPEC.md §8: write-once at boot.
+        metrics.set_protocol_info(parameters.protocol.label());
         reporter.clone().start();
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Worker {} metrics listening on {}", id, metrics_address);
@@ -105,6 +105,8 @@ impl Worker {
                 .expect("Our public key is not in the committee")
                 .worker_to_primary,                              //filter primary associated with current worker based on the committee config.
             rx_primary,                                          //receiver channel to connect to primary channel (i.e. how other listener functions can invoke to PrimaryConnector)
+            worker.metrics.clone(),
+            worker.parameters.compress_network,
         );
 
         // NOTE: This log entry is used to compute performance.
@@ -136,10 +138,12 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .primary_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
+        Receiver::spawn_full(
             address,                                    //socket to receive Primary messages from
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer }, //handler for received Primary messages, forwards them to synchronizer
+            PrimaryReceiverHandler { tx_synchronizer, metrics: self.metrics.clone() }, //handler for received Primary messages, forwards them to synchronizer
+            Some(self.metrics.clone()),
+            self.parameters.compress_network,
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -154,6 +158,7 @@ impl Worker {
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
             self.metrics.clone(),
+            self.parameters.compress_network,
         );
 
         info!(
@@ -175,9 +180,19 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
+        Receiver::spawn_full(
             address,                                            //socket to receive Client messages from
             /* handler */ TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
+            Some(self.metrics.clone()),
+            // METRICS-DASHBOARD-SPEC.md §8: client traffic is NEVER compressed --
+            // `node::client::Client` builds its own raw `Framed`/`TcpStream` directly
+            // (bypasses `network::SimpleSender` entirely, see `node/src/client.rs`),
+            // so it never compresses regardless of this committee's own
+            // `compress_network` setting. Always `false` here, independent of
+            // `self.parameters.compress_network` (which only governs primary<->worker/
+            // primary<->primary/worker<->worker traffic, all of which DOES go through
+            // `network::{Simple,Reliable}Sender`).
+            false,
         );
 
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
@@ -195,6 +210,8 @@ impl Worker {
                 .iter()
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
+            self.metrics.clone(),
+            self.parameters.compress_network,
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -234,13 +251,16 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .worker_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
+        Receiver::spawn_full(
             address,                     //socket to receive Worker messages from
             /* handler */
             WorkerReceiverHandler {      //handler for received Worker messages, forwards them either to helper, or processor -- depending on (?)
                 tx_helper,               //sender channel to connect to helper
                 tx_processor,            //sender channel to connect to processor
+                metrics: self.metrics.clone(),
             },
+            Some(self.metrics.clone()),
+            self.parameters.compress_network,
         );
 
         // The `Helper` is dedicated to reply to batch requests from other workers.
@@ -249,6 +269,8 @@ impl Worker {
             self.committee.clone(),
             self.store.clone(),
             /* rx_request */ rx_helper,   //receiver channel to connect to WorkerReceiverHandler
+            self.metrics.clone(),
+            self.parameters.compress_network,
         );
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
@@ -299,6 +321,7 @@ impl MessageHandler for TxReceiverHandler {
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,   //sender channel to connect to helper
     tx_processor: Sender<SerializedBatchMessage>,  //sender channel to connect to processor
+    metrics: Arc<Metrics>,
 }
 
 #[async_trait]
@@ -307,32 +330,41 @@ impl MessageHandler for WorkerReceiverHandler {
         //NEW: Do not need to Reply with an ack... Currently simple sender expects it though so we keep it (useful for debugging). Simple sender just sinks the reply.
         // // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;     //Question: Where is ack signed? Is authenticated channel assumed? TLS?
-        // //Acknowledge Batches received. 
+        // //Acknowledge Batches received.
         // //Note: Missing Batch Requests don't expect an ack (they use simple sender) -- seems like it is sent anyways, but origin probably simply ignores it.
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self     //If receive batch message from another worker. Store the batch, and process.
+            Ok(WorkerMessage::Batch(..)) => {     //If receive batch message from another worker. Store the batch, and process.
+                self.metrics.network_messages_received_total.with_label_values(&["Batch"]).inc();
+                self.metrics.network_bytes_received_total.with_label_values(&["Batch"]).inc_by(serialized.len() as u64);
+                self
                 .tx_processor
                 .send(serialized.to_vec())
                 .await
-                .expect("Failed to send batch"),
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => self  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
+                .expect("Failed to send batch")
+            },
+            Ok(WorkerMessage::BatchRequest(missing, requestor)) => {  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
+                self.metrics.network_messages_received_total.with_label_values(&["BatchRequest"]).inc();
+                self.metrics.network_bytes_received_total.with_label_values(&["BatchRequest"]).inc_by(serialized.len() as u64);
+                self
                 .tx_helper
                 .send((missing, requestor))
                 .await
-                .expect("Failed to send batch request"),
+                .expect("Failed to send batch request")
+            },
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())
     }
 }
 
-/// Defines how the network receiver handles incoming primary messages.  
+/// Defines how the network receiver handles incoming primary messages.
 //Note: Only expect to receive primary messages requesting synchronization.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,  //sender channel to connect to synchronizer.
+    metrics: Arc<Metrics>,
 }
 
 #[async_trait]
@@ -343,13 +375,17 @@ impl MessageHandler for PrimaryReceiverHandler {
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize the message and send it to the synchronizer.
-        match bincode::deserialize(&serialized) {
+        match bincode::deserialize::<PrimaryWorkerMessage>(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self             
+            Ok(message) => {
+                self.metrics.network_messages_received_total.with_label_values(&[message.type_name()]).inc();
+                self.metrics.network_bytes_received_total.with_label_values(&[message.type_name()]).inc_by(serialized.len() as u64);
+                self
                 .tx_synchronizer
                 .send(message)
                 .await
-                .expect("Failed to send transaction"),
+                .expect("Failed to send transaction")
+            },
         }
         Ok(())
     }

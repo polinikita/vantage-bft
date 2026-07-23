@@ -16,6 +16,8 @@ async fn make_batch() {
         rx_transaction,
         tx_message,
         /* workers_addresses */ dummy_addresses,
+        Metrics::new(&prometheus::Registry::new()).0,
+        false,
     );
 
     // Send enough transactions to seal a batch.
@@ -44,6 +46,8 @@ async fn batch_timeout() {
         rx_transaction,
         tx_message,
         /* workers_addresses */ dummy_addresses,
+        Metrics::new(&prometheus::Registry::new()).0,
+        false,
     );
 
     // Do not send enough transactions to seal a batch..

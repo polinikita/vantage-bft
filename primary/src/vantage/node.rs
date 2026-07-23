@@ -21,7 +21,7 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
-use metrics::Metrics;
+use metrics::{Metrics, UtilizationTimerVecExt};
 use network::{CancelHandler, MessageHandler, ReliableSender, SimpleSender, Writer};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -85,6 +85,10 @@ pub enum Inbound {
 #[derive(Clone)]
 pub struct VantageReceiverHandler {
     pub tx: Sender<Inbound>,
+    /// METRICS-DASHBOARD-SPEC.md §1: `None` only in tests that construct this handler
+    /// directly without wiring metrics (matches `VantageCore`'s own optional-handle
+    /// convention) -- production (`Primary::spawn`) always passes `Some`.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 #[async_trait]
@@ -92,6 +96,9 @@ impl MessageHandler for VantageReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         let _ = writer.send(Bytes::from("Ack")).await;
         let message: PrimaryMessage = bincode::deserialize(&serialized)?;
+        if let Some(metrics) = &self.metrics {
+            crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
+        }
         let inbound = match message {
             PrimaryMessage::Header(h, false) => Inbound::Publish(h.author, h),
             PrimaryMessage::Header(h, true) => Inbound::Serve(h),
@@ -186,6 +193,7 @@ pub struct VantageCore {
 }
 
 impl VantageCore {
+    // clippy::too_many_arguments: see primary/src/committer.rs's identical justification.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -251,8 +259,20 @@ impl VantageCore {
             pacemaker,
             resolver,
             control,
-            network: ReliableSender::new().with_latency(latency_map.clone()),
-            worker_network: SimpleSender::new().with_latency(latency_map),
+            network: {
+                let mut s = ReliableSender::new().with_latency(latency_map.clone()).with_compression(parameters.compress_network);
+                if let Some(m) = &core_metrics {
+                    s = s.with_metrics(m.clone());
+                }
+                s
+            },
+            worker_network: {
+                let mut s = SimpleSender::new().with_latency(latency_map).with_compression(parameters.compress_network);
+                if let Some(m) = &core_metrics {
+                    s = s.with_metrics(m.clone());
+                }
+                s
+            },
             cancel_handlers: Vec::new(),
             other_primaries,
             worker_addresses,
@@ -331,12 +351,16 @@ impl VantageCore {
 
                 Some(inbound) = rx_vantage.recv() => {
                     let now = Instant::now();
+                    let dispatch_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("inbound_dispatch"));
                     let effects = self.dispatch_inbound(inbound, now).await;
+                    drop(dispatch_timer);
                     self.execute(effects, now).await;
                 }
 
                 Some((header_digest, digest, worker_id)) = rx_payload_ready.recv() => {
+                    let payload_sync_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("payload_sync"));
                     self.on_payload_ready(header_digest, digest, worker_id).await;
+                    drop(payload_sync_timer);
                 }
 
                 Some((digest, worker_id)) = rx_our_digests.recv() => {
@@ -355,18 +379,28 @@ impl VantageCore {
 
                 () = &mut agb_sleep, if next_deadline.is_some() => {
                     let now = Instant::now();
+                    let timer_firing_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("timer_firing"));
                     let effects = self.fire_agb_timers(now);
+                    drop(timer_firing_timer);
                     self.execute(effects, now).await;
                 }
 
                 () = &mut control_sleep, if next_control_deadline.is_some() => {
                     let now = Instant::now();
+                    let timer_firing_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("timer_firing"));
                     let effects = self.fire_control_timers(now);
+                    drop(timer_firing_timer);
                     self.execute(effects, now).await;
                 }
 
                 _ = metrics_tick.tick() => {
                     self.sample_metrics();
+                    // METRICS-DASHBOARD-SPEC.md §3: `core_queue_length` -- `rx_vantage`'s
+                    // current depth (cheap, `Receiver::len()` is O(1)); `0` (never set)
+                    // on the two Autobahn paths, which never construct a `VantageCore`.
+                    if let Some(metrics) = &self.metrics {
+                        metrics.core_queue_length.set(rx_vantage.len() as i64);
+                    }
                 }
             }
         }
@@ -507,10 +541,10 @@ impl VantageCore {
 
     /// PHASE5-SPEC.md §3: execute a formal `Effect::Enter(view)` as `AgbEngine::enter`
     /// + `Frontier::enter`, in that order -- `Frontier::enter`'s W5(c) floor can newly
-    /// activate further views (its own contiguous-advance loop, on top of `view`
-    /// itself), each of which must still run through `AgbEngine::activate` exactly like
-    /// `Effect::Fixed`'s handling does, and a floor raise can newly satisfy R1 too.
-    /// Shared by the genesis boot call (view 1) and every subsequent WISH-driven entry.
+    ///   activate further views (its own contiguous-advance loop, on top of `view`
+    ///   itself), each of which must still run through `AgbEngine::activate` exactly like
+    ///   `Effect::Fixed`'s handling does, and a floor raise can newly satisfy R1 too.
+    ///   Shared by the genesis boot call (view 1) and every subsequent WISH-driven entry.
     fn enter_view_effects(&mut self, view: View, now: Instant) -> Vec<Effect> {
         let mut effects = self.agb.enter(view, now, &mut self.lm, &mut self.rep);
         let activated = self.frontier.enter(view);
@@ -609,6 +643,11 @@ impl VantageCore {
     /// calls) so cross-component chains (e.g. `Fixed` -> `Frontier::record_fixed` ->
     /// `AgbEngine::activate` -> more effects) stay within one `Future`.
     async fn execute(&mut self, initial: Vec<Effect>, now: Instant) {
+        // METRICS-DASHBOARD-SPEC.md §3: covers every call site (every `run` branch
+        // calls `execute`, plus `on_payload_ready`/`seal_own_header` indirectly) --
+        // wrapping here once, rather than at each call site, measures the whole
+        // effect-draining loop under one "effect_execution" label regardless of caller.
+        let _timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("effect_execution"));
         let mut queue: VecDeque<Effect> = initial.into();
         while let Some(effect) = queue.pop_front() {
             match effect {
@@ -743,28 +782,41 @@ impl VantageCore {
 
     /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
     /// and broadcasts it verbatim (`bincode::serialize` never fails on our own wire
-    /// types, hence the `expect`).
+    /// types, hence the `expect`). METRICS-DASHBOARD-SPEC.md §1: `message.type_name()`
+    /// is computed before serializing, so it labels the exact variant sent.
     async fn broadcast_message(&mut self, message: PrimaryMessage) {
+        let msg_type = message.type_name();
+        // METRICS-DASHBOARD-SPEC.md §3: `proposed_block_size_bytes` -- our own
+        // self-authored block's serialized size at publish time. `Header(_, false)` is
+        // specifically the publish variant (`false` = not a serve/sync reply); the
+        // metrics handle is `Option` (unit tests construct `VantageCore` without one).
+        let is_own_publish = matches!(message, PrimaryMessage::Header(_, false));
         let bytes = bincode::serialize(&message).expect("serializes");
-        self.broadcast(Bytes::from(bytes)).await;
+        if is_own_publish {
+            if let Some(metrics) = &self.metrics {
+                metrics.proposed_block_size_bytes.observe(bytes.len());
+            }
+        }
+        self.broadcast(Bytes::from(bytes), msg_type).await;
     }
 
     /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
     /// and unicasts it verbatim to one peer.
     async fn send_message(&mut self, peer: PublicKey, message: PrimaryMessage) {
+        let msg_type = message.type_name();
         let bytes = bincode::serialize(&message).expect("serializes");
-        self.send_to(peer, Bytes::from(bytes)).await;
+        self.send_to(peer, Bytes::from(bytes), msg_type).await;
     }
 
-    async fn broadcast(&mut self, data: Bytes) {
+    async fn broadcast(&mut self, data: Bytes, msg_type: &'static str) {
         let addresses: Vec<SocketAddr> = self.other_primaries.iter().map(|(_, a)| *a).collect();
-        let handlers = self.network.broadcast(addresses, data).await;
+        let handlers = self.network.broadcast_typed(addresses, data, msg_type).await;
         self.cancel_handlers.extend(handlers);
     }
 
-    async fn send_to(&mut self, peer: PublicKey, data: Bytes) {
+    async fn send_to(&mut self, peer: PublicKey, data: Bytes, msg_type: &'static str) {
         if let Some(addr) = self.other_primaries.iter().find(|(pk, _)| *pk == peer).map(|(_, a)| *a) {
-            let handler = self.network.send(addr, data).await;
+            let handler = self.network.send_typed(addr, data, msg_type).await;
             self.cancel_handlers.push(handler);
         }
     }
@@ -784,7 +836,7 @@ impl VantageCore {
         for (worker_id, digests) in by_worker {
             if let Some(addr) = self.worker_addresses.get(&worker_id) {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Synchronize(digests, author)).expect("serializes");
-                self.worker_network.send(*addr, Bytes::from(bytes)).await;
+                self.worker_network.send_typed(*addr, Bytes::from(bytes), "Synchronize").await;
             }
         }
 
@@ -820,7 +872,7 @@ impl VantageCore {
         for (worker_id, digests) in by_worker {
             if let Some(addr) = self.worker_addresses.get(&worker_id) {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests)).expect("serializes");
-                self.worker_network.send(*addr, Bytes::from(bytes)).await;
+                self.worker_network.send_typed(*addr, Bytes::from(bytes), "Committed").await;
             }
         }
         for header in headers {

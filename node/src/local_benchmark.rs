@@ -13,7 +13,10 @@ use anyhow::{Context, Result};
 use clap::ArgMatches;
 use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol, WorkerId};
 use crypto::{PublicKey, SignatureService};
-use metrics::{aggregate_latency_snapshots, read_latency_snapshot, read_vantage_progress, LatencySnapshot, MetricReporter};
+use metrics::{
+    aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot, read_vantage_progress, LatencySnapshot,
+    MetricReporter,
+};
 use primary::Primary;
 use std::fs;
 use std::net::SocketAddr;
@@ -22,6 +25,11 @@ use std::sync::Arc;
 use store::{Store, StoreProfile};
 use tokio::sync::mpsc::channel;
 use worker::Worker;
+
+/// clippy::type_complexity: named alias for `spawn_node_primary`/`spawn_node_workers`'s
+/// shared return shape -- (this node's metrics registry, its periodic reporter, and
+/// its own (label, address) scrape target for `prometheus.yaml`).
+type NodeMetricsHandle = (prometheus::Registry, Arc<MetricReporter>, (String, SocketAddr));
 
 pub async fn run(matches: &ArgMatches) -> Result<()> {
     let nodes: usize = matches
@@ -153,16 +161,20 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .export(data_dir.join("committee.json").to_str().unwrap())
         .context("Failed to write committee.json")?;
 
-    let mut parameters = Parameters::default();
-    parameters.protocol = protocol;
-    parameters.delta_ms = delta_ms;
-    parameters.max_batch_delay = max_batch_delay_ms;
-    parameters.max_header_delay = max_header_delay_ms;
-    // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
-    // means it never round-trips through the `parameters.json` export just below --
-    // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
-    // is all `Core::spawn`/`vantage::node::VantageCore::spawn` ever read it from.
-    parameters.latency_table = latency_table.map(Arc::new);
+    let mut parameters = Parameters {
+        protocol,
+        delta_ms,
+        max_batch_delay: max_batch_delay_ms,
+        max_header_delay: max_header_delay_ms,
+        // METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when off.
+        compress_network: matches.get_flag("compress-network"),
+        // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
+        // means it never round-trips through the `parameters.json` export just below --
+        // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
+        // is all `Core::spawn`/`vantage::node::VantageCore::spawn` ever read it from.
+        latency_table: latency_table.map(Arc::new),
+        ..Parameters::default()
+    };
     parameters.reconcile_protocol();
     parameters
         .export(data_dir.join("parameters.json").to_str().unwrap())
@@ -214,7 +226,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         fs::create_dir_all(&node_dir)?;
 
         let (primary_registry, primary_reporter, primary_target) =
-            spawn_node_primary(i, keypair, &node_dir, &committee, &parameters)?;
+            spawn_node_primary(i, keypair, &node_dir, &committee, &parameters, mode)?;
         primary_metrics.push((i, primary_registry, primary_reporter));
         metrics_targets.push(primary_target);
 
@@ -247,7 +259,17 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     );
     println!("Grafana (once up): http://localhost:3003\n");
 
-    println!("Running benchmark ({} sec)...", duration);
+    // METRICS-DASHBOARD-SPEC.md §5: `--duration 0` = run until Ctrl-C (clean shutdown,
+    // final RESULTS still printed). Actual wall-clock elapsed time is tracked
+    // separately from the configured `duration` so RESULTS' TPS/BPS figures are
+    // correct whether the run went the full configured length, was interrupted
+    // early, or (duration 0) has no configured length at all.
+    if duration == 0 {
+        println!("Running benchmark (until Ctrl-C)...");
+    } else {
+        println!("Running benchmark ({} sec)...", duration);
+    }
+    let run_start = tokio::time::Instant::now();
     if timeline {
         // PHASE7-PREP-NOTES.md Finding A: once/sec progress-gauge line per live
         // primary, for the whole run -- reads the same registries `print_results`
@@ -268,7 +290,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                             );
                         }
                     }
-                    if elapsed >= duration {
+                    if duration != 0 && elapsed >= duration {
                         break 'timeline;
                     }
                 }
@@ -278,6 +300,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                 }
             }
         }
+    } else if duration == 0 {
+        // No sleep branch at all -- the only way out is Ctrl-C.
+        tokio::signal::ctrl_c().await.ok();
+        println!("\nInterrupted -- computing results from data observed so far.");
     } else {
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(duration)) => {}
@@ -287,8 +313,47 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         }
     }
 
-    print_results(&worker_metrics, &primary_metrics, duration).await;
+    let actual_secs = run_start.elapsed().as_secs().max(1);
+    print_results(&worker_metrics, &primary_metrics, actual_secs, protocol).await;
     Ok(())
+}
+
+/// METRICS-DASHBOARD-SPEC.md §2: the wire-`type` -> traffic-category map, one per
+/// protocol family (Vantage's wire variants are entirely disjoint from Autobahn's,
+/// but both protocols share a few names -- e.g. `Header`, `Synchronize`,
+/// `BatchRequest`, `Committed` -- with different category meanings per protocol, so
+/// the map is protocol-scoped rather than global).
+///
+/// Known simplification (documented, not a metrics bug): `Header` is a single wire
+/// variant carrying a bool (publish vs. serve/sync) that the `type` label does not
+/// distinguish (the label is the wire variant name, per §1) -- so `Header` is folded
+/// entirely into `dissemination` here, even though a (typically small) share of it is
+/// actually repair/sync traffic (Vantage `Header(serve)`, Autobahn `Header(sync)`).
+/// Every wire type not named below (e.g. `OurBatch`/`OthersBatch`, worker-to-primary
+/// digest notifications) falls into `other` -- this keeps totals conserved (every
+/// sent message lands in exactly one bucket) rather than silently under-counting.
+fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
+    match protocol {
+        Protocol::Vantage => match msg_type {
+            "Header" | "Batch" => "dissemination",
+            "VantageAck" => "acks",
+            "VantagePropose" | "VantageEcho" | "VantageEchoSkip" | "VantageReady" | "VantageNoReady" => "agb",
+            "VantageWish" => "pacemaker",
+            "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
+            "CompReport" | "ControlInit" | "ControlEcho" | "ControlReady" | "ControlTimeoutVote" | "ControlTimeoutAccept"
+            | "ControlCommit" | "ControlFetch" | "ControlServe" => "control",
+            "Committed" => "metricsplumbing",
+            _ => "other",
+        },
+        Protocol::AutobahnOptimistic | Protocol::AutobahnSeamless => match msg_type {
+            "Header" | "Batch" => "dissemination",
+            "Vote" | "Certificate" => "votes-certs",
+            "ConsensusMessage" | "ConsensusRequest" | "ConsensusVote" | "Timeout" | "TC" => "consensus",
+            "CertificatesRequest" | "HeadersRequest" | "ProposalHeadersRequest" | "Synchronize" | "BatchRequest" => "sync",
+            "Committed" => "metricsplumbing",
+            _ => "other",
+        },
+    }
 }
 
 /// Spawns one live node's primary in-process -- the exact same `Primary::spawn`
@@ -304,7 +369,8 @@ fn spawn_node_primary(
     node_dir: &std::path::Path,
     committee: &Committee,
     parameters: &Parameters,
-) -> Result<(prometheus::Registry, Arc<MetricReporter>, (String, SocketAddr))> {
+    mode: TransactionMode,
+) -> Result<NodeMetricsHandle> {
     let name = keypair.name;
     let signature_service = SignatureService::new(keypair.secret);
 
@@ -316,13 +382,13 @@ fn spawn_node_primary(
 
     let (tx_output, mut rx_output) = channel(CHANNEL_CAPACITY);
     let (tx_new_certificates, _rx_new_certificates) = channel(CHANNEL_CAPACITY);
-    let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+    let (_tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
     let (tx_committer, rx_committer) = channel(CHANNEL_CAPACITY);
     let (_tx_pushdown_cert, rx_pushdown_cert) = channel(CHANNEL_CAPACITY);
     let (_tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
     let (tx_sailfish, _rx_sailfish) = channel(CHANNEL_CAPACITY);
 
-    let (_primary_metrics, primary_reporter, primary_registry) = Primary::spawn(
+    let (primary_metrics, primary_reporter, primary_registry) = Primary::spawn(
         name,
         committee.clone(),
         parameters.clone(),
@@ -337,6 +403,10 @@ fn spawn_node_primary(
         rx_request_header_sync,
         tx_output,
     );
+    // METRICS-DASHBOARD-SPEC.md §8: write-once (see `spawn_node_workers`'s identical
+    // comment -- primary/worker both know `mode` here since `local-benchmark` builds
+    // both).
+    primary_metrics.set_transaction_mode_info(mode.label());
     // Application logic no-op, matching node/src/main.rs::analyze.
     tokio::spawn(async move { while rx_output.recv().await.is_some() {} });
     let target = (format!("node-{}-primary", i), committee.primary(&name).unwrap().metrics);
@@ -349,6 +419,8 @@ fn spawn_node_primary(
 /// before sending (mirrors `benchmark_client --nodes`). Returns each worker's
 /// metrics registry/reporter alongside its own metrics-scrape target for
 /// `prometheus.yaml`, in worker-id order.
+// clippy::too_many_arguments: see primary/src/committer.rs's identical justification
+// (this local helper mirrors Worker::spawn's own wiring one-for-one).
 #[allow(clippy::too_many_arguments)]
 fn spawn_node_workers(
     i: usize,
@@ -361,7 +433,7 @@ fn spawn_node_workers(
     rate_share: u64,
     mode: TransactionMode,
     all_worker_addresses: &[SocketAddr],
-) -> Result<Vec<(prometheus::Registry, Arc<MetricReporter>, (String, SocketAddr))>> {
+) -> Result<Vec<NodeMetricsHandle>> {
     let mut spawned = Vec::with_capacity(workers);
     for j in 0..workers {
         let worker_id = j as WorkerId;
@@ -372,7 +444,11 @@ fn spawn_node_workers(
         .context("Failed to create worker store")?;
 
         let (metrics, reporter, registry) = Worker::spawn(name, worker_id, committee.clone(), parameters.clone(), worker_store);
-        let _ = &metrics; // kept alive by `reporter`/`registry`; not read directly here
+        // METRICS-DASHBOARD-SPEC.md §8: write-once -- only `local-benchmark` has the
+        // client's tx-mode in scope at registry-construction time (see `Metrics::
+        // set_transaction_mode_info`'s doc for why the standalone `node run` path
+        // doesn't set this).
+        metrics.set_transaction_mode_info(mode.label());
         let target = (format!("node-{}-worker-{}", i, j), committee.worker(&name, &worker_id).unwrap().metrics);
         spawned.push((registry, reporter, target));
 
@@ -403,6 +479,7 @@ async fn print_results(
     worker_metrics: &[(prometheus::Registry, Arc<MetricReporter>)],
     primary_metrics: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
     duration: u64,
+    protocol: Protocol,
 ) {
     let mut snapshots: Vec<LatencySnapshot> = Vec::new();
     for (registry, reporter) in worker_metrics {
@@ -457,6 +534,83 @@ async fn print_results(
             );
         }
     }
+
+    // METRICS-DASHBOARD-SPEC.md §2: goodput (submitted vs. sequenced) + wire-taxonomy
+    // breakdown, computed here (not stored) from the §1 counters. Submitted/wire
+    // counters are SUMMED across every node (each node's own independent traffic,
+    // additive) -- unlike the replicated-commit-stream latency snapshot above, which
+    // uses max/median across nodes because every node counts the same global stream.
+    let submitted_transactions: u64 = worker_metrics.iter().map(|(r, _)| read_counter(r, "submitted_transactions")).sum();
+    let submitted_bytes: u64 = worker_metrics.iter().map(|(r, _)| read_counter(r, "submitted_transactions_bytes")).sum();
+
+    let mut sent_by_type: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut sent_bytes_by_type: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut total_bytes_sent: u64 = 0;
+    let mut total_bytes_received: u64 = 0;
+    let all_registries = worker_metrics
+        .iter()
+        .map(|(r, _)| r)
+        .chain(primary_metrics.iter().map(|(_, r, _)| r));
+    for registry in all_registries {
+        total_bytes_sent += read_counter(registry, "bytes_sent_total");
+        total_bytes_received += read_counter(registry, "bytes_received_total");
+        for (t, c) in read_counter_vec(registry, "network_messages_sent_total", "type") {
+            *sent_by_type.entry(t).or_insert(0) += c;
+        }
+        for (t, b) in read_counter_vec(registry, "network_bytes_sent_total", "type") {
+            *sent_bytes_by_type.entry(t).or_insert(0) += b;
+        }
+    }
+    let total_messages_sent: u64 = sent_by_type.values().sum();
+
+    println!(" + GOODPUT / NETWORK:");
+    println!(
+        " Submitted: {} tx(s), {} B  |  Sequenced (committed): {} tx(s), {} B",
+        submitted_transactions, submitted_bytes, max_committed_transactions, max_committed_bytes
+    );
+    println!(
+        " Wire: {} B sent, {} B received ({} messages sent)",
+        total_bytes_sent, total_bytes_received, total_messages_sent
+    );
+    if max_committed_bytes > 0 {
+        println!(
+            " Overhead bytes per sequenced byte: {:.3}",
+            total_bytes_sent as f64 / max_committed_bytes as f64
+        );
+    }
+    if max_committed_transactions > 0 {
+        println!(
+            " Messages per committed tx: {:.3}",
+            total_messages_sent as f64 / max_committed_transactions as f64
+        );
+        // Starfish's own formula (metrics.rs:1077-1083): bytes sent per committed tx,
+        // normalized to a 512 B transaction -- 1.0 means exactly 512 B of wire traffic
+        // per committed tx at this run's tx size; higher means more relative overhead.
+        println!(
+            " Bandwidth efficiency (512B-normalized): {:.3}",
+            total_bytes_sent as f64 / max_committed_transactions as f64 / 512.0
+        );
+    }
+    if !sent_bytes_by_type.is_empty() {
+        let mut by_category: std::collections::BTreeMap<&'static str, (u64, u64)> = std::collections::BTreeMap::new();
+        for (t, bytes) in &sent_bytes_by_type {
+            let count = sent_by_type.get(t).copied().unwrap_or(0);
+            let entry = by_category.entry(categorize(protocol, t)).or_insert((0, 0));
+            entry.0 += count;
+            entry.1 += *bytes;
+        }
+        let total_category_bytes: u64 = by_category.values().map(|(_, b)| b).sum();
+        println!(" Traffic by category (messages, bytes, % of sent bytes):");
+        for (category, (count, bytes)) in &by_category {
+            let pct = if total_category_bytes > 0 {
+                100.0 * *bytes as f64 / total_category_bytes as f64
+            } else {
+                0.0
+            };
+            println!("   {:<16} {:>10} msgs  {:>12} B  ({:.1}%)", category, count, bytes, pct);
+        }
+    }
+    println!();
 
     // PHASE6-SPEC.md §9 gate amendment: per-node seal-route breakdown (near-idle/absent
     // on the two Autobahn paths, which never observe into `vantage_seals` at all).

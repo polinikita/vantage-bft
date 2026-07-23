@@ -34,7 +34,7 @@ pub fn committee() -> Committee {
                     worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
                     metrics: format!("127.0.0.1:{}", 600 + i).parse().unwrap(),
                 };
-                let workers = vec![(
+                let workers = [(
                     0,
                     WorkerAddresses {
                         primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),

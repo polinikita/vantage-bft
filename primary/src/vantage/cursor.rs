@@ -103,11 +103,8 @@ impl Cursor {
 
     fn pump(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
-        loop {
-            let (completed, sealed) = match self.pending.get(&self.next_view) {
-                Some(input) => (input.completed.clone(), input.sealed.clone()),
-                None => break,
-            };
+        while let Some(input) = self.pending.get(&self.next_view) {
+            let (completed, sealed) = (input.completed.clone(), input.sealed.clone());
 
             // Locally completed but open: emit K, do not advance (tip stays open).
             if !self.core_emitted.contains(&self.next_view) {

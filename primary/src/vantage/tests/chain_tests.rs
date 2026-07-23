@@ -2,7 +2,7 @@
 use super::common::*;
 use crate::messages::Header;
 use crate::vantage::Effect;
-use crypto::{Digest, Hash as _};
+use crypto::Digest;
 use std::collections::BTreeMap;
 
 fn is_cached(effects: &[Effect]) -> bool {

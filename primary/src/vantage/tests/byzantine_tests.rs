@@ -60,6 +60,12 @@
 // call sequence `Node::try_propose_effects` makes; `resolve_tests.rs` separately covers
 // the bit/pointer bookkeeping in isolation.
 
+// clippy::needless_range_loop: see harness.rs's identical justification -- this
+// suite's fixtures index several parallel per-party collections at once inside
+// `for i in 0..n`/`for j in 0..n` loops throughout; test-only code, not hiding any
+// dead logic.
+#![allow(clippy::needless_range_loop)]
+
 use super::common::*;
 use super::harness::{advance_time, boot, boot_without_control, deliver_only_to, drain_local, run_to_quiescence, start_control, Node};
 use crate::messages::Header;

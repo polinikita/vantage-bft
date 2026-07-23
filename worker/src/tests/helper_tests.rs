@@ -22,7 +22,7 @@ async fn batch_reply() {
         .await;
 
     // Spawn an `Helper` instance.
-    Helper::spawn(id, committee.clone(), store, rx_request);
+    Helper::spawn(id, committee.clone(), store, rx_request, Metrics::new(&prometheus::Registry::new()).0, false);
 
     // Spawn a listener to receive the batch reply.
     let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;

@@ -361,12 +361,12 @@ impl AgbEngine {
         match stage {
             ResponseStage::Echo => {
                 let prev = view.saturating_sub(1);
-                let prev_ready_sent = prev == 0 || self.views.get(&prev).map_or(false, |s| s.ready_sent);
+                let prev_ready_sent = prev == 0 || self.views.get(&prev).is_some_and(|s| s.ready_sent);
                 prev_ready_sent.then(|| view + 2)
             }
             ResponseStage::Ready => {
                 let next = view + 1;
-                self.views.get(&next).map_or(false, |s| s.echo_sent).then(|| view + 3)
+                self.views.get(&next).is_some_and(|s| s.echo_sent).then(|| view + 3)
             }
         }
     }
@@ -461,7 +461,7 @@ impl AgbEngine {
     /// (the caller, `resolve.rs`, also folds in the anchor-resolved predicate once §6
     /// lands).
     pub fn is_sealed(&self, view: View) -> bool {
-        self.views.get(&view).map_or(false, |s| s.sealed.is_some())
+        self.views.get(&view).is_some_and(|s| s.sealed.is_some())
     }
 
     /// D7-4 (PHASE7-PREP-NOTES.md): read-only mirror of the exact guard
@@ -471,13 +471,13 @@ impl AgbEngine {
     /// dispatching the handler call, instead of dispatching into a guard that would
     /// have returned an empty `Vec` anyway. Same value, same meaning, no `&mut self`.
     pub fn echo_sent(&self, view: View) -> bool {
-        self.views.get(&view).map_or(false, |s| s.echo_sent)
+        self.views.get(&view).is_some_and(|s| s.echo_sent)
     }
 
     /// D7-4: read-only mirror of `on_ready_timer`'s guard, same reasoning as
     /// `echo_sent` above.
     pub fn ready_sent(&self, view: View) -> bool {
-        self.views.get(&view).map_or(false, |s| s.ready_sent)
+        self.views.get(&view).is_some_and(|s| s.ready_sent)
     }
 
     /// PHASE6-SPEC.md §6: submit an anchor-derived outcome `X_u` to the SAME try-seal
@@ -718,7 +718,7 @@ impl AgbEngine {
     fn tip_ok(c: &Manifest, t: &Manifest, lm: &mut LaneManager) -> bool {
         for t_ref in t {
             if let Some(c_ref) = c.iter().find(|c_ref| c_ref.0 == t_ref.0) {
-                if !(t_ref.1 > c_ref.1) {
+                if t_ref.1 <= c_ref.1 {
                     return false; // equal-height (or shorter) tip excluded
                 }
                 if !lm.holds_prefix(t_ref) {
@@ -1215,7 +1215,7 @@ impl AgbEngine {
         if !lock.active {
             return effects;
         }
-        let already = self.views.get(&view).map_or(false, |s| s.fastsealed);
+        let already = self.views.get(&view).is_some_and(|s| s.fastsealed);
         if already {
             return effects;
         }

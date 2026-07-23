@@ -1,0 +1,55 @@
+# local-dryrun config (METRICS-DASHBOARD-SPEC.md §5) -- every run parameter in one
+# file. Commented values below are the n=10 / 1000 tx/s WAN-shaped latency experiment
+# (PHASE7-PREP-NOTES.md's own latency-table runs) -- edit in place, or copy this file
+# and pass `--config <path>` to `dryrun.py`.
+#
+# Mirrors starfish's own local-dryrun UX (~/code/starfish/local-dryrun, read-only
+# reference for the UX only -- that one is a bash script driving one Docker container
+# per validator; this one is Python driving native `node local-benchmark` processes,
+# per Phase-2 §8's deliberate deviation -- see README.md).
+
+# Consensus protocol: vantage | autobahn-optimistic | autobahn-seamless
+protocol: vantage
+
+# Committee size and workers per authority.
+nodes: 10
+workers: 1
+
+# Aggregate offered load across the whole committee.
+rate: 1000          # tx/s
+tx_size: 512        # bytes
+
+# Transaction payload mode: all-zero | random (METRICS-DASHBOARD-SPEC.md §8: random
+# is the new default everywhere -- pin all-zero here if you need a number comparable
+# to this repo's historical (pre-§8) gate/sweep figures).
+mode: random
+
+# Run duration in seconds. 0 = run until Ctrl-C (clean shutdown, RESULTS still
+# printed) -- METRICS-DASHBOARD-SPEC.md §5.
+duration: 0
+
+# Vantage AGB base delay unit (ms); irrelevant to the two Autobahn paths.
+delta_ms: 150
+
+# Worker max batch seal delay / primary max header (car) creation delay, ms.
+max_batch_delay_ms: 20
+max_header_delay_ms: 50
+
+# PHASE6-SPEC.md R2 crash-fault count: this many trailing nodes are never spawned
+# (committee membership unchanged). 0 = fault-free.
+crash: 0
+
+# PHASE7-PREP-NOTES.md WAN-shaped local runs: path to an NxN RTT-ms CSV matrix
+# (relative to the repository root), or the literal string `none` for zero injected
+# latency (pure loopback -- measures machine capacity, not geography; this is what
+# METRICS-DASHBOARD-SPEC.md §7's scaling sweep uses). The commented default below is
+# the n=10 latency experiment's own table.
+latency_table: wan-testbed-latency-10node.csv
+# latency_table: none
+
+# METRICS-DASHBOARD-SPEC.md §8: lz4 network compression, off by default (byte-
+# identical framing when off).
+compress_network: false
+
+# Where `node local-benchmark` writes its per-node stores + prometheus.yaml.
+data_dir: local-dryrun/data

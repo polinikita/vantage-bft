@@ -1,7 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-//use crate::common::committee;
 // Copyright(C) Facebook, Inc. and its affiliates.
 
 use crate::error::{ConsensusError, ConsensusResult, DagError, DagResult};
@@ -12,7 +8,6 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use core::panic;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::convert::TryInto;
 use std::fmt;
 
 #[cfg(test)]
@@ -112,19 +107,19 @@ pub enum ConsensusMessage {  //TODO: Easier to re-factor into a single message t
     },
 }
 
-pub fn transform_commitQC(commit_qc: CommitQC) -> ConsensusMessage {
+pub fn transform_commit_qc(commit_qc: CommitQC) -> ConsensusMessage {
     ConsensusMessage::Commit {slot: commit_qc.slot, view: commit_qc.view, qc: commit_qc.qc, proposals: commit_qc.proposals}
 }
 
 pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee) -> bool {
     
     match consensus_message {
-        ConsensusMessage::Commit{ slot, view, qc, proposals } => {
+        ConsensusMessage::Commit{ slot, view, qc, proposals: _ } => {
             let mut hasher = Blake3Hasher::new();
             hasher.update(&slot.to_le_bytes());
             hasher.update(&view.to_le_bytes());
             //hasher.update(proposal_digest(consensus_message)); FIXME: ADD THIS AND DEBUG
-            hasher.update(&(0 as u8).to_le_bytes());
+            hasher.update(&0_u8.to_le_bytes());
             let prepare_id = Digest(hasher.finalize().into());
 
             debug!("PrepareIDCheck has slot: {}, view: {}, digest: {}", slot, view, prepare_id);
@@ -148,14 +143,13 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
                 hasher.update(&slot.to_le_bytes());
                 hasher.update(&view.to_le_bytes());
                 hasher.update(&prepare_id.0);
-                hasher.update(&(1 as u8).to_le_bytes());
+                hasher.update(&1_u8.to_le_bytes());
                 let confirm_id = Digest(hasher.finalize().into());
 
                 debug!("ConfirmIDCheck for slot: {}, view: {}, qc_dig {:?} -> has digest: {}", slot, view, prepare_id , confirm_id);
 
                 if confirm_id != qc.id {
                     panic!("ids don't match");
-                    return false;
                 }
                  //Check Sigs. 
                 qc.verify(committee).is_ok()
@@ -183,14 +177,14 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
 
 pub fn verify_confirm(consensus_message: &ConsensusMessage, committee: &Committee) -> bool {
     match consensus_message {
-        ConsensusMessage::Confirm { slot, view, qc, proposals } => {
+        ConsensusMessage::Confirm { slot, view, qc, proposals: _ } => {
 
             //Check ID
             let mut hasher = Blake3Hasher::new();
             hasher.update(&slot.to_le_bytes());
             hasher.update(&view.to_le_bytes());
             //hasher.update(proposal_digest(consensus_message)); FIXME: ADD THIS AND DEBUG
-            hasher.update(&(0 as u8).to_le_bytes());
+            hasher.update(&0_u8.to_le_bytes());
             let prepare_id = Digest(hasher.finalize().into());
 
             if prepare_id != qc.id {
@@ -209,18 +203,18 @@ pub fn proposal_digest(consensus_message: &ConsensusMessage) -> Digest {
     let mut hasher = Blake3Hasher::new();
     match consensus_message {
         ConsensusMessage::Prepare { slot: _, view: _, tc: _, qc_ticket: _, proposals } => {
-            for (_, proposal) in proposals {
+            for proposal in proposals.values() {
                 hasher.update(&proposal.header_digest.0);
             }
         },
         ConsensusMessage::Confirm { slot: _, view: _, qc: _, proposals } => {
-            for (_, proposal) in proposals {
+            for proposal in proposals.values() {
                 hasher.update(&proposal.header_digest.0);
             }
 
         },
         ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
-            for (_, proposal) in proposals {
+            for proposal in proposals.values() {
                 hasher.update(&proposal.header_digest.0);
             }
         }
@@ -235,8 +229,8 @@ impl Hash for ConsensusMessage {
             ConsensusMessage::Prepare {
                 slot,
                 view,
-                tc,
-                qc_ticket,
+                tc: _,
+                qc_ticket: _,
                 proposals: _,
             } => {
                 hasher.update(&slot.to_le_bytes());
@@ -244,7 +238,7 @@ impl Hash for ConsensusMessage {
                 //hasher.update(proposal_digest(self)); FIXME: ADD THIS AND DEBUG
                 //hasher.update(tc.digest().0);
                 // NOTE: Indicates a prepare message
-                hasher.update(&(0 as u8).to_le_bytes());
+                hasher.update(&0_u8.to_le_bytes());
             }
             ConsensusMessage::Confirm {
                 slot,
@@ -257,7 +251,7 @@ impl Hash for ConsensusMessage {
                 hasher.update(&qc.id.0);
                 //hasher.update(qc.digest().0);
                 // NOTE: Indicates a confirm message
-                hasher.update(&(1 as u8).to_le_bytes());
+                hasher.update(&1_u8.to_le_bytes());
             }
             ConsensusMessage::Commit {
                 slot,
@@ -270,7 +264,7 @@ impl Hash for ConsensusMessage {
                 hasher.update(&qc.id.0);
                 //hasher.update(qc.digest().0);
                 // NOTE: Indicates a commit message
-                hasher.update(&(2 as u8).to_le_bytes());
+                hasher.update(&2_u8.to_le_bytes());
             }
         }
         Digest(hasher.finalize().into())
@@ -292,15 +286,15 @@ impl PartialEq for ConsensusMessage {
                 slot,
                 view,
                 tc,
-                qc_ticket,
+                qc_ticket: _,
                 proposals,
             } => {
-                return match other {
+                match other {
                     ConsensusMessage::Prepare {
                         slot: other_slot,
                         view: other_view,
                         tc: other_tc,
-                        qc_ticket: other_ticket,
+                        qc_ticket: _other_ticket,
                         proposals: other_proposals,
                     } => {
                         slot == other_slot
@@ -309,7 +303,7 @@ impl PartialEq for ConsensusMessage {
                             && proposals == other_proposals
                     }
                     _ => false,
-                };
+                }
             }
             ConsensusMessage::Confirm {
                 slot,
@@ -317,7 +311,7 @@ impl PartialEq for ConsensusMessage {
                 qc,
                 proposals,
             } => {
-                return match other {
+                match other {
                     ConsensusMessage::Confirm {
                         slot: other_slot,
                         view: other_view,
@@ -325,7 +319,7 @@ impl PartialEq for ConsensusMessage {
                         proposals: other_proposals,
                     } => slot == other_slot && view == other_view && qc == other_qc && proposals == other_proposals,
                     _ => false,
-                };
+                }
             }
             ConsensusMessage::Commit {
                 slot,
@@ -333,7 +327,7 @@ impl PartialEq for ConsensusMessage {
                 qc,
                 proposals,
             } => {
-                return match other {
+                match other {
                     ConsensusMessage::Commit {
                         slot: other_slot,
                         view: other_view,
@@ -341,7 +335,7 @@ impl PartialEq for ConsensusMessage {
                         proposals: other_proposals,
                     } => slot == other_slot && view == other_view && qc == other_qc && proposals == other_proposals,
                     _ => false,
-                };
+                }
             }
         }
     }
@@ -356,7 +350,7 @@ impl fmt::Debug for ConsensusMessage {
                 slot,
                 view: _,
                 tc: _,
-                qc_ticket,
+                qc_ticket: _,
                 proposals: _,
             } => {
                 write!(f, "Prepare({})", slot,)
@@ -388,18 +382,18 @@ impl fmt::Display for ConsensusMessage {
         match self {
             ConsensusMessage::Prepare {
                 slot,
-                view,
-                tc,
-                qc_ticket,
-                proposals,
+                view: _,
+                tc: _,
+                qc_ticket: _,
+                proposals: _,
             } => {
                 write!(f, "T{})", slot,)
             }
 
             ConsensusMessage::Confirm {
                 slot,
-                view,
-                qc,
+                view: _,
+                qc: _,
                 proposals: _,
             } => {
                 write!(f, "T{})", slot,)
@@ -407,8 +401,8 @@ impl fmt::Display for ConsensusMessage {
 
             ConsensusMessage::Commit {
                 slot,
-                view,
-                qc,
+                view: _,
+                qc: _,
                 proposals: _,
             } => {
                 write!(f, "T{})", slot,)
@@ -519,9 +513,7 @@ impl Header {
 
     pub fn genesis_headers(committee: &Committee) -> HashMap<PublicKey, Self> {
         committee
-            .authorities
-            .iter()
-            .map(|(pk, _)| {
+            .authorities.keys().map(|pk| {
                 (
                     *pk,
                     Header {
@@ -536,9 +528,7 @@ impl Header {
 
     pub fn genesis_proposals(committee: &Committee) -> HashMap<PublicKey, Proposal> {
         committee
-            .authorities
-            .iter()
-            .map(|(pk, _)| {
+            .authorities.keys().map(|pk| {
                 (
                     *pk,
                     Proposal {
@@ -565,7 +555,7 @@ impl Header {
         // Ensure all worker ids are correct.
         for worker_id in self.payload.values() {
             committee
-                .worker(&self.author, &worker_id)
+                .worker(&self.author, worker_id)
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
@@ -589,10 +579,10 @@ impl Header {
 
     pub fn new_from_key(
         author: PublicKey,
-        view: View,
+        _view: View,
         round: Height,
         secret: &SecretKey,
-        committee: &Committee,
+        _committee: &Committee,
     ) -> Header {
         let header = Header {
             author,
@@ -748,7 +738,7 @@ impl ConsensusRequest {
 
 impl fmt::Debug for ConsensusRequest {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        return self.message.fmt(f);
+        self.message.fmt(f)
     }
 }
 
@@ -900,7 +890,7 @@ impl Vote {
             consensus_votes,
             //consensus_instance: None,
         };
-        let signature = Signature::new(&vote.digest(), &secret);
+        let signature = Signature::new(&vote.digest(), secret);
         Self { signature, ..vote }
     }
 }
@@ -1003,7 +993,7 @@ impl Certificate {
             //compute all the individual vote digests and verify them  (TODO: Since there are only 2 possible types, 0 and 1 ==> Could compute 2 digests, and then insert them in the correct order)
             //E.g. could re-order Votes to be first all for 0, then all for 1. And call verify_batch separately twice
             let mut digests = Vec::new();
-            for (_i, _) in self.votes.iter().enumerate() {
+            for _ in self.votes.iter() {
                 digests.push({
                     let mut hasher = Blake3Hasher::new();
                     hasher.update(&self.header_digest.0);
@@ -1053,9 +1043,9 @@ impl Certificate {
     fn valid_weight(&self, committee: &Committee) -> Stake {
         self.votes
             .iter()
-            .enumerate()
-            .map(|(_i, (author, _))| {
-                committee.stake(&author) * (1 /*self.special_valids[i]*/ as Stake)
+            
+            .map(|(author, _)| {
+                committee.stake(author) * (1 /*self.special_valids[i]*/ as Stake)
             })
             .sum()
     }
@@ -1069,7 +1059,7 @@ impl Certificate {
     }
 }
 
-pub fn matching_valids(vec: &Vec<u8>) -> bool {
+pub fn matching_valids(vec: &[u8]) -> bool {
     vec.iter().min() == vec.iter().max()
 }
 
@@ -1325,12 +1315,14 @@ pub struct QC {
 }
 
 impl QC {
-    pub fn genesis(committee: &Committee) -> Self {
+    pub fn genesis(_committee: &Committee) -> Self {
         QC::default()
     }
 
+    // clippy::result_large_err: see error.rs's `ConsensusError` doc comment.
+    #[allow(clippy::result_large_err)]
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
-    
+
         //genesis QC always valid
         if Self::genesis(committee) == *self {
             return Ok(());
@@ -1374,7 +1366,7 @@ impl fmt::Debug for QC {
 }
 
 impl PartialEq for QC {
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, _other: &Self) -> bool {
         false
         //self.hash == other.hash && self.view == other.view
     }
@@ -1470,7 +1462,7 @@ impl Timeout {
             author,
             signature: Signature::default(),
         };
-        let signature = Signature::new(&timeout.digest(), &secret);
+        let signature = Signature::new(&timeout.digest(), secret);
         Self {
             signature,
             ..timeout
@@ -1492,7 +1484,7 @@ pub struct TC {
 }
 
 impl PartialEq for TC {
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, _other: &Self) -> bool {
         //self.hash == other.hash && self.view == other.view
         //*self.winning_proposal == *other.winning_proposal
         true
@@ -1500,19 +1492,19 @@ impl PartialEq for TC {
 }
 
 impl TC {
-    pub fn new(committee: &Committee, slot: Slot, view: View, timeouts: Vec<Timeout>) -> Self {
-        let tc = TC {
+    pub fn new(_committee: &Committee, slot: Slot, view: View, timeouts: Vec<Timeout>) -> Self {
+        
+        TC {
             slot,
             view,
             timeouts,
-        };
-        tc
+        }
         //tc.determine_winning_proposal(committee)
     }
 
     pub fn genesis(committee: &Committee) -> Self {
         //QC::default()
-        let genesis_header = Header::genesis(committee);
+        let _genesis_header = Header::genesis(committee);
         TC {
             //hash: genesis_header.id,
             //view: genesis_header.consensus_info.unwrap().view,
@@ -1530,42 +1522,36 @@ impl TC {
         // Find the timeout message containing the highest QC, and use that as the winning
         // proposal for the view change
         for timeout in &self.timeouts {
-            match &timeout.high_qc {
-                Some(qc) => {
-                    match qc {
-                        ConsensusMessage::Confirm {
-                            slot: _,
-                            view: other_view,
-                            qc: _,
-                            proposals,
-                        } => {
-                            // Update the highest QC view if we see a higher one
-                            if other_view > &winning_view {
-                                winning_view = timeout.view;
-                                winning_proposals = proposals.clone();
-                            }
-                        }
-
-                        ConsensusMessage::Commit {
-                            slot: _,
-                            view: _,
-                            qc: _,
-                            proposals,
-                        } => {
-                            // Adopt the proposals of a commit qc
-                            winning_proposals = proposals.clone();
-                            break;
-                        }
-
-                        _ => {}
+            if let Some(qc) = &timeout.high_qc {
+                match qc {
+                    ConsensusMessage::Confirm {
+                        slot: _,
+                        view: other_view,
+                        qc: _,
+                        proposals,
                     }
+                        // Update the highest QC view if we see a higher one
+                        if other_view > &winning_view => {
+                            winning_view = timeout.view;
+                            winning_proposals = proposals.clone();
+                        }
+
+                    ConsensusMessage::Commit {
+                        slot: _,
+                        view: _,
+                        qc: _,
+                        proposals,
+                    } => {
+                        // Adopt the proposals of a commit qc
+                        winning_proposals = proposals.clone();
+                        break;
+                    }
+
+                    _ => {}
                 }
-                None => {}
             };
-            match &timeout.high_prop {
-                Some(prepare) => {
-                    match prepare {
-                        ConsensusMessage::Prepare { slot, view, tc: _, qc_ticket: _, proposals } => {
+            if let Some(prepare) = &timeout.high_prop {
+                if let ConsensusMessage::Prepare { slot: _, view, tc: _, qc_ticket: _, proposals } = prepare {
                             if view > &winning_view{
                                 let weight = prepared_feq.entry(prepare.digest()).or_default();
                                 *weight += committee.stake(&timeout.author);
@@ -1577,33 +1563,32 @@ impl TC {
                                 }
                             }
                         }
-                        _ => {}
-                    }
-                }
-                None => {}
-
             }
         }
         winning_proposals
     }
 
-    pub fn determine_winning_proposal(mut self, committee: &Committee) -> Self {
+    pub fn determine_winning_proposal(self, _committee: &Committee) -> Self {
         self
     }
 
     pub fn set_winning_proposal(
-        mut self,
-        header: Option<Header>,
-        cert: Option<Certificate>,
-        qc: Option<Certificate>,
+        self,
+        _header: Option<Header>,
+        _cert: Option<Certificate>,
+        _qc: Option<Certificate>,
     ) -> Self {
         self
     }
 
-    pub fn validate_winning_proposal(&self, committee: &Committee) -> ConsensusResult<()> {
+    // clippy::result_large_err: see error.rs's `ConsensusError` doc comment.
+    #[allow(clippy::result_large_err)]
+    pub fn validate_winning_proposal(&self, _committee: &Committee) -> ConsensusResult<()> {
         Ok(())
     }
 
+    // clippy::result_large_err: see error.rs's `ConsensusError` doc comment.
+    #[allow(clippy::result_large_err)]
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         //genesis TC always valid
         if Self::genesis(committee) == *self {

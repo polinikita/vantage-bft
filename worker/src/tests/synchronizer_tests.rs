@@ -31,6 +31,7 @@ async fn synchronize() {
         /* sync_retry_nodes */ 3, // Not used in this test.
         rx_message,
         metrics,
+        false,
     );
 
     // Spawn a listener to receive our batch requests.
