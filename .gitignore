@@ -26,3 +26,4 @@ scripts/build_and_fab
 
 # `node local-benchmark` (PHASE2-SPEC.md #8) per-node stores/reference config.
 .local-bench/
+.local-bench*/
