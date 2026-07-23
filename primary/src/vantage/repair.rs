@@ -1,0 +1,327 @@
+// PHASE3-SPEC.md §3.3 -- Authorize walk + serving (N6-N8).
+//
+// `Repairer` owns the request-out / answer-in bookkeeping (`authorized`, `requested`,
+// `pendingReq`, `answered`) and shares `lanes::BlockCache` with `LaneManager` (see
+// lanes.rs's module doc for why). Shape follows `HeaderWaiter`+`Helper`
+// (request-out / answer-in split) with the paper's differences (D2): requests fan out
+// to all other primaries once, no retry timers; serving keeps `pendingReq` for blocks
+// not yet held instead of dropping unknown digests (Autobahn's `Helper` drops them,
+// helper.rs:77 -- we must not, N7).
+
+use crate::messages::Header;
+use crate::vantage::block::block_ok;
+use crate::vantage::lanes::SharedBlocks;
+use crate::vantage::{BlockRef, Effect};
+use config::Committee;
+use crypto::{Digest, PublicKey};
+use metrics::Metrics;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+pub struct Repairer {
+    name: PublicKey,
+    committee: Committee,
+    sid: Digest,
+    genesis: Digest,
+    max_block_payload: usize,
+    blocks: SharedBlocks,
+
+    /// N6: every `(a, k, h)` ever passed to `authorize`.
+    authorized: HashSet<BlockRef>,
+    /// PHASE6-SPEC.md §9 gate amendment, R1 (D6-7 continued): every `BlockRef` for which
+    /// `settle` has ever returned `true` (verified-through-genesis + retained). Both of
+    /// those facts are monotone/sticky (N8: retention never discards; the chain a digest
+    /// names is immutable), so membership here is permanent -- once settled, always
+    /// settled. `settle` short-circuits at the top for any ref already in this set,
+    /// making repeat/recursive `settle` calls amortized O(1) once the whole prefix below
+    /// a tip has been walked once.
+    settled: HashSet<BlockRef>,
+    /// PHASE6-SPEC.md §9 gate amendment, R1: `authorized \ settled` -- the only refs
+    /// `on_block_available` re-attempts on a new block arrival (replacing the previous
+    /// re-settle-everything sweep). A ref leaves this set (into `settled`) exactly when
+    /// `settle` succeeds for it; it never leaves any other way, so this is always exactly
+    /// `authorized \ settled` without needing to recompute the set difference.
+    pending_settle: HashSet<BlockRef>,
+    /// N6: `(peer, h)` we have sent `request(h)` to, ever -- at most one, no retries.
+    requested: HashSet<(PublicKey, Digest)>,
+    /// N6/P1-2: every hash we have ever requested (union of `requested`'s second
+    /// component) -- gates `on_serve`, since the paper's serve clause fires only "for a
+    /// requested hash". Without this an unsolicited-but-hash-correct serve could inject
+    /// unbounded valid blocks of a peer's own lane into the shared cache without us
+    /// ever asking, outside §6.3's documented (attacker-cost-proportional) exposure.
+    requested_hashes: HashSet<Digest>,
+    /// N7: `(requester, h)` recorded on a direct `request(h)`, even before we hold `h`.
+    pending_req: HashSet<(PublicKey, Digest)>,
+    /// N7: `(requester, h)` we have already served -- at most one answer, ever.
+    answered: HashSet<(PublicKey, Digest)>,
+
+    /// §6.4 counters; `None` in most unit tests, which don't assert on metrics.
+    metrics: Option<Arc<Metrics>>,
+}
+
+impl Repairer {
+    pub fn new(
+        name: PublicKey,
+        committee: Committee,
+        sid: Digest,
+        genesis: Digest,
+        max_block_payload: usize,
+        blocks: SharedBlocks,
+    ) -> Self {
+        Self {
+            name,
+            committee,
+            sid,
+            genesis,
+            max_block_payload,
+            blocks,
+            authorized: HashSet::new(),
+            settled: HashSet::new(),
+            pending_settle: HashSet::new(),
+            requested: HashSet::new(),
+            requested_hashes: HashSet::new(),
+            pending_req: HashSet::new(),
+            answered: HashSet::new(),
+            metrics: None,
+        }
+    }
+
+    /// Attach §6.4 counters (production wiring only -- most unit tests skip this).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// §4 entry point, N6. Idempotent: re-authorizing a tuple already in `authorized`
+    /// never re-emits a request (guarded by `requested`) but does re-attempt to settle
+    /// it (harmless/idempotent, and O(1) if it's already `settled`) in case cached state
+    /// advanced since the last attempt.
+    pub fn authorize(&mut self, r: BlockRef) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.note_authorized(r.clone());
+        self.settle(r, &mut effects);
+        effects
+    }
+
+    /// PHASE6-SPEC.md §9 gate amendment, R1(a): record `r` in `authorized`, and in
+    /// `pending_settle` too unless it's already `settled` (permanent membership there
+    /// means it can never regress back to pending).
+    fn note_authorized(&mut self, r: BlockRef) {
+        self.authorized.insert(r.clone());
+        if !self.settled.contains(&r) {
+            self.pending_settle.insert(r);
+        }
+    }
+
+    /// `settle` succeeded for `r`: move it from `pending_settle` into the permanent
+    /// `settled` set.
+    fn mark_settled(&mut self, r: BlockRef) {
+        self.settled.insert(r.clone());
+        self.pending_settle.remove(&r);
+    }
+
+    /// Whenever a cached block matches an authorized exact coordinate (arriving via
+    /// publish *or* serve), the walk advances -- called by the caller after any block
+    /// becomes cached (`Effect::BlockCached`, from either `LaneManager` or `on_serve`
+    /// below).
+    ///
+    /// PHASE6-SPEC.md §9 gate amendment, R1(c): iterates only `pending_settle` (=
+    /// `authorized \ settled`), not the whole `authorized` set. This still gets
+    /// retention propagation right: when ancestors arrive one at a time, the newly-
+    /// arrived ancestor's OWN `settle` call (a `pending_settle` member, since nothing
+    /// settles before its own walk succeeds) completes and is memoized into `settled`;
+    /// every *descendant* still in `pending_settle` (blocked earlier, waiting on exactly
+    /// this ancestor) then short-circuits into that memoized `true` at the top of
+    /// `settle` the moment its own turn in this same loop is reached (or on the next
+    /// arrival, if this one doesn't reach it) -- no re-walk of the settled ancestor
+    /// itself is needed, unlike the previous re-settle-everything sweep. A ref that
+    /// fails to settle this round (still blocked on a different/deeper missing digest)
+    /// simply stays in `pending_settle`, tried again on the next arrival -- identical
+    /// externally-observable behavior to the old sweep, just amortized.
+    pub fn on_block_available(&mut self, _digest: Digest) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let refs: Vec<BlockRef> = self.pending_settle.iter().cloned().collect();
+        for r in refs {
+            self.settle(r, &mut effects);
+        }
+        effects
+    }
+
+    /// On `serve(h, b)` **for a requested `h`** (N6 -- this gate is normative, not
+    /// incidental: an unsolicited-but-hash-correct serve is ignored, same as a
+    /// corrupted one, so a peer cannot bulk-inject unbounded valid blocks of its own
+    /// lane into our cache without us ever asking): if `h` was requested and `b` is
+    /// well-formed (`hash(b) == h` is implicit -- we compute `h` from `b` ourselves
+    /// below -- `BlockOK`, size caps), cache it as repaired data *without* a provenance
+    /// mark, coordinate-independent (cached even if `b`'s encoded author/height differ
+    /// from whatever coordinate we were hoping this digest would satisfy -- only an
+    /// exact coordinate match advances a walk). A failed check leaves no trace: the
+    /// hash stays un-obtained.
+    pub fn on_serve(&mut self, block: Header) -> Vec<Effect> {
+        if !self.requested_hashes.contains(&block.id) {
+            return Vec::new();
+        }
+        if !block_ok(&block, &self.committee, &self.sid, self.max_block_payload) {
+            return Vec::new();
+        }
+        let digest = block.id.clone();
+        {
+            let mut blocks = self.blocks.lock().unwrap();
+            blocks.upsert(block, false, true, false);
+        }
+        // `payload_ok` is left false here -- serving/retention are chain-hash
+        // authenticity concerns (D1's clause (ii)), not the payload-possession clause
+        // (D1 (iii)), which only ever gates *acking*, never repair/retention. A
+        // caller that also wants the batch bytes synced can still do so separately;
+        // Phase 3's repair walk itself only ever needs the chain of headers.
+        let mut effects = vec![Effect::BlockCached(digest.clone())];
+        effects.extend(self.on_block_available(digest));
+        effects
+    }
+
+    /// On a direct `request(h)` from `p_j` (N7): record `(j, h)` in `pendingReq` if not
+    /// already answered -- even when the block is not held yet -- then try-serve.
+    pub fn on_request(&mut self, requester: PublicKey, h: Digest) -> Vec<Effect> {
+        if !self.answered.contains(&(requester, h.clone())) {
+            self.pending_req.insert((requester, h.clone()));
+        }
+        let mut effects = Vec::new();
+        self.try_serve(&h, &mut effects);
+        effects
+    }
+
+    /// The recursive Authorize walk (§3.3 N6): match a cached block at the exact
+    /// coordinate, recurse into the parent, or fan out `request(h)`. Returns whether
+    /// this reference's prefix is verified through genesis *right now* (used only to
+    /// decide whether to retain+try-serve at this level; the return value itself is not
+    /// otherwise consumed by the top-level caller, though it IS consumed by the direct
+    /// recursive caller below to decide whether to retain/settle).
+    ///
+    /// PHASE6-SPEC.md §9 gate amendment, R1(b): short-circuits at the top for any `r`
+    /// already in `settled` -- recursion then stops at the first settled ancestor
+    /// instead of re-walking to genesis, making repeat calls (whether from a fresh
+    /// `authorize` on an overlapping lane, or from `on_block_available`'s loop) amortized
+    /// O(1) per already-settled tip. Only a genuinely new, not-yet-settled tail of the
+    /// chain is ever walked.
+    fn settle(&mut self, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
+        if self.settled.contains(&r) {
+            return true;
+        }
+        let (author, height, h) = r.clone();
+        if height == 0 {
+            return true; // implicit genesis base case; trivial, not memoized
+        }
+
+        let cached = {
+            let blocks = self.blocks.lock().unwrap();
+            blocks.get(&h).and_then(|entry| {
+                let b = &entry.block;
+                if b.author == author
+                    && b.height == height
+                    && b.id == h
+                    && block_ok(b, &self.committee, &self.sid, self.max_block_payload)
+                {
+                    Some(b.clone())
+                } else {
+                    None
+                }
+            })
+        };
+
+        let Some(block) = cached else {
+            self.requested_hashes.insert(h.clone());
+            for (peer, _) in self.committee.others_primaries(&self.name) {
+                if self.requested.insert((peer, h.clone())) {
+                    effects.push(Effect::RequestTo(peer, h.clone()));
+                    if let Some(metrics) = &self.metrics {
+                        metrics.vantage_repairs_requested.inc();
+                    }
+                }
+            }
+            return false;
+        };
+
+        let parent_h = block.parent_cert.header_digest.clone();
+        if height == 1 {
+            if parent_h != self.genesis {
+                // Never verifies (a malformed/forged genesis link) -- documented
+                // residual: the walk simply never completes for this coordinate.
+                return false;
+            }
+            self.retain_and_serve(&r, effects);
+            self.mark_settled(r);
+            return true;
+        }
+
+        let parent_ref = (author, height - 1, parent_h);
+        self.note_authorized(parent_ref.clone());
+        let parent_verified = self.settle(parent_ref, effects);
+        if parent_verified {
+            self.retain_and_serve(&r, effects);
+            self.mark_settled(r);
+        }
+        parent_verified
+    }
+
+    fn retain_and_serve(&mut self, r: &BlockRef, effects: &mut Vec<Effect>) {
+        let h = r.2.clone();
+        {
+            let mut blocks = self.blocks.lock().unwrap();
+            blocks.mark_retained(&h);
+        }
+        self.try_serve(&h, effects);
+    }
+
+    /// Try-serve (N7): if a retained block matches `h`, answer each pending
+    /// `(j, h)` not yet answered with `serve(h, b)`, marking `(j, h)` answered.
+    fn try_serve(&mut self, h: &Digest, effects: &mut Vec<Effect>) {
+        let block = {
+            let blocks = self.blocks.lock().unwrap();
+            match blocks.get(h) {
+                Some(entry) if entry.retained => Some(entry.block.clone()),
+                _ => None,
+            }
+        };
+        let Some(block) = block else {
+            return;
+        };
+        let pending: Vec<PublicKey> = self
+            .pending_req
+            .iter()
+            .filter(|(_, dh)| dh == h)
+            .map(|(peer, _)| *peer)
+            .filter(|peer| !self.answered.contains(&(*peer, h.clone())))
+            .collect();
+        for peer in pending {
+            self.answered.insert((peer, h.clone()));
+            // Paper: "remove it from pendingReq" -- `answered` already makes the
+            // (peer, h) pair permanently inert, but do the removal too so the set
+            // doesn't grow forever.
+            self.pending_req.remove(&(peer, h.clone()));
+            effects.push(Effect::ServeTo(peer, block.clone()));
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_repairs_served.inc();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requested_count(&self) -> usize {
+        self.requested.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_settled(&self, r: &BlockRef) -> bool {
+        self.settled.contains(r)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending_settle(&self, r: &BlockRef) -> bool {
+        self.pending_settle.contains(r)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocks_for_test(&self) -> std::sync::MutexGuard<'_, crate::vantage::lanes::BlockCache> {
+        self.blocks.lock().unwrap()
+    }
+}

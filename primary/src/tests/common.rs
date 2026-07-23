@@ -36,6 +36,7 @@ pub fn committee() -> Committee {
                 let primary = PrimaryAddresses {
                     primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
                     worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
+                    metrics: format!("127.0.0.1:{}", 600 + i).parse().unwrap(),
                 };
                 let workers = vec![(
                     0,
@@ -43,6 +44,7 @@ pub fn committee() -> Committee {
                         primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
                         transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
                         worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
+                        metrics: format!("127.0.0.1:{}", 700 + i).parse().unwrap(),
                     },
                 )]
                 .iter()
@@ -74,6 +76,9 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
         let port = primary.worker_to_primary.port();
         primary.worker_to_primary.set_port(base_port + port);
 
+        let port = primary.metrics.port();
+        primary.metrics.set_port(base_port + port);
+
         for worker in authority.workers.values_mut() {
             let port = worker.primary_to_worker.port();
             worker.primary_to_worker.set_port(base_port + port);
@@ -83,6 +88,9 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
 
             let port = worker.worker_to_worker.port();
             worker.worker_to_worker.set_port(base_port + port);
+
+            let port = worker.metrics.port();
+            worker.metrics.set_port(base_port + port);
         }
     }
     committee
@@ -103,7 +111,7 @@ pub fn header() -> Header {
     };
     Header {
         id: header.digest(),
-        signature: Signature::new(&header.digest(), &secret),
+        signature: Some(Signature::new(&header.digest(), &secret)),
         ..header
     }
 }
@@ -125,7 +133,7 @@ pub fn special_header(parent_cert: Certificate, consensus_messages: HashMap<Dige
     };
     Header {
         id: header.digest(),
-        signature: Signature::new(&header.digest(), &secret),
+        signature: Some(Signature::new(&header.digest(), &secret)),
         ..header
     }
 }
@@ -147,7 +155,7 @@ pub fn headers() -> Vec<Header> {
             };
             Header {
                 id: header.digest(),
-                signature: Signature::new(&header.digest(), &secret),
+                signature: Some(Signature::new(&header.digest(), &secret)),
                 ..header
             }
         })
@@ -167,7 +175,7 @@ pub fn header_from_cert(certificate: &Certificate) -> Header {
 
     Header {
         id: header.digest(),
-        signature: Signature::new(&header.digest(), &secret),
+        signature: Some(Signature::new(&header.digest(), &secret)),
         ..header
     }
 

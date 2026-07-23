@@ -15,11 +15,12 @@ mod primary;
 mod proposer;
 mod synchronizer;
 pub mod timer;
+pub mod vantage;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]
 mod common;
 
 pub use crate::error::DagError;
-pub use crate::messages::{Certificate, Header};
-pub use crate::primary::{Primary, PrimaryWorkerMessage, Height, WorkerPrimaryMessage};
+pub use crate::messages::{Ack, Certificate, Header};
+pub use crate::primary::{Primary, PrimaryMessage, PrimaryWorkerMessage, Height, WorkerPrimaryMessage};

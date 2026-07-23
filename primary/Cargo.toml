@@ -3,31 +3,32 @@ name = "primary"
 version = "0.1.0"
 authors = ["Libra <oncall+libra@xmail.facebook.com>"]
 publish = false
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-futures = "0.3.6"
-serial_test = "0.9.0"
-serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.5.0", features = ["sync", "rt", "macros", "time"] }
-tokio-util = { version = "0.7.4", features= ["codec", "time"] }
-ed25519-dalek = "1.0.1"
-thiserror = "1.0.20"
-bincode = "1.3.1"
-bytes = "1.0.1"
-env_logger = "0.7.1"
-log = "0.4.11"
-async-recursion = "0.3.2"
-async-trait = "0.1.50"
+futures = { workspace = true }
+serial_test = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio-util = { workspace = true, features = ["codec", "time"] }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+async-recursion = { workspace = true }
+async-trait = { workspace = true }
 
 crypto = { path = "../crypto" }
 store = { path = "../store" }
 config = { path = "../config" }
 network = { path = "../network" }
-#sailfish = { path = "../sailfish"}
+metrics = { path = "../metrics" }
+prometheus = { workspace = true }
 
 [dev-dependencies]
-rand = "0.7.3"
+rand = { workspace = true }
 
 [features]
 benchmark = []

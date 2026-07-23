@@ -2,17 +2,21 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 use crate::messages::ConsensusMessage;
-use crate::primary::{Slot, CHANNEL_CAPACITY};
+use crate::primary::{PrimaryWorkerMessage, Slot, CHANNEL_CAPACITY};
 use crate::synchronizer::Synchronizer;
 use crate::{Certificate, Header, Height};
 //use crate::error::{ConsensusError, ConsensusResult};
-use config::Committee;
+use bytes::Bytes;
+use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info};
+use network::SimpleSender;
 use std::borrow::BorrowMut;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -78,10 +82,17 @@ pub struct Committer {
     tx_output: Sender<Header>,
     synchronizer: Synchronizer,
     genesis: Vec<Certificate>,
+    /// Our own local workers' `primary_to_worker` addresses, keyed by id (benchmark-only:
+    /// used to notify a worker of the batches it just saw committed, PHASE2-SPEC.md #5).
+    #[cfg(feature = "benchmark")]
+    worker_addresses: HashMap<WorkerId, SocketAddr>,
+    #[cfg(feature = "benchmark")]
+    network: SimpleSender,
 }
 
 impl Committer {
     pub fn spawn(
+        name: PublicKey,
         committee: Committee,
         store: Store,
         gc_depth: Height,
@@ -99,6 +110,14 @@ impl Committer {
         //Alternatively, just store genesis digests and compare against
         //let genesis_digests = genesis.clone().iter().map(|x| x.digest()).collect();
 
+        #[cfg(feature = "benchmark")]
+        let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
+            .our_workers_by_id(&name)
+            .expect("Our public key or worker id is not in the committee")
+            .into_iter()
+            .map(|(id, address)| (id, address.primary_to_worker))
+            .collect();
+
         tokio::spawn(async move {
             Self {
                 gc_depth,
@@ -108,6 +127,10 @@ impl Committer {
                 tx_output,
                 synchronizer,
                 genesis,
+                #[cfg(feature = "benchmark")]
+                worker_addresses,
+                #[cfg(feature = "benchmark")]
+                network: SimpleSender::new(),
             }
             .run()
             .await;
@@ -151,9 +174,43 @@ impl Committer {
                                 for header in headers {
                                     info!("Committed {}", header);
                                     #[cfg(feature = "benchmark")]
-                                    for digest in header.payload.keys() {
-                                        // NOTE: This log entry is used to compute performance.
-                                        info!("Committed {} -> {:?}", header, digest);
+                                    {
+                                        for digest in header.payload.keys() {
+                                            // NOTE: This log entry is used to compute performance.
+                                            info!("Committed {} -> {:?}", header, digest);
+                                        }
+
+                                        // Commit instant (PHASE2-SPEC.md #5, amended): taken
+                                        // once per header, right at the "Committed" log site,
+                                        // and carried in the notification itself so the
+                                        // worker's latency measurement is submission -> this
+                                        // exact instant -- not submission -> whenever the
+                                        // worker's queue got around to the notification.
+                                        let commit_millis = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .expect("Failed to measure time")
+                                            .as_millis() as u64;
+
+                                        // Notify our own local worker(s), grouped by
+                                        // WorkerId, of the batches just committed so they
+                                        // can extract real transaction latency
+                                        // (PHASE2-SPEC.md #5). Routed to *our* worker with
+                                        // the same id as the header author's -- batches are
+                                        // gossiped worker-to-worker by matching id, so our
+                                        // local worker likely holds a replica even for a
+                                        // remote author's batch; a store miss is fine
+                                        // (worker-side `latency_misses`, never blocks).
+                                        let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
+                                        for (digest, worker_id) in header.payload.iter() {
+                                            by_worker.entry(*worker_id).or_default().push(digest.clone());
+                                        }
+                                        for (worker_id, digests) in by_worker {
+                                            if let Some(address) = self.worker_addresses.get(&worker_id) {
+                                                let bytes = bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests))
+                                                    .expect("Failed to serialize committed message");
+                                                self.network.send(*address, Bytes::from(bytes)).await;
+                                            }
+                                        }
                                     }
                                     debug!("Finished Commit");
                                     // Output the block to the top-level application.

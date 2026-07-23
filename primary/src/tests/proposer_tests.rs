@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, HashMap};
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::{common::{committee, keys}, messages::Vote};
+use serial_test::serial;
 use tokio::sync::mpsc::channel;
 
 #[tokio::test]
+#[serial]
 async fn propose_empty() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
@@ -45,6 +47,7 @@ async fn propose_empty() {
 }
 
 #[tokio::test]
+#[serial]
 async fn propose_payload() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
@@ -93,6 +96,7 @@ async fn propose_payload() {
 }
 
 #[tokio::test]
+#[serial]
 async fn propose_normal() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
@@ -121,6 +125,8 @@ async fn propose_normal() {
         .send(genesis_cert)
         .await
         .expect("failed to send cert to proposer");
+
+    sleep(Duration::from_millis(500)).await;
 
     // Send enough digests for the header payload.
     let digest = Digest(name.0);
@@ -166,6 +172,7 @@ async fn propose_normal() {
 
 // Special header tests
 #[tokio::test]
+#[serial]
 async fn propose_special_ticket_first() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
@@ -230,6 +237,7 @@ async fn propose_special_ticket_first() {
 }
 
 #[tokio::test]
+#[serial]
 async fn propose_confirm_message() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);

@@ -877,6 +877,22 @@ impl Core {
                     // Leader tip proposal
                     proposals.insert(self.name, Proposal { header_digest: header.id.clone(), height: header.height });
 
+                    // Defining seamless invariant (PHASE2-SPEC.md #2): under autobahn-seamless,
+                    // every proposal entering a cut -- other than our own tip, which an author
+                    // always trusts ahead of its own certificate (see the early insert in
+                    // process_own_header) -- references a height no greater than that author's
+                    // last *certified* height. No uncertified tip may ever enter consensus.
+                    if !self.use_optimistic_tips {
+                        debug_assert!(
+                            proposals.iter().all(|(pk, proposal)| {
+                                *pk == self.name
+                                    || self.current_certified_tips.get(pk)
+                                        .is_some_and(|certified| proposal.height <= certified.height)
+                            }),
+                            "seamless invariant violated: a cut proposal exceeds its author's last certified height"
+                        );
+                    }
+
                     for (pk, proposal) in proposals {
                         debug!("new proposal height is {:?}", proposal.height);
                     }

@@ -7,9 +7,7 @@
 use crate::error::{ConsensusError, ConsensusResult, DagError, DagResult};
 use crate::primary::{Height, Slot, View};
 use config::{Committee, Stake, WorkerId};
-use crypto::{Digest, Hash, PublicKey, SecretKey, Signature, SignatureService};
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
+use crypto::{Blake3Hasher, Digest, Hash, PublicKey, SecretKey, Signature, SignatureService};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use core::panic;
@@ -57,10 +55,10 @@ impl fmt::Display for Proposal {
 
 impl Hash for Proposal {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
+        let mut hasher = Blake3Hasher::new();
         hasher.update(&self.header_digest.0);
         hasher.update(&self.height.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize().into())
     }
 }
 
@@ -122,12 +120,12 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
     
     match consensus_message {
         ConsensusMessage::Commit{ slot, view, qc, proposals } => {
-            let mut hasher = Sha512::new();
-            hasher.update(slot.to_le_bytes());
-            hasher.update(view.to_le_bytes());
+            let mut hasher = Blake3Hasher::new();
+            hasher.update(&slot.to_le_bytes());
+            hasher.update(&view.to_le_bytes());
             //hasher.update(proposal_digest(consensus_message)); FIXME: ADD THIS AND DEBUG
-            hasher.update((0 as u8).to_le_bytes());
-            let prepare_id = Digest(hasher.finalize().as_slice()[..32].try_into().unwrap());
+            hasher.update(&(0 as u8).to_le_bytes());
+            let prepare_id = Digest(hasher.finalize().into());
 
             debug!("PrepareIDCheck has slot: {}, view: {}, digest: {}", slot, view, prepare_id);
 
@@ -146,12 +144,12 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
 
                 //TODO: Need to have digest of the confirm vote
                 // Confirm vote has digest = 
-                let mut hasher = Sha512::new();
-                hasher.update(slot.to_le_bytes());
-                hasher.update(view.to_le_bytes());
+                let mut hasher = Blake3Hasher::new();
+                hasher.update(&slot.to_le_bytes());
+                hasher.update(&view.to_le_bytes());
                 hasher.update(&prepare_id.0);
-                hasher.update((1 as u8).to_le_bytes());
-                let confirm_id = Digest(hasher.finalize().as_slice()[..32].try_into().unwrap());
+                hasher.update(&(1 as u8).to_le_bytes());
+                let confirm_id = Digest(hasher.finalize().into());
 
                 debug!("ConfirmIDCheck for slot: {}, view: {}, qc_dig {:?} -> has digest: {}", slot, view, prepare_id , confirm_id);
 
@@ -188,12 +186,12 @@ pub fn verify_confirm(consensus_message: &ConsensusMessage, committee: &Committe
         ConsensusMessage::Confirm { slot, view, qc, proposals } => {
 
             //Check ID
-            let mut hasher = Sha512::new();
-            hasher.update(slot.to_le_bytes());
-            hasher.update(view.to_le_bytes());
+            let mut hasher = Blake3Hasher::new();
+            hasher.update(&slot.to_le_bytes());
+            hasher.update(&view.to_le_bytes());
             //hasher.update(proposal_digest(consensus_message)); FIXME: ADD THIS AND DEBUG
-            hasher.update((0 as u8).to_le_bytes());
-            let prepare_id = Digest(hasher.finalize().as_slice()[..32].try_into().unwrap());
+            hasher.update(&(0 as u8).to_le_bytes());
+            let prepare_id = Digest(hasher.finalize().into());
 
             if prepare_id != qc.id {
                 return false;
@@ -208,31 +206,31 @@ pub fn verify_confirm(consensus_message: &ConsensusMessage, committee: &Committe
 }
 
 pub fn proposal_digest(consensus_message: &ConsensusMessage) -> Digest {
-    let mut hasher = Sha512::new();
+    let mut hasher = Blake3Hasher::new();
     match consensus_message {
         ConsensusMessage::Prepare { slot: _, view: _, tc: _, qc_ticket: _, proposals } => {
             for (_, proposal) in proposals {
-                hasher.update(proposal.header_digest.0);
+                hasher.update(&proposal.header_digest.0);
             }
         },
         ConsensusMessage::Confirm { slot: _, view: _, qc: _, proposals } => {
             for (_, proposal) in proposals {
-                hasher.update(proposal.header_digest.0);
+                hasher.update(&proposal.header_digest.0);
             }
 
         },
         ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
             for (_, proposal) in proposals {
-                hasher.update(proposal.header_digest.0);
+                hasher.update(&proposal.header_digest.0);
             }
         }
     }
-    Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+    Digest(hasher.finalize().into())
 }
 
 impl Hash for ConsensusMessage {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
+        let mut hasher = Blake3Hasher::new();
         match self {
             ConsensusMessage::Prepare {
                 slot,
@@ -241,12 +239,12 @@ impl Hash for ConsensusMessage {
                 qc_ticket,
                 proposals: _,
             } => {
-                hasher.update(slot.to_le_bytes());
-                hasher.update(view.to_le_bytes());
+                hasher.update(&slot.to_le_bytes());
+                hasher.update(&view.to_le_bytes());
                 //hasher.update(proposal_digest(self)); FIXME: ADD THIS AND DEBUG
                 //hasher.update(tc.digest().0);
                 // NOTE: Indicates a prepare message
-                hasher.update((0 as u8).to_le_bytes());
+                hasher.update(&(0 as u8).to_le_bytes());
             }
             ConsensusMessage::Confirm {
                 slot,
@@ -254,12 +252,12 @@ impl Hash for ConsensusMessage {
                 qc,
                 proposals: _,
             } => {
-                hasher.update(slot.to_le_bytes());
-                hasher.update(view.to_le_bytes());
-                hasher.update(&qc.id);
+                hasher.update(&slot.to_le_bytes());
+                hasher.update(&view.to_le_bytes());
+                hasher.update(&qc.id.0);
                 //hasher.update(qc.digest().0);
                 // NOTE: Indicates a confirm message
-                hasher.update((1 as u8).to_le_bytes());
+                hasher.update(&(1 as u8).to_le_bytes());
             }
             ConsensusMessage::Commit {
                 slot,
@@ -267,15 +265,15 @@ impl Hash for ConsensusMessage {
                 qc,
                 proposals: _,
             } => {
-                hasher.update(slot.to_le_bytes());
-                hasher.update(view.to_le_bytes());
-                hasher.update(&qc.id);
+                hasher.update(&slot.to_le_bytes());
+                hasher.update(&view.to_le_bytes());
+                hasher.update(&qc.id.0);
                 //hasher.update(qc.digest().0);
                 // NOTE: Indicates a commit message
-                hasher.update((2 as u8).to_le_bytes());
+                hasher.update(&(2 as u8).to_le_bytes());
             }
         }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize().into())
     }
 }
 
@@ -426,7 +424,13 @@ pub struct Header {
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parent_cert: Certificate,
     pub id: Digest,
-    pub signature: Signature,
+    // `None` on the vantage path (PHASE3-SPEC.md §3.1) -- vantage carries no
+    // signatures anywhere. Autobahn constructors always set `Some(sig)`;
+    // `Header::verify` (the only reader) requires presence.
+    pub signature: Option<Signature>,
+    // Vantage only (PHASE3-SPEC.md §3.1/§6.1): `Some(sid)` binds a block to its
+    // session; `None` on both Autobahn paths, where it is meaningless.
+    pub sid: Option<Digest>,
 
     // Consensus metadata
     pub consensus_messages: HashMap<Digest, ConsensusMessage>,
@@ -452,7 +456,8 @@ impl Header {
             payload,
             parent_cert,
             id: Digest::default(),
-            signature: Signature::default(),
+            signature: Some(Signature::default()),
+            sid: None,
             consensus_messages: consensus_instances,
             num_active_instances,
             special: false,
@@ -461,9 +466,43 @@ impl Header {
         let signature = signature_service.request_signature(id.clone()).await;
         Self {
             id,
-            signature,
+            signature: Some(signature),
             ..header
         }
+    }
+
+    /// Vantage constructor (PHASE3-SPEC.md §3.1): no signature service, no consensus
+    /// metadata, `parent_cert` is an empty-votes certificate acting as a pure predecessor
+    /// pointer (never `Certificate::verify`d on this path -- N2's chain check is a plain
+    /// height+digest match, see `vantage::block::block_ok`). `prev_digest` is the
+    /// predecessor's block hash, or the session's genesis digest at height 1.
+    pub fn new_vantage(
+        author: PublicKey,
+        height: Height,
+        payload: BTreeMap<Digest, WorkerId>,
+        prev_digest: Digest,
+        sid: Digest,
+    ) -> Self {
+        let parent_cert = Certificate {
+            author,
+            header_digest: prev_digest,
+            height: height.saturating_sub(1),
+            votes: Vec::new(),
+        };
+        let header = Self {
+            author,
+            height,
+            payload,
+            parent_cert,
+            id: Digest::default(),
+            signature: None,
+            sid: Some(sid),
+            consensus_messages: HashMap::new(),
+            num_active_instances: 0,
+            special: false,
+        };
+        let id = header.digest();
+        Self { id, ..header }
     }
 
     //Note: This is essentially equivalent to Header::default() but with an author name. ==> Currently no difference in functionality; can use them interchangeably
@@ -530,8 +569,12 @@ impl Header {
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
-        // Check the signature.
+        // Check the signature (Autobahn paths only -- always `Some`; the vantage path
+        // never calls this, it uses `vantage::block::block_ok` instead, which requires
+        // `signature.is_none()`).
         self.signature
+            .as_ref()
+            .ok_or_else(|| DagError::MalformedHeader(self.id.clone()))?
             .verify(&self.id, &self.author)
             .map_err(DagError::from)
     }
@@ -554,14 +597,14 @@ impl Header {
         let header = Header {
             author,
             height: round,
-            signature: Signature::default(),
+            signature: Some(Signature::default()),
             ..Header::default()
         };
         let id = header.digest();
         let signature = Signature::new(&id, secret);
         Self {
             id,
-            signature,
+            signature: Some(signature),
             ..header
         }
     }
@@ -569,14 +612,14 @@ impl Header {
 
 impl Hash for Header {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(&self.author);
-        hasher.update(self.height.to_le_bytes());
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(&self.author.0);
+        hasher.update(&self.height.to_le_bytes());
         for (x, y) in &self.payload {
-            hasher.update(x);
-            hasher.update(y.to_le_bytes());
+            hasher.update(&x.0);
+            hasher.update(&y.to_le_bytes());
         }
-        hasher.update(&self.parent_cert.header_digest); //Need to hash the chain parent(?)
+        hasher.update(&self.parent_cert.header_digest.0); //Need to hash the chain parent(?)
         //hasher.update(&self.parent_cert);
 
         /*for info in &self.prepare_info_list {
@@ -589,7 +632,22 @@ impl Hash for Header {
     //     //     hasher.update(dig);
     //     // }
 
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        // PHASE3-SPEC.md §3.1: fold the new `sid` Option injectively (presence byte then
+        // content when `Some`), appended after every pre-existing fold so Autobahn's
+        // digest is unaffected in shape (only in value, since every Autobahn header now
+        // also folds a `0` byte for `sid: None`). `signature` stays outside the digest,
+        // as before.
+        match &self.sid {
+            Some(sid) => {
+                hasher.update(&[1u8]);
+                hasher.update(&sid.0);
+            }
+            None => {
+                hasher.update(&[0u8]);
+            }
+        };
+
+        Digest(hasher.finalize().into())
     }
 }
 
@@ -619,6 +677,37 @@ impl fmt::Display for Header {
     }
 }
 
+/// Vantage-only (PHASE3-SPEC.md §3.1, wire variant §5): the paper's unsigned
+/// `⟨ack, a, k, h⟩`. `sender` is the acking party's declared identity -- trusted the same
+/// way `HeadersRequest`'s `requestor` already is (D4); first-hand counting keys on the
+/// *channel* sender at the receiving end (network dispatch), not this field alone, but
+/// the field must still be carried so the receiver knows whose channel it should have
+/// arrived on and so tests can construct/inspect acks without a live network.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct Ack {
+    pub author: PublicKey,
+    pub height: Height,
+    pub digest: Digest,
+    pub sender: PublicKey,
+}
+
+impl Ack {
+    pub fn new(author: PublicKey, height: Height, digest: Digest, sender: PublicKey) -> Self {
+        Self { author, height, digest, sender }
+    }
+
+    /// The exact tuple `(a, k, h)` N3/N4 key acks by (sender is not part of the tuple --
+    /// it is the *value* counted per tuple, one distinct sender at a time).
+    pub fn reference(&self) -> (PublicKey, Height, Digest) {
+        (self.author, self.height, self.digest.clone())
+    }
+}
+
+impl fmt::Display for Ack {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f, "Ack({}, {}, {}, from {})", self.author, self.height, self.digest, self.sender)
+    }
+}
 
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -771,14 +860,14 @@ impl Vote {
 
 impl Hash for Vote {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
+        let mut hasher = Blake3Hasher::new();
         // hasher.update(&self.id);
         // hasher.update(self.view.to_le_bytes());
-        hasher.update(&self.id);
-        hasher.update(self.height.to_le_bytes());
+        hasher.update(&self.id.0);
+        hasher.update(&self.height.to_le_bytes());
         //hasher.update(&self.origin);
         //hasher.update(self.special_valid.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize().into())
     }
 }
 
@@ -916,12 +1005,12 @@ impl Certificate {
             let mut digests = Vec::new();
             for (_i, _) in self.votes.iter().enumerate() {
                 digests.push({
-                    let mut hasher = Sha512::new();
-                    hasher.update(&self.header_digest);
-                    hasher.update(self.height().to_le_bytes());
+                    let mut hasher = Blake3Hasher::new();
+                    hasher.update(&self.header_digest.0);
+                    hasher.update(&self.height().to_le_bytes());
                     //hasher.update(&self.origin());
                     //hasher.update(self.special_valids[i].to_le_bytes());
-                    Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+                    Digest(hasher.finalize().into())
                 })
                 //Check special valid.
                 //Does one still need to check  QC? Or can one trust cert?  ==> Yes, because only invalid ones need proof => invalid = not forwarded to consensus. For Dag layer makes no difference.
@@ -942,12 +1031,12 @@ impl Certificate {
     pub fn verifiable_digest(&self) -> Digest {
         if false {
             //matching_valids(&self.special_valids) {
-            let mut hasher = Sha512::new();
-            hasher.update(&self.header_digest);
-            hasher.update(self.height().to_le_bytes());
+            let mut hasher = Blake3Hasher::new();
+            hasher.update(&self.header_digest.0);
+            hasher.update(&self.height().to_le_bytes());
             //hasher.update(&self.origin());
             //hasher.update(&self.special_valids[0].to_le_bytes());
-            Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+            Digest(hasher.finalize().into())
         } else {
             panic!("This verfiable digest branch should never be used");
             /*let mut hasher = Sha512::new();
@@ -988,12 +1077,12 @@ pub fn matching_valids(vec: &Vec<u8>) -> bool {
 //Double check though if this is fine/safe
 impl Hash for Certificate {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(&self.header_digest);
-        hasher.update(self.height().to_le_bytes());
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(&self.header_digest.0);
+        hasher.update(&self.height().to_le_bytes());
         //hasher.update(&self.origin());
 
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize().into())
     }
 }
 
@@ -1270,11 +1359,11 @@ impl QC {
 
 impl Hash for QC {
     fn digest(&self) -> Digest {
-        let hasher = Sha512::new(); //NOTE: We are not using this digest ever currently. QC verification happens on the ID included in the QC
+        let hasher = Blake3Hasher::new(); //NOTE: We are not using this digest ever currently. QC verification happens on the ID included in the QC
         //hasher.update(&self.hash);
         //hasher.update(self.view.to_le_bytes());
         //hasher.update(self.view_round.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize().into())
     }
 }
 
@@ -1348,13 +1437,13 @@ impl Timeout {
 
 impl Hash for Timeout {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();  
+        let hasher = Blake3Hasher::new();
         /*hasher.update(self.view.to_le_bytes());
         if let Some(qc_view) = self.vote_high_qc {
             hasher.update(qc_view.to_le_bytes());
         }*/
 
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize().into())
     }
 }
 
@@ -1582,8 +1671,8 @@ pub struct Committment {
 
 impl Hash for Committment {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.commit_view.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(&self.commit_view.to_le_bytes());
+        Digest(hasher.finalize().into())
     }
 }
