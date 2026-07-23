@@ -1166,3 +1166,129 @@ builds throughout; no two builds/benchmark processes run concurrently. New data 
 This closes the coordinator's outstanding items for this task (the crash-fault
 control-round-latency follow-on finding is explicitly deferred to the coordinator's
 strategic discussion with the user — no further fix attempted here, per instruction).
+
+---
+
+## §wan-shaped-runs — crash-fault anchor-rate mismatch under realistic network latency (measurement only, no fixes)
+
+Final work item: quantify Finding A's crash-fault mismatch under REALISTIC WAN
+latency (not an artificial, unthrottled LAN race) using the now-fixed (D7-3)
+latency-table mechanism, to inform the paper author's choice among the deferred
+structural remedies (§findingA-rerun). Measurement only — nothing implemented here.
+
+### The RTT table
+
+`wan-testbed-latency.csv` (repo root) — a 4×4 RTT-ms matrix built from the Autobahn
+paper's own evaluation testbed (Table 1's four GCP regions: `us-east1`, `us-east5`,
+`us-west1`, `us-west4`; inter-region RTTs 19/50/55/57/64/67 ms, 0.5 ms intra-region —
+figures supplied by the coordinator from the source table; this session did not open
+`tex-projects` to derive them). The paper's table gives one RTT per unordered region
+pair (6 pairs among 4 regions) but not an explicit region-to-region assignment
+alongside each number in the form handed to this session, so the following mapping
+was constructed rather than read verbatim: the two SAME-COAST pairs
+(`us-east1`↔`us-east5`, `us-west1`↔`us-west4`) get the two smallest values (19, 50 ms
+— consistent with same-coast pairs being closer than any cross-coast pair), and the
+four cross-coast pairs get the remaining four values (55, 57, 64, 67 ms). This is a
+faithful use of the paper's full VALUE SET, not a claim of an exact verbatim
+region-to-region correspondence — flagged honestly rather than presented as more
+precise than it is:
+
+```
+       east1  east5  west1  west4
+east1    0      19     64     55
+east5   19       0     67     57
+west1   64      67      0     50
+west4   55      57     50      0
+```
+
+(`--latency-table` halves these to one-way per D7-3's contract; the CSV's own
+diagonal is unused — `Committee::latency_map` never looks up `other == myself` — the
+paper's "0.5 ms intra" describes same-region host-to-host latency, which doesn't
+arise here since all 4 nodes map to 4 distinct regions, one node each.) Committee
+order (which random keypair sorts into which row/column) is not controllable run to
+run (`Committee`'s `BTreeMap<PublicKey,_>` order depends on freshly-generated keys),
+so exactly which physical region label lands on the crashed node varies by run --
+immaterial to this measurement, since the table's aggregate character (one 19 ms
+same-coast link, the rest 50-67 ms) is present in every row regardless of which row
+the crashed node draws.
+
+### Run 1 — fault-free WAN baseline (the deliverable)
+
+`--protocol vantage --nodes 4 --workers 1 --rate 240000 --tx-size 512 --duration 60
+--delta-ms 150 --max-batch-delay-ms 20 --max-header-delay-ms 50 --latency-table
+wan-testbed-latency.csv`:
+
+- **Consensus TPS: 240,515 tx/s** — matches the LAN baseline almost exactly (240-241k
+  tx/s throughout this session); throughput is **fully sustained** under realistic WAN
+  latency, exactly the expected result.
+- **Avg latency: 132.32 ms** (stddev 24.95, p50/p90/p99 132.50/162.50/184.50 ms) — up
+  from the ~46-53 ms LAN baseline, a **realistic, geography-driven shift** (roughly the
+  cost of a small number of echo/ready/quorum hops each riding a real WAN link, mostly
+  the 50-67 ms cross-coast pairs) rather than any pathological effect.
+- Seal routes stayed on the two happy-path routes (`fast_full`/`direct_full`) at every
+  node — no fallback ever tripped fault-free, consistent with Finding B's own
+  methodology rule (Δ=150 is safe when not simultaneously CPU-saturated).
+
+This is exactly the WAN baseline the deliverable asked for: latency shifted by
+geography, throughput near-sustained.
+
+### Run 2 — crash-fault under realistic WAN latency (THE number)
+
+`--protocol vantage --nodes 4 --workers 1 --crash 1 --rate 180000` (rate scaled to 3
+live clients, matching the original Finding-A repro's own convention) `--tx-size 512
+--duration 60 --delta-ms 150 --max-batch-delay-ms 20 --max-header-delay-ms 50
+--latency-table wan-testbed-latency.csv --timeline`:
+
+| Quantity | Value | Derivation |
+|---|---|---|
+| View-production rate (`entered`) | **≈33.3 views/s** | `entered=1999` at T+60 |
+| Cursor-advance rate | **≈7.63 views/s** | `cursor=458` at T+60 |
+| Anchor rate | **≈1.90 anchors/s** | `anchor_skip=114` (per node) over 60 s |
+| Achieved throughput | **41,069 tx/s** | measured (2,464,140 committed txs / 60 s) |
+| Backlog trend (`entered − cursor`) | **growing, ~linearly** | 277 (T+10) → 792 (T+30) → 1,541 (T+60); growth rate ≈ 25.7 views/s |
+| Avg latency | 24,380.72 ms (`stddev` **0.00**) | p50/p90/p99 24,823/40,690/45,702 ms |
+
+**Consistency check**: `anchor rate × (views per anchor cycle, ≈4 under this 1-in-4
+crash pattern) ≈ 1.90 × 4 = 7.6 views/s`, matching the directly-measured cursor rate
+(7.63 views/s) closely — the anchor rate is the thing actually pacing `cursor`, exactly
+as the LAN-repro finding (§findingA-rerun) concluded, now confirmed under realistic
+network latency too.
+
+**The realistic mismatch ratio**: view-production outpaces cursor-gated sealing by
+**≈4.36:1** (33.3 views/s produced vs. 7.63 views/s sealed; equivalently, `entered /
+cursor` at T+60 = 1999/458 ≈ 4.36) — a persistent, non-shrinking mismatch, not a
+transient warm-up effect (the `entered − cursor` gap grows essentially linearly for
+the full 60 s window, so a longer run would show a proportionally larger backlog and
+larger average latency, not a converging one). This is dramatically less severe than
+the unthrottled-LAN repro's effectively-unbounded mismatch (WISH races to tens of
+thousands of views/s there vs. ~33/s here, because on a REAL network the view-entry
+rate itself is capped by genuine round-trip latencies rather than racing as fast as
+local scheduling allows) — but the STRUCTURAL mismatch is still real and measurable
+even at realistic WAN speeds: the resolution pipeline's own pacing (~1.9 anchors/s
+here, driven by real Bracha-RBC/Simple-IT round trips over the WAN links) is
+persistently slower than the rate at which new (1-in-4 dead) views get produced, so
+`cursor` — and hence committed-transaction latency — falls further behind for as
+long as the crash persists, exactly the same qualitative shape as §findingA-rerun's
+LAN finding, just at proportionally realistic numbers instead of a LAN race's extreme
+ones. This is the number the paper author's remedy discussion (§findingA's ranked
+remedies vs. the control-round-latency follow-on) needs.
+
+### Run 3 — SKIPPED
+
+Silencing one live node's own lane under `--crash 0` (to isolate a single-source
+liveness gap without a full crash) has no existing harness hook: `local-benchmark`'s
+only fault-injection knob is `--crash <k>` (never spawn the trailing `k` nodes at
+all — a full process-level crash, not a partial "still alive, echoes/readies
+normally, but never publishes its own lane" scenario). Building that would require new
+code (a new flag threading a "suppress own-lane publication" bit through
+`VantageCore`/`LaneManager`), which the instruction explicitly said to skip rather
+than build. Not attempted.
+
+### Changes (this section)
+
+- `wan-testbed-latency.csv` (repo root) — the 4×4 RTT-ms input matrix, cited above;
+  a plain data file, not code.
+
+No other files touched. No `tex-projects`/`starfish` file touched. No git command run.
+New data dirs (`.local-bench-wan-*`) left on disk (gitignored); new logs under
+`/private/tmp/claude-501/.../scratchpad/wan-*.log`.
