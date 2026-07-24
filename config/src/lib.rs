@@ -154,6 +154,20 @@ pub struct Parameters {
     pub use_ride_share: bool,
     pub car_timeout: u64,
 
+    /// Autobahn (Giridharan et al., SOSP'24) §5.5.3 "All-to-all communication":
+    /// on the external-consensus path (`use_ride_share = false`), replicas
+    /// broadcast Prepare-Votes/Confirm-Acks and assemble PrepareQC/ConfirmQC
+    /// locally instead of unicasting votes to the leader for it to assemble and
+    /// re-broadcast -- 3 message exchanges / 2 message-delays on the fast path
+    /// instead of the leader-collected regime's 5/4. Off by default
+    /// (`#[serde(default)]`) -- byte-identical to today when off; every new
+    /// branch this flag guards is inert unless set. Orthogonal to
+    /// `use_optimistic_tips`, so it composes with both autobahn-optimistic and
+    /// autobahn-seamless automatically. Irrelevant to the ride-share and Vantage
+    /// paths (untouched).
+    #[serde(default)]
+    pub all_to_all: bool,
+
     //asynchrony simulation:
     pub simulate_asynchrony: bool,
     pub asynchrony_start: u64,
@@ -310,6 +324,7 @@ impl Default for Parameters {
             fast_path_timeout: 500,
             use_ride_share: false,
             car_timeout: 2000,
+            all_to_all: false,
 
             //Async simulation:
             simulate_asynchrony: false,
@@ -362,6 +377,7 @@ impl Parameters {
         info!("Optimistic tips enabled? {}", self.use_optimistic_tips);
         info!("Parallel Proposals enabled? {}. K: {}", self.use_parallel_proposals, self.k);
         info!("Ride share enabled? {}. Car timeout: {}", self.use_ride_share, self.car_timeout);
+        info!("All-to-all (Autobahn §5.5.3) enabled? {}", self.all_to_all);
         info!("Max block payload set to {} entries", self.max_block_payload);
         info!("Vantage delta set to {} ms", self.delta_ms);
         if self.latency_table.is_some() {

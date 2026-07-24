@@ -421,6 +421,7 @@ impl Primary {
                     parameters.use_fast_path,
                     parameters.fast_path_timeout,
                     parameters.use_ride_share,
+                    parameters.all_to_all,
                     parameters.simulate_asynchrony,
                     parameters.asynchrony_start,
                     parameters.asynchrony_duration,

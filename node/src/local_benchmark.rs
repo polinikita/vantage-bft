@@ -168,6 +168,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         max_header_delay: max_header_delay_ms,
         // METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when off.
         compress_network: matches.get_flag("compress-network"),
+        // Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
+        // behavior when off.
+        all_to_all: matches.get_flag("all-to-all"),
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which

@@ -3,7 +3,7 @@ use crate::aggregators::{QCMaker, TCMaker, VotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::leader::LeaderElector;
 use crate::messages::{
-    Certificate, ConsensusMessage, Header, Proposal, Timeout, Vote, TC, verify_confirm, verify_commit, CommitQC, transform_commit_qc, ConsensusRequest, ConsensusVote,
+    Certificate, ConsensusMessage, Header, Proposal, Timeout, Vote, TC, verify_confirm, verify_commit, CommitQC, transform_commit_qc, ConsensusRequest, ConsensusVote, QC,
 };
 use crate::primary::{Height, PrimaryMessage, Slot, View};
 use crate::synchronizer::Synchronizer;
@@ -132,6 +132,40 @@ pub struct Core {
     car_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Vote> + Send>>>,
     fast_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ConsensusVote> + Send>>>, // Use this one for Fast Path on external Consensus case
 
+    /// Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: on the external path,
+    /// replicas broadcast Prepare-Votes/Confirm-Acks and assemble PrepareQC/ConfirmQC
+    /// locally instead of unicasting votes to the leader. `false` (default) is
+    /// byte-identical to today; every branch this flag guards is new.
+    all_to_all: bool,
+    /// All-to-all only: votes for a consensus instance that arrived before this node
+    /// registered that instance locally (it hasn't yet received/processed the
+    /// leader's Prepare, or hasn't yet locally formed the PrepareQC that synthesizes
+    /// the Confirm instance). Dropping these outright (as the leader-collected path
+    /// safely does, since only the leader -- who always has the instance -- ever
+    /// collects votes) would risk never reaching 2f+1/3f+1 under all-to-all, i.e. a
+    /// liveness bug. Drained into `process_consensus_vote` as soon as the matching
+    /// instance is registered (`process_consensus_request`'s Prepare registration,
+    /// and the synthesized-Confirm registration in `all_to_all_synthesize_confirm`).
+    ///
+    /// Keyed `Slot -> Digest -> Author` (see `buffer_pending_consensus_vote`) so it is
+    /// bounded on FOUR independent axes against a Byzantine sender, not just the
+    /// slot: (1) the slot window `is_sane_pending_vote_slot` enforces (O(k)); (2) a
+    /// cap on the number of DISTINCT digests buffered per slot
+    /// (`pending_vote_digest_cap`, O(n)) -- without this a single Byzantine author
+    /// emitting endless fresh, self-signed-but-garbage digests for one slot would
+    /// grow this map without bound; (3) a real-committee-member check on `vote.author`
+    /// before ever buffering (`process_consensus_vote`'s buffering branch) -- without
+    /// this an attacker could mint unlimited throwaway keypairs and self-sign each as
+    /// a distinct "author" of one already-admitted digest (`sig.verify` alone only
+    /// checks the signature against whatever pubkey is claimed, not committee
+    /// membership), which axis (4) alone would not catch; (4) per-author dedup within
+    /// a `(slot, digest)` bucket (at most one buffered vote per REAL author, mirroring
+    /// `QCMaker::append`'s `used`-author-set) -- bounds each digest bucket to
+    /// `committee.size()` entries given (3). Overall worst case is O(k * n * n)
+    /// buffered votes. GC'd alongside `consensus_instances` in `clean_slot_periods`.
+    /// Always empty when `all_to_all` is false.
+    pending_consensus_votes: HashMap<Slot, HashMap<Digest, HashMap<PublicKey, ConsensusVote>>>,
+
     //asynchrony simulation,
     simulate_asynchrony: bool,
     asynchrony_start: u64,
@@ -169,6 +203,7 @@ impl Core {
         use_fast_path: bool,
         fast_path_timeout: u64,
         use_ride_share: bool,
+        all_to_all: bool,
 
         simulate_asynchrony: bool,
         asynchrony_start: u64,
@@ -245,6 +280,8 @@ impl Core {
                 use_ride_share,
                 car_timer_futures: FuturesUnordered::new(),
                 fast_timer_futures: FuturesUnordered::new(),
+                all_to_all,
+                pending_consensus_votes: HashMap::with_capacity(2 * gc_depth as usize),
 
                 simulate_asynchrony,
                 asynchrony_start,
@@ -777,12 +814,56 @@ impl Core {
     }
 
      //TODO: Then work on Process Vote //TODO: Add a function: SendConsensus
+    // P3-1 fix: deliberately NOT `#[async_recursion]` -- that macro boxes/heap-
+    // allocates this fn's future on EVERY call, including the entire flag-off path
+    // (the leader-collected baseline this flag is benchmarked against), which is a
+    // real perf regression versus today. The one place this fn needs to call back
+    // into itself (all-to-all's synthesized Confirm-vote, Change 2) is isolated in
+    // `all_to_all_synthesize_confirm` below and boxed only at ITS call site
+    // (`Box::pin(...)`, all-to-all only) -- `Box<T>` is pointer-sized regardless of
+    // `T`, so that single boxed edge is enough to give this fn's own future a finite
+    // size without needing `#[async_recursion]` here. Flag-off never takes that path,
+    // so it stays a plain, unboxed `async fn` exactly like before this flag existed.
     async fn process_consensus_vote(&mut self, vote: ConsensusVote, is_loopback: bool) -> DagResult<()> {
 
         debug!("Receive consensus vote for dig {}", &vote.digest);
 
         let opt_curr_instance = self.consensus_instances.get(&(vote.slot, vote.digest.clone()));
         if opt_curr_instance.is_none() {
+            // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: unlike the
+            // leader-collected path (only the leader, who always already has the
+            // instance, ever collects votes), a peer's vote can race ahead of this
+            // node's own instance registration. Buffer instead of dropping so a
+            // straggling-but-honest vote can't cost the 2f+1/3f+1 needed for liveness.
+            // See `buffer_pending_consensus_vote` for the bounds that keep this safe
+            // against a Byzantine sender.
+            if self.all_to_all && !is_loopback {
+                // P2-1 fix: require a real committee author before buffering (mirrors
+                // `ConsensusVote::verify`, which this inline check otherwise doesn't
+                // fully replicate). Without this, an attacker can mint an unlimited
+                // number of throwaway keypairs, self-sign each one as a distinct
+                // "author" of the SAME already-admitted digest, and pass
+                // `sig.verify` trivially (it only checks the signature against
+                // whatever pubkey is claimed, not committee membership) -- defeating
+                // the per-author dedup below, which only bounds REPEATS by the SAME
+                // author, not the number of distinct (fake) authors. Rejecting
+                // non-members up front bounds the per-digest author axis to
+                // `committee.size()` real authorities, which is what makes the
+                // O(n^2 * window) bound in `pending_consensus_votes`'s doc comment
+                // actually hold.
+                if self.committee.stake(&vote.author) == 0 {
+                    debug!("dropping all-to-all pending vote from unknown authority {}", vote.author);
+                    return Ok(());
+                }
+                if vote.author != self.name {
+                    //Verify signature before buffering untrusted data.
+                    vote.sig.verify(&vote.digest, &vote.author)?;
+                }
+                if self.is_sane_pending_vote_slot(vote.slot) {
+                    self.buffer_pending_consensus_vote(vote);
+                }
+                return Ok(());
+            }
             debug!("consensus instance slot has committed, skip processing vote");
             return Ok(());
         }
@@ -838,30 +919,76 @@ impl Core {
                 //println!("QC formed");
             
                 match current_instance {
-                    ConsensusMessage::Prepare {slot, view, tc: _, qc_ticket: _, proposals,} 
+                    ConsensusMessage::Prepare {slot, view, tc: _, qc_ticket: _, proposals,}
                     => {
                         debug!("Prepare QC formed in slot {:?}", slot);
                         debug!("Prepare has slot: {}, view: {}, digest: {}", slot, view, current_instance.digest());
 
-                        let new_consensus_message = match qc_maker.try_fast {
-                            true => {
-                                debug!("taking fast path!");
-                                ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
-                                }, // Create Commit if we have FastPrepareQC
-                            false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
-                        };
-                        //let new_consensus_message = ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: new_proposals,};
+                        // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: form
+                        // and act on the next phase LOCALLY from our own just-assembled
+                        // PrepareQC, instead of unicasting it to the leader via
+                        // `send_consensus_req` for it to assemble/re-broadcast. Copy
+                        // everything we need out of `current_instance`/`qc_maker`
+                        // (borrows of `self.consensus_instances`/`self.qc_makers`)
+                        // before any `&mut self` method call, exactly as the unchanged
+                        // `send_consensus_req` branch below already has to.
+                        if self.all_to_all {
+                            let slot = *slot;
+                            let view = *view;
+                            let proposals = proposals.clone();
+                            let try_fast = qc_maker.try_fast;
 
-                        // continue with next consensus phase
-                        self.send_consensus_req(new_consensus_message).await?;
+                            if try_fast {
+                                // FastPrepareQC (3f+1): commit locally on the fast path --
+                                // this is exactly the local-commit path the leader already
+                                // takes for its own vote at the `send_consensus_req` local
+                                // `process_consensus_request` call site; mirrored here so
+                                // any replica, not just the leader, can take it.
+                                debug!("taking fast path! (all-to-all)");
+                                let commit_message = ConsensusMessage::Commit { slot, view, qc, proposals };
+                                let header = Header { author: self.name, ..Header::default() };
+                                self.process_commit_message(commit_message, &header).await?;
+                            } else {
+                                // SlowPrepareQC (2f+1): synthesize the Confirm instance
+                                // and feed our own Confirm-Ack back into
+                                // `process_consensus_vote` -- self-recursion, so this
+                                // step lives in its own fn boxed at this ONE call site
+                                // (P3-1 fix; see `all_to_all_synthesize_confirm`'s doc
+                                // comment and `process_consensus_vote`'s own).
+                                Box::pin(self.all_to_all_synthesize_confirm(slot, view, qc, proposals)).await?;
+                            }
+                        } else {
+                            let new_consensus_message = match qc_maker.try_fast {
+                                true => {
+                                    debug!("taking fast path!");
+                                    ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
+                                    }, // Create Commit if we have FastPrepareQC
+                                false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
+                            };
+                            //let new_consensus_message = ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: new_proposals,};
+
+                            // continue with next consensus phase
+                            self.send_consensus_req(new_consensus_message).await?;
+                        }
                     }
                     ConsensusMessage::Confirm {slot, view, qc: _,proposals,}
                     => {
                         debug!("Commit QC formed in slot {:?}", slot);
                         let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
-                        // continue with next consensus phase
-                        self.send_consensus_req(new_consensus_message).await?;
+                        if self.all_to_all {
+                            // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all:
+                            // ConfirmQC formed locally (2f+1 Confirm-Acks) -- commit
+                            // locally instead of unicasting to the leader for it to
+                            // assemble/re-broadcast Commit. `process_commit_message`/
+                            // `committed_slots` already dedup per slot, so this is
+                            // idempotent with any other path that might also reach it.
+                            let header = Header { author: self.name, ..Header::default() };
+                            self.process_commit_message(new_consensus_message, &header).await?;
+                        } else {
+                            // continue with next consensus phase
+                            self.send_consensus_req(new_consensus_message).await?;
+                        }
                     }
                     ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals: _, } => {
                         panic!("Should never receive Vote for Commit")
@@ -871,6 +998,136 @@ impl Core {
         }
          
         Ok(())
+    }
+
+    /// All-to-all only (Change 2, SlowPrepareQC branch): synthesize the Confirm
+    /// instance from our own just-formed (2f+1) PrepareQC, register it (and its
+    /// `high_qcs` entry -- REQUIRED for correct view-change winning-proposal
+    /// recovery, since `process_confirm_message` no longer runs on a broadcast
+    /// Confirm we never send), sign our own Confirm-Ack, broadcast it, and feed our
+    /// own copy back into `process_consensus_vote`.
+    ///
+    /// P3-1 fix: split out of `process_consensus_vote` specifically so the boxing
+    /// needed to break its self-recursion (the `process_consensus_vote` call below)
+    /// happens at THIS fn's call site (`Box::pin(self.all_to_all_synthesize_confirm(
+    /// ..)).await` in `process_consensus_vote`) rather than via `#[async_recursion]`
+    /// on `process_consensus_vote` itself, which would box/heap-allocate on every
+    /// call including the entire flag-off path. `Box<T>` is pointer-sized regardless
+    /// of `T`'s own size, so boxing this ONE edge in the
+    /// process_consensus_vote -> all_to_all_synthesize_confirm -> process_consensus_vote
+    /// cycle is sufficient to give both fns' futures a finite size -- this fn itself
+    /// does not need `#[async_recursion]` (only its call site boxes).
+    async fn all_to_all_synthesize_confirm(
+        &mut self,
+        slot: Slot,
+        view: View,
+        qc: QC,
+        proposals: HashMap<PublicKey, Proposal>,
+    ) -> DagResult<()> {
+        let confirm_message = ConsensusMessage::Confirm { slot, view, qc, proposals };
+        let confirm_digest = confirm_message.digest();
+
+        self.consensus_instances.insert((slot, confirm_digest.clone()), confirm_message.clone());
+        self.high_qcs.insert(slot, confirm_message.clone());
+
+        let sig = self.signature_service.request_signature(confirm_digest.clone()).await;
+        let confirm_vote = ConsensusVote { author: self.name, slot, digest: confirm_digest.clone(), sig };
+
+        let addresses = self
+            .committee
+            .others_primaries(&self.name)
+            .iter()
+            .map(|(_, x)| x.primary_to_primary)
+            .collect();
+        let bytes = bincode::serialize(&PrimaryMessage::ConsensusVote(confirm_vote.clone()))
+            .expect("Failed to serialize consensus vote");
+        let handlers = self.network.broadcast_typed(addresses, Bytes::from(bytes), "ConsensusVote").await;
+        self.consensus_cancel_handlers.entry(slot).or_default().extend(handlers);
+
+        self.process_consensus_vote(confirm_vote, false).await?;
+
+        // Drain any Confirm-votes that raced ahead of this registration (Change 3).
+        self.drain_pending_consensus_votes(slot, confirm_digest).await;
+
+        Ok(())
+    }
+
+    /// All-to-all only (Change 3 bound): whether a vote for `slot` is close enough to
+    /// what we've already committed to be worth buffering. Mirrors the same k-wide
+    /// open-instance window `try_prepare_waiting_slots`/`is_valid` already enforce for
+    /// honest Prepare tickets (at most `k` consecutive instances open at a time, gated
+    /// by `committed_slots`) so a Byzantine vote for a wildly out-of-range slot is
+    /// dropped rather than buffered. This bounds the SLOT axis only; see
+    /// `buffer_pending_consensus_vote` for the digest/author axes.
+    fn is_sane_pending_vote_slot(&self, slot: Slot) -> bool {
+        slot > self.last_committed_slot.saturating_sub(self.k) && slot <= self.last_committed_slot + self.k + 1
+    }
+
+    /// P2-1 fix: the cap on distinct digests buffered per slot (see
+    /// `buffer_pending_consensus_vote`). Honest replicas only ever produce O(1) real
+    /// instances per slot (the genuine Prepare + Confirm), so `2 * committee.size()`
+    /// is generous headroom above any legitimate digest while still keeping the
+    /// bound O(n) per slot rather than unbounded.
+    fn pending_vote_digest_cap(&self) -> usize {
+        2 * self.committee.size()
+    }
+
+    /// All-to-all only (Change 3 buffer / P2-1 fix): buffer `vote`, keyed
+    /// `slot -> digest -> author`. Callers MUST have already rejected non-committee
+    /// authors (see `process_consensus_vote`'s buffering branch) -- this fn alone
+    /// only enforces the other two axes:
+    ///  (a) per-author dedup: at most one buffered vote per author per
+    ///      `(slot, digest)` (the inner `HashMap<PublicKey, _>`'s `or_insert` --
+    ///      mirrors `QCMaker::append`'s `used`-author-set idea) -- a single author
+    ///      repeat-flooding votes for the SAME digest can't grow that bucket past 1.
+    ///      Combined with the caller's committee-membership check, this bounds each
+    ///      digest's bucket to at most `committee.size()` entries.
+    ///  (b) a cap on the number of DISTINCT digests buffered per slot
+    ///      (`pending_vote_digest_cap`) -- without this, one Byzantine author
+    ///      emitting votes with endless fresh, self-signed (but garbage) digests for
+    ///      one slot would otherwise grow this map without bound (each such vote
+    ///      passes `sig.verify` trivially, since it verifies against its own
+    ///      attacker-chosen digest). Once a slot is at the cap, a vote for a digest
+    ///      not already tracked for that slot is dropped.
+    fn buffer_pending_consensus_vote(&mut self, vote: ConsensusVote) {
+        let slot = vote.slot;
+        let digest = vote.digest.clone();
+        let author = vote.author;
+        let cap = self.pending_vote_digest_cap();
+
+        let by_digest = self.pending_consensus_votes.entry(slot).or_default();
+        if !by_digest.contains_key(&digest) && by_digest.len() >= cap {
+            debug!("dropping all-to-all pending vote for slot {}: at distinct-digest cap {}", slot, cap);
+            return;
+        }
+        by_digest.entry(digest).or_default().entry(author).or_insert(vote);
+    }
+
+    /// All-to-all only (Change 3 drain): feed every vote buffered for `(slot, digest)`
+    /// -- i.e. that arrived before this node had registered that consensus instance --
+    /// through `process_consensus_vote` now that it has. Called right after each place
+    /// an instance is registered: the Prepare registration in
+    /// `process_consensus_request`, and the synthesized-Confirm registration in
+    /// `all_to_all_synthesize_confirm`.
+    ///
+    /// Errors from a single buffered vote (e.g. a Byzantine duplicate) are logged, not
+    /// propagated: this runs nested inside the processing of whatever just registered
+    /// the instance (an incoming Prepare/ConsensusRequest, or our own locally-formed
+    /// PrepareQC), and one bad buffered vote must not abort that unrelated, otherwise
+    /// perfectly valid, processing.
+    async fn drain_pending_consensus_votes(&mut self, slot: Slot, digest: Digest) {
+        let votes = self.pending_consensus_votes.get_mut(&slot).and_then(|by_digest| by_digest.remove(&digest));
+        if let Some(votes) = votes {
+            for (_, vote) in votes {
+                if let Err(e) = self.process_consensus_vote(vote, false).await {
+                    warn!("Failed to process buffered all-to-all consensus vote: {}", e);
+                }
+            }
+        }
+        // Avoid leaking an empty inner map once a slot's last buffered digest drains.
+        if self.pending_consensus_votes.get(&slot).is_some_and(HashMap::is_empty) {
+            self.pending_consensus_votes.remove(&slot);
+        }
     }
 
     fn set_consensus_proposal(&mut self, consensus_message: &mut ConsensusMessage) {
@@ -1327,8 +1584,20 @@ impl Core {
         }
         let dig = consensus_message.digest();
         match &consensus_message { //TODO: Re-factor ConsensusMessages to all have slot/view, option for TC/QC, and a type.
-            ConsensusMessage::Prepare {slot, view: _, tc: _, qc_ticket: _, proposals: _, } => {self.consensus_instances.insert((*slot, dig.clone()), consensus_message.clone());},  
-            ConsensusMessage::Confirm {slot, view: _, qc: _, proposals: _, } => {self.consensus_instances.insert((*slot, dig.clone()), consensus_message.clone());},  
+            ConsensusMessage::Prepare {slot, view: _, tc: _, qc_ticket: _, proposals: _, } => {
+                self.consensus_instances.insert((*slot, dig.clone()), consensus_message.clone());
+                // Change 3 drain: a peer's Prepare-vote may have raced ahead of our own
+                // registration of this Prepare instance.
+                if self.all_to_all {
+                    self.drain_pending_consensus_votes(*slot, dig.clone()).await;
+                }
+            },
+            ConsensusMessage::Confirm {slot, view: _, qc: _, proposals: _, } => {
+                self.consensus_instances.insert((*slot, dig.clone()), consensus_message.clone());
+                if self.all_to_all {
+                    self.drain_pending_consensus_votes(*slot, dig.clone()).await;
+                }
+            },
             _ => {},
         };
 
@@ -1402,13 +1671,36 @@ impl Core {
         let (slot, digest, sig) = consensus_votes.pop().unwrap();
         let vote = ConsensusVote {author: self.name, slot, digest, sig};
 
-        if author == self.name {
+        if self.all_to_all {
+            // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: broadcast the
+            // Prepare-Vote/Confirm-Ack to every other replica (instead of unicasting it
+            // to `author`, the leader) so each replica can assemble its own QC locally;
+            // still process our own copy locally exactly as the leader-collected path
+            // does. Reuses the exact broadcast idiom `send_consensus_req` uses below.
+            debug!("Process own consensus vote (all-to-all)");
+            self.process_consensus_vote(vote.clone(), false).await.expect("Failed to process our own vote");
+
+            let addresses = self
+                .committee
+                .others_primaries(&self.name)
+                .iter()
+                .map(|(_, x)| x.primary_to_primary)
+                .collect();
+            let bytes = bincode::serialize(&PrimaryMessage::ConsensusVote(vote))
+                .expect("Failed to serialize our own vote");
+            let handlers = self.network.broadcast_typed(addresses, Bytes::from(bytes), "ConsensusVote").await;
+            self.consensus_cancel_handlers
+                .entry(slot)
+                .or_default()
+                .extend(handlers);
+        }
+        else if author == self.name {
             debug!("Process own consensus vote");
             self.process_consensus_vote(vote, false).await.expect("Failed to process our own vote"); //TODO: Don't need to sign...
-        } 
+        }
         else {
             debug!("Send consensus vote to replica {}", author);
-          
+
             let address = self
                     .committee
                     .primary(&author)
@@ -1418,12 +1710,12 @@ impl Core {
                     .expect("Failed to serialize our own vote");
                 let handler = self.network.send_typed(address, Bytes::from(bytes), "ConsensusVote").await;
                 self.consensus_cancel_handlers
-                    .entry(slot) 
+                    .entry(slot)
                     .or_default()
                     .push(handler);
         }
-       
-        
+
+
         Ok(())
     }
 
@@ -1627,8 +1919,11 @@ impl Core {
         //self.committed_slots GC those that are older.
 
         //GC QC_Makers
-        self.qc_makers.retain(|(s, _), _| s % k != slot_period && s <= &slot); 
-     
+        self.qc_makers.retain(|(s, _), _| s % k != slot_period && s <= &slot);
+
+        //GC all-to-all pending votes (Change 3): no-op (always empty) when
+        //`all_to_all` is false.
+        self.pending_consensus_votes.retain(|s, _| s % k != slot_period && s <= &slot);
 
         Ok(())
     }

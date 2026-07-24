@@ -163,7 +163,13 @@ async fn main() -> Result<()> {
                 .arg(Arg::new("compress-network").long("compress-network").action(ArgAction::SetTrue)
                     .help("METRICS-DASHBOARD-SPEC.md §8: lz4-compress every wire message \
                         (network crate, all protocols identically). Off by default -- \
-                        byte-identical framing when off.")),
+                        byte-identical framing when off."))
+                .arg(Arg::new("all-to-all").long("all-to-all").action(ArgAction::SetTrue)
+                    .help("Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all \
+                        communication: on the external-consensus path, replicas broadcast \
+                        Prepare-Votes/Confirm-Acks and assemble PrepareQC/ConfirmQC locally \
+                        instead of unicasting to the leader for it to assemble and \
+                        re-broadcast. Off by default -- byte-identical behavior when off.")),
         )
         .subcommand_required(true)
         .arg_required_else_help(true)

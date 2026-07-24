@@ -63,7 +63,7 @@ def install(ctx):
 
 
 @task
-def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False):
+def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False, all_to_all=False):
     ''' Run benchmarks on AWS.
 
     Phase-7 smoke test: checked-in defaults below, except `rate` set to
@@ -115,6 +115,9 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
         # METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when
         # off; `fab remote --compress-network` (or edit this literal) to enable.
         'compress_network': compress_network,
+        # Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
+        # behavior when off; `fab remote --all-to-all` (or edit this literal) to enable.
+        'all_to_all': all_to_all,
 
         'simulate_asynchrony': False,
         'asynchrony_start': 15_000, #ms
