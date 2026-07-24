@@ -1,6 +1,7 @@
 // PHASE3-SPEC.md §7 "ACK discipline (N3/N4)".
 use super::common::*;
 use crate::messages::Header;
+use crate::vantage::lanes::{AckAggregator, AckThreshold};
 use crate::vantage::Effect;
 use crypto::Digest;
 use std::collections::BTreeMap;
@@ -56,15 +57,22 @@ async fn per_sender_ack_dedup() {
     let (watcher, _) = authors()[0];
     let (author, _) = authors()[1];
     let (sender, _) = authors()[2];
-    let (mut lm, _store) = new_lane_manager(watcher, ".db_test_vantage_ack_dedup");
     let r = (author, 1u64, Digest([9u8; 32]));
+    let mut aggregator = AckAggregator::new(test_committee());
 
-    lm.process_ack(sender, r.clone());
-    let once = lm.ack_stake(&r);
-    lm.process_ack(sender, r.clone());
-    let twice = lm.ack_stake(&r);
-    assert_eq!(once, twice);
-    assert_eq!(once, 1); // this committee's per-authority stake
+    assert!(aggregator
+        .record_ack(sender, r.clone())
+        .availability
+        .is_none());
+    assert!(aggregator
+        .record_ack(sender, r.clone())
+        .availability
+        .is_none());
+    let availability = aggregator
+        .record_ack(watcher, r)
+        .availability
+        .expect("second distinct sender crosses f+1");
+    assert_eq!(availability.threshold, AckThreshold::Validity);
 }
 
 /// N4: q-available at the exact f+1 / 2f+1 stake boundaries (n=4, f=1 => f+1=2, 2f+1=3).
@@ -75,18 +83,30 @@ async fn q_available_exact_boundaries() {
     let (author, _) = all[1];
     let (mut lm, _store) = new_lane_manager(watcher, ".db_test_vantage_q_available");
     let r = (author, 1u64, Digest([9u8; 32]));
+    let mut aggregator = AckAggregator::new(test_committee());
 
     let validity = 2; // f+1
     let quorum = 3; // 2f+1
 
-    lm.process_ack(all[0].0, r.clone());
+    assert!(aggregator
+        .record_ack(all[0].0, r.clone())
+        .availability
+        .is_none());
     assert!(!lm.is_q_available(&r, validity));
 
-    lm.process_ack(all[2].0, r.clone());
+    let availability = aggregator
+        .record_ack(all[2].0, r.clone())
+        .availability
+        .expect("second distinct ACK crosses f+1");
+    lm.process_ack_availability(availability);
     assert!(lm.is_q_available(&r, validity));
     assert!(!lm.is_q_available(&r, quorum));
 
-    lm.process_ack(all[3].0, r.clone());
+    let availability = aggregator
+        .record_ack(all[3].0, r.clone())
+        .availability
+        .expect("third distinct ACK crosses 2f+1");
+    lm.process_ack_availability(availability);
     assert!(lm.is_q_available(&r, quorum));
 }
 

@@ -27,10 +27,8 @@ async fn publish_block(
     header
 }
 
-fn quorum_ack(lm: &mut LaneManager, senders: &[PublicKey], r: (PublicKey, u64, Digest)) {
-    for s in senders {
-        lm.process_ack(*s, r.clone());
-    }
+fn quorum_ack(lm: &mut LaneManager, _senders: &[PublicKey], r: (PublicKey, u64, Digest)) {
+    mark_quorum_available(lm, r);
 }
 
 /// N5: newest = greatest height, ties at the same height broken by the

@@ -19,7 +19,7 @@ use crate::primary::View;
 use crate::vantage::agb::{AgbEngine, TimerKind};
 use crate::vantage::control::ControlLog;
 use crate::vantage::frontier::Frontier;
-use crate::vantage::lanes::LaneManager;
+use crate::vantage::lanes::{AckAggregator, AckAvailability, LaneManager, SharedAckAggregator};
 use crate::vantage::node::Inbound;
 use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::repair::Repairer;
@@ -28,12 +28,13 @@ use crate::vantage::{Cursor, Effect};
 use crypto::PublicKey;
 use metrics::Metrics;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct Node {
     pub name: PublicKey,
     pub lm: LaneManager,
+    pub ack_aggregator: SharedAckAggregator,
     pub rep: Repairer,
     pub agb: AgbEngine,
     pub frontier: Frontier,
@@ -105,6 +106,7 @@ impl Node {
         Self {
             name,
             lm,
+            ack_aggregator: Arc::new(Mutex::new(AckAggregator::new(test_committee()))),
             rep,
             agb,
             frontier,
@@ -180,6 +182,27 @@ impl Node {
         self.pacemaker.on_wish(sender, x)
     }
 
+    fn on_ack_availability(&mut self, availability: AckAvailability, now: Instant) -> Vec<Effect> {
+        let mut effects = self.lm.process_ack_availability(availability);
+        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+        effects
+    }
+
+    fn record_ack(
+        &mut self,
+        sender: PublicKey,
+        reference: crate::vantage::block::BlockRef,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let availability = {
+            let mut aggregator = self.ack_aggregator.lock().unwrap();
+            aggregator.record_ack(sender, reference).availability
+        };
+        availability
+            .map(|availability| self.on_ack_availability(availability, now))
+            .unwrap_or_default()
+    }
+
     pub async fn dispatch(&mut self, inbound: Inbound, now: Instant) -> Vec<Effect> {
         if !self.alive {
             return Vec::new();
@@ -194,7 +217,8 @@ impl Node {
                 }
                 effects
             }
-            Inbound::Ack(ack) => self.lm.process_ack(ack.sender, ack.reference()),
+            Inbound::AckAvailability(availability) => self.on_ack_availability(availability, now),
+            Inbound::Ack(ack) => self.record_ack(ack.sender, ack.reference(), now),
             Inbound::Propose(proposal) => {
                 let sender = self.agb.proposer(proposal.view);
                 self.agb
@@ -348,6 +372,10 @@ pub fn drain_local(
                 }
             }
             Effect::BroadcastAck(ack) => {
+                {
+                    let node = &mut nodes[idx];
+                    queue.extend(node.record_ack(node.name, ack.reference(), now));
+                }
                 for j in 0..n {
                     if j != idx && nodes[j].alive {
                         outbox.push_back((j, Inbound::Ack(ack.clone())));

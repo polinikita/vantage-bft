@@ -14,7 +14,7 @@ use crate::vantage::Effect;
 use config::{Committee, Stake, WorkerId};
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use store::Store;
 
@@ -461,11 +461,162 @@ impl BlockCache {
 
 pub type SharedBlocks = Arc<Mutex<BlockCache>>;
 
-/// Greatest height, ties broken by lexicographically smallest digest (§2 N5 "newest").
-fn newest(refs: Vec<BlockRef>) -> Option<BlockRef> {
-    refs.into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
+fn min_digest() -> Digest {
+    Digest([0; 32])
 }
+
+fn max_digest() -> Digest {
+    Digest([u8::MAX; 32])
+}
+
+fn author_lower_bound(author: PublicKey) -> BlockRef {
+    author_lower_bound_from(author, 0)
+}
+
+fn author_lower_bound_from(author: PublicKey, height: Height) -> BlockRef {
+    (author, height, min_digest())
+}
+
+fn author_upper_bound(author: PublicKey) -> BlockRef {
+    (author, u64::MAX, max_digest())
+}
+
+/// Greatest height, ties broken by lexicographically smallest digest (§2 N5 "newest"),
+/// read directly from an `(author, height, digest)` BTree index.
+fn newest_indexed(index: &BTreeSet<BlockRef>, author: PublicKey) -> Option<BlockRef> {
+    let mut current_height = None;
+    let mut best_at_height = None;
+    for r in index
+        .range(author_lower_bound(author)..=author_upper_bound(author))
+        .rev()
+    {
+        if current_height.is_some_and(|height| height != r.1) {
+            break;
+        }
+        current_height.get_or_insert(r.1);
+        // Reverse BTree iteration sees larger digests first for a fixed height.
+        // Overwrite through the height group so the smallest digest wins ties.
+        best_at_height = Some(r.clone());
+    }
+    best_at_height
+}
+
+fn set_candidate(
+    candidates: &mut HashMap<PublicKey, BlockRef>,
+    author: PublicKey,
+    value: Option<BlockRef>,
+) {
+    match value {
+        Some(r) => {
+            candidates.insert(author, r);
+        }
+        None => {
+            candidates.remove(&author);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AckThreshold {
+    Validity,
+    Quorum,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AckAvailability {
+    pub reference: BlockRef,
+    pub threshold: AckThreshold,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AckAggregationResult {
+    pub accepted: bool,
+    pub availability: Option<AckAvailability>,
+}
+
+/// First-hand ACK accumulator for Vantage data dissemination.
+///
+/// This intentionally sits outside `LaneManager`'s hot protocol state: it keeps the
+/// per-sender dedup sets needed to implement the paper's first-hand ACK counting, and
+/// emits only monotone f+1 / 2f+1 availability marks to the core.
+pub struct AckAggregator {
+    committee: Committee,
+    members: HashSet<PublicKey>,
+    senders: HashMap<BlockRef, HashSet<PublicKey>>,
+    weights: HashMap<BlockRef, Stake>,
+    emitted: HashMap<BlockRef, AckThreshold>,
+}
+
+impl AckAggregator {
+    pub fn new(committee: Committee) -> Self {
+        let members = committee.authorities.keys().cloned().collect();
+        Self {
+            committee,
+            members,
+            senders: HashMap::new(),
+            weights: HashMap::new(),
+            emitted: HashMap::new(),
+        }
+    }
+
+    pub fn record_ack(&mut self, sender: PublicKey, reference: BlockRef) -> AckAggregationResult {
+        if !self.members.contains(&sender) {
+            return AckAggregationResult {
+                accepted: false,
+                availability: None,
+            };
+        }
+        if !self
+            .senders
+            .entry(reference.clone())
+            .or_default()
+            .insert(sender)
+        {
+            return AckAggregationResult {
+                accepted: true,
+                availability: None,
+            };
+        }
+
+        let stake = self.committee.stake(&sender);
+        let weight = self.weights.entry(reference.clone()).or_insert(0);
+        *weight += stake;
+        let crossed = if *weight >= self.committee.quorum_threshold() {
+            Some(AckThreshold::Quorum)
+        } else if *weight >= self.committee.validity_threshold() {
+            Some(AckThreshold::Validity)
+        } else {
+            None
+        };
+
+        let Some(threshold) = crossed else {
+            return AckAggregationResult {
+                accepted: true,
+                availability: None,
+            };
+        };
+        if self
+            .emitted
+            .get(&reference)
+            .is_some_and(|old| *old >= threshold)
+        {
+            return AckAggregationResult {
+                accepted: true,
+                availability: None,
+            };
+        }
+        self.emitted.insert(reference.clone(), threshold);
+        AckAggregationResult {
+            accepted: true,
+            availability: Some(AckAvailability {
+                reference,
+                threshold,
+            }),
+        }
+    }
+}
+
+pub type SharedAckAggregator = Arc<Mutex<AckAggregator>>;
 
 pub struct LaneManager {
     name: PublicKey,
@@ -476,10 +627,21 @@ pub struct LaneManager {
     store: Store,
     blocks: SharedBlocks,
 
-    /// N4: first-hand ack senders per exact tuple.
-    ack_senders: HashMap<BlockRef, HashSet<PublicKey>>,
+    /// ACK-derived availability marks per exact tuple. First-hand sender counting lives
+    /// in `AckAggregator`; the core consumes only these monotone threshold facts.
+    ack_availability: HashMap<BlockRef, AckThreshold>,
     /// N3: tuples we have already broadcast our own ack for (at most once, ever).
     acked: HashSet<BlockRef>,
+    /// Direct, payload-ready tuples whose prefix has not yet been confirmed
+    /// `DirectPub`. A missing parent/payload can make a descendant become valid later;
+    /// this keeps retries to that monotone frontier instead of every cached block.
+    pending_direct: BTreeSet<BlockRef>,
+    /// Tuples already confirmed as `DirectPub`. Ordered by `(author, height, digest)` so
+    /// N5's newest selection and GC can walk/prune by key rather than scanning all block
+    /// cache entries.
+    direct_pub_refs: BTreeSet<BlockRef>,
+    /// Confirmed `DirectPub` tuples that have reached quorum ack stake.
+    quorum_direct_refs: BTreeSet<BlockRef>,
 
     /// N5 registers.
     c_candidate: HashMap<PublicKey, BlockRef>,
@@ -525,8 +687,11 @@ impl LaneManager {
             max_block_payload,
             store,
             blocks,
-            ack_senders: HashMap::new(),
+            ack_availability: HashMap::new(),
             acked: HashSet::new(),
+            pending_direct: BTreeSet::new(),
+            direct_pub_refs: BTreeSet::new(),
+            quorum_direct_refs: BTreeSet::new(),
             c_candidate: HashMap::new(),
             t_candidate: HashMap::new(),
             own_frontier: (0, genesis),
@@ -555,7 +720,8 @@ impl LaneManager {
     /// N1: create and self-publish our own next block. Height advances immediately on
     /// self-creation -- lanes are ack-independent (no certificate wait, unlike
     /// Autobahn's `last_parent` gate at proposer.rs:241). Self-delivery counts: we
-    /// process our own block as a direct publication and count our own ack.
+    /// process our own block as a direct publication; `VantageCore` feeds the resulting
+    /// local ACK back through `AckAggregator`.
     pub async fn publish_own(
         &mut self,
         payload: BTreeMap<Digest, WorkerId>,
@@ -599,6 +765,10 @@ impl LaneManager {
             let mut blocks = self.blocks.lock().unwrap();
             // `block_ok` just passed above for this exact header -- memoize it.
             blocks.upsert(header.clone(), direct, false, payload_ok, true);
+        }
+        if direct && payload_ok {
+            self.pending_direct
+                .insert((header.author, header.height, digest.clone()));
         }
         effects.push(Effect::BlockCached(digest.clone()));
         if header.author != self.name {
@@ -644,38 +814,53 @@ impl LaneManager {
     /// after `store.notify_read` resolves following a `SyncBatches` effect; tests:
     /// after writing the payload marker directly). Re-runs the N3 ack check.
     pub fn set_payload_ready(&mut self, digest: &Digest) -> Vec<Effect> {
-        let author = {
+        let direct_ready = {
             let mut blocks = self.blocks.lock().unwrap();
             blocks.set_payload_ok(digest, true);
-            blocks.get(digest).map(|e| e.block.author)
+            blocks.get(digest).and_then(|e| {
+                (e.direct && e.payload_ok).then(|| (e.block.author, e.block.height, digest.clone()))
+            })
         };
-        match author {
-            Some(author) => self.refresh_author(author),
+        match direct_ready {
+            Some(r) => {
+                self.pending_direct.insert(r.clone());
+                self.refresh_author(r.0)
+            }
             None => Vec::new(),
         }
     }
 
-    /// Re-run the N3 ack trigger and N5 registers over every known tuple of `author`.
+    /// Re-run the N3 ack trigger over direct, payload-ready tuples of `author` that have
+    /// not yet been confirmed as `DirectPub`, then refresh N5 registers from the indexed
+    /// direct/quorum sets. This is intentionally not a full block-cache scan: under
+    /// steady honest traffic the pending set contains only the freshly-arrived tip.
+    ///
     /// Deterministic and idempotent: `acked`/registers only ever grow/replace with a
     /// "newer" (§2 N5) reference, never regress.
     fn refresh_author(&mut self, author: PublicKey) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let refs: Vec<BlockRef> = {
-            let blocks = self.blocks.lock().unwrap();
-            blocks.author_refs(&author)
-        };
+        let refs: Vec<BlockRef> = self
+            .pending_direct
+            .range(author_lower_bound(author)..=author_upper_bound(author))
+            .cloned()
+            .collect();
+        let mut registers_changed = false;
         for r in refs {
             if !self.acked.contains(&r) && self.direct_pub(&r) {
+                self.pending_direct.remove(&r);
                 self.on_direct_pub_confirmed(&r, &mut effects);
+                registers_changed = true;
             }
         }
-        self.recompute_registers(author);
+        if registers_changed {
+            self.refresh_registers(author);
+        }
         effects
     }
 
-    /// Note: does *not* itself call `recompute_registers` -- `refresh_author` (the only
-    /// caller) always does so once, after this loop, covering every tuple confirmed in
-    /// the same pass.
+    /// Note: does *not* itself call `refresh_registers` -- `refresh_author` (the only
+    /// caller) always does so once after processing this batch, covering every tuple
+    /// confirmed in the same pass.
     fn on_direct_pub_confirmed(&mut self, r: &BlockRef, effects: &mut Vec<Effect>) {
         // N8(i): retain the whole valid lane prefix through h.
         self.retain_prefix(r);
@@ -685,8 +870,7 @@ impl LaneManager {
         if let Some(metrics) = &self.metrics {
             metrics.vantage_acks_sent.inc();
         }
-        // N1: self-delivery counts -- record our own ack immediately.
-        self.record_ack(self.name, r.clone());
+        self.record_direct_pub(r);
     }
 
     /// Callers only ever reach this after `verified_prefix_through_genesis` (which
@@ -755,34 +939,35 @@ impl LaneManager {
         }
     }
 
-    /// N4: count a first-hand ack. Callers must have already confirmed `sender` is the
-    /// message's own channel sender (network dispatch, not re-derived here) and that
-    /// the enclosing session is ours -- `Ack` itself carries no `sid` (§6.1 D5), acks
-    /// bind the session transitively through the digest, which folds `sid`.
-    pub fn process_ack(&mut self, sender: PublicKey, r: BlockRef) -> Vec<Effect> {
-        self.record_ack(sender, r.clone());
-        if let Some(metrics) = &self.metrics {
-            metrics.vantage_acks_received.inc();
+    /// Consume a compact ACK-derived availability mark from `AckAggregator`.
+    pub fn process_ack_availability(&mut self, availability: AckAvailability) -> Vec<Effect> {
+        let r = availability.reference;
+        let threshold = availability.threshold;
+        if self
+            .ack_availability
+            .get(&r)
+            .is_some_and(|old| *old >= threshold)
+        {
+            return Vec::new();
         }
-        self.recompute_registers(r.0);
+        self.ack_availability.insert(r.clone(), threshold);
+        if threshold >= AckThreshold::Quorum
+            && self.direct_pub_refs.contains(&r)
+            && self.quorum_direct_refs.insert(r.clone())
+        {
+            self.refresh_registers(r.0);
+        }
         Vec::new()
-    }
-
-    fn record_ack(&mut self, sender: PublicKey, r: BlockRef) {
-        self.ack_senders.entry(r).or_default().insert(sender);
-    }
-
-    pub fn ack_stake(&self, r: &BlockRef) -> Stake {
-        self.ack_senders
-            .get(r)
-            .map(|senders| senders.iter().map(|pk| self.committee.stake(pk)).sum())
-            .unwrap_or(0)
     }
 
     /// §4 query: `is_q_available(ref, q)`, `q` typically `committee.validity_threshold()`
     /// (f+1) or `committee.quorum_threshold()` (2f+1).
     pub fn is_q_available(&self, r: &BlockRef, q: Stake) -> bool {
-        self.ack_stake(r) >= q
+        match self.ack_availability.get(r) {
+            Some(AckThreshold::Quorum) => q <= self.committee.quorum_threshold(),
+            Some(AckThreshold::Validity) => q <= self.committee.validity_threshold(),
+            None => false,
+        }
     }
 
     fn exact_coordinate(&self, r: &BlockRef) -> bool {
@@ -857,48 +1042,53 @@ impl LaneManager {
         self.t_candidate.get(author).cloned()
     }
 
-    /// N5: recompute both registers for `author` from current first-hand state.
-    fn recompute_registers(&mut self, author: PublicKey) {
-        let refs: Vec<BlockRef> = {
-            let blocks = self.blocks.lock().unwrap();
-            blocks.author_refs(&author)
-        };
-        let quorum = self.committee.quorum_threshold();
+    fn record_direct_pub(&mut self, r: &BlockRef) {
+        self.direct_pub_refs.insert(r.clone());
+        if self.is_q_available(r, self.committee.quorum_threshold()) {
+            self.quorum_direct_refs.insert(r.clone());
+        }
+    }
 
-        let c_candidates: Vec<BlockRef> = refs
-            .iter()
-            .filter(|r| self.direct_pub(r) && self.ack_stake(r) >= quorum)
-            .cloned()
-            .collect();
-        let c = newest(c_candidates);
+    /// N5: refresh both registers for `author` from the monotone direct/quorum indexes.
+    /// This preserves `newest` (greatest height, smallest digest tie-break) without
+    /// walking every historical block ref on each ack.
+    fn refresh_registers(&mut self, author: PublicKey) {
+        let c = newest_indexed(&self.quorum_direct_refs, author);
+        set_candidate(&mut self.c_candidate, author, c.clone());
 
-        let t_candidates: Vec<BlockRef> = refs
-            .iter()
-            .filter(|r| self.direct_pub(r))
-            .filter(|r| match &c {
+        let t = self.newest_t_candidate(author, c.as_ref());
+        set_candidate(&mut self.t_candidate, author, t);
+    }
+
+    fn newest_t_candidate(&self, author: PublicKey, c: Option<&BlockRef>) -> Option<BlockRef> {
+        let min_height = c.map_or(0, |c_ref| c_ref.1.saturating_add(1));
+        let mut current_height = None;
+        let mut best_at_height = None;
+        for r in self
+            .direct_pub_refs
+            .range(author_lower_bound_from(author, min_height)..=author_upper_bound(author))
+            .rev()
+        {
+            if current_height.is_some_and(|height| height != r.1) {
+                if best_at_height.is_some() {
+                    return best_at_height;
+                }
+                current_height = Some(r.1);
+            } else if current_height.is_none() {
+                current_height = Some(r.1);
+            }
+
+            let qualifies = match c {
                 Some(c_ref) => r.1 > c_ref.1 && self.prefix_contains(r, c_ref),
                 None => true,
-            })
-            .cloned()
-            .collect();
-        let t = newest(t_candidates);
-
-        match c {
-            Some(c) => {
-                self.c_candidate.insert(author, c);
-            }
-            None => {
-                self.c_candidate.remove(&author);
+            };
+            if qualifies {
+                // Reverse BTree iteration sees larger digests first for a fixed height.
+                // Overwrite through the height group so the smallest digest wins ties.
+                best_at_height = Some(r.clone());
             }
         }
-        match t {
-            Some(t) => {
-                self.t_candidate.insert(author, t);
-            }
-            None => {
-                self.t_candidate.remove(&author);
-            }
-        }
+        best_at_height
     }
 
     /// Does `r`'s ancestor chain pass through `target`'s exact (height, digest) as a

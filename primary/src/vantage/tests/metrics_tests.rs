@@ -20,17 +20,15 @@ async fn lane_manager_counters_observe() {
     assert_eq!(metrics.vantage_acks_sent.get(), 1);
     assert!(metrics.vantage_retained_bytes.get() > 0);
 
-    // A relayed (non-self-authored) publish increments `blocks_received`, and an
-    // externally-counted ack increments `acks_received`.
+    // A relayed (non-self-authored) publish increments `blocks_received`. ACK receive
+    // counting now lives at the ACK-aggregation boundary, before the core consumes only
+    // availability marks.
     let (other, _) = authors()[1];
     let genesis = lm.genesis().clone();
     let sid = lm.sid().clone();
     let header = crate::messages::Header::new_vantage(other, 1, BTreeMap::new(), genesis, sid);
     lm.process_publish(other, header.clone()).await;
     assert_eq!(metrics.vantage_blocks_received.get(), 1);
-
-    lm.process_ack(authors()[2].0, (other, 1, header.id));
-    assert_eq!(metrics.vantage_acks_received.get(), 1);
 }
 
 #[tokio::test]

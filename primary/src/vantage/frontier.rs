@@ -11,7 +11,7 @@ use crate::vantage::agb::{formed, proposer, Manifest, ResolutionEntry, ViewPropo
 use crate::vantage::lanes::LaneManager;
 use config::Committee;
 use crypto::PublicKey;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub struct Frontier {
     name: PublicKey,
@@ -20,12 +20,13 @@ pub struct Frontier {
     a_i: View,
     /// Views that are "active" (R2's positive gate may run) -- via the proposal-chain
     /// advance reaching them, or via `enter(v)` (Phase 4: only ever v = 1).
-    active: HashSet<View>,
+    active: BTreeSet<View>,
     /// Per-view well-formedness of the (sticky) fixed proposal, as reported by
     /// `AgbEngine::on_propose` via `Effect::Fixed`.
-    fixed_well_formed: HashMap<View, bool>,
+    fixed_well_formed: BTreeMap<View, bool>,
     /// Views we have already emitted our own proposal for (R1 "not yet proposed").
-    proposed: HashSet<View>,
+    proposed: BTreeSet<View>,
+    min_live_view: View,
 }
 
 impl Frontier {
@@ -34,9 +35,10 @@ impl Frontier {
             name,
             committee,
             a_i: 0,
-            active: HashSet::new(),
-            fixed_well_formed: HashMap::new(),
-            proposed: HashSet::new(),
+            active: BTreeSet::new(),
+            fixed_well_formed: BTreeMap::new(),
+            proposed: BTreeSet::new(),
+            min_live_view: 1,
         }
     }
 
@@ -46,6 +48,17 @@ impl Frontier {
 
     pub fn is_active(&self, view: View) -> bool {
         self.active.contains(&view)
+    }
+
+    pub fn gc_below(&mut self, floor: View) {
+        if floor <= self.min_live_view {
+            return;
+        }
+        self.active = self.active.split_off(&floor);
+        self.fixed_well_formed = self.fixed_well_formed.split_off(&floor);
+        self.proposed = self.proposed.split_off(&floor);
+        self.a_i = self.a_i.max(floor.saturating_sub(1));
+        self.min_live_view = floor;
     }
 
     /// §4 "`enter(v)` also activates", extended by PHASE5-SPEC.md W5(c)'s formal-entry
@@ -60,6 +73,9 @@ impl Frontier {
     /// as `record_fixed`) -- `view` itself is always included unless already active.
     pub fn enter(&mut self, view: View) -> Vec<View> {
         let mut activated = Vec::new();
+        if view < self.min_live_view {
+            return activated;
+        }
         if self.active.insert(view) {
             activated.push(view);
         }
@@ -89,6 +105,9 @@ impl Frontier {
     /// order ("activate(v) fires exactly when processing the fixed proposal advances
     /// the frontier to v").
     pub fn record_fixed(&mut self, view: View, well_formed: bool) -> Vec<View> {
+        if view < self.min_live_view {
+            return Vec::new();
+        }
         self.fixed_well_formed.insert(view, well_formed);
         let mut activated = Vec::new();
         loop {
@@ -151,6 +170,9 @@ impl Frontier {
         lm: &LaneManager,
         m: Option<ResolutionEntry>,
     ) -> Option<ViewProposal> {
+        if view < self.min_live_view {
+            return None;
+        }
         if self.proposed.contains(&view) {
             return None;
         }

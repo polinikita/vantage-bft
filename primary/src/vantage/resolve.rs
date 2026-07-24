@@ -9,7 +9,7 @@
 use crate::primary::View;
 use crate::vantage::agb::{AgbEngine, ResolutionEntry};
 use crate::vantage::Thresholds;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 pub struct Resolver {
@@ -26,7 +26,7 @@ pub struct Resolver {
     /// shape/order between attempts (new evidence can only ever grow the set, never
     /// remove an already-qualified entry, but new smaller-order entries can shift
     /// positions).
-    candidate_pointer: HashMap<View, ResolutionEntry>,
+    candidate_pointer: BTreeMap<View, ResolutionEntry>,
     /// D7-1 (PHASE7-PREP-NOTES.md; coordinator-sanctioned WITH this time bound;
     /// Finding A's root-cause fix): the last time this party either (a) itself minted
     /// a recovery attempt for `u`, or (b) observed (via `note_carrier_report`, at the
@@ -42,7 +42,7 @@ pub struct Resolver {
     /// the limit (this only throttles the mint rate, never which entries are ever
     /// chosen), so the liveness argument survives; the paper author should still rule
     /// on this.
-    in_flight: HashMap<View, Instant>,
+    in_flight: BTreeMap<View, Instant>,
     /// 12Δ, per the coordinator's ruling (D7-1).
     expiry: Duration,
     /// Fable perf audit: a monotone lower bound on where an unresolved view can be, so
@@ -73,8 +73,8 @@ impl Resolver {
             f_plus_1_parties: thresholds.f_plus_1_parties,
             two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
             next_is_recovery: false,
-            candidate_pointer: HashMap::new(),
-            in_flight: HashMap::new(),
+            candidate_pointer: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
             expiry: Duration::from_millis(12 * delta_ms),
             resolved_watermark: 1,
         }
@@ -92,7 +92,23 @@ impl Resolver {
     /// observes (via `Effect::CompletionReportable`) a carrier -- ours or another
     /// party's -- whose `M` targets `u`, at that carrier's first genuine completion.
     pub fn note_carrier_report(&mut self, u: View, now: Instant) {
+        if u < self.resolved_watermark {
+            return;
+        }
         self.in_flight.insert(u, now);
+    }
+
+    pub fn resolved_watermark(&self) -> View {
+        self.resolved_watermark
+    }
+
+    pub fn gc_floor(&self, gc_window: View) -> View {
+        self.resolved_watermark.saturating_sub(gc_window).max(1)
+    }
+
+    pub fn gc_below(&mut self, floor: View) {
+        self.candidate_pointer = self.candidate_pointer.split_off(&floor);
+        self.in_flight = self.in_flight.split_off(&floor);
     }
 
     /// §4's canonical sort key: payloads sorted lexicographically by `bincode(C,T)`,

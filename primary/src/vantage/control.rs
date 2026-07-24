@@ -15,7 +15,7 @@ use crate::vantage::block::BlockRef;
 use crate::vantage::{Effect, Thresholds};
 use config::Committee;
 use crypto::{Digest, PublicKey};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 pub type Round = u64;
@@ -87,10 +87,10 @@ pub struct ControlLog {
 
     // --- reports census (§5) ---
     /// First-hand, one report per (view, sender), ever.
-    reports: HashMap<View, HashMap<PublicKey, Digest>>,
+    reports: BTreeMap<View, HashMap<PublicKey, Digest>>,
     /// Held + verified `B_w`'s, keyed by view (at most one correct value can ever
     /// exist per view by quorum intersection).
-    blocks: HashMap<View, ViewProposal>,
+    blocks: BTreeMap<View, ViewProposal>,
     /// Fable audit pass 1, P6-1: views we have broadcast our OWN `CompReport` for,
     /// ever -- the once-guard `on_completion_reportable` uses. Deliberately SEPARATE
     /// from `blocks`' own keys: `blocks[w]` can be populated by `try_echo`'s
@@ -100,7 +100,7 @@ pub struct ControlLog {
     /// the body" -- gating on `blocks.contains_key` let a party that validated/fetched
     /// `B_w` early suppress its own report forever, starving O3's `>= 2f+1` universal-
     /// completion progress argument.
-    reported: HashSet<View>,
+    reported: BTreeSet<View>,
 
     // --- Simple-IT round state (Fig. 2) ---
     curr_round: Round,
@@ -126,13 +126,14 @@ pub struct ControlLog {
 
     // --- log assembly + anchors (§6) ---
     delivered_log: Vec<(View, Digest)>,
-    delivered_set: HashSet<(View, Digest)>,
+    delivered_set: BTreeSet<(View, Digest)>,
     consume_pos: usize,
-    anchored: HashSet<View>,
+    anchored: BTreeSet<View>,
 
     // --- fetch bookkeeping ---
-    pending_fetch: HashSet<(View, Digest)>,
-    fetch_answered: HashSet<(PublicKey, View, Digest)>,
+    pending_fetch: BTreeSet<(View, Digest)>,
+    fetch_answered: BTreeSet<(View, Digest, PublicKey)>,
+    min_live_view: View,
 
     /// Test-only cap on how far `try_propose` will ever lead a round (mirrors
     /// `harness::Node::max_views`'s exact reasoning): nothing throttles a `⊥`-valued
@@ -156,9 +157,9 @@ impl ControlLog {
             f_plus_1_parties: thresholds.f_plus_1_parties,
             two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
             n_minus_f_parties: thresholds.n_minus_f_parties,
-            reports: HashMap::new(),
-            blocks: HashMap::new(),
-            reported: HashSet::new(),
+            reports: BTreeMap::new(),
+            blocks: BTreeMap::new(),
+            reported: BTreeSet::new(),
             curr_round: 0,
             voted: false,
             timed_out: false,
@@ -172,11 +173,12 @@ impl ControlLog {
             bracha: HashMap::new(),
             notif: HashMap::new(),
             delivered_log: Vec::new(),
-            delivered_set: HashSet::new(),
+            delivered_set: BTreeSet::new(),
             consume_pos: 0,
-            anchored: HashSet::new(),
-            pending_fetch: HashSet::new(),
-            fetch_answered: HashSet::new(),
+            anchored: BTreeSet::new(),
+            pending_fetch: BTreeSet::new(),
+            fetch_answered: BTreeSet::new(),
+            min_live_view: 1,
             #[cfg(test)]
             max_rounds_for_test: None,
         }
@@ -189,6 +191,39 @@ impl ControlLog {
 
     pub fn control_round_timeout(&self) -> Duration {
         self.delta * 6
+    }
+
+    fn is_pruned_view(&self, view: View) -> bool {
+        view < self.min_live_view
+    }
+
+    fn anchor_resolved(&self, view: View) -> bool {
+        self.is_pruned_view(view) || self.anchored.contains(&view)
+    }
+
+    fn compact_delivered_log(&mut self) {
+        if self.consume_pos == 0 {
+            return;
+        }
+        self.delivered_log.drain(..self.consume_pos);
+        self.consume_pos = 0;
+    }
+
+    pub fn gc_below(&mut self, floor: View) {
+        if floor <= self.min_live_view {
+            return;
+        }
+        self.reports = self.reports.split_off(&floor);
+        self.blocks = self.blocks.split_off(&floor);
+        self.reported = self.reported.split_off(&floor);
+        self.delivered_set = self.delivered_set.split_off(&(floor, Digest::default()));
+        self.anchored = self.anchored.split_off(&floor);
+        self.pending_fetch = self.pending_fetch.split_off(&(floor, Digest::default()));
+        self.fetch_answered =
+            self.fetch_answered
+                .split_off(&(floor, Digest::default(), PublicKey::default()));
+        self.min_live_view = floor;
+        self.compact_delivered_log();
     }
 
     /// §5: round-robin control leader, independent of the data-view proposer rotation
@@ -318,6 +353,9 @@ impl ControlLog {
         let in_chain: HashSet<(View, Digest)> = self.log_chain(parent).into_iter().collect();
         let mut best: Option<(View, Digest)> = None;
         for (&view, reporters) in &self.reports {
+            if self.is_pruned_view(view) {
+                continue;
+            }
             let Some(proposal) = self.blocks.get(&view) else {
                 continue;
             };
@@ -336,7 +374,7 @@ impl ControlLog {
             // carrier already resolved it, so this pair is moot -- skip it to avoid
             // burning this leader's own per-round bandwidth re-delivering a no-op.
             if let Some(entry) = &proposal.m {
-                if self.anchored.contains(&entry.target_view()) {
+                if self.anchor_resolved(entry.target_view()) {
                     continue;
                 }
             }
@@ -768,6 +806,9 @@ impl ControlLog {
         let chain = self.log_chain(r);
         let mut effects = Vec::new();
         for pair in chain {
+            if self.is_pruned_view(pair.0) {
+                continue;
+            }
             if self.delivered_set.insert(pair.clone()) {
                 self.delivered_log.push(pair);
             }
@@ -820,6 +861,9 @@ impl ControlLog {
 
     /// A first-hand `CompReport`.
     pub fn on_comp_report(&mut self, view: View, digest: Digest, sender: PublicKey) -> Vec<Effect> {
+        if self.is_pruned_view(view) {
+            return Vec::new();
+        }
         let entry = self.reports.entry(view).or_default();
         if entry.contains_key(&sender) {
             return Vec::new();
@@ -845,6 +889,9 @@ impl ControlLog {
     /// content-identical, so re-inserting here is harmless even when `blocks[view]`
     /// was already held).
     pub fn on_completion_reportable(&mut self, view: View, proposal: ViewProposal) -> Vec<Effect> {
+        if self.is_pruned_view(view) {
+            return Vec::new();
+        }
         if self.reported.contains(&view) {
             return Vec::new();
         }
@@ -863,6 +910,9 @@ impl ControlLog {
 
     /// Counted first-hand reports for `view` naming exactly `digest` (party count).
     pub(crate) fn report_count_for(&self, view: View, digest: &Digest) -> usize {
+        if self.is_pruned_view(view) {
+            return 0;
+        }
         self.reports
             .get(&view)
             .map_or(0, |m| m.values().filter(|d| *d == digest).count())
@@ -890,6 +940,9 @@ impl ControlLog {
     /// round) a `ControlProposal` naming `(w,h)` -- §5's "request B_w once from every
     /// matching REPORT and ECHO author".
     fn matching_report_and_echo_authors(&self, w: View, h: &Digest) -> Vec<PublicKey> {
+        if self.is_pruned_view(w) {
+            return Vec::new();
+        }
         let mut out: HashSet<PublicKey> = HashSet::new();
         if let Some(m) = self.reports.get(&w) {
             for (sender, d) in m {
@@ -909,6 +962,9 @@ impl ControlLog {
     }
 
     fn ensure_fetch(&mut self, w: View, h: &Digest, _round: Round) -> Vec<Effect> {
+        if self.is_pruned_view(w) {
+            return Vec::new();
+        }
         if self.blocks.contains_key(&w) || !self.pending_fetch.insert((w, h.clone())) {
             return Vec::new();
         }
@@ -921,7 +977,10 @@ impl ControlLog {
     /// A peer's `ControlFetch(w, h)` request -- answer with our held, verified `B_w` if
     /// we have it and haven't already answered this requester for this pair.
     pub fn on_control_fetch(&mut self, requester: PublicKey, w: View, h: Digest) -> Vec<Effect> {
-        if self.fetch_answered.contains(&(requester, w, h.clone())) {
+        if self.is_pruned_view(w) {
+            return Vec::new();
+        }
+        if self.fetch_answered.contains(&(w, h.clone(), requester)) {
             return Vec::new();
         }
         let Some(proposal) = self.blocks.get(&w) else {
@@ -930,7 +989,7 @@ impl ControlLog {
         if proposal.digest(&self.sid) != h {
             return Vec::new();
         }
-        self.fetch_answered.insert((requester, w, h));
+        self.fetch_answered.insert((w, h, requester));
         vec![Effect::ControlServeTo(requester, w, proposal.clone())]
     }
 
@@ -948,6 +1007,9 @@ impl ControlLog {
     /// other check has already passed, so a defensive check-then-remove ordering
     /// still leaves nothing partially mutated on a rejection).
     pub fn on_control_serve(&mut self, view: View, proposal: ViewProposal) -> Vec<Effect> {
+        if self.is_pruned_view(view) {
+            return Vec::new();
+        }
         if self.blocks.contains_key(&view) || proposal.view != view {
             return Vec::new();
         }
@@ -1003,6 +1065,10 @@ impl ControlLog {
             let Some((w, h)) = self.delivered_log.get(self.consume_pos).cloned() else {
                 break;
             };
+            if self.is_pruned_view(w) {
+                self.consume_pos += 1;
+                continue;
+            }
             let Some(proposal) = self.blocks.get(&w) else {
                 effects.extend(self.ensure_fetch(w, &h, self.curr_round));
                 break;
@@ -1029,7 +1095,7 @@ impl ControlLog {
                 continue;
             };
             let u = entry.target_view();
-            if self.anchored.contains(&u) {
+            if self.anchor_resolved(u) {
                 self.consume_pos += 1;
                 continue; // a later anchor for an already-resolved u -- ignored
             }
@@ -1072,7 +1138,7 @@ impl ControlLog {
     /// resolved through the control log (folded together with `AgbEngine::is_sealed`
     /// by the caller).
     pub fn is_anchor_resolved(&self, view: View) -> bool {
-        self.anchored.contains(&view)
+        self.anchor_resolved(view)
     }
 
     #[cfg(test)]

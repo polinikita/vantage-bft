@@ -6,7 +6,7 @@ use crate::common::{committee, keys};
 use crate::messages::Header;
 use crate::vantage::agb::{self, AgbEngine, Manifest};
 use crate::vantage::block::{self, BlockRef};
-use crate::vantage::lanes::LaneManager;
+use crate::vantage::lanes::{AckAvailability, AckThreshold, LaneManager};
 use crate::vantage::repair::Repairer;
 use config::Committee;
 use crypto::{Digest, PublicKey, SecretKey};
@@ -74,6 +74,21 @@ pub fn tagged_header(
 
 pub fn block_ref(header: &Header) -> BlockRef {
     (header.author, header.height, header.id.clone())
+}
+
+pub fn mark_ack_available(lm: &mut LaneManager, reference: BlockRef, threshold: AckThreshold) {
+    lm.process_ack_availability(AckAvailability {
+        reference,
+        threshold,
+    });
+}
+
+pub fn mark_validity_available(lm: &mut LaneManager, reference: BlockRef) {
+    mark_ack_available(lm, reference, AckThreshold::Validity);
+}
+
+pub fn mark_quorum_available(lm: &mut LaneManager, reference: BlockRef) {
+    mark_ack_available(lm, reference, AckThreshold::Quorum);
 }
 
 /// Sort a manifest by author -- `Formed_v`'s "strictly increasing author order".

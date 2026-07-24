@@ -11,7 +11,9 @@ use crate::vantage::block;
 use crate::vantage::control::{ControlLog, ControlProposal, Round};
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
-use crate::vantage::lanes::{BlockCache, LaneManager, SharedBlocks};
+use crate::vantage::lanes::{
+    AckAggregator, AckAvailability, BlockCache, LaneManager, SharedAckAggregator, SharedBlocks,
+};
 use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
@@ -52,6 +54,11 @@ pub enum Inbound {
     /// `Header(h, true)`: serve path.
     Serve(Header),
     HeadersRequest(Vec<Digest>, PublicKey),
+    /// Production network ACKs are accumulated by `AckAggregator` before reaching the
+    /// core. This compact mark is the only ACK-derived fact the hot protocol path needs.
+    AckAvailability(AckAvailability),
+    /// Test/direct-injection compatibility path. `VantageReceiverHandler` does not emit
+    /// this in production.
     Ack(Ack),
     /// `VantagePropose` carries no sender field on the wire (§2) -- see
     /// `VantageCore::dispatch_inbound` for how the trusted sender is derived.
@@ -143,6 +150,7 @@ fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
 #[derive(Clone)]
 pub struct VantageReceiverHandler {
     pub tx: Sender<Inbound>,
+    pub ack_aggregator: SharedAckAggregator,
     /// METRICS-DASHBOARD-SPEC.md §1: `None` only in tests that construct this handler
     /// directly without wiring metrics (matches `VantageCore`'s own optional-handle
     /// convention) -- production (`Primary::spawn`) always passes `Some`.
@@ -214,7 +222,25 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::HeadersRequest(digests, requestor) => {
                 Inbound::HeadersRequest(digests, requestor)
             }
-            PrimaryMessage::VantageAck(a) => Inbound::Ack(a),
+            PrimaryMessage::VantageAck(a) => {
+                let result = {
+                    let mut aggregator = self.ack_aggregator.lock().unwrap();
+                    aggregator.record_ack(a.sender, a.reference())
+                };
+                if !result.accepted {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.vantage_rejected_nonmember_total.inc();
+                    }
+                    return Ok(());
+                }
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_acks_received.inc();
+                }
+                let Some(availability) = result.availability else {
+                    return Ok(());
+                };
+                Inbound::AckAvailability(availability)
+            }
             PrimaryMessage::VantagePropose(p) => Inbound::Propose(p),
             PrimaryMessage::VantageEcho(e) => Inbound::Echo(e),
             PrimaryMessage::VantageEchoSkip(v, s, w) => Inbound::EchoSkip(v, s, w),
@@ -257,6 +283,7 @@ pub struct VantageCore {
     /// choke point for every other wire-message path too.
     members: HashSet<PublicKey>,
     lm: LaneManager,
+    ack_aggregator: SharedAckAggregator,
     rep: Repairer,
     agb: AgbEngine,
     frontier: Frontier,
@@ -323,6 +350,13 @@ pub struct VantageCore {
     store: Store,
     tx_payload_ready: Sender<(Digest, Digest, WorkerId)>,
 
+    /// Vantage internal-state retention window, in views. Uses `Parameters::gc_depth`
+    /// to preserve the existing deployment knob: once the resolver has proven a
+    /// contiguous resolved prefix, component state below `resolved_watermark - gc_window`
+    /// can be dropped.
+    gc_window: View,
+    last_gc_floor: View,
+
     /// PHASE7-PREP-NOTES.md Finding A: kept for `sample_metrics`'s 1s progress-gauge
     /// tick -- a separate clone from the ones already handed to `lm`/`rep`/`agb`
     /// (`Arc<Metrics>` is freely shareable; this is not new metrics plumbing, just one
@@ -348,13 +382,15 @@ pub struct VantageCore {
     tx_output: Sender<Header>,
 }
 
-/// `VantageCore::build`'s return shape: the constructed core plus the three channel
-/// ends `spawn` still needs to wire up (or a test needs to drive directly).
+/// `VantageCore::build`'s return shape: the constructed core, channel ends `spawn`
+/// still needs to wire up (or a test needs to drive directly), and the shared
+/// ACK accumulator used by both local ACK feedback and the network handler.
 type BuildOutput = (
     VantageCore,
     Receiver<Inbound>,
     Receiver<(Digest, Digest, WorkerId)>,
     Sender<Inbound>,
+    SharedAckAggregator,
 );
 
 impl VantageCore {
@@ -368,11 +404,11 @@ impl VantageCore {
         metrics: Option<Arc<Metrics>>,
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
-    ) -> Sender<Inbound> {
-        let (core, rx_vantage, rx_payload_ready, tx_vantage) =
+    ) -> (Sender<Inbound>, SharedAckAggregator) {
+        let (core, rx_vantage, rx_payload_ready, tx_vantage, ack_aggregator) =
             Self::build(name, committee, parameters, store, metrics, tx_output);
         tokio::spawn(core.run(rx_vantage, rx_our_digests, rx_payload_ready));
-        tx_vantage
+        (tx_vantage, ack_aggregator)
     }
 
     /// Everything `spawn` used to do up through constructing `core`, split out purely
@@ -414,6 +450,8 @@ impl VantageCore {
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
         let blocks: SharedBlocks = Arc::new(Mutex::new(BlockCache::new()));
+        let ack_aggregator: SharedAckAggregator =
+            Arc::new(Mutex::new(AckAggregator::new(committee.clone())));
 
         let mut lm = LaneManager::with_shared_blocks(
             name,
@@ -488,6 +526,7 @@ impl VantageCore {
             name,
             members,
             lm,
+            ack_aggregator: ack_aggregator.clone(),
             rep,
             agb,
             frontier,
@@ -530,6 +569,8 @@ impl VantageCore {
             pending_payload: HashMap::new(),
             store,
             tx_payload_ready,
+            gc_window: parameters.gc_depth,
+            last_gc_floor: 1,
             metrics: core_metrics,
             ut_inbound_dispatch: None,
             ut_payload_sync: None,
@@ -537,7 +578,13 @@ impl VantageCore {
             ut_effect_execution: None,
             tx_output,
         };
-        (core, rx_vantage, rx_payload_ready, tx_vantage)
+        (
+            core,
+            rx_vantage,
+            rx_payload_ready,
+            tx_vantage,
+            ack_aggregator,
+        )
     }
 
     async fn run(
@@ -646,6 +693,7 @@ impl VantageCore {
                     // regardless of `maybe_prune_cancel_handlers`'s doubling
                     // condition, bounding worst-case staleness to ~1s.
                     self.prune_cancel_handlers();
+                    self.collect_internal_garbage();
                     self.sample_metrics();
                     // METRICS-DASHBOARD-SPEC.md §3: `core_queue_length` -- `rx_vantage`'s
                     // current depth (cheap, `Receiver::len()` is O(1)); `0` (never set)
@@ -793,6 +841,26 @@ impl VantageCore {
         );
     }
 
+    fn collect_internal_garbage(&mut self) {
+        let floor = self.resolver.gc_floor(self.gc_window);
+        if floor <= self.last_gc_floor {
+            return;
+        }
+        self.agb.gc_below(floor);
+        self.frontier.gc_below(floor);
+        self.cursor.gc_below(floor);
+        self.control.gc_below(floor);
+        self.resolver.gc_below(floor);
+        self.timers.retain(|Reverse((_, view, _))| *view >= floor);
+        self.last_gc_floor = floor;
+        log::debug!(
+            "vantage node: internal GC floor advanced to {} (resolved_watermark={}, gc_window={})",
+            floor,
+            self.resolver.resolved_watermark(),
+            self.gc_window
+        );
+    }
+
     /// R1's "should we propose next" check (§4), as a pure effect-producing step so it
     /// can be inlined both at boot and inside `execute`'s `Fixed` handling without
     /// recursive `async fn` calls. PHASE6-SPEC.md §4: when it's genuinely our turn,
@@ -861,12 +929,13 @@ impl VantageCore {
     }
 
     /// SECURITY (Fable audit): extracts the wire-declared sender to validate against
-    /// `self.members`, for every `Inbound` variant that carries one. `None` for the
-    /// four variants with no wire sender field at all: `Serve` (header content is
-    /// self-authenticating by digest), `Propose`/`ControlInit` (positionally
-    /// attributed to `proposer(view)`/`control_leader(round)`, D4's standing
-    /// claimed-by-position class -- see `dispatch_inbound`'s own comments on those two
-    /// arms), and `ControlServe` (gated downstream by `pending_fetch(view, digest)`).
+    /// `self.members`, for every `Inbound` variant that carries one. `None` for
+    /// internal or positionally-attributed facts: `Serve` (header content is
+    /// self-authenticating by digest), `AckAvailability` (already checked by
+    /// `AckAggregator`), `Propose`/`ControlInit` (positionally attributed to
+    /// `proposer(view)`/`control_leader(round)`, D4's standing claimed-by-position
+    /// class -- see `dispatch_inbound`'s own comments on those two arms), and
+    /// `ControlServe` (gated downstream by `pending_fetch(view, digest)`).
     fn wire_sender(inbound: &Inbound) -> Option<PublicKey> {
         // `PublicKey` is `Copy` -- dereference rather than `.clone()` (clippy::clone_on_copy).
         match inbound {
@@ -886,10 +955,49 @@ impl VantageCore {
             Inbound::ControlTimeoutAccept(s, _) => Some(*s),
             Inbound::ControlFetch(_, _, s) => Some(*s),
             Inbound::Serve(_)
+            | Inbound::AckAvailability(_)
             | Inbound::Propose(_)
             | Inbound::ControlInit(_, _)
             | Inbound::ControlServe(_, _) => None,
         }
+    }
+
+    fn on_ack_availability(&mut self, availability: AckAvailability, now: Instant) -> Vec<Effect> {
+        let mut effects = self.lm.process_ack_availability(availability);
+        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+        effects
+    }
+
+    fn record_local_ack(&mut self, ack: &Ack, now: Instant) -> Vec<Effect> {
+        let availability = {
+            let mut aggregator = self.ack_aggregator.lock().unwrap();
+            aggregator
+                .record_ack(self.name, ack.reference())
+                .availability
+        };
+        availability
+            .map(|availability| self.on_ack_availability(availability, now))
+            .unwrap_or_default()
+    }
+
+    fn record_injected_ack(&mut self, ack: Ack, now: Instant) -> Vec<Effect> {
+        let result = {
+            let mut aggregator = self.ack_aggregator.lock().unwrap();
+            aggregator.record_ack(ack.sender, ack.reference())
+        };
+        if !result.accepted {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_rejected_nonmember_total.inc();
+            }
+            return Vec::new();
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_acks_received.inc();
+        }
+        result
+            .availability
+            .map(|availability| self.on_ack_availability(availability, now))
+            .unwrap_or_default()
     }
 
     async fn dispatch_inbound(&mut self, inbound: Inbound, now: Instant) -> Vec<Effect> {
@@ -919,16 +1027,8 @@ impl VantageCore {
                 }
                 effects
             }
-            Inbound::Ack(ack) => {
-                // P4-4: an ack can be the event that pushes a C/T entry's ack stake
-                // across the f+1/2f+1 thresholds `author_ok`/`is_q_available` read --
-                // the R2 positive gate must be re-polled, the same as after a
-                // `BlockCached` wakeup, or a view whose *last* gate-enabling event was
-                // an ack (rather than a fresh publish) would never echo.
-                let mut effects = self.lm.process_ack(ack.sender, ack.reference());
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
-                effects
-            }
+            Inbound::AckAvailability(availability) => self.on_ack_availability(availability, now),
+            Inbound::Ack(ack) => self.record_injected_ack(ack, now),
             Inbound::Propose(proposal) => {
                 // D4 (PHASE4-SPEC.md §13's standing note): `ViewProposal` carries no
                 // sender field and there is no channel identity to check it against
@@ -1040,6 +1140,7 @@ impl VantageCore {
                         .await
                 }
                 Effect::BroadcastAck(ack) => {
+                    queue.extend(self.record_local_ack(&ack, now));
                     self.broadcast_message(PrimaryMessage::VantageAck(ack))
                         .await
                 }
@@ -1480,14 +1581,15 @@ mod tests {
         let registry = prometheus::Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         let (tx_output, _rx_output) = channel(1);
-        let (core, _rx_vantage, _rx_payload_ready, _tx_vantage) = VantageCore::build(
-            name,
-            committee,
-            Parameters::default(),
-            store,
-            Some(metrics),
-            tx_output,
-        );
+        let (core, _rx_vantage, _rx_payload_ready, _tx_vantage, _ack_aggregator) =
+            VantageCore::build(
+                name,
+                committee,
+                Parameters::default(),
+                store,
+                Some(metrics),
+                tx_output,
+            );
         core
     }
 
@@ -1696,17 +1798,26 @@ mod tests {
 
     /// End-to-end over a real TCP loopback (mirrors `network::receiver_tests::receive`):
     /// flag off (`channel_auth: None`) is byte-identical to pre-MAC behavior -- a plain,
-    /// untagged wire message still deserializes and reaches `VantageCore` untouched.
+    /// untagged ACK still deserializes and reaches `VantageCore` once it advances
+    /// aggregate availability.
     #[tokio::test]
-    async fn dispatch_flag_off_delivers_untagged_message_unchanged() {
+    async fn dispatch_flag_off_delivers_untagged_ack_threshold() {
         use futures::SinkExt as _;
         use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
         let committee = crate::common::committee();
+        let ack_aggregator = Arc::new(Mutex::new(AckAggregator::new(committee.clone())));
         let (sender, _) = crate::common::keys()[1];
+        let (pre_sender, _) = crate::common::keys()[2];
+        let reference = (sender, 7, Digest::default());
+        ack_aggregator
+            .lock()
+            .unwrap()
+            .record_ack(pre_sender, reference.clone());
         let (tx_vantage, mut rx_vantage) = channel(4);
         let handler = VantageReceiverHandler {
             tx: tx_vantage,
+            ack_aggregator,
             metrics: None,
             channel_auth: None,
             committee,
@@ -1716,7 +1827,7 @@ mod tests {
         network::Receiver::spawn(address, handler);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let ack = Ack::new(sender, 7, Digest::default(), sender);
+        let ack = Ack::new(reference.0, reference.1, reference.2.clone(), sender);
         let payload = bincode::serialize(&PrimaryMessage::VantageAck(ack)).unwrap();
 
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -1725,8 +1836,8 @@ mod tests {
 
         let received = tokio::time::timeout(Duration::from_millis(500), rx_vantage.recv()).await;
         assert!(
-            matches!(received, Ok(Some(Inbound::Ack(_)))),
-            "flag off must deliver a plain untagged message exactly as before"
+            matches!(received, Ok(Some(Inbound::AckAvailability(_)))),
+            "flag off must deliver a plain untagged ACK once it advances availability"
         );
     }
 
@@ -1749,9 +1860,17 @@ mod tests {
         let sender_auth = committee.pairwise_keys(&sender, &secret);
         let impostor_auth = committee.pairwise_keys(&impostor, &secret);
 
+        let ack_aggregator = Arc::new(Mutex::new(AckAggregator::new(committee.clone())));
+        let (pre_sender, _) = crate::common::keys()[3];
+        let reference = (sender, 9, Digest::default());
+        ack_aggregator
+            .lock()
+            .unwrap()
+            .record_ack(pre_sender, reference.clone());
         let (tx_vantage, mut rx_vantage) = channel(4);
         let handler = VantageReceiverHandler {
             tx: tx_vantage,
+            ack_aggregator,
             metrics: None,
             channel_auth: Some(receiver_auth),
             committee: committee.clone(),
@@ -1763,7 +1882,7 @@ mod tests {
 
         // A wire `Ack` whose DECLARED sender field is `sender` -- but physically
         // produced (MAC'd) by `impostor`, who does not hold `k_{sender,name}`.
-        let ack = Ack::new(sender, 9, Digest::default(), sender);
+        let ack = Ack::new(reference.0, reference.1, reference.2.clone(), sender);
         let payload = bincode::serialize(&PrimaryMessage::VantageAck(ack.clone())).unwrap();
         let forged_tag = impostor_auth
             .tag_for(&name, &payload)
@@ -1788,8 +1907,8 @@ mod tests {
 
         let delivered = tokio::time::timeout(Duration::from_millis(500), rx_vantage.recv()).await;
         assert!(
-            matches!(delivered, Ok(Some(Inbound::Ack(a))) if a.sender == sender),
-            "a genuinely MAC'd message from the real declared sender must be delivered"
+            matches!(delivered, Ok(Some(Inbound::AckAvailability(_)))),
+            "a genuinely MAC'd ACK from the real declared sender must be delivered when it advances availability"
         );
     }
 }

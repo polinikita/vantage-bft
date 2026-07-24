@@ -294,7 +294,7 @@ impl Primary {
                 // Core/Proposer/HeaderWaiter/Helper/consensus entirely. Only the
                 // worker-facing receiver and the metrics server (already booted above)
                 // are shared with Autobahn.
-                let tx_vantage = crate::vantage::VantageCore::spawn(
+                let (tx_vantage, ack_aggregator) = crate::vantage::VantageCore::spawn(
                     name,
                     committee.clone(),
                     parameters.clone(),
@@ -316,6 +316,7 @@ impl Primary {
                     /* handler */
                     crate::vantage::node::VantageReceiverHandler {
                         tx: tx_vantage,
+                        ack_aggregator,
                         metrics: Some(metrics.clone()),
                         channel_auth: channel_auth.clone(),
                         committee: committee.clone(),

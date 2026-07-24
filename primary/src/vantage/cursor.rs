@@ -8,7 +8,7 @@ use crate::vantage::lanes::SharedBlocks;
 use crate::vantage::Effect;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Default, Clone)]
@@ -34,7 +34,7 @@ pub struct Cursor {
     output_log: Vec<Digest>,
     /// Views whose core prefix `K` has already been emitted (either at a
     /// completed-but-open step, or inline while sealing).
-    core_emitted: HashSet<View>,
+    core_emitted: BTreeSet<View>,
     pending: BTreeMap<View, ViewInput>,
     /// PHASE6-SPEC.md §9 gate amendment (D6-7, performance-only, deterministic-
     /// equivalent): per-author "last emitted" watermark (height + digest), replacing
@@ -64,7 +64,7 @@ impl Cursor {
             next_view: 1,
             output,
             output_log: Vec::new(),
-            core_emitted: HashSet::new(),
+            core_emitted: BTreeSet::new(),
             pending: BTreeMap::new(),
             watermarks: HashMap::new(),
         }
@@ -76,6 +76,12 @@ impl Cursor {
 
     pub fn next_view(&self) -> View {
         self.next_view
+    }
+
+    pub fn gc_below(&mut self, floor: View) {
+        let floor = floor.min(self.next_view);
+        self.pending = self.pending.split_off(&floor);
+        self.core_emitted = self.core_emitted.split_off(&floor);
     }
 
     /// R4's `complete(v) -> B`: the core becomes irrevocable at a still-`gopen` view.

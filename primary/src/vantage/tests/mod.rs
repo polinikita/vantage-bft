@@ -14,6 +14,7 @@ mod completion_tests;
 mod cursor_tests;
 mod fastseal_tests;
 mod frontier_tests;
+mod gc_tests;
 mod harness;
 mod integration_tests;
 mod ready_tests;

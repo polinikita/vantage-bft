@@ -177,12 +177,10 @@ async fn tip_acked_but_not_held_blocks_gate() {
 
     let c_ref = (author_c, 1, Digest([11u8; 32]));
     let t_ref = (author_c, 2, Digest([12u8; 32]));
-    // f+1 = 2 distinct first-hand acks for each coordinate -> author_ok via
-    // is_q_available(validity_threshold), but the block itself was never published.
-    for (sender, _) in authors().into_iter().take(2) {
-        lm.process_ack(sender, c_ref.clone());
-        lm.process_ack(sender, t_ref.clone());
-    }
+    // f+1 availability for each coordinate -> author_ok via is_q_available, but the
+    // block itself was never published.
+    mark_validity_available(&mut lm, c_ref.clone());
+    mark_validity_available(&mut lm, t_ref.clone());
     assert!(lm.author_ok(&c_ref));
     assert!(lm.author_ok(&t_ref));
     assert!(!lm.holds_prefix(&t_ref.clone()));
@@ -430,12 +428,9 @@ async fn positive_gate_fires_when_final_enabling_event_is_an_ack() {
         "gate must not fire before the entry is author_ok"
     );
 
-    // The wiring's exact sequence for `Inbound::Ack` (node.rs `dispatch_inbound`):
-    // `lm.process_ack` then `agb.recheck_all`. f+1 = 2 distinct acks cross
-    // `is_q_available(validity_threshold)`.
-    for (sender, _) in authors().into_iter().take(2) {
-        lm.process_ack(sender, c_ref.clone());
-    }
+    // The wiring's exact sequence for an ACK-derived threshold mark: lane availability
+    // update, then `agb.recheck_all`. f+1 crosses `is_q_available(validity_threshold)`.
+    mark_validity_available(&mut lm, c_ref.clone());
     assert!(
         lm.author_ok(&c_ref),
         "test setup: ack stake must actually cross the threshold"

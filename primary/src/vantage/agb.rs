@@ -13,7 +13,7 @@ use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -334,13 +334,17 @@ pub struct AgbEngine {
     /// D4-3: fast-seal thresholds count *parties*, not stake.
     f_plus_1_parties: usize,
     quorum: Stake,
-    views: HashMap<View, ViewState>,
+    views: BTreeMap<View, ViewState>,
     /// Efficiency Item 2: exactly the views `recheck_all` would find by scanning
     /// `views` for `active && !echo_sent && matches!(fixed, Fixed::Proposal(..))`.
     /// Maintained incrementally at the only three sites that can change this
     /// membership (`activate`, `on_propose`, and every `echo_sent = true` site) --
     /// see those call sites for the exact insert/remove reasoning.
-    pending_gate: std::collections::HashSet<View>,
+    pending_gate: BTreeSet<View>,
+    /// Lowest view for which this engine may still create/read per-view state. Views
+    /// below this have crossed the node-level GC floor and are treated as already
+    /// resolved for late-message/timer purposes.
+    min_live_view: View,
     /// PHASE6-SPEC.md §9 gate amendment: per-view seal-route counters.
     /// `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
@@ -359,8 +363,9 @@ impl AgbEngine {
             n,
             f_plus_1_parties,
             quorum,
-            views: HashMap::new(),
-            pending_gate: std::collections::HashSet::new(),
+            views: BTreeMap::new(),
+            pending_gate: BTreeSet::new(),
+            min_live_view: 1,
             metrics: None,
         }
     }
@@ -406,15 +411,14 @@ impl AgbEngine {
         match stage {
             ResponseStage::Echo => {
                 let prev = view.saturating_sub(1);
-                let prev_ready_sent =
-                    prev == 0 || self.views.get(&prev).is_some_and(|s| s.ready_sent);
+                let prev_ready_sent = prev == 0
+                    || self.is_pruned(prev)
+                    || self.views.get(&prev).is_some_and(|s| s.ready_sent);
                 prev_ready_sent.then(|| view + 2)
             }
             ResponseStage::Ready => {
                 let next = view + 1;
-                self.views
-                    .get(&next)
-                    .is_some_and(|s| s.echo_sent)
+                (self.is_pruned(next) || self.views.get(&next).is_some_and(|s| s.echo_sent))
                     .then(|| view + 3)
             }
         }
@@ -430,6 +434,19 @@ impl AgbEngine {
 
     fn state_mut(&mut self, view: View) -> &mut ViewState {
         self.views.entry(view).or_default()
+    }
+
+    fn is_pruned(&self, view: View) -> bool {
+        view < self.min_live_view
+    }
+
+    pub fn gc_below(&mut self, floor: View) {
+        if floor <= self.min_live_view {
+            return;
+        }
+        self.views = self.views.split_off(&floor);
+        self.pending_gate = self.pending_gate.split_off(&floor);
+        self.min_live_view = floor;
     }
 
     /// Efficiency Item 1: `ViewProposal::digest` is a pure function of the
@@ -470,7 +487,7 @@ impl AgbEngine {
     /// Whether `view` has entered AT ALL (a target with genuinely no state yet is a
     /// "no-evidence view" that never blocks a later target, per §4's scanning rule).
     pub fn has_any_state(&self, view: View) -> bool {
-        self.views.contains_key(&view)
+        self.is_pruned(view) || self.views.contains_key(&view)
     }
 
     /// Counted echo statements for `view` matching `pred` (0 if `view` has no state
@@ -559,7 +576,7 @@ impl AgbEngine {
     /// (the caller, `resolve.rs`, also folds in the anchor-resolved predicate once §6
     /// lands).
     pub fn is_sealed(&self, view: View) -> bool {
-        self.views.get(&view).is_some_and(|s| s.sealed.is_some())
+        self.is_pruned(view) || self.views.get(&view).is_some_and(|s| s.sealed.is_some())
     }
 
     /// D7-4 (PHASE7-PREP-NOTES.md): read-only mirror of the exact guard
@@ -569,13 +586,13 @@ impl AgbEngine {
     /// dispatching the handler call, instead of dispatching into a guard that would
     /// have returned an empty `Vec` anyway. Same value, same meaning, no `&mut self`.
     pub fn echo_sent(&self, view: View) -> bool {
-        self.views.get(&view).is_some_and(|s| s.echo_sent)
+        self.is_pruned(view) || self.views.get(&view).is_some_and(|s| s.echo_sent)
     }
 
     /// D7-4: read-only mirror of `on_ready_timer`'s guard, same reasoning as
     /// `echo_sent` above.
     pub fn ready_sent(&self, view: View) -> bool {
-        self.views.get(&view).is_some_and(|s| s.ready_sent)
+        self.is_pruned(view) || self.views.get(&view).is_some_and(|s| s.ready_sent)
     }
 
     /// PHASE6-SPEC.md §6: submit an anchor-derived outcome `X_u` to the SAME try-seal
@@ -584,6 +601,9 @@ impl AgbEngine {
     /// no-op (`debug_assert`ed compatible by `outcomes_compatible`, same as ever).
     pub fn submit_anchor(&mut self, view: View, outcome: Outcome) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         let route = match &outcome {
             Outcome::Full(..) => "anchor_full",
             Outcome::Core(..) => "anchor_core",
@@ -642,6 +662,9 @@ impl AgbEngine {
         rep: &mut Repairer,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         if self.state_mut(view).entered {
             return effects;
         }
@@ -693,6 +716,9 @@ impl AgbEngine {
         lm: &mut LaneManager,
         rep: &mut Repairer,
     ) -> Vec<Effect> {
+        if self.is_pruned(view) {
+            return Vec::new();
+        }
         if self.state_mut(view).active {
             return Vec::new();
         }
@@ -726,6 +752,9 @@ impl AgbEngine {
     ) -> Vec<Effect> {
         let view = proposal.view;
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         if sender != self.proposer(view) {
             return effects; // only a *direct* proposal from proposer(v) can ever fix
         }
@@ -818,6 +847,9 @@ impl AgbEngine {
         rep: &mut Repairer,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         let (active, echo_sent, proposal_digest) = {
             let s = self.state_mut(view);
             // Efficiency Item 3: `p.clone()` on an `Arc<ViewProposal>` is a refcount
@@ -934,6 +966,9 @@ impl AgbEngine {
             return true;
         };
         let u = entry.target_view();
+        if self.is_pruned(u) {
+            return true;
+        }
         let Some(state_u) = self.views.get(&u) else {
             return false; // no state at all for u yet -- E_i(u)/R_i(u) certainly pending
         };
@@ -1007,6 +1042,12 @@ impl AgbEngine {
     fn compute_origin(&self, m: &Option<ResolutionEntry>) -> Option<u8> {
         let entry = m.as_ref()?;
         let u = entry.target_view();
+        if self.is_pruned(u) {
+            return match entry {
+                ResolutionEntry::Full(..) | ResolutionEntry::Core(..) => Some(1),
+                ResolutionEntry::Skip(_) => None,
+            };
+        }
         let own_echo = self
             .views
             .get(&u)
@@ -1034,6 +1075,9 @@ impl AgbEngine {
         rep: &mut Repairer,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         let (echo_sent, fixed) = {
             let s = self.state_mut(view);
             (s.echo_sent, s.fixed.clone())
@@ -1081,6 +1125,9 @@ impl AgbEngine {
     /// echo-skip.
     pub fn on_echo_absolute_timer(&mut self, view: View, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         if self.state_mut(view).echo_sent {
             return effects;
         }
@@ -1106,6 +1153,9 @@ impl AgbEngine {
             return effects;
         }
         let view = echo.proposal.view;
+        if self.is_pruned(view) {
+            return effects;
+        }
         let sender = echo.sender;
         let grade = echo.grade;
         let origin = echo.origin;
@@ -1128,6 +1178,9 @@ impl AgbEngine {
     /// A counted `VantageEchoSkip`.
     pub fn on_echo_skip(&mut self, view: View, sender: PublicKey) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         if !self.count_echo_statement(view, sender, EchoStatement::Skip) {
             return effects;
         }
@@ -1147,6 +1200,9 @@ impl AgbEngine {
         sender: PublicKey,
         statement: EchoStatement,
     ) -> bool {
+        if self.is_pruned(view) {
+            return false;
+        }
         let state = self.state_mut(view);
         if state.echo_statements.contains_key(&sender) {
             return false;
@@ -1174,6 +1230,9 @@ impl AgbEngine {
         sender: PublicKey,
         statement: ReadyStatement,
     ) -> bool {
+        if self.is_pruned(view) {
+            return false;
+        }
         let state = self.state_mut(view);
         if state.ready_statements.contains_key(&sender) {
             return false;
@@ -1191,6 +1250,9 @@ impl AgbEngine {
     /// entry/fixed-proposal/own-echo guard.
     fn recheck_ready(&mut self, view: View, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         if self.state_mut(view).ready_sent {
             return effects;
         }
@@ -1269,6 +1331,9 @@ impl AgbEngine {
     /// broadcast a no-ready.
     pub fn on_ready_timer(&mut self, view: View) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         if self.state_mut(view).ready_sent {
             return effects;
         }
@@ -1282,6 +1347,9 @@ impl AgbEngine {
     /// A counted `VantageReady`.
     pub fn on_ready(&mut self, ready: Ready, rep: &mut Repairer) -> Vec<Effect> {
         let view = ready.proposal.view;
+        if self.is_pruned(view) {
+            return Vec::new();
+        }
         let sender = ready.sender;
         let grade = ready.grade;
         // Efficiency Item 1: reuse the per-view digest cache instead of always
@@ -1302,6 +1370,9 @@ impl AgbEngine {
     /// census (§4's justification reads it). Names no B, so it never feeds
     /// completion/direct.
     pub fn on_noready(&mut self, view: View, sender: PublicKey) -> Vec<Effect> {
+        if self.is_pruned(view) {
+            return Vec::new();
+        }
         self.count_ready_statement(view, sender, ReadyStatement::NoReady);
         Vec::new()
     }
@@ -1315,6 +1386,9 @@ impl AgbEngine {
     /// a late homogeneous quorum still produces the direct result.
     fn recheck_completion_and_direct(&mut self, view: View, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
         // Efficiency Item 3: see `recheck_ready`'s matching comment -- `Arc::clone`
         // instead of a deep `ViewProposal` clone on every re-scan.
         let mut tallies: HashMap<Digest, (Arc<ViewProposal>, Stake, Stake, Stake)> = HashMap::new();
@@ -1389,6 +1463,9 @@ impl AgbEngine {
         route: &'static str,
         effects: &mut Vec<Effect>,
     ) {
+        if self.is_pruned(view) {
+            return;
+        }
         let state = self.state_mut(view);
         match &state.sealed {
             None => {
@@ -1427,6 +1504,9 @@ impl AgbEngine {
     /// exactly B) echo. Born inactive if ≥ f+1 parties already have non-matching
     /// echo-stage statements counted; otherwise born active. Recorded once per view.
     fn record_lock(&mut self, view: View, proposal: &ViewProposal, digest: &Digest) {
+        if self.is_pruned(view) {
+            return;
+        }
         if self.state_mut(view).lock.is_some() {
             return;
         }

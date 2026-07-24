@@ -85,7 +85,7 @@ async fn no_discard_on_local_events() {
     // Unrelated local events: acks for a different author/tuple, more (unrelated)
     // publishes.
     let (other, _) = all[1];
-    lm.process_ack(all[2].0, (other, 99, crypto::Digest([1u8; 32])));
+    mark_validity_available(&mut lm, (other, 99, crypto::Digest([1u8; 32])));
     let (_second_header, _) = lm.publish_own(BTreeMap::new()).await;
 
     assert!(lm.holds_prefix(&r));
