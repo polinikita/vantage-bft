@@ -4,17 +4,51 @@ from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
 from paramiko import RSAKey
 from paramiko.ssh_exception import PasswordRequiredException, SSHException
+from os import makedirs
 from os.path import basename, splitext, abspath, dirname, join
+from json import dump
+from urllib.error import URLError
 from time import sleep
 from math import ceil
 from copy import deepcopy
 import subprocess
 
-from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
-from benchmark.utils import BenchError, Print, PathMaker, progress_bar, scrape_metrics
+from benchmark.config import (
+    Committee, Key, NodeParameters, BenchParameters, ConfigError,
+    generate_collector_scrape_config,
+)
+from benchmark.utils import (
+    BenchError, Print, PathMaker, progress_bar, scrape_metrics, prometheus_query,
+)
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
 from benchmark.instance import InstanceManager
+
+
+# METRICS-COLLECTOR-PREP: PromQL for each series the analysis needs off the
+# metrics-collector's Prometheus (see `Bench.fetch_collector_metrics`). Names
+# verified against metrics/src/metrics.rs's `Metrics::new` registrations, not
+# guessed -- see that module for the authoritative list.
+COLLECTOR_QUERIES = {
+    'committed_transactions_total': 'sum(committed_transactions)',
+    'committed_transactions_rate': 'sum(rate(committed_transactions[30s]))',
+    # transaction_committed_latency is exposed as a gauge vector labeled by
+    # `v` (p25/p50/p75/p90/p99/max/sum/count), not a native Prometheus
+    # histogram -- see HistogramReporter::report in metrics/src/metrics.rs.
+    'transaction_committed_latency': 'transaction_committed_latency',
+    'vantage_seals_by_route': 'sum by (route) (vantage_seals)',
+    'network_messages_sent_by_type': 'sum by (type) (network_messages_sent_total)',
+    'network_messages_received_by_type': 'sum by (type) (network_messages_received_total)',
+    'network_bytes_sent_by_type': 'sum by (type) (network_bytes_sent_total)',
+    'network_bytes_received_by_type': 'sum by (type) (network_bytes_received_total)',
+    'bytes_sent_total': 'sum(bytes_sent_total)',
+    'bytes_received_total': 'sum(bytes_received_total)',
+    'submitted_transactions': 'sum(submitted_transactions)',
+    'utilization_timer_by_proc': 'sum by (proc) (utilization_timer)',
+    'core_queue_length': 'core_queue_length',
+    'protocol_info': 'protocol_info',
+    'transaction_mode_info': 'transaction_mode_info',
+}
 
 
 class FabricError(Exception):
@@ -357,6 +391,107 @@ class Bench:
 
         return committee
 
+    def deploy_monitoring(self, committee_json, faults=0):
+        ''' METRICS-COLLECTOR-PREP step 2: install + start Prometheus on the
+        dedicated metrics-collector instance (instance.py's COLLECTOR_NAME),
+        scraping every validator's primary+worker metrics endpoint over the
+        PRIVATE VPC ip at 1s intervals (see
+        `config.generate_collector_scrape_config`'s docstring for why PRIVATE,
+        not the committee's own public 'metrics' field).
+
+        `committee_json`: the raw committee dict (`.committee.json`'s shape --
+        either loaded straight off disk or a live `Committee`'s `.json`
+        attribute); `faults`: same slice-out-the-faulty-nodes convention as
+        `_config`'s own upload step.
+
+        Docker (`apt-get install docker.io` + `prom/prometheus` image) rather
+        than the raw Prometheus binary: one apt package + one image pull, no
+        manual arch/version bookkeeping, and idempotent on redeploy (`docker rm
+        -f` tolerates a container that's already there) -- the same tradeoff
+        starfish's own monitoring/docker-compose.yml already makes locally.
+
+        No-op (with a warning) if no collector instance exists (`fab create`
+        predates this feature, or it's still booting) -- monitoring is
+        additive, never required for the benchmark itself. '''
+        collector = self.manager.collector_host()
+        if collector is None:
+            Print.warn(
+                'No metrics-collector instance found; skipping Prometheus deploy'
+            )
+            return None
+        collector_public_ip, _ = collector
+
+        yaml_text = generate_collector_scrape_config(committee_json, faults=faults)
+        local_path = PathMaker.collector_prometheus_file()
+        with open(local_path, 'w') as f:
+            f.write(yaml_text)
+
+        Print.info(
+            f'Deploying Prometheus on the metrics-collector ({collector_public_ip})...'
+        )
+        c = Connection(
+            collector_public_ip, user=self.settings.username, connect_kwargs=self.connect
+        )
+        install_cmd = ' && '.join([
+            'sudo apt-get update -qq',
+            'sudo apt-get install -y -qq docker.io',
+            'sudo systemctl enable --now docker',
+        ])
+        c.run(install_cmd, hide=True)
+        c.put(local_path, 'prometheus.yml')
+        run_cmd = ' && '.join([
+            # Idempotent: tolerates redeploying onto the same, already-running
+            # collector (e.g. between sweep points in the same campaign).
+            'sudo docker rm -f prometheus || true',
+            'sudo docker run -d --name prometheus --restart unless-stopped '
+            f'-p {InstanceManager.MONITOR_PORT}:9090 '
+            f'-v /home/{self.settings.username}/prometheus.yml:/etc/prometheus/prometheus.yml '
+            'prom/prometheus --config.file=/etc/prometheus/prometheus.yml '
+            '--storage.tsdb.retention.time=7d --web.enable-admin-api',
+        ])
+        c.run(run_cmd, hide=True)
+        Print.heading(
+            f'Prometheus is running on the metrics-collector '
+            f'(http://{collector_public_ip}:{InstanceManager.MONITOR_PORT})'
+        )
+        return collector_public_ip
+
+    def fetch_collector_metrics(self, start=None, end=None, step='1s'):
+        ''' METRICS-COLLECTOR-PREP step 3: pull the key series (COLLECTOR_QUERIES,
+        module-level above) off the metrics-collector's Prometheus HTTP API and
+        write each as JSON under logs/collector/<name>.json, so post-run
+        analysis has the comprehensive metrics locally instead of re-querying
+        the (about to be `fab destroy`ed) collector.
+
+        `start`/`end` (unix seconds, both or neither): give both for a
+        `query_range` covering the run window (e.g. the campaign's start time
+        through now) at `step` resolution; omit both for an instant `query`
+        (Prometheus's last-known value per series -- always available, no
+        window bookkeeping required by the caller).
+
+        Best-effort per series -- one query failing (collector API briefly
+        unreachable, a series that was never observed into on this run) prints
+        a warning and continues rather than aborting the whole export, same
+        convention as `scrape_metrics`. '''
+        collector = self.manager.collector_host()
+        if collector is None:
+            Print.warn('No metrics-collector instance found; nothing to fetch')
+            return
+        collector_public_ip, _ = collector
+        base_url = f'http://{collector_public_ip}:{InstanceManager.MONITOR_PORT}'
+
+        out_dir = PathMaker.collector_metrics_dir()
+        makedirs(out_dir, exist_ok=True)
+        for name, promql in COLLECTOR_QUERIES.items():
+            try:
+                body = prometheus_query(base_url, promql, start=start, end=end, step=step)
+            except (URLError, OSError) as e:
+                Print.warn(f'Failed to fetch {name!r} ({promql!r}) from {base_url}: {e}')
+                continue
+            with open(PathMaker.collector_metrics_file(name), 'w') as f:
+                dump(body, f, indent=2)
+        Print.heading(f'Wrote collector metrics to {out_dir}')
+
     def _run_single(self, rate, committee, bench_parameters, debug=False):
         faults = bench_parameters.faults
 
@@ -611,6 +746,17 @@ class Bench:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to configure nodes', e)
 
+        # METRICS-COLLECTOR-PREP: deploy the dedicated metrics-collector's
+        # Prometheus (scraping every validator over its PRIVATE ip, see
+        # `deploy_monitoring`'s docstring). Best-effort/non-fatal -- an older
+        # testbed with no collector instance, or a transient SSH hiccup while
+        # installing Docker, must not abort the whole campaign: monitoring is
+        # additive, not required for the benchmark itself to run.
+        try:
+            self.deploy_monitoring(committee.json, faults=bench_parameters.faults)
+        except Exception as e:
+            Print.warn(f'Failed to deploy monitoring on the metrics-collector: {e}')
+
         # Run benchmarks.
         for n in bench_parameters.nodes:
             committee_copy = deepcopy(committee)
@@ -645,3 +791,11 @@ class Bench:
                             e = FabricError(e)
                         Print.error(BenchError('Benchmark failed', e))
                         continue
+
+        # METRICS-COLLECTOR-PREP step 3: pull the comprehensive metrics off the
+        # collector now, before `fab destroy` terminates it. Best-effort/
+        # non-fatal for the same reason as the deploy step above.
+        try:
+            self.fetch_collector_metrics()
+        except Exception as e:
+            Print.warn(f'Failed to fetch metrics from the metrics-collector: {e}')

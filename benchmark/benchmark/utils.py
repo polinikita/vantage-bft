@@ -1,6 +1,8 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+from json import loads
 from os.path import join
 from urllib.error import URLError
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 
@@ -74,6 +76,21 @@ class PathMaker:
         return join(PathMaker.logs_path(), f'metrics-worker-{i}-{j}.txt')
 
     @staticmethod
+    def collector_prometheus_file():
+        ''' METRICS-COLLECTOR-PREP: the generated scrape-config uploaded to the
+        dedicated metrics-collector instance (local staging copy). '''
+        return '.collector-prometheus.yml'
+
+    @staticmethod
+    def collector_metrics_dir():
+        return join(PathMaker.logs_path(), 'collector')
+
+    @staticmethod
+    def collector_metrics_file(name):
+        assert isinstance(name, str)
+        return join(PathMaker.collector_metrics_dir(), f'{name}.json')
+
+    @staticmethod
     def results_path():
         return 'results'
 
@@ -117,6 +134,26 @@ def scrape_metrics(address, filename, timeout=5):
         return
     with open(filename, 'w') as f:
         f.write(body)
+
+
+def prometheus_query(base_url, promql, start=None, end=None, step='1s', timeout=10):
+    ''' METRICS-COLLECTOR-PREP: query the metrics-collector's Prometheus HTTP API
+    and return the parsed JSON response (same stdlib-urllib, best-effort-by-
+    caller style as `scrape_metrics` above -- no `requests` dependency for a
+    handful of coordinator-side reads). Instant `query` when both `start`/`end`
+    are None (the default); `query_range` (stepped, over [start, end]) when
+    both are given -- `start`/`end` are unix timestamps (seconds). Raises
+    URLError/OSError on failure/timeout; callers decide whether that's fatal. '''
+    assert isinstance(base_url, str)
+    assert isinstance(promql, str)
+    if start is None and end is None:
+        url = f'{base_url}/api/v1/query?{urlencode({"query": promql})}'
+    else:
+        assert start is not None and end is not None
+        params = {'query': promql, 'start': start, 'end': end, 'step': step}
+        url = f'{base_url}/api/v1/query_range?{urlencode(params)}'
+    with urlopen(url, timeout=timeout) as response:
+        return loads(response.read().decode('utf-8'))
 
 
 class Color:

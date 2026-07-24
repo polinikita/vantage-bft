@@ -18,7 +18,19 @@ class AWSError(Exception):
 
 class InstanceManager:
     INSTANCE_NAME = 'dag-node'
+    # METRICS-COLLECTOR-PREP: the dedicated metrics-collector instance gets its own
+    # tag:Name value so it is distinguishable from validators at a glance (AWS
+    # console, `describe_instances`) and, critically, so hosts()/internal_hosts()
+    # (which filter on INSTANCE_NAME only, see below) never surface it to
+    # `_select_hosts`/`_select_hosts_config` -- the collector is not a committee
+    # member and runs no node.
+    COLLECTOR_NAME = 'metrics-collector'
     SECURITY_GROUP_NAME = 'dag'
+    # Prometheus HTTP API port on the metrics-collector instance -- scraped targets
+    # dial validators (see config.py's committee 'metrics' addresses); this is the
+    # port the *collector itself* listens on, queried by the coordinator laptop
+    # after a run (remote.py's fetch_collector_metrics).
+    MONITOR_PORT = 9090
 
     def __init__(self, settings):
         assert isinstance(settings, Settings)
@@ -34,9 +46,17 @@ class InstanceManager:
         except SettingsError as e:
             raise BenchError('Failed to load settings', e)
 
-    def _get(self, state):
+    def _get(self, state, name=None):
         # Possible states are: 'pending', 'running', 'shutting-down',
         # 'terminated', 'stopping', and 'stopped'.
+        #
+        # `name`: a single tag:Name value to filter on (INSTANCE_NAME or
+        # COLLECTOR_NAME). None (the default) matches BOTH -- every instance
+        # this harness owns, validator or collector alike -- which is what
+        # terminate_instances/_wait (teardown, boot-wait) want: the collector
+        # must be included in both. hosts()/internal_hosts() pass
+        # name=INSTANCE_NAME explicitly so the committee/host-selection logic
+        # never sees the collector; collector_host() passes name=COLLECTOR_NAME.
         #
         # Collects PUBLIC and PRIVATE IPs side by side (single
         # describe_instances call per region) so the two stay index-aligned
@@ -48,12 +68,13 @@ class InstanceManager:
         # `None`s out themselves, see `_paired_hosts`.
         ids = defaultdict(list)
         public_ips, private_ips = defaultdict(list), defaultdict(list)
+        tag_values = [name] if name is not None else [self.INSTANCE_NAME, self.COLLECTOR_NAME]
         for region, client in self.clients.items():
             r = client.describe_instances(
                 Filters=[
                     {
                         'Name': 'tag:Name',
-                        'Values': [self.INSTANCE_NAME]
+                        'Values': tag_values
                     },
                     {
                         'Name': 'instance-state-name',
@@ -68,13 +89,14 @@ class InstanceManager:
                 private_ips[region] += [x.get('PrivateIpAddress')]
         return ids, public_ips, private_ips
 
-    def _paired_hosts(self, state):
+    def _paired_hosts(self, state, name=None):
         ''' Per-region list of (public_ip, private_ip) pairs for instances in
-        `state`, built from a single `_get()` snapshot so the two addresses
-        stay tied to the same physical instance. Any instance missing either
-        address is dropped (with a warning) rather than left to silently
-        shift the pairing of every instance after it -- see `_get`. '''
-        _, public_ips, private_ips = self._get(state)
+        `state` (optionally restricted to tag:Name == `name`, see `_get`),
+        built from a single `_get()` snapshot so the two addresses stay tied
+        to the same physical instance. Any instance missing either address is
+        dropped (with a warning) rather than left to silently shift the
+        pairing of every instance after it -- see `_get`. '''
+        _, public_ips, private_ips = self._get(state, name)
         pairs = defaultdict(list)
         for region in public_ips:
             for pub, priv in zip(public_ips[region], private_ips[region]):
@@ -87,12 +109,12 @@ class InstanceManager:
                 pairs[region].append((pub, priv))
         return pairs
 
-    def _wait(self, state):
+    def _wait(self, state, name=None):
         # Possible states are: 'pending', 'running', 'shutting-down',
         # 'terminated', 'stopping', and 'stopped'.
         while True:
             sleep(1)
-            ids, _, _ = self._get(state)
+            ids, _, _ = self._get(state, name)
             if sum(len(x) for x in ids.values()) == 0:
                 break
 
@@ -130,7 +152,30 @@ class InstanceManager:
                         'CidrIpv6': '::/0',
                         'Description': 'Dag port',
                     }],
-                }
+                },
+                {
+                    # METRICS-COLLECTOR-PREP: the metrics-collector's Prometheus
+                    # HTTP API, queried by the coordinator laptop after a run
+                    # (remote.py's fetch_collector_metrics). Same shared security
+                    # group as the validators (simplicity: one group, one call
+                    # site) -- validators get this rule too but nothing listens
+                    # on their :9090, so it is inert there. Same 0.0.0.0/0
+                    # posture as the SSH/Dag-port rules above (not narrowed to
+                    # the coordinator's own IP); tightening this to the
+                    # coordinator's CIDR is the obvious hardening follow-up if
+                    # that posture is ever revisited for the other two rules.
+                    'IpProtocol': 'tcp',
+                    'FromPort': self.MONITOR_PORT,
+                    'ToPort': self.MONITOR_PORT,
+                    'IpRanges': [{
+                        'CidrIp': '0.0.0.0/0',
+                        'Description': 'Metrics-collector Prometheus HTTP API',
+                    }],
+                    'Ipv6Ranges': [{
+                        'CidrIpv6': '::/0',
+                        'Description': 'Metrics-collector Prometheus HTTP API',
+                    }],
+                },
             ]
         )
 
@@ -230,12 +275,69 @@ class InstanceManager:
 
             # Wait for the instances to boot.
             Print.info('Waiting for all instances to boot...')
-            self._wait(['pending'])
+            self._wait(['pending'], name=self.INSTANCE_NAME)
             Print.heading(f'Successfully created {size} new instances')
+
+            # METRICS-COLLECTOR-PREP: one dedicated, extra metrics-collector
+            # instance (not a validator, runs no node) -- in the FIRST configured
+            # region only. A single collector regardless of how many regions
+            # `settings.json` lists: scraping a validator over its PRIVATE ip from
+            # a collector in a *different* region would need cross-region VPC
+            # peering this harness never sets up (today's settings.json is
+            # single-region, so this is exact there; a genuinely multi-region
+            # campaign would need that peering for validator<->validator traffic
+            # regardless of this feature). Tagged COLLECTOR_NAME (never
+            # INSTANCE_NAME) so hosts()/internal_hosts() -- and therefore
+            # `_select_hosts`/the committee -- never see it; only
+            # terminate_instances (matches both tags) and collector_host()
+            # (COLLECTOR_NAME only) do.
+            region, client = next(iter(self.clients.items()))
+            collector_type = getattr(
+                self.settings, 'monitor_instance_type', None
+            ) or self.settings.instance_type
+            Print.info(
+                f'Creating the metrics-collector instance ({collector_type}, '
+                f'{region})...'
+            )
+            client.run_instances(
+                ImageId=self._get_ami(client),
+                InstanceType=collector_type,
+                KeyName=self.settings.key_name,
+                MaxCount=1,
+                MinCount=1,
+                SecurityGroups=[self.SECURITY_GROUP_NAME],
+                TagSpecifications=[{
+                    'ResourceType': 'instance',
+                    'Tags': [{
+                        'Key': 'Name',
+                        'Value': self.COLLECTOR_NAME
+                    }]
+                }],
+                EbsOptimized=True,
+                BlockDeviceMappings=[{
+                    'DeviceName': '/dev/sda1',
+                    'Ebs': {
+                        'VolumeType': 'gp2',
+                        # The collector only runs a single Prometheus container
+                        # (scrape data for one benchmark run, not a fleet of
+                        # them) -- far less storage than a validator's 200GB.
+                        'VolumeSize': 50,
+                        'DeleteOnTermination': True
+                    }
+                }],
+                **spot_options,
+            )
+            Print.info('Waiting for the metrics-collector instance to boot...')
+            self._wait(['pending'], name=self.COLLECTOR_NAME)
+            Print.heading('Successfully created the metrics-collector instance')
         except ClientError as e:
             raise BenchError('Failed to create AWS instances', AWSError(e))
 
     def terminate_instances(self):
+        ''' Terminates every instance this harness owns -- validators AND the
+        dedicated metrics-collector alike. `_get`'s default `name=None` matches
+        both INSTANCE_NAME and COLLECTOR_NAME, so no separate collector-teardown
+        step is needed here. '''
         try:
             ids, _, _ = self._get(['pending', 'running', 'stopping', 'stopped'])
             size = sum(len(x) for x in ids.values())
@@ -288,9 +390,14 @@ class InstanceManager:
     def hosts(self, flat=False):
         ''' PUBLIC (internet-routable) IPs -- the SSH/rsync/tmux connection
         targets used from the coordinator laptop. NOT for the Committee
-        (node<->node/client<->node): see `internal_hosts()`. '''
+        (node<->node/client<->node): see `internal_hosts()`.
+
+        Validators ONLY (tag:Name == INSTANCE_NAME) -- the dedicated
+        metrics-collector instance (COLLECTOR_NAME) is deliberately excluded so
+        `_select_hosts`/the committee never see it; use `collector_host()` to
+        reach the collector itself. '''
         try:
-            pairs = self._paired_hosts(['pending', 'running'])
+            pairs = self._paired_hosts(['pending', 'running'], name=self.INSTANCE_NAME)
             ips = {region: [pub for pub, _ in v] for region, v in pairs.items()}
             return [x for y in ips.values() for x in y] if flat else ips
         except ClientError as e:
@@ -312,13 +419,35 @@ class InstanceManager:
         AWS returning the same per-region instance order both times (true in
         practice for an unchanged, non-transitioning fleet queried
         back-to-back, which is how `_select_hosts`/`_select_hosts_config`
-        call them in `run()`) rather than on a shared API response. '''
+        call them in `run()`) rather than on a shared API response.
+
+        Validators ONLY -- see `hosts()`'s same note re: the metrics-collector. '''
         try:
-            pairs = self._paired_hosts(['pending', 'running'])
+            pairs = self._paired_hosts(['pending', 'running'], name=self.INSTANCE_NAME)
             ips = {region: [priv for _, priv in v] for region, v in pairs.items()}
             return [x for y in ips.values() for x in y] if flat else ips
         except ClientError as e:
             raise BenchError('Failed to gather instances private IPs', AWSError(e))
+
+    def collector_host(self):
+        ''' (public_ip, private_ip) of the dedicated metrics-collector instance
+        (tag:Name == COLLECTOR_NAME), or None if it hasn't been created yet (an
+        older testbed predating this feature, or the instance is still booting
+        and lacks one of its two addresses -- see `_paired_hosts`).
+        `create_instances` creates exactly one, in the first configured region,
+        so the first match across regions is it. Public ip: the coordinator's
+        SSH/deploy target for installing + running Prometheus, and later for
+        querying its HTTP API. Private ip: informational here (the collector
+        doesn't need to know its own address to scrape outward), but returned
+        for symmetry/completeness. '''
+        try:
+            pairs = self._paired_hosts(['pending', 'running'], name=self.COLLECTOR_NAME)
+        except ClientError as e:
+            raise BenchError('Failed to gather metrics-collector IPs', AWSError(e))
+        for region_pairs in pairs.values():
+            if region_pairs:
+                return region_pairs[0]
+        return None
 
     def print_info(self):
         hosts = self.hosts()
@@ -329,6 +458,15 @@ class InstanceManager:
             for i, ip in enumerate(ips):
                 new_line = '\n' if (i+1) % 6 == 0 else ''
                 text += f'{new_line} {i}\tssh -i {key} ubuntu@{ip}\n'
+
+        collector = self.collector_host()
+        collector_text = (
+            f'\n Metrics collector:\n'
+            f' \tssh -i {key} ubuntu@{collector[0]} '
+            f'(private ip: {collector[1]}, Prometheus: http://{collector[0]}:'
+            f'{self.MONITOR_PORT})\n'
+        ) if collector is not None else '\n Metrics collector: none\n'
+
         print(
             '\n'
             '----------------------------------------------------------------\n'
@@ -336,5 +474,6 @@ class InstanceManager:
             '----------------------------------------------------------------\n'
             f' Available machines: {sum(len(x) for x in hosts.values())}\n'
             f'{text}'
+            f'{collector_text}'
             '----------------------------------------------------------------\n'
         )

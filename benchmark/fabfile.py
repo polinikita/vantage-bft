@@ -142,7 +142,8 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
 
 
 @task
-def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100):
+def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
+             nodes=20, duration=180, rates='50000,100000,150000,200000,250000'):
     ''' Distributed Vantage AWS throughput/latency campaign (PREP -- the
     coordinator performs the actual `fab create`/`fab remote`/`fab destroy`;
     this task only assembles + validates the config and hands it to
@@ -170,13 +171,13 @@ def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100):
     '''
     bench_params = {
         'faults': 0,
-        'nodes': [20],
+        'nodes': [int(nodes)],
         'workers': 1,
         'collocate': True,
-        'rate': [50_000, 100_000, 150_000, 200_000, 250_000],
+        'rate': [int(r) for r in str(rates).split(',') if r.strip()],
         'tx_size': 512,
         'tx_mode': 'all-zero',
-        'duration': 180,
+        'duration': int(duration),
         'runs': 1,
 
         # Partition simulation unused for this campaign.
@@ -271,6 +272,51 @@ def monitor(ctx):
                'prometheus-remote.yaml (instead of .local-bench/prometheus.yaml), '
                'then `docker compose -f monitoring/docker-compose.yml up -d` -- see '
                'monitoring/README.md\'s "Orchestration mode" section.')
+
+
+@task
+def monitor_collector(ctx):
+    ''' METRICS-COLLECTOR-PREP: (re)deploy Prometheus on the dedicated
+    metrics-collector instance, reading the last run's .committee.json for
+    scrape targets (every validator's primary+worker metrics endpoint, over
+    its PRIVATE VPC ip). `Bench.run()` already calls this automatically right
+    after `_config()`; this standalone task is for redeploying without a full
+    `fab remote`/`fab campaign` (e.g. after manually editing .committee.json,
+    or recovering a collector that failed to come up). Requires `fab create`
+    (with the collector) and at least one prior `fab remote`/`fab campaign` to
+    have written .committee.json. '''
+    from json import load
+    from benchmark.utils import PathMaker
+
+    try:
+        with open(PathMaker.committee_file(), 'r') as f:
+            committee_json = load(f)
+    except (OSError, IOError) as e:
+        Print.error(BenchError(
+            'Failed to read committee file (run `fab remote` at least once first)', e
+        ))
+        return
+
+    try:
+        Bench(ctx).deploy_monitoring(committee_json)
+    except BenchError as e:
+        Print.error(e)
+
+
+@task
+def fetch_metrics(ctx):
+    ''' METRICS-COLLECTOR-PREP: pull the key metrics series (committed
+    transactions, transaction-committed-latency, vantage_seals, network
+    message/byte counters, submitted_transactions, utilization_timer,
+    core_queue_length, protocol_info/transaction_mode_info -- see
+    `remote.COLLECTOR_QUERIES`) off the metrics-collector's Prometheus HTTP
+    API into logs/collector/*.json. Safe to run any time after `fab remote`/
+    `fab campaign` has deployed monitoring and before `fab destroy` terminates
+    the collector. '''
+    try:
+        Bench(ctx).fetch_collector_metrics()
+    except BenchError as e:
+        Print.error(e)
 
 
 @task

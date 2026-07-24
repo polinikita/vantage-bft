@@ -21,7 +21,8 @@ class Settings:
 
     def __init__(self, key_name, key_path, base_port, repo_name, repo_url,
                  branch, instance_type, aws_regions, project_id=None,
-                 templates=None, username='ubuntu', spot=False):
+                 templates=None, username='ubuntu', spot=False,
+                 monitor_instance_type=None):
         inputs_str = [
             key_name, key_path, repo_name, repo_url, branch, instance_type
         ]
@@ -58,6 +59,12 @@ class Settings:
         # -> on-demand, byte-identical to prior behavior. When true, create_instances
         # requests one-time Spot capacity capped at the on-demand price (no MaxPrice).
         self.spot = spot
+        # METRICS-COLLECTOR-PREP: instance type for the dedicated metrics-collector
+        # instance (instance.py's create_instances). Optional -- None (absent from
+        # settings.json, the default) makes instance.py fall back to the same
+        # `instance_type` the validators use, byte-identical to a settings.json
+        # written before this feature existed.
+        self.monitor_instance_type = monitor_instance_type
 
     @classmethod
     def load(cls, filename):
@@ -78,6 +85,7 @@ class Settings:
                 data['instances'].get('templates'),
                 data.get('username', 'ubuntu'),
                 bool(data['instances'].get('spot', False)),
+                data['instances'].get('monitor_type'),
             )
         except (OSError, JSONDecodeError) as e:
             raise SettingsError(str(e))

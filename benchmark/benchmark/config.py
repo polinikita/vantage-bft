@@ -301,6 +301,65 @@ class Committee:
         return address.split(':')[0]
 
 
+def generate_collector_scrape_config(
+    committee_json, faults=0, scrape_interval='1s', job_name='vantage-collector'
+):
+    ''' METRICS-COLLECTOR-PREP: Prometheus scrape-config YAML for the dedicated
+    metrics-collector instance -- one target per (non-faulty) authority's
+    primary metrics endpoint and one per worker, all on the PRIVATE (VPC) ip.
+
+    Operates on the RAW committee dict (`{'authorities': {name: {...}}}` --
+    exactly `.committee.json`'s shape, and exactly what a live `Committee`
+    exposes as `committee.json`), not a `Committee` object, so the same
+    function drives both `remote.py`'s `Bench.deploy_monitoring` (called with
+    the live committee right after `_config()`) and a standalone
+    `fab monitor-collector` re-deploy (called with `.committee.json` loaded
+    straight off disk, `fab monitor`'s own read-only pattern) -- and is
+    directly unit-testable against a hand-built dict, no AWS/live Committee
+    required.
+
+    The committee only ever stores the PUBLIC ip in each 'metrics' field (see
+    `Committee.__init__`'s docstring: metrics is scraped by an external
+    observer, never dialed by a peer, so it's free to be the address the
+    *coordinator laptop* can reach). The dedicated collector instead lives
+    inside the VPC and must scrape over the PRIVATE ip (same
+    cross-instance-billing/throughput reasoning as every peer-dialed
+    committee field) -- so this derives the private host from the
+    'primary_to_primary'/'primary_to_worker' fields (always the private ip)
+    and keeps the port from 'metrics' (primary: port+2 of
+    'primary_to_primary'; worker: port+3 of 'primary_to_worker' -- see
+    `Committee.__init__`), rather than reading 'metrics' directly. '''
+    assert faults >= 0
+    authorities = committee_json['authorities']
+    names = list(authorities.keys())
+    assert faults < len(names)
+    names = names[:len(names) - faults]
+
+    targets = []
+    for name in names:
+        authority = authorities[name]
+        primary_host = Committee.ip(authority['primary']['primary_to_primary'])
+        primary_port = authority['primary']['metrics'].split(':')[1]
+        targets.append((f'{name[:8]}-primary', f'{primary_host}:{primary_port}'))
+        for wid, worker in authority['workers'].items():
+            worker_host = Committee.ip(worker['primary_to_worker'])
+            worker_port = worker['metrics'].split(':')[1]
+            targets.append((f'{name[:8]}-worker-{wid}', f'{worker_host}:{worker_port}'))
+
+    lines = [
+        'global:',
+        f'  scrape_interval: {scrape_interval}',
+        'scrape_configs:',
+        f"  - job_name: '{job_name}'",
+        '    static_configs:',
+    ]
+    for label, addr in targets:
+        lines.append(f"      - targets: ['{addr}']")
+        lines.append('        labels:')
+        lines.append(f"          node: '{label}'")
+    return '\n'.join(lines) + '\n'
+
+
 class NodeParameters:
     def __init__(self, json):
         inputs = []
