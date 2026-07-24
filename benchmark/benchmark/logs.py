@@ -15,13 +15,21 @@ class ParseError(Exception):
 
 
 class LogParser:
-    def __init__(self, clients, primaries, workers, metrics=None, faults=0):
+    def __init__(self, clients, primaries, workers, metrics=None, faults=0, duration=None):
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
         assert all(x for x in inputs)
         metrics = metrics if metrics is not None else []
         assert isinstance(metrics, list) and all(isinstance(x, str) for x in metrics)
+        assert duration is None or (isinstance(duration, (int, float)) and duration > 0)
+
+        # PREP FIX 3: the run's configured duration (bench_parameters.duration,
+        # e.g. 180 s for the campaign), used as the denominator for the
+        # prometheus-derived committed TPS below. `None` when unknown (e.g. the
+        # standalone `fab logs` re-parse), in which case that TPS falls back to
+        # the log-observed end-to-end window.
+        self.configured_duration = duration
 
         self.faults = faults
         if isinstance(faults, int):
@@ -243,6 +251,31 @@ class LogParser:
             'nodes_expected': self.expected_metrics_nodes,
         }
 
+    def _prometheus_committed_tps(self):
+        ''' PREP FIX 3: prometheus-derived committed TPS. Vantage doesn't emit the
+        Autobahn-format log lines `_consensus_throughput`/`_end_to_end_throughput`
+        parse (`Created`/`Committed B\\d+(...) -> ...=`), so those read 0 for a
+        Vantage run even though real work committed -- the scraped
+        `transaction_committed_latency` counter (already surfaced as `count` by
+        `_real_transaction_latency`) is the protocol-agnostic, VALID signal. TPS is
+        that committed-tx count divided by the run's actual duration: the
+        configured `duration` bench parameter (e.g. 180 s for the campaign) when
+        known, else the log-observed end-to-end window as a fallback (e.g. for a
+        standalone `fab logs` re-parse with no bench-parameters context). Returns
+        `None` if nothing was committed/scraped, or no duration is available
+        either way. '''
+        real_latency = self._real_transaction_latency()
+        if real_latency is None:
+            return None
+
+        duration = self.configured_duration
+        if duration is None:
+            _, _, duration = self._end_to_end_throughput()
+        if not duration or duration <= 0:
+            return None
+
+        return real_latency['count'] / duration
+
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
         return datetime.timestamp(x)
@@ -333,6 +366,22 @@ class LogParser:
                 f"misses){scrape_note}\n"
             )
 
+        prometheus_tps = self._prometheus_committed_tps()
+        if prometheus_tps is None:
+            prometheus_tps_line = (
+                ' Real TPS (prometheus): n/a (no committed-tx count scraped, '
+                'or no run duration available)\n'
+            )
+        else:
+            duration_note = (
+                'configured' if self.configured_duration is not None
+                else 'log-observed'
+            )
+            prometheus_tps_line = (
+                f' Real TPS (prometheus): {round(prometheus_tps):,} tx/s '
+                f'({duration_note} duration)\n'
+            )
+
         return (
             '\n'
             '-----------------------------------------\n'
@@ -367,6 +416,7 @@ class LogParser:
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
             '\n'
             f'{real_latency_line}'
+            f'{prometheus_tps_line}'
             '-----------------------------------------\n'
         )
 
@@ -376,7 +426,7 @@ class LogParser:
             f.write(self.result())
 
     @classmethod
-    def process(cls, directory, faults=0):
+    def process(cls, directory, faults=0, duration=None):
         assert isinstance(directory, str)
 
         clients = []
@@ -396,4 +446,7 @@ class LogParser:
             with open(filename, 'r') as f:
                 metrics += [f.read()]
 
-        return cls(clients, primaries, workers, metrics=metrics, faults=faults)
+        return cls(
+            clients, primaries, workers,
+            metrics=metrics, faults=faults, duration=duration
+        )

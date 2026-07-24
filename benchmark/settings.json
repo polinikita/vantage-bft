@@ -1,7 +1,7 @@
 {
     "key": {
-        "name": "vantage-smoke-20260723170010",
-        "path": "/private/tmp/claude-501/-Users-nikitapolianskii-code-tex-projects-signature-free/e3d22549-28b8-43f2-b3e6-5dbd87e1cdde/scratchpad/vantage-smoke.pem"
+        "name": "vantage-eval20",
+        "path": "/private/tmp/claude-501/-Users-nikitapolianskii-code-tex-projects-signature-free/e3d22549-28b8-43f2-b3e6-5dbd87e1cdde/scratchpad/vantage-eval20.pem"
     },
     "port": 6000,
     "repo": {
@@ -12,6 +12,7 @@
     "username": "ubuntu",
     "instances": {
         "type": "c5.xlarge",
-        "regions": ["eu-west-1"]
+        "regions": ["eu-west-1"],
+        "spot": true
     }
 }

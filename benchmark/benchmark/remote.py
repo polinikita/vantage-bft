@@ -287,7 +287,14 @@ class Bench:
         g = Group(*ips, user=self.settings.username, connect_kwargs=self.connect)
         g.run(' && '.join(cmd), hide=True)
 
-    def _config(self, hosts, node_parameters, bench_parameters):
+    def _config(self, hosts, hosts_private, node_parameters, bench_parameters):
+        ''' `hosts`: PUBLIC IPs -- used only to reach each instance over SSH
+        (config upload below). `hosts_private`: PRIVATE (VPC-internal) IPs,
+        index-aligned with `hosts` (same `_select_hosts`/`_select_hosts_config`
+        selection, same order) -- these become the Committee's addresses,
+        i.e. what nodes and collocated clients actually dial each other on.
+        Same-region node<->node/client<->node traffic over public IPs is
+        billed cross-instance data transfer and collapses throughput. '''
         Print.info('Generating configuration files...')
 
         # Cleanup all local configuration files.
@@ -315,22 +322,33 @@ class Bench:
         if bench_parameters.collocate:
             workers = bench_parameters.workers
             addresses = OrderedDict(
+                (x, [y] * (workers + 1)) for x, y in zip(names, hosts_private)
+            )
+            public_hosts = OrderedDict(
                 (x, [y] * (workers + 1)) for x, y in zip(names, hosts)
             )
         else:
             addresses = OrderedDict(
+                (x, y) for x, y in zip(names, hosts_private)
+            )
+            public_hosts = OrderedDict(
                 (x, y) for x, y in zip(names, hosts)
             )
-        committee = Committee(addresses, self.settings.base_port)
+        committee = Committee(
+            addresses, self.settings.base_port, public_hosts=public_hosts
+        )
         committee.print(PathMaker.committee_file())
 
         node_parameters.print(PathMaker.parameters_file())
 
-        # Cleanup all nodes and upload configuration files.
+        # Cleanup all nodes and upload configuration files. Connections MUST
+        # go over the PUBLIC ip (committee.public_ips) -- committee.ips()
+        # would now return the (private, VPC-only) wire addresses, which the
+        # coordinator laptop cannot reach.
         names = names[:len(names)-bench_parameters.faults]
         progress = progress_bar(names, prefix='Uploading config files:')
         for i, name in enumerate(progress):
-            for ip in committee.ips(name):
+            for ip in committee.public_ips(name):
                 c = Connection(ip, user=self.settings.username, connect_kwargs=self.connect)
                 c.run(f'{CommandMaker.cleanup()} || true', hide=True)
                 c.put(PathMaker.committee_file(), '.')
@@ -342,8 +360,10 @@ class Bench:
     def _run_single(self, rate, committee, bench_parameters, debug=False):
         faults = bench_parameters.faults
 
-        # Kill any potentially unfinished run and delete logs.
-        hosts = committee.ips()
+        # Kill any potentially unfinished run and delete logs. SSH targets
+        # are the PUBLIC (physical-host) ips -- committee.ips() now returns
+        # the PRIVATE wire addresses, unreachable from the coordinator.
+        hosts = committee.public_ips()
         self.kill(hosts=hosts, delete_logs=True)
 
         # Clear stale LOCAL logs/metrics from a previous run now, not in
@@ -360,10 +380,15 @@ class Bench:
         # for the faulty nodes to be online).
         Print.info('Booting clients...')
         workers_addresses = committee.workers_addresses(faults)
+        workers_public_ips = committee.workers_public_ips(faults)
         rate_share = ceil(rate / committee.workers())
         for i, addresses in enumerate(workers_addresses):
-            for (id, address) in addresses:
-                host = Committee.ip(address)
+            for (id, address), (_, host) in zip(addresses, workers_public_ips[i]):
+                # `address` (the client's own submit target, and the peer
+                # addresses below) is the PRIVATE committee address -- the
+                # client runs ON the instance and talks to its co-located
+                # worker/peers over the VPC. `host` (the fabric SSH target
+                # to spawn it) is the instance's PUBLIC ip.
                 cmd = CommandMaker.run_client(
                     address,
                     bench_parameters.tx_size,
@@ -377,8 +402,7 @@ class Bench:
 
         # Run the primaries (except the faulty ones).
         Print.info('Booting primaries...')
-        for i, address in enumerate(committee.primary_addresses(faults)):
-            host = Committee.ip(address)
+        for i, host in enumerate(committee.primary_public_ips(faults)):
             cmd = CommandMaker.run_primary(
                 PathMaker.key_file(i),
                 PathMaker.committee_file(),
@@ -392,8 +416,7 @@ class Bench:
         # Run the workers (except the faulty ones).
         Print.info('Booting workers...')
         for i, addresses in enumerate(workers_addresses):
-            for (id, address) in addresses:
-                host = Committee.ip(address)
+            for (id, address), (_, host) in zip(addresses, workers_public_ips[i]):
                 cmd = CommandMaker.run_worker(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
@@ -432,7 +455,12 @@ class Bench:
         self.kill(hosts=hosts, delete_logs=False)
 
     def _simulate_partition(self, bench_parameters, committee, faults):
-        partition_ips = []
+        # `tc ... match ip dst` must target the PRIVATE (wire) address peers
+        # actually dial (unchanged); the SSH connection to install that rule
+        # must go to the PUBLIC ip of the physical host running primary `i`
+        # -- Committee.ip(address) on a (now private) committee address is
+        # not reachable from the coordinator laptop.
+        primary_public_ips = committee.primary_public_ips(faults)
         for i, address in enumerate(committee.primary_addresses(faults)):
             if i < bench_parameters.partition_nodes:
                 print(i, address)
@@ -445,14 +473,14 @@ class Bench:
                     if i == j:
                         continue
                     cmd.append('sudo tc class add dev ens4 parent 1:1 classid 1:' + str(idx) + ' htb rate 10gibps')
-                    cmd.append('sudo tc qdisc add dev ens4 handle ' + str(idx) + ': parent 1:' 
+                    cmd.append('sudo tc qdisc add dev ens4 handle ' + str(idx) + ': parent 1:'
                             + str(idx) + ' netem delay 5000ms')
-                    cmd.append('sudo tc filter add dev ens4 pref ' + str(idx) + ' protocol ip u32 match ip dst ' + 
+                    cmd.append('sudo tc filter add dev ens4 pref ' + str(idx) + ' protocol ip u32 match ip dst ' +
                             Committee.ip(addr) + ' flowid 1:' + str(idx))
                     idx = idx + 1
-                ip = [Committee.ip(address)]
+                ip = [primary_public_ips[i]]
                 g = Group(*ip, user=self.settings.username, connect_kwargs=self.connect)
-                g.run(' && '.join(cmd), hide=True) 
+                g.run(' && '.join(cmd), hide=True)
         
 
          
@@ -473,13 +501,14 @@ class Bench:
         #self._background_run(host, cmd, log_file)
     
     def _delete_partition(self, bench_parameters, committee, faults):
-        partition_ips = []
+        # Same PUBLIC-for-SSH note as `_simulate_partition` above.
+        primary_public_ips = committee.primary_public_ips(faults)
         for i, address in enumerate(committee.primary_addresses(faults)):
             if i < bench_parameters.partition_nodes:
-                partition_ips = [Committee.ip(address)]
+                partition_ips = [primary_public_ips[i]]
                 cmd = ['sudo tc qdisc del dev ens4 root']
                 g = Group(*partition_ips, user=self.settings.username, connect_kwargs=self.connect)
-                g.run(' && '.join(cmd), hide=True) 
+                g.run(' && '.join(cmd), hide=True)
 
        
         #hosts = committee.ips()
@@ -494,7 +523,7 @@ class Bench:
         #    log_file = PathMaker.primary_log_file(i)
         #    self._background_run(host, cmd, log_file)
 
-    def _logs(self, committee, faults):
+    def _logs(self, committee, faults, duration=None):
         # NOTE: local logs/metrics are cleared in `_run_single` now (before
         # this run's `scrape_metrics()` writes its metrics-*.txt), not here
         # -- doing it here would delete this run's own metrics files, which
@@ -502,35 +531,40 @@ class Bench:
         # `LogParser.process()` below ever gets to read them. See the note
         # in `_run_single`.
 
-        # Download log files.
+        # Download log files. SSH targets are the PUBLIC (physical-host)
+        # ips -- Committee.ip(address) on a committee address would now
+        # extract a PRIVATE ip, unreachable from the coordinator.
         workers_addresses = committee.workers_addresses(faults)
+        workers_public_ips = committee.workers_public_ips(faults)
         progress = progress_bar(workers_addresses, prefix='Downloading workers logs:')
         for i, addresses in enumerate(progress):
-            for id, address in addresses:
-                host = Committee.ip(address)
+            for (id, address), (_, host) in zip(addresses, workers_public_ips[i]):
                 c = Connection(host, user=self.settings.username, connect_kwargs=self.connect)
                 c.get(
-                    PathMaker.client_log_file(i, id), 
+                    PathMaker.client_log_file(i, id),
                     local=PathMaker.client_log_file(i, id)
                 )
                 c.get(
-                    PathMaker.worker_log_file(i, id), 
+                    PathMaker.worker_log_file(i, id),
                     local=PathMaker.worker_log_file(i, id)
                 )
 
-        primary_addresses = committee.primary_addresses(faults)
-        progress = progress_bar(primary_addresses, prefix='Downloading primaries logs:')
-        for i, address in enumerate(progress):
-            host = Committee.ip(address)
+        primary_public_ips = committee.primary_public_ips(faults)
+        progress = progress_bar(primary_public_ips, prefix='Downloading primaries logs:')
+        for i, host in enumerate(progress):
             c = Connection(host, user=self.settings.username, connect_kwargs=self.connect)
             c.get(
-                PathMaker.primary_log_file(i), 
+                PathMaker.primary_log_file(i),
                 local=PathMaker.primary_log_file(i)
             )
 
-        # Parse logs and return the parser.
+        # Parse logs and return the parser. `duration` (the campaign's
+        # configured run length) is the denominator for the prometheus-based
+        # committed TPS (PREP FIX 3) when given.
         Print.info('Parsing logs and computing performance...')
-        return LogParser.process(PathMaker.logs_path(), faults=faults)
+        return LogParser.process(
+            PathMaker.logs_path(), faults=faults, duration=duration
+        )
 
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
@@ -541,10 +575,22 @@ class Bench:
         except ConfigError as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
-        # Select which hosts to use.
+        # Select which hosts to use -- PUBLIC ips (SSH/rsync/tmux: install,
+        # deploy, background-run, kill, log download all connect through
+        # these, from the coordinator laptop).
         selected_hosts = self._select_hosts(bench_parameters)
         if not selected_hosts:
             Print.warn('There are not enough instances available')
+            return
+
+        # Same selection, but PRIVATE (VPC-internal) ips -- index-aligned
+        # with `selected_hosts` above (same region ordering, same slicing).
+        # This is what the Committee (node<->node, client<->node) gets built
+        # from, so same-region traffic never crosses the public internet
+        # edge. See instance.py's `internal_hosts()` for the pairing caveat.
+        selected_hosts_private = self._select_hosts_config(bench_parameters)
+        if not selected_hosts_private:
+            Print.warn('There are not enough instances available (private IPs)')
             return
 
         # Update nodes.
@@ -558,7 +604,8 @@ class Bench:
         # Upload all configuration files.
         try:
             committee = self._config(
-                selected_hosts, node_parameters, bench_parameters
+                selected_hosts, selected_hosts_private,
+                node_parameters, bench_parameters
             )
         except (subprocess.SubprocessError, GroupException) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
@@ -581,7 +628,9 @@ class Bench:
                         )
 
                         faults = bench_parameters.faults
-                        logger = self._logs(committee_copy, faults)
+                        logger = self._logs(
+                            committee_copy, faults, bench_parameters.duration
+                        )
                         logger.print(PathMaker.result_file(
                             faults,
                             n, 

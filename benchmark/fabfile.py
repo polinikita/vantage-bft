@@ -186,14 +186,29 @@ def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100):
         'partition_nodes': 0,
     }
     node_params = {
-        'timeout_delay': 5_000,  # ms
-        'header_size': 32,  # bytes
-        'max_header_delay': 5_000,  # ms
-        'gc_depth': 50,  # rounds
-        'sync_retry_delay': 5_000,  # ms
-        'sync_retry_nodes': 3,  # number of nodes
-        'batch_size': 500_000,  # bytes
-        'max_batch_delay': 20,  # ms
+        'timeout_delay': 5_000,  # ms -- Autobahn's Core only (VantageCore doesn't
+                                  # read it, see primary/src/vantage/); left alone.
+        'header_size': 32,  # bytes -- ~1 digest (32 B): a header/car fires as
+                             # soon as ANY digest is ready, gated only by
+                             # max_header_delay below. Already Vantage-appropriate
+                             # (fast/frequent cars), unlike max_header_delay was.
+        'max_header_delay': 50,  # ms -- was 5_000 (Autobahn's own default; PREP
+                                  # FIX 2). `node local-benchmark`'s Vantage runs
+                                  # use 50 ms (its --max-header-delay-ms CLI
+                                  # default): at 5_000 ms almost every header
+                                  # waited out the full 5 s timer instead of firing
+                                  # on the ~50 ms cadence Vantage's AGB/car
+                                  # mechanism expects, throttling committed
+                                  # throughput independent of the public/private
+                                  # IP fix (PREP FIX 1).
+        'gc_depth': 50,  # rounds -- Autobahn's Core/garbage_collector only.
+        'sync_retry_delay': 5_000,  # ms -- Autobahn's Core only.
+        'sync_retry_nodes': 3,  # number of nodes -- Autobahn's Core only.
+        'batch_size': 500_000,  # bytes -- matches Parameters::default() /
+                                 # local-benchmark's (unexposed) worker batch
+                                 # size; not a Vantage throttle.
+        'max_batch_delay': 20,  # ms -- matches local-benchmark's own
+                                 # --max-batch-delay-ms CLI default; unchanged.
         'protocol': protocol,
         'use_parallel_proposals': True,
         'k': 4,

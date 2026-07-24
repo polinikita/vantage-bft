@@ -52,12 +52,30 @@ class Committee:
         is no back-compat concern with older committee files.
     '''
 
-    def __init__(self, addresses, base_port):
+    def __init__(self, addresses, base_port, public_hosts=None):
         ''' The `addresses` field looks as follows:
-            { 
+            {
                 "name": ["host", "host", ...],
                 ...
             }
+            These MUST be the PRIVATE (VPC-internal) IPs when this committee
+            is for a real (multi-instance) deployment: they become the
+            node<->node and client<->node wire addresses every authority
+            reads out of committee.json, and same-region traffic over public
+            IPs is billed cross-instance data transfer and collapses
+            throughput (routes through the internet edge instead of the
+            VPC).
+
+            `public_hosts` (optional): same shape/order as `addresses` was
+            *before* this constructor consumes it (index 0 = the primary's
+            physical host, 1.. = each worker's, one entry per authority) --
+            the PUBLIC (internet-routable) IP of the instance that authority
+            actually runs on. This is the orchestrator's own SSH/rsync/tmux
+            connection-target bookkeeping (`public_ips()` and friends below);
+            it is never written to committee.json and never read by a node
+            binary. Omit it when `addresses` already IS the connection
+            target (e.g. a purely local run with no public/private
+            distinction) -- `public_ips()` then falls back to `ips()`.
         '''
         assert isinstance(addresses, OrderedDict)
         assert all(isinstance(x, str) for x in addresses.keys())
@@ -69,12 +87,34 @@ class Committee:
         )
         assert len({len(x) for x in addresses.values()}) == 1
         assert isinstance(base_port, int) and base_port > 1024
+        if public_hosts is not None:
+            assert isinstance(public_hosts, OrderedDict)
+            assert list(public_hosts.keys()) == list(addresses.keys())
+            assert all(
+                len(public_hosts[name]) == len(addresses[name])
+                for name in addresses
+            )
 
         port = base_port
         self.json = {'authorities': OrderedDict()}
+        self.public_hosts = public_hosts
 
         for name, hosts in addresses.items():
+            # `metrics` is never dialed by a peer node -- only scraped by an
+            # external observer (this orchestrator's own `scrape_metrics()`,
+            # or a real Prometheus pointed at `fab monitor`'s generated
+            # prometheus-remote.yaml, which is explicitly built from public
+            # IPs -- see fabfile.py's `monitor` task). The node itself always
+            # binds its metrics server on 0.0.0.0 regardless of the address
+            # text here (see primary::Primary::spawn), so this field is free
+            # to be the PUBLIC ip while every peer-dialed field below (
+            # consensus/primary/worker addresses) is the PRIVATE one. Use a
+            # local, poppable copy so `self.public_hosts` (consumed by the
+            # public_ip accessors below) is left intact.
+            pub_hosts = list(public_hosts[name]) if public_hosts is not None else None
+
             host = hosts.pop(0)
+            pub_host = pub_hosts.pop(0) if pub_hosts is not None else host
             consensus_addr = {
                 'consensus_to_consensus': f'{host}:{port}',
             }
@@ -83,17 +123,18 @@ class Committee:
             primary_addr = {
                 'primary_to_primary': f'{host}:{port}',
                 'worker_to_primary': f'{host}:{port + 1}',
-                'metrics': f'{host}:{port + 2}',
+                'metrics': f'{pub_host}:{port + 2}',
             }
             port += 3
 
             workers_addr = OrderedDict()
             for j, host in enumerate(hosts):
+                pub_worker_host = pub_hosts[j] if pub_hosts is not None else host
                 workers_addr[j] = {
                     'primary_to_worker': f'{host}:{port}',
                     'transactions': f'{host}:{port + 1}',
                     'worker_to_worker': f'{host}:{port + 2}',
-                    'metrics': f'{host}:{port + 3}',
+                    'metrics': f'{pub_worker_host}:{port + 3}',
                 }
                 port += 4
 
@@ -146,6 +187,69 @@ class Committee:
                 authority_addresses += [(id, worker['metrics'])]
             addresses.append(authority_addresses)
         return addresses
+
+    def primary_public_ip(self, name):
+        ''' The physical (public) host running authority `name`'s primary --
+        the SSH/rsync/tmux connection target, as opposed to the (private)
+        wire address `primary_addresses()` returns. Falls back to the
+        private address when this committee has no public/private
+        distinction (`public_hosts` unset at construction). '''
+        if self.public_hosts is None:
+            return self.ip(
+                self.json['authorities'][name]['primary']['primary_to_primary']
+            )
+        return self.public_hosts[name][0]
+
+    def worker_public_ip(self, name, worker_id):
+        ''' The physical (public) host running authority `name`'s worker
+        `worker_id`. See `primary_public_ip`. '''
+        if self.public_hosts is None:
+            return self.ip(
+                self.json['authorities'][name]['workers'][worker_id]['transactions']
+            )
+        return self.public_hosts[name][worker_id + 1]
+
+    def primary_public_ips(self, faults=0):
+        ''' Public-host mirror of `primary_addresses()`: same order/slicing,
+        one entry per (non-faulty) authority. '''
+        assert faults < self.size()
+        good_nodes = self.size() - faults
+        names = list(self.json['authorities'].keys())[:good_nodes]
+        return [self.primary_public_ip(name) for name in names]
+
+    def workers_public_ips(self, faults=0):
+        ''' Public-host mirror of `workers_addresses()`: same order/shape,
+        i.e. a list (per non-faulty authority) of list of
+        (worker_id, public_ip). '''
+        assert faults < self.size()
+        good_nodes = self.size() - faults
+        result = []
+        for name, authority in list(self.json['authorities'].items())[:good_nodes]:
+            result.append([
+                (wid, self.worker_public_ip(name, wid))
+                for wid in authority['workers']
+            ])
+        return result
+
+    def public_ips(self, name=None):
+        ''' Returns all the physical (public) host ip(s) associated with an
+        authority (in any order) -- the SSH/rsync/tmux connection targets,
+        as opposed to `ips()` which returns the (private) committee/wire
+        addresses. Falls back to `ips()` when this committee has no
+        public/private distinction (`public_hosts` unset at construction). '''
+        if self.public_hosts is None:
+            return self.ips(name)
+
+        # Scope to the LIVE authorities (self.json), not all of
+        # self.public_hosts -- remove_nodes() trims the former (e.g. per
+        # `committee_copy` in remote.py's `run()`, one per swept node count)
+        # but leaves the latter untouched, so using public_hosts' own keys
+        # here would resurrect already-removed authorities' hosts.
+        names = [name] if name is not None else list(self.json['authorities'].keys())
+        ips = set()
+        for n in names:
+            ips.update(self.public_hosts[n])
+        return list(ips)
 
     def ips(self, name=None):
         ''' Returns all the ips associated with an authority (in any order). '''

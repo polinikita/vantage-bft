@@ -37,7 +37,17 @@ class InstanceManager:
     def _get(self, state):
         # Possible states are: 'pending', 'running', 'shutting-down',
         # 'terminated', 'stopping', and 'stopped'.
-        ids, ips = defaultdict(list), defaultdict(list)
+        #
+        # Collects PUBLIC and PRIVATE IPs side by side (single
+        # describe_instances call per region) so the two stay index-aligned
+        # per instance. `None` is recorded (not dropped) when an instance
+        # transiently lacks one of the two (e.g. still 'pending' and not yet
+        # assigned an address) -- dropping it here would desync `ids`/
+        # `public_ips`/`private_ips` against each other; callers that need a
+        # complete pair (the committee vs. SSH-connection host lists) filter
+        # `None`s out themselves, see `_paired_hosts`.
+        ids = defaultdict(list)
+        public_ips, private_ips = defaultdict(list), defaultdict(list)
         for region, client in self.clients.items():
             r = client.describe_instances(
                 Filters=[
@@ -54,16 +64,35 @@ class InstanceManager:
             instances = [y for x in r['Reservations'] for y in x['Instances']]
             for x in instances:
                 ids[region] += [x['InstanceId']]
-                if 'PublicIpAddress' in x:
-                    ips[region] += [x['PublicIpAddress']]
-        return ids, ips
+                public_ips[region] += [x.get('PublicIpAddress')]
+                private_ips[region] += [x.get('PrivateIpAddress')]
+        return ids, public_ips, private_ips
+
+    def _paired_hosts(self, state):
+        ''' Per-region list of (public_ip, private_ip) pairs for instances in
+        `state`, built from a single `_get()` snapshot so the two addresses
+        stay tied to the same physical instance. Any instance missing either
+        address is dropped (with a warning) rather than left to silently
+        shift the pairing of every instance after it -- see `_get`. '''
+        _, public_ips, private_ips = self._get(state)
+        pairs = defaultdict(list)
+        for region in public_ips:
+            for pub, priv in zip(public_ips[region], private_ips[region]):
+                if pub is None or priv is None:
+                    Print.warn(
+                        f'Instance in {region} is missing its public or '
+                        f'private IP (skipped; likely still booting)'
+                    )
+                    continue
+                pairs[region].append((pub, priv))
+        return pairs
 
     def _wait(self, state):
         # Possible states are: 'pending', 'running', 'shutting-down',
         # 'terminated', 'stopping', and 'stopped'.
         while True:
             sleep(1)
-            ids, _ = self._get(state)
+            ids, _, _ = self._get(state)
             if sum(len(x) for x in ids.values()) == 0:
                 break
 
@@ -208,7 +237,7 @@ class InstanceManager:
 
     def terminate_instances(self):
         try:
-            ids, _ = self._get(['pending', 'running', 'stopping', 'stopped'])
+            ids, _, _ = self._get(['pending', 'running', 'stopping', 'stopped'])
             size = sum(len(x) for x in ids.values())
             if size == 0:
                 Print.heading(f'All instances are shut down')
@@ -234,7 +263,7 @@ class InstanceManager:
     def start_instances(self, max):
         size = 0
         try:
-            ids, _ = self._get(['stopping', 'stopped'])
+            ids, _, _ = self._get(['stopping', 'stopped'])
             for region, client in self.clients.items():
                 if ids[region]:
                     target = ids[region]
@@ -247,7 +276,7 @@ class InstanceManager:
 
     def stop_instances(self):
         try:
-            ids, _ = self._get(['pending', 'running'])
+            ids, _, _ = self._get(['pending', 'running'])
             for region, client in self.clients.items():
                 if ids[region]:
                     client.stop_instances(InstanceIds=ids[region])
@@ -257,11 +286,39 @@ class InstanceManager:
             raise BenchError(AWSError(e))
 
     def hosts(self, flat=False):
+        ''' PUBLIC (internet-routable) IPs -- the SSH/rsync/tmux connection
+        targets used from the coordinator laptop. NOT for the Committee
+        (node<->node/client<->node): see `internal_hosts()`. '''
         try:
-            _, ips = self._get(['pending', 'running'])
+            pairs = self._paired_hosts(['pending', 'running'])
+            ips = {region: [pub for pub, _ in v] for region, v in pairs.items()}
             return [x for y in ips.values() for x in y] if flat else ips
         except ClientError as e:
             raise BenchError('Failed to gather instances IPs', AWSError(e))
+
+    def internal_hosts(self, flat=False):
+        ''' PRIVATE (VPC-internal) IPs, index-aligned per region with
+        `hosts()` (both are read from a single `_paired_hosts()` snapshot per
+        call). The Committee (primary/worker/consensus/transactions/metrics
+        addresses -- everything nodes and collocated clients talk to each
+        other over) must be built from these, never from `hosts()`'s public
+        IPs: same-region node<->node traffic over public IPs is billed
+        cross-instance data transfer and routes through the internet edge
+        instead of the VPC, which is what collapsed a live 20-node run to
+        ~1.6k tx/s at 50k offered.
+
+        Residual risk: `hosts()` and `internal_hosts()` are two independent
+        `describe_instances` calls, so pairing across the two calls relies on
+        AWS returning the same per-region instance order both times (true in
+        practice for an unchanged, non-transitioning fleet queried
+        back-to-back, which is how `_select_hosts`/`_select_hosts_config`
+        call them in `run()`) rather than on a shared API response. '''
+        try:
+            pairs = self._paired_hosts(['pending', 'running'])
+            ips = {region: [priv for _, priv in v] for region, v in pairs.items()}
+            return [x for y in ips.values() for x in y] if flat else ips
+        except ClientError as e:
+            raise BenchError('Failed to gather instances private IPs', AWSError(e))
 
     def print_info(self):
         hosts = self.hosts()
