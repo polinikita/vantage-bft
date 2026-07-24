@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::processor::SerializedBatchMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
@@ -20,9 +21,12 @@ use tokio::time::{sleep, Duration, Instant};
 #[path = "tests/batch_maker_tests.rs"]
 pub mod batch_maker_tests;
 
-//The message type received by clients
-pub type Transaction = Vec<u8>;
-//The message type forwarded to quorum waiters
+// The message type received by clients. Fable perf audit item 1: `Bytes` (refcounted),
+// not `Vec<u8>` -- the network receiver already hands `TxReceiverHandler::dispatch` an
+// owned `Bytes` per transaction; keeping it as `Bytes` end-to-end through the batch
+// avoids one full memcpy per transaction that `message.to_vec()` used to perform.
+pub type Transaction = Bytes;
+// The message type forwarded to quorum waiters.
 pub type Batch = Vec<Transaction>;
 
 /// Assemble clients transactions into batches.
@@ -35,7 +39,7 @@ pub struct BatchMaker {
     rx_transaction: Receiver<Transaction>,
    
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
-    tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
+    tx_batch: Sender<SerializedBatchMessage>,   // channel to forward batch digest to processor in order for primary to propose.
 
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -49,7 +53,16 @@ pub struct BatchMaker {
     /// transactions`/`submitted_transactions_bytes`), observed as each client
     /// transaction arrives, before batching.
     metrics: Arc<Metrics>,
+    /// Fable perf audit item 1: counts `run`'s own loop iterations so the trailing
+    /// `yield_now` only actually yields every `YIELD_EVERY`-th iteration instead of
+    /// literally every one (every single received transaction/timer tick previously
+    /// yielded unconditionally) -- purely a scheduling-fairness knob, no protocol
+    /// effect either way.
+    loop_ticks: u64,
 }
+
+/// See `BatchMaker::loop_ticks`'s doc comment.
+const YIELD_EVERY: u64 = 32;
 
 impl BatchMaker {
     pub fn spawn(
@@ -57,7 +70,7 @@ impl BatchMaker {
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
-        tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
+        tx_batch: Sender<SerializedBatchMessage>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         // METRICS-DASHBOARD-SPEC.md §1/§2: appended last, same convention as
         // primary-side `::spawn` functions.
@@ -77,6 +90,7 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: SimpleSender::new().with_metrics(metrics.clone()).with_compression(compress_network),
                 metrics,
+                loop_ticks: 0,
             }
             .run()
             .await;
@@ -119,8 +133,13 @@ impl BatchMaker {
                 }
             }
 
-            // Give the change to schedule other tasks.
-            tokio::task::yield_now().await;
+            // Give the chance to schedule other tasks, but not on literally every
+            // single loop iteration (Fable perf audit item 1) -- see
+            // `BatchMaker::loop_ticks`'s doc comment.
+            self.loop_ticks = self.loop_ticks.wrapping_add(1);
+            if self.loop_ticks.is_multiple_of(YIELD_EVERY) {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -143,12 +162,19 @@ impl BatchMaker {
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
+        // Fable perf audit item 2: wrap the freshly-serialized `Vec<u8>` into `Bytes`
+        // once (a cheap pointer/len/cap move, not a copy -- `Bytes::from(Vec<u8>)`
+        // takes ownership of the existing allocation). Both consumers below then just
+        // clone this `Bytes` handle (a refcount bump, not a memcpy) instead of the
+        // previous `Bytes::from(serialized.clone())`, which memcpy'd the whole batch
+        // a second time on every single seal.
+        let bytes = Bytes::from(serialized);
 
         #[cfg(feature = "benchmark")]
         {
             // NOTE: This is one extra hash that is only needed to print the following log entries.
             let mut hasher = Blake3Hasher::new();
-            hasher.update(&serialized);
+            hasher.update(&bytes);
             let digest = Digest(hasher.finalize().into());
 
             for id in tx_ids {
@@ -169,10 +195,9 @@ impl BatchMaker {
         //NEW:
         //Best-effort broadcast only. Any failure is correlated with the primary operating this node (running on same machine)
         let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
-        let bytes = Bytes::from(serialized.clone());
-        self.network.broadcast_typed(addresses, bytes, "Batch").await;
+        self.network.broadcast_typed(addresses, bytes.clone(), "Batch").await;
 
-        self.tx_batch.send(serialized).await.expect("Failed to deliver batch");
+        self.tx_batch.send(bytes).await.expect("Failed to deliver batch");
 
         //OLD:
         //This uses reliable sender. The receiver worker will reply with an ack. The Reply Handler is passed to Quorum Waiter.

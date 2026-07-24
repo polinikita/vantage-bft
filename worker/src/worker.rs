@@ -16,6 +16,7 @@ use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
@@ -182,7 +183,7 @@ impl Worker {
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn_full(
             address,                                            //socket to receive Client messages from
-            /* handler */ TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
+            /* handler */ TxReceiverHandler { tx_batch_maker, yield_counter: Arc::new(AtomicU64::new(0)) }, //handler for received Client messages, forwards them to batch maker
             Some(self.metrics.clone()),
             // METRICS-DASHBOARD-SPEC.md §8: client traffic is NEVER compressed --
             // `node::client::Client` builds its own raw `Framed`/`TcpStream` directly
@@ -298,19 +299,36 @@ impl Worker {
 #[derive(Clone)]
 struct TxReceiverHandler {
     tx_batch_maker: Sender<Transaction>,  //sender channel to connect to batch maker
+    /// Fable perf audit item 1: shared (across every connection this handler's
+    /// `Receiver` accepts -- `handler.clone()` per accepted connection, see
+    /// `network::Receiver::run`) counter gating how often `dispatch` actually yields.
+    /// Purely a scheduling-fairness knob (see `dispatch`'s doc comment); no protocol
+    /// effect either way.
+    yield_counter: Arc<AtomicU64>,
 }
+
+/// See `TxReceiverHandler::yield_counter`'s doc comment.
+const TX_YIELD_EVERY: u64 = 128;
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
-        // Send the transaction to the batch maker.
+        // Send the transaction to the batch maker. `message` is already an owned
+        // `Bytes` handed to us by `network::Receiver` -- forward it directly instead
+        // of the previous `message.to_vec()`, which copied every single transaction
+        // out of an already-owned buffer for no reason (Fable perf audit item 1).
         self.tx_batch_maker
-            .send(message.to_vec())
+            .send(message)
             .await
             .expect("Failed to send transaction");
 
-        // Give the change to schedule other tasks.
-        tokio::task::yield_now().await;
+        // Occasionally give the chance to schedule other tasks, instead of on every
+        // single transaction (Fable perf audit item 1) -- tokio's own cooperative
+        // scheduling budget already yields periodically regardless; this just adds
+        // an explicit, cheap backstop under sustained client load.
+        if self.yield_counter.fetch_add(1, Ordering::Relaxed).is_multiple_of(TX_YIELD_EVERY) {
+            tokio::task::yield_now().await;
+        }
         Ok(())
     }
 }
@@ -338,9 +356,14 @@ impl MessageHandler for WorkerReceiverHandler {
             Ok(WorkerMessage::Batch(..)) => {     //If receive batch message from another worker. Store the batch, and process.
                 self.metrics.network_messages_received_total.with_label_values(&["Batch"]).inc();
                 self.metrics.network_bytes_received_total.with_label_values(&["Batch"]).inc_by(serialized.len() as u64);
+                // `serialized` is already an owned `Bytes` -- forward it directly
+                // instead of the previous `serialized.to_vec()`, which copied every
+                // received batch a second time for no reason (Fable perf audit item
+                // 3). `Processor` now does the one unavoidable `Bytes -> Vec<u8>`
+                // copy itself, right at `Store::write`'s fixed `Vec<u8>` boundary.
                 self
                 .tx_processor
-                .send(serialized.to_vec())
+                .send(serialized)
                 .await
                 .expect("Failed to send batch")
             },

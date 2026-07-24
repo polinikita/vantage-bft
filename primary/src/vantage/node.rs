@@ -21,8 +21,9 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
-use metrics::{Metrics, UtilizationTimerVecExt};
+use metrics::{Metrics, UtilizationTimer};
 use network::{CancelHandler, MessageHandler, ReliableSender, SimpleSender, Writer};
+use prometheus::IntCounter;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -154,8 +155,18 @@ pub struct VantageCore {
     network: ReliableSender,
     worker_network: SimpleSender,
     cancel_handlers: Vec<CancelHandler>,
+    /// Fable perf audit item 4: `cancel_handlers.len()` at the last actual
+    /// `prune_cancel_handlers` scan -- `maybe_prune_cancel_handlers` only re-scans
+    /// once this has (at least) doubled, instead of every single loop iteration.
+    last_prune_len: usize,
 
     other_primaries: Vec<(PublicKey, SocketAddr)>,
+    /// Fable perf audit item 5a: `other_primaries`' addresses only, precomputed once
+    /// -- `other_primaries` itself is fixed for this node's whole lifetime (built
+    /// once here, never mutated), so `broadcast`'s previous per-call
+    /// `.iter().map(|(_, a)| *a).collect()` rebuilt an identical `Vec<SocketAddr>`
+    /// every single broadcast for no reason.
+    other_primary_addrs: Vec<SocketAddr>,
     worker_addresses: HashMap<WorkerId, SocketAddr>,
 
     header_size: usize,
@@ -193,6 +204,15 @@ pub struct VantageCore {
     /// (`Arc<Metrics>` is freely shareable; this is not new metrics plumbing, just one
     /// more clone of the same handle every node already builds).
     metrics: Option<Arc<Metrics>>,
+    /// Fable perf audit item 7 (cheap subset): `metrics.utilization_timer`'s
+    /// `"inbound_dispatch"`/`"payload_sync"`/`"timer_firing"`/`"effect_execution"`
+    /// labels, resolved once (first use) and cached -- see
+    /// `cached_utilization_timer`'s doc comment. `None` until first resolved, same as
+    /// `metrics` itself being `None` in tests that build a `VantageCore` without one.
+    ut_inbound_dispatch: Option<IntCounter>,
+    ut_payload_sync: Option<IntCounter>,
+    ut_timer_firing: Option<IntCounter>,
+    ut_effect_execution: Option<IntCounter>,
 
     /// PHASE7-PREP-NOTES.md: pays down PHASE4-NOTES.md §6's scope cut -- forwards each
     /// cursor-committed `Header` to the top-level application, the same output-channel
@@ -270,6 +290,9 @@ impl VantageCore {
             .into_iter()
             .map(|(pk, addr)| (pk, addr.primary_to_primary))
             .collect();
+        // Fable perf audit item 5a: precomputed once here, see the field's own doc
+        // comment.
+        let other_primary_addrs: Vec<SocketAddr> = other_primaries.iter().map(|(_, a)| *a).collect();
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
             .our_workers_by_id(&name)
             .expect("Our public key is not in the committee")
@@ -314,7 +337,9 @@ impl VantageCore {
                 s
             },
             cancel_handlers: Vec::new(),
+            last_prune_len: 0,
             other_primaries,
+            other_primary_addrs,
             worker_addresses,
             header_size: parameters.header_size,
             max_header_delay: parameters.max_header_delay,
@@ -326,6 +351,10 @@ impl VantageCore {
             store,
             tx_payload_ready,
             metrics: core_metrics,
+            ut_inbound_dispatch: None,
+            ut_payload_sync: None,
+            ut_timer_firing: None,
+            ut_effect_execution: None,
             tx_output,
         };
         (core, rx_vantage, rx_payload_ready, tx_vantage)
@@ -357,13 +386,13 @@ impl VantageCore {
         metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
-            // P4-3: bound `cancel_handlers`' otherwise-unbounded growth under sustained
-            // honest traffic. Retains only handlers whose oneshot hasn't resolved yet
-            // (`TryRecvError::Empty` -- genuinely still in flight, dropping it would
-            // cancel `ReliableSender`'s retransmit-until-ack retry for a message that
-            // hasn't been ack'd yet); a resolved or closed one has already done its job
-            // (or its connection died and it'll never resolve) and is dropped.
-            self.prune_cancel_handlers();
+            // P4-3, amended by Fable perf audit item 4: bound `cancel_handlers`'
+            // otherwise-unbounded growth under sustained honest traffic, but without
+            // the O(n) `retain_mut` scan on every single inbound message -- see
+            // `maybe_prune_cancel_handlers`'s doc comment. The `metrics_tick` branch
+            // below additionally forces an unconditional prune once/sec, bounding
+            // staleness even if the list never doubles.
+            self.maybe_prune_cancel_handlers();
 
             // D7-4: O(1) peek instead of the previous O(n) full-`Vec` rescan.
             let next_deadline = self.timers.peek().map(|Reverse((d, _, _))| *d);
@@ -390,14 +419,14 @@ impl VantageCore {
 
                 Some(inbound) = rx_vantage.recv() => {
                     let now = Instant::now();
-                    let dispatch_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("inbound_dispatch"));
+                    let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
                     let effects = self.dispatch_inbound(inbound, now).await;
                     drop(dispatch_timer);
                     self.execute(effects, now).await;
                 }
 
                 Some((header_digest, digest, worker_id)) = rx_payload_ready.recv() => {
-                    let payload_sync_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("payload_sync"));
+                    let payload_sync_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_payload_sync, "payload_sync");
                     self.on_payload_ready(header_digest, digest, worker_id).await;
                     drop(payload_sync_timer);
                 }
@@ -418,7 +447,7 @@ impl VantageCore {
 
                 () = &mut agb_sleep, if next_deadline.is_some() => {
                     let now = Instant::now();
-                    let timer_firing_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("timer_firing"));
+                    let timer_firing_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_timer_firing, "timer_firing");
                     let effects = self.fire_agb_timers(now);
                     drop(timer_firing_timer);
                     self.execute(effects, now).await;
@@ -426,13 +455,17 @@ impl VantageCore {
 
                 () = &mut control_sleep, if next_control_deadline.is_some() => {
                     let now = Instant::now();
-                    let timer_firing_timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("timer_firing"));
+                    let timer_firing_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_timer_firing, "timer_firing");
                     let effects = self.fire_control_timers(now);
                     drop(timer_firing_timer);
                     self.execute(effects, now).await;
                 }
 
                 _ = metrics_tick.tick() => {
+                    // Fable perf audit item 4: force an unconditional prune once/sec
+                    // regardless of `maybe_prune_cancel_handlers`'s doubling
+                    // condition, bounding worst-case staleness to ~1s.
+                    self.prune_cancel_handlers();
                     self.sample_metrics();
                     // METRICS-DASHBOARD-SPEC.md §3: `core_queue_length` -- `rx_vantage`'s
                     // current depth (cheap, `Receiver::len()` is O(1)); `0` (never set)
@@ -731,7 +764,7 @@ impl VantageCore {
         // calls `execute`, plus `on_payload_ready`/`seal_own_header` indirectly) --
         // wrapping here once, rather than at each call site, measures the whole
         // effect-draining loop under one "effect_execution" label regardless of caller.
-        let _timer = self.metrics.as_ref().map(|m| m.utilization_timer.utilization_timer("effect_execution"));
+        let _timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_effect_execution, "effect_execution");
         let mut queue: VecDeque<Effect> = initial.into();
         while let Some(effect) = queue.pop_front() {
             match effect {
@@ -862,6 +895,34 @@ impl VantageCore {
     /// drop one that's genuinely still pending).
     fn prune_cancel_handlers(&mut self) {
         self.cancel_handlers.retain_mut(|handler| matches!(handler.try_recv(), Err(TryRecvError::Empty)));
+        self.last_prune_len = self.cancel_handlers.len();
+    }
+
+    /// Fable perf audit item 4: an O(1) length check on every `run` loop iteration,
+    /// only actually invoking `prune_cancel_handlers`'s O(n) `retain_mut` scan once
+    /// `cancel_handlers` has (at least) doubled since the last prune. `run`'s
+    /// `metrics_tick` branch additionally forces an unconditional prune once/sec, so a
+    /// slow-growing tail that never doubles is still bounded to ~1s of extra
+    /// staleness -- handlers surviving marginally longer than before is harmless (see
+    /// `prune_cancel_handlers`'s own doc comment for why dropping one early would
+    /// NOT be harmless).
+    fn maybe_prune_cancel_handlers(&mut self) {
+        if self.cancel_handlers.len() >= 2 * self.last_prune_len.max(1) {
+            self.prune_cancel_handlers();
+        }
+    }
+
+    /// Fable perf audit item 7 (cheap subset): resolves `label`'s `IntCounter` from
+    /// `metrics.utilization_timer` on first use -- the identical `with_label_values`
+    /// call, at the identical first occurrence, that `IntCounterVec::
+    /// utilization_timer` would have made anyway (so this metric's first appearance
+    /// in a scrape is unchanged) -- then caches the resolved handle in `cache` so
+    /// every subsequent call constructs the timer directly from the cached counter,
+    /// with no `with_label_values` lookup at all.
+    fn cached_utilization_timer(metrics: &Option<Arc<Metrics>>, cache: &mut Option<IntCounter>, label: &str) -> Option<UtilizationTimer> {
+        let metrics = metrics.as_ref()?;
+        let counter = cache.get_or_insert_with(|| metrics.utilization_timer.with_label_values(&[label])).clone();
+        Some(UtilizationTimer::from_counter(counter))
     }
 
     /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
@@ -893,8 +954,13 @@ impl VantageCore {
     }
 
     async fn broadcast(&mut self, data: Bytes, msg_type: &'static str) {
-        let addresses: Vec<SocketAddr> = self.other_primaries.iter().map(|(_, a)| *a).collect();
-        let handlers = self.network.broadcast_typed(addresses, data, msg_type).await;
+        // Fable perf audit item 5a: `other_primary_addrs` is precomputed once (see its
+        // own doc comment) -- this `.clone()` is a straight contiguous
+        // `Vec<SocketAddr>` memcpy, versus the previous per-call
+        // `.iter().map(|(_, a)| *a).collect()` walking the larger `(PublicKey,
+        // SocketAddr)` tuples in `other_primaries` to re-extract the identical
+        // addresses every single broadcast.
+        let handlers = self.network.broadcast_typed(self.other_primary_addrs.clone(), data, msg_type).await;
         self.cancel_handlers.extend(handlers);
     }
 

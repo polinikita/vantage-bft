@@ -94,7 +94,7 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
 
 // Fixture
 pub fn transaction() -> Transaction {
-    vec![0; 100]
+    Bytes::from(vec![0; 100])
 }
 
 // Fixture

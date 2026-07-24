@@ -39,6 +39,20 @@ impl Drop for UtilizationTimer {
     }
 }
 
+impl UtilizationTimer {
+    /// Fable perf-audit item 7: construct directly from an already-resolved counter
+    /// handle. A caller that repeatedly times the SAME fixed label (e.g.
+    /// `VantageCore`'s handful of named sections) can resolve the `IntCounter` once
+    /// via `IntCounterVec::with_label_values` and reuse this constructor on every
+    /// subsequent call, skipping the vec's internal lookup entirely from then on.
+    /// Identical timing semantics to `UtilizationTimerVecExt::utilization_timer`
+    /// (same `Drop` impl, same elapsed-time accounting) -- this is purely an
+    /// alternate constructor, not a behavior change.
+    pub fn from_counter(metric: IntCounter) -> Self {
+        Self { metric, start: Instant::now() }
+    }
+}
+
 pub trait UtilizationTimerVecExt {
     /// Start a timer for `label`; the accumulated busy time is committed to the
     /// counter when the returned guard is dropped.

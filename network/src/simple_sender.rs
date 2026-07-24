@@ -188,11 +188,72 @@ impl Connection {
         Bytes::from(lz4_flex::compress_prepend_size(data))
     }
 
-    /// Main loop trying to connect to the peer and transmit messages. D7-3 (PHASE7-
-    /// PREP-NOTES.md): the default (`extra_latency.is_zero()`) path is untouched
-    /// (current behavior, byte-identical) -- delayed delivery only applies when a
-    /// per-destination latency is actually configured.
+    /// Main loop trying to connect to the peer and transmit messages. Fable perf
+    /// audit item 6: dispatches to one of two loops depending on whether a
+    /// per-destination latency is actually configured -- mirrors `ReliableSender::
+    /// keep_alive`'s existing `extra_latency.is_zero()` split (`keep_alive_immediate`
+    /// vs. `keep_alive_delayed`).
     async fn run(&mut self) {
+        if self.extra_latency.is_zero() {
+            self.run_immediate().await
+        } else {
+            self.run_delayed().await
+        }
+    }
+
+    /// Fable perf audit item 6: the zero-latency fast path -- byte-identical to the
+    /// pre-D7-3 loop (no delay queue, no `Instant::now()`/`sleep_until` bookkeeping at
+    /// all), used whenever no artificial per-destination latency is configured (the
+    /// default). Every message still goes through `wire_bytes`/metrics exactly as
+    /// `run_delayed` does, so the bytes actually written to the wire are identical
+    /// either way -- only the zero-cost scheduling differs.
+    async fn run_immediate(&mut self) {
+        // Try to connect to the peer.
+        let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
+            Ok(stream) => Framed::new(stream, LengthDelimitedCodec::new()).split(),
+            Err(e) => {
+                warn!(
+                    "{}",
+                    NetworkError::FailedToConnect(self.address, /* retry */ 0, e)
+                );
+                return;
+            }
+        };
+        info!("Outgoing connection established with {}", self.address);
+
+        // Transmit messages once we have established a connection.
+        loop {
+            tokio::select! {
+                Some(data) = self.receiver.recv() => {
+                    let wire = self.wire_bytes(&data);
+                    let len = wire.len();
+                    if let Err(e) = writer.send(wire).await {
+                        warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                        return;
+                    }
+                    if let Some(metrics) = &self.metrics {
+                        metrics.bytes_sent_total.inc_by(len as u64 + 4);
+                    }
+                },
+                response = reader.next() => {
+                    match response {
+                        Some(Ok(_)) => {
+                            // Sink the reply.
+                        },
+                        _ => {
+                            // Something has gone wrong (either the channel dropped or we failed to read from it).
+                            warn!("{}", NetworkError::FailedToReceiveAck(self.address));
+                            return;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// The pre-existing delay-queue loop, used whenever a nonzero per-destination
+    /// latency is configured. See `Connection::run`'s doc comment.
+    async fn run_delayed(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
             Ok(stream) => Framed::new(stream, LengthDelimitedCodec::new()).split(),
@@ -209,10 +270,7 @@ impl Connection {
         // D7-3: a plain FIFO delay queue, same reasoning as `ReliableSender::
         // keep_alive_delayed` (every message on this link gets the identical fixed
         // delay, so arrival order implies release-order -- no jitter, no concurrency,
-        // strict ordering preserved by construction) -- empty and inert whenever
-        // `extra_latency` is zero (the default), since nothing is ever scheduled with
-        // a nonzero wait in that case (`Instant::now() + Duration::ZERO` is due
-        // immediately on the very next poll).
+        // strict ordering preserved by construction).
         let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> = std::collections::VecDeque::new();
 
         // Transmit messages once we have established a connection.

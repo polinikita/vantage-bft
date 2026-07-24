@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::worker::SerializedBatchDigestMessage;
+use bytes::Bytes;
 use config::WorkerId;
 use crypto::{Blake3Hasher, Digest};
 use primary::WorkerPrimaryMessage;
@@ -10,8 +11,14 @@ use tokio::sync::mpsc::{Receiver, Sender};
 #[path = "tests/processor_tests.rs"]
 pub mod processor_tests;
 
-/// Indicates a serialized `WorkerMessage::Batch` message.
-pub type SerializedBatchMessage = Vec<u8>;
+/// Indicates a serialized `WorkerMessage::Batch` message. Fable perf audit item 2/3:
+/// `Bytes` (refcounted) rather than `Vec<u8>` -- both `BatchMaker::seal` (our own
+/// batches) and `WorkerReceiverHandler::dispatch` (others' batches) already hold the
+/// wire bytes as a `Bytes` and can hand it here without copying. `Store::write` still
+/// needs an owned `Vec<u8>` (its fixed `Value = Vec<u8>` API, out of this audit's
+/// scope) -- that one unavoidable copy now happens right here, at the point a write
+/// actually needs `Vec`, instead of earlier on the sender's hot broadcast path.
+pub type SerializedBatchMessage = Bytes;
 
 /// Hashes and stores batches, it then outputs the batch's digest.
 pub struct Processor;
@@ -36,8 +43,10 @@ impl Processor {
                 hasher.update(&batch);
                 let digest = Digest(hasher.finalize().into());
 
-                // Store the batch.
-                store.write(digest.to_vec(), batch).await;
+                // Store the batch. `Store::write` needs an owned `Vec<u8>` -- this is
+                // the one owned copy `batch: Bytes` truly can't avoid (see
+                // `SerializedBatchMessage`'s doc comment above).
+                store.write(digest.to_vec(), batch.to_vec()).await;
                 //store.write(digest.to_vec(), Vec::default()).await;
 
                 // Deliver the batch's digest.
