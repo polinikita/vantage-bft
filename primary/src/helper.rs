@@ -5,7 +5,7 @@ use config::Committee;
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use metrics::Metrics;
-use network::SimpleSender;
+use network::{BatchConfig, SimpleSender};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
@@ -35,6 +35,8 @@ impl Helper {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         tokio::spawn(async move {
             Self {
@@ -42,7 +44,7 @@ impl Helper {
                 store,
                 rx_primaries_certs,
                 rx_primaries_headers,
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
             }
             .run()
             .await;

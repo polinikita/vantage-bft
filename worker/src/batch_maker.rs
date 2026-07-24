@@ -9,7 +9,7 @@ use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use metrics::Metrics;
-use network::SimpleSender;
+use network::{BatchConfig, SimpleSender};
 use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "benchmark")]
@@ -89,6 +89,8 @@ impl BatchMaker {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         tokio::spawn(async move {
             Self {
@@ -100,7 +102,7 @@ impl BatchMaker {
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
-                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network),
+                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network).with_batching(batch),
                 metrics,
                 loop_ticks: 0,
             }

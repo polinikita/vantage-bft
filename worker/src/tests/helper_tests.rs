@@ -30,6 +30,7 @@ async fn batch_reply() {
         /* latency_map */ std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         false,
+        BatchConfig::default(),
     );
 
     // Spawn a listener to receive the batch reply.

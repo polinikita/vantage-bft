@@ -17,7 +17,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn};
 use metrics::Metrics;
-use network::{CancelHandler, ReliableSender};
+use network::{BatchConfig, CancelHandler, ReliableSender};
 use core::panic;
 //use tokio::time::error::Elapsed;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -222,6 +222,8 @@ impl Core {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         tokio::spawn(async move {
             Self {
@@ -248,7 +250,7 @@ impl Core {
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 current_header: Header::default(),
                 votes_aggregator: VotesAggregator::new(),
-                network: ReliableSender::new().with_latency(latency_map).with_metrics(metrics).with_compression(compress_network),
+                network: ReliableSender::new().with_latency(latency_map).with_metrics(metrics).with_compression(compress_network).with_batching(batch),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 already_proposed_slots: HashSet::new(),

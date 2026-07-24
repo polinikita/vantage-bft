@@ -63,7 +63,8 @@ def install(ctx):
 
 
 @task
-def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False, all_to_all=False):
+def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False, all_to_all=False,
+           batch_messages=False, batch_max_bytes=65536, batch_max_delay_ms=5):
     ''' Run benchmarks on AWS.
 
     Phase-7 smoke test: checked-in defaults below, except `rate` set to
@@ -118,6 +119,11 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
         # Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
         # behavior when off; `fab remote --all-to-all` (or edit this literal) to enable.
         'all_to_all': all_to_all,
+        # Transport-level per-peer outbound batching: off by default, byte-identical
+        # wire/behavior when off; `fab remote --batch-messages` to enable.
+        'batch_messages': batch_messages,
+        'batch_max_bytes': batch_max_bytes,
+        'batch_max_delay_ms': batch_max_delay_ms,
 
         'simulate_asynchrony': False,
         'asynchrony_start': 15_000, #ms

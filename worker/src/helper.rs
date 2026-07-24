@@ -4,7 +4,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use metrics::Metrics;
-use network::SimpleSender;
+use network::{BatchConfig, SimpleSender};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,6 +31,9 @@ pub struct Helper {
 }
 
 impl Helper {
+    // clippy::too_many_arguments: see `worker::batch_maker::BatchMaker::spawn`'s
+    // identical justification (the new `batch` param pushed this over the threshold).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: WorkerId,
         committee: Committee,
@@ -47,6 +50,8 @@ impl Helper {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         tokio::spawn(async move {
             Self {
@@ -54,7 +59,7 @@ impl Helper {
                 committee,
                 store,
                 rx_request,
-                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics).with_compression(compress_network),
+                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics).with_compression(compress_network).with_batching(batch),
             }
             .run()
             .await;

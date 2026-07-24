@@ -15,6 +15,7 @@ use crypto::PublicKey;
 use crypto::Digest;
 use log::{debug, info};
 use metrics::Metrics;
+use network::BatchConfig;
 #[cfg(feature = "benchmark")]
 use network::SimpleSender;
 use std::borrow::BorrowMut;
@@ -96,6 +97,8 @@ impl Committer {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         let (_tx_deliver, rx_deliver) = channel(CHANNEL_CAPACITY);
 
@@ -124,7 +127,7 @@ impl Committer {
                 #[cfg(feature = "benchmark")]
                 worker_addresses,
                 #[cfg(feature = "benchmark")]
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
             }
             .run()
             .await;

@@ -8,10 +8,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
-use futures::sink::SinkExt as _;
 use log::{error, info, warn};
 use metrics::{start_prometheus_server, MetricReporter, Metrics};
-use network::{MessageHandler, Receiver, Writer};
+use network::{BatchConfig, MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
@@ -70,6 +69,13 @@ pub struct Worker {
     /// (`BatchMaker`, `Synchronizer`, `Helper`), which previously ran at zero
     /// injected delay even under a WAN-shaped run.
     latency_map: HashMap<SocketAddr, Duration>,
+    /// Transport-level batching config, resolved once at spawn time from
+    /// `parameters.batch_{messages,max_bytes,max_delay_ms}` (mirrors `latency_map`'s
+    /// own resolve-once-at-spawn convention). Threaded into every worker-to-worker/
+    /// worker-to-primary-reply `SimpleSender` this worker spawns, and into the
+    /// matching `network::Receiver`s -- EXCEPT the client transaction port, which
+    /// never batches (see `handle_clients_transactions`).
+    batch: BatchConfig,
 }
 
 impl Worker {
@@ -107,6 +113,13 @@ impl Worker {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
+        // Resolved once, same convention as `latency_map` above.
+        let batch = BatchConfig {
+            enabled: parameters.batch_messages,
+            max_bytes: parameters.batch_max_bytes,
+            max_delay_ms: parameters.batch_max_delay_ms,
+        };
+
         // Define a worker instance.
         let worker = Self {
             name,
@@ -116,6 +129,7 @@ impl Worker {
             store,
             metrics: metrics.clone(),
             latency_map,
+            batch,
         };
 
         // Spawn all worker tasks.
@@ -134,6 +148,7 @@ impl Worker {
             rx_primary,                                          //receiver channel to connect to primary channel (i.e. how other listener functions can invoke to PrimaryConnector)
             worker.metrics.clone(),
             worker.parameters.compress_network,
+            worker.batch,
         );
 
         // NOTE: This log entry is used to compute performance.
@@ -171,6 +186,9 @@ impl Worker {
             PrimaryReceiverHandler { tx_synchronizer, metrics: self.metrics.clone() }, //handler for received Primary messages, forwards them to synchronizer
             Some(self.metrics.clone()),
             self.parameters.compress_network,
+            // This handler never acked (see its `dispatch`'s doc comment).
+            /* acks */ false,
+            self.parameters.batch_messages,
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -187,6 +205,7 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
+            self.batch,
         );
 
         info!(
@@ -221,6 +240,13 @@ impl Worker {
             // primary<->primary/worker<->worker traffic, all of which DOES go through
             // `network::{Simple,Reliable}Sender`).
             false,
+            // This handler never acked either (see its `dispatch`).
+            /* acks */ false,
+            // Client traffic is NEVER batched -- `node::client::Client` sends raw,
+            // unbundled frames (same bypass-of-`network::{Simple,Reliable}Sender`
+            // reasoning as the `compress` argument just above). Always `false` here,
+            // independent of `self.parameters.batch_messages`.
+            /* batch */ false,
         );
 
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
@@ -241,6 +267,7 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
+            self.batch,
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -290,6 +317,10 @@ impl Worker {
             },
             Some(self.metrics.clone()),
             self.parameters.compress_network,
+            // This handler acks every received frame (moved out of `dispatch` -- see
+            // its doc comment).
+            /* acks */ true,
+            self.parameters.batch_messages,
         );
 
         // The `Helper` is dedicated to reply to batch requests from other workers.
@@ -301,6 +332,7 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
+            self.batch,
         );
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
@@ -373,12 +405,12 @@ struct WorkerReceiverHandler {
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
-    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        //NEW: Do not need to Reply with an ack... Currently simple sender expects it though so we keep it (useful for debugging). Simple sender just sinks the reply.
-        // // Reply with an ACK.
-        let _ = writer.send(Bytes::from("Ack")).await;     //Question: Where is ack signed? Is authenticated channel assumed? TLS?
-        // //Acknowledge Batches received.
-        // //Note: Missing Batch Requests don't expect an ack (they use simple sender) -- seems like it is sent anyways, but origin probably simply ignores it.
+    async fn dispatch(&self, _writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        // The ack (kept for debugging -- `SimpleSender` never required it, it just
+        // sinks whatever reply arrives) is now sent by `network::Receiver` itself,
+        // once per received FRAME rather than once per `dispatch` call -- required
+        // for batching (several logical messages can share one frame, and only one
+        // ack may be sent per frame). See `Receiver::acks`'s doc comment.
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {

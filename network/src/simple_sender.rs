@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::batch::{sleep_until_or_pending, BatchConfig, Coalescer};
 use crate::error::NetworkError;
 use crate::reliable_sender::record_typed_sent;
 use bytes::Bytes;
@@ -36,6 +37,8 @@ pub struct SimpleSender {
     metrics: Option<Arc<Metrics>>,
     /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::compress`.
     compress: bool,
+    /// Same contract as `ReliableSender::batch` (see `network::batch`'s module doc).
+    batch: BatchConfig,
 }
 
 impl std::default::Default for SimpleSender {
@@ -52,6 +55,7 @@ impl SimpleSender {
             latency: HashMap::new(),
             metrics: None,
             compress: false,
+            batch: BatchConfig::default(),
         }
     }
 
@@ -76,11 +80,17 @@ impl SimpleSender {
         self
     }
 
+    /// Same contract as `ReliableSender::with_batching`.
+    pub fn with_batching(mut self, config: BatchConfig) -> Self {
+        self.batch = config;
+        self
+    }
+
     /// Helper function to spawn a new connection.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(1_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.compress);
+        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.compress, self.batch);
         tx
     }
 
@@ -162,6 +172,8 @@ struct Connection {
     metrics: Option<Arc<Metrics>>,
     /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::Connection::compress`.
     compress: bool,
+    /// Same contract as `ReliableSender::Connection::batch`.
+    batch: BatchConfig,
 }
 
 impl Connection {
@@ -171,13 +183,16 @@ impl Connection {
         extra_latency: Duration,
         metrics: Option<Arc<Metrics>>,
         compress: bool,
+        batch: BatchConfig,
     ) {
         tokio::spawn(async move {
-            Self { address, receiver, extra_latency, metrics, compress }.run().await;
+            Self { address, receiver, extra_latency, metrics, compress, batch }.run().await;
         });
     }
 
     /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::wire_bytes`.
+    /// When batching is also on, `data` here is already the whole bundle frame (same
+    /// composition order as `ReliableSender`: coalesce -> compress -> outer frame).
     fn wire_bytes(&self, data: &Bytes) -> Bytes {
         if !self.compress {
             return data.clone();
@@ -186,6 +201,12 @@ impl Connection {
             metrics.bytes_uncompressed_sent_total.inc_by(data.len() as u64);
         }
         Bytes::from(lz4_flex::compress_prepend_size(data))
+    }
+
+    fn record_frame_sent(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.network_frames_sent_total.inc();
+        }
     }
 
     /// Main loop trying to connect to the peer and transmit messages. Fable perf
@@ -207,6 +228,11 @@ impl Connection {
     /// default). Every message still goes through `wire_bytes`/metrics exactly as
     /// `run_delayed` does, so the bytes actually written to the wire are identical
     /// either way -- only the zero-cost scheduling differs.
+    ///
+    /// Batching (`self.batch.enabled`) coalesces arrivals into bundle frames before
+    /// they ever reach `writer.send` -- best-effort, same as everything else here: if
+    /// the connection drops mid-accumulation, whatever is still buffered is simply
+    /// dropped (SimpleSender never retries, on or off batching).
     async fn run_immediate(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
@@ -221,11 +247,18 @@ impl Connection {
         };
         info!("Outgoing connection established with {}", self.address);
 
+        let mut coalescer: Coalescer<()> = Coalescer::new();
+        let mut coalesce_deadline: Option<tokio::time::Instant> = None;
+
         // Transmit messages once we have established a connection.
         loop {
+            let coalesce_due = sleep_until_or_pending(coalesce_deadline);
+
             tokio::select! {
-                Some(data) = self.receiver.recv() => {
-                    let wire = self.wire_bytes(&data);
+                () = coalesce_due, if self.batch.enabled && !coalescer.is_empty() => {
+                    let (bundle, _) = coalescer.flush();
+                    coalesce_deadline = None;
+                    let wire = self.wire_bytes(&bundle);
                     let len = wire.len();
                     if let Err(e) = writer.send(wire).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
@@ -233,6 +266,39 @@ impl Connection {
                     }
                     if let Some(metrics) = &self.metrics {
                         metrics.bytes_sent_total.inc_by(len as u64 + 4);
+                    }
+                    self.record_frame_sent();
+                },
+                Some(data) = self.receiver.recv() => {
+                    if self.batch.enabled {
+                        if coalescer.push(data, ()) {
+                            coalesce_deadline = Some(tokio::time::Instant::now() + self.batch.max_delay());
+                        }
+                        if coalescer.over_cap(self.batch.max_bytes) {
+                            let (bundle, _) = coalescer.flush();
+                            coalesce_deadline = None;
+                            let wire = self.wire_bytes(&bundle);
+                            let len = wire.len();
+                            if let Err(e) = writer.send(wire).await {
+                                warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                                return;
+                            }
+                            if let Some(metrics) = &self.metrics {
+                                metrics.bytes_sent_total.inc_by(len as u64 + 4);
+                            }
+                            self.record_frame_sent();
+                        }
+                    } else {
+                        let wire = self.wire_bytes(&data);
+                        let len = wire.len();
+                        if let Err(e) = writer.send(wire).await {
+                            warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                            return;
+                        }
+                        if let Some(metrics) = &self.metrics {
+                            metrics.bytes_sent_total.inc_by(len as u64 + 4);
+                        }
+                        self.record_frame_sent();
                     }
                 },
                 response = reader.next() => {
@@ -252,7 +318,10 @@ impl Connection {
     }
 
     /// The pre-existing delay-queue loop, used whenever a nonzero per-destination
-    /// latency is configured. See `Connection::run`'s doc comment.
+    /// latency is configured. See `Connection::run`'s doc comment. Batching coalesces
+    /// arrivals the same way as `run_immediate`; a flushed bundle is treated as a
+    /// single fresh "arrival" into `delay_queue` (one release time, one injected
+    /// latency for the whole bundle), computed at flush time.
     async fn run_delayed(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
@@ -272,6 +341,8 @@ impl Connection {
         // delay, so arrival order implies release-order -- no jitter, no concurrency,
         // strict ordering preserved by construction).
         let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> = std::collections::VecDeque::new();
+        let mut coalescer: Coalescer<()> = Coalescer::new();
+        let mut coalesce_deadline: Option<tokio::time::Instant> = None;
 
         // Transmit messages once we have established a connection.
         loop {
@@ -281,6 +352,7 @@ impl Connection {
                     None => std::future::pending::<()>().await,
                 }
             };
+            let coalesce_due = sleep_until_or_pending(coalesce_deadline);
 
             // Check if there are any new messages to send or if we get an ACK for messages we already sent.
             tokio::select! {
@@ -295,9 +367,26 @@ impl Connection {
                     if let Some(metrics) = &self.metrics {
                         metrics.bytes_sent_total.inc_by(len as u64 + 4);
                     }
+                    self.record_frame_sent();
+                },
+                () = coalesce_due, if self.batch.enabled && !coalescer.is_empty() => {
+                    let (bundle, _) = coalescer.flush();
+                    coalesce_deadline = None;
+                    delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, bundle));
                 },
                 Some(data) = self.receiver.recv() => {
-                    delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, data));
+                    if self.batch.enabled {
+                        if coalescer.push(data, ()) {
+                            coalesce_deadline = Some(tokio::time::Instant::now() + self.batch.max_delay());
+                        }
+                        if coalescer.over_cap(self.batch.max_bytes) {
+                            let (bundle, _) = coalescer.flush();
+                            coalesce_deadline = None;
+                            delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, bundle));
+                        }
+                    } else {
+                        delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, data));
+                    }
                 },
                 response = reader.next() => {
                     match response {

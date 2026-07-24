@@ -87,6 +87,16 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--max-header-delay-ms must be a non-negative integer")?;
+    let batch_max_bytes: usize = matches
+        .get_one::<String>("batch-max-bytes")
+        .unwrap()
+        .parse()
+        .context("--batch-max-bytes must be a non-negative integer")?;
+    let batch_max_delay_ms: u64 = matches
+        .get_one::<String>("batch-max-delay-ms")
+        .unwrap()
+        .parse()
+        .context("--batch-max-delay-ms must be a non-negative integer")?;
     // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default.
     let timeline: bool = matches.get_flag("timeline");
     // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `--latency-table <csv>` (an n x n
@@ -168,6 +178,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         max_header_delay: max_header_delay_ms,
         // METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when off.
         compress_network: matches.get_flag("compress-network"),
+        // Transport-level batching: off by default, byte-identical wire/behavior when off.
+        batch_messages: matches.get_flag("batch-messages"),
+        batch_max_bytes,
+        batch_max_delay_ms,
         // Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
         // behavior when off.
         all_to_all: matches.get_flag("all-to-all"),

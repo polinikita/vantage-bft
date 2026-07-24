@@ -16,7 +16,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, Protocol, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
-use futures::sink::SinkExt as _;
 use log::info;
 use metrics::{start_prometheus_server, MetricReporter, Metrics};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
@@ -256,6 +255,16 @@ impl Primary {
         // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
         let consensus_round = Arc::new(AtomicU64::new(0));
 
+        // Transport-level batching, resolved once here (mirrors `compress_network`'s
+        // own plumbing -- a single `Parameters`-derived value threaded into every
+        // `Reliable`/`SimpleSender` and `network::Receiver` this primary spawns,
+        // both protocols identically).
+        let batch = network::BatchConfig {
+            enabled: parameters.batch_messages,
+            max_bytes: parameters.batch_max_bytes,
+            max_delay_ms: parameters.batch_max_delay_ms,
+        };
+
         match parameters.protocol {
             Protocol::Vantage => {
                 // PHASE4-SPEC.md §1: a single `VantageCore` task replaces
@@ -285,6 +294,10 @@ impl Primary {
                     crate::vantage::node::VantageReceiverHandler { tx: tx_vantage, metrics: Some(metrics.clone()) },
                     Some(metrics.clone()),
                     parameters.compress_network,
+                    // Acks every received frame (moved out of `dispatch` -- see
+                    // `VantageReceiverHandler`'s doc comment).
+                    /* acks */ true,
+                    parameters.batch_messages,
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -310,6 +323,9 @@ impl Primary {
                     },
                     Some(metrics.clone()),
                     parameters.compress_network,
+                    // This handler never acked (see its `dispatch`).
+                    /* acks */ false,
+                    parameters.batch_messages,
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -348,6 +364,10 @@ impl Primary {
                     },
                     Some(metrics.clone()),
                     parameters.compress_network,
+                    // Acks every received frame (moved out of `dispatch` -- see
+                    // `PrimaryReceiverHandler`'s doc comment).
+                    /* acks */ true,
+                    parameters.batch_messages,
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -370,6 +390,9 @@ impl Primary {
                     },
                     Some(metrics.clone()),
                     parameters.compress_network,
+                    // This handler never acked (see its `dispatch`).
+                    /* acks */ false,
+                    parameters.batch_messages,
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -438,9 +461,10 @@ impl Primary {
                         .unwrap_or_default(),
                     metrics.clone(),
                     parameters.compress_network,
+                    batch,
                 );
 
-                Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer, metrics.clone(), parameters.compress_network);
+                Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer, metrics.clone(), parameters.compress_network, batch);
 
                 // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
                 GarbageCollector::spawn(
@@ -452,6 +476,7 @@ impl Primary {
                     tx_certificates_loopback.clone(),
                     metrics.clone(),
                     parameters.compress_network,
+                    batch,
                 );
 
                 // Receives batch digests from other workers. They are only used to validate headers.
@@ -473,6 +498,7 @@ impl Primary {
                     tx_header_waiter_instances,
                     metrics.clone(),
                     parameters.compress_network,
+                    batch,
                 );
 
                 // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
@@ -498,7 +524,7 @@ impl Primary {
                 );
 
                 // The `Helper` is dedicated to reply to certificates requests from other primaries.
-                Helper::spawn(committee.clone(), store, rx_cert_requests, rx_header_requests, metrics.clone(), parameters.compress_network);
+                Helper::spawn(committee.clone(), store, rx_cert_requests, rx_header_requests, metrics.clone(), parameters.compress_network, batch);
 
                 // NOTE: This log entry is used to compute performance.
                 info!(
@@ -528,9 +554,11 @@ struct PrimaryReceiverHandler {
 
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
-    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        // Reply with an ACK.
-        let _ = writer.send(Bytes::from("Ack")).await;
+    async fn dispatch(&self, _writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        // The ack is now sent by `network::Receiver` itself, once per received FRAME
+        // rather than once per `dispatch` call -- required for batching (several
+        // logical messages can share one frame, and only one ack may be sent per
+        // frame). See `Receiver::acks`'s doc comment.
 
         // Deserialize and parse the message.
         let message: PrimaryMessage = bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;

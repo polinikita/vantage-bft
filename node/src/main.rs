@@ -164,6 +164,20 @@ async fn main() -> Result<()> {
                     .help("METRICS-DASHBOARD-SPEC.md §8: lz4-compress every wire message \
                         (network crate, all protocols identically). Off by default -- \
                         byte-identical framing when off."))
+                .arg(Arg::new("batch-messages").long("batch-messages").action(ArgAction::SetTrue)
+                    .help("Transport-level per-peer outbound message batching \
+                        (coalescing), applied uniformly by the network crate to every \
+                        sender/receiver (all protocols identically) except the \
+                        client-facing transaction port. Off by default -- byte-identical \
+                        wire/behavior when off."))
+                .arg(Arg::new("batch-max-bytes").long("batch-max-bytes").value_name("INT")
+                    .default_value("65536").action(ArgAction::Set)
+                    .help("Batching hybrid flush size cap, in bytes -- irrelevant unless \
+                        --batch-messages is set"))
+                .arg(Arg::new("batch-max-delay-ms").long("batch-max-delay-ms").value_name("INT")
+                    .default_value("5").action(ArgAction::Set)
+                    .help("Batching hybrid flush delay, in ms -- irrelevant unless \
+                        --batch-messages is set"))
                 .arg(Arg::new("all-to-all").long("all-to-all").action(ArgAction::SetTrue)
                     .help("Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all \
                         communication: on the external-consensus path, replicas broadcast \

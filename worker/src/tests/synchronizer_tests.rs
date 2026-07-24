@@ -33,6 +33,7 @@ async fn synchronize() {
         /* latency_map */ std::collections::HashMap::new(),
         metrics,
         false,
+        BatchConfig::default(),
     );
 
     // Spawn a listener to receive our batch requests.

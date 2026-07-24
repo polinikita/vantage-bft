@@ -6,7 +6,7 @@ use config::Committee;
 use crypto::Hash as _;
 use crypto::PublicKey;
 use metrics::Metrics;
-use network::SimpleSender;
+use network::{BatchConfig, SimpleSender};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -43,6 +43,8 @@ impl GarbageCollector {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         let addresses = committee
             .our_workers(name)
@@ -58,7 +60,7 @@ impl GarbageCollector {
                 rx_consensus,
                 tx_loopback,
                 addresses,
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
             }
             .run()
             .await;

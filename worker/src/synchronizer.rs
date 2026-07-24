@@ -7,7 +7,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use metrics::Metrics;
-use network::SimpleSender;
+use network::{BatchConfig, SimpleSender};
 use primary::PrimaryWorkerMessage;
 use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
@@ -87,6 +87,8 @@ impl Synchronizer {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention as `metrics`.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         tokio::spawn(async move {
             Self {
@@ -98,7 +100,7 @@ impl Synchronizer {
                 sync_retry_delay,
                 sync_retry_nodes,
                 rx_message,
-                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network),
+                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network).with_batching(batch),
                 round: Round::default(),
                 pending: HashMap::new(),
                 metrics,

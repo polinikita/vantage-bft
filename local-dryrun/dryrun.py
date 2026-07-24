@@ -165,6 +165,15 @@ def build_local_benchmark_args(cfg: dict, binary: Path) -> list:
         args += ["--latency-table", latency_table]
     if cfg.get("compress_network"):
         args.append("--compress-network")
+    # Transport-level batching: optional (not in REQUIRED_KEYS), off by default --
+    # byte-identical wire/behavior when omitted, mirroring `compress_network`'s own
+    # optional-flag handling just above.
+    if cfg.get("batch_messages"):
+        args.append("--batch-messages")
+        if cfg.get("batch_max_bytes") is not None:
+            args += ["--batch-max-bytes", str(cfg["batch_max_bytes"])]
+        if cfg.get("batch_max_delay_ms") is not None:
+            args += ["--batch-max-delay-ms", str(cfg["batch_max_delay_ms"])]
     return args
 
 

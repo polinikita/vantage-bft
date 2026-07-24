@@ -20,9 +20,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
-use futures::sink::SinkExt as _;
 use metrics::{Metrics, UtilizationTimer};
-use network::{CancelHandler, MessageHandler, ReliableSender, SimpleSender, Writer};
+use network::{BatchConfig, CancelHandler, MessageHandler, ReliableSender, SimpleSender, Writer};
 use prometheus::IntCounter;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -94,8 +93,11 @@ pub struct VantageReceiverHandler {
 
 #[async_trait]
 impl MessageHandler for VantageReceiverHandler {
-    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        let _ = writer.send(Bytes::from("Ack")).await;
+    async fn dispatch(&self, _writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        // The ack is now sent by `network::Receiver` itself, once per received FRAME
+        // rather than once per `dispatch` call -- required for batching (several
+        // logical messages can share one frame, and only one ack may be sent per
+        // frame). See `Receiver::acks`'s doc comment.
         let message: PrimaryMessage = bincode::deserialize(&serialized)?;
         if let Some(metrics) = &self.metrics {
             crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
@@ -311,6 +313,14 @@ impl VantageCore {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
+        // Transport-level batching, resolved once (mirrors `latency_map`/
+        // `compress_network`'s own resolve-once-at-spawn convention).
+        let batch = BatchConfig {
+            enabled: parameters.batch_messages,
+            max_bytes: parameters.batch_max_bytes,
+            max_delay_ms: parameters.batch_max_delay_ms,
+        };
+
         let core = Self {
             name,
             members,
@@ -323,14 +333,14 @@ impl VantageCore {
             resolver,
             control,
             network: {
-                let mut s = ReliableSender::new().with_latency(latency_map.clone()).with_compression(parameters.compress_network);
+                let mut s = ReliableSender::new().with_latency(latency_map.clone()).with_compression(parameters.compress_network).with_batching(batch);
                 if let Some(m) = &core_metrics {
                     s = s.with_metrics(m.clone());
                 }
                 s
             },
             worker_network: {
-                let mut s = SimpleSender::new().with_latency(latency_map).with_compression(parameters.compress_network);
+                let mut s = SimpleSender::new().with_latency(latency_map).with_compression(parameters.compress_network).with_batching(batch);
                 if let Some(m) = &core_metrics {
                     s = s.with_metrics(m.clone());
                 }

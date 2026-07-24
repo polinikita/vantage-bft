@@ -19,6 +19,7 @@ async fn make_batch() {
         /* latency_map */ std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         false,
+        BatchConfig::default(),
     );
 
     // Send enough transactions to seal a batch.
@@ -50,6 +51,7 @@ async fn batch_timeout() {
         /* latency_map */ std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         false,
+        BatchConfig::default(),
     );
 
     // Do not send enough transactions to seal a batch..

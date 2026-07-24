@@ -10,7 +10,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use metrics::Metrics;
-use network::SimpleSender;
+use network::{BatchConfig, SimpleSender};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -97,6 +97,8 @@ impl HeaderWaiter {
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
         compress_network: bool,
+        // Transport-level batching: appended last, same convention.
+        batch: BatchConfig,
     ) {
         tokio::spawn(async move {
             Self {
@@ -110,7 +112,7 @@ impl HeaderWaiter {
                 rx_synchronizer,
                 tx_core,
                 tx_consensus_loopback,
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
+                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
                 parent_requests: HashMap::new(),
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),

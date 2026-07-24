@@ -177,6 +177,14 @@ pub struct Metrics {
     pub network_bytes_sent_total: IntCounterVec,
     /// Serialized (pre-frame-prefix) bytes received, by `type`.
     pub network_bytes_received_total: IntCounterVec,
+    /// Physical wire frames sent (length-prefix-delimited units), across every
+    /// connection this node's senders own -- NOT per-type. When transport-level
+    /// batching (`Parameters::batch_messages`) is off, every logical message is its
+    /// own frame, so this equals the sum of `network_messages_sent_total` across
+    /// types. When batching is on, several coalesced logical messages can share one
+    /// frame, so `network_messages_sent_total` (sum) / `network_frames_sent_total`
+    /// reads directly as the coalescing ratio.
+    pub network_frames_sent_total: IntCounter,
 
     // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
     /// Transactions the worker's `BatchMaker` received from a client, before batching
@@ -462,6 +470,13 @@ impl Metrics {
                 "network_bytes_received_total",
                 "Serialized bytes received, by type (no frame prefix)",
                 &["type"],
+                registry,
+            )
+            .unwrap(),
+            network_frames_sent_total: register_int_counter_with_registry!(
+                "network_frames_sent_total",
+                "Physical wire frames sent (bundles count once); compare against \
+                 network_messages_sent_total for the batching coalescing ratio",
                 registry,
             )
             .unwrap(),

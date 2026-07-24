@@ -221,6 +221,38 @@ pub struct Parameters {
     /// to decode an uncompressed peer's traffic, and vice versa).
     #[serde(default)]
     pub compress_network: bool,
+
+    /// Transport-level per-peer outbound message batching (coalescing), off by
+    /// default (`#[serde(default)]` = `false`) -- byte-identical wire/behavior when
+    /// off (see `network` crate's `batch` module doc). Protocol-transparent: applied
+    /// uniformly by the `network` crate to every sender/receiver this node spawns
+    /// EXCEPT the client-facing transaction port (clients never batch, same carve-out
+    /// as `compress_network`). Committee-wide consistent by construction, same
+    /// reasoning as `compress_network`.
+    #[serde(default)]
+    pub batch_messages: bool,
+    /// Hybrid flush size cap in bytes (see `network::BatchConfig::max_bytes`).
+    /// Irrelevant when `batch_messages` is off. `#[serde(default)]` (65536) keeps
+    /// pre-batching parameter files valid.
+    #[serde(default = "default_batch_max_bytes")]
+    pub batch_max_bytes: usize,
+    /// Hybrid flush delay in milliseconds (see `network::BatchConfig::max_delay_ms`).
+    /// Irrelevant when `batch_messages` is off. `#[serde(default)]` (5) keeps
+    /// pre-batching parameter files valid. 5 ms costs only ~2.5 ms average added
+    /// latency (a message waits ~window/2) -- negligible next to a WAN's ~400 ms
+    /// p50 -- while coalescing substantially more per flush than a 1 ms window
+    /// would, which matters more as n grows (n~50/100). `batch_max_bytes`'s size
+    /// cap still short-circuits this window the moment a burst fills it.
+    #[serde(default = "default_batch_max_delay_ms")]
+    pub batch_max_delay_ms: u64,
+}
+
+fn default_batch_max_bytes() -> usize {
+    65_536
+}
+
+fn default_batch_max_delay_ms() -> u64 {
+    5
 }
 
 fn default_max_block_payload() -> usize {
@@ -336,6 +368,9 @@ impl Default for Parameters {
             delta_ms: default_delta_ms(),
             latency_table: None,
             compress_network: false,
+            batch_messages: false,
+            batch_max_bytes: default_batch_max_bytes(),
+            batch_max_delay_ms: default_batch_max_delay_ms(),
         }
     }
 }
@@ -383,6 +418,11 @@ impl Parameters {
         if self.latency_table.is_some() {
             info!("Mimic latency table active (PHASE7-PREP-NOTES.md)");
         }
+        info!("Network compression enabled? {}", self.compress_network);
+        info!(
+            "Network batching enabled? {}. Max bytes: {}. Max delay: {} ms",
+            self.batch_messages, self.batch_max_bytes, self.batch_max_delay_ms
+        );
     }
 }
 

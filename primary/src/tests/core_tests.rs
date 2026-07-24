@@ -102,6 +102,7 @@ async fn process_header() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
     // Send a header to the core.
@@ -202,6 +203,7 @@ async fn process_header_missing_parent() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
     let header_one = header();
@@ -293,6 +295,7 @@ async fn process_header_invalid_height() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
     // Send a header to the core.
@@ -387,6 +390,7 @@ async fn process_header_missing_payload() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
     // Send a header to the core.
@@ -479,6 +483,7 @@ async fn process_votes() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -597,6 +602,7 @@ async fn process_certificates() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -723,6 +729,7 @@ async fn process_prepare() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -862,6 +869,7 @@ async fn generate_confirm() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -1018,6 +1026,7 @@ async fn generate_commit() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -1223,6 +1232,7 @@ async fn generate_pipelined_prepare() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -1395,6 +1405,7 @@ async fn local_timeout_view() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -1492,6 +1503,7 @@ async fn sync_missing_proposals() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
 
@@ -1515,6 +1527,7 @@ async fn sync_missing_proposals() {
         tx_header_waiter_instances,
         test_metrics(),
         false,
+        BatchConfig::default(),
     );
 
     // Send headers to the core, so they won't request sync
