@@ -152,6 +152,23 @@ class InstanceManager:
         try:
             # Create all instances.
             size = instances * len(self.clients)
+            # Opt-in EC2 Spot (settings.json instances.spot == true). One-time
+            # requests, terminate-on-interruption, and NO MaxPrice -- boto3 then
+            # caps the bid at the on-demand price, so Spot never costs more than
+            # on-demand while still yielding the usual discount, and there is no
+            # surprise-price exposure. Absent/false -> {} -> on-demand, i.e. the
+            # exact prior run_instances call (byte-identical request).
+            spot_options = {}
+            if getattr(self.settings, 'spot', False):
+                spot_options = {
+                    'InstanceMarketOptions': {
+                        'MarketType': 'spot',
+                        'SpotOptions': {
+                            'SpotInstanceType': 'one-time',
+                            'InstanceInterruptionBehavior': 'terminate',
+                        },
+                    }
+                }
             progress = progress_bar(
                 self.clients.values(), prefix=f'Creating {size} instances'
             )
@@ -179,6 +196,7 @@ class InstanceManager:
                             'DeleteOnTermination': True
                         }
                     }],
+                    **spot_options,
                 )
 
             # Wait for the instances to boot.

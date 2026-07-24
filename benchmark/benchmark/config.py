@@ -215,6 +215,29 @@ class NodeParameters:
         if not all(isinstance(x, int) for x in inputs):
             raise ConfigError('Invalid parameters type')
 
+        # Vantage / distributed WAN-mimic knobs. These are NOT required (the Rust
+        # side supplies serde defaults for every one of them), but when present they
+        # must be well typed -- the whole `json` dict is written verbatim into
+        # parameters.json and deserialized by `config::Parameters` on each node, so a
+        # typo here would only surface as a node-side parse error mid-deploy.
+        #  - `protocol`: selects the node assembly; "vantage" runs Vantage (serde
+        #    kebab-case of `Protocol::Vantage`), else one of the two autobahn labels.
+        #  - `delta_ms`: Vantage AGB base delay unit (ms).
+        #  - `mimic_latency_ms`: DEPLOYABLE uniform RTT (ms) mimic latency. `node run`
+        #    expands it into a uniform NxN one-way (RTT/2) latency_table at spawn --
+        #    this is the ONLY way to inject WAN-shaped latency on the distributed
+        #    path, since `Parameters.latency_table` itself is `#[serde(skip)]` and
+        #    thus never travels through parameters.json.
+        if 'protocol' in json and json['protocol'] not in (
+            'autobahn-optimistic', 'autobahn-seamless', 'vantage'
+        ):
+            raise ConfigError(f"Invalid protocol '{json['protocol']}'")
+        for key in ('delta_ms', 'mimic_latency_ms'):
+            if key in json:
+                v = json[key]
+                if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                    raise ConfigError(f"'{key}' must be a non-negative integer")
+
         self.json = json
 
     def print(self, filename):

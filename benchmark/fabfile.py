@@ -64,7 +64,8 @@ def install(ctx):
 
 @task
 def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False, all_to_all=False,
-           batch_messages=False, batch_max_bytes=65536, batch_max_delay_ms=5):
+           batch_messages=False, batch_max_bytes=65536, batch_max_delay_ms=5,
+           mimic_latency_ms=0):
     ''' Run benchmarks on AWS.
 
     Phase-7 smoke test: checked-in defaults below, except `rate` set to
@@ -113,6 +114,11 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
         'use_ride_share': False,
         'car_timeout': 5_000,
         'delta_ms': 150,  # ms -- Phase 7 smoke-test setting (Vantage's AGB/control-log delta)
+        # DEPLOYABLE uniform RTT (ms) mimic latency; 0 (default) = off, byte-identical
+        # to prior behavior. `node run` expands >0 into a uniform NxN one-way (RTT/2)
+        # latency_table at spawn -- the only way to inject WAN-shaped latency on the
+        # distributed path (Parameters.latency_table is #[serde(skip)]).
+        'mimic_latency_ms': int(mimic_latency_ms),
         # METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when
         # off; `fab remote --compress-network` (or edit this literal) to enable.
         'compress_network': compress_network,
@@ -128,6 +134,78 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
         'simulate_asynchrony': False,
         'asynchrony_start': 15_000, #ms
         'asynchrony_duration': 3_000, #ms
+    }
+    try:
+        Bench(ctx).run(bench_params, node_params, debug)
+    except BenchError as e:
+        Print.error(e)
+
+
+@task
+def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100):
+    ''' Distributed Vantage AWS throughput/latency campaign (PREP -- the
+    coordinator performs the actual `fab create`/`fab remote`/`fab destroy`;
+    this task only assembles + validates the config and hands it to
+    `Bench(...).run`).
+
+    Target campaign:
+      - nodes = [20], workers = 1, faults = 0, collocate (default)
+      - tx_size = 512 B, tx_mode = 'all-zero' (comparability with gate numbers)
+      - duration = 180 s per point, runs = 1
+      - rate SWEEP ascending toward saturation:
+          [50k, 100k, 150k, 200k, 250k] tx/s
+      - protocol = vantage, delta_ms = 150
+      - UNIFORM one-region WAN mimic latency: `mimic_latency_ms` RTT (default
+        100 ms RTT = 50 ms one-way) injected on every inter-authority link even
+        though the 20 instances are co-located. `node run` expands this scalar
+        into a uniform 20x20 one-way (RTT/2) latency_table at spawn via
+        `Committee::latency_map` -- the SAME path both protocols already use for
+        `node local-benchmark --mimic-latency-ms`. This scalar is the only knob
+        that carries latency on the distributed path (Parameters.latency_table
+        is #[serde(skip)] and never travels through parameters.json).
+
+    Prerequisite (coordinator): a settings.json sized for 20 instances (and, if
+    desired, `"instances": { ..., "spot": true }` for Spot capacity), then
+    `fab create --nodes 20`, `fab install`, `fab campaign`, `fab destroy`.
+    '''
+    bench_params = {
+        'faults': 0,
+        'nodes': [20],
+        'workers': 1,
+        'collocate': True,
+        'rate': [50_000, 100_000, 150_000, 200_000, 250_000],
+        'tx_size': 512,
+        'tx_mode': 'all-zero',
+        'duration': 180,
+        'runs': 1,
+
+        # Partition simulation unused for this campaign.
+        'simulate_partition': False,
+        'partition_start': 0,
+        'partition_duration': 0,
+        'partition_nodes': 0,
+    }
+    node_params = {
+        'timeout_delay': 5_000,  # ms
+        'header_size': 32,  # bytes
+        'max_header_delay': 5_000,  # ms
+        'gc_depth': 50,  # rounds
+        'sync_retry_delay': 5_000,  # ms
+        'sync_retry_nodes': 3,  # number of nodes
+        'batch_size': 500_000,  # bytes
+        'max_batch_delay': 20,  # ms
+        'protocol': protocol,
+        'use_parallel_proposals': True,
+        'k': 4,
+        'use_fast_path': True,
+        'fast_path_timeout': 5_000,
+        'use_ride_share': False,
+        'car_timeout': 5_000,
+        'delta_ms': 150,  # ms -- Vantage AGB/control-log base delay unit
+        'mimic_latency_ms': int(mimic_latency_ms),  # uniform WAN RTT (ms); node halves to one-way
+        'simulate_asynchrony': False,
+        'asynchrony_start': 15_000,  # ms
+        'asynchrony_duration': 3_000,  # ms
     }
     try:
         Bench(ctx).run(bench_params, node_params, debug)

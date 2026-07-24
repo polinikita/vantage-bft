@@ -211,6 +211,23 @@ pub struct Parameters {
     #[serde(skip)]
     pub latency_table: Option<Arc<LatencyTable>>,
 
+    /// PHASE7 (AWS/distributed WAN-shaped runs): the DEPLOYABLE uniform-RTT mimic
+    /// latency knob -- the parameters.json counterpart of `node local-benchmark
+    /// --mimic-latency-ms`. Unlike `latency_table` (which is `#[serde(skip)]`: an
+    /// in-process value built only by `local-benchmark`, never carried in a config
+    /// file), THIS field DOES round-trip through `parameters.json`/`fab`, so the fab
+    /// harness can inject a WAN-like RTT into a co-located AWS committee where every
+    /// node reads its config from a deployed file rather than a CLI flag. `node run`
+    /// expands `Some(rtt)` into a uniform `latency_table` at spawn time
+    /// (`LatencyTable::uniform(committee.size(), rtt)`, one-way = rtt/2), which the
+    /// existing `Committee::latency_map` path then applies identically to both
+    /// protocols -- so no primary/worker/Vantage code changes are needed, only this
+    /// one expansion in `node`'s `run`. `None`/`Some(0)` (the default -- also what
+    /// every pre-Phase-7 `parameters.json` deserializes to, the field being absent)
+    /// means zero injected delay, i.e. byte-identical current behavior.
+    #[serde(default)]
+    pub mimic_latency_ms: Option<u64>,
+
     /// METRICS-DASHBOARD-SPEC.md §8: network-level lz4 compression, off by default
     /// (`#[serde(default)]` = `false`) -- byte-identical framing when off (no
     /// compress/decompress call is even made, see `network` crate). Applied uniformly
@@ -388,6 +405,7 @@ impl Default for Parameters {
             max_block_payload: default_max_block_payload(),
             delta_ms: default_delta_ms(),
             latency_table: None,
+            mimic_latency_ms: None,
             compress_network: false,
             batch_messages: false,
             batch_max_bytes: default_batch_max_bytes(),
@@ -829,5 +847,69 @@ impl KeyPair {
 impl Default for KeyPair {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PHASE7 (AWS PREP): the real contract the distributed `node run` must honor --
+    /// the exact `parameters.json` the fab campaign task emits (via
+    /// `benchmark/config.py`'s `NodeParameters(...).print()`) must deserialize into
+    /// `config::Parameters`, select Vantage, carry `delta_ms`, and carry the
+    /// deployable `mimic_latency_ms` mimic-latency knob (the only mechanism able to
+    /// inject WAN-shaped latency on the distributed path, since `latency_table` is
+    /// `#[serde(skip)]`). This JSON is byte-identical in KEYS/VALUES to the campaign
+    /// `node_params` dict in `benchmark/fabfile.py::campaign`.
+    #[test]
+    fn deserializes_fab_vantage_parameters_json_with_mimic_latency() {
+        let json = r#"{
+            "timeout_delay": 5000,
+            "header_size": 32,
+            "max_header_delay": 5000,
+            "gc_depth": 50,
+            "sync_retry_delay": 5000,
+            "sync_retry_nodes": 3,
+            "batch_size": 500000,
+            "max_batch_delay": 20,
+            "protocol": "vantage",
+            "use_parallel_proposals": true,
+            "k": 4,
+            "use_fast_path": true,
+            "fast_path_timeout": 5000,
+            "use_ride_share": false,
+            "car_timeout": 5000,
+            "delta_ms": 150,
+            "mimic_latency_ms": 100,
+            "simulate_asynchrony": false,
+            "asynchrony_start": 15000,
+            "asynchrony_duration": 3000
+        }"#;
+
+        let mut params: Parameters =
+            serde_json::from_str(json).expect("fab-generated Vantage parameters.json must parse");
+        // `node run` calls this immediately after import.
+        params.reconcile_protocol();
+
+        assert_eq!(params.protocol, Protocol::Vantage);
+        assert_eq!(params.delta_ms, 150);
+        assert_eq!(params.mimic_latency_ms, Some(100));
+        // Fields absent from the JSON fall back to their serde defaults.
+        assert!(!params.authenticate_channels);
+        assert!(!params.batch_messages);
+        assert!(!params.compress_network);
+        // `latency_table` is `#[serde(skip)]`: never present in the file, always
+        // `None` after deserialization -- `node run` builds it from
+        // `mimic_latency_ms` at spawn.
+        assert!(params.latency_table.is_none());
+
+        // Prove the spawn-time expansion `node run` performs yields a well-formed
+        // uniform NxN table with the RTT/2 one-way convention.
+        let n = 20;
+        let table = LatencyTable::uniform(n, params.mimic_latency_ms.unwrap() as f64);
+        assert_eq!(table.one_way(0, 0), Duration::ZERO); // diagonal
+        assert_eq!(table.one_way(0, 1), Duration::from_millis(50)); // 100ms RTT / 2
+        assert_eq!(table.one_way(19, 3), Duration::from_millis(50));
     }
 }

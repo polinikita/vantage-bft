@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, Arg, ArgAction, ArgMatches, Command};
 use config::Export as _;
 use config::Import as _;
-use config::{Committee, KeyPair, Parameters, WorkerId};
+use config::{Committee, KeyPair, LatencyTable, Parameters, WorkerId};
 use crypto::SignatureService;
 use env_logger::Env;
 use primary::Header;
@@ -254,6 +254,27 @@ async fn run(matches: &ArgMatches) -> Result<()> {
 
     // `protocol` is authoritative over the legacy `use_optimistic_tips` knob.
     parameters.reconcile_protocol();
+
+    // PHASE7 (AWS/distributed WAN-shaped runs): expand the DEPLOYABLE uniform-RTT
+    // mimic-latency knob (`mimic_latency_ms`, which -- unlike the `#[serde(skip)]`
+    // `latency_table` -- rides through `parameters.json`) into the in-process
+    // `latency_table` that `Primary::spawn`/`Worker::spawn` already consume via
+    // `Committee::latency_map`. This is the exact table `node local-benchmark
+    // --mimic-latency-ms` builds (`LatencyTable::uniform`, one-way = RTT/2), just
+    // sourced from the deployed config instead of a CLI flag, so mimic latency works
+    // identically on the distributed path with no primary/worker/Vantage changes.
+    // Only applied when `latency_table` isn't already set (never is on this path) and
+    // the RTT is positive; `None`/0 leaves behavior byte-identical to today.
+    if parameters.latency_table.is_none() {
+        if let Some(rtt_ms) = parameters.mimic_latency_ms {
+            if rtt_ms > 0 {
+                parameters.latency_table = Some(std::sync::Arc::new(LatencyTable::uniform(
+                    committee.size(),
+                    rtt_ms as f64,
+                )));
+            }
+        }
+    }
 
     // Select the node assembly by protocol. Both Autobahn variants share the
     // existing primary/worker assembly (the seamless path is activated inside

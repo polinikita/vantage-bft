@@ -21,7 +21,7 @@ class Settings:
 
     def __init__(self, key_name, key_path, base_port, repo_name, repo_url,
                  branch, instance_type, aws_regions, project_id=None,
-                 templates=None, username='ubuntu'):
+                 templates=None, username='ubuntu', spot=False):
         inputs_str = [
             key_name, key_path, repo_name, repo_url, branch, instance_type
         ]
@@ -32,6 +32,7 @@ class Settings:
         inputs_str += regions
         ok = all(isinstance(x, str) for x in inputs_str)
         ok &= isinstance(base_port, int)
+        ok &= isinstance(spot, bool)
         ok &= len(regions) > 0
         if not ok:
             raise SettingsError('Invalid settings types')
@@ -53,6 +54,10 @@ class Settings:
         self.project_id = project_id
         self.templates = templates if templates is not None else []
         self.username = username
+        # AWS EC2 Spot request (instance.py). Opt-in: absent/false in settings.json
+        # -> on-demand, byte-identical to prior behavior. When true, create_instances
+        # requests one-time Spot capacity capped at the on-demand price (no MaxPrice).
+        self.spot = spot
 
     @classmethod
     def load(cls, filename):
@@ -72,6 +77,7 @@ class Settings:
                 data.get('project_id'),
                 data['instances'].get('templates'),
                 data.get('username', 'ubuntu'),
+                bool(data['instances'].get('spot', False)),
             )
         except (OSError, JSONDecodeError) as e:
             raise SettingsError(str(e))
