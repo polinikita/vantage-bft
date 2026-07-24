@@ -360,12 +360,16 @@ impl AgbEngine {
         self
     }
 
+    /// theta_E: absolute echo fallback deadline. Paper (signature-free.tex, timeout
+    /// display): theta_E = 4*Delta (tightened from 5*Delta).
     pub fn theta_echo(&self) -> Duration {
-        self.delta * 5
+        self.delta * 4
     }
 
+    /// theta_R: absolute ready deadline. Paper: theta_R = 5*Delta (tightened from
+    /// 6*Delta). The control-round timer stays 6*Delta (paper: must exceed 5*Delta).
     pub fn theta_ready(&self) -> Duration {
-        self.delta * 6
+        self.delta * 5
     }
 
     pub fn proposer(&self, view: View) -> PublicKey {
