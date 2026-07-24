@@ -465,3 +465,338 @@ async fn p6_2_poisoning_attempt_rejected_true_anchor_still_applies() {
     );
     assert!(control.is_anchor_resolved(1));
 }
+
+// ---------------------------------------------------------------- Fable audit pass 2:
+// P2-1/P2-2/P2-3/P2-4 liveness (round-machine predicates re-evaluated on a subset of
+// their enabling transitions -- cross-round message reordering, normal on an async
+// network, could wedge the log permanently). Every test below drives `ControlLog`
+// directly (bypassing `on_control_init`'s leader check via `on_control_ready`, the same
+// technique the round-machine tests above already use) so it can force the exact
+// out-of-order arrival the synchronous test harness would otherwise never produce.
+
+/// P2-1 regression: round `r+1` RB-delivers (2f+1 READY) while its parent round `r` is
+/// not yet safe. Pre-fix, `mark_safe(r+1)` bails at the `!safe.contains(parent)` guard
+/// and is NEVER retried once `r` finally becomes safe -- `safe[r+1]` is wedged false
+/// forever. Post-fix, marking `r` safe must cascade to `r+1`. (Note: once `r` becomes
+/// safe it also votes/advances immediately -- Advance doesn't wait for `r`'s own commit
+/// quorum, only `safe && (voted || timed_out)` -- so `curr_round` races ahead past `r+1`
+/// too in this exact drive; the assertion below is deliberately just on `safe[r+1]`,
+/// the thing P2-1 is actually about, not on the incidental exact `curr_round` it lands
+/// on.)
+#[tokio::test]
+async fn p2_reorder_deliver_cascades_safe_to_child_round() {
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    control.genesis(); // curr_round = 1
+    let all = authors();
+    let others: Vec<PublicKey> = all.iter().map(|(pk, _)| *pk).filter(|pk| *pk != name).collect();
+
+    // Round 2 (parent = round 1, still unsafe) RB-delivers FIRST -- 2 external READYs
+    // plus our own relay reach 2f+1=3, exactly as `bracha_delivers_on_two_f_plus_1_readies`
+    // establishes for round 1 there.
+    let round2 = ControlProposal { round: 2, parent: 1, value: None };
+    control.on_control_ready(others[0], round2.clone());
+    control.on_control_ready(others[1], round2);
+    assert!(!control.is_safe_for_test(2), "round 1 (its parent) isn't safe yet -- correctly deferred, not an error");
+
+    // Round 1 (parent = 0, always safe) RB-delivers next -- this must cascade.
+    let round1 = ControlProposal { round: 1, parent: 0, value: None };
+    control.on_control_ready(others[0], round1.clone());
+    control.on_control_ready(others[1], round1);
+    assert!(control.is_safe_for_test(1));
+    assert!(
+        control.is_safe_for_test(2),
+        "P2-1: marking round 1 safe must cascade to the already-RB-delivered child round 2 -- pre-fix this stays false forever"
+    );
+}
+
+/// P2-2 regression, isolated from P2-1's own cascade so it can't be the thing doing the
+/// work: round 2 is fixed with parent = round 0 directly (as a real leader would
+/// construct it once it already knows round 1 is disabled -- `safe_parent_for` skips
+/// disabled rounds), so round 2 becomes safe the INSTANT it RB-delivers, independent of
+/// round 1 entirely, while `curr_round` is still 1. `curr_round` only reaches round 2
+/// LATER, via a completely separate transition (round 1 gets DISABLED through the
+/// reliable-notification path, whose own `try_advance_round` call fires on
+/// `disabled[1]`, unrelated to round 2's safety at all). Pre-fix, `enter_round` never
+/// retried Vote, so a round already safe before it's entered sits un-voted until some
+/// other, unrelated event happens to retrigger it. Post-fix, `enter_round(2)` must vote
+/// immediately.
+#[tokio::test]
+async fn p2_enter_round_votes_immediately_when_already_safe() {
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    control.genesis(); // curr_round = 1
+    let all = authors();
+    let others: Vec<PublicKey> = all.iter().map(|(pk, _)| *pk).filter(|pk| *pk != name).collect();
+
+    // Round 2 (parent = 0, unconditionally safe) RB-delivers while curr_round is still
+    // 1 -- safe[2] becomes true right away, well before curr_round ever reaches it.
+    let round2 = ControlProposal { round: 2, parent: 0, value: None };
+    control.on_control_ready(others[0], round2.clone());
+    control.on_control_ready(others[1], round2);
+    assert!(control.is_safe_for_test(2));
+    assert_eq!(control.curr_round_for_test(), 1, "safe[2] says nothing about curr_round -- still 1");
+    assert!(!control.voted(), "round 2 isn't curr_round yet -- Vote correctly hasn't fired for it");
+
+    // Disable round 1 via reliable notification (never RB-delivered/voted at all) --
+    // n-f=3 votes -> accept, then 2f+1=3 accepts -> confirm -> disabled[1], which tries
+    // Advance on `disabled[curr_round]` and enters round 2 -- a transition entirely
+    // unrelated to round 2's own safety.
+    control.on_control_round_timer(1);
+    control.on_control_timeout_vote(others[0], 1);
+    control.on_control_timeout_vote(others[1], 1);
+    control.on_control_timeout_accept(others[0], 1);
+    let effects = control.on_control_timeout_accept(others[1], 1);
+    assert!(control.is_disabled_for_test(1));
+    // P2-2: round 2 was ALREADY safe by the time `curr_round` reached it -- entering it
+    // must vote immediately, which (since Advance doesn't wait for a round's own commit
+    // quorum) races `curr_round` one step further still, to round 3. What matters is
+    // that round 2's OWN commit vote is among the effects of this very call: pre-fix,
+    // `enter_round` never retried Vote, so an already-safe round entered this way would
+    // sit un-voted, and `curr_round` would have stopped dead at 2.
+    assert!(
+        control.curr_round_for_test() >= 2,
+        "P2-2: disabled[1] must at least advance into round 2 (curr_round={})",
+        control.curr_round_for_test()
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::BroadcastControlCommit(2))),
+        "P2-2: round 2's commit vote must be among the effects of the very call that advanced into it -- \
+         pre-fix, `enter_round` never retried Vote, so an already-safe round entered this way never votes"
+    );
+}
+
+/// P2-3 regression: `n-f` matching commits for round `r` arrive BEFORE `r` is locally
+/// safe. Pre-fix, `committed[r]` is set (commit-counting doesn't check `safe`), but
+/// `try_deliver` -- called only from `on_control_commit` -- bails on `!safe[r]` and is
+/// NEVER retried once `r` becomes safe: `r`'s log suffix is a permanent gap. Post-fix,
+/// `mark_safe` must retry Deliver.
+#[tokio::test]
+async fn p2_commit_before_safe_still_delivers_once_safe() {
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    control.genesis(); // curr_round = 1
+    let all = authors();
+    let others: Vec<PublicKey> = all.iter().map(|(pk, _)| *pk).filter(|pk| *pk != name).collect();
+    let proposal = skip_proposal(4, 1);
+    let digest = proposal.digest(&test_sid());
+    control.on_completion_reportable(4, proposal); // seeds `blocks[4]` -- needed for
+                                                    // `pump_log` to resolve the entry
+                                                    // into `Effect::ApplyAnchor` below.
+
+    // Round 2 (parent = round 1, still unsafe) RB-delivers a REAL (non-bottom) value.
+    let round2 = ControlProposal { round: 2, parent: 1, value: Some((4, digest.clone())) };
+    control.on_control_ready(others[0], round2.clone());
+    control.on_control_ready(others[1], round2);
+    assert!(!control.is_safe_for_test(2));
+
+    // n-f=3 matching commits for round 2 arrive NOW, while round 2 is still unsafe.
+    control.on_control_commit(others[0], 2);
+    control.on_control_commit(others[1], 2);
+    control.on_control_commit(name, 2);
+    assert!(control.is_committed_for_test(2), "commit-counting doesn't gate on safe -- committed[2] is set");
+    assert!(control.delivered_log_for_test().is_empty(), "not yet safe -- try_deliver correctly bailed, nothing delivered yet");
+
+    // Round 1 (parent = 0) now RB-delivers -- cascades safe to round 2 (P2-1), which
+    // must retry Deliver (P2-3) since round 2 was already committed.
+    let round1 = ControlProposal { round: 1, parent: 0, value: None };
+    control.on_control_ready(others[0], round1.clone());
+    let effects = control.on_control_ready(others[1], round1);
+    assert!(control.is_safe_for_test(2));
+    assert_eq!(
+        control.delivered_log_for_test(),
+        &[(4, digest)],
+        "P2-3: round 2's log suffix must be delivered once it becomes safe, even though its n-f commits arrived earlier"
+    );
+    assert!(effects.iter().any(|e| matches!(e, Effect::ApplyAnchor(1, ..))), "pump_log must have run off the back of the retried Deliver");
+}
+
+/// P2-4 regression: the round timer fires (`timed_out = true`) while `curr_round` is
+/// still unsafe; `curr_round` only becomes safe AFTERWARD. Pre-fix, Advance's
+/// `safe[curr] && (voted || timed_out)` predicate is only re-evaluated from `try_vote`
+/// (which itself no-ops once `timed_out`) and from `try_deliver` (which needs
+/// `committed` too) -- neither fires here, so the node holds at `curr_round` forever
+/// even though its own predicate is now true. Post-fix (`on_control_round_timer` retries
+/// Advance, and `mark_safe`'s new `try_deliver` retry lets a round that's both
+/// `committed` and freshly `safe` reach Advance through the existing `try_deliver ->
+/// try_advance_round` chain), the node must advance.
+#[tokio::test]
+async fn p2_safe_after_timeout_still_advances() {
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    control.genesis(); // curr_round = 1
+    let all = authors();
+    let others: Vec<PublicKey> = all.iter().map(|(pk, _)| *pk).filter(|pk| *pk != name).collect();
+
+    // Our own round-1 timer fires first -- `timed_out = true`, `voted` stays false.
+    control.on_control_round_timer(1);
+    assert_eq!(control.curr_round_for_test(), 1, "round 1 isn't safe yet -- Advance correctly doesn't fire yet");
+
+    // n-f=3 matching commits for round 1 reach quorum (from OTHER parties' own votes --
+    // this node's local timeout doesn't stop others from voting) BEFORE round 1 is
+    // locally safe.
+    control.on_control_commit(others[0], 1);
+    control.on_control_commit(others[1], 1);
+    control.on_control_commit(others[2], 1);
+    assert!(control.is_committed_for_test(1));
+    assert_eq!(control.curr_round_for_test(), 1, "committed but not yet safe -- try_deliver correctly bails, no advance yet");
+
+    // Round 1 (parent = 0) now RB-delivers -- Mark-safe fires; `try_vote` no-ops
+    // (`timed_out` already true) but `try_deliver` fires (already committed), whose own
+    // `safe[curr] && timed_out` check in Advance now holds.
+    let round1 = ControlProposal { round: 1, parent: 0, value: None };
+    control.on_control_ready(others[0], round1.clone());
+    control.on_control_ready(others[1], round1);
+    assert!(control.is_safe_for_test(1));
+    assert!(!control.voted(), "timed_out was already true -- Vote must never fire for this round");
+    assert_eq!(
+        control.curr_round_for_test(),
+        2,
+        "P2-4: safe[1] && timed_out now both hold -- Advance must fire even though this node itself never voted"
+    );
+}
+
+/// P2-4, the OTHER missing site (see `mark_safe`'s doc comment): `timed_out` fires
+/// first, and `curr_round` becomes safe LATER with NO commits at all yet counted
+/// (`committed[curr]` false). Neither `try_vote` (no-ops once `timed_out`) nor
+/// `try_deliver` (no-ops while `!committed`) ever reaches `try_advance_round` in this
+/// case -- confirmed empirically to still wedge with only fixes #2/#3 (`enter_round`
+/// and the timer path) applied; `mark_safe` itself must also re-check Advance directly.
+#[tokio::test]
+async fn p2_safe_after_timeout_advances_even_with_no_commits_yet() {
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    control.genesis(); // curr_round = 1
+    let all = authors();
+    let others: Vec<PublicKey> = all.iter().map(|(pk, _)| *pk).filter(|pk| *pk != name).collect();
+
+    control.on_control_round_timer(1); // timed_out = true, voted stays false
+    assert_eq!(control.curr_round_for_test(), 1);
+
+    // Round 1 (parent = 0) RB-delivers -- NO commits counted at all yet.
+    let round1 = ControlProposal { round: 1, parent: 0, value: None };
+    control.on_control_ready(others[0], round1.clone());
+    control.on_control_ready(others[1], round1);
+    assert!(control.is_safe_for_test(1));
+    assert!(!control.is_committed_for_test(1), "this scenario has zero commits, unlike the sibling test above");
+    assert!(!control.voted(), "timed_out was already true -- Vote must never fire");
+    assert_eq!(
+        control.curr_round_for_test(),
+        2,
+        "P2-4: safe[1] && timed_out hold with no commits at all -- Advance must still fire (its predicate has no committed/voted-by-us term)"
+    );
+}
+
+/// Fable re-audit pass 1 (P2-1 depth, separate from the recursion-cycle test below):
+/// a single `mark_safe` cascade establishing K=5000 CONSECUTIVE already-RB-delivered
+/// rounds (deliver rounds K down to 2 first -- each one's parent isn't even
+/// RB-delivered yet, so `mark_safe` correctly defers every one -- then deliver round 1
+/// last, whose parent, round 0, is unconditionally safe) must walk the entire chain,
+/// in one `mark_safe` call, voting and advancing through every round, without
+/// overflowing the ambient stack.
+#[tokio::test]
+async fn p2_deep_cascade_five_thousand_rounds_does_not_overflow_stack() {
+    const K: u64 = 5000;
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    control.genesis(); // curr_round = 1
+    let all = authors();
+    let others: Vec<PublicKey> = all.iter().map(|(pk, _)| *pk).filter(|pk| *pk != name).collect();
+
+    // RB-deliver rounds K, K-1, ..., 2 FIRST, out of order -- each round r's parent
+    // (r-1) isn't even RB-delivered yet at the moment r itself delivers, so `mark_safe`
+    // correctly defers every one of them (no cascade at all yet, just O(1) work each).
+    for r in (2..=K).rev() {
+        let cp = ControlProposal { round: r, parent: r - 1, value: None };
+        control.on_control_ready(others[0], cp.clone());
+        control.on_control_ready(others[1], cp);
+        assert!(!control.is_safe_for_test(r));
+    }
+
+    // Round 1 (parent = 0, unconditionally safe) RB-delivers LAST -- the single
+    // `mark_safe` call whose worklist cascade must walk the entire K-round chain,
+    // voting and advancing through every one of them.
+    let round1 = ControlProposal { round: 1, parent: 0, value: None };
+    control.on_control_ready(others[0], round1.clone());
+    control.on_control_ready(others[1], round1);
+
+    assert!(control.is_safe_for_test(K), "the whole K-round chain must become safe in the one cascading mark_safe call");
+    assert!(
+        control.curr_round_for_test() > K,
+        "the node must advance all the way through the K-round chain (curr_round = {})",
+        control.curr_round_for_test()
+    );
+}
+
+/// Fable re-audit pass 1 regression: `enter_round_core` (P2-2's Vote-on-entry retry)
+/// and `try_advance_round` (Advance) must not close a mutual-recursion cycle. Before
+/// this fix, `enter_round` called `try_vote`, which called `try_advance_round`, which
+/// called `enter_round` again.
+///
+/// IMPORTANT: this needs a DIFFERENT structure from the sibling test above to actually
+/// be discriminating. That test's CHAIN structure (`parent = r-1`) drives the K-round
+/// cascade entirely through `mark_safe`'s own iterative worklist, which marks ONE round
+/// safe at a time and votes it immediately -- so by construction the next round is
+/// never already-safe when the (reverted, pre-fix) recursive `try_vote ->
+/// try_advance_round -> enter_round` excursion reaches it, and that excursion always
+/// bottoms out after a single level REGARDLESS of K. Confirmed empirically: reverting
+/// to the pre-fix recursive shape and running the sibling test's exact chain structure
+/// at K up to 50,000 with a stack as small as 48 KiB never overflows -- that structure
+/// cannot expose this bug at all.
+///
+/// The genuine trigger needs K rounds ALREADY marked safe, ALL before `curr_round` ever
+/// reaches the first of them, via transitions entirely SEPARATE from the one that
+/// finally advances into them. This test builds exactly that: every round 2..=K+1 has
+/// parent = 0 (unconditionally safe), so each becomes safe via its own independent,
+/// trivial `mark_safe` call while `curr_round` is still 1 (none of them voted for yet).
+/// Round 1 is then DISABLED via reliable notification (a transition wholly unrelated to
+/// any of the K rounds' own safety) advancing `curr_round` into round 2 -- already safe,
+/// so voting it recurses (pre-fix) into round 3, ALSO already safe, and so on through
+/// all K in one unbroken recursive chain.
+///
+/// Run inside a thread with an explicitly small, realistic stack (2 MiB -- a typical
+/// tokio worker-thread default, not the test harness's own inflated ambient default of
+/// several MiB, which would mask the bug regardless of K). Confirmed empirically both
+/// ways: the pre-fix recursive shape overflows this exact 2 MiB stack at K=5000; the
+/// fixed iterative shape survives it, and (checked separately) survives the same 2 MiB
+/// stack at K=500,000 too -- O(1) stack, independent of K.
+#[test]
+fn p2_deep_recursion_cycle_broken_survives_constrained_stack() {
+    const STACK_SIZE: usize = 2 * 1024 * 1024; // 2 MiB, a typical tokio worker-thread default
+    const K: u64 = 5000;
+    let handle = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let (name, _) = authors()[3];
+            let mut control = new_control(name);
+            control.genesis(); // curr_round = 1
+            let all = authors();
+            let others: Vec<PublicKey> = all.iter().map(|(pk, _)| *pk).filter(|pk| *pk != name).collect();
+
+            // STAR structure: every round 2..=K+1 has parent = 0 (unconditionally safe),
+            // so EACH becomes safe via its OWN separate, trivial `mark_safe` call, ALL
+            // while curr_round is still 1 and none of them has been voted for yet.
+            for r in 2..=(K + 1) {
+                let cp = ControlProposal { round: r, parent: 0, value: None };
+                control.on_control_ready(others[0], cp.clone());
+                control.on_control_ready(others[1], cp);
+                assert!(control.is_safe_for_test(r));
+            }
+            assert_eq!(control.curr_round_for_test(), 1);
+
+            // Disable round 1 via reliable notification (never RB-delivered/voted) --
+            // an entirely separate transition mechanism, unrelated to any of the K
+            // rounds' own safety -- advances curr_round into round 2, which is ALREADY
+            // safe: voting it recurses (pre-fix) into round 3, ALSO already safe, and so
+            // on through all K, in one unbroken chain if the cycle is not actually gone.
+            control.on_control_round_timer(1);
+            control.on_control_timeout_vote(others[0], 1);
+            control.on_control_timeout_vote(others[1], 1);
+            control.on_control_timeout_accept(others[0], 1);
+            control.on_control_timeout_accept(others[1], 1);
+            control.curr_round_for_test()
+        })
+        .unwrap();
+    let curr_round = handle.join().expect("a 2 MiB stack must survive a K=5000 already-safe cascade -- the recursion cycle must be gone");
+    assert_eq!(curr_round, K + 2, "must advance all the way through the K already-safe rounds plus the disabled round 1");
+}

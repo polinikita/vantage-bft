@@ -190,14 +190,48 @@ impl ControlLog {
         self.enter_round(1)
     }
 
-    /// **Enter round**: `curr_round <- r`, reset the round timer, `voted =
-    /// timed_out = false`, propose if leader.
-    fn enter_round(&mut self, r: Round) -> Vec<Effect> {
+    /// **Enter round**'s pure bookkeeping: `curr_round <- r`, reset the round timer,
+    /// `voted = timed_out = false`, propose if leader, and (Fable audit P2-2) retry
+    /// Vote -- a round that became `safe` before we ever entered it (its `try_vote`
+    /// no-op'd earlier because `r != curr_round` at the time) is never retried on its
+    /// own otherwise. No-op unless `safe[r]` is already true (`voted`/`timed_out` were
+    /// both just reset above).
+    ///
+    /// Deliberately NOT itself recursive/iterative on Advance -- Fable re-audit pass 1:
+    /// this used to live directly in `enter_round`, which called `try_vote`, which
+    /// called `try_advance_round`, which called `enter_round` again -- a 3-function
+    /// mutual-recursion cycle with one full cycle of stack depth PER round a single
+    /// `mark_safe` cascade could advance through. Since `mark_safe`'s own cascade over
+    /// K consecutive already-RB-delivered rounds is adversarially controllable (a
+    /// lagging/rejoining node's safe backlog), that was an O(K) stack-overflow risk --
+    /// exactly the class `mark_safe` itself was already rewritten iteratively to avoid.
+    /// Split out as a shared helper that itself NEVER drives Advance (its `try_vote` is
+    /// voting-only): `enter_round` (the one-shot boot entry) and `try_advance_round`'s
+    /// loop (the sole repeated driver, now bounded O(1) stack regardless of K) both
+    /// call this. `try_advance_round` calls `enter_round_core` but not `enter_round`,
+    /// and nothing `enter_round_core` calls re-enters `try_advance_round`, so the cycle
+    /// is gone -- `enter_round`'s own single `try_advance_round` call (boot only) is not
+    /// on any loop and costs O(1).
+    fn enter_round_core(&mut self, r: Round) -> Vec<Effect> {
         self.curr_round = r;
         self.voted = false;
         self.timed_out = false;
         let mut effects = vec![Effect::ArmControlTimer(r, std::time::Instant::now() + self.control_round_timeout())];
         effects.extend(self.try_propose(r));
+        effects.extend(self.try_vote(r));
+        effects
+    }
+
+    /// **Init** (Fig. 2): the one-shot boot entry point (`genesis` -> `enter_round(1)`).
+    /// Enters `r` via `enter_round_core`, then drives Advance iteratively in case `r`
+    /// is somehow already safe/disabled at the moment of entry (never true for `r=1`
+    /// in practice -- nothing can be safe before round 1 even exists -- but keeps this
+    /// the same shape as every other post-entry site, all of which already call
+    /// `try_advance_round` themselves rather than relying on `enter_round_core` to
+    /// cascade on its own).
+    fn enter_round(&mut self, r: Round) -> Vec<Effect> {
+        let mut effects = self.enter_round_core(r);
+        effects.extend(self.try_advance_round());
         effects
     }
 
@@ -471,16 +505,68 @@ impl ControlLog {
     // ============================================================ Round machine
 
     /// **Mark safe**: `proposal[r] = <r',b>` and `safe[r']` => `safe[r] = true`.
+    ///
+    /// Fable audit P2-1/P2-2/P2-3/P2-4: `safe[r]` becoming true is a transition every
+    /// one of Vote/Deliver/Advance's predicates depends on, AND a transition a child
+    /// round's OWN `safe` predicate depends on (`safe[r]` is child `r+1`'s `p.parent`
+    /// condition) -- under cross-round reordering a child can RB-deliver while its
+    /// parent is still unsafe, and back then `mark_safe(child)` bailed for good (the
+    /// parent's later `mark_safe` never used to look at it). Rewritten as an ITERATIVE
+    /// worklist (not recursion -- an adversarial chain must not cost O(chain) stack
+    /// depth): every round this call newly marks safe (a) retries Vote (P2-2's other
+    /// half: `enter_round` retries the case safe-before-entry; this retries the case
+    /// safe-after-entry, both against the SAME `try_vote` no-op-unless-ready guard),
+    /// (b) retries Deliver (P2-3: `committed[r]` may already hold from commits that
+    /// arrived before `r` was safe), (c) retries Advance directly (see the note below),
+    /// and (d) pushes any already-RB-delivered child whose parent is this now-safe
+    /// round onto the worklist (P2-1's cascade).
+    ///
+    /// Deviation from the audit's literal fix list, flagged per its own "STOP and
+    /// report rather than guess" instruction rather than silently applied: the audit's
+    /// bug description names TWO sites that fail to drive Advance's `timed_out`
+    /// disjunct -- "neither the timer path ... nor mark_safe" -- but its concrete fix
+    /// list only patches the timer path (`on_control_round_timer` retrying Advance).
+    /// That alone only fixes the safe-before-timeout ordering. Confirmed empirically
+    /// (a throwaway probe test) that with ONLY the timer-path + `enter_round` +
+    /// `try_deliver`-in-`mark_safe` fixes applied, the timeout-before-safe ordering
+    /// with zero commits counted still wedges forever: `try_vote(r)` no-ops once
+    /// `timed_out`, and `try_deliver(r)` no-ops while `!committed[r]` -- neither ever
+    /// reaches `try_advance_round`, even though Advance's own predicate
+    /// (`safe[curr] && (voted || timed_out)`) has no `committed` term and is already
+    /// true. The direct call below closes that second named site, exactly mirroring
+    /// the same "re-check the predicate at every site that can newly satisfy it"
+    /// principle already applied to Vote/Deliver/the child cascade/the timer path --
+    /// no threshold, format, or safety predicate changed, just one more idempotent
+    /// recheck call (harmless if `r != curr_round`: `try_advance_round` reads
+    /// `self.curr_round` itself and no-ops otherwise).
     fn mark_safe(&mut self, r: Round) -> Vec<Effect> {
-        if self.safe.contains(&r) {
-            return Vec::new();
+        let mut effects = Vec::new();
+        let mut worklist = vec![r];
+        while let Some(r) = worklist.pop() {
+            if self.safe.contains(&r) {
+                continue;
+            }
+            let Some(p) = self.proposal.get(&r) else { continue };
+            let parent = p.parent;
+            if !self.safe.contains(&parent) {
+                continue;
+            }
+            self.safe.insert(r);
+            effects.extend(self.try_vote(r));
+            effects.extend(self.try_deliver(r));
+            effects.extend(self.try_advance_round());
+            // P2-1 cascade: any already-RB-delivered child whose parent is the
+            // now-safe `r`, collected into an owned `Vec` first so this doesn't hold a
+            // borrow of `self.proposal`/`self.bracha` across the `worklist.extend` (no
+            // further `self` calls needed once collected).
+            let children: Vec<Round> = self
+                .proposal
+                .iter()
+                .filter(|(cr, cp)| cp.parent == r && !self.safe.contains(cr) && self.bracha.get(cr).is_some_and(|b| b.delivered.is_some()))
+                .map(|(cr, _)| *cr)
+                .collect();
+            worklist.extend(children);
         }
-        let Some(p) = self.proposal.get(&r) else { return Vec::new() };
-        if !self.safe.contains(&p.parent) {
-            return Vec::new();
-        }
-        self.safe.insert(r);
-        let mut effects = self.try_vote(r);
         effects.extend(self.retry_propose()); // a newly-safe round can unblock a
                                                // pending leader proposal at curr_round
         effects
@@ -489,6 +575,13 @@ impl ControlLog {
     /// **Vote**: `safe[curr_round] && !timed_out && !voted` => broadcast
     /// `<commit,curr_round>`, `voted = true`. Only ever fires for `curr_round` (the
     /// paper's own per-round state).
+    ///
+    /// Fable re-audit pass 1: deliberately does NOT itself call `try_advance_round`
+    /// anymore (it used to) -- see `enter_round_core`'s doc comment for the
+    /// mutual-recursion cycle that call used to close. Voting only; every call site
+    /// (`enter_round_core`, `mark_safe`) is responsible for driving Advance itself
+    /// afterward, which they all already do (directly, or via `try_deliver`'s own
+    /// existing `try_advance_round` call).
     fn try_vote(&mut self, r: Round) -> Vec<Effect> {
         if r != self.curr_round || self.voted || self.timed_out {
             return Vec::new();
@@ -499,9 +592,11 @@ impl ControlLog {
         self.voted = true;
         let name = self.name;
         self.commit_votes.entry(r).or_default().insert(name);
-        let mut effects = vec![Effect::BroadcastControlCommit(r)];
-        effects.extend(self.try_advance_round());
-        effects
+        // Voting ONLY -- deliberately does not drive Advance (it used to, which closed
+        // the mutual-recursion cycle enter_round_core -> try_vote -> try_advance_round
+        // -> enter_round_core ...). Every caller (`enter_round_core`, `mark_safe`)
+        // drives `try_advance_round` -- now the single iterative driver -- itself.
+        vec![Effect::BroadcastControlCommit(r)]
     }
 
     /// **Timeout**: the control-round timer firing.
@@ -510,7 +605,13 @@ impl ControlLog {
             return Vec::new();
         }
         self.timed_out = true;
-        self.rn_raise(r)
+        // Fable audit P2-4: Advance's own predicate (`safe[curr] && (voted ||
+        // timed_out)`) just gained a new true disjunct at THIS transition site (`timed_out`
+        // becoming true) -- re-evaluate it here too, not only at the `voted`/`disabled`
+        // transition sites that already did. No-op unless `safe[r]` is already true.
+        let mut effects = self.rn_raise(r);
+        effects.extend(self.try_advance_round());
+        effects
     }
 
     /// Reliable notification's **Vote** step: `rn_raise(<timeout,r>)`.
@@ -610,13 +711,40 @@ impl ControlLog {
 
     /// **Advance round**: `safe[curr_round] && (voted || timed_out)`, or
     /// `disabled[curr_round]` => enter `curr_round + 1`.
+    ///
+    /// Fable re-audit pass 1: the SOLE driver of round advancement, rewritten as an
+    /// ITERATIVE loop (was: `self.enter_round(r + 1)`, which itself called `try_vote`,
+    /// which used to call back into this function -- a mutual-recursion cycle costing
+    /// a few stack frames per round advanced through). A single `mark_safe` cascade
+    /// establishing K consecutive already-safe rounds now advances through all K here,
+    /// in one bounded loop, however large K is -- O(1) stack regardless. Each iteration
+    /// re-reads `self.curr_round`/`self.safe`/`self.voted`/`self.timed_out`/
+    /// `self.disabled` fresh (no stale captured state), so a round that `enter_round_core`
+    /// just voted for (setting `voted = true`) can immediately satisfy the NEXT
+    /// iteration's own Advance check if it too is already safe -- exactly the K-deep
+    /// cascade case.
+    ///
+    /// The loop's only callee is `enter_round_core` (voting-only `try_vote` + `try_propose`).
+    /// One static path does lead from `enter_round_core` back here -- the leader's own
+    /// INIT self-delivery: `try_propose -> on_control_init(self) -> try_echo ->
+    /// recheck_bracha_ready -> recheck_bracha_deliver -> mark_safe -> try_advance_round`.
+    /// It is dynamically DEAD for every fault-tolerant committee (n >= 4): closing it
+    /// needs `recheck_bracha_deliver` to reach `2f+1` READYs from the locally-available
+    /// set, which after a self-INIT is at most the leader's own 1 (+ f Byzantine) = f+1,
+    /// and `f+1 >= 2f+1` only at `f = 0` (n <= 3). So for any real deployment nothing the
+    /// loop calls re-enters it, and stack stays O(1); the constrained-stack regression
+    /// test (`tests/control_tests.rs`) confirms it empirically.
     fn try_advance_round(&mut self) -> Vec<Effect> {
-        let r = self.curr_round;
-        let ready = (self.safe.contains(&r) && (self.voted || self.timed_out)) || self.disabled.contains(&r);
-        if !ready {
-            return Vec::new();
+        let mut effects = Vec::new();
+        loop {
+            let r = self.curr_round;
+            let ready = (self.safe.contains(&r) && (self.voted || self.timed_out)) || self.disabled.contains(&r);
+            if !ready {
+                break;
+            }
+            effects.extend(self.enter_round_core(r + 1));
         }
-        self.enter_round(r + 1)
+        effects
     }
 
     // ============================================================ Reports (§5)
