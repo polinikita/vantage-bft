@@ -81,6 +81,28 @@ impl Client {
 
         // Submit all transactions.
         let burst = self.rate / PRECISION;
+        // Fable audit item 2: `burst = rate / PRECISION` truncates any per-client rate
+        // in `1..PRECISION` (i.e. under 20 tx/s) down to 0, so the loop below would
+        // send nothing at all, every tick, forever -- silently: no error, no log line,
+        // RESULTS just shows 0 TPS. Warn once, loudly, so a misconfigured low-rate run
+        // is obvious instead of a silent no-op.
+        if self.rate > 0 && burst == 0 {
+            warn!(
+                "Per-client rate {} tx/s is below the sampling precision ({} ticks/s); \
+                 falling back to sub-burst pacing (~1 tx roughly every {} ms) instead of \
+                 silently sending zero transactions.",
+                self.rate,
+                PRECISION,
+                (PRECISION as f64 / self.rate as f64 * BURST_DURATION as f64).round() as u64,
+            );
+        }
+        // Fractional tx budget for the sub-burst (`burst == 0`) case: accumulates
+        // `self.rate` every tick and flushes whole transactions out of it, so any
+        // positive rate below the `PRECISION` sampling grid still sends at (on
+        // average, over one second) exactly `self.rate` tx/s instead of 0. Unused --
+        // and behavior-irrelevant -- whenever `burst > 0`, since that branch never
+        // touches it (see the `this_tick_count` computation below).
+        let mut sub_burst_carry: u64 = 0;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
         let mut r = rand::thread_rng().gen();
@@ -95,8 +117,24 @@ impl Client {
             interval.as_mut().tick().await;
             let now = Instant::now();
 
-            for x in 0..burst {
-                if x == counter % burst {
+            // `burst > 0`: byte-identical to before this fix -- always exactly `burst`
+            // sends this tick. `burst == 0` (rate below `PRECISION`): most ticks send
+            // nothing, but the accumulator above periodically allows exactly one, at
+            // the rate implied by `self.rate` (a standard fixed-point "Bresenham" rate
+            // limiter, not a hack -- it reproduces `burst` exactly whenever the rate
+            // divides evenly, and never drops below 1 tx/PRECISION-tick average
+            // otherwise).
+            let this_tick_count = if burst > 0 {
+                burst
+            } else {
+                sub_burst_carry += self.rate;
+                let n = sub_burst_carry / PRECISION;
+                sub_burst_carry %= PRECISION;
+                n
+            };
+
+            for x in 0..this_tick_count {
+                if x == counter % this_tick_count {
                     // NOTE: This log entry is used to compute performance.
                     info!("Sending sample transaction {}", counter);
 

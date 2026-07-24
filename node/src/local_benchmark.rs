@@ -212,13 +212,21 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
 
     // Spawn every primary and every worker natively, in this one process -- only for
     // the live nodes (R2).
-    let mut worker_metrics: Vec<(prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
+    // Fable audit item 1: kept per NODE index (not a flat list) -- with `--workers >
+    // 1`, each worker's own registry only ever observes the slice of the committed
+    // stream tagged with ITS OWN worker id (`Synchronizer::observe_committed`), so
+    // summing every worker belonging to the same node recovers that node's true
+    // committed total; only THEN is it comparable across nodes (see `print_results`).
+    let mut worker_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
     // PHASE6-SPEC.md §9 gate amendment: `vantage_seals` lives on each PRIMARY's own
     // registry (distinct from `worker_metrics` above) -- kept per node index so the
     // RESULTS block can print each node's own route breakdown (they can legitimately
     // differ across nodes) plus a summed total.
     let mut primary_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
     let mut metrics_targets: Vec<(String, SocketAddr)> = Vec::new(); // (label, addr) for prometheus.yaml
+    // Fable audit item 5: every client task's handle, so they can be stopped (aborted)
+    // before the final, drained re-read -- see the end of this fn.
+    let mut client_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     for (i, keypair) in keypairs.into_iter().take(live_nodes).enumerate() {
         let name = keypair.name;
@@ -230,7 +238,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         primary_metrics.push((i, primary_registry, primary_reporter));
         metrics_targets.push(primary_target);
 
-        for (worker_registry, worker_reporter, worker_target) in spawn_node_workers(
+        let (workers_spawned, workers_client_handles) = spawn_node_workers(
             i,
             name,
             &node_dir,
@@ -241,10 +249,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             rate_share,
             mode,
             &all_worker_addresses,
-        )? {
-            worker_metrics.push((worker_registry, worker_reporter));
+        )?;
+        for (worker_registry, worker_reporter, worker_target) in workers_spawned {
+            worker_metrics.push((i, worker_registry, worker_reporter));
             metrics_targets.push(worker_target);
         }
+        client_handles.extend(workers_client_handles);
     }
 
     // Generate prometheus.yaml for the optional monitoring/ stack (PHASE2-SPEC.md #8):
@@ -314,7 +324,48 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     }
 
     let actual_secs = run_start.elapsed().as_secs().max(1);
-    print_results(&worker_metrics, &primary_metrics, actual_secs, protocol).await;
+    // Unchanged from before this fix: read + print exactly as always (byte-identical
+    // numbers for every existing config, including the default gate config) --
+    // client tasks are still running and the commit pipeline may still be advancing
+    // underneath this read, same as before.
+    print_results(&worker_metrics, &primary_metrics, actual_secs, protocol, "").await;
+
+    // Fable audit item 5 (measurement window): the RESULTS above can under- or
+    // over-count the tail of the run, since client tasks are never stopped and the
+    // registries are read while commits are still non-atomically advancing. Rather
+    // than changing the numbers above (which would move already-recorded headline
+    // numbers for every config, including the default gate config), stop every
+    // client task now (so no NEW transaction is submitted), give already-in-flight
+    // transactions a bounded chance to actually land in the registries, and re-report
+    // the same duration/numbers from that settled state as a clearly separate,
+    // additional block. This is the "at least stop the client/benchmark tasks before
+    // reading final RESULTS" alternative this item calls out; `duration` (the
+    // denominator) is intentionally NOT extended by the drain below, only the
+    // registry read is delayed.
+    //
+    // NOT done here (would change existing numbers, so out of scope without a STOP):
+    // trimming `run_start`'s own ramp-up (ports/synchronization warm-up before the
+    // first real commit) out of the measured window -- that would shrink the
+    // denominator and raise every reported TPS/BPS, including the default gate
+    // config's.
+    for handle in &client_handles {
+        handle.abort();
+    }
+    let drain_ms = max_batch_delay_ms
+        .saturating_add(max_header_delay_ms)
+        .saturating_add(parameters.timeout_delay)
+        .saturating_add(delta_ms)
+        .max(1_000);
+    tokio::time::sleep(tokio::time::Duration::from_millis(drain_ms)).await;
+    print_results(
+        &worker_metrics,
+        &primary_metrics,
+        actual_secs,
+        protocol,
+        &format!(" -- STEADY-STATE (client tasks stopped, {} ms drain before re-read)", drain_ms),
+    )
+    .await;
+
     Ok(())
 }
 
@@ -418,7 +469,9 @@ fn spawn_node_primary(
 /// client task per worker, waiting for every live node's worker addresses
 /// before sending (mirrors `benchmark_client --nodes`). Returns each worker's
 /// metrics registry/reporter alongside its own metrics-scrape target for
-/// `prometheus.yaml`, in worker-id order.
+/// `prometheus.yaml` (in worker-id order), plus that client task's own
+/// `JoinHandle` (Fable audit item 5: so the caller can stop it before a final,
+/// drained re-read -- see `run`).
 // clippy::too_many_arguments: see primary/src/committer.rs's identical justification
 // (this local helper mirrors Worker::spawn's own wiring one-for-one).
 #[allow(clippy::too_many_arguments)]
@@ -433,8 +486,9 @@ fn spawn_node_workers(
     rate_share: u64,
     mode: TransactionMode,
     all_worker_addresses: &[SocketAddr],
-) -> Result<Vec<NodeMetricsHandle>> {
+) -> Result<(Vec<NodeMetricsHandle>, Vec<tokio::task::JoinHandle<()>>)> {
     let mut spawned = Vec::with_capacity(workers);
+    let mut client_handles = Vec::with_capacity(workers);
     for j in 0..workers {
         let worker_id = j as WorkerId;
         let worker_store = Store::new_with_profile(
@@ -460,14 +514,14 @@ fn spawn_node_workers(
             nodes: all_worker_addresses.to_vec(),
             mode,
         };
-        tokio::spawn(async move {
+        client_handles.push(tokio::spawn(async move {
             client.wait().await;
             if let Err(e) = client.send().await {
                 log::warn!("Client for node {} worker {} exited: {}", i, j, e);
             }
-        });
+        }));
     }
-    Ok(spawned)
+    Ok((spawned, client_handles))
 }
 
 /// Computed in-process from each worker's own `Registry` -- no scraping, no log
@@ -476,28 +530,45 @@ fn spawn_node_workers(
 /// counts the same replicated commit stream), summed sum/sum-of-squares for the exact
 /// avg/stddev ratio, median across nodes for percentiles.
 async fn print_results(
-    worker_metrics: &[(prometheus::Registry, Arc<MetricReporter>)],
+    worker_metrics: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
     primary_metrics: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
     duration: u64,
     protocol: Protocol,
+    label: &str,
 ) {
     let mut snapshots: Vec<LatencySnapshot> = Vec::new();
-    for (registry, reporter) in worker_metrics {
+    // Fable audit item 1: with `--workers > 1`, each worker's registry only ever
+    // observes the slice of the committed stream tagged with ITS OWN worker id
+    // (`Synchronizer::observe_committed` routes a `Committed` notification to the
+    // local worker whose id matches the header author's payload entries) -- so
+    // `committed_transactions`/`committed_bytes` on any ONE worker's registry is only
+    // that worker-id's partition, not the node's full committed total. Summed within
+    // each NODE first (below), so the two committed counters reflect that node's true
+    // total BEFORE taking `.max()` ACROSS nodes -- every node counts ~the same
+    // replicated stream once summed, the same invariant `aggregate_latency_snapshots`
+    // already relies on for the latency histogram's own `count`/`misses`. With
+    // `--workers 1` (the default) each node contributes exactly one worker, so this
+    // sum is a no-op and the reported numbers are unchanged.
+    let mut committed_by_node: std::collections::BTreeMap<usize, (u64, u64)> = std::collections::BTreeMap::new();
+    for (node, registry, reporter) in worker_metrics {
         // Force a final drain so the gauges reflect every observation up to now, not
         // whatever the last periodic (every-10s) tick happened to see.
         reporter.force_report();
         if let Some(snapshot) = read_latency_snapshot(registry) {
+            let entry = committed_by_node.entry(*node).or_insert((0, 0));
+            entry.0 += snapshot.committed_transactions;
+            entry.1 += snapshot.committed_bytes;
             snapshots.push(snapshot);
         }
     }
 
-    let max_committed_transactions = snapshots.iter().map(|s| s.committed_transactions).max().unwrap_or(0);
-    let max_committed_bytes = snapshots.iter().map(|s| s.committed_bytes).max().unwrap_or(0);
+    let max_committed_transactions = committed_by_node.values().map(|(t, _)| *t).max().unwrap_or(0);
+    let max_committed_bytes = committed_by_node.values().map(|(_, b)| *b).max().unwrap_or(0);
     let consensus_tps = max_committed_transactions as f64 / duration.max(1) as f64;
     let consensus_bps = max_committed_bytes as f64 / duration.max(1) as f64;
 
     println!("\n-----------------------------------------");
-    println!(" SUMMARY:");
+    println!(" SUMMARY{}:", label);
     println!("-----------------------------------------");
     println!(" + RESULTS:");
     println!(" Consensus TPS: {:.0} tx/s", consensus_tps);
@@ -540,8 +611,8 @@ async fn print_results(
     // counters are SUMMED across every node (each node's own independent traffic,
     // additive) -- unlike the replicated-commit-stream latency snapshot above, which
     // uses max/median across nodes because every node counts the same global stream.
-    let submitted_transactions: u64 = worker_metrics.iter().map(|(r, _)| read_counter(r, "submitted_transactions")).sum();
-    let submitted_bytes: u64 = worker_metrics.iter().map(|(r, _)| read_counter(r, "submitted_transactions_bytes")).sum();
+    let submitted_transactions: u64 = worker_metrics.iter().map(|(_, r, _)| read_counter(r, "submitted_transactions")).sum();
+    let submitted_bytes: u64 = worker_metrics.iter().map(|(_, r, _)| read_counter(r, "submitted_transactions_bytes")).sum();
 
     let mut sent_by_type: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut sent_bytes_by_type: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
@@ -549,7 +620,7 @@ async fn print_results(
     let mut total_bytes_received: u64 = 0;
     let all_registries = worker_metrics
         .iter()
-        .map(|(r, _)| r)
+        .map(|(_, r, _)| r)
         .chain(primary_metrics.iter().map(|(_, r, _)| r));
     for registry in all_registries {
         total_bytes_sent += read_counter(registry, "bytes_sent_total");

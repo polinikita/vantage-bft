@@ -10,6 +10,7 @@ use log::debug;
 use log::info;
 use metrics::Metrics;
 use network::SimpleSender;
+use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
@@ -65,6 +66,10 @@ pub struct BatchMaker {
 const YIELD_EVERY: u64 = 32;
 
 impl BatchMaker {
+    // clippy::too_many_arguments: see primary/src/committer.rs's identical
+    // justification (Fable audit item 4's new `latency_map` param pushed this over the
+    // threshold).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         batch_size: usize,
         max_batch_delay: u64,
@@ -72,6 +77,13 @@ impl BatchMaker {
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<SerializedBatchMessage>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        // Fable audit item 4 (WAN latency injection): this authority's own
+        // per-destination artificial latency map (same contract as
+        // `Core::spawn`/`vantage::node::VantageCore::spawn`'s `latency_map` --
+        // resolved once by `Worker::spawn` via `Committee::latency_map`, empty ==
+        // current behavior). Applied to worker-to-worker batch broadcast, the
+        // dominant bandwidth path a WAN-shaped run previously left undelayed.
+        latency_map: HashMap<SocketAddr, Duration>,
         // METRICS-DASHBOARD-SPEC.md §1/§2: appended last, same convention as
         // primary-side `::spawn` functions.
         metrics: Arc<Metrics>,
@@ -88,7 +100,7 @@ impl BatchMaker {
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
-                network: SimpleSender::new().with_metrics(metrics.clone()).with_compression(compress_network),
+                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network),
                 metrics,
                 loop_ticks: 0,
             }

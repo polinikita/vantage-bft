@@ -30,6 +30,7 @@ async fn synchronize() {
         /* sync_retry_delay */ 1_000_000, // Ensure it is not triggered.
         /* sync_retry_nodes */ 3, // Not used in this test.
         rx_message,
+        /* latency_map */ std::collections::HashMap::new(),
         metrics,
         false,
     );

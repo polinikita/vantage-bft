@@ -15,9 +15,12 @@ use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 
@@ -57,6 +60,16 @@ pub struct Worker {
     /// worker's own real-transaction-latency counters are only observed into under the
     /// `benchmark` feature (see `Synchronizer::observe_committed`).
     metrics: Arc<Metrics>,
+    /// Fable audit item 4 (WAN latency injection): this authority's own
+    /// per-destination artificial latency map, resolved once at spawn time exactly
+    /// the way `Core::spawn`/`vantage::node::VantageCore::spawn` resolve theirs (same
+    /// `Committee::latency_map` call, same `name`/`parameters.latency_table`) --
+    /// empty (== current behavior, byte-identical) unless `--latency-table`/
+    /// `--mimic-latency-ms` set `parameters.latency_table`. Threaded into every
+    /// worker-to-worker/worker-to-primary-reply `SimpleSender` this worker spawns
+    /// (`BatchMaker`, `Synchronizer`, `Helper`), which previously ran at zero
+    /// injected delay even under a WAN-shaped run.
+    latency_map: HashMap<SocketAddr, Duration>,
 }
 
 impl Worker {
@@ -82,6 +95,18 @@ impl Worker {
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Worker {} metrics listening on {}", id, metrics_address);
 
+        // Fable audit item 4: resolved once, relative to OUR OWN committee index --
+        // empty (== current behavior) unless `--latency-table`/`--mimic-latency-ms`
+        // set `parameters.latency_table`. Identical construction to
+        // `vantage::node::VantageCore::spawn`'s own `latency_map` (same table, same
+        // per-authority resolution), so worker-to-worker traffic is delayed the same
+        // way primary-to-primary traffic already is.
+        let latency_map = parameters
+            .latency_table
+            .as_deref()
+            .map(|table| committee.latency_map(&name, table))
+            .unwrap_or_default();
+
         // Define a worker instance.
         let worker = Self {
             name,
@@ -90,6 +115,7 @@ impl Worker {
             parameters,
             store,
             metrics: metrics.clone(),
+            latency_map,
         };
 
         // Spawn all worker tasks.
@@ -158,6 +184,7 @@ impl Worker {
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
+            self.latency_map.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
         );
@@ -211,6 +238,7 @@ impl Worker {
                 .iter()
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
+            self.latency_map.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
         );
@@ -270,6 +298,7 @@ impl Worker {
             self.committee.clone(),
             self.store.clone(),
             /* rx_request */ rx_helper,   //receiver channel to connect to WorkerReceiverHandler
+            self.latency_map.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
         );

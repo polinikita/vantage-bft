@@ -5,7 +5,10 @@ use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use metrics::Metrics;
 use network::SimpleSender;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -33,6 +36,12 @@ impl Helper {
         committee: Committee,
         store: Store,
         rx_request: Receiver<(Vec<Digest>, PublicKey)>,
+        // Fable audit item 4 (WAN latency injection): this authority's own
+        // per-destination artificial latency map (same contract/construction as
+        // `BatchMaker::spawn`'s -- see its doc comment). Applied to this worker's
+        // batch-request replies to other workers, previously undelayed even under a
+        // WAN-shaped run.
+        latency_map: HashMap<SocketAddr, Duration>,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as primary-side
         // `::spawn` functions.
         metrics: Arc<Metrics>,
@@ -45,7 +54,7 @@ impl Helper {
                 committee,
                 store,
                 rx_request,
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network),
+                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics).with_compression(compress_network),
             }
             .run()
             .await;

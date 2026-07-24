@@ -16,6 +16,7 @@ async fn make_batch() {
         rx_transaction,
         tx_message,
         /* workers_addresses */ dummy_addresses,
+        /* latency_map */ std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         false,
     );
@@ -46,6 +47,7 @@ async fn batch_timeout() {
         rx_transaction,
         tx_message,
         /* workers_addresses */ dummy_addresses,
+        /* latency_map */ std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         false,
     );

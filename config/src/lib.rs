@@ -440,8 +440,23 @@ impl Committee {
     /// primary ports
     /// (`primary_to_primary`, `worker_to_primary`, `metrics`), then four ports per
     /// worker (`primary_to_worker`, `transactions`, `worker_to_worker`, `metrics`).
-    /// Returns the committee alongside each authority's freshly generated keypair, in
-    /// the same order, since the caller (not this constructor) owns spawning nodes.
+    ///
+    /// Fable audit (harness reproducibility): keys are generated at random, but the
+    /// returned `keypairs` are sorted by public key before being handed back -- the
+    /// exact same order `authorities`' `BTreeMap<PublicKey, _>` iterates in (i.e.
+    /// `Committee::index_of` order). This guarantees `keypairs[i]` is always committee
+    /// index `i`, so the harness's own node numbering (the printed `node-i` label,
+    /// `node-i.json`, a `--latency-table` CSV's row `i`, and which nodes `--crash k`
+    /// selects -- all of which index into this `Vec` positionally) stays aligned with
+    /// `index_of`/`latency_map`'s committee order on every run, instead of the two
+    /// orderings being a fresh random permutation of each other every time the process
+    /// happens to draw different random keys. Without this, `node-i` in one run and
+    /// `node-i` in the next could land on two different committee indices, silently
+    /// misaligning any asymmetric `--latency-table` or targeted `--crash` across
+    /// repeated runs. Purely a re-labeling of which (still-random) key occupies which
+    /// slot -- committee membership, stakes, and every address/port assignment are
+    /// unaffected; aggregate latency stats are invariant under relabeling of a fixed
+    /// matrix, so this does not change any already-recorded headline number.
     pub fn local_benchmark(nodes: usize, workers: usize, base_port: u16) -> (Self, Vec<KeyPair>) {
         let mut authorities = BTreeMap::new();
         let mut keypairs = Vec::with_capacity(nodes);
@@ -487,6 +502,12 @@ impl Committee {
             );
             keypairs.push(keypair);
         }
+
+        // See this fn's doc comment: sort into the same order `authorities`' own
+        // `BTreeMap<PublicKey, _>` iterates in, so `keypairs[i]` is always committee
+        // index `i` (`Committee::index_of`), deterministically and reproducibly across
+        // runs -- not a fresh random permutation of it every time.
+        keypairs.sort_by_key(|k| k.name);
 
         (Self { authorities }, keypairs)
     }

@@ -12,6 +12,7 @@ use primary::PrimaryWorkerMessage;
 use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
@@ -78,6 +79,11 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
+        // Fable audit item 4 (WAN latency injection): this authority's own
+        // per-destination artificial latency map (same contract/construction as
+        // `BatchMaker::spawn`'s -- see its doc comment). Applied to worker-to-worker
+        // sync requests, previously undelayed even under a WAN-shaped run.
+        latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention as `metrics`.
         compress_network: bool,
@@ -92,7 +98,7 @@ impl Synchronizer {
                 sync_retry_delay,
                 sync_retry_nodes,
                 rx_message,
-                network: SimpleSender::new().with_metrics(metrics.clone()).with_compression(compress_network),
+                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network),
                 round: Round::default(),
                 pending: HashMap::new(),
                 metrics,
