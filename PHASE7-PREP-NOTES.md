@@ -1819,3 +1819,52 @@ data dirs (`.local-bench-3proto-*`) and `benchmark/logs/`/`benchmark/latencies.t
 this session's pattern) left on disk; new logs under
 `/private/tmp/claude-501/.../scratchpad/{3proto,fab-local-run}*.log` and the scratch
 `parse_fab_logs.py`.
+
+## Re-run: 3-protocol local latency, n=10, 1000 tx/s (2026-07-24, post worker-latency fix 900380a)
+
+Re-run of the 3-protocol latency comparison AFTER commit 900380a (WAN latency now
+injected on worker senders too, not just primary senders). Config: n=10, 1 worker/node,
+1000 tx/s, 512 B tx, Delta=150, batch 20 / header 50, `--latency-table
+wan-testbed-latency-10node.csv` (the starfish 10x10 RTT matrix), 30 s, `node
+local-benchmark`. HEADLINE METRIC = p50 (median), per user preference.
+
+Random tx (default mode):
+  vantage             p50 396 ms  (p90 487, p99 551) -- 1000 tx/s, 0 misses
+  autobahn-optimistic p50 537 ms  (p90 683, p99 805) -- 1000 tx/s, 0 misses
+  autobahn-seamless   p50 642 ms  (p90 834, p99 1000) -- 1000 tx/s, 0 misses
+
+All-zero tx (for comparability with the original run): p50 vantage 397.5 / optimistic
+536.5 / seamless 640.5 -- within noise of random.
+
+Observations:
+- Ordering unchanged and robust: vantage < optimistic < seamless. Vantage's ~140 ms p50
+  lead over optimistic is the 2-delta leaderless all-to-all seal vs Autobahn's leader-QC
+  + header-cadence path (see the earlier "Why autobahn-optimistic > vantage" analysis).
+- The worker-latency fix (900380a) BARELY moved these vs the original 416/543/651 (avg):
+  at 1000 tx/s with small batches, worker->worker batch dissemination is not on the
+  critical path; the primary consensus path (already delayed pre-fix) dominates. So the
+  original comparison stands, now measured on the more-representative harness.
+- Absolute values still carry the ~57% in-process-vehicle inflation caveat; use the
+  separate-process AWS run for paper-quotable absolute latency. Relative ordering + spread
+  are vehicle-independent.
+
+## Re-run: 3-protocol local latency, n=20, 1000 tx/s (2026-07-24)
+
+Same config as the n=10 re-run but n=20, `--latency-table wan-testbed-latency-20node.csv`
+(the 10x10 real matrix extended by round-robin region assignment, 2 nodes/region; self=1).
+Random tx, 30 s, steady-state, p50 headline.
+
+  vantage             p50 549 ms  (p90 738, p99 966) -- ONLY 622 tx/s sustained (of 1000), 0 misses
+  autobahn-optimistic p50 544 ms  (p90 690, p99 810) -- 800 tx/s sustained, 0 misses
+  autobahn-seamless   p50 667 ms  (p90 840, p99 990) -- 801 tx/s sustained, 0 misses
+
+CAVEAT -- LOCAL MACHINE CEILING, not a protocol result: at n=20 on this 14-core laptop,
+20 in-process nodes saturate the shared cores. Vantage under-sustains (622 of 1000 tx/s)
+and its n=10 latency lead over optimistic (396 vs 537) evaporates (549 ~= 544), because
+vantage's all-to-all O(n^2) echo/ack traffic + per-view AGB work is far heavier per node
+than Autobahn's leader-based path, so vantage is CPU-starved first under co-scheduling.
+0 misses everywhere -> no correctness issue, pure saturation. Consistent with the known
+local ceiling (vantage clean to n=10, degrading past n=15). A trustworthy n=20 comparison
+must come from AWS (separate machines): there vantage's O(n^2) is network load, not shared-
+CPU contention, so the per-node compute starvation seen here does not apply. Do NOT quote
+the n=20 LOCAL numbers as a protocol comparison.
