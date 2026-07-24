@@ -51,6 +51,22 @@ pub struct BlockEntry {
     /// own content is immutable, and `BlockOK` is a pure function of that content -- so
     /// nothing can ever make an already-verified chain stop verifying.
     pub chain_verified: bool,
+    /// Fable perf audit: memoized result of `block::block_ok(&self.block, ...)` for
+    /// THIS exact digest. Set exactly once, in `BlockCache::upsert`, and ONLY by a
+    /// caller that has ALREADY run a genuine, passing `block_ok` check on this exact
+    /// `Header` (both current call sites -- `LaneManager::process_publish_inner` and
+    /// `Repairer::on_serve` -- check `block_ok` first and return early without ever
+    /// calling `upsert` if it fails, so `upsert` is never reached with a failing
+    /// header). Sound to trust forever after that: the cache is digest-keyed and a
+    /// cached entry's `block` content is immutable once inserted (a later `upsert` for
+    /// the SAME digest is, by construction, byte-identical content -- see `upsert`'s own
+    /// doc comment), and `block_ok` is a pure function of that content plus the
+    /// (per-session-constant) committee/sid/size-cap arguments -- so a digest that
+    /// passed once can never later fail. Read-side chain walks
+    /// (`verified_prefix_through_genesis`, `collect_verified_suffix`, and
+    /// `repair::Repairer::settle`) consult this flag instead of re-running the header's
+    /// `blake3` self-consistency check on every visit.
+    pub block_ok_verified: bool,
 }
 
 impl BlockEntry {
@@ -89,10 +105,25 @@ impl BlockCache {
     }
 
     /// Insert a freshly-seen block, or upgrade an existing entry's provenance/payload
-    /// flags. `direct`/`repaired`/`payload_ok` are OR-merged (N2: "a later publish may
-    /// upgrade bytes previously cached via repair"; all flags besides the block body
-    /// itself are monotonic/sticky, matching N8's "no discard").
-    pub fn upsert(&mut self, block: Header, direct: bool, repaired: bool, payload_ok: bool) {
+    /// flags. `direct`/`repaired`/`payload_ok`/`block_ok_verified` are OR-merged (N2: "a
+    /// later publish may upgrade bytes previously cached via repair"; all flags besides
+    /// the block body itself are monotonic/sticky, matching N8's "no discard").
+    /// `block_ok_verified` must be `true` only when the caller has already run a
+    /// genuine, passing `block::block_ok` check on this exact `block` (see
+    /// `BlockEntry::block_ok_verified`'s doc comment) -- both current call sites satisfy
+    /// this by construction.
+    ///
+    /// Fable perf audit: the valuable part on an EXISTING entry is OR-merging the
+    /// monotonic flags (esp. `block_ok_verified`, so readers never re-run `block_ok`).
+    /// The `block` field is still overwritten last-writer-wins, exactly as before this
+    /// audit -- NOT skipped: although the digest key pins everything `Header::digest()`
+    /// folds and everything `block_ok` checks, the one field it pins neither
+    /// (`parent_cert.author`) is Byzantine-forgeable, so two same-`id` headers can
+    /// differ there; keeping the overwrite preserves the pre-audit last-writer-wins
+    /// bytes exactly (that field is dead on every vantage read path, so this is purely
+    /// about staying byte-identical, not correctness). The overwrite is a cheap move of
+    /// an already-owned `Header`, not a clone.
+    pub fn upsert(&mut self, block: Header, direct: bool, repaired: bool, payload_ok: bool, block_ok_verified: bool) {
         let digest = block.id.clone();
         let author = block.author;
         let height = block.height;
@@ -102,19 +133,28 @@ impl BlockCache {
             .entry(height)
             .or_default()
             .insert(digest.clone());
-        let entry = self.by_digest.entry(digest).or_insert_with(|| BlockEntry {
-            block: block.clone(),
-            direct: false,
-            repaired: false,
-            retained: false,
-            payload_ok: false,
-            direct_prefix_verified: false,
-            chain_verified: false,
-        });
-        entry.block = block;
-        entry.direct |= direct;
-        entry.repaired |= repaired;
-        entry.payload_ok |= payload_ok;
+        match self.by_digest.entry(digest) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(BlockEntry {
+                    block,
+                    direct,
+                    repaired,
+                    retained: false,
+                    payload_ok,
+                    direct_prefix_verified: false,
+                    chain_verified: false,
+                    block_ok_verified,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let entry = o.get_mut();
+                entry.direct |= direct;
+                entry.repaired |= repaired;
+                entry.payload_ok |= payload_ok;
+                entry.block_ok_verified |= block_ok_verified;
+                entry.block = block; // last-writer-wins, as before the audit (see doc)
+            }
+        }
     }
 
     /// Returns `true` iff this call is the one that newly retained `h` (idempotent).
@@ -244,11 +284,19 @@ impl BlockCache {
     /// itself is unchanged (still used by nothing else; kept for the shape/doc
     /// parallel with `collect_verified_suffix`, and in case a future caller needs the
     /// actual hash sequence again).
+    ///
+    /// Fable perf audit: the per-visited-block `block::block_ok` re-check now consults
+    /// `BlockEntry::block_ok_verified` instead of recomputing (every cached entry has
+    /// this memo set true at admission time -- see that field's doc comment), so
+    /// `_committee`/`_sid`/`_max_block_payload` are no longer read in this body; kept as
+    /// parameters (renamed, not removed) to leave `collect_verified_suffix`'s identical
+    /// signature shape and this function's own call sites (`direct_pub`, `holds_prefix`)
+    /// untouched.
     pub fn verified_prefix_through_genesis(
         &mut self,
-        committee: &Committee,
-        sid: &Digest,
-        max_block_payload: usize,
+        _committee: &Committee,
+        _sid: &Digest,
+        _max_block_payload: usize,
         genesis: &Digest,
         h: &Digest,
     ) -> bool {
@@ -278,7 +326,7 @@ impl BlockCache {
             if !entry.pinned_at(author, expected_height) {
                 return false; // cross-author graft (§1 "one author index") or height gap
             }
-            if !block_ok(&entry.block, committee, sid, max_block_payload) {
+            if !entry.block_ok_verified {
                 return false;
             }
             if entry.chain_verified {
@@ -357,11 +405,17 @@ impl BlockCache {
     /// fork below the watermark -- Byzantine-unreachable under this protocol's own
     /// safety properties, since the cursor only ever advances along a single agreed
     /// chain per author, but checked defensively rather than assumed).
+    ///
+    /// Fable perf audit: the per-visited-block `block::block_ok` re-check now consults
+    /// `BlockEntry::block_ok_verified` instead of recomputing (see that field's doc
+    /// comment); `_committee`/`_sid`/`_max_block_payload` are no longer read in this
+    /// body but stay in the signature (renamed, not removed) so `cursor.rs`'s call site
+    /// -- outside this change's scope -- is untouched.
     pub fn collect_verified_suffix(
         &self,
-        committee: &Committee,
-        sid: &Digest,
-        max_block_payload: usize,
+        _committee: &Committee,
+        _sid: &Digest,
+        _max_block_payload: usize,
         stop_height: Height,
         stop_digest: &Digest,
         h: &Digest,
@@ -386,7 +440,7 @@ impl BlockCache {
             if !entry.pinned_at(author, expected_height) {
                 return None; // cross-author graft (§1 "one author index") or height gap
             }
-            if !block_ok(&entry.block, committee, sid, max_block_payload) {
+            if !entry.block_ok_verified {
                 return None;
             }
             chain.push(cur.clone());
@@ -519,7 +573,8 @@ impl LaneManager {
 
         {
             let mut blocks = self.blocks.lock().unwrap();
-            blocks.upsert(header.clone(), direct, false, payload_ok);
+            // `block_ok` just passed above for this exact header -- memoize it.
+            blocks.upsert(header.clone(), direct, false, payload_ok, true);
         }
         effects.push(Effect::BlockCached(digest.clone()));
         if header.author != self.name {
@@ -611,6 +666,33 @@ impl LaneManager {
     /// from `r` to genesis is real and cycle-free; this walk still tracks expected
     /// height itself too, defensively, so it can never hang even if that invariant were
     /// ever violated by a future change.
+    ///
+    /// Fable perf audit: early-breaks the walk at the first block that's already
+    /// `retained`, instead of continuing to genesis (and re-serializing every already-
+    /// retained ancestor along the way just to have `mark_retained` report "not new")
+    /// every single call. Sound by the retention invariant this codebase already
+    /// relies on elsewhere (mirroring the `chain_verified`/`direct_prefix_verified`/
+    /// `settled` memoization pattern): retention is prefix-closed -- whenever a block is
+    /// retained, its ENTIRE ancestor chain down to genesis is already retained too. This
+    /// holds inductively because `mark_retained` is only ever reached in two places, and
+    /// both preserve it: (a) this same function, which -- absent the early break --
+    /// walks a block's *whole* verified prefix down to genesis (or down to an ancestor
+    /// that, by the same induction, already has ITS prefix retained) in one call; (b)
+    /// `Repairer::settle`'s post-order ascend, which retains a chain's ancestors
+    /// strictly before the chain's own tip in the same call (see that function's own
+    /// doc comment). So the first already-retained block this walk meets is guaranteed
+    /// to already have its own full prefix retained -- stopping there, rather than
+    /// re-walking it, changes neither the final retained SET nor the total newly-
+    /// retained byte count: every block below the break point would have contributed
+    /// `size` only to have `mark_retained` return `false` (already retained) and discard
+    /// it, exactly as skipping it here discards nothing new.
+    ///
+    /// Also computes `serialized_size` only for a block this call is about to newly
+    /// retain: the `!entry.retained` state (checked, and not yet the early-break
+    /// condition, at this point in the loop) combined with this function holding the
+    /// cache's lock for its whole duration guarantees `mark_retained` below always
+    /// newly retains here, so sizing every visited block up front (including ones later
+    /// discarded) is no longer necessary.
     fn retain_prefix(&mut self, r: &BlockRef) {
         let mut cur = r.2.clone();
         let mut expected_height = r.1;
@@ -627,11 +709,13 @@ impl LaneManager {
                 if entry.block.height != expected_height {
                     break; // defensive; height mismatch means this isn't the real chain
                 }
+                if entry.retained {
+                    break; // prefix-closed: everything below here is already retained
+                }
                 let next = entry.block.parent_cert.header_digest.clone();
                 let size = bincode::serialized_size(&entry.block).unwrap_or(0);
-                if blocks.mark_retained(&cur) {
-                    newly_retained_bytes += size;
-                }
+                blocks.mark_retained(&cur);
+                newly_retained_bytes += size;
                 cur = next;
                 expected_height -= 1;
             }

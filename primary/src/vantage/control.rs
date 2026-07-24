@@ -99,6 +99,11 @@ pub struct ControlLog {
     /// separately keyed for `Log(r)` traversal after a round's Bracha state could, in
     /// principle, be pruned -- kept simple here, no pruning yet).
     proposal: HashMap<Round, ControlProposal>,
+    /// Parent-round -> its RB-delivered child rounds, populated once per round at
+    /// delivery. Lets `mark_safe`'s cascade find a newly-safe round's children in
+    /// O(children) instead of scanning all of `proposal` per newly-safe round (which
+    /// made a deep reversed-chain cascade O(K^2)).
+    children_by_parent: HashMap<Round, Vec<Round>>,
     proposed_this_round: HashSet<Round>,
     commit_votes: HashMap<Round, HashSet<PublicKey>>,
 
@@ -148,6 +153,7 @@ impl ControlLog {
             disabled: HashSet::new(),
             committed: HashSet::new(),
             proposal: HashMap::new(),
+            children_by_parent: HashMap::new(),
             proposed_this_round: HashSet::new(),
             commit_votes: HashMap::new(),
             bracha: HashMap::new(),
@@ -483,6 +489,10 @@ impl ControlLog {
         };
         let proposal = proposal.clone();
         self.bracha.get_mut(&round).unwrap().delivered = Some(proposal.clone());
+        // The single RB-delivery site is the only place `proposal` is populated, and a
+        // round delivers at most once (guarded above), so this parent->children index
+        // (used by `mark_safe`'s cascade) gains each delivered round exactly once.
+        self.children_by_parent.entry(proposal.parent).or_default().push(round);
         self.proposal.insert(round, proposal.clone());
         let mut effects = Vec::new();
         if let Some((w, h)) = &proposal.value {
@@ -555,17 +565,17 @@ impl ControlLog {
             effects.extend(self.try_vote(r));
             effects.extend(self.try_deliver(r));
             effects.extend(self.try_advance_round());
-            // P2-1 cascade: any already-RB-delivered child whose parent is the
-            // now-safe `r`, collected into an owned `Vec` first so this doesn't hold a
-            // borrow of `self.proposal`/`self.bracha` across the `worklist.extend` (no
-            // further `self` calls needed once collected).
-            let children: Vec<Round> = self
-                .proposal
-                .iter()
-                .filter(|(cr, cp)| cp.parent == r && !self.safe.contains(cr) && self.bracha.get(cr).is_some_and(|b| b.delivered.is_some()))
-                .map(|(cr, _)| *cr)
-                .collect();
-            worklist.extend(children);
+            // P2-1 cascade: any already-RB-delivered child whose parent is the now-safe
+            // `r`. Looked up via the `children_by_parent` index (populated once per round
+            // at its RB-delivery) rather than scanning all of `self.proposal` per
+            // newly-safe round -- the index membership is exactly the delivered rounds,
+            // so this yields the identical set the old `parent == r && delivered` scan did
+            // (the `!safe.contains` filter is still applied). Collected into an owned
+            // `Vec` first so no borrow of `self.children_by_parent` crosses `worklist`.
+            if let Some(kids) = self.children_by_parent.get(&r) {
+                let children: Vec<Round> = kids.iter().copied().filter(|cr| !self.safe.contains(cr)).collect();
+                worklist.extend(children);
+            }
         }
         effects.extend(self.retry_propose()); // a newly-safe round can unblock a
                                                // pending leader proposal at curr_round

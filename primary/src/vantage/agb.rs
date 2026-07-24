@@ -220,21 +220,28 @@ pub fn proposer(committee: &Committee, view: View) -> PublicKey {
 enum Fixed {
     Unset,
     Reject,
-    Proposal(ViewProposal, Digest),
+    /// The `ViewProposal` is `Arc`-wrapped purely as an internal ownership
+    /// optimization (Efficiency Item 3): every clone below is a refcount bump, never
+    /// a deep copy of `c`/`t`/`m`. Content, digest, and every comparison/query over it
+    /// are unchanged; the wrapper never crosses into a wire type (`Echo`/`Ready`
+    /// still carry an owned `ViewProposal`, materialized via `(*arc).clone()` at the
+    /// point an effect is actually built).
+    Proposal(Arc<ViewProposal>, Digest),
 }
 
 #[derive(Clone, Debug)]
 enum EchoStatement {
-    /// A counted proposal echo: the proposal, its digest, its grade (0 or 1), and its
-    /// origin bit (PHASE6-SPEC.md §3 `Ann`; `None` for skip entries/empty M).
-    Graded(ViewProposal, Digest, u8, Option<u8>),
+    /// A counted proposal echo: the proposal (`Arc`-wrapped, see `Fixed::Proposal`),
+    /// its digest, its grade (0 or 1), and its origin bit (PHASE6-SPEC.md §3 `Ann`;
+    /// `None` for skip entries/empty M).
+    Graded(Arc<ViewProposal>, Digest, u8, Option<u8>),
     Skip,
 }
 
 #[derive(Clone, Debug)]
 enum ReadyStatement {
-    /// A counted proposal ready.
-    Graded(ViewProposal, Digest, ReadyGrade),
+    /// A counted proposal ready (`Arc`-wrapped, see `Fixed::Proposal`).
+    Graded(Arc<ViewProposal>, Digest, ReadyGrade),
     /// PHASE6-SPEC.md D6-5: a counted no-ready -- Phase 4/5 recorded only that the
     /// one-shot ready-stage slot was used, never the content; §4's justification needs
     /// the content (a first-hand noready census per view), so it is stored now.
@@ -266,6 +273,18 @@ struct ViewState {
     echo_statements: HashMap<PublicKey, EchoStatement>,
     ready_statements: HashMap<PublicKey, ReadyStatement>,
     lock: Option<Lock>,
+    /// Efficiency Item 1: memoizes `ViewProposal::digest` per distinct payload
+    /// actually observed for this view (content-keyed, via `ViewProposal`'s derived
+    /// `Eq` -- NOT the digest itself, which would be circular). Echo/ready messages
+    /// from different senders routinely carry byte-identical `ViewProposal`s for the
+    /// same view, but each arrives as its own freshly deserialized value, so a
+    /// per-object cache (e.g. a `OnceCell` field on `ViewProposal`) cannot dedup
+    /// across them -- only a per-view, content-keyed cache can. In practice this
+    /// holds at most a handful of entries (quorum-intersection bounds the number of
+    /// distinct payloads that can ever be justified for one view); worst case under
+    /// Byzantine senders it is bounded by `n`, same order as `echo_statements`
+    /// itself.
+    digest_cache: Vec<(Arc<ViewProposal>, Digest)>,
 }
 
 impl Default for ViewState {
@@ -285,6 +304,7 @@ impl Default for ViewState {
             echo_statements: HashMap::new(),
             ready_statements: HashMap::new(),
             lock: None,
+            digest_cache: Vec::new(),
         }
     }
 }
@@ -303,6 +323,12 @@ pub struct AgbEngine {
     f_plus_1_parties: usize,
     quorum: Stake,
     views: HashMap<View, ViewState>,
+    /// Efficiency Item 2: exactly the views `recheck_all` would find by scanning
+    /// `views` for `active && !echo_sent && matches!(fixed, Fixed::Proposal(..))`.
+    /// Maintained incrementally at the only three sites that can change this
+    /// membership (`activate`, `on_propose`, and every `echo_sent = true` site) --
+    /// see those call sites for the exact insert/remove reasoning.
+    pending_gate: std::collections::HashSet<View>,
     /// PHASE6-SPEC.md §9 gate amendment: per-view seal-route counters.
     /// `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
@@ -322,6 +348,7 @@ impl AgbEngine {
             f_plus_1_parties,
             quorum,
             views: HashMap::new(),
+            pending_gate: std::collections::HashSet::new(),
             metrics: None,
         }
     }
@@ -380,6 +407,30 @@ impl AgbEngine {
 
     fn state_mut(&mut self, view: View) -> &mut ViewState {
         self.views.entry(view).or_default()
+    }
+
+    /// Efficiency Item 1: `ViewProposal::digest` is a pure function of the
+    /// proposal's content plus `self.sid`. Rather than recomputing it (full bincode
+    /// serialize + blake3) on every `on_echo`/`on_ready` -- up to n-1 times per view
+    /// for byte-identical content arriving in separate messages -- memoize it in
+    /// `view`'s `digest_cache`, keyed by structural equality (`ViewProposal`'s
+    /// derived `Eq`) rather than by the digest itself (which would be circular).
+    /// Returns the SAME `Digest` value `proposal.digest(&self.sid)` would have
+    /// returned -- only the second and later calls for an equal payload skip the
+    /// hash. Also returns an `Arc` around the (possibly newly cached) proposal so
+    /// callers can store it in `Fixed`/`EchoStatement`/`ReadyStatement` (Efficiency
+    /// Item 3) as a refcount bump instead of a deep clone, and so repeated identical
+    /// content shares one allocation.
+    fn canonical_proposal(&mut self, view: View, proposal: ViewProposal) -> (Arc<ViewProposal>, Digest) {
+        if let Some(state) = self.views.get(&view) {
+            if let Some((cached, digest)) = state.digest_cache.iter().find(|(p, _)| **p == proposal) {
+                return (Arc::clone(cached), digest.clone());
+            }
+        }
+        let digest = proposal.digest(&self.sid);
+        let arc = Arc::new(proposal);
+        self.state_mut(view).digest_cache.push((Arc::clone(&arc), digest.clone()));
+        (arc, digest)
     }
 
     // ---------------------------------------------------------- PHASE6-SPEC.md §4
@@ -572,6 +623,15 @@ impl AgbEngine {
             return Vec::new();
         }
         self.state_mut(view).active = true;
+        // Efficiency Item 2 transition (a): `active` just became true. If a
+        // proposal is already fixed and the echo hasn't been sent, this view now
+        // matches `recheck_all`'s scan predicate -- record it. (If `recheck_gate`
+        // below immediately sends the echo, the `echo_sent` transition removes it
+        // again before this function returns, same net effect as before.)
+        let s = self.state_mut(view);
+        if matches!(s.fixed, Fixed::Proposal(..)) && !s.echo_sent {
+            self.pending_gate.insert(view);
+        }
         self.recheck_gate(view, now, lm, rep)
     }
 
@@ -612,8 +672,16 @@ impl AgbEngine {
             return effects;
         }
 
-        let digest = proposal.digest(&self.sid);
-        self.state_mut(view).fixed = Fixed::Proposal(proposal.clone(), digest.clone());
+        let (proposal, digest) = self.canonical_proposal(view, proposal);
+        self.state_mut(view).fixed = Fixed::Proposal(Arc::clone(&proposal), digest.clone());
+        // Efficiency Item 2 transition (b): `fixed` just became `Proposal`. If the
+        // view is already active and the echo hasn't been sent, it now matches
+        // `recheck_all`'s scan predicate -- record it (see `activate`'s matching
+        // comment; the direct `recheck_gate` call below may immediately remove it
+        // again via the `echo_sent` transition, same net effect as before).
+        if self.state_mut(view).active && !self.state_mut(view).echo_sent {
+            self.pending_gate.insert(view);
+        }
         for r in proposal.c.iter().chain(proposal.t.iter()).chain(aux_refs(&proposal.m).iter()) {
             effects.extend(rep.authorize(r.clone()));
         }
@@ -634,12 +702,22 @@ impl AgbEngine {
     /// every currently pending, active view after any such event.
     pub fn recheck_all(&mut self, now: Instant, lm: &mut LaneManager, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let views: Vec<View> = self
-            .views
-            .iter()
-            .filter(|(_, s)| s.active && !s.echo_sent && matches!(s.fixed, Fixed::Proposal(_, _)))
-            .map(|(v, _)| *v)
-            .collect();
+        // Efficiency Item 2: `pending_gate` is maintained incrementally (see its
+        // field doc and the `activate`/`on_propose`/`echo_sent`-site comments) to
+        // always equal exactly what the old full `self.views` scan below would have
+        // found:
+        //   self.views.iter().filter(|(_, s)| s.active && !s.echo_sent
+        //       && matches!(s.fixed, Fixed::Proposal(_, _))).map(|(v, _)| *v)
+        // `active`, `fixed`, and `echo_sent` are each one-shot/monotonic (active and
+        // fixed only ever become true/set once; echo_sent only ever flips false ->
+        // true), so the three transition sites are exhaustive. Iteration order over
+        // a `HashSet` is just as unspecified as it was over the `HashMap` here
+        // before -- still fine, since each view's `recheck_gate` reads/writes only
+        // that view's own `ViewState` and pushes only that view's effects, so the
+        // per-view effect outcomes (and hence the concatenated `effects` content,
+        // modulo which-view's-chunk-comes-first -- already unordered before) are
+        // independent of processing order.
+        let views: Vec<View> = self.pending_gate.iter().copied().collect();
         for view in views {
             effects.extend(self.recheck_gate(view, now, lm, rep));
         }
@@ -650,8 +728,13 @@ impl AgbEngine {
         let mut effects = Vec::new();
         let (active, echo_sent, proposal_digest) = {
             let s = self.state_mut(view);
+            // Efficiency Item 3: `p.clone()` on an `Arc<ViewProposal>` is a refcount
+            // bump (this used to deep-clone the whole `ViewProposal`, incl. its C/T
+            // Vecs, on every call reaching here while a proposal is already fixed --
+            // including calls that immediately bail out below because `echo_sent` is
+            // already true).
             let pd = match &s.fixed {
-                Fixed::Proposal(p, d) => Some((p.clone(), d.clone())),
+                Fixed::Proposal(p, d) => Some((Arc::clone(p), d.clone())),
                 _ => None,
             };
             (s.active, s.echo_sent, pd)
@@ -671,11 +754,16 @@ impl AgbEngine {
         // Record the fast-seal lock immediately before sending our own matching echo.
         self.record_lock(view, &proposal, &digest);
         self.state_mut(view).echo_sent = true;
+        self.pending_gate.remove(&view); // Efficiency Item 2 transition (c)
         let origin = self.compute_origin(&proposal.m);
-        self.count_echo_statement(view, self.name, EchoStatement::Graded(proposal.clone(), digest, 1, origin));
+        self.count_echo_statement(view, self.name, EchoStatement::Graded(Arc::clone(&proposal), digest, 1, origin));
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
         effects.push(Effect::BroadcastEcho(Echo {
-            proposal,
+            // The wire type still carries an owned `ViewProposal`: exactly one deep
+            // clone here (same total deep-clone count as before this file's
+            // efficiency changes -- the deep clone above simply moved from the
+            // now-Arc'd census entry to this required-owned wire value).
+            proposal: (*proposal).clone(),
             grade: 1,
             sender: self.name,
             wish: 0, // D5-3: stamped by `VantageCore` at serialization time
@@ -852,15 +940,18 @@ impl AgbEngine {
             return effects; // fixed is still ⊥ or Reject -- defer to the absolute deadline
         };
         self.state_mut(view).echo_sent = true;
+        self.pending_gate.remove(&view); // Efficiency Item 2 transition (c)
         // PHASE7-PREP-NOTES.md Delta=1000 investigation: diagnostic-only observational
         // log (no behavior change) -- the Delta-scaled fallback (grade-0) echo path.
         log::info!("vantage agb: FALLBACK grade-0 echo view={}", view);
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
         if Self::core_ok(&proposal.c, lm) && self.meta_ok(&proposal.m, lm) {
             let origin = self.compute_origin(&proposal.m);
-            self.count_echo_statement(view, self.name, EchoStatement::Graded(proposal.clone(), digest, 0, origin));
+            self.count_echo_statement(view, self.name, EchoStatement::Graded(Arc::clone(&proposal), digest, 0, origin));
             effects.push(Effect::BroadcastEcho(Echo {
-                proposal,
+                // See `recheck_gate`'s matching comment: one deep clone here, same
+                // total count as before Efficiency Item 3.
+                proposal: (*proposal).clone(),
                 grade: 0,
                 sender: self.name,
                 wish: 0, // D5-3: stamped by `VantageCore` at serialization time
@@ -885,6 +976,7 @@ impl AgbEngine {
             return effects;
         }
         self.state_mut(view).echo_sent = true;
+        self.pending_gate.remove(&view); // Efficiency Item 2 transition (c)
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
         self.count_echo_statement(view, self.name, EchoStatement::Skip);
         effects.push(Effect::BroadcastEchoSkip(view));
@@ -905,9 +997,13 @@ impl AgbEngine {
             return effects;
         }
         let view = echo.proposal.view;
-        let digest = echo.proposal.digest(&self.sid);
+        let sender = echo.sender;
+        let grade = echo.grade;
         let origin = echo.origin;
-        if !self.count_echo_statement(view, echo.sender, EchoStatement::Graded(echo.proposal, digest, echo.grade, origin)) {
+        // Efficiency Item 1: reuse the per-view digest cache instead of always
+        // recomputing `echo.proposal.digest(&self.sid)`.
+        let (proposal, digest) = self.canonical_proposal(view, echo.proposal);
+        if !self.count_echo_statement(view, sender, EchoStatement::Graded(proposal, digest, grade, origin)) {
             return effects;
         }
         self.recheck_lock_release(view);
@@ -975,12 +1071,16 @@ impl AgbEngine {
         if self.state_mut(view).ready_sent {
             return effects;
         }
-        let mut tallies: HashMap<Digest, (ViewProposal, Stake, Stake, usize)> = HashMap::new();
+        // Efficiency Item 3: the tally's proposal slot is `Arc<ViewProposal>` -- both
+        // `or_insert_with` below (once per distinct digest re-derived on every call)
+        // and the `.clone()` calls further down are now refcount bumps, not deep
+        // clones of `c`/`t`/`m`.
+        let mut tallies: HashMap<Digest, (Arc<ViewProposal>, Stake, Stake, usize)> = HashMap::new();
         if let Some(state) = self.views.get(&view) {
             for (sender, stmt) in &state.echo_statements {
                 if let EchoStatement::Graded(p, d, g, origin) = stmt {
                     let stake = self.committee.stake(sender);
-                    let entry = tallies.entry(d.clone()).or_insert_with(|| (p.clone(), 0, 0, 0));
+                    let entry = tallies.entry(d.clone()).or_insert_with(|| (Arc::clone(p), 0, 0, 0));
                     if *g == 1 {
                         entry.1 += stake;
                     } else {
@@ -1015,10 +1115,15 @@ impl AgbEngine {
             };
             let name = self.name;
             self.state_mut(view).ready_sent = true;
-            self.count_ready_statement(view, name, ReadyStatement::Graded(proposal.clone(), digest, grade));
+            self.count_ready_statement(view, name, ReadyStatement::Graded(Arc::clone(&proposal), digest, grade));
             effects.extend(self.wish_effect(view, ResponseStage::Ready));
             effects.push(Effect::BroadcastReady(Ready {
-                proposal,
+                // The wire type still carries an owned `ViewProposal`: exactly one
+                // deep clone here, same total deep-clone count as before Efficiency
+                // Item 3 (previously the census `.clone()` above was the deep clone
+                // and this value was moved; now the census clone is free and this is
+                // the one remaining deep clone).
+                proposal: (*proposal).clone(),
                 grade,
                 sender: self.name,
                 wish: 0, // D5-3: stamped by `VantageCore` at serialization time
@@ -1046,8 +1151,12 @@ impl AgbEngine {
     /// A counted `VantageReady`.
     pub fn on_ready(&mut self, ready: Ready, rep: &mut Repairer) -> Vec<Effect> {
         let view = ready.proposal.view;
-        let digest = ready.proposal.digest(&self.sid);
-        if !self.count_ready_statement(view, ready.sender, ReadyStatement::Graded(ready.proposal, digest, ready.grade)) {
+        let sender = ready.sender;
+        let grade = ready.grade;
+        // Efficiency Item 1: reuse the per-view digest cache instead of always
+        // recomputing `ready.proposal.digest(&self.sid)`.
+        let (proposal, digest) = self.canonical_proposal(view, ready.proposal);
+        if !self.count_ready_statement(view, sender, ReadyStatement::Graded(proposal, digest, grade)) {
             return Vec::new();
         }
         self.recheck_completion_and_direct(view, rep)
@@ -1071,12 +1180,14 @@ impl AgbEngine {
     /// a late homogeneous quorum still produces the direct result.
     fn recheck_completion_and_direct(&mut self, view: View, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let mut tallies: HashMap<Digest, (ViewProposal, Stake, Stake, Stake)> = HashMap::new();
+        // Efficiency Item 3: see `recheck_ready`'s matching comment -- `Arc::clone`
+        // instead of a deep `ViewProposal` clone on every re-scan.
+        let mut tallies: HashMap<Digest, (Arc<ViewProposal>, Stake, Stake, Stake)> = HashMap::new();
         if let Some(state) = self.views.get(&view) {
             for (sender, stmt) in &state.ready_statements {
                 if let ReadyStatement::Graded(proposal, digest, grade) = stmt {
                     let stake = self.committee.stake(sender);
-                    let entry = tallies.entry(digest.clone()).or_insert_with(|| (proposal.clone(), 0, 0, 0));
+                    let entry = tallies.entry(digest.clone()).or_insert_with(|| (Arc::clone(proposal), 0, 0, 0));
                     entry.1 += stake;
                     match grade {
                         ReadyGrade::One => entry.2 += stake,
@@ -1097,9 +1208,13 @@ impl AgbEngine {
                 // PHASE6-SPEC.md §5: the FIRST genuine R4 completion with M != ∅
                 // triggers a completion report (fast-seal alone never does -- fastseal
                 // only ever produces `directed`/`sealed`, never `completed`, so this
-                // site -- and only this site -- is the right hook).
+                // site -- and only this site -- is the right hook). `Effect::
+                // CompletionReportable` carries an owned `ViewProposal` (a downstream
+                // effect consumer, not internal state), so this one deep clone is
+                // required and unchanged from before -- it only ever runs once per
+                // view, on the transition into `completed`.
                 if proposal.m.is_some() {
-                    effects.push(Effect::CompletionReportable(view, proposal.clone()));
+                    effects.push(Effect::CompletionReportable(view, (*proposal).clone()));
                 }
                 effects.push(Effect::Completed(view, c, t));
             }

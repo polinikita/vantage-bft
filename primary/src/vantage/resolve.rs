@@ -45,6 +45,21 @@ pub struct Resolver {
     in_flight: HashMap<View, Instant>,
     /// 12Δ, per the coordinator's ruling (D7-1).
     expiry: Duration,
+    /// Fable perf audit: a monotone lower bound on where an unresolved view can be, so
+    /// `decide` doesn't rescan the whole `1..=w-3` prefix on every own-proposer turn.
+    /// Sound because "resolved" (`AgbEngine::is_sealed(u) || ControlLog::
+    /// is_anchor_resolved(u)`, the predicate the caller always passes as `resolved`) is
+    /// sticky and never regresses: `AgbEngine::is_sealed` only flips a view's `sealed`
+    /// field `None -> Some` (first submission wins; `submit_anchor`/the fastseal path
+    /// leave an already-`Some` field untouched), and no entry is ever removed from
+    /// `AgbEngine`'s per-view map, so it can never un-seal; `ControlLog::
+    /// is_anchor_resolved` only ever inserts into the `anchored` set (never removes),
+    /// so it can never un-anchor. Once `resolved(u)` is witnessed true for some `u`, it
+    /// is true for every later call -- advancing past `u` here only ever skips a view
+    /// this or an earlier call already confirmed resolved, never one whose resolved-
+    /// ness was merely assumed. Starts at 1 (nothing resolved yet); only ever advances,
+    /// lazily, at the top of `decide`.
+    resolved_watermark: View,
 }
 
 impl Resolver {
@@ -61,6 +76,7 @@ impl Resolver {
             candidate_pointer: HashMap::new(),
             in_flight: HashMap::new(),
             expiry: Duration::from_millis(12 * delta_ms),
+            resolved_watermark: 1,
         }
     }
 
@@ -147,7 +163,15 @@ impl Resolver {
     /// still flips the bit); `Some(entry)` for a recovery proposal targeting the first
     /// qualifying view. `now` -- D7-1's in-flight age check and marker refresh.
     pub fn decide(&mut self, agb: &AgbEngine, w: View, now: Instant, resolved: impl Fn(View) -> bool) -> Option<ResolutionEntry> {
-        for u in 1..=w.saturating_sub(3) {
+        let scan_limit = w.saturating_sub(3);
+        // Advance the watermark over the (possibly newly-grown) contiguous resolved
+        // prefix before scanning -- sound by the monotonicity argument on the field
+        // itself; identical result to scanning from 1, since every `u` skipped here was
+        // just witnessed `resolved(u) == true`.
+        while self.resolved_watermark <= scan_limit && resolved(self.resolved_watermark) {
+            self.resolved_watermark += 1;
+        }
+        for u in self.resolved_watermark..=scan_limit {
             if resolved(u) {
                 continue;
             }

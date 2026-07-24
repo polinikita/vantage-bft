@@ -167,7 +167,8 @@ impl Repairer {
         let digest = block.id.clone();
         {
             let mut blocks = self.blocks.lock().unwrap();
-            blocks.upsert(block, false, true, false);
+            // `block_ok` just passed above for this exact block -- memoize it.
+            blocks.upsert(block, false, true, false, true);
         }
         // `payload_ok` is left false here -- serving/retention are chain-hash
         // authenticity concerns (D1's clause (ii)), not the payload-possession clause
@@ -190,77 +191,111 @@ impl Repairer {
         effects
     }
 
-    /// The recursive Authorize walk (§3.3 N6): match a cached block at the exact
-    /// coordinate, recurse into the parent, or fan out `request(h)`. Returns whether
-    /// this reference's prefix is verified through genesis *right now* (used only to
-    /// decide whether to retain+try-serve at this level; the return value itself is not
-    /// otherwise consumed by the top-level caller, though it IS consumed by the direct
-    /// recursive caller below to decide whether to retain/settle).
+    /// The Authorize walk (§3.3 N6): match a cached block at the exact coordinate,
+    /// walk into the parent, or fan out `request(h)`. Returns whether this reference's
+    /// prefix is verified through genesis *right now* (used only to decide whether to
+    /// retain+try-serve at this level; the return value itself is not otherwise
+    /// consumed by the top-level caller, though it IS consumed by the direct caller
+    /// below to decide whether to retain/settle).
     ///
     /// PHASE6-SPEC.md §9 gate amendment, R1(b): short-circuits at the top for any `r`
-    /// already in `settled` -- recursion then stops at the first settled ancestor
+    /// already in `settled` -- the walk then stops at the first settled ancestor
     /// instead of re-walking to genesis, making repeat calls (whether from a fresh
     /// `authorize` on an overlapping lane, or from `on_block_available`'s loop) amortized
     /// O(1) per already-settled tip. Only a genuinely new, not-yet-settled tail of the
     /// chain is ever walked.
+    ///
+    /// Fable perf audit: rewritten from recursion (depth = length of the contiguous
+    /// cached-but-unsettled suffix -- an adversarial deep chain, cached all at once and
+    /// then authorized only at the tip, could overflow the stack; the same class
+    /// `control::mark_safe` and the height-bounded lane walks in `lanes.rs` were already
+    /// made iterative to avoid) into an explicit descend-then-ascend loop that produces
+    /// the IDENTICAL result. The original recursion walks parent-ward on the way down
+    /// and settles/serves on the way back up (post-order: deepest ancestor first, `r`
+    /// itself last); this rewrite reproduces that exactly in two phases instead of via
+    /// the call stack:
+    ///   - Descend: walk from `r` toward genesis, exactly mirroring each recursive
+    ///     frame's own logic in the same order -- the `settled` short-circuit, the
+    ///     height-0 base case, the cached-block lookup (now consulting
+    ///     `BlockEntry::block_ok_verified` instead of recomputing `block_ok`, per the
+    ///     memoization above), the missing-block request fan-out, and the height==1
+    ///     genesis-link check -- pushing each ref that has a verified parent step ahead
+    ///     of it onto `frames` (and calling `note_authorized` on that parent) in the same
+    ///     place the recursive call used to recurse, and terminating with the same
+    ///     `verified` value the recursion would have returned from that point (`true` at
+    ///     an already-settled ancestor, genesis, or a matching height-1 genesis link;
+    ///     `false` at a missing block or a broken genesis link).
+    ///   - Ascend: pop `frames` in LIFO order (deepest-pushed first -- the same order
+    ///     the recursive unwind visits frames) and, only if `verified`, call
+    ///     `retain_and_serve`/`mark_settled` for each, in that order -- identical to the
+    ///     recursion, which does exactly this each time it unwinds through a level with
+    ///     `parent_verified == true`, and does neither once `parent_verified` is
+    ///     `false` (propagated unchanged through every remaining level).
+    ///
+    /// Net effect: identical `settled`/`requested_hashes`/`requested` mutations,
+    /// identical `Effect`s in identical order, identical return value -- just O(1) stack
+    /// depth instead of O(chain length).
     fn settle(&mut self, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
-        if self.settled.contains(&r) {
-            return true;
-        }
-        let (author, height, h) = r.clone();
-        if height == 0 {
-            return true; // implicit genesis base case; trivial, not memoized
-        }
+        let mut cur = r;
+        let mut frames: Vec<BlockRef> = Vec::new();
+        let verified = loop {
+            if self.settled.contains(&cur) {
+                break true;
+            }
+            let (author, height, h) = cur.clone();
+            if height == 0 {
+                break true; // implicit genesis base case; trivial, not memoized
+            }
 
-        let cached = {
-            let blocks = self.blocks.lock().unwrap();
-            blocks.get(&h).and_then(|entry| {
-                let b = &entry.block;
-                if b.author == author
-                    && b.height == height
-                    && b.id == h
-                    && block_ok(b, &self.committee, &self.sid, self.max_block_payload)
-                {
-                    Some(b.clone())
-                } else {
-                    None
-                }
-            })
-        };
+            let cached = {
+                let blocks = self.blocks.lock().unwrap();
+                blocks.get(&h).and_then(|entry| {
+                    let b = &entry.block;
+                    if b.author == author && b.height == height && b.id == h && entry.block_ok_verified {
+                        Some(b.clone())
+                    } else {
+                        None
+                    }
+                })
+            };
 
-        let Some(block) = cached else {
-            self.requested_hashes.insert(h.clone());
-            for (peer, _) in self.committee.others_primaries(&self.name) {
-                if self.requested.insert((peer, h.clone())) {
-                    effects.push(Effect::RequestTo(peer, h.clone()));
-                    if let Some(metrics) = &self.metrics {
-                        metrics.vantage_repairs_requested.inc();
+            let Some(block) = cached else {
+                self.requested_hashes.insert(h.clone());
+                for (peer, _) in self.committee.others_primaries(&self.name) {
+                    if self.requested.insert((peer, h.clone())) {
+                        effects.push(Effect::RequestTo(peer, h.clone()));
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_repairs_requested.inc();
+                        }
                     }
                 }
+                break false;
+            };
+
+            let parent_h = block.parent_cert.header_digest.clone();
+            if height == 1 {
+                if parent_h != self.genesis {
+                    // Never verifies (a malformed/forged genesis link) -- documented
+                    // residual: the walk simply never completes for this coordinate.
+                    break false;
+                }
+                frames.push(cur);
+                break true;
             }
-            return false;
+
+            let parent_ref = (author, height - 1, parent_h);
+            self.note_authorized(parent_ref.clone());
+            frames.push(cur);
+            cur = parent_ref;
         };
 
-        let parent_h = block.parent_cert.header_digest.clone();
-        if height == 1 {
-            if parent_h != self.genesis {
-                // Never verifies (a malformed/forged genesis link) -- documented
-                // residual: the walk simply never completes for this coordinate.
-                return false;
+        if verified {
+            while let Some(frame) = frames.pop() {
+                self.retain_and_serve(&frame, effects);
+                self.mark_settled(frame);
             }
-            self.retain_and_serve(&r, effects);
-            self.mark_settled(r);
-            return true;
         }
-
-        let parent_ref = (author, height - 1, parent_h);
-        self.note_authorized(parent_ref.clone());
-        let parent_verified = self.settle(parent_ref, effects);
-        if parent_verified {
-            self.retain_and_serve(&r, effects);
-            self.mark_settled(r);
-        }
-        parent_verified
+        verified
     }
 
     fn retain_and_serve(&mut self, r: &BlockRef, effects: &mut Vec<Effect>) {
