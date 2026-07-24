@@ -185,15 +185,23 @@ class InstanceManager:
     def _get_ami(self, client):
         # The AMI id changes per region and the old fixed build-date
         # description (2020-10-26 focal) is long deregistered, so resolve
-        # the newest available Ubuntu 22.04 LTS amd64 HVM/EBS image by
-        # owner + name glob instead of pinning an ImageId or exact date.
+        # the newest available Ubuntu amd64 HVM/EBS image by owner + name
+        # glob instead of pinning an ImageId or exact date.
+        #
+        # Ubuntu 24.04 LTS (noble), not 22.04 (jammy): the fetch-binary deploy
+        # path (remote.py's default, non-`--source-build`, mode) downloads a
+        # `node`/`benchmark_client` built in this repo's Dockerfile against
+        # `rust:1.95-bookworm` -- glibc 2.36. Jammy ships glibc 2.35, too old
+        # to dynamically link that binary; Noble ships glibc 2.39. The name
+        # glob matches both `hvm-ssd/` (pre-24.04 path) and the newer
+        # `hvm-ssd-gp3/` Canonical publishes 24.04+ server images under.
         response = client.describe_images(
             Owners=[self.CANONICAL_OWNER_ID],
             Filters=[
                 {
                     'Name': 'name',
                     'Values': [
-                        'ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*'
+                        'ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-amd64-server-*'
                     ]
                 },
                 {'Name': 'state', 'Values': ['available']},
@@ -207,7 +215,7 @@ class InstanceManager:
         if not images:
             raise BenchError(
                 'AMI resolution',
-                Exception('No matching Ubuntu 22.04 AMI found in region')
+                Exception('No matching Ubuntu 24.04 AMI found in region')
             )
         return images[0]['ImageId']
 

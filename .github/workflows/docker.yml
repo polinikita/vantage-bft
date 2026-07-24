@@ -1,0 +1,60 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: vantage:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract binaries from image
+        run: |
+          docker create --name extract vantage:ci
+          mkdir -p target/release
+          docker cp extract:/usr/local/bin/node ./target/node-linux-amd64
+          docker cp extract:/usr/local/bin/benchmark_client ./target/benchmark_client-linux-amd64
+          docker rm extract
+          chmod +x ./target/node-linux-amd64 ./target/benchmark_client-linux-amd64
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vantage-linux-amd64
+          path: |
+            ./target/node-linux-amd64
+            ./target/benchmark_client-linux-amd64
+          retention-days: 30
+
+      - name: Update nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          files: |
+            ./target/node-linux-amd64
+            ./target/benchmark_client-linux-amd64
+          body: |
+            Rolling nightly build from `main` branch.
+            **Commit**: ${{ github.sha }}
+            **Built**: ${{ github.event.head_commit.timestamp }}

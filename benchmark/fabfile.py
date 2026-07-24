@@ -54,10 +54,15 @@ def info(ctx):
 
 
 @task
-def install(ctx):
-    ''' Install the codebase on all machines '''
+def install(ctx, source_build=False):
+    ''' Install the codebase on all machines.
+
+    Default: fetch-binary mode -- runtime deps only, `fab remote`/
+    `fab campaign` download the pre-built nightly release. `--source-build`:
+    old behavior -- full Rust toolchain + rsync the working tree, remote
+    hosts compile from source on every `fab remote`/`fab campaign`. '''
     try:
-        Bench(ctx).install()
+        Bench(ctx, source_build=source_build).install()
     except BenchError as e:
         Print.error(e)
 
@@ -65,7 +70,7 @@ def install(ctx):
 @task
 def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False, all_to_all=False,
            batch_messages=False, batch_max_bytes=65536, batch_max_delay_ms=5,
-           mimic_latency_ms=0):
+           mimic_latency_ms=0, source_build=False):
     ''' Run benchmarks on AWS.
 
     Phase-7 smoke test: checked-in defaults below, except `rate` set to
@@ -75,6 +80,10 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
     exposed as a fab CLI arg (`--protocol=vantage`) so the same task runs
     both the autobahn-optimistic and vantage smoke passes without editing
     this file between runs.
+
+    `--source-build`: use the old rsync + remote `cargo build` deploy path
+    instead of the default fetch-prebuilt-binary one (must match whatever
+    `fab install` prepared the hosts for -- see `install`'s docstring).
     '''
     bench_params = {
         'faults': 0,
@@ -136,18 +145,22 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
         'asynchrony_duration': 3_000, #ms
     }
     try:
-        Bench(ctx).run(bench_params, node_params, debug)
+        Bench(ctx, source_build=source_build).run(bench_params, node_params, debug)
     except BenchError as e:
         Print.error(e)
 
 
 @task
 def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
-             nodes=20, duration=180, rates='50000,100000,150000,200000,250000'):
+             nodes=20, duration=180, rates='50000,100000,150000,200000,250000',
+             source_build=False):
     ''' Distributed Vantage AWS throughput/latency campaign (PREP -- the
     coordinator performs the actual `fab create`/`fab remote`/`fab destroy`;
     this task only assembles + validates the config and hands it to
     `Bench(...).run`).
+
+    `--source-build`: see `remote`'s docstring -- same toggle, same
+    hosts-must-match-`fab install` caveat.
 
     Target campaign:
       - nodes = [20], workers = 1, faults = 0, collocate (default)
@@ -224,7 +237,7 @@ def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
         'asynchrony_duration': 3_000,  # ms
     }
     try:
-        Bench(ctx).run(bench_params, node_params, debug)
+        Bench(ctx, source_build=source_build).run(bench_params, node_params, debug)
     except BenchError as e:
         Print.error(e)
 

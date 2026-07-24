@@ -124,6 +124,17 @@ The third block (`repo`) contains the information regarding the repository's nam
 ```
 Remember to update the `url` field to the name of your repo. Modifying the branch name is particularly useful when testing new functionalities without having to checkout the code locally. 
 
+**`release_repo` (build-once/deploy-prebuilt-binary).** By default (no `--source-build` flag, see step 4/5 below), `fab install`/`fab remote`/`fab campaign` do **not** compile anything remotely: they download the `node`/`benchmark_client` binaries the repo's `.github/workflows/docker.yml` publishes to a rolling `nightly` GitHub Release on every push to `main`. Add a `release_repo` key to the `repo` block with your repo's `<OWNER>/<REPO>` slug:
+```json
+"repo": {
+    "name": "vantage",
+    "url": "https://github.com/<OWNER>/<REPO>.git",
+    "branch": "main",
+    "release_repo": "<OWNER>/<REPO>"
+},
+```
+The repo must be public (anonymous `curl`, no auth). Without `release_repo` set, `fab remote`/`fab campaign` fail with a clear error telling you to either fill it in or pass `--source-build`.
+
 The the last block (`instances`) specifies the [AWS instance type](https://aws.amazon.com/ec2/instance-types) and the [AWS regions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html#concepts-available-regions) to use:
 ```json
 "instances": {
@@ -153,13 +164,13 @@ Creating 10 instances |███████████████████
 Waiting for all instances to boot...
 Successfully created 10 new instances
 ```
-You can then clone the repo and install rust on the remote instances with `fab install`:
+You can then prepare the remote instances with `fab install`:
 ```
 $ fab install
 
-Installing rust and cloning the repo...
-Initialized testbed of 10 nodes
+Initialized testbed of 10 nodes (fetch-binary mode)
 ```
+By default this only installs runtime dependencies (curl, ca-certificates, tmux) -- no Rust toolchain, no source tree; `fab remote`/`fab campaign` fetch the pre-built `nightly` release binaries per run (see `release_repo` above). Pass `fab install --source-build` to fall back to the original behavior (full Rust toolchain + rsync'd working tree, remote `cargo build` on every run) -- useful when testing a change that hasn't been released yet; `fab remote --source-build`/`fab campaign --source-build` must then be used too, since the two toggles select incompatible host setups.
 This may take a long time as the command will first update all instances.
 The commands `fab stop` and `fab start` respectively stop and start the testbed without destroying it (it is good practice to stop the testbed when not in use as AWS can be quite expensive); and `fab destroy` terminates all instances and destroys the testbed. Note that, depending on the instance types, AWS instances may take up to several minutes to fully start or stop. The command `fab info` displays a nice summary of all available machines and information to manually connect to them (for debug).
 

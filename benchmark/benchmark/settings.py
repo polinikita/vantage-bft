@@ -22,7 +22,7 @@ class Settings:
     def __init__(self, key_name, key_path, base_port, repo_name, repo_url,
                  branch, instance_type, aws_regions, project_id=None,
                  templates=None, username='ubuntu', spot=False,
-                 monitor_instance_type=None):
+                 monitor_instance_type=None, release_repo=None):
         inputs_str = [
             key_name, key_path, repo_name, repo_url, branch, instance_type
         ]
@@ -65,6 +65,13 @@ class Settings:
         # `instance_type` the validators use, byte-identical to a settings.json
         # written before this feature existed.
         self.monitor_instance_type = monitor_instance_type
+        # Build-once/deploy-prebuilt-binary (fetch mode, remote.py's default
+        # non-`--source-build` path): "<OWNER>/<REPO>" GitHub slug the
+        # `docker.yml` workflow publishes the rolling `nightly` release to.
+        # Optional -- None (absent from settings.json) means fetch mode has
+        # no release to download from and `Bench._update` raises a clear
+        # error telling the user to fill this in (or pass --source-build).
+        self.release_repo = release_repo
 
     @classmethod
     def load(cls, filename):
@@ -86,6 +93,7 @@ class Settings:
                 data.get('username', 'ubuntu'),
                 bool(data['instances'].get('spot', False)),
                 data['instances'].get('monitor_type'),
+                data['repo'].get('release_repo'),
             )
         except (OSError, JSONDecodeError) as e:
             raise SettingsError(str(e))

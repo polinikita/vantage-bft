@@ -12,7 +12,8 @@
     "repo": {
         "name": "autobahn-artifact",
         "url": "https://github.com/neilgiri/autobahn-artifact.git",
-        "branch": "vanilla-hs"
+        "branch": "vanilla-hs",
+        "release_repo": "polinikita/vantage-bft"
     },
     "username": "<USERNAME>",
     "project_id": "<PROJECT_ID>",

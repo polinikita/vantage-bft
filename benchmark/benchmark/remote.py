@@ -91,7 +91,14 @@ class Bench:
         '*.pem',
     ]
 
-    def __init__(self, ctx):
+    def __init__(self, ctx, source_build=False):
+        # Default (source_build=False): fetch the pre-built nightly binaries
+        # (docker.yml's release) instead of compiling remotely -- see
+        # `install`/`_update`. `--source-build` (wired through fabfile.py's
+        # `install`/`remote`/`campaign` tasks) restores the old rsync +
+        # `cargo build` deploy path, kept for debugging a change that isn't
+        # in a released binary yet.
+        self.source_build = bool(source_build)
         self.manager = InstanceManager.make()
         self.settings = self.manager.settings
         try:
@@ -183,34 +190,64 @@ class Bench:
                 )
 
     def install(self):
-        Print.info('Installing rust and syncing the working tree...')
-        cmd = [
-            'sudo apt-get update',
-            'sudo apt-get -y upgrade',
-            'sudo apt-get -y autoremove',
+        ''' Prepare all machines to run the node/benchmark_client binaries.
 
-            # The following dependencies prevent the error: [error: linker `cc` not found].
-            'sudo apt-get -y install build-essential',
-            'sudo apt-get -y install cmake',
-
-            # Install rust (non-interactive).
-            'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
-            'source $HOME/.cargo/env',
-            'rustup default stable',
-
-            # This is missing from the Rocksdb installer (needed for Rocksdb).
-            'sudo apt-get install -y clang',
-        ]
+        Default (self.source_build == False): fetch-binary mode -- minimal
+        runtime dependencies only (no Rust toolchain, no source tree; the
+        binaries themselves are downloaded per-run by `_update`, see below).
+        `--source-build`: the original behavior -- full build toolchain, then
+        rsync the working tree so `_update` can compile remotely. '''
         hosts = self.manager.hosts(flat=True)
         print(hosts)
-        try:
-            g = Group(*hosts, user=self.settings.username, connect_kwargs=self.connect)
-            g.run(' && '.join(cmd), hide=True)
-            self._sync_tree(hosts)
-            Print.heading(f'Initialized testbed of {len(hosts)} nodes')
-        except (GroupException, ExecutionError) as e:
-            e = FabricError(e) if isinstance(e, GroupException) else e
-            raise BenchError('Failed to install repo on testbed', e)
+
+        if self.source_build:
+            Print.info('Installing rust and syncing the working tree...')
+            cmd = [
+                'sudo apt-get update',
+                'sudo apt-get -y upgrade',
+                'sudo apt-get -y autoremove',
+
+                # The following dependencies prevent the error: [error: linker `cc` not found].
+                'sudo apt-get -y install build-essential',
+                'sudo apt-get -y install cmake',
+
+                # Install rust (non-interactive).
+                'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
+                'source $HOME/.cargo/env',
+                'rustup default stable',
+
+                # This is missing from the Rocksdb installer (needed for Rocksdb).
+                'sudo apt-get install -y clang',
+            ]
+            try:
+                g = Group(*hosts, user=self.settings.username, connect_kwargs=self.connect)
+                g.run(' && '.join(cmd), hide=True)
+                self._sync_tree(hosts)
+                Print.heading(f'Initialized testbed of {len(hosts)} nodes (source-build mode)')
+            except (GroupException, ExecutionError) as e:
+                e = FabricError(e) if isinstance(e, GroupException) else e
+                raise BenchError('Failed to install repo on testbed', e)
+        else:
+            Print.info('Installing runtime dependencies (fetch-binary mode)...')
+            repo_name = self.settings.repo_name
+            cmd = [
+                'sudo apt-get update',
+                # curl: downloads the release binaries in `_update`. ca-certificates:
+                # verifies the https://github.com download. tmux: `_background_run`
+                # launches every primary/worker/client inside a tmux session.
+                'sudo apt-get -y install curl ca-certificates tmux',
+                # Same directory layout `_config`/`_update`/`_background_run`
+                # already expect from the source-build path, just without a
+                # compiled-from-source tree underneath it.
+                f'mkdir -p {repo_name}/target/release',
+            ]
+            try:
+                g = Group(*hosts, user=self.settings.username, connect_kwargs=self.connect)
+                g.run(' && '.join(cmd), hide=True)
+                Print.heading(f'Initialized testbed of {len(hosts)} nodes (fetch-binary mode)')
+            except (GroupException, ExecutionError) as e:
+                e = FabricError(e) if isinstance(e, GroupException) else e
+                raise BenchError('Failed to install runtime dependencies on testbed', e)
 
     def kill(self, hosts=[], delete_logs=False):
         assert isinstance(hosts, list)
@@ -303,23 +340,62 @@ class Bench:
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
 
+    # Binaries the orchestrator launches (node/Cargo.toml's default `[[bin]]`
+    # from src/main.rs, plus the explicit `benchmark_client` `[[bin]]`) --
+    # same names commands.py's CommandMaker.run_primary/run_worker/run_client
+    # and alias_binaries hardcode, and the same names docker.yml publishes
+    # release assets under (`<bin>-linux-amd64`).
+    RELEASE_BINARIES = ('node', 'benchmark_client')
+
     def _update(self, hosts, collocate):
         if collocate:
             ips = list(set(hosts))
         else:
             ips = list(set([x for y in hosts for x in y]))
 
-        Print.info(f'Updating {len(ips)} machines (working tree deploy)...')
-        self._sync_tree(ips)
-        cmd = [
-            'source $HOME/.cargo/env',
-            f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
-            CommandMaker.alias_binaries(
-                f'./{self.settings.repo_name}/target/release/'
-            )
-        ]
-        g = Group(*ips, user=self.settings.username, connect_kwargs=self.connect)
-        g.run(' && '.join(cmd), hide=True)
+        if self.source_build:
+            Print.info(f'Updating {len(ips)} machines (working tree deploy, source build)...')
+            self._sync_tree(ips)
+            cmd = [
+                'source $HOME/.cargo/env',
+                f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
+                CommandMaker.alias_binaries(
+                    f'./{self.settings.repo_name}/target/release/'
+                )
+            ]
+            g = Group(*ips, user=self.settings.username, connect_kwargs=self.connect)
+            g.run(' && '.join(cmd), hide=True)
+        else:
+            release_repo = self.settings.release_repo
+            if not release_repo:
+                raise BenchError(
+                    'Fetch-binary deploy failed',
+                    ConfigError(
+                        'settings.json is missing "repo.release_repo" '
+                        '(e.g. "<OWNER>/<REPO>", the GitHub slug docker.yml '
+                        'publishes the nightly release to) -- set it, or '
+                        'pass --source-build to compile on the remote hosts '
+                        'instead'
+                    )
+                )
+            repo_name = self.settings.repo_name
+            Print.info(f'Updating {len(ips)} machines (fetching pre-built binaries)...')
+            cmd = [f'mkdir -p {repo_name}/target/release']
+            for binary in self.RELEASE_BINARIES:
+                url = (
+                    f'https://github.com/{release_repo}/releases/download/'
+                    f'nightly/{binary}-linux-amd64'
+                )
+                dest = f'{repo_name}/target/release/{binary}'
+                # Anonymous curl -- the release is public, no auth needed.
+                # Same parallel-across-hosts pattern as the source-build
+                # path above: one Group.run(), not a per-host loop.
+                cmd.append(f'curl -fL --retry 3 -o {dest} {url} && chmod +x {dest}')
+            cmd.append(CommandMaker.alias_binaries(
+                f'./{repo_name}/target/release/'
+            ))
+            g = Group(*ips, user=self.settings.username, connect_kwargs=self.connect)
+            g.run(' && '.join(cmd), hide=True)
 
     def _config(self, hosts, hosts_private, node_parameters, bench_parameters):
         ''' `hosts`: PUBLIC IPs -- used only to reach each instance over SSH
