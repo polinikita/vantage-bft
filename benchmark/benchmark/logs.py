@@ -276,6 +276,17 @@ class LogParser:
 
         return real_latency['count'] / duration
 
+    def committed_tps(self):
+        ''' Public accessor for the prometheus-derived committed TPS (see
+        `_prometheus_committed_tps`): the protocol-agnostic, VALID committed
+        throughput this run achieved, i.e. exactly the number `result()`
+        prints as "Real TPS (prometheus)". Added (CHANGE A) so `remote.py`'s
+        rate-sweep loop can read a run's committed TPS numerically right
+        after parsing it, without scraping/re-parsing the printed result
+        text. Returns `None` under the same conditions `_prometheus_committed_tps`
+        does (nothing committed/scraped, or no run duration available). '''
+        return self._prometheus_committed_tps()
+
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
         return datetime.timestamp(x)

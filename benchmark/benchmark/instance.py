@@ -119,65 +119,103 @@ class InstanceManager:
                 break
 
     def _create_security_group(self, client):
-        client.create_security_group(
-            Description='HotStuff node',
-            GroupName=self.SECURITY_GROUP_NAME,
-        )
+        ''' Idempotent w.r.t. BOTH the group and its ingress rules.
 
-        client.authorize_security_group_ingress(
-            GroupName=self.SECURITY_GROUP_NAME,
-            IpPermissions=[
-                {
-                    'IpProtocol': 'tcp',
-                    'FromPort': 22,
-                    'ToPort': 22,
-                    'IpRanges': [{
-                        'CidrIp': '0.0.0.0/0',
-                        'Description': 'Debug SSH access',
-                    }],
-                    'Ipv6Ranges': [{
-                        'CidrIpv6': '::/0',
-                        'Description': 'Debug SSH access',
-                    }],
-                },
-                {
-                    'IpProtocol': 'tcp',
-                    'FromPort': self.settings.base_port,
-                    'ToPort': self.settings.base_port + 2_000,
-                    'IpRanges': [{
-                        'CidrIp': '0.0.0.0/0',
-                        'Description': 'Dag port',
-                    }],
-                    'Ipv6Ranges': [{
-                        'CidrIpv6': '::/0',
-                        'Description': 'Dag port',
-                    }],
-                },
-                {
-                    # METRICS-COLLECTOR-PREP: the metrics-collector's Prometheus
-                    # HTTP API, queried by the coordinator laptop after a run
-                    # (remote.py's fetch_collector_metrics). Same shared security
-                    # group as the validators (simplicity: one group, one call
-                    # site) -- validators get this rule too but nothing listens
-                    # on their :9090, so it is inert there. Same 0.0.0.0/0
-                    # posture as the SSH/Dag-port rules above (not narrowed to
-                    # the coordinator's own IP); tightening this to the
-                    # coordinator's CIDR is the obvious hardening follow-up if
-                    # that posture is ever revisited for the other two rules.
-                    'IpProtocol': 'tcp',
-                    'FromPort': self.MONITOR_PORT,
-                    'ToPort': self.MONITOR_PORT,
-                    'IpRanges': [{
-                        'CidrIp': '0.0.0.0/0',
-                        'Description': 'Metrics-collector Prometheus HTTP API',
-                    }],
-                    'Ipv6Ranges': [{
-                        'CidrIpv6': '::/0',
-                        'Description': 'Metrics-collector Prometheus HTTP API',
-                    }],
-                },
-            ]
-        )
+        METRICS-COLLECTOR-STEP2: the observed bug was every
+        `fab fetch-metrics` query to the collector's Prometheus HTTP API
+        (coordinator -> collector:9090) timing out, while the per-run direct
+        node scrape (coordinator/nodes -> each validator's own metrics port,
+        within the "Dag port" range below) worked fine. The MONITOR_PORT rule
+        below already asks for 0.0.0.0/0 -- so a *freshly created* group is
+        fine. The actual bug is `create_security_group` being a create-only,
+        run-once operation: `create_instances` swallows
+        'InvalidGroup.Duplicate' and never revisits an ALREADY-EXISTING group
+        (e.g. one created by an earlier `fab create` against an older
+        revision of this file, before the MONITOR_PORT rule existed here) --
+        that group keeps whatever rules it had at creation time forever,
+        silently missing any rule added to the code since. The "Dag port"
+        rule predates MONITOR_PORT, so it was already present on such a
+        group; :9090 was not, hence exactly this symptom.
+
+        Fix: always (whether the group is new or pre-existing) (re-)authorize
+        every ingress rule below, one `authorize_security_group_ingress` call
+        per rule rather than one call for all three -- AWS fails the ENTIRE
+        call if ANY single permission in it is already present
+        ('InvalidPermission.Duplicate'), so a combined call against a
+        partially-provisioned pre-existing group would raise on the first
+        already-present rule and never reach the missing one. Per-rule calls
+        let each rule's own 'already there' be swallowed independently while
+        any genuinely missing rule (like :9090 above) still gets added. '''
+        try:
+            client.create_security_group(
+                Description='HotStuff node',
+                GroupName=self.SECURITY_GROUP_NAME,
+            )
+        except ClientError as e:
+            if AWSError(e).code != 'InvalidGroup.Duplicate':
+                raise
+
+        permissions = [
+            {
+                'IpProtocol': 'tcp',
+                'FromPort': 22,
+                'ToPort': 22,
+                'IpRanges': [{
+                    'CidrIp': '0.0.0.0/0',
+                    'Description': 'Debug SSH access',
+                }],
+                'Ipv6Ranges': [{
+                    'CidrIpv6': '::/0',
+                    'Description': 'Debug SSH access',
+                }],
+            },
+            {
+                'IpProtocol': 'tcp',
+                'FromPort': self.settings.base_port,
+                'ToPort': self.settings.base_port + 2_000,
+                'IpRanges': [{
+                    'CidrIp': '0.0.0.0/0',
+                    'Description': 'Dag port',
+                }],
+                'Ipv6Ranges': [{
+                    'CidrIpv6': '::/0',
+                    'Description': 'Dag port',
+                }],
+            },
+            {
+                # METRICS-COLLECTOR-PREP: the metrics-collector's Prometheus
+                # HTTP API, queried by the coordinator laptop after a run
+                # (remote.py's fetch_collector_metrics). Same shared security
+                # group as the validators (simplicity: one group, one call
+                # site) -- validators get this rule too but nothing listens
+                # on their :9090, so it is inert there. 0.0.0.0/0, same
+                # posture as the SSH/Dag-port rules above: this is a
+                # throwaway testbed (`fab destroy` tears the group down with
+                # it), so narrowing to the coordinator's own public IP would
+                # add a resolve-my-IP dependency (and break the moment that
+                # IP changes mid-campaign) for no real security benefit here.
+                'IpProtocol': 'tcp',
+                'FromPort': self.MONITOR_PORT,
+                'ToPort': self.MONITOR_PORT,
+                'IpRanges': [{
+                    'CidrIp': '0.0.0.0/0',
+                    'Description': 'Metrics-collector Prometheus HTTP API',
+                }],
+                'Ipv6Ranges': [{
+                    'CidrIpv6': '::/0',
+                    'Description': 'Metrics-collector Prometheus HTTP API',
+                }],
+            },
+        ]
+        for permission in permissions:
+            try:
+                client.authorize_security_group_ingress(
+                    GroupName=self.SECURITY_GROUP_NAME,
+                    IpPermissions=[permission],
+                )
+            except ClientError as e:
+                if AWSError(e).code != 'InvalidPermission.Duplicate':
+                    raise
 
     # Canonical's official AWS account id (stable across regions/time).
     CANONICAL_OWNER_ID = '099720109477'
@@ -222,14 +260,16 @@ class InstanceManager:
     def create_instances(self, instances):
         assert isinstance(instances, int) and instances > 0
 
-        # Create the security group in every region.
+        # Create (or, if it already existed, re-authorize the ingress rules
+        # of) the security group in every region -- see
+        # `_create_security_group`'s docstring: it now swallows both
+        # 'InvalidGroup.Duplicate' and per-rule 'InvalidPermission.Duplicate'
+        # itself, so any ClientError reaching here is a genuine failure.
         for client in self.clients.values():
             try:
                 self._create_security_group(client)
             except ClientError as e:
-                error = AWSError(e)
-                if error.code != 'InvalidGroup.Duplicate':
-                    raise BenchError('Failed to create security group', error)
+                raise BenchError('Failed to create security group', AWSError(e))
 
         try:
             # Create all instances.

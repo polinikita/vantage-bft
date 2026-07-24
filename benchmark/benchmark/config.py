@@ -451,6 +451,22 @@ class BenchParameters:
             self.partition_nodes = int(json['partition_nodes'])
             self.partition_start = int(json['partition_start'])
             self.partition_duration = int(json['partition_duration'])
+
+            # CHANGE A (rate-sweep early stop): fraction the running PEAK
+            # committed TPS is allowed to drop by before `remote.py`'s rate
+            # loop stops sweeping to higher rates (saturation reached).
+            # Peak-relative (not previous-point-relative), so a single noisy
+            # point that dips below its *immediate predecessor* without
+            # actually falling off the true peak does not truncate the
+            # sweep early -- see remote.py's `run()` for the comparison
+            # itself. 0.10 (10%) default; 0 disables early-stop entirely
+            # (the sweep always runs every configured rate, prior behavior).
+            self.early_stop_margin = (
+                float(json['early_stop_margin'])
+                if 'early_stop_margin' in json else 0.10
+            )
+            if self.early_stop_margin < 0:
+                raise ConfigError('early_stop_margin must be non-negative')
         except KeyError as e:
             raise ConfigError(f'Malformed bench parameters: missing key {e}')
 

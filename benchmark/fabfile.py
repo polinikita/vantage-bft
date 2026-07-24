@@ -153,6 +153,7 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
 @task
 def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
              nodes=20, duration=180, rates='50000,100000,150000,200000,250000',
+             max_header_delay=50, batch_size=500_000, early_stop_margin=0.10,
              source_build=False):
     ''' Distributed Vantage AWS throughput/latency campaign (PREP -- the
     coordinator performs the actual `fab create`/`fab remote`/`fab destroy`;
@@ -161,6 +162,17 @@ def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
 
     `--source-build`: see `remote`'s docstring -- same toggle, same
     hosts-must-match-`fab install` caveat.
+
+    `--max-header-delay` (ms) / `--batch-size` (bytes): CHANGE C -- expose the
+    two node knobs behind the observed n=4 ~68k tx/s throughput ceiling
+    (`max_header_delay=50ms` + `batch_size=500KB` ~= 976 tx/header) as
+    campaign args, so a peak-finding rerun doesn't need a code edit. Defaults
+    (50 ms / 500_000 B) are byte-identical to the prior hardcoded values.
+
+    `--early-stop-margin` (fraction, default 0.10; 0 disables): CHANGE A --
+    threaded into `bench_parameters.early_stop_margin`; see
+    `config.BenchParameters` and `remote.Bench.run`'s rate loop for the
+    peak-relative committed-TPS early-stop this drives.
 
     Target campaign:
       - nodes = [20], workers = 1, faults = 0, collocate (default)
@@ -192,6 +204,7 @@ def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
         'tx_mode': 'all-zero',
         'duration': int(duration),
         'runs': 1,
+        'early_stop_margin': float(early_stop_margin),
 
         # Partition simulation unused for this campaign.
         'simulate_partition': False,
@@ -206,21 +219,24 @@ def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
                              # soon as ANY digest is ready, gated only by
                              # max_header_delay below. Already Vantage-appropriate
                              # (fast/frequent cars), unlike max_header_delay was.
-        'max_header_delay': 50,  # ms -- was 5_000 (Autobahn's own default; PREP
-                                  # FIX 2). `node local-benchmark`'s Vantage runs
-                                  # use 50 ms (its --max-header-delay-ms CLI
-                                  # default): at 5_000 ms almost every header
-                                  # waited out the full 5 s timer instead of firing
-                                  # on the ~50 ms cadence Vantage's AGB/car
-                                  # mechanism expects, throttling committed
-                                  # throughput independent of the public/private
-                                  # IP fix (PREP FIX 1).
+        'max_header_delay': int(max_header_delay),  # ms -- was 5_000 (Autobahn's
+                                  # own default; PREP FIX 2). `node
+                                  # local-benchmark`'s Vantage runs use 50 ms (its
+                                  # --max-header-delay-ms CLI default, and this
+                                  # arg's own default): at 5_000 ms almost every
+                                  # header waited out the full 5 s timer instead
+                                  # of firing on the ~50 ms cadence Vantage's
+                                  # AGB/car mechanism expects, throttling
+                                  # committed throughput independent of the
+                                  # public/private IP fix (PREP FIX 1). Now a
+                                  # `--max-header-delay` campaign arg (CHANGE C).
         'gc_depth': 50,  # rounds -- Autobahn's Core/garbage_collector only.
         'sync_retry_delay': 5_000,  # ms -- Autobahn's Core only.
         'sync_retry_nodes': 3,  # number of nodes -- Autobahn's Core only.
-        'batch_size': 500_000,  # bytes -- matches Parameters::default() /
+        'batch_size': int(batch_size),  # bytes -- matches Parameters::default() /
                                  # local-benchmark's (unexposed) worker batch
-                                 # size; not a Vantage throttle.
+                                 # size; not a Vantage throttle. Now a
+                                 # `--batch-size` campaign arg (CHANGE C).
         'max_batch_delay': 20,  # ms -- matches local-benchmark's own
                                  # --max-batch-delay-ms CLI default; unchanged.
         'protocol': protocol,

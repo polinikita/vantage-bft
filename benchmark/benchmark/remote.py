@@ -10,6 +10,7 @@ from json import dump
 from urllib.error import URLError
 from time import sleep
 from math import ceil
+from statistics import mean
 from copy import deepcopy
 import subprocess
 
@@ -838,10 +839,18 @@ class Bench:
             committee_copy = deepcopy(committee)
             committee_copy.remove_nodes(committee.size() - n)
 
+            # CHANGE A (rate-sweep early stop on committed-TPS turnover):
+            # running PEAK committed TPS seen so far in THIS node count's
+            # rate sweep (reset per `n`, since saturation is a function of
+            # committee size). `None` until the first rate point with a
+            # usable committed-TPS reading.
+            peak_committed_tps = None
+
             for r in bench_parameters.rate:
                 Print.heading(f'\nRunning {n} nodes (input rate: {r:,} tx/s)')
 
                 # Run the benchmark.
+                run_committed_tps = []
                 for i in range(bench_parameters.runs):
                     Print.heading(f'Run {i+1}/{bench_parameters.runs}')
                     try:
@@ -855,18 +864,56 @@ class Bench:
                         )
                         logger.print(PathMaker.result_file(
                             faults,
-                            n, 
+                            n,
                             bench_parameters.workers,
                             bench_parameters.collocate,
-                            r, 
-                            bench_parameters.tx_size, 
+                            r,
+                            bench_parameters.tx_size,
                         ))
+
+                        # CHANGE A: this run's committed TPS (prometheus-
+                        # derived, see logs.py's `committed_tps`), for the
+                        # early-stop decision below. `None`/0 (nothing
+                        # committed/scraped, or no duration) is dropped, not
+                        # treated as a real 0 tx/s reading -- a run that
+                        # failed to produce a usable number must not look
+                        # like a genuine collapse to the peak-relative check.
+                        tps = logger.committed_tps()
+                        if tps is not None and tps > 0:
+                            run_committed_tps.append(tps)
                     except (subprocess.SubprocessError, GroupException, ParseError) as e:
                         self.kill(hosts=selected_hosts)
                         if isinstance(e, GroupException):
                             e = FabricError(e)
                         Print.error(BenchError('Benchmark failed', e))
                         continue
+
+                # CHANGE A: peak-relative early stop. This rate's
+                # representative committed TPS is the AVERAGE across its
+                # `runs` (documented choice -- smooths a single noisy run
+                # without discarding the others; with the campaign's default
+                # `runs=1` this is just that one run's number). Skipped
+                # entirely (no peak update, no stop check) if every run at
+                # this rate failed to parse or produced no usable committed-
+                # TPS reading -- a parse failure must never be read as a
+                # throughput collapse, and must never crash the sweep.
+                if run_committed_tps:
+                    point_tps = mean(run_committed_tps)
+                    if peak_committed_tps is None:
+                        peak_committed_tps = point_tps
+                    else:
+                        peak_committed_tps = max(peak_committed_tps, point_tps)
+
+                    margin = bench_parameters.early_stop_margin
+                    threshold = peak_committed_tps * (1 - margin)
+                    if margin > 0 and point_tps < threshold:
+                        Print.heading(
+                            f'Committed TPS {point_tps:,.0f} < '
+                            f'{(1 - margin) * 100:.0f}% of peak '
+                            f'{peak_committed_tps:,.0f} at rate={r:,} -- '
+                            f'stopping sweep (remaining higher rates skipped)'
+                        )
+                        break
 
         # METRICS-COLLECTOR-PREP step 3: pull the comprehensive metrics off the
         # collector now, before `fab destroy` terminates it. Best-effort/
