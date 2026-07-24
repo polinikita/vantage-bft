@@ -23,7 +23,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 #[tokio::main]
 async fn main() -> Result<()> {
     //std::env::set_var("RUST_BACKTRACE", "1");
-    
+
     let matches = Command::new(crate_name!())
         .version(crate_version!())
         .about("A research implementation of Sailfish.")
@@ -82,115 +82,255 @@ async fn main() -> Result<()> {
                 )
                 .subcommand(Command::new("primary").about("Run a single primary"))
                 .subcommand(
-                    Command::new("worker")
-                        .about("Run a single worker")
-                        .arg(
-                            Arg::new("id")
-                                .long("id")
-                                .value_name("INT")
-                                .required(true)
-                                .action(ArgAction::Set)
-                                .help("The worker id"),
-                        ),
+                    Command::new("worker").about("Run a single worker").arg(
+                        Arg::new("id")
+                            .long("id")
+                            .value_name("INT")
+                            .required(true)
+                            .action(ArgAction::Set)
+                            .help("The worker id"),
+                    ),
                 )
                 .subcommand_required(true)
                 .arg_required_else_help(true),
         )
         .subcommand(
             Command::new("local-benchmark")
-                .about("Self-host a whole local benchmark run (every primary, every \
+                .about(
+                    "Self-host a whole local benchmark run (every primary, every \
                     worker, and one client per worker) in this one process \
-                    (PHASE2-SPEC.md #8) -- the local replacement for `fab local`")
-                .arg(Arg::new("nodes").long("nodes").value_name("INT").default_value("4")
-                    .action(ArgAction::Set).help("Number of authorities"))
-                .arg(Arg::new("workers").long("workers").value_name("INT").default_value("1")
-                    .action(ArgAction::Set).help("Workers per authority"))
-                .arg(Arg::new("rate").long("rate").value_name("INT").default_value("240000")
-                    .action(ArgAction::Set).help("Aggregate input rate (tx/s)"))
-                .arg(Arg::new("tx-size").long("tx-size").value_name("INT").default_value("512")
-                    .action(ArgAction::Set).help("Transaction size in bytes"))
-                .arg(Arg::new("protocol").long("protocol").value_name("PROTOCOL")
-                    .default_value("autobahn-optimistic")
-                    .value_parser(["autobahn-optimistic", "autobahn-seamless", "vantage"])
-                    .action(ArgAction::Set).help("Consensus protocol"))
-                .arg(Arg::new("mode").long("mode").value_name("MODE").default_value("random")
-                    .value_parser(["all-zero", "random"])
-                    .action(ArgAction::Set).help("Transaction payload mode (default 'random' as \
+                    (PHASE2-SPEC.md #8) -- the local replacement for `fab local`",
+                )
+                .arg(
+                    Arg::new("nodes")
+                        .long("nodes")
+                        .value_name("INT")
+                        .default_value("4")
+                        .action(ArgAction::Set)
+                        .help("Number of authorities"),
+                )
+                .arg(
+                    Arg::new("workers")
+                        .long("workers")
+                        .value_name("INT")
+                        .default_value("1")
+                        .action(ArgAction::Set)
+                        .help("Workers per authority"),
+                )
+                .arg(
+                    Arg::new("rate")
+                        .long("rate")
+                        .value_name("INT")
+                        .default_value("240000")
+                        .action(ArgAction::Set)
+                        .help("Aggregate input rate (tx/s)"),
+                )
+                .arg(
+                    Arg::new("tx-size")
+                        .long("tx-size")
+                        .value_name("INT")
+                        .default_value("512")
+                        .action(ArgAction::Set)
+                        .help("Transaction size in bytes"),
+                )
+                .arg(
+                    Arg::new("protocol")
+                        .long("protocol")
+                        .value_name("PROTOCOL")
+                        .default_value("autobahn-optimistic")
+                        .value_parser(["autobahn-optimistic", "autobahn-seamless", "vantage"])
+                        .action(ArgAction::Set)
+                        .help("Consensus protocol"),
+                )
+                .arg(
+                    Arg::new("mode")
+                        .long("mode")
+                        .value_name("MODE")
+                        .default_value("random")
+                        .value_parser(["all-zero", "random"])
+                        .action(ArgAction::Set)
+                        .help(
+                            "Transaction payload mode (default 'random' as \
                         of METRICS-DASHBOARD-SPEC.md §8 -- pin '--mode all-zero' explicitly for \
                         comparability with historical gate/sweep numbers, all of which are \
-                        all-zero)"))
-                .arg(Arg::new("duration").long("duration").value_name("INT").default_value("60")
-                    .action(ArgAction::Set).help("Benchmark duration in seconds (0 = run until Ctrl-C)"))
-                .arg(Arg::new("base-port").long("base-port").value_name("INT").default_value("4000")
-                    .action(ArgAction::Set).help("First port allocated (127.0.0.1)"))
-                .arg(Arg::new("data-dir").long("data-dir").value_name("PATH").default_value(".local-bench")
-                    .action(ArgAction::Set).help("Directory for per-node stores/reference config"))
-                .arg(Arg::new("crash").long("crash").value_name("INT").default_value("0")
-                    .action(ArgAction::Set).help("PHASE6-SPEC.md R2: number of trailing nodes \
+                        all-zero)",
+                        ),
+                )
+                .arg(
+                    Arg::new("duration")
+                        .long("duration")
+                        .value_name("INT")
+                        .default_value("60")
+                        .action(ArgAction::Set)
+                        .help("Benchmark duration in seconds (0 = run until Ctrl-C)"),
+                )
+                .arg(
+                    Arg::new("base-port")
+                        .long("base-port")
+                        .value_name("INT")
+                        .default_value("4000")
+                        .action(ArgAction::Set)
+                        .help("First port allocated (127.0.0.1)"),
+                )
+                .arg(
+                    Arg::new("data-dir")
+                        .long("data-dir")
+                        .value_name("PATH")
+                        .default_value(".local-bench")
+                        .action(ArgAction::Set)
+                        .help("Directory for per-node stores/reference config"),
+                )
+                .arg(
+                    Arg::new("crash")
+                        .long("crash")
+                        .value_name("INT")
+                        .default_value("0")
+                        .action(ArgAction::Set)
+                        .help(
+                            "PHASE6-SPEC.md R2: number of trailing nodes \
                         to leave unspawned (true crash fault -- committee membership is \
                         unchanged, only the last k nodes' primary/worker/client tasks are \
-                        never started); offered rate is scaled to the live clients only"))
-                .arg(Arg::new("delta-ms").long("delta-ms").value_name("INT").default_value("1000")
-                    .action(ArgAction::Set).help("Vantage AGB base delay unit Δ, ms \
+                        never started); offered rate is scaled to the live clients only",
+                        ),
+                )
+                .arg(
+                    Arg::new("delta-ms")
+                        .long("delta-ms")
+                        .value_name("INT")
+                        .default_value("1000")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Vantage AGB base delay unit Δ, ms \
                         (theta_E=5Δ, theta_R=6Δ, control-round=6Δ derive from this \
-                        automatically; irrelevant to the two Autobahn paths)"))
-                .arg(Arg::new("max-batch-delay-ms").long("max-batch-delay-ms").value_name("INT").default_value("20")
-                    .action(ArgAction::Set).help("Worker max batch seal delay, ms"))
-                .arg(Arg::new("max-header-delay-ms").long("max-header-delay-ms").value_name("INT").default_value("50")
-                    .action(ArgAction::Set).help("Primary max header/car creation delay, ms"))
-                .arg(Arg::new("timeline").long("timeline").action(ArgAction::SetTrue)
-                    .help("PHASE7-PREP-NOTES.md Finding A: print a once/sec progress-gauge \
+                        automatically; irrelevant to the two Autobahn paths)",
+                        ),
+                )
+                .arg(
+                    Arg::new("max-batch-delay-ms")
+                        .long("max-batch-delay-ms")
+                        .value_name("INT")
+                        .default_value("20")
+                        .action(ArgAction::Set)
+                        .help("Worker max batch seal delay, ms"),
+                )
+                .arg(
+                    Arg::new("max-header-delay-ms")
+                        .long("max-header-delay-ms")
+                        .value_name("INT")
+                        .default_value("50")
+                        .action(ArgAction::Set)
+                        .help("Primary max header/car creation delay, ms"),
+                )
+                .arg(
+                    Arg::new("timeline")
+                        .long("timeline")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "PHASE7-PREP-NOTES.md Finding A: print a once/sec progress-gauge \
                         line per live node (entered view / frontier a_i / cursor next_view / \
                         control round / delivered-log len / consume pos) for the duration of \
-                        the run -- diagnostic only, off by default (verbose)"))
-                .arg(Arg::new("mimic-latency-ms").long("mimic-latency-ms").value_name("INT")
-                    .default_value("0").action(ArgAction::Set)
-                    .help("PHASE7-PREP-NOTES.md (WAN-shaped local runs): uniform shorthand for \
+                        the run -- diagnostic only, off by default (verbose)",
+                        ),
+                )
+                .arg(
+                    Arg::new("mimic-latency-ms")
+                        .long("mimic-latency-ms")
+                        .value_name("INT")
+                        .default_value("0")
+                        .action(ArgAction::Set)
+                        .help(
+                            "PHASE7-PREP-NOTES.md (WAN-shaped local runs): uniform shorthand for \
                         --latency-table -- an RTT-ms value applied to every inter-authority \
                         link (one-way = value/2), as if every cell of a --latency-table CSV \
                         held this same number; 0 = off (default, current behavior). Ignored if \
-                        --latency-table is also given."))
-                .arg(Arg::new("latency-table").long("latency-table").value_name("PATH")
-                    .action(ArgAction::Set)
-                    .help("PHASE7-PREP-NOTES.md (WAN-shaped local runs): path to an NxN \
+                        --latency-table is also given.",
+                        ),
+                )
+                .arg(
+                    Arg::new("latency-table")
+                        .long("latency-table")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .help(
+                            "PHASE7-PREP-NOTES.md (WAN-shaped local runs): path to an NxN \
                         RTT-ms CSV matrix (N = --nodes, no header row, node index = committee \
                         order), applied one-way (RTT/2) to each node's own inter-authority \
                         primary-to-primary/-worker connections (starfish-style per-connection \
                         injection, read-only reference: \
                         ~/code/starfish/crates/starfish-core/src/network.rs). Takes precedence \
                         over --mimic-latency-ms. Unset (default) = zero injected delay, \
-                        current behavior unchanged for both protocols."))
-                .arg(Arg::new("compress-network").long("compress-network").action(ArgAction::SetTrue)
-                    .help("METRICS-DASHBOARD-SPEC.md §8: lz4-compress every wire message \
+                        current behavior unchanged for both protocols.",
+                        ),
+                )
+                .arg(
+                    Arg::new("compress-network")
+                        .long("compress-network")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "METRICS-DASHBOARD-SPEC.md §8: lz4-compress every wire message \
                         (network crate, all protocols identically). Off by default -- \
-                        byte-identical framing when off."))
-                .arg(Arg::new("batch-messages").long("batch-messages").action(ArgAction::SetTrue)
-                    .help("Transport-level per-peer outbound message batching \
+                        byte-identical framing when off.",
+                        ),
+                )
+                .arg(
+                    Arg::new("batch-messages")
+                        .long("batch-messages")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Transport-level per-peer outbound message batching \
                         (coalescing), applied uniformly by the network crate to every \
                         sender/receiver (all protocols identically) except the \
                         client-facing transaction port. Off by default -- byte-identical \
-                        wire/behavior when off."))
-                .arg(Arg::new("batch-max-bytes").long("batch-max-bytes").value_name("INT")
-                    .default_value("65536").action(ArgAction::Set)
-                    .help("Batching hybrid flush size cap, in bytes -- irrelevant unless \
-                        --batch-messages is set"))
-                .arg(Arg::new("batch-max-delay-ms").long("batch-max-delay-ms").value_name("INT")
-                    .default_value("5").action(ArgAction::Set)
-                    .help("Batching hybrid flush delay, in ms -- irrelevant unless \
-                        --batch-messages is set"))
-                .arg(Arg::new("all-to-all").long("all-to-all").action(ArgAction::SetTrue)
-                    .help("Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all \
+                        wire/behavior when off.",
+                        ),
+                )
+                .arg(
+                    Arg::new("batch-max-bytes")
+                        .long("batch-max-bytes")
+                        .value_name("INT")
+                        .default_value("65536")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Batching hybrid flush size cap, in bytes -- irrelevant unless \
+                        --batch-messages is set",
+                        ),
+                )
+                .arg(
+                    Arg::new("batch-max-delay-ms")
+                        .long("batch-max-delay-ms")
+                        .value_name("INT")
+                        .default_value("5")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Batching hybrid flush delay, in ms -- irrelevant unless \
+                        --batch-messages is set",
+                        ),
+                )
+                .arg(
+                    Arg::new("all-to-all")
+                        .long("all-to-all")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all \
                         communication: on the external-consensus path, replicas broadcast \
                         Prepare-Votes/Confirm-Acks and assemble PrepareQC/ConfirmQC locally \
                         instead of unicasting to the leader for it to assemble and \
-                        re-broadcast. Off by default -- byte-identical behavior when off."))
-                .arg(Arg::new("authenticate-channels").long("authenticate-channels").action(ArgAction::SetTrue)
-                    .help("Symmetric pairwise-MAC authenticated channels: closes wire-level \
+                        re-broadcast. Off by default -- byte-identical behavior when off.",
+                        ),
+                )
+                .arg(
+                    Arg::new("authenticate-channels")
+                        .long("authenticate-channels")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Symmetric pairwise-MAC authenticated channels: closes wire-level \
                         sender impersonation on every inter-validator channel (BLAKE3-keyed \
                         MAC over a shared committee master secret -- no signatures, no PKI, \
                         no handshake). A fresh master secret is generated in-process and \
                         shared across every node this run spawns. Off by default -- \
-                        byte-identical wire/behavior when off.")),
+                        byte-identical wire/behavior when off.",
+                        ),
+                ),
         )
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -221,9 +361,7 @@ async fn main() -> Result<()> {
             #[cfg(not(feature = "benchmark"))]
             {
                 let _ = sub_matches;
-                anyhow::bail!(
-                    "local-benchmark requires building with --features benchmark"
-                );
+                anyhow::bail!("local-benchmark requires building with --features benchmark");
             }
         }
         _ => unreachable!(),
@@ -291,8 +429,8 @@ async fn run(matches: &ArgMatches) -> Result<()> {
         Some("worker") => StoreProfile::Data,
         _ => StoreProfile::Metadata,
     };
-    let store = Store::new_with_profile(store_path, store_profile)
-        .context("Failed to create a store")?;
+    let store =
+        Store::new_with_profile(store_path, store_profile).context("Failed to create a store")?;
 
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
@@ -315,7 +453,7 @@ async fn run(matches: &ArgMatches) -> Result<()> {
             let (_tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
             let (tx_committer, rx_committer) = channel(CHANNEL_CAPACITY);
             let (_tx_pushdown_cert, rx_pushdown_cert) = channel(CHANNEL_CAPACITY);
-            let(_tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
+            let (_tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
 
             Primary::spawn(
                 name,

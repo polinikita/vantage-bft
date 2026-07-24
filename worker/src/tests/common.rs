@@ -2,7 +2,7 @@
 use crate::batch_maker::{Batch, Transaction};
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
-use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses, ConsensusAddresses};
+use config::{Authority, Committee, ConsensusAddresses, PrimaryAddresses, WorkerAddresses};
 use crypto::{generate_keypair, Blake3Hasher, Digest, PublicKey, SecretKey};
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;

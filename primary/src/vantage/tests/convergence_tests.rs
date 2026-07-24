@@ -38,7 +38,11 @@ async fn convergence_partitioned_party_enters_all_missed_views_on_release() {
     let others: Vec<usize> = (0..nodes.len()).filter(|&i| i != p).collect();
     let target_at_partition = nodes[p].pacemaker.entry_target();
     for &i in &others {
-        assert_eq!(nodes[i].pacemaker.entry_target(), target_at_partition, "every party starts in lock-step right after genesis");
+        assert_eq!(
+            nodes[i].pacemaker.entry_target(),
+            target_at_partition,
+            "every party starts in lock-step right after genesis"
+        );
     }
 
     // Delay party p's inbound wishes from here on (piggybacked and standalone alike)
@@ -58,10 +62,24 @@ async fn convergence_partitioned_party_enters_all_missed_views_on_release() {
     // Party p must have fallen behind: its own entry target is unchanged (no wish was
     // ever absorbed while partitioned), strictly below at least one live party's, and
     // it must have accumulated held wishes to replay later.
-    let max_other_target = others.iter().map(|&i| nodes[i].pacemaker.entry_target()).max().unwrap();
-    assert_eq!(nodes[p].pacemaker.entry_target(), target_at_partition, "no wish may be absorbed while partitioned");
-    assert!(max_other_target > target_at_partition, "test setup: the other parties must have genuinely progressed");
-    assert!(!nodes[p].held_wishes.is_empty(), "wishes must have accumulated, held, during the partition");
+    let max_other_target = others
+        .iter()
+        .map(|&i| nodes[i].pacemaker.entry_target())
+        .max()
+        .unwrap();
+    assert_eq!(
+        nodes[p].pacemaker.entry_target(),
+        target_at_partition,
+        "no wish may be absorbed while partitioned"
+    );
+    assert!(
+        max_other_target > target_at_partition,
+        "test setup: the other parties must have genuinely progressed"
+    );
+    assert!(
+        !nodes[p].held_wishes.is_empty(),
+        "wishes must have accumulated, held, during the partition"
+    );
 
     // Release: replay every held wish, in arrival order -- p must enter every missed
     // view, in order, and rejoin (its entry target converges to at least what the
@@ -76,7 +94,12 @@ async fn convergence_partitioned_party_enters_all_missed_views_on_release() {
         "the partitioned party must have caught up to (at least) the others' target on release"
     );
     for v in 1..=max_other_target {
-        assert!(nodes[p].frontier.is_active(v), "node {} must have entered every missed view {} after release, in order", p, v);
+        assert!(
+            nodes[p].frontier.is_active(v),
+            "node {} must have entered every missed view {} after release, in order",
+            p,
+            v
+        );
     }
     // No wishes are left un-replayed.
     assert!(nodes[p].held_wishes.is_empty());

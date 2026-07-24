@@ -57,8 +57,10 @@ async fn main() -> Result<()> {
                 .default_value("random")
                 .value_parser(["all-zero", "random"])
                 .action(ArgAction::Set)
-                .help("Transaction payload mode: 'all-zero' or 'random' (default, as of \
-                    METRICS-DASHBOARD-SPEC.md §8)"),
+                .help(
+                    "Transaction payload mode: 'all-zero' or 'random' (default, as of \
+                    METRICS-DASHBOARD-SPEC.md §8)",
+                ),
         )
         .arg_required_else_help(true)
         .get_matches();

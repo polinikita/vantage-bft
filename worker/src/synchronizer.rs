@@ -117,7 +117,11 @@ impl Synchronizer {
                 sync_retry_delay,
                 sync_retry_nodes,
                 rx_message,
-                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network).with_batching(batch),
+                network: SimpleSender::new()
+                    .with_latency(latency_map)
+                    .with_metrics(metrics.clone())
+                    .with_compression(compress_network)
+                    .with_batching(batch),
                 round: Round::default(),
                 pending: HashMap::new(),
                 metrics,
@@ -137,7 +141,9 @@ impl Synchronizer {
         match &self.channel_auth {
             None => Bytes::from(payload),
             Some(auth) => {
-                let tag = auth.tag_for(dest, &payload).expect("dest is a committee member");
+                let tag = auth
+                    .tag_for(dest, &payload)
+                    .expect("dest is a committee member");
                 let mut tagged = payload;
                 tagged.extend_from_slice(&tag);
                 Bytes::from(tagged)

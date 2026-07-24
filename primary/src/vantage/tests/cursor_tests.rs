@@ -6,7 +6,13 @@ use crate::vantage::agb::Outcome;
 use crate::vantage::Cursor;
 
 fn new_cursor(lm: &crate::vantage::LaneManager) -> Cursor {
-    Cursor::new(test_committee(), lm.sid().clone(), lm.genesis().clone(), MAX_BLOCK_PAYLOAD, lm.blocks_handle())
+    Cursor::new(
+        test_committee(),
+        lm.sid().clone(),
+        lm.genesis().clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    )
 }
 
 #[tokio::test]
@@ -24,10 +30,14 @@ async fn expansion_order_and_cross_view_dedup() {
     // first, not a fixed literal order).
     let c = vec![block_ref(&chain_a[0])];
     let t = sorted_manifest(vec![block_ref(&chain_a[1]), block_ref(&chain_b[0])]);
-    let expected: Vec<_> = std::iter::once(chain_a[0].id.clone()).chain(t.iter().map(|r| r.2.clone())).collect();
+    let expected: Vec<_> = std::iter::once(chain_a[0].id.clone())
+        .chain(t.iter().map(|r| r.2.clone()))
+        .collect();
     cursor.on_completed(1, c.clone(), t.clone());
     let effects = cursor.on_sealed(1, Outcome::Full(c, t));
-    assert!(effects.iter().any(|e| matches!(e, crate::vantage::Effect::NotifyCommitted(..))));
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, crate::vantage::Effect::NotifyCommitted(..))));
     assert_eq!(cursor.output_log(), expected.as_slice());
     assert_eq!(cursor.next_view(), 2);
 
@@ -59,7 +69,10 @@ async fn core_prefix_of_full_property() {
     // Sealing with gfull appends only T-hat -- K is a literal prefix, never re-emitted.
     cursor.on_sealed(1, Outcome::Full(c, t));
     assert_eq!(&cursor.output_log()[..k_len], &[chain_a[0].id.clone()]);
-    assert_eq!(cursor.output_log(), &[chain_a[0].id.clone(), chain_a[1].id.clone()]);
+    assert_eq!(
+        cursor.output_log(),
+        &[chain_a[0].id.clone(), chain_a[1].id.clone()]
+    );
     assert_eq!(cursor.next_view(), 2);
 }
 
@@ -83,7 +96,10 @@ async fn open_tip_blocks_later_views_payload() {
     // Once view 1 seals, both views' outputs appear, in view order.
     let effects = cursor.on_sealed(1, Outcome::Core(vec![block_ref(&chain_a[0])]));
     assert!(!effects.is_empty());
-    assert_eq!(cursor.output_log(), &[chain_a[0].id.clone(), chain_b[0].id.clone()]);
+    assert_eq!(
+        cursor.output_log(),
+        &[chain_a[0].id.clone(), chain_b[0].id.clone()]
+    );
     assert_eq!(cursor.next_view(), 3);
 }
 
@@ -125,14 +141,29 @@ async fn missing_prefix_wait_then_emit() {
     let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_missing_prefix");
     let sid = lm.sid().clone();
     let genesis = lm.genesis().clone();
-    let h1 = crate::messages::Header::new_vantage(author_a, 1, std::collections::BTreeMap::new(), genesis, sid.clone());
+    let h1 = crate::messages::Header::new_vantage(
+        author_a,
+        1,
+        std::collections::BTreeMap::new(),
+        genesis,
+        sid.clone(),
+    );
     // h1 is *not* published yet -- h2 (the manifest's actual entry) references it but
     // the prefix isn't obtainable.
-    let h2 = crate::messages::Header::new_vantage(author_a, 2, std::collections::BTreeMap::new(), h1.id.clone(), sid);
+    let h2 = crate::messages::Header::new_vantage(
+        author_a,
+        2,
+        std::collections::BTreeMap::new(),
+        h1.id.clone(),
+        sid,
+    );
     let mut cursor = new_cursor(&lm);
     let c = vec![(author_a, 2, h2.id.clone())];
     let effects = cursor.on_sealed(1, Outcome::Core(c));
-    assert!(effects.is_empty(), "must wait for the missing prefix, never emit garbage");
+    assert!(
+        effects.is_empty(),
+        "must wait for the missing prefix, never emit garbage"
+    );
     assert_eq!(cursor.next_view(), 1);
 
     // The prefix arrives (h1 then h2) -- a `BlockCached` wakeup re-attempts via retry().
@@ -143,4 +174,3 @@ async fn missing_prefix_wait_then_emit() {
     assert_eq!(cursor.output_log(), &[h1.id.clone(), h2.id.clone()]);
     assert_eq!(cursor.next_view(), 2);
 }
-

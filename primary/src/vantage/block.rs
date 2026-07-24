@@ -62,7 +62,12 @@ pub fn genesis_digest(sid: &Digest) -> Digest {
 /// height arithmetic); the cross-block half (does `parent_cert.header_digest` really
 /// name the real predecessor) is necessarily stateful and lives in
 /// `lanes::BlockCache::verified_prefix_through_genesis`.
-pub fn block_ok(header: &Header, committee: &Committee, sid: &Digest, max_block_payload: usize) -> bool {
+pub fn block_ok(
+    header: &Header,
+    committee: &Committee,
+    sid: &Digest,
+    max_block_payload: usize,
+) -> bool {
     header.digest() == header.id
         && header.sid.as_ref() == Some(sid)
         && header.payload.len() <= max_block_payload

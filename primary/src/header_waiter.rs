@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::{ConsensusMessage, Header, Proposal, proposal_digest};
+use crate::messages::{proposal_digest, ConsensusMessage, Header, Proposal};
 use crate::primary::{Height, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -127,7 +127,10 @@ impl HeaderWaiter {
                 rx_synchronizer,
                 tx_core,
                 tx_consensus_loopback,
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
+                network: SimpleSender::new()
+                    .with_metrics(metrics)
+                    .with_compression(compress_network)
+                    .with_batching(batch),
                 parent_requests: HashMap::new(),
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
@@ -147,7 +150,9 @@ impl HeaderWaiter {
         match &self.channel_auth {
             None => Bytes::from(payload),
             Some(auth) => {
-                let tag = auth.tag_for(&self.name, &payload).expect("self is a committee member");
+                let tag = auth
+                    .tag_for(&self.name, &payload)
+                    .expect("self is a committee member");
                 let mut tagged = payload;
                 tagged.extend_from_slice(&tag);
                 Bytes::from(tagged)
@@ -173,7 +178,6 @@ impl HeaderWaiter {
             _ = handler.recv() => Ok(None),
         }
     }
-
 
     async fn proposal_waiter(
         mut missing: Vec<(Vec<u8>, Store)>,
@@ -411,7 +415,7 @@ impl HeaderWaiter {
                         for (_, prop) in possibly_missing.iter() {
                             let _ = self.parent_requests.remove(&prop.header_digest);
                         }
-                     
+
                         self.tx_consensus_loopback.send(deliver).await.expect("Failed to send header");
                     },
                     Ok(None) => {

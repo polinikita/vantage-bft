@@ -14,8 +14,8 @@ use clap::ArgMatches;
 use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol, WorkerId};
 use crypto::{MacSecret, PublicKey, SignatureService};
 use metrics::{
-    aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot, read_vantage_progress, LatencySnapshot,
-    MetricReporter,
+    aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot,
+    read_vantage_progress, LatencySnapshot, MetricReporter,
 };
 use primary::Primary;
 use std::fs;
@@ -29,7 +29,11 @@ use worker::Worker;
 /// clippy::type_complexity: named alias for `spawn_node_primary`/`spawn_node_workers`'s
 /// shared return shape -- (this node's metrics registry, its periodic reporter, and
 /// its own (label, address) scrape target for `prometheus.yaml`).
-type NodeMetricsHandle = (prometheus::Registry, Arc<MetricReporter>, (String, SocketAddr));
+type NodeMetricsHandle = (
+    prometheus::Registry,
+    Arc<MetricReporter>,
+    (String, SocketAddr),
+);
 
 pub async fn run(matches: &ArgMatches) -> Result<()> {
     let nodes: usize = matches
@@ -70,7 +74,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--crash must be a non-negative integer")?;
-    anyhow::ensure!(crash < nodes, "--crash ({}) must be strictly less than --nodes ({})", crash, nodes);
+    anyhow::ensure!(
+        crash < nodes,
+        "--crash ({}) must be strictly less than --nodes ({})",
+        crash,
+        nodes
+    );
     let live_nodes = nodes - crash;
     let delta_ms: u64 = matches
         .get_one::<String>("delta-ms")
@@ -111,9 +120,17 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .context("--mimic-latency-ms must be a non-negative integer")?;
     let latency_table_path = matches.get_one::<String>("latency-table").cloned();
     let latency_table: Option<LatencyTable> = if let Some(path) = &latency_table_path {
-        let table = LatencyTable::from_rtt_csv(path, nodes)
-            .with_context(|| format!("Failed to parse --latency-table '{}' as a {n}x{n} RTT-ms CSV matrix", path, n = nodes))?;
-        println!("Latency table: loaded from {} ({}x{} RTT-ms matrix, node index = committee order)", path, nodes, nodes);
+        let table = LatencyTable::from_rtt_csv(path, nodes).with_context(|| {
+            format!(
+                "Failed to parse --latency-table '{}' as a {n}x{n} RTT-ms CSV matrix",
+                path,
+                n = nodes
+            )
+        })?;
+        println!(
+            "Latency table: loaded from {} ({}x{} RTT-ms matrix, node index = committee order)",
+            path, nodes, nodes
+        );
         Some(table)
     } else if mimic_latency_ms > 0 {
         println!(
@@ -152,7 +169,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     );
     println!("Data dir: {}", data_dir.display());
     if matches.get_flag("authenticate-channels") {
-        println!("Authenticated channels: ON (symmetric pairwise MAC, fresh in-process master secret)");
+        println!(
+            "Authenticated channels: ON (symmetric pairwise MAC, fresh in-process master secret)"
+        );
     }
     if crash > 0 {
         println!(
@@ -194,7 +213,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // node this run spawns) across every node -- exactly the in-process-shared-
         // secret contract `authenticate_channels`'s own doc comment describes.
         authenticate_channels: matches.get_flag("authenticate-channels"),
-        mac_secret: matches.get_flag("authenticate-channels").then(MacSecret::generate),
+        mac_secret: matches
+            .get_flag("authenticate-channels")
+            .then(MacSecret::generate),
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
@@ -251,8 +272,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     // differ across nodes) plus a summed total.
     let mut primary_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
     let mut metrics_targets: Vec<(String, SocketAddr)> = Vec::new(); // (label, addr) for prometheus.yaml
-    // Fable audit item 5: every client task's handle, so they can be stopped (aborted)
-    // before the final, drained re-read -- see the end of this fn.
+                                                                     // Fable audit item 5: every client task's handle, so they can be stopped (aborted)
+                                                                     // before the final, drained re-read -- see the end of this fn.
     let mut client_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     for (i, keypair) in keypairs.into_iter().take(live_nodes).enumerate() {
@@ -312,7 +333,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // primary, for the whole run -- reads the same registries `print_results`
         // reads below, just every second instead of once at the end. Diagnostic only;
         // does not touch the client/committer/execute path in any way.
-        println!(" [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume");
+        println!(
+            " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume"
+        );
         let mut elapsed: u64 = 0;
         'timeline: loop {
             tokio::select! {
@@ -389,7 +412,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         &primary_metrics,
         actual_secs,
         protocol,
-        &format!(" -- STEADY-STATE (client tasks stopped, {} ms drain before re-read)", drain_ms),
+        &format!(
+            " -- STEADY-STATE (client tasks stopped, {} ms drain before re-read)",
+            drain_ms
+        ),
     )
     .await;
 
@@ -415,19 +441,33 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
         Protocol::Vantage => match msg_type {
             "Header" | "Batch" => "dissemination",
             "VantageAck" => "acks",
-            "VantagePropose" | "VantageEcho" | "VantageEchoSkip" | "VantageReady" | "VantageNoReady" => "agb",
+            "VantagePropose" | "VantageEcho" | "VantageEchoSkip" | "VantageReady"
+            | "VantageNoReady" => "agb",
             "VantageWish" => "pacemaker",
             "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
-            "CompReport" | "ControlInit" | "ControlEcho" | "ControlReady" | "ControlTimeoutVote" | "ControlTimeoutAccept"
-            | "ControlCommit" | "ControlFetch" | "ControlServe" => "control",
+            "CompReport"
+            | "ControlInit"
+            | "ControlEcho"
+            | "ControlReady"
+            | "ControlTimeoutVote"
+            | "ControlTimeoutAccept"
+            | "ControlCommit"
+            | "ControlFetch"
+            | "ControlServe" => "control",
             "Committed" => "metricsplumbing",
             _ => "other",
         },
         Protocol::AutobahnOptimistic | Protocol::AutobahnSeamless => match msg_type {
             "Header" | "Batch" => "dissemination",
             "Vote" | "Certificate" => "votes-certs",
-            "ConsensusMessage" | "ConsensusRequest" | "ConsensusVote" | "Timeout" | "TC" => "consensus",
-            "CertificatesRequest" | "HeadersRequest" | "ProposalHeadersRequest" | "Synchronize" | "BatchRequest" => "sync",
+            "ConsensusMessage" | "ConsensusRequest" | "ConsensusVote" | "Timeout" | "TC" => {
+                "consensus"
+            }
+            "CertificatesRequest"
+            | "HeadersRequest"
+            | "ProposalHeadersRequest"
+            | "Synchronize"
+            | "BatchRequest" => "sync",
             "Committed" => "metricsplumbing",
             _ => "other",
         },
@@ -487,7 +527,10 @@ fn spawn_node_primary(
     primary_metrics.set_transaction_mode_info(mode.label());
     // Application logic no-op, matching node/src/main.rs::analyze.
     tokio::spawn(async move { while rx_output.recv().await.is_some() {} });
-    let target = (format!("node-{}-primary", i), committee.primary(&name).unwrap().metrics);
+    let target = (
+        format!("node-{}-primary", i),
+        committee.primary(&name).unwrap().metrics,
+    );
     Ok((primary_registry, primary_reporter, target))
 }
 
@@ -524,13 +567,22 @@ fn spawn_node_workers(
         )
         .context("Failed to create worker store")?;
 
-        let (metrics, reporter, registry) = Worker::spawn(name, worker_id, committee.clone(), parameters.clone(), worker_store);
+        let (metrics, reporter, registry) = Worker::spawn(
+            name,
+            worker_id,
+            committee.clone(),
+            parameters.clone(),
+            worker_store,
+        );
         // METRICS-DASHBOARD-SPEC.md §8: write-once -- only `local-benchmark` has the
         // client's tx-mode in scope at registry-construction time (see `Metrics::
         // set_transaction_mode_info`'s doc for why the standalone `node run` path
         // doesn't set this).
         metrics.set_transaction_mode_info(mode.label());
-        let target = (format!("node-{}-worker-{}", i, j), committee.worker(&name, &worker_id).unwrap().metrics);
+        let target = (
+            format!("node-{}-worker-{}", i, j),
+            committee.worker(&name, &worker_id).unwrap().metrics,
+        );
         spawned.push((registry, reporter, target));
 
         let target_addr = committee.worker(&name, &worker_id).unwrap().transactions;
@@ -576,7 +628,8 @@ async fn print_results(
     // already relies on for the latency histogram's own `count`/`misses`. With
     // `--workers 1` (the default) each node contributes exactly one worker, so this
     // sum is a no-op and the reported numbers are unchanged.
-    let mut committed_by_node: std::collections::BTreeMap<usize, (u64, u64)> = std::collections::BTreeMap::new();
+    let mut committed_by_node: std::collections::BTreeMap<usize, (u64, u64)> =
+        std::collections::BTreeMap::new();
     for (node, registry, reporter) in worker_metrics {
         // Force a final drain so the gauges reflect every observation up to now, not
         // whatever the last periodic (every-10s) tick happened to see.
@@ -589,8 +642,16 @@ async fn print_results(
         }
     }
 
-    let max_committed_transactions = committed_by_node.values().map(|(t, _)| *t).max().unwrap_or(0);
-    let max_committed_bytes = committed_by_node.values().map(|(_, b)| *b).max().unwrap_or(0);
+    let max_committed_transactions = committed_by_node
+        .values()
+        .map(|(t, _)| *t)
+        .max()
+        .unwrap_or(0);
+    let max_committed_bytes = committed_by_node
+        .values()
+        .map(|(_, b)| *b)
+        .max()
+        .unwrap_or(0);
     let consensus_tps = max_committed_transactions as f64 / duration.max(1) as f64;
     let consensus_bps = max_committed_bytes as f64 / duration.max(1) as f64;
 
@@ -638,11 +699,19 @@ async fn print_results(
     // counters are SUMMED across every node (each node's own independent traffic,
     // additive) -- unlike the replicated-commit-stream latency snapshot above, which
     // uses max/median across nodes because every node counts the same global stream.
-    let submitted_transactions: u64 = worker_metrics.iter().map(|(_, r, _)| read_counter(r, "submitted_transactions")).sum();
-    let submitted_bytes: u64 = worker_metrics.iter().map(|(_, r, _)| read_counter(r, "submitted_transactions_bytes")).sum();
+    let submitted_transactions: u64 = worker_metrics
+        .iter()
+        .map(|(_, r, _)| read_counter(r, "submitted_transactions"))
+        .sum();
+    let submitted_bytes: u64 = worker_metrics
+        .iter()
+        .map(|(_, r, _)| read_counter(r, "submitted_transactions_bytes"))
+        .sum();
 
-    let mut sent_by_type: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut sent_bytes_by_type: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut sent_by_type: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut sent_bytes_by_type: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     let mut total_bytes_sent: u64 = 0;
     let mut total_bytes_received: u64 = 0;
     let all_registries = worker_metrics
@@ -690,7 +759,8 @@ async fn print_results(
         );
     }
     if !sent_bytes_by_type.is_empty() {
-        let mut by_category: std::collections::BTreeMap<&'static str, (u64, u64)> = std::collections::BTreeMap::new();
+        let mut by_category: std::collections::BTreeMap<&'static str, (u64, u64)> =
+            std::collections::BTreeMap::new();
         for (t, bytes) in &sent_bytes_by_type {
             let count = sent_by_type.get(t).copied().unwrap_or(0);
             let entry = by_category.entry(categorize(protocol, t)).or_insert((0, 0));
@@ -705,14 +775,18 @@ async fn print_results(
             } else {
                 0.0
             };
-            println!("   {:<16} {:>10} msgs  {:>12} B  ({:.1}%)", category, count, bytes, pct);
+            println!(
+                "   {:<16} {:>10} msgs  {:>12} B  ({:.1}%)",
+                category, count, bytes, pct
+            );
         }
     }
     println!();
 
     // PHASE6-SPEC.md §9 gate amendment: per-node seal-route breakdown (near-idle/absent
     // on the two Autobahn paths, which never observe into `vantage_seals` at all).
-    let mut per_route_totals: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut per_route_totals: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     let mut any_route_observed = false;
     for (i, registry, _reporter) in primary_metrics {
         // No `force_report()` needed here (unlike the latency histogram above):
@@ -723,15 +797,24 @@ async fn print_results(
             continue;
         }
         any_route_observed = true;
-        let breakdown: Vec<String> = routes.iter().map(|(route, count)| format!("{}={}", route, count)).collect();
+        let breakdown: Vec<String> = routes
+            .iter()
+            .map(|(route, count)| format!("{}={}", route, count))
+            .collect();
         println!(" Node {} seal routes: {}", i, breakdown.join(", "));
         for (route, count) in &routes {
             *per_route_totals.entry(route.clone()).or_insert(0) += count;
         }
     }
     if any_route_observed {
-        let total: Vec<String> = per_route_totals.iter().map(|(route, count)| format!("{}={}", route, count)).collect();
-        println!(" Total seal routes (summed across nodes): {}", total.join(", "));
+        let total: Vec<String> = per_route_totals
+            .iter()
+            .map(|(route, count)| format!("{}={}", route, count))
+            .collect();
+        println!(
+            " Total seal routes (summed across nodes): {}",
+            total.join(", ")
+        );
     }
     println!("-----------------------------------------");
 }
@@ -739,7 +822,10 @@ async fn print_results(
 /// Generates `prometheus.yaml` targeting every primary/worker metrics endpoint, for
 /// the optional `monitoring/docker-compose.yml` stack. Containers reach native node
 /// endpoints via `host.docker.internal` (macOS Docker Desktop's host-loopback name).
-fn write_prometheus_config(data_dir: &std::path::Path, targets: &[(String, SocketAddr)]) -> Result<()> {
+fn write_prometheus_config(
+    data_dir: &std::path::Path,
+    targets: &[(String, SocketAddr)],
+) -> Result<()> {
     let mut yaml = String::new();
     yaml.push_str("global:\n  scrape_interval: 1s\n");
     yaml.push_str("scrape_configs:\n");

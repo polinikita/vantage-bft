@@ -1,5 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use rocksdb::{BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, Options, WriteOptions};
+use rocksdb::{
+    BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, Options, WriteOptions,
+};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;

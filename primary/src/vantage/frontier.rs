@@ -129,7 +129,11 @@ impl Frontier {
     /// Thin wrapper over `propose_view` for the `a_i + 1` case (the frontier-advance
     /// path); the paper's `omega_i^+` early-wish trigger reaches other owned views
     /// through `propose_view` directly.
-    pub fn try_propose(&mut self, lm: &LaneManager, m: Option<ResolutionEntry>) -> Option<ViewProposal> {
+    pub fn try_propose(
+        &mut self,
+        lm: &LaneManager,
+        m: Option<ResolutionEntry>,
+    ) -> Option<ViewProposal> {
         self.propose_view(self.a_i + 1, lm, m)
     }
 
@@ -141,7 +145,12 @@ impl Frontier {
     /// reaches it (automatic in the existing echo-stage code, unaffected by this
     /// method). Same gate as `try_propose`: not-yet-proposed, and it must actually be
     /// this party's turn for `view`.
-    pub fn propose_view(&mut self, view: View, lm: &LaneManager, m: Option<ResolutionEntry>) -> Option<ViewProposal> {
+    pub fn propose_view(
+        &mut self,
+        view: View,
+        lm: &LaneManager,
+        m: Option<ResolutionEntry>,
+    ) -> Option<ViewProposal> {
         if self.proposed.contains(&view) {
             return None;
         }
@@ -176,7 +185,10 @@ impl Frontier {
                 }
             }
         }
-        debug_assert!(formed(&self.committee, view, &c, &t, &None), "own construction must always be Formed_v");
+        debug_assert!(
+            formed(&self.committee, view, &c, &t, &None),
+            "own construction must always be Formed_v"
+        );
         (c, t)
     }
 }

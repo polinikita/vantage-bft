@@ -80,7 +80,13 @@ impl Node {
         let (metrics, _reporter) = Metrics::new(&registry);
         let agb = new_agb_engine(name).with_metrics(metrics.clone());
         let frontier = Frontier::new(name, test_committee());
-        let cursor = Cursor::new(test_committee(), lm.sid().clone(), lm.genesis().clone(), MAX_BLOCK_PAYLOAD, lm.blocks_handle());
+        let cursor = Cursor::new(
+            test_committee(),
+            lm.sid().clone(),
+            lm.genesis().clone(),
+            MAX_BLOCK_PAYLOAD,
+            lm.blocks_handle(),
+        );
         let pacemaker = Pacemaker::new(name, &test_committee());
         let resolver = Resolver::new(test_committee().size(), TEST_DELTA_MS);
         let mut control = ControlLog::new(name, test_committee(), lm.sid().clone(), TEST_DELTA_MS);
@@ -128,13 +134,21 @@ impl Node {
         let m = if self.agb.proposer(view) == self.name && !self.frontier.already_proposed(view) {
             let agb = &self.agb;
             let control = &self.control;
-            self.resolver.decide(agb, view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+            self.resolver.decide(agb, view, now, |u| {
+                agb.is_sealed(u) || control.is_anchor_resolved(u)
+            })
         } else {
             None
         };
         if let Some(proposal) = self.frontier.try_propose(&self.lm, m) {
             effects.push(Effect::BroadcastPropose(proposal.clone()));
-            effects.extend(self.agb.on_propose(self.name, proposal, now, &mut self.lm, &mut self.rep));
+            effects.extend(self.agb.on_propose(
+                self.name,
+                proposal,
+                now,
+                &mut self.lm,
+                &mut self.rep,
+            ));
         }
         effects
     }
@@ -183,7 +197,8 @@ impl Node {
             Inbound::Ack(ack) => self.lm.process_ack(ack.sender, ack.reference()),
             Inbound::Propose(proposal) => {
                 let sender = self.agb.proposer(proposal.view);
-                self.agb.on_propose(sender, proposal, now, &mut self.lm, &mut self.rep)
+                self.agb
+                    .on_propose(sender, proposal, now, &mut self.lm, &mut self.rep)
             }
             Inbound::Echo(echo) => {
                 let mut effects = self.absorb_wish(echo.sender, echo.wish);
@@ -210,17 +225,29 @@ impl Node {
                 effects
             }
             Inbound::Wish(view, sender) => self.absorb_wish(sender, view),
-            Inbound::CompReport(view, digest, sender) => self.control.on_comp_report(view, digest, sender),
+            Inbound::CompReport(view, digest, sender) => {
+                self.control.on_comp_report(view, digest, sender)
+            }
             Inbound::ControlInit(proposal, b_w) => {
                 let sender = self.control.control_leader(proposal.round);
                 self.control.on_control_init(sender, proposal, b_w)
             }
-            Inbound::ControlEcho(sender, proposal) => self.control.on_control_echo(sender, proposal),
-            Inbound::ControlReady(sender, proposal) => self.control.on_control_ready(sender, proposal),
+            Inbound::ControlEcho(sender, proposal) => {
+                self.control.on_control_echo(sender, proposal)
+            }
+            Inbound::ControlReady(sender, proposal) => {
+                self.control.on_control_ready(sender, proposal)
+            }
             Inbound::ControlCommit(sender, round) => self.control.on_control_commit(sender, round),
-            Inbound::ControlTimeoutVote(sender, round) => self.control.on_control_timeout_vote(sender, round),
-            Inbound::ControlTimeoutAccept(sender, round) => self.control.on_control_timeout_accept(sender, round),
-            Inbound::ControlFetch(view, digest, requester) => self.control.on_control_fetch(requester, view, digest),
+            Inbound::ControlTimeoutVote(sender, round) => {
+                self.control.on_control_timeout_vote(sender, round)
+            }
+            Inbound::ControlTimeoutAccept(sender, round) => {
+                self.control.on_control_timeout_accept(sender, round)
+            }
+            Inbound::ControlFetch(view, digest, requester) => {
+                self.control.on_control_fetch(requester, view, digest)
+            }
             Inbound::ControlServe(view, proposal) => self.control.on_control_serve(view, proposal),
         }
     }
@@ -265,8 +292,14 @@ impl Node {
         let mut effects = Vec::new();
         for (view, kind) in due {
             match kind {
-                TimerKind::EchoFallback => effects.extend(self.agb.on_echo_fallback_timer(view, &mut self.lm, &mut self.rep)),
-                TimerKind::EchoAbsolute => effects.extend(self.agb.on_echo_absolute_timer(view, &mut self.rep)),
+                TimerKind::EchoFallback => effects.extend(self.agb.on_echo_fallback_timer(
+                    view,
+                    &mut self.lm,
+                    &mut self.rep,
+                )),
+                TimerKind::EchoAbsolute => {
+                    effects.extend(self.agb.on_echo_absolute_timer(view, &mut self.rep))
+                }
                 TimerKind::ReadyAbsolute => effects.extend(self.agb.on_ready_timer(view)),
             }
         }
@@ -293,7 +326,13 @@ impl Node {
 /// `outbox` instead of a real network -- mirrors `VantageCore::execute` exactly,
 /// including D5-3's wish-stamping-at-serialization-time and the WISH pacemaker's own
 /// effects. Messages addressed to a dead node are simply never enqueued (`!alive`).
-pub fn drain_local(nodes: &mut [Node], idx: usize, initial: Vec<Effect>, now: Instant, outbox: &mut VecDeque<(usize, Inbound)>) {
+pub fn drain_local(
+    nodes: &mut [Node],
+    idx: usize,
+    initial: Vec<Effect>,
+    now: Instant,
+    outbox: &mut VecDeque<(usize, Inbound)>,
+) {
     if !nodes[idx].alive {
         return;
     }
@@ -319,7 +358,8 @@ pub fn drain_local(nodes: &mut [Node], idx: usize, initial: Vec<Effect>, now: In
             Effect::RequestTo(peer, digest) => {
                 if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
                     if nodes[j].alive {
-                        outbox.push_back((j, Inbound::HeadersRequest(vec![digest], nodes[idx].name)));
+                        outbox
+                            .push_back((j, Inbound::HeadersRequest(vec![digest], nodes[idx].name)));
                     }
                 }
             }
@@ -509,7 +549,12 @@ pub fn drain_local(nodes: &mut [Node], idx: usize, initial: Vec<Effect>, now: In
 /// `dispatch` would derive it from a real channel). `targets` may include dead nodes;
 /// they are silently skipped (mirrors every `drain_local` arm's own `nodes[j].alive`
 /// check).
-pub fn deliver_only_to(nodes: &[Node], outbox: &mut VecDeque<(usize, Inbound)>, targets: &[usize], inbound: Inbound) {
+pub fn deliver_only_to(
+    nodes: &[Node],
+    outbox: &mut VecDeque<(usize, Inbound)>,
+    targets: &[usize],
+    inbound: Inbound,
+) {
     for &i in targets {
         if nodes[i].alive {
             outbox.push_back((i, inbound.clone()));
@@ -517,7 +562,11 @@ pub fn deliver_only_to(nodes: &[Node], outbox: &mut VecDeque<(usize, Inbound)>, 
     }
 }
 
-pub async fn run_to_quiescence(nodes: &mut [Node], outbox: &mut VecDeque<(usize, Inbound)>, now: Instant) {
+pub async fn run_to_quiescence(
+    nodes: &mut [Node],
+    outbox: &mut VecDeque<(usize, Inbound)>,
+    now: Instant,
+) {
     while let Some((idx, inbound)) = outbox.pop_front() {
         if !nodes[idx].alive {
             continue;
@@ -554,7 +603,11 @@ pub async fn boot(nodes: &mut [Node], now: Instant, outbox: &mut VecDeque<(usize
 /// `max_rounds_for_test` budget on empty rounds, permanently stranding the round
 /// machine before it ever gets a chance to propose the real value (the cap is a hard,
 /// non-retriable ceiling by design, not a soft/resettable one).
-pub async fn boot_without_control(nodes: &mut [Node], now: Instant, outbox: &mut VecDeque<(usize, Inbound)>) {
+pub async fn boot_without_control(
+    nodes: &mut [Node],
+    now: Instant,
+    outbox: &mut VecDeque<(usize, Inbound)>,
+) {
     for i in 0..nodes.len() {
         if !nodes[i].alive {
             continue;
@@ -568,7 +621,11 @@ pub async fn boot_without_control(nodes: &mut [Node], now: Instant, outbox: &mut
 
 /// Starts the control-round clock (`ControlLog::genesis`) for every live node -- pairs
 /// with `boot_without_control`, see its doc comment.
-pub async fn start_control(nodes: &mut [Node], now: Instant, outbox: &mut VecDeque<(usize, Inbound)>) {
+pub async fn start_control(
+    nodes: &mut [Node],
+    now: Instant,
+    outbox: &mut VecDeque<(usize, Inbound)>,
+) {
     for i in 0..nodes.len() {
         if !nodes[i].alive {
             continue;
@@ -584,7 +641,11 @@ pub async fn start_control(nodes: &mut [Node], now: Instant, outbox: &mut VecDeq
 /// branch (processing one node's wakeup at a time is fine: correctness only needs
 /// every timer due at this `now` to eventually fire, not a particular cross-node
 /// order).
-pub async fn advance_time(nodes: &mut [Node], outbox: &mut VecDeque<(usize, Inbound)>, now: Instant) {
+pub async fn advance_time(
+    nodes: &mut [Node],
+    outbox: &mut VecDeque<(usize, Inbound)>,
+    now: Instant,
+) {
     for idx in 0..nodes.len() {
         if !nodes[idx].alive {
             continue;

@@ -40,12 +40,19 @@ pub fn read_latency_snapshot(registry: &Registry) -> Option<LatencySnapshot> {
     let families = registry.gather();
 
     let gauge = |metric: &str, label: &str| -> Option<u64> {
-        families.iter().find(|f| f.get_name() == metric).and_then(|f| {
-            f.get_metric()
-                .iter()
-                .find(|m| m.get_label().iter().any(|l| l.get_name() == "v" && l.get_value() == label))
-                .map(|m| m.get_gauge().get_value() as u64)
-        })
+        families
+            .iter()
+            .find(|f| f.get_name() == metric)
+            .and_then(|f| {
+                f.get_metric()
+                    .iter()
+                    .find(|m| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == "v" && l.get_value() == label)
+                    })
+                    .map(|m| m.get_gauge().get_value() as u64)
+            })
     };
     let counter = |metric: &str| -> u64 {
         families
@@ -142,7 +149,10 @@ pub fn read_seal_route_counts(registry: &Registry) -> BTreeMap<String, u64> {
         let Some(route) = m.get_label().iter().find(|l| l.get_name() == "route") else {
             continue;
         };
-        out.insert(route.get_value().to_string(), m.get_counter().get_value() as u64);
+        out.insert(
+            route.get_value().to_string(),
+            m.get_counter().get_value() as u64,
+        );
     }
     out
 }

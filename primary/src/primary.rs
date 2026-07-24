@@ -7,7 +7,10 @@ use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::Helper;
 use crate::leader::LeaderElector;
-use crate::messages::{Ack, Certificate, Header, Vote, Timeout, TC, Proposal, ConsensusMessage, ConsensusVote, ConsensusRequest};
+use crate::messages::{
+    Ack, Certificate, ConsensusMessage, ConsensusRequest, ConsensusVote, Header, Proposal, Timeout,
+    Vote, TC,
+};
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
@@ -137,8 +140,14 @@ impl PrimaryMessage {
 /// (no frame prefix -- `network_bytes_received_total` is "beyond starfish", the
 /// serialized-length-is-in-hand convention noted in the spec).
 pub(crate) fn record_typed_received(metrics: &Arc<Metrics>, msg_type: &'static str, len: usize) {
-    metrics.network_messages_received_total.with_label_values(&[msg_type]).inc();
-    metrics.network_bytes_received_total.with_label_values(&[msg_type]).inc_by(len as u64);
+    metrics
+        .network_messages_received_total
+        .with_label_values(&[msg_type])
+        .inc();
+    metrics
+        .network_bytes_received_total
+        .with_label_values(&[msg_type])
+        .inc_by(len as u64);
 }
 
 /// The messages sent by the primary to its workers.
@@ -229,7 +238,6 @@ impl Primary {
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
         let (_tx_mempool, rx_mempool) = channel(CHANNEL_CAPACITY);
 
-
         // Write the parameters to the logs.
         // NOTE: These log entries are needed to compute performance.
         parameters.log();
@@ -272,7 +280,9 @@ impl Primary {
         // (would otherwise silently run unauthenticated); panic loudly rather than
         // let it pass.
         let channel_auth: Option<Arc<crypto::PairwiseKeys>> = if parameters.authenticate_channels {
-            let secret = parameters.mac_secret.expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
+            let secret = parameters
+                .mac_secret
+                .expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
             Some(Arc::new(committee.pairwise_keys(&name, &secret)))
         } else {
             None
@@ -304,12 +314,18 @@ impl Primary {
                 NetworkReceiver::spawn_full(
                     address,
                     /* handler */
-                    crate::vantage::node::VantageReceiverHandler { tx: tx_vantage, metrics: Some(metrics.clone()), channel_auth: channel_auth.clone(), committee: committee.clone() },
+                    crate::vantage::node::VantageReceiverHandler {
+                        tx: tx_vantage,
+                        metrics: Some(metrics.clone()),
+                        channel_auth: channel_auth.clone(),
+                        committee: committee.clone(),
+                    },
                     Some(metrics.clone()),
                     parameters.compress_network,
                     // Acks every received frame (moved out of `dispatch` -- see
                     // `VantageReceiverHandler`'s doc comment).
-                    /* acks */ true,
+                    /* acks */
+                    true,
                     parameters.batch_messages,
                 );
                 info!(
@@ -339,7 +355,8 @@ impl Primary {
                     Some(metrics.clone()),
                     parameters.compress_network,
                     // This handler never acked (see its `dispatch`).
-                    /* acks */ false,
+                    /* acks */
+                    false,
                     parameters.batch_messages,
                 );
                 info!(
@@ -381,7 +398,8 @@ impl Primary {
                     parameters.compress_network,
                     // Acks every received frame (moved out of `dispatch` -- see
                     // `PrimaryReceiverHandler`'s doc comment).
-                    /* acks */ true,
+                    /* acks */
+                    true,
                     parameters.batch_messages,
                 );
                 info!(
@@ -408,7 +426,8 @@ impl Primary {
                     Some(metrics.clone()),
                     parameters.compress_network,
                     // This handler never acked (see its `dispatch`).
-                    /* acks */ false,
+                    /* acks */
+                    false,
                     parameters.batch_messages,
                 );
                 info!(
@@ -481,7 +500,21 @@ impl Primary {
                     batch,
                 );
 
-                Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer, metrics.clone(), parameters.compress_network, batch, channel_auth.clone());
+                Committer::spawn(
+                    name,
+                    committee.clone(),
+                    store.clone(),
+                    parameters.gc_depth,
+                    rx_mempool,
+                    rx_committer,
+                    rx_commit,
+                    tx_output,
+                    synchronizer,
+                    metrics.clone(),
+                    parameters.compress_network,
+                    batch,
+                    channel_auth.clone(),
+                );
 
                 // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
                 GarbageCollector::spawn(
@@ -543,7 +576,15 @@ impl Primary {
                 );
 
                 // The `Helper` is dedicated to reply to certificates requests from other primaries.
-                Helper::spawn(committee.clone(), store, rx_cert_requests, rx_header_requests, metrics.clone(), parameters.compress_network, batch);
+                Helper::spawn(
+                    committee.clone(),
+                    store,
+                    rx_cert_requests,
+                    rx_header_requests,
+                    metrics.clone(),
+                    parameters.compress_network,
+                    batch,
+                );
 
                 // NOTE: This log entry is used to compute performance.
                 info!(
@@ -573,14 +614,19 @@ struct PrimaryReceiverHandler {
 
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(
+        &self,
+        _writer: &mut Writer,
+        serialized: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
         // The ack is now sent by `network::Receiver` itself, once per received FRAME
         // rather than once per `dispatch` call -- required for batching (several
         // logical messages can share one frame, and only one ack may be sent per
         // frame). See `Receiver::acks`'s doc comment.
 
         // Deserialize and parse the message.
-        let message: PrimaryMessage = bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
+        let message: PrimaryMessage =
+            bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
         record_typed_received(&self.metrics, message.type_name(), serialized.len());
         match message {
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
@@ -595,11 +641,10 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .expect("Failed to send primary message"),
             request => {
                 ////println!("Made it to dispatch");
-                self
-                .tx_primary_messages
-                .send(request)
-                .await
-                .expect("Failed to send certificate")
+                self.tx_primary_messages
+                    .send(request)
+                    .await
+                    .expect("Failed to send certificate")
             }
         }
         Ok(())
@@ -643,7 +688,8 @@ impl MessageHandler for WorkerReceiverHandler {
         };
 
         // Deserialize and parse the message.
-        let message: WorkerPrimaryMessage = bincode::deserialize(payload).map_err(DagError::SerializationError)?;
+        let message: WorkerPrimaryMessage =
+            bincode::deserialize(payload).map_err(DagError::SerializationError)?;
 
         if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
             if !auth.verify(&self.name, payload, &tag) {
@@ -655,18 +701,18 @@ impl MessageHandler for WorkerReceiverHandler {
         match message {
             WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
                 record_typed_received(&self.metrics, "OurBatch", payload.len());
-                self.tx_our_digests                                         //sender channel to Proposer
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests")
-            },
+                self.tx_our_digests //sender channel to Proposer
+                    .send((digest, worker_id))
+                    .await
+                    .expect("Failed to send workers' digests")
+            }
             WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
                 record_typed_received(&self.metrics, "OthersBatch", payload.len());
-                self.tx_others_digests                                      //sender channel to PayloadReceiver
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests")
-            },
+                self.tx_others_digests //sender channel to PayloadReceiver
+                    .send((digest, worker_id))
+                    .await
+                    .expect("Failed to send workers' digests")
+            }
         }
         Ok(())
     }

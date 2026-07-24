@@ -3,8 +3,8 @@
 pub mod error;
 mod aggregators;
 mod certificate_waiter;
-mod core;
 pub mod committer;
+mod core;
 mod garbage_collector;
 mod header_waiter;
 mod helper;
@@ -23,4 +23,6 @@ mod common;
 
 pub use crate::error::DagError;
 pub use crate::messages::{Ack, Certificate, Header};
-pub use crate::primary::{Primary, PrimaryMessage, PrimaryWorkerMessage, Height, WorkerPrimaryMessage};
+pub use crate::primary::{
+    Height, Primary, PrimaryMessage, PrimaryWorkerMessage, WorkerPrimaryMessage,
+};

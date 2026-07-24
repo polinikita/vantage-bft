@@ -42,8 +42,11 @@ impl Pacemaker {
         let thresholds = Thresholds::from_party_count(n);
         let f_plus_1_parties = thresholds.f_plus_1_parties;
         let two_f_plus_1_parties = thresholds.two_f_plus_1_parties;
-        let index_of: HashMap<PublicKey, usize> = names.iter().enumerate().map(|(i, pk)| (*pk, i)).collect();
-        let own_index = *index_of.get(&name).expect("self must be a committee member");
+        let index_of: HashMap<PublicKey, usize> =
+            names.iter().enumerate().map(|(i, pk)| (*pk, i)).collect();
+        let own_index = *index_of
+            .get(&name)
+            .expect("self must be a committee member");
         Self {
             omega: vec![0; n],
             index_of,

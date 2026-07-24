@@ -234,7 +234,10 @@ impl ControlLog {
         self.curr_round = r;
         self.voted = false;
         self.timed_out = false;
-        let mut effects = vec![Effect::ArmControlTimer(r, std::time::Instant::now() + self.control_round_timeout())];
+        let mut effects = vec![Effect::ArmControlTimer(
+            r,
+            std::time::Instant::now() + self.control_round_timeout(),
+        )];
         effects.extend(self.try_propose(r));
         effects.extend(self.try_vote(r));
         effects
@@ -272,7 +275,11 @@ impl ControlLog {
         };
         let value = self.pick_submittable_value(parent);
         self.proposed_this_round.insert(r);
-        let proposal = ControlProposal { round: r, parent, value: value.clone() };
+        let proposal = ControlProposal {
+            round: r,
+            parent,
+            value: value.clone(),
+        };
         let b_w = value.and_then(|(w, _)| self.blocks.get(&w).cloned());
         let mut effects = vec![Effect::BroadcastControlInit(proposal.clone(), b_w.clone())];
         // Bracha self-delivery: the leader also processes its own INIT locally (same
@@ -311,7 +318,9 @@ impl ControlLog {
         let in_chain: HashSet<(View, Digest)> = self.log_chain(parent).into_iter().collect();
         let mut best: Option<(View, Digest)> = None;
         for (&view, reporters) in &self.reports {
-            let Some(proposal) = self.blocks.get(&view) else { continue };
+            let Some(proposal) = self.blocks.get(&view) else {
+                continue;
+            };
             let digest = proposal.digest(&self.sid);
             let matching = reporters.values().filter(|d| **d == digest).count();
             if matching < self.two_f_plus_1_parties {
@@ -347,7 +356,9 @@ impl ControlLog {
             if cur == 0 {
                 break;
             }
-            let Some(p) = self.proposal.get(&cur) else { break };
+            let Some(p) = self.proposal.get(&cur) else {
+                break;
+            };
             if let Some(pair) = &p.value {
                 chain.push(pair.clone());
             }
@@ -370,7 +381,12 @@ impl ControlLog {
     /// `control_leader(round)`. Sticky: only the FIRST complete proposal ever received
     /// from the leader is stored (Bracha's own uniqueness -- "first" and "matching"
     /// collapse to the same thing).
-    pub fn on_control_init(&mut self, sender: PublicKey, proposal: ControlProposal, b_w: Option<ViewProposal>) -> Vec<Effect> {
+    pub fn on_control_init(
+        &mut self,
+        sender: PublicKey,
+        proposal: ControlProposal,
+        b_w: Option<ViewProposal>,
+    ) -> Vec<Effect> {
         if sender != self.control_leader(proposal.round) {
             return Vec::new();
         }
@@ -382,7 +398,7 @@ impl ControlLog {
         state.received_init = Some((proposal, b_w));
         let mut effects = self.try_echo(round);
         effects.extend(self.pump_log()); // a freshly-fetched-or-completed B_w might
-                                          // unblock an already-pending log position
+                                         // unblock an already-pending log position
         effects
     }
 
@@ -391,11 +407,15 @@ impl ControlLog {
     /// `B_w` to verify. Persistent: re-evaluated by `retry_pending_echoes` whenever new
     /// reports arrive or a `B_w` becomes newly held.
     fn try_echo(&mut self, round: Round) -> Vec<Effect> {
-        let Some(state) = self.bracha.get(&round) else { return Vec::new() };
+        let Some(state) = self.bracha.get(&round) else {
+            return Vec::new();
+        };
         if state.echo_sent {
             return Vec::new();
         }
-        let Some((proposal, b_w)) = state.received_init.clone() else { return Vec::new() };
+        let Some((proposal, b_w)) = state.received_init.clone() else {
+            return Vec::new();
+        };
         let valid = match &proposal.value {
             None => true, // ⊥ passes immediately
             Some((w, h)) => {
@@ -452,7 +472,9 @@ impl ControlLog {
     /// **READY** on `2f+1` matching ECHOes or `f+1` matching READYs (Bracha's relay
     /// rule) -- once, ever, per round.
     fn recheck_bracha_ready(&mut self, round: Round) -> Vec<Effect> {
-        let Some(state) = self.bracha.get(&round) else { return Vec::new() };
+        let Some(state) = self.bracha.get(&round) else {
+            return Vec::new();
+        };
         if state.ready_sent {
             return Vec::new();
         }
@@ -461,9 +483,15 @@ impl ControlLog {
         let winner = echo_tally
             .iter()
             .find(|(_, count)| **count >= self.two_f_plus_1_parties)
-            .or_else(|| ready_tally.iter().find(|(_, count)| **count >= self.f_plus_1_parties))
+            .or_else(|| {
+                ready_tally
+                    .iter()
+                    .find(|(_, count)| **count >= self.f_plus_1_parties)
+            })
             .map(|(p, _)| p.clone());
-        let Some(proposal) = winner else { return Vec::new() };
+        let Some(proposal) = winner else {
+            return Vec::new();
+        };
         let state = self.bracha.get_mut(&round).unwrap();
         state.ready_sent = true;
         let name = self.name;
@@ -474,7 +502,11 @@ impl ControlLog {
     }
 
     /// A counted `ControlReady`.
-    pub fn on_control_ready(&mut self, sender: PublicKey, proposal: ControlProposal) -> Vec<Effect> {
+    pub fn on_control_ready(
+        &mut self,
+        sender: PublicKey,
+        proposal: ControlProposal,
+    ) -> Vec<Effect> {
         let round = proposal.round;
         let state = self.bracha.entry(round).or_default();
         if state.ready_statements.contains_key(&sender) {
@@ -491,12 +523,17 @@ impl ControlLog {
     /// matching READYs. Sets `proposal[round]`, runs Mark-safe, requests `B_w` early if
     /// missing (§5's "missing validation data at delivery time").
     fn recheck_bracha_deliver(&mut self, round: Round) -> Vec<Effect> {
-        let Some(state) = self.bracha.get(&round) else { return Vec::new() };
+        let Some(state) = self.bracha.get(&round) else {
+            return Vec::new();
+        };
         if state.delivered.is_some() {
             return Vec::new();
         }
         let ready_tally = Self::tally(&state.ready_statements);
-        let Some((proposal, _)) = ready_tally.iter().find(|(_, count)| **count >= self.two_f_plus_1_parties) else {
+        let Some((proposal, _)) = ready_tally
+            .iter()
+            .find(|(_, count)| **count >= self.two_f_plus_1_parties)
+        else {
             return Vec::new();
         };
         let proposal = proposal.clone();
@@ -504,7 +541,10 @@ impl ControlLog {
         // The single RB-delivery site is the only place `proposal` is populated, and a
         // round delivers at most once (guarded above), so this parent->children index
         // (used by `mark_safe`'s cascade) gains each delivered round exactly once.
-        self.children_by_parent.entry(proposal.parent).or_default().push(round);
+        self.children_by_parent
+            .entry(proposal.parent)
+            .or_default()
+            .push(round);
         self.proposal.insert(round, proposal.clone());
         let mut effects = Vec::new();
         if let Some((w, h)) = &proposal.value {
@@ -568,7 +608,9 @@ impl ControlLog {
             if self.safe.contains(&r) {
                 continue;
             }
-            let Some(p) = self.proposal.get(&r) else { continue };
+            let Some(p) = self.proposal.get(&r) else {
+                continue;
+            };
             let parent = p.parent;
             if !self.safe.contains(&parent) {
                 continue;
@@ -585,12 +627,16 @@ impl ControlLog {
             // (the `!safe.contains` filter is still applied). Collected into an owned
             // `Vec` first so no borrow of `self.children_by_parent` crosses `worklist`.
             if let Some(kids) = self.children_by_parent.get(&r) {
-                let children: Vec<Round> = kids.iter().copied().filter(|cr| !self.safe.contains(cr)).collect();
+                let children: Vec<Round> = kids
+                    .iter()
+                    .copied()
+                    .filter(|cr| !self.safe.contains(cr))
+                    .collect();
                 worklist.extend(children);
             }
         }
         effects.extend(self.retry_propose()); // a newly-safe round can unblock a
-                                               // pending leader proposal at curr_round
+                                              // pending leader proposal at curr_round
         effects
     }
 
@@ -694,7 +740,7 @@ impl ControlLog {
         state.confirmed = true;
         self.disabled.insert(r);
         let mut effects = self.retry_propose(); // a newly-disabled round can complete
-                                                 // a downstream SafeParent scan
+                                                // a downstream SafeParent scan
         effects.extend(self.try_advance_round());
         effects
     }
@@ -760,7 +806,8 @@ impl ControlLog {
         let mut effects = Vec::new();
         loop {
             let r = self.curr_round;
-            let ready = (self.safe.contains(&r) && (self.voted || self.timed_out)) || self.disabled.contains(&r);
+            let ready = (self.safe.contains(&r) && (self.voted || self.timed_out))
+                || self.disabled.contains(&r);
             if !ready {
                 break;
             }
@@ -816,7 +863,9 @@ impl ControlLog {
 
     /// Counted first-hand reports for `view` naming exactly `digest` (party count).
     pub(crate) fn report_count_for(&self, view: View, digest: &Digest) -> usize {
-        self.reports.get(&view).map_or(0, |m| m.values().filter(|d| *d == digest).count())
+        self.reports
+            .get(&view)
+            .map_or(0, |m| m.values().filter(|d| *d == digest).count())
     }
 
     /// §5: "verified `B_w`" -- view matches, `M_w != ∅`, digest matches, and the
@@ -826,7 +875,13 @@ impl ControlLog {
         proposal.view == view
             && proposal.m.is_some()
             && proposal.digest(&self.sid) == *digest
-            && agb::formed(&self.committee, proposal.view, &proposal.c, &proposal.t, &proposal.m)
+            && agb::formed(
+                &self.committee,
+                proposal.view,
+                &proposal.c,
+                &proposal.t,
+                &proposal.m,
+            )
     }
 
     // ============================================================ Fetch (§5/§6)
@@ -869,7 +924,9 @@ impl ControlLog {
         if self.fetch_answered.contains(&(requester, w, h.clone())) {
             return Vec::new();
         }
-        let Some(proposal) = self.blocks.get(&w) else { return Vec::new() };
+        let Some(proposal) = self.blocks.get(&w) else {
+            return Vec::new();
+        };
         if proposal.digest(&self.sid) != h {
             return Vec::new();
         }
@@ -898,7 +955,15 @@ impl ControlLog {
         if !self.pending_fetch.contains(&(view, digest.clone())) {
             return Vec::new(); // unsolicited, or answers a DIFFERENT pending pair -- ignored
         }
-        if proposal.m.is_none() || !agb::formed(&self.committee, proposal.view, &proposal.c, &proposal.t, &proposal.m) {
+        if proposal.m.is_none()
+            || !agb::formed(
+                &self.committee,
+                proposal.view,
+                &proposal.c,
+                &proposal.t,
+                &proposal.m,
+            )
+        {
             return Vec::new();
         }
         self.pending_fetch.remove(&(view, digest));
@@ -935,7 +1000,9 @@ impl ControlLog {
     fn pump_log(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         loop {
-            let Some((w, h)) = self.delivered_log.get(self.consume_pos).cloned() else { break };
+            let Some((w, h)) = self.delivered_log.get(self.consume_pos).cloned() else {
+                break;
+            };
             let Some(proposal) = self.blocks.get(&w) else {
                 effects.extend(self.ensure_fetch(w, &h, self.curr_round));
                 break;
@@ -973,7 +1040,12 @@ impl ControlLog {
             // target view, with the carrier (w) and control round it rode in on, so a
             // run's log can show the actual wall-clock/round distance between a target
             // becoming unresolved and its anchor finally landing.
-            log::info!("vantage control log: anchor applied for u={} via carrier w={} at control round={}", u, w, self.curr_round);
+            log::info!(
+                "vantage control log: anchor applied for u={} via carrier w={} at control round={}",
+                u,
+                w,
+                self.curr_round
+            );
             effects.push(Effect::ApplyAnchor(u, outcome, refs));
             self.consume_pos += 1;
         }
@@ -984,8 +1056,14 @@ impl ControlLog {
     /// `(C,T)` retained for authorization, `Skip -> gskip`.
     fn derive_anchor(entry: &ResolutionEntry) -> (Outcome, Vec<BlockRef>) {
         match entry {
-            ResolutionEntry::Full(_, c, t) => (Outcome::Full(c.clone(), t.clone()), c.iter().chain(t.iter()).cloned().collect()),
-            ResolutionEntry::Core(_, c, t) => (Outcome::Core(c.clone()), c.iter().chain(t.iter()).cloned().collect()),
+            ResolutionEntry::Full(_, c, t) => (
+                Outcome::Full(c.clone(), t.clone()),
+                c.iter().chain(t.iter()).cloned().collect(),
+            ),
+            ResolutionEntry::Core(_, c, t) => (
+                Outcome::Core(c.clone()),
+                c.iter().chain(t.iter()).cloned().collect(),
+            ),
             ResolutionEntry::Skip(_) => (Outcome::Skip, Vec::new()),
         }
     }

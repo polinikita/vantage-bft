@@ -2,7 +2,7 @@
 // `AgbEngine::on_echo`/`on_echo_skip`/`on_ready_timer`.
 
 use super::common::*;
-use crate::vantage::agb::{Echo, ReadyGrade, Ready, ViewProposal};
+use crate::vantage::agb::{Echo, Ready, ReadyGrade, ViewProposal};
 use crate::vantage::Effect;
 use crypto::Digest;
 
@@ -24,7 +24,13 @@ fn ready_effect(effects: &[Effect]) -> Option<&Ready> {
 }
 
 fn echo(proposal: ViewProposal, grade: u8, sender: crypto::PublicKey) -> Echo {
-    Echo { proposal, grade, sender, wish: 0, origin: None }
+    Echo {
+        proposal,
+        grade,
+        sender,
+        wish: 0,
+        origin: None,
+    }
 }
 
 /// Constructing a `LaneManager` opens a real (on-disk) `Store`, which spawns a tokio
@@ -45,7 +51,11 @@ async fn ready_fires_at_quorum_with_grade_one() {
 
     for (i, (sender, _)) in authors().into_iter().enumerate().take(2) {
         let effects = agb.on_echo(echo(proposal.clone(), 1, sender), &mut rep);
-        assert!(ready_effect(&effects).is_none(), "quorum not yet reached at echo {}", i);
+        assert!(
+            ready_effect(&effects).is_none(),
+            "quorum not yet reached at echo {}",
+            i
+        );
     }
     let (third, _) = authors()[2];
     let effects = agb.on_echo(echo(proposal.clone(), 1, third), &mut rep);
@@ -90,7 +100,10 @@ async fn q_boundary_exact() {
     let e1 = agb.on_echo(echo(proposal.clone(), 1, all[0].0), &mut rep);
     assert!(ready_effect(&e1).is_none());
     let e2 = agb.on_echo(echo(proposal.clone(), 1, all[1].0), &mut rep);
-    assert!(ready_effect(&e2).is_none(), "2 < Q=3 must not trigger ready");
+    assert!(
+        ready_effect(&e2).is_none(),
+        "2 < Q=3 must not trigger ready"
+    );
     let e3 = agb.on_echo(echo(proposal, 1, all[2].0), &mut rep);
     assert!(ready_effect(&e3).is_some(), "3 == Q must trigger ready");
 }
@@ -130,7 +143,9 @@ async fn noready_fires_when_ready_pending_at_theta_r_and_never_after() {
     let (name, _) = authors()[3];
     let mut agb = new_agb_engine(name);
     let effects = agb.on_ready_timer(1);
-    assert!(effects.iter().any(|e| matches!(e, Effect::BroadcastNoReady(1))));
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::BroadcastNoReady(1))));
 
     let mut rep = dummy_repairer(name, ".db_test_ready_noready_then_never");
     // Once already "ready" (one-shot marker consumed by the no-ready above), further

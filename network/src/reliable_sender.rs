@@ -122,7 +122,14 @@ impl ReliableSender {
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(1_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.compress, self.batch);
+        Connection::spawn(
+            address,
+            rx,
+            extra_latency,
+            self.metrics.clone(),
+            self.compress,
+            self.batch,
+        );
         tx
     }
 
@@ -179,7 +186,12 @@ impl ReliableSender {
     /// the call site, not by this generic sender. Counts the LOGICAL message (once per
     /// `send_typed` call) regardless of whether it later gets coalesced into a bundle
     /// with others -- see `record_frame_sent` for the wire-frame-level counterpart.
-    pub async fn send_typed(&mut self, address: SocketAddr, data: Bytes, msg_type: &'static str) -> CancelHandler {
+    pub async fn send_typed(
+        &mut self,
+        address: SocketAddr,
+        data: Bytes,
+        msg_type: &'static str,
+    ) -> CancelHandler {
         record_typed_sent(&self.metrics, msg_type, data.len());
         self.send(address, data).await
     }
@@ -215,9 +227,16 @@ impl ReliableSender {
 
 /// Shared by `ReliableSender`/`SimpleSender`'s `*_typed` methods: increments the two
 /// typed counters if `metrics` is attached, a no-op otherwise.
-pub(crate) fn record_typed_sent(metrics: &Option<Arc<Metrics>>, msg_type: &'static str, len: usize) {
+pub(crate) fn record_typed_sent(
+    metrics: &Option<Arc<Metrics>>,
+    msg_type: &'static str,
+    len: usize,
+) {
     if let Some(metrics) = metrics {
-        metrics.network_messages_sent_total.with_label_values(&[msg_type]).inc();
+        metrics
+            .network_messages_sent_total
+            .with_label_values(&[msg_type])
+            .inc();
         metrics
             .network_bytes_sent_total
             .with_label_values(&[msg_type])
@@ -320,14 +339,18 @@ impl Connection {
             return data.clone();
         }
         if let Some(metrics) = &self.metrics {
-            metrics.bytes_uncompressed_sent_total.inc_by(data.len() as u64);
+            metrics
+                .bytes_uncompressed_sent_total
+                .inc_by(data.len() as u64);
         }
         Bytes::from(lz4_flex::compress_prepend_size(data))
     }
 
     fn record_bytes_sent(&self, len: usize) {
         if let Some(metrics) = &self.metrics {
-            metrics.bytes_sent_total.inc_by(len as u64 + Self::FRAME_PREFIX_LEN);
+            metrics
+                .bytes_sent_total
+                .inc_by(len as u64 + Self::FRAME_PREFIX_LEN);
         }
     }
 

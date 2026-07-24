@@ -67,7 +67,10 @@
 #![allow(clippy::needless_range_loop)]
 
 use super::common::*;
-use super::harness::{advance_time, boot, boot_without_control, deliver_only_to, drain_local, run_to_quiescence, start_control, Node};
+use super::harness::{
+    advance_time, boot, boot_without_control, deliver_only_to, drain_local, run_to_quiescence,
+    start_control, Node,
+};
 use crate::messages::Header;
 use crate::primary::View;
 use crate::vantage::agb::{self, Echo, Outcome, ReadyGrade, ResolutionEntry, ViewProposal};
@@ -105,8 +108,18 @@ const MAX_VIEWS_NO_ORGANIC: crate::primary::View = 1;
 /// leader can pick up a just-became-submittable pair -- see scenario 1's own note on
 /// why this is needed (a stale/`⊥` round may already be in flight when the pair
 /// becomes submittable).
-async fn drive_control_rounds(nodes: &mut [Node], outbox: &mut VecDeque<(usize, Inbound)>, now: Instant, rounds: usize) {
-    let control_timeout = nodes.iter().find(|n| n.alive).unwrap().control.control_round_timeout();
+async fn drive_control_rounds(
+    nodes: &mut [Node],
+    outbox: &mut VecDeque<(usize, Inbound)>,
+    now: Instant,
+    rounds: usize,
+) {
+    let control_timeout = nodes
+        .iter()
+        .find(|n| n.alive)
+        .unwrap()
+        .control
+        .control_round_timeout();
     let mut ct = now;
     for _ in 0..rounds {
         ct += control_timeout + Duration::from_millis(1);
@@ -121,7 +134,11 @@ async fn drive_control_rounds(nodes: &mut [Node], outbox: &mut VecDeque<(usize, 
 /// `carrying_view`'s own proposer's turn (see scenario 1's own methodology note for why
 /// this is driven directly rather than via the organic WISH cascade). Returns (the
 /// carrying view's own live proposer's node index, the resolved entry).
-fn resolve_carrying_entry(nodes: &mut [Node], carrying_view: View, target_view: View) -> (usize, ResolutionEntry) {
+fn resolve_carrying_entry(
+    nodes: &mut [Node],
+    carrying_view: View,
+    target_view: View,
+) -> (usize, ResolutionEntry) {
     let carrier_name = agb::proposer(&test_committee(), carrying_view);
     let carrier_idx = nodes.iter().position(|n| n.name == carrier_name).unwrap();
     let now = Instant::now();
@@ -129,14 +146,18 @@ fn resolve_carrying_entry(nodes: &mut [Node], carrying_view: View, target_view: 
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
         let control = &node.control;
-        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+        node.resolver.decide(agb, carrying_view, now, |u| {
+            agb.is_sealed(u) || control.is_anchor_resolved(u)
+        })
     };
     assert_eq!(first, None, "the next-turn bit starts data-only");
     let m = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
         let control = &node.control;
-        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+        node.resolver.decide(agb, carrying_view, now, |u| {
+            agb.is_sealed(u) || control.is_anchor_resolved(u)
+        })
     };
     let entry = m.expect("the target view must be justified for recovery");
     assert_eq!(entry.target_view(), target_view);
@@ -172,7 +193,13 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     let mut nodes: Vec<Node> = all
         .iter()
         .enumerate()
-        .map(|(i, (pk, _))| Node::new(*pk, &format!(".db_test_byz_scenario1_node_{}", i), MAX_VIEWS))
+        .map(|(i, (pk, _))| {
+            Node::new(
+                *pk,
+                &format!(".db_test_byz_scenario1_node_{}", i),
+                MAX_VIEWS,
+            )
+        })
         .collect();
     let now = Instant::now();
     let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
@@ -181,7 +208,10 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     // party's N5 registers have a real, quorum-acked C candidate for all four authors
     // before any AGB view proposes (same seeding as `crash_fault_tests.rs`).
     for i in 0..nodes.len() {
-        let (_, effects) = nodes[i].lm.publish_own(std::collections::BTreeMap::new()).await;
+        let (_, effects) = nodes[i]
+            .lm
+            .publish_own(std::collections::BTreeMap::new())
+            .await;
         drain_local(&mut nodes, i, effects, now, &mut outbox);
     }
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
@@ -193,7 +223,11 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     let dead_idx = nodes.iter().position(|n| n.name == dead_name).unwrap();
     nodes[dead_idx].alive = false;
     let live: Vec<usize> = (0..nodes.len()).filter(|&i| i != dead_idx).collect();
-    assert_eq!(live.len(), 3, "n=4, f=1 -- exactly 2f+1=3 correct parties remain");
+    assert_eq!(
+        live.len(),
+        3,
+        "n=4, f=1 -- exactly 2f+1=3 correct parties remain"
+    );
 
     boot(&mut nodes, now, &mut outbox).await;
 
@@ -203,12 +237,29 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
 
     // Refusals at deadlines: echo-skip at theta_E, no-ready at theta_R -- exactly
     // Phase-5's documented behavior (`crash_fault_tests.rs`).
-    advance_time(&mut nodes, &mut outbox, entry_instant + theta_echo + Duration::from_millis(1)).await;
-    advance_time(&mut nodes, &mut outbox, entry_instant + theta_ready + Duration::from_millis(1)).await;
+    advance_time(
+        &mut nodes,
+        &mut outbox,
+        entry_instant + theta_echo + Duration::from_millis(1),
+    )
+    .await;
+    advance_time(
+        &mut nodes,
+        &mut outbox,
+        entry_instant + theta_ready + Duration::from_millis(1),
+    )
+    .await;
 
     for &i in &live {
-        assert_eq!(nodes[i].agb.sealed_for_test(dead_view), None, "the dead view never seals directly");
-        assert!(nodes[i].agb.noready_count(dead_view) >= 3, "D6-5: every live party's first-hand no-ready is counted (2f+1=3)");
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(dead_view),
+            None,
+            "the dead view never seals directly"
+        );
+        assert!(
+            nodes[i].agb.noready_count(dead_view) >= 3,
+            "D6-5: every live party's first-hand no-ready is counted (2f+1=3)"
+        );
     }
 
     // A later correct proposer's recovery turn: pick a fresh view (well past
@@ -220,27 +271,45 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     // that party's next unproposed turn.
     let carrying_view: crate::primary::View = 1000;
     let carrier_name = crate::vantage::agb::proposer(&test_committee(), carrying_view);
-    let carrier_idx = live.iter().find(|&&i| nodes[i].name == carrier_name).copied().expect("a live party must lead the carrying view");
+    let carrier_idx = live
+        .iter()
+        .find(|&&i| nodes[i].name == carrier_name)
+        .copied()
+        .expect("a live party must lead the carrying view");
 
     let now = Instant::now();
     let first = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
-        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u))
+        node.resolver
+            .decide(agb, carrying_view, now, |u| agb.is_sealed(u))
     };
     assert_eq!(first, None, "the next-turn bit starts data-only");
     let m = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
-        node.resolver.decide(agb, carrying_view, now, |u| agb.is_sealed(u))
+        node.resolver
+            .decide(agb, carrying_view, now, |u| agb.is_sealed(u))
     };
-    assert_eq!(m, Some(ResolutionEntry::Skip(dead_view)), "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate");
+    assert_eq!(
+        m,
+        Some(ResolutionEntry::Skip(dead_view)),
+        "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate"
+    );
 
     // Build the carrying proposal over the SAME seeded, already-quorum'd content every
     // other view in this harness uses (author 0's height-1 block).
     let (author0, _) = all[0];
-    let c_ref = nodes[carrier_idx].lm.c_candidate(&author0).expect("seeded C candidate");
-    let proposal = ViewProposal { view: carrying_view, c: vec![c_ref], t: Vec::new(), m };
+    let c_ref = nodes[carrier_idx]
+        .lm
+        .c_candidate(&author0)
+        .expect("seeded C candidate");
+    let proposal = ViewProposal {
+        view: carrying_view,
+        c: vec![c_ref],
+        t: Vec::new(),
+        m,
+    };
 
     // Every live party must formally activate the carrying view before it can process
     // a direct proposal for it (mirrors `Frontier::enter`'s "also activates" -- WISH
@@ -281,12 +350,25 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     // and the cursor has advanced PAST it -- the exact Phase-5 boundary this phase
     // closes.
     for &i in &live {
-        assert_eq!(nodes[i].agb.sealed_for_test(dead_view), Some(Outcome::Skip), "node {} must have sealed gskip for the dead view via the anchor", i);
-        assert!(nodes[i].cursor.next_view() > dead_view, "node {} cursor must have advanced past the dead view", i);
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(dead_view),
+            Some(Outcome::Skip),
+            "node {} must have sealed gskip for the dead view via the anchor",
+            i
+        );
+        assert!(
+            nodes[i].cursor.next_view() > dead_view,
+            "node {} cursor must have advanced past the dead view",
+            i
+        );
         // PHASE6-SPEC.md §9 gate amendment: the dead view can ONLY ever have been
         // sealed via the anchor's Skip route (direct-AGB never produces gskip at all).
         assert_eq!(
-            nodes[i].metrics.vantage_seals.with_label_values(&["anchor_skip"]).get(),
+            nodes[i]
+                .metrics
+                .vantage_seals
+                .with_label_values(&["anchor_skip"])
+                .get(),
             1,
             "node {} must show exactly one anchor_skip route increment for the dead view",
             i
@@ -297,7 +379,13 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     // control log's own totality make this deterministic).
     let reference = nodes[live[0]].cursor.output_log().to_vec();
     for &i in &live[1..] {
-        assert_eq!(nodes[i].cursor.output_log(), reference.as_slice(), "node {} output log must match node {}", i, live[0]);
+        assert_eq!(
+            nodes[i].cursor.output_log(),
+            reference.as_slice(),
+            "node {} output log must match node {}",
+            i,
+            live[0]
+        );
     }
 }
 
@@ -335,7 +423,13 @@ async fn scenario_2_withheld_tip_author_mixed_grades_resolved_via_anchor() {
     let mut nodes: Vec<Node> = all
         .iter()
         .enumerate()
-        .map(|(i, (pk, _))| Node::new(*pk, &format!(".db_test_byz_scenario2_node_{}", i), MAX_VIEWS_NO_ORGANIC))
+        .map(|(i, (pk, _))| {
+            Node::new(
+                *pk,
+                &format!(".db_test_byz_scenario2_node_{}", i),
+                MAX_VIEWS_NO_ORGANIC,
+            )
+        })
         .collect();
     let now = Instant::now();
     let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
@@ -354,61 +448,145 @@ async fn scenario_2_withheld_tip_author_mixed_grades_resolved_via_anchor() {
     let view: View = 2;
     let (tip_author, _) = all[1];
     let sid = nodes[0].lm.sid().clone();
-    let parent1 = nodes[0].lm.c_candidate(&tip_author).expect("seeded C candidate").2;
+    let parent1 = nodes[0]
+        .lm
+        .c_candidate(&tip_author)
+        .expect("seeded C candidate")
+        .2;
     let tip = Header::new_vantage(tip_author, 2, BTreeMap::new(), parent1, sid);
     let tip_holders = [0usize, 1usize];
     let core_only_holders = [2usize, 3usize];
     // The tip is directly published ONLY to the two parties that will ever see a T
     // entry for it -- so their own gate needs no repair round-trip at all.
-    deliver_only_to(&nodes, &mut outbox, &tip_holders, Inbound::Publish(tip_author, tip.clone()));
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &tip_holders,
+        Inbound::Publish(tip_author, tip.clone()),
+    );
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
 
-    let c_ref = nodes[0].lm.c_candidate(&tip_author).expect("seeded C candidate");
+    let c_ref = nodes[0]
+        .lm
+        .c_candidate(&tip_author)
+        .expect("seeded C candidate");
     let t_ref = (tip_author, tip.height, tip.id.clone());
-    let proposal_full = ViewProposal { view, c: vec![c_ref.clone()], t: vec![t_ref.clone()], m: None };
-    let proposal_core = ViewProposal { view, c: vec![c_ref], t: Vec::new(), m: None };
+    let proposal_full = ViewProposal {
+        view,
+        c: vec![c_ref.clone()],
+        t: vec![t_ref.clone()],
+        m: None,
+    };
+    let proposal_core = ViewProposal {
+        view,
+        c: vec![c_ref],
+        t: Vec::new(),
+        m: None,
+    };
     assert_ne!(
         proposal_full.digest(&nodes[0].lm.sid().clone()),
         proposal_core.digest(&nodes[0].lm.sid().clone()),
         "the two proposals (differing only in whether T is attached) must be genuinely distinct"
     );
-    deliver_only_to(&nodes, &mut outbox, &tip_holders, Inbound::Propose(proposal_full));
-    deliver_only_to(&nodes, &mut outbox, &core_only_holders, Inbound::Propose(proposal_core));
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &tip_holders,
+        Inbound::Propose(proposal_full),
+    );
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &core_only_holders,
+        Inbound::Propose(proposal_core),
+    );
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
 
     // Both halves' own positive gates fire immediately (CoreOK holds for the common,
     // seeded C either way; the tip-holders' TipOK needs no repair, the others' T is
     // vacuously empty) -- 2 grade-1 echoes per digest, each strictly below quorum.
     let theta_ready = nodes[0].agb.theta_ready();
-    advance_time(&mut nodes, &mut outbox, now + theta_ready + Duration::from_millis(1)).await;
+    advance_time(
+        &mut nodes,
+        &mut outbox,
+        now + theta_ready + Duration::from_millis(1),
+    )
+    .await;
 
     for i in 0..nodes.len() {
         assert!(nodes[i].agb.sealed_for_test(view).is_none(), "node {} must not seal view {} directly -- quorum intersection forbids either digest from reaching quorum alone", i, view);
-        assert!(nodes[i].agb.completed_for_test(view).is_none(), "node {} must not even complete view {} -- neither digest's readies reach quorum", i, view);
-        assert!(nodes[i].agb.noready_count(view) >= 3, "node {} must have the full 2f+1 no-ready census for view {}", i, view);
+        assert!(
+            nodes[i].agb.completed_for_test(view).is_none(),
+            "node {} must not even complete view {} -- neither digest's readies reach quorum",
+            i,
+            view
+        );
+        assert!(
+            nodes[i].agb.noready_count(view) >= 3,
+            "node {} must have the full 2f+1 no-ready census for view {}",
+            i,
+            view
+        );
     }
 
     let carrying_view: View = 1000;
     let (carrier_idx, entry) = resolve_carrying_entry(&mut nodes, carrying_view, view);
     let entry_carries_tip = match &entry {
-        ResolutionEntry::Full(_, _, t) | ResolutionEntry::Core(_, _, t) => t.iter().any(|r| r.2 == tip.id),
+        ResolutionEntry::Full(_, _, t) | ResolutionEntry::Core(_, _, t) => {
+            t.iter().any(|r| r.2 == tip.id)
+        }
         ResolutionEntry::Skip(_) => false,
     };
 
     let (author0, _) = all[0];
-    let carrying_c = nodes[carrier_idx].lm.c_candidate(&author0).expect("seeded C candidate");
-    let carrying_proposal = ViewProposal { view: carrying_view, c: vec![carrying_c], t: Vec::new(), m: Some(entry) };
-    drive_carrying_proposal_to_anchor(&mut nodes, &mut outbox, now, carrying_view, carrying_proposal).await;
+    let carrying_c = nodes[carrier_idx]
+        .lm
+        .c_candidate(&author0)
+        .expect("seeded C candidate");
+    let carrying_proposal = ViewProposal {
+        view: carrying_view,
+        c: vec![carrying_c],
+        t: Vec::new(),
+        m: Some(entry),
+    };
+    drive_carrying_proposal_to_anchor(
+        &mut nodes,
+        &mut outbox,
+        now,
+        carrying_view,
+        carrying_proposal,
+    )
+    .await;
 
     let reference_outcome = nodes[0].agb.sealed_for_test(view);
-    assert!(reference_outcome.is_some(), "view {} must be sealed via the anchor", view);
+    assert!(
+        reference_outcome.is_some(),
+        "view {} must be sealed via the anchor",
+        view
+    );
     for i in 0..nodes.len() {
-        assert_eq!(nodes[i].agb.sealed_for_test(view), reference_outcome, "node {} must seal the IDENTICAL outcome for view {}", i, view);
-        assert!(nodes[i].cursor.next_view() > view, "node {} cursor must advance past view {}", i, view);
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(view),
+            reference_outcome,
+            "node {} must seal the IDENTICAL outcome for view {}",
+            i,
+            view
+        );
+        assert!(
+            nodes[i].cursor.next_view() > view,
+            "node {} cursor must advance past view {}",
+            i,
+            view
+        );
     }
     let reference_log = nodes[0].cursor.output_log().to_vec();
     for i in 1..nodes.len() {
-        assert_eq!(nodes[i].cursor.output_log(), reference_log.as_slice(), "node {} output log must match node 0 (core-prefix property + identical resolution)", i);
+        assert_eq!(
+            nodes[i].cursor.output_log(),
+            reference_log.as_slice(),
+            "node {} output log must match node 0 (core-prefix property + identical resolution)",
+            i
+        );
     }
     // Core-prefix property, made concrete: IFF the anchored entry carries the tip, it
     // must appear in every node's output -- including the two parties that never held
@@ -416,7 +594,11 @@ async fn scenario_2_withheld_tip_author_mixed_grades_resolved_via_anchor() {
     // `AuxRefs` authorization.
     if entry_carries_tip {
         for i in 0..nodes.len() {
-            assert!(nodes[i].cursor.output_log().contains(&tip.id), "node {} output must contain the tip (repaired via the anchor)", i);
+            assert!(
+                nodes[i].cursor.output_log().contains(&tip.id),
+                "node {} output must contain the tip (repaired via the anchor)",
+                i
+            );
         }
     }
 
@@ -451,7 +633,13 @@ async fn scenario_3_equivocating_leader_disjoint_halves_resolution_settles_it() 
     let mut nodes: Vec<Node> = all
         .iter()
         .enumerate()
-        .map(|(i, (pk, _))| Node::new(*pk, &format!(".db_test_byz_scenario3_node_{}", i), MAX_VIEWS_NO_ORGANIC))
+        .map(|(i, (pk, _))| {
+            Node::new(
+                *pk,
+                &format!(".db_test_byz_scenario3_node_{}", i),
+                MAX_VIEWS_NO_ORGANIC,
+            )
+        })
         .collect();
     let now = Instant::now();
     let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
@@ -470,10 +658,26 @@ async fn scenario_3_equivocating_leader_disjoint_halves_resolution_settles_it() 
     let view: View = 2;
     let (author0, _) = all[0];
     let (author1, _) = all[1];
-    let x_ref = nodes[0].lm.c_candidate(&author0).expect("seeded C candidate");
-    let y_ref = nodes[0].lm.c_candidate(&author1).expect("seeded C candidate");
-    let proposal_x = ViewProposal { view, c: vec![x_ref], t: Vec::new(), m: None };
-    let proposal_y = ViewProposal { view, c: vec![y_ref], t: Vec::new(), m: None };
+    let x_ref = nodes[0]
+        .lm
+        .c_candidate(&author0)
+        .expect("seeded C candidate");
+    let y_ref = nodes[0]
+        .lm
+        .c_candidate(&author1)
+        .expect("seeded C candidate");
+    let proposal_x = ViewProposal {
+        view,
+        c: vec![x_ref],
+        t: Vec::new(),
+        m: None,
+    };
+    let proposal_y = ViewProposal {
+        view,
+        c: vec![y_ref],
+        t: Vec::new(),
+        m: None,
+    };
     assert_ne!(
         proposal_x.digest(&nodes[0].lm.sid().clone()),
         proposal_y.digest(&nodes[0].lm.sid().clone()),
@@ -490,31 +694,76 @@ async fn scenario_3_equivocating_leader_disjoint_halves_resolution_settles_it() 
     // author's seeded, quorum-acked content) -- 2 grade-1 echoes per digest, each
     // strictly below the 2f+1=3 quorum a single digest needs to trigger R3's ready.
     let theta_ready = nodes[0].agb.theta_ready();
-    advance_time(&mut nodes, &mut outbox, now + theta_ready + Duration::from_millis(1)).await;
+    advance_time(
+        &mut nodes,
+        &mut outbox,
+        now + theta_ready + Duration::from_millis(1),
+    )
+    .await;
 
     for i in 0..nodes.len() {
         assert!(nodes[i].agb.sealed_for_test(view).is_none(), "node {} must not seal view {} directly -- quorum intersection forbids either digest from reaching quorum alone", i, view);
         assert!(nodes[i].agb.completed_for_test(view).is_none(), "node {} must not even complete view {} -- neither digest's readies reach quorum, so no ready quorum of ANY digest forms", i, view);
-        assert!(nodes[i].agb.noready_count(view) >= 3, "node {} must have the full 2f+1 no-ready census for view {}", i, view);
+        assert!(
+            nodes[i].agb.noready_count(view) >= 3,
+            "node {} must have the full 2f+1 no-ready census for view {}",
+            i,
+            view
+        );
     }
 
     let carrying_view: View = 1000;
     let (carrier_idx, entry) = resolve_carrying_entry(&mut nodes, carrying_view, view);
 
     let (author2, _) = all[2];
-    let carrying_c = nodes[carrier_idx].lm.c_candidate(&author2).expect("seeded C candidate");
-    let carrying_proposal = ViewProposal { view: carrying_view, c: vec![carrying_c], t: Vec::new(), m: Some(entry) };
-    drive_carrying_proposal_to_anchor(&mut nodes, &mut outbox, now, carrying_view, carrying_proposal).await;
+    let carrying_c = nodes[carrier_idx]
+        .lm
+        .c_candidate(&author2)
+        .expect("seeded C candidate");
+    let carrying_proposal = ViewProposal {
+        view: carrying_view,
+        c: vec![carrying_c],
+        t: Vec::new(),
+        m: Some(entry),
+    };
+    drive_carrying_proposal_to_anchor(
+        &mut nodes,
+        &mut outbox,
+        now,
+        carrying_view,
+        carrying_proposal,
+    )
+    .await;
 
     let reference_outcome = nodes[0].agb.sealed_for_test(view);
-    assert!(reference_outcome.is_some(), "view {} must be sealed via the anchor", view);
+    assert!(
+        reference_outcome.is_some(),
+        "view {} must be sealed via the anchor",
+        view
+    );
     for i in 0..nodes.len() {
-        assert_eq!(nodes[i].agb.sealed_for_test(view), reference_outcome, "node {} must seal the IDENTICAL outcome for view {} -- no two nodes may diverge", i, view);
-        assert!(nodes[i].cursor.next_view() > view, "node {} cursor must advance past view {}", i, view);
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(view),
+            reference_outcome,
+            "node {} must seal the IDENTICAL outcome for view {} -- no two nodes may diverge",
+            i,
+            view
+        );
+        assert!(
+            nodes[i].cursor.next_view() > view,
+            "node {} cursor must advance past view {}",
+            i,
+            view
+        );
     }
     let reference_log = nodes[0].cursor.output_log().to_vec();
     for i in 1..nodes.len() {
-        assert_eq!(nodes[i].cursor.output_log(), reference_log.as_slice(), "node {} output log must match node 0", i);
+        assert_eq!(
+            nodes[i].cursor.output_log(),
+            reference_log.as_slice(),
+            "node {} output log must match node 0",
+            i
+        );
     }
 }
 
@@ -543,7 +792,13 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
     let mut nodes: Vec<Node> = all
         .iter()
         .enumerate()
-        .map(|(i, (pk, _))| Node::new(*pk, &format!(".db_test_byz_scenario4_node_{}", i), MAX_VIEWS_NO_ORGANIC))
+        .map(|(i, (pk, _))| {
+            Node::new(
+                *pk,
+                &format!(".db_test_byz_scenario4_node_{}", i),
+                MAX_VIEWS_NO_ORGANIC,
+            )
+        })
         .collect();
     let now = Instant::now();
     let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
@@ -562,15 +817,32 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
     let view: View = 2;
     let (fork_author, _) = all[3];
     let sid = nodes[0].lm.sid().clone();
-    let parent1 = nodes[0].lm.c_candidate(&fork_author).expect("seeded C candidate").2;
+    let parent1 = nodes[0]
+        .lm
+        .c_candidate(&fork_author)
+        .expect("seeded C candidate")
+        .2;
     let x2 = tagged_header(fork_author, 2, parent1.clone(), sid.clone(), 0xA0);
     let y2 = tagged_header(fork_author, 2, parent1, sid, 0xB0);
-    assert_ne!(x2.id, y2.id, "the two forked children must be genuinely distinct");
+    assert_ne!(
+        x2.id, y2.id,
+        "the two forked children must be genuinely distinct"
+    );
 
     let x_holders = [0usize, 1usize];
     let y_holders = [2usize, 3usize];
-    deliver_only_to(&nodes, &mut outbox, &x_holders, Inbound::Publish(fork_author, x2.clone()));
-    deliver_only_to(&nodes, &mut outbox, &y_holders, Inbound::Publish(fork_author, y2.clone()));
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &x_holders,
+        Inbound::Publish(fork_author, x2.clone()),
+    );
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &y_holders,
+        Inbound::Publish(fork_author, y2.clone()),
+    );
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
     // `tagged_header`'s non-empty (tagged) payload needs a payload-presence marker at
     // each RECEIVING holder for `author_ok`/`direct_pub` to hold on the T entry (D1's
@@ -586,27 +858,65 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
         nodes[i].lm.set_payload_ready(&y2.id);
     }
 
-    let c_ref = nodes[0].lm.c_candidate(&fork_author).expect("seeded C candidate");
+    let c_ref = nodes[0]
+        .lm
+        .c_candidate(&fork_author)
+        .expect("seeded C candidate");
     let t_x = (fork_author, x2.height, x2.id.clone());
     let t_y = (fork_author, y2.height, y2.id.clone());
-    let proposal_x = ViewProposal { view, c: vec![c_ref.clone()], t: vec![t_x], m: None };
-    let proposal_y = ViewProposal { view, c: vec![c_ref], t: vec![t_y], m: None };
+    let proposal_x = ViewProposal {
+        view,
+        c: vec![c_ref.clone()],
+        t: vec![t_x],
+        m: None,
+    };
+    let proposal_y = ViewProposal {
+        view,
+        c: vec![c_ref],
+        t: vec![t_y],
+        m: None,
+    };
     assert_ne!(
         proposal_x.digest(&nodes[0].lm.sid().clone()),
         proposal_y.digest(&nodes[0].lm.sid().clone()),
         "the two per-branch proposals must be genuinely distinct"
     );
-    deliver_only_to(&nodes, &mut outbox, &x_holders, Inbound::Propose(proposal_x));
-    deliver_only_to(&nodes, &mut outbox, &y_holders, Inbound::Propose(proposal_y));
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &x_holders,
+        Inbound::Propose(proposal_x),
+    );
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &y_holders,
+        Inbound::Propose(proposal_y),
+    );
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
 
     let theta_ready = nodes[0].agb.theta_ready();
-    advance_time(&mut nodes, &mut outbox, now + theta_ready + Duration::from_millis(1)).await;
+    advance_time(
+        &mut nodes,
+        &mut outbox,
+        now + theta_ready + Duration::from_millis(1),
+    )
+    .await;
 
     for i in 0..nodes.len() {
         assert!(nodes[i].agb.sealed_for_test(view).is_none(), "node {} must not seal view {} directly -- quorum intersection forbids either branch from reaching quorum alone", i, view);
-        assert!(nodes[i].agb.completed_for_test(view).is_none(), "node {} must not even complete view {} -- neither branch's readies reach quorum", i, view);
-        assert!(nodes[i].agb.noready_count(view) >= 3, "node {} must have the full 2f+1 no-ready census for view {}", i, view);
+        assert!(
+            nodes[i].agb.completed_for_test(view).is_none(),
+            "node {} must not even complete view {} -- neither branch's readies reach quorum",
+            i,
+            view
+        );
+        assert!(
+            nodes[i].agb.noready_count(view) >= 3,
+            "node {} must have the full 2f+1 no-ready census for view {}",
+            i,
+            view
+        );
     }
 
     let carrying_view: View = 1000;
@@ -626,18 +936,52 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
         }
         ResolutionEntry::Skip(_) => panic!("this view has real, justified Full/Core evidence for both branches -- Skip should never win canonical order here"),
     };
-    let (losing_branch_id, kept_branch_id) = if winner_is_x { (y2.id.clone(), x2.id.clone()) } else { (x2.id.clone(), y2.id.clone()) };
+    let (losing_branch_id, kept_branch_id) = if winner_is_x {
+        (y2.id.clone(), x2.id.clone())
+    } else {
+        (x2.id.clone(), y2.id.clone())
+    };
 
     let (author0, _) = all[0];
-    let carrying_c = nodes[carrier_idx].lm.c_candidate(&author0).expect("seeded C candidate");
-    let carrying_proposal = ViewProposal { view: carrying_view, c: vec![carrying_c], t: Vec::new(), m: Some(entry) };
-    drive_carrying_proposal_to_anchor(&mut nodes, &mut outbox, now, carrying_view, carrying_proposal).await;
+    let carrying_c = nodes[carrier_idx]
+        .lm
+        .c_candidate(&author0)
+        .expect("seeded C candidate");
+    let carrying_proposal = ViewProposal {
+        view: carrying_view,
+        c: vec![carrying_c],
+        t: Vec::new(),
+        m: Some(entry),
+    };
+    drive_carrying_proposal_to_anchor(
+        &mut nodes,
+        &mut outbox,
+        now,
+        carrying_view,
+        carrying_proposal,
+    )
+    .await;
 
     let reference_outcome = nodes[0].agb.sealed_for_test(view);
-    assert!(reference_outcome.is_some(), "view {} must be sealed via the anchor", view);
+    assert!(
+        reference_outcome.is_some(),
+        "view {} must be sealed via the anchor",
+        view
+    );
     for i in 0..nodes.len() {
-        assert_eq!(nodes[i].agb.sealed_for_test(view), reference_outcome, "node {} must seal the IDENTICAL outcome for view {}", i, view);
-        assert!(nodes[i].cursor.next_view() > view, "node {} cursor must advance past view {}", i, view);
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(view),
+            reference_outcome,
+            "node {} must seal the IDENTICAL outcome for view {}",
+            i,
+            view
+        );
+        assert!(
+            nodes[i].cursor.next_view() > view,
+            "node {} cursor must advance past view {}",
+            i,
+            view
+        );
     }
     let reference_log = nodes[0].cursor.output_log().to_vec();
     for i in 1..nodes.len() {
@@ -649,8 +993,16 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
         );
     }
     for i in 0..nodes.len() {
-        assert!(nodes[i].cursor.output_log().contains(&kept_branch_id), "node {} output must contain the kept branch", i);
-        assert!(!nodes[i].cursor.output_log().contains(&losing_branch_id), "node {} output must NEVER contain the orphaned/losing fork branch", i);
+        assert!(
+            nodes[i].cursor.output_log().contains(&kept_branch_id),
+            "node {} output must contain the kept branch",
+            i
+        );
+        assert!(
+            !nodes[i].cursor.output_log().contains(&losing_branch_id),
+            "node {} output must NEVER contain the orphaned/losing fork branch",
+            i
+        );
     }
 }
 
@@ -662,7 +1014,11 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
 /// sender for the next hop, mirroring `harness::drain_local`'s exact routing rules for
 /// the same effect variants (D4: declared-sender trust, never forged here -- every
 /// `origin` really is the party that produced this effect).
-fn drain_control(controls: &mut [ControlLog], names: &[crypto::PublicKey], initial: Vec<(usize, Effect)>) {
+fn drain_control(
+    controls: &mut [ControlLog],
+    names: &[crypto::PublicKey],
+    initial: Vec<(usize, Effect)>,
+) {
     let n = controls.len();
     let mut queue: VecDeque<(usize, Effect)> = initial.into();
     while let Some((origin, effect)) = queue.pop_front() {
@@ -718,8 +1074,16 @@ async fn scenario_5_byzantine_control_leader_totality_via_fetch_and_invalid_pair
     let sid = test_sid();
 
     // ---------------- Part A: totality via fetch for a genuinely submittable pair ----------------
-    let mut controls: Vec<ControlLog> = names.iter().map(|pk| ControlLog::new(*pk, test_committee(), sid.clone(), TEST_DELTA_MS)).collect();
-    let b_w = ViewProposal { view: 4, c: Vec::new(), t: Vec::new(), m: Some(ResolutionEntry::Skip(1)) };
+    let mut controls: Vec<ControlLog> = names
+        .iter()
+        .map(|pk| ControlLog::new(*pk, test_committee(), sid.clone(), TEST_DELTA_MS))
+        .collect();
+    let b_w = ViewProposal {
+        view: 4,
+        c: Vec::new(),
+        t: Vec::new(),
+        m: Some(ResolutionEntry::Skip(1)),
+    };
     let digest = b_w.digest(&sid);
     let leader = controls[0].control_leader(1);
 
@@ -734,47 +1098,85 @@ async fn scenario_5_byzantine_control_leader_totality_via_fetch_and_invalid_pair
         }
     }
 
-    let proposal1 = ControlProposal { round: 1, parent: 0, value: Some((4, digest.clone())) };
+    let proposal1 = ControlProposal {
+        round: 1,
+        parent: 0,
+        value: Some((4, digest.clone())),
+    };
     let mut initial: Vec<(usize, Effect)> = Vec::new();
     for i in 0..4 {
         let b_w_variant = if i < 3 { Some(b_w.clone()) } else { None }; // party 3: INIT WITHOUT B_w
         let effects = controls[i].on_control_init(leader, proposal1.clone(), b_w_variant);
-        let echoed = effects.iter().any(|e| matches!(e, Effect::BroadcastControlEcho(_)));
+        let echoed = effects
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastControlEcho(_)));
         if i < 3 {
-            assert!(echoed, "party {} legitimately holds reports + B_w -- must ECHO immediately", i);
+            assert!(
+                echoed,
+                "party {} legitimately holds reports + B_w -- must ECHO immediately",
+                i
+            );
         } else {
-            assert!(!echoed, "party 3 lacks B_w entirely -- must NOT ECHO (validity gate blocks it)");
+            assert!(
+                !echoed,
+                "party 3 lacks B_w entirely -- must NOT ECHO (validity gate blocks it)"
+            );
         }
         initial.extend(effects.into_iter().map(|e| (i, e)));
     }
 
     drain_control(&mut controls, &names, initial);
 
-    assert!(controls[3].holds_block_for_test(4), "party 3 must have obtained B_w via fetch (totality), despite never validating it directly");
+    assert!(
+        controls[3].holds_block_for_test(4),
+        "party 3 must have obtained B_w via fetch (totality), despite never validating it directly"
+    );
     for i in 0..4 {
-        assert!(controls[i].is_safe_for_test(1), "round 1 must be marked safe for every party once delivered (parent=0 is always safe)");
+        assert!(
+            controls[i].is_safe_for_test(1),
+            "round 1 must be marked safe for every party once delivered (parent=0 is always safe)"
+        );
     }
 
     // ---------------- Part B: an invalid pair can never be delivered ----------------
-    let mut controls_b: Vec<ControlLog> = names.iter().map(|pk| ControlLog::new(*pk, test_committee(), sid.clone(), TEST_DELTA_MS)).collect();
+    let mut controls_b: Vec<ControlLog> = names
+        .iter()
+        .map(|pk| ControlLog::new(*pk, test_committee(), sid.clone(), TEST_DELTA_MS))
+        .collect();
     let bogus_digest = crypto::Digest([0xEEu8; 32]);
     let bogus_view: View = 99;
     let leader_b = controls_b[0].control_leader(1);
-    let proposal_bogus = ControlProposal { round: 1, parent: 0, value: Some((bogus_view, bogus_digest.clone())) };
+    let proposal_bogus = ControlProposal {
+        round: 1,
+        parent: 0,
+        value: Some((bogus_view, bogus_digest.clone())),
+    };
     // No party anywhere has ever reported on view 99 -- this pair is entirely
     // fictional. Attach no B_w either (a Byzantine leader could equally attach a
     // mismatched/corrupt one -- `verify_b_w`'s digest check would reject it the same
     // way `None` does).
     let mut any_echo = false;
     for i in 0..4 {
-        assert_eq!(controls_b[i].report_count_for(bogus_view, &bogus_digest), 0, "no legitimate reports exist anywhere for the fictional pair");
+        assert_eq!(
+            controls_b[i].report_count_for(bogus_view, &bogus_digest),
+            0,
+            "no legitimate reports exist anywhere for the fictional pair"
+        );
         let effects = controls_b[i].on_control_init(leader_b, proposal_bogus.clone(), None);
-        any_echo |= effects.iter().any(|e| matches!(e, Effect::BroadcastControlEcho(_)));
+        any_echo |= effects
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastControlEcho(_)));
     }
     assert!(!any_echo, "an invalid pair with no real backing must never be validated by anyone -- no 2f+1 ECHOs, ever");
     for i in 0..4 {
-        assert!(!controls_b[i].is_safe_for_test(1), "round 1 must never become safe for the invalid pair");
-        assert!(controls_b[i].delivered_log_for_test().is_empty(), "nothing may ever be delivered for the invalid pair");
+        assert!(
+            !controls_b[i].is_safe_for_test(1),
+            "round 1 must never become safe for the invalid pair"
+        );
+        assert!(
+            controls_b[i].delivered_log_for_test().is_empty(),
+            "nothing may ever be delivered for the invalid pair"
+        );
     }
 }
 
@@ -816,10 +1218,20 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
     let chain = direct_chain(&mut lm, author_c, 1).await;
     let c_ref = block_ref(&chain[0]);
     agb.enter(1, now, &mut lm, &mut rep);
-    let proposal_u = ViewProposal { view: 1, c: vec![c_ref.clone()], t: Vec::new(), m: None };
+    let proposal_u = ViewProposal {
+        view: 1,
+        c: vec![c_ref.clone()],
+        t: Vec::new(),
+        m: None,
+    };
     let sender_u = proposer_of(1);
     let effects0 = agb.on_propose(sender_u, proposal_u.clone(), now, &mut lm, &mut rep);
-    assert!(effects0.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))), "our own positive gate must fire for view 1");
+    assert!(
+        effects0
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        "our own positive gate must fire for view 1"
+    );
     assert_eq!(agb.lock_active_for_test(1), Some(true));
 
     // A carrying view (w=4) whose resolution entry targets view 1 with `Core(1,
@@ -833,7 +1245,12 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
     let c_w = block_ref(&chain_w[0]);
     agb.enter(4, now, &mut lm, &mut rep);
     let m = Some(ResolutionEntry::Core(1, vec![c_ref], Vec::new()));
-    let proposal_w = ViewProposal { view: 4, c: vec![c_w], t: Vec::new(), m };
+    let proposal_w = ViewProposal {
+        view: 4,
+        c: vec![c_w],
+        t: Vec::new(),
+        m,
+    };
     let sender_w = proposer_of(4);
     let effects_w = agb.on_propose(sender_w, proposal_w.clone(), now, &mut lm, &mut rep);
     assert!(
@@ -843,10 +1260,25 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
 
     // First external, non-matching (grade-0) echo for view 1's own digest: nonmatching
     // count -> 1, still below f+1=2 -- the lock must stay active.
-    let effects1 = agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 0, sender: other_a, wish: 0, origin: None }, &mut rep);
-    assert_eq!(agb.lock_active_for_test(1), Some(true), "one nonmatching echo (< f+1=2) must not yet release the lock");
+    let effects1 = agb.on_echo(
+        Echo {
+            proposal: proposal_u.clone(),
+            grade: 0,
+            sender: other_a,
+            wish: 0,
+            origin: None,
+        },
+        &mut rep,
+    );
+    assert_eq!(
+        agb.lock_active_for_test(1),
+        Some(true),
+        "one nonmatching echo (< f+1=2) must not yet release the lock"
+    );
     assert!(
-        !effects1.iter().any(|e| matches!(e, Effect::BroadcastReady(_))),
+        !effects1
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastReady(_))),
         "g1+g0 = 1+1 = 2 is still below the 2f+1=3 ready quorum"
     );
 
@@ -854,13 +1286,30 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
     // DIFFERENT sender: this single call crosses BOTH the f+1=2 release threshold
     // (nonmatching now 2) AND the 2f+1=3 ready-quorum threshold (g1+g0 = 1+2 = 3) at
     // once -- exactly the same-event race D6-4's ordering exists to resolve.
-    let effects2 = agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 0, sender: other_b, wish: 0, origin: None }, &mut rep);
-    assert_eq!(agb.lock_active_for_test(1), Some(false), "the SECOND nonmatching echo must have released the lock");
+    let effects2 = agb.on_echo(
+        Echo {
+            proposal: proposal_u.clone(),
+            grade: 0,
+            sender: other_b,
+            wish: 0,
+            origin: None,
+        },
+        &mut rep,
+    );
+    assert_eq!(
+        agb.lock_active_for_test(1),
+        Some(false),
+        "the SECOND nonmatching echo must have released the lock"
+    );
     let ready = effects2.iter().find_map(|e| match e {
         Effect::BroadcastReady(r) if r.proposal.view == 1 => Some(r.grade),
         _ => None,
     });
-    assert_eq!(ready, Some(ReadyGrade::Mix), "neither grade alone reaches quorum (g1=1,g0=2 < 3 each) -- the ready must be Mix");
+    assert_eq!(
+        ready,
+        Some(ReadyGrade::Mix),
+        "neither grade alone reaches quorum (g1=1,g0=2 < 3 each) -- the ready must be Mix"
+    );
     // The lock was ALREADY inactive (checked above) by the time this very call
     // produced that Mix ready -- never a stale-active lock coexisting with a
     // contradictory (non-grade-1) ready, on this or any prior call.
@@ -869,7 +1318,9 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
     // same way `dispatch`'s response arms retry via `recheck_all` in production.
     let effects3 = agb.recheck_all(now, &mut lm, &mut rep);
     assert!(
-        effects3.iter().any(|e| matches!(e, Effect::BroadcastEcho(echo) if echo.proposal.view == 4)),
+        effects3
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(echo) if echo.proposal.view == 4)),
         "once the lock releases, the carrying view's Core(1,...) entry must pass MetaOK and echo"
     );
 }

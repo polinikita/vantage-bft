@@ -251,7 +251,11 @@ impl Repairer {
                 let blocks = self.blocks.lock().unwrap();
                 blocks.get(&h).and_then(|entry| {
                     let b = &entry.block;
-                    if b.author == author && b.height == height && b.id == h && entry.block_ok_verified {
+                    if b.author == author
+                        && b.height == height
+                        && b.id == h
+                        && entry.block_ok_verified
+                    {
                         Some(b.clone())
                     } else {
                         None
@@ -356,7 +360,9 @@ impl Repairer {
     }
 
     #[cfg(test)]
-    pub(crate) fn blocks_for_test(&self) -> std::sync::MutexGuard<'_, crate::vantage::lanes::BlockCache> {
+    pub(crate) fn blocks_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::vantage::lanes::BlockCache> {
         self.blocks.lock().unwrap()
     }
 }

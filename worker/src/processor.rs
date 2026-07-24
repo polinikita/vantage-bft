@@ -32,7 +32,7 @@ impl Processor {
         // Input channel to receive batches.
         mut rx_batch: Receiver<SerializedBatchMessage>,
         // Output channel to send out batches' digests.
-        tx_digest: Sender<SerializedBatchDigestMessage>,    //sender channel connects to PrimaryConnector
+        tx_digest: Sender<SerializedBatchDigestMessage>, //sender channel connects to PrimaryConnector
         // Whether we are processing our own batches or the batches of other nodes.
         own_digest: bool,
     ) {

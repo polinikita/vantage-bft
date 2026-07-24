@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::time::{sleep, Duration, Instant, Sleep};
 
-use crate::messages::{Vote, ConsensusVote};
+use crate::messages::{ConsensusVote, Vote};
 use crate::primary::{Slot, View};
 
 //#[cfg(test)]
@@ -20,7 +20,12 @@ pub struct Timer {
 impl Timer {
     pub fn new(slot: Slot, view: View, duration: u64) -> Self {
         let sleep = Box::pin(sleep(Duration::from_millis(duration)));
-        Self { slot, view, duration, sleep }
+        Self {
+            slot,
+            view,
+            duration,
+            sleep,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -41,10 +46,9 @@ impl Future for Timer {
     }
 }
 
-
 //This timer is used for FastPath and for Cars waiting to proceed without consensus
 pub struct CarTimer {
-    vote: Vote, 
+    vote: Vote,
     duration: u64,
     sleep: Pin<Box<Sleep>>,
 }
@@ -52,7 +56,11 @@ pub struct CarTimer {
 impl CarTimer {
     pub fn new(vote: Vote, duration: u64) -> Self {
         let sleep = Box::pin(sleep(Duration::from_millis(duration)));
-        Self {vote, duration, sleep }
+        Self {
+            vote,
+            duration,
+            sleep,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -73,10 +81,8 @@ impl Future for CarTimer {
     }
 }
 
-
-
 pub struct FastTimer {
-    vote: ConsensusVote, 
+    vote: ConsensusVote,
     duration: u64,
     sleep: Pin<Box<Sleep>>,
 }
@@ -84,7 +90,11 @@ pub struct FastTimer {
 impl FastTimer {
     pub fn new(vote: ConsensusVote, duration: u64) -> Self {
         let sleep = Box::pin(sleep(Duration::from_millis(duration)));
-        Self {vote, duration, sleep }
+        Self {
+            vote,
+            duration,
+            sleep,
+        }
     }
 
     pub fn reset(&mut self) {

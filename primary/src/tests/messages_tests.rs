@@ -1,5 +1,3 @@
-
-
 //CONSENSUS MESSAGE TESTS
 //TODO: Add TC tests.
 
@@ -13,7 +11,7 @@ async fn verify_accept_vote_unknown_authority() {
     // Create Accept Vote with unknown authority.
     let mut rng = StdRng::from_seed([1; 32]);
     let (unknown_pub, unknown_priv) = generate_keypair(&mut rng);
-   
+
     let accept_vote = AcceptVote::new_from_key(special_header().digest(), 1, 1, unknown_pub, &unknown_priv);
 
     // Verify the QC.

@@ -40,14 +40,24 @@ async fn four_party_happy_path_three_consecutive_views_identical_output() {
 
     // Every party must have advanced its cursor past at least 3 consecutive views.
     for (i, node) in nodes.iter().enumerate() {
-        assert!(node.cursor.next_view() >= 4, "node {} only reached view {}", i, node.cursor.next_view());
+        assert!(
+            node.cursor.next_view() >= 4,
+            "node {} only reached view {}",
+            i,
+            node.cursor.next_view()
+        );
     }
 
     // Output logs must be byte-identical across all four parties (deterministic
     // linearization, §9).
     let reference = nodes[0].cursor.output_log().to_vec();
     for (i, node) in nodes.iter().enumerate().skip(1) {
-        assert_eq!(node.cursor.output_log(), reference.as_slice(), "node {} output log diverged from node 0", i);
+        assert_eq!(
+            node.cursor.output_log(),
+            reference.as_slice(),
+            "node {} output log diverged from node 0",
+            i
+        );
     }
 
     // The seeded height-1 blocks (the only real content in this test) must actually
@@ -57,9 +67,20 @@ async fn four_party_happy_path_three_consecutive_views_identical_output() {
     // PHASE6-SPEC.md §9 gate amendment: the happy path (every party correct, every
     // echo matching) should be overwhelmingly sealed via the all-n unanimous fast
     // seal, not merely the (also-correct, but slower) direct grade-1 quorum path.
-    let fast_full: u64 = nodes[0].metrics.vantage_seals.with_label_values(&["fast_full"]).get();
-    let direct_full: u64 = nodes[0].metrics.vantage_seals.with_label_values(&["direct_full"]).get();
-    assert!(fast_full > 0, "the happy path must seal at least one view via fast_full");
+    let fast_full: u64 = nodes[0]
+        .metrics
+        .vantage_seals
+        .with_label_values(&["fast_full"])
+        .get();
+    let direct_full: u64 = nodes[0]
+        .metrics
+        .vantage_seals
+        .with_label_values(&["direct_full"])
+        .get();
+    assert!(
+        fast_full > 0,
+        "the happy path must seal at least one view via fast_full"
+    );
     assert!(
         fast_full >= direct_full,
         "the happy path must be dominated by fast_full, not direct_full (fast_full={}, direct_full={})",

@@ -18,7 +18,9 @@ pub mod repair;
 pub mod resolve;
 pub mod threshold;
 
-pub use agb::{AgbEngine, Echo, Manifest, Outcome, Ready, ReadyGrade, ResolutionEntry, TimerKind, ViewProposal};
+pub use agb::{
+    AgbEngine, Echo, Manifest, Outcome, Ready, ReadyGrade, ResolutionEntry, TimerKind, ViewProposal,
+};
 pub use block::BlockRef;
 pub use cursor::Cursor;
 pub use frontier::Frontier;
@@ -50,7 +52,11 @@ pub enum Effect {
     /// resolved `store.notify_read` waiter back to `LaneManager::set_payload_ready` via
     /// this digest; a minimal extension of the Phase-3 shape, documented in
     /// PHASE4-NOTES.md).
-    SyncBatches(PublicKey /* author */, Digest /* header digest */, Vec<(Digest, WorkerId)>),
+    SyncBatches(
+        PublicKey, /* author */
+        Digest,    /* header digest */
+        Vec<(Digest, WorkerId)>,
+    ),
     /// D2/N6: send `request(h)` to `peer` (fan-out is one `Effect` per peer, emitted at
     /// most once per (peer, h) ever -- see `Repairer::requested`).
     RequestTo(PublicKey, Digest),
@@ -105,7 +111,11 @@ pub enum Effect {
     /// from `BlockCache` by the cursor at emit time -- so `VantageCore` only has to
     /// forward them to `tx_output`, matching the Autobahn `Committer`'s output-channel
     /// shape without VantageCore needing its own `BlockCache` handle.
-    NotifyCommitted(u64 /* commit UTC-millis */, Vec<(WorkerId, Vec<Digest>)>, Vec<Header>),
+    NotifyCommitted(
+        u64, /* commit UTC-millis */
+        Vec<(WorkerId, Vec<Digest>)>,
+        Vec<Header>,
+    ),
 
     // --- PHASE5-SPEC.md §1-3 (WISH pacemaker) ---
     /// W2 amplification: broadcast a standalone `VantageWish` (sender filled in by the

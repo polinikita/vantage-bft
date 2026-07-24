@@ -99,8 +99,8 @@ async fn rejects_non_consecutive_height() {
     let sid = lm.sid().clone();
     let mut header = Header::new_vantage(author, 2, BTreeMap::new(), genesis, sid);
     header.parent_cert.height = 5; // `Header::digest()` doesn't fold `parent_cert.height`,
-                                    // so `id` is still consistent -- only BlockOK's
-                                    // explicit arithmetic check should catch this.
+                                   // so `id` is still consistent -- only BlockOK's
+                                   // explicit arithmetic check should catch this.
     let effects = lm.process_publish(author, header.clone()).await;
     assert!(effects.is_empty());
     assert!(!lm.holds_prefix(&(author, 2, header.id)));

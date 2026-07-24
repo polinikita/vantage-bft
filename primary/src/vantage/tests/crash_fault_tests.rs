@@ -52,7 +52,11 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
     let dead_idx = nodes.iter().position(|n| n.name == dead_name).unwrap();
     nodes[dead_idx].alive = false;
     let live: Vec<usize> = (0..nodes.len()).filter(|&i| i != dead_idx).collect();
-    assert_eq!(live.len(), 3, "n=4, f=1 -- exactly 2f+1=3 correct parties remain, the tight case");
+    assert_eq!(
+        live.len(),
+        3,
+        "n=4, f=1 -- exactly 2f+1=3 correct parties remain, the tight case"
+    );
 
     boot(&mut nodes, now, &mut outbox).await;
 
@@ -60,7 +64,11 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
     // reach quorum -- view 2 must be formally entered by every live party even though
     // its proposer never proposes anything at all (W1/W2, entry via wishes alone).
     for &i in &live {
-        assert!(nodes[i].frontier.is_active(dead_view), "node {} must have formally entered the dead view via WISH", i);
+        assert!(
+            nodes[i].frontier.is_active(dead_view),
+            "node {} must have formally entered the dead view via WISH",
+            i
+        );
     }
 
     let theta_echo = nodes[live[0]].agb.theta_echo();
@@ -71,15 +79,29 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
 
     // Advance to theta_E(2): no proposal ever arrived (`fixed` stays Unset forever)
     // -- the absolute deadline must fire an echo-skip for every live party.
-    advance_time(&mut nodes, &mut outbox, entry_instant + theta_echo + Duration::from_millis(1)).await;
+    advance_time(
+        &mut nodes,
+        &mut outbox,
+        entry_instant + theta_echo + Duration::from_millis(1),
+    )
+    .await;
     for &i in &live {
-        assert_eq!(nodes[i].agb.sealed_for_test(dead_view), None, "the dead view must never seal");
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(dead_view),
+            None,
+            "the dead view must never seal"
+        );
     }
 
     // Advance to theta_R(2): no ready quorum ever formed (only echo-skips were ever
     // counted, never a graded proposal echo) -- the absolute deadline fires a
     // no-ready.
-    advance_time(&mut nodes, &mut outbox, entry_instant + theta_ready + Duration::from_millis(1)).await;
+    advance_time(
+        &mut nodes,
+        &mut outbox,
+        entry_instant + theta_ready + Duration::from_millis(1),
+    )
+    .await;
 
     // Lemma (a)'s inductive step, observable: entry continued past the dead view --
     // W3's amplification rides out on the very echo-skip/no-ready responses just
@@ -89,11 +111,20 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
     // 2's proposal never arrives -- only W5(c)'s formal-entry floor can unblock R1 for
     // view 3 and beyond).
     for &i in &live {
-        assert!(nodes[i].frontier.is_active(dead_view + 1), "node {} must have entered past the dead view", i);
+        assert!(
+            nodes[i].frontier.is_active(dead_view + 1),
+            "node {} must have entered past the dead view",
+            i
+        );
     }
 
     // Let the now-unblocked live-proposer views actually run their course.
-    run_to_quiescence(&mut nodes, &mut outbox, entry_instant + theta_ready + Duration::from_millis(1)).await;
+    run_to_quiescence(
+        &mut nodes,
+        &mut outbox,
+        entry_instant + theta_ready + Duration::from_millis(1),
+    )
+    .await;
 
     // Later views with live proposers must complete and seal normally.
     let mut any_live_view_sealed = false;
@@ -102,13 +133,21 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
             any_live_view_sealed = true;
         }
     }
-    assert!(any_live_view_sealed, "at least one live-proposer view beyond the dead one must seal at the AGB layer");
+    assert!(
+        any_live_view_sealed,
+        "at least one live-proposer view beyond the dead one must seal at the AGB layer"
+    );
 
     // The pre-resolver checkpoint (Phase 5's own documented boundary, kept here as the
     // "before" half of this test): the output cursor is TRANSIENTLY blocked exactly at
     // the dead view, even though later views sealed at the AGB layer above.
     for &i in &live {
-        assert_eq!(nodes[i].cursor.next_view(), dead_view, "node {} cursor must be transiently blocked exactly at the dead view (pre-resolution)", i);
+        assert_eq!(
+            nodes[i].cursor.next_view(),
+            dead_view,
+            "node {} cursor must be transiently blocked exactly at the dead view (pre-resolution)",
+            i
+        );
     }
 
     // PHASE6-SPEC.md §9: drive the resolver -> anchor pipeline the rest of the way
@@ -118,21 +157,43 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
     // established above.
     let carrying_view: crate::primary::View = 1000;
     let carrier_name = crate::vantage::agb::proposer(&test_committee(), carrying_view);
-    let carrier_idx = live.iter().find(|&&i| nodes[i].name == carrier_name).copied().expect("a live party must lead the carrying view");
+    let carrier_idx = live
+        .iter()
+        .find(|&&i| nodes[i].name == carrier_name)
+        .copied()
+        .expect("a live party must lead the carrying view");
     let m = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
         let control = &node.control;
         // Consume the (initially data-only) next-turn bit first, exactly like
         // `Node::try_propose_effects` would at this party's own proposer turn.
-        node.resolver.decide(agb, carrying_view, entry_instant, |u| agb.is_sealed(u) || control.is_anchor_resolved(u));
-        node.resolver.decide(agb, carrying_view, entry_instant, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+        node.resolver
+            .decide(agb, carrying_view, entry_instant, |u| {
+                agb.is_sealed(u) || control.is_anchor_resolved(u)
+            });
+        node.resolver
+            .decide(agb, carrying_view, entry_instant, |u| {
+                agb.is_sealed(u) || control.is_anchor_resolved(u)
+            })
     };
-    assert_eq!(m, Some(ResolutionEntry::Skip(dead_view)), "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate");
+    assert_eq!(
+        m,
+        Some(ResolutionEntry::Skip(dead_view)),
+        "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate"
+    );
 
     let (author0, _) = all[0];
-    let c_ref = nodes[carrier_idx].lm.c_candidate(&author0).expect("seeded C candidate");
-    let proposal = ViewProposal { view: carrying_view, c: vec![c_ref], t: Vec::new(), m };
+    let c_ref = nodes[carrier_idx]
+        .lm
+        .c_candidate(&author0)
+        .expect("seeded C candidate");
+    let proposal = ViewProposal {
+        view: carrying_view,
+        c: vec![c_ref],
+        t: Vec::new(),
+        m,
+    };
 
     for &i in &live {
         let effects = nodes[i].enter_view_effects(carrying_view, entry_instant);
@@ -161,11 +222,22 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
     // node has sealed `gskip` for the dead view via the anchor, and the cursor has
     // ADVANCED PAST it -- the pre-resolver blocking behavior asserted above is gone.
     for &i in &live {
-        assert_eq!(nodes[i].agb.sealed_for_test(dead_view), Some(Outcome::Skip), "node {} must have sealed gskip for the dead view via the anchor", i);
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(dead_view),
+            Some(Outcome::Skip),
+            "node {} must have sealed gskip for the dead view via the anchor",
+            i
+        );
         assert!(nodes[i].cursor.next_view() > dead_view, "node {} cursor must have advanced past the dead view -- the pre-resolver block is gone", i);
     }
     let reference = nodes[live[0]].cursor.output_log().to_vec();
     for &i in &live[1..] {
-        assert_eq!(nodes[i].cursor.output_log(), reference.as_slice(), "node {} output log must match node {}", i, live[0]);
+        assert_eq!(
+            nodes[i].cursor.output_log(),
+            reference.as_slice(),
+            "node {} output log must match node {}",
+            i,
+            live[0]
+        );
     }
 }

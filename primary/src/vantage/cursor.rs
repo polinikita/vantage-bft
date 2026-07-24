@@ -46,7 +46,13 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    pub fn new(committee: Committee, sid: Digest, genesis: Digest, max_block_payload: usize, blocks: SharedBlocks) -> Self {
+    pub fn new(
+        committee: Committee,
+        sid: Digest,
+        genesis: Digest,
+        max_block_payload: usize,
+        blocks: SharedBlocks,
+    ) -> Self {
         let mut output = HashSet::new();
         output.insert(genesis.clone());
         Self {
@@ -172,7 +178,11 @@ impl Cursor {
         }
         let (by_worker, headers) = self.batches_by_worker_and_headers(&hashes);
         let commit_millis = now_millis();
-        vec![Effect::NotifyCommitted(commit_millis, by_worker.into_iter().collect(), headers)]
+        vec![Effect::NotifyCommitted(
+            commit_millis,
+            by_worker.into_iter().collect(),
+            headers,
+        )]
     }
 
     /// Same `BlockCache` lock/lookup `batches_by_worker` always did, plus (PHASE7-
@@ -210,14 +220,25 @@ impl Cursor {
         // `None` (still-missing/unverified prefix somewhere in the manifest) leaves no
         // partial side effect -- `pump()`'s callers rely on `expand` being all-or-
         // nothing, exactly as the original genesis-anew version was.
-        let mut suffixes: Vec<(PublicKey, Height, Vec<Digest>)> = Vec::with_capacity(manifest.len());
+        let mut suffixes: Vec<(PublicKey, Height, Vec<Digest>)> =
+            Vec::with_capacity(manifest.len());
         for (author, height, digest) in manifest {
-            let (stop_height, stop_digest) = self.watermarks.get(author).cloned().unwrap_or_else(|| (0, self.genesis.clone()));
+            let (stop_height, stop_digest) = self
+                .watermarks
+                .get(author)
+                .cloned()
+                .unwrap_or_else(|| (0, self.genesis.clone()));
             if *height <= stop_height {
                 continue; // already emitted (or older) through this author's watermark
             }
-            let suffix =
-                blocks.collect_verified_suffix(&self.committee, &self.sid, self.max_block_payload, stop_height, &stop_digest, digest)?;
+            let suffix = blocks.collect_verified_suffix(
+                &self.committee,
+                &self.sid,
+                self.max_block_payload,
+                stop_height,
+                &stop_digest,
+                digest,
+            )?;
             suffixes.push((*author, *height, suffix));
         }
         drop(blocks);
@@ -241,5 +262,8 @@ impl Cursor {
 }
 
 fn now_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_millis() as u64
 }

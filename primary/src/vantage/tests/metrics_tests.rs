@@ -46,9 +46,15 @@ async fn repairer_counters_observe() {
     let registry = Registry::new();
     let (metrics, _reporter) = Metrics::new(&registry);
 
-    let mut repairer =
-        Repairer::new(watcher, test_committee(), sid.clone(), genesis.clone(), MAX_BLOCK_PAYLOAD, lm.blocks_handle())
-            .with_metrics(metrics.clone());
+    let mut repairer = Repairer::new(
+        watcher,
+        test_committee(),
+        sid.clone(),
+        genesis.clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    )
+    .with_metrics(metrics.clone());
 
     let block = crate::messages::Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
     let h = block.id.clone();

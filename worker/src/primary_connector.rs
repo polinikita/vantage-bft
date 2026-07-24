@@ -48,7 +48,10 @@ impl PrimaryConnector {
                 name,
                 primary_address,
                 rx_digest,
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
+                network: SimpleSender::new()
+                    .with_metrics(metrics)
+                    .with_compression(compress_network)
+                    .with_batching(batch),
                 channel_auth,
             }
             .run()
@@ -72,7 +75,9 @@ impl PrimaryConnector {
             let data = match &self.channel_auth {
                 None => Bytes::from(digest),
                 Some(auth) => {
-                    let tag = auth.tag_for(&self.name, &digest).expect("self is a committee member");
+                    let tag = auth
+                        .tag_for(&self.name, &digest)
+                        .expect("self is a committee member");
                     let mut tagged = digest;
                     tagged.extend_from_slice(&tag);
                     Bytes::from(tagged)

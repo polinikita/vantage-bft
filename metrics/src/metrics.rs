@@ -16,8 +16,8 @@ use std::{ops::AddAssign, sync::Arc, sync::Mutex, time::Duration};
 
 use prometheus::{
     register_int_counter_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
-    Registry,
+    register_int_gauge_vec_with_registry, register_int_gauge_with_registry, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, Registry,
 };
 use tokio::time::Instant;
 
@@ -49,7 +49,10 @@ impl UtilizationTimer {
     /// (same `Drop` impl, same elapsed-time accounting) -- this is purely an
     /// alternate constructor, not a behavior change.
     pub fn from_counter(metric: IntCounter) -> Self {
-        Self { metric, start: Instant::now() }
+        Self {
+            metric,
+            start: Instant::now(),
+        }
     }
 }
 
@@ -268,7 +271,11 @@ impl AsPrometheusMetric for usize {
 }
 
 impl<T: Ord + AddAssign + DivUsize + Copy + Default + AsPrometheusMetric> HistogramReporter<T> {
-    pub fn new_in_registry(histogram: PreciseHistogram<T>, registry: &Registry, name: &str) -> Self {
+    pub fn new_in_registry(
+        histogram: PreciseHistogram<T>,
+        registry: &Registry,
+        name: &str,
+    ) -> Self {
         let gauge = register_int_gauge_vec_with_registry!(name, name, &["v"], registry).unwrap();
         Self { histogram, gauge }
     }
@@ -278,19 +285,30 @@ impl<T: Ord + AddAssign + DivUsize + Copy + Default + AsPrometheusMetric> Histog
     /// registers this same shape but never observes into it) simply omits the metric
     /// from its scrape output rather than reporting a misleading zero.
     pub fn report(&mut self) {
-        let Some([p25, p50, p75, p90, p99]) = self.histogram.pcts([250, 500, 750, 900, 990])
-        else {
+        let Some([p25, p50, p75, p90, p99]) = self.histogram.pcts([250, 500, 750, 900, 990]) else {
             return;
         };
         let Some(max) = self.histogram.max() else {
             return;
         };
-        self.gauge.with_label_values(&["p25"]).set(p25.as_prometheus_metric());
-        self.gauge.with_label_values(&["p50"]).set(p50.as_prometheus_metric());
-        self.gauge.with_label_values(&["p75"]).set(p75.as_prometheus_metric());
-        self.gauge.with_label_values(&["p90"]).set(p90.as_prometheus_metric());
-        self.gauge.with_label_values(&["p99"]).set(p99.as_prometheus_metric());
-        self.gauge.with_label_values(&["max"]).set(max.as_prometheus_metric());
+        self.gauge
+            .with_label_values(&["p25"])
+            .set(p25.as_prometheus_metric());
+        self.gauge
+            .with_label_values(&["p50"])
+            .set(p50.as_prometheus_metric());
+        self.gauge
+            .with_label_values(&["p75"])
+            .set(p75.as_prometheus_metric());
+        self.gauge
+            .with_label_values(&["p90"])
+            .set(p90.as_prometheus_metric());
+        self.gauge
+            .with_label_values(&["p99"])
+            .set(p99.as_prometheus_metric());
+        self.gauge
+            .with_label_values(&["max"])
+            .set(max.as_prometheus_metric());
         self.gauge
             .with_label_values(&["sum"])
             .set(self.histogram.total_sum().as_prometheus_metric());

@@ -164,8 +164,9 @@ impl Client {
                     }
                 }
                 let bytes = tx.split().freeze(); //split() moves byte content from tx to bytes (i.e. avoids copy). freeze() makes it const so it can be shared. (bytes can now be used/sent async)
-                //Note: Does not sign transactions. Transaction id-s are not unique w.r.t to content.
-                if let Err(e) = transport.send(bytes).await { //Uses TCP connection to send request to assigned worker. Note: Optimistically only sending to one worker.
+                                                 //Note: Does not sign transactions. Transaction id-s are not unique w.r.t to content.
+                if let Err(e) = transport.send(bytes).await {
+                    //Uses TCP connection to send request to assigned worker. Note: Optimistically only sending to one worker.
                     warn!("Failed to send transaction: {}", e);
                     break 'main;
                 }

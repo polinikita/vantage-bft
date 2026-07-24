@@ -48,7 +48,11 @@ pub trait Export: Serialize {
             // trailing bytes from a longer previous file -- without this, a stale
             // longer parameters.json/committee.json from an earlier run could corrupt
             // the JSON a later, shorter write produces).
-            let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)?;
             let mut writer = BufWriter::new(file);
             let data = serde_json::to_string_pretty(self).unwrap();
             writer.write_all(data.as_ref())?;
@@ -79,7 +83,6 @@ pub enum Protocol {
     /// Signature-free AGB protocol (implemented in Phase 3+).
     Vantage,
 }
-
 
 impl Protocol {
     /// The `use_optimistic_tips` value implied by this protocol when the
@@ -143,12 +146,12 @@ pub struct Parameters {
 
     //Autobahn protocol config parameters
     #[serde(default = "default_use_optimistic_tips")]
-    pub use_optimistic_tips: bool,     //default = true (TODO: implement non optimistic tip option)
+    pub use_optimistic_tips: bool, //default = true (TODO: implement non optimistic tip option)
 
-    pub use_parallel_proposals: bool,  //default = true (TODO: implement sequential slot option)
-    pub k: u64, //Max open conensus instances at a time.
+    pub use_parallel_proposals: bool, //default = true (TODO: implement sequential slot option)
+    pub k: u64,                       //Max open conensus instances at a time.
 
-    pub use_fast_path: bool,           //default = false
+    pub use_fast_path: bool, //default = false
     pub fast_path_timeout: u64,
 
     pub use_ride_share: bool,
@@ -341,15 +344,23 @@ impl LatencyTable {
     /// direction of a send, hence the one-way half). `n` must match the parsed
     /// matrix's own row/column count exactly (checked, not assumed).
     pub fn from_rtt_csv(path: &str, n: usize) -> Result<Self, ConfigError> {
-        let err = |message: String| ConfigError::ImportError { file: path.to_string(), message };
+        let err = |message: String| ConfigError::ImportError {
+            file: path.to_string(),
+            message,
+        };
         let data = fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
         let mut rows: Vec<Vec<f64>> = Vec::new();
         for line in data.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            let row: Result<Vec<f64>, _> = line.split(',').map(|cell| cell.trim().parse::<f64>()).collect();
-            rows.push(row.map_err(|e| err(format!("non-numeric cell in row {}: {}", rows.len(), e)))?);
+            let row: Result<Vec<f64>, _> = line
+                .split(',')
+                .map(|cell| cell.trim().parse::<f64>())
+                .collect();
+            rows.push(
+                row.map_err(|e| err(format!("non-numeric cell in row {}: {}", rows.len(), e)))?,
+            );
         }
         if rows.len() != n || rows.iter().any(|r| r.len() != n) {
             return Err(err(format!(
@@ -358,7 +369,10 @@ impl LatencyTable {
                 rows.iter().map(|r| r.len()).collect::<Vec<_>>()
             )));
         }
-        let one_way_ms = rows.into_iter().map(|row| row.into_iter().map(|rtt_ms| rtt_ms / 2.0).collect()).collect();
+        let one_way_ms = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(|rtt_ms| rtt_ms / 2.0).collect())
+            .collect();
         Ok(Self { one_way_ms })
     }
 
@@ -370,7 +384,9 @@ impl LatencyTable {
         self.one_way_ms
             .get(i)
             .and_then(|row| row.get(j))
-            .map_or(Duration::ZERO, |ms| Duration::from_secs_f64(ms.max(0.0) / 1000.0))
+            .map_or(Duration::ZERO, |ms| {
+                Duration::from_secs_f64(ms.max(0.0) / 1000.0)
+            })
     }
 }
 
@@ -398,7 +414,7 @@ impl Default for Parameters {
 
             //Async simulation:
             simulate_asynchrony: false,
-            asynchrony_start: 20_000, //20 second in
+            asynchrony_start: 20_000,    //20 second in
             asynchrony_duration: 10_000, //10 seconds
 
             protocol: Protocol::default(),
@@ -449,12 +465,24 @@ impl Parameters {
         info!("Batch size set to {} B", self.batch_size);
         info!("Max batch delay set to {} ms", self.max_batch_delay);
 
-        info!("Fast path enabled? {}. Fast timeout: {}", self.use_fast_path, self.fast_path_timeout);
+        info!(
+            "Fast path enabled? {}. Fast timeout: {}",
+            self.use_fast_path, self.fast_path_timeout
+        );
         info!("Optimistic tips enabled? {}", self.use_optimistic_tips);
-        info!("Parallel Proposals enabled? {}. K: {}", self.use_parallel_proposals, self.k);
-        info!("Ride share enabled? {}. Car timeout: {}", self.use_ride_share, self.car_timeout);
+        info!(
+            "Parallel Proposals enabled? {}. K: {}",
+            self.use_parallel_proposals, self.k
+        );
+        info!(
+            "Ride share enabled? {}. Car timeout: {}",
+            self.use_ride_share, self.car_timeout
+        );
         info!("All-to-all (Autobahn §5.5.3) enabled? {}", self.all_to_all);
-        info!("Max block payload set to {} entries", self.max_block_payload);
+        info!(
+            "Max block payload set to {} entries",
+            self.max_block_payload
+        );
         info!("Vantage delta set to {} ms", self.delta_ms);
         if self.latency_table.is_some() {
             info!("Mimic latency table active (PHASE7-PREP-NOTES.md)");
@@ -464,7 +492,10 @@ impl Parameters {
             "Network batching enabled? {}. Max bytes: {}. Max delay: {} ms",
             self.batch_messages, self.batch_max_bytes, self.batch_max_delay_ms
         );
-        info!("Authenticated channels (symmetric pairwise MAC) enabled? {}", self.authenticate_channels);
+        info!(
+            "Authenticated channels (symmetric pairwise MAC) enabled? {}",
+            self.authenticate_channels
+        );
     }
 }
 
@@ -513,7 +544,7 @@ pub struct Authority {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
-    //pub id_map: HashMap<PublicKey, u64>, //position 
+    //pub id_map: HashMap<PublicKey, u64>, //position
 }
 
 impl Import for Committee {}
@@ -525,7 +556,18 @@ impl Committee {
             authorities: info
                 .into_iter()
                 .map(|(name, stake, address)| {
-                    let authority = Authority { stake, consensus: ConsensusAddresses { consensus_to_consensus: address }, primary: PrimaryAddresses { primary_to_primary: address, worker_to_primary: address, metrics: address }, workers: HashMap::new() };
+                    let authority = Authority {
+                        stake,
+                        consensus: ConsensusAddresses {
+                            consensus_to_consensus: address,
+                        },
+                        primary: PrimaryAddresses {
+                            primary_to_primary: address,
+                            worker_to_primary: address,
+                            metrics: address,
+                        },
+                        workers: HashMap::new(),
+                    };
                     (name, authority)
                 })
                 .collect(),
@@ -710,7 +752,12 @@ impl Committee {
             a.consensus.consensus_to_consensus,
         ];
         for w in a.workers.values() {
-            out.extend([w.primary_to_worker, w.transactions, w.worker_to_worker, w.metrics]);
+            out.extend([
+                w.primary_to_worker,
+                w.transactions,
+                w.worker_to_worker,
+                w.metrics,
+            ]);
         }
         out
     }
@@ -725,7 +772,11 @@ impl Committee {
     /// fairness point: a WAN-shaped run models the same network for either
     /// assembly). Empty (no entries -- equivalent to zero injected delay everywhere)
     /// if `myself` isn't a committee member.
-    pub fn latency_map(&self, myself: &PublicKey, table: &LatencyTable) -> HashMap<SocketAddr, Duration> {
+    pub fn latency_map(
+        &self,
+        myself: &PublicKey,
+        table: &LatencyTable,
+    ) -> HashMap<SocketAddr, Duration> {
         let mut out = HashMap::new();
         let Some(i) = self.index_of(myself) else {
             return out;
@@ -804,7 +855,9 @@ impl Committee {
     }
 
     pub fn address(&self, name: &PublicKey) -> Option<SocketAddr> {
-        self.authorities.get(name).map(|x| x.consensus.consensus_to_consensus)
+        self.authorities
+            .get(name)
+            .map(|x| x.consensus.consensus_to_consensus)
     }
 
     /// Symmetric pairwise-MAC authenticated channels: builds `myself`'s own

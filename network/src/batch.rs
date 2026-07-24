@@ -40,7 +40,11 @@ impl Default for BatchConfig {
         // -- negligible next to a WAN's ~400 ms p50 -- while coalescing substantially
         // more per flush than a 1 ms window, which matters more as n grows (n~50/100).
         // `max_bytes`'s size cap still short-circuits this window under a burst.
-        Self { enabled: false, max_bytes: 65_536, max_delay_ms: 5 }
+        Self {
+            enabled: false,
+            max_bytes: 65_536,
+            max_delay_ms: 5,
+        }
     }
 }
 
@@ -130,7 +134,10 @@ pub(crate) struct Coalescer<T> {
 
 impl<T> Coalescer<T> {
     pub(crate) fn new() -> Self {
-        Self { items: Vec::new(), bytes: 0 }
+        Self {
+            items: Vec::new(),
+            bytes: 0,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -193,7 +200,11 @@ mod tests {
 
     #[test]
     fn bundle_roundtrip() {
-        let msgs = vec![Bytes::from_static(b"hello"), Bytes::from_static(b""), Bytes::from_static(b"world!")];
+        let msgs = vec![
+            Bytes::from_static(b"hello"),
+            Bytes::from_static(b""),
+            Bytes::from_static(b"world!"),
+        ];
         let bundle = encode_bundle(&msgs);
         let decoded = decode_bundle(&bundle).unwrap();
         assert_eq!(decoded, msgs);
@@ -265,6 +276,9 @@ mod tests {
         let (bundle, extras) = c.flush();
         assert!(c.is_empty());
         assert_eq!(extras, vec![1, 2]);
-        assert_eq!(decode_bundle(&bundle).unwrap(), vec![Bytes::from_static(b"abc"), Bytes::from_static(b"de")]);
+        assert_eq!(
+            decode_bundle(&bundle).unwrap(),
+            vec![Bytes::from_static(b"abc"), Bytes::from_static(b"de")]
+        );
     }
 }

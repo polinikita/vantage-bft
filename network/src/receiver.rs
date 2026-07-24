@@ -77,7 +77,11 @@ impl<Handler: MessageHandler> Receiver<Handler> {
 
     /// Same as `spawn`, plus a `bytes_received_total` observation for every frame this
     /// receiver's connections read (a no-op if `metrics` is `None`).
-    pub fn spawn_with_metrics(address: SocketAddr, handler: Handler, metrics: Option<Arc<Metrics>>) {
+    pub fn spawn_with_metrics(
+        address: SocketAddr,
+        handler: Handler,
+        metrics: Option<Arc<Metrics>>,
+    ) {
         Self::spawn_full(address, handler, metrics, false, false, false);
     }
 
@@ -96,7 +100,16 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         batch: bool,
     ) {
         tokio::spawn(async move {
-            Self { address, handler, metrics, compress, acks, batch }.run().await;
+            Self {
+                address,
+                handler,
+                metrics,
+                compress,
+                acks,
+                batch,
+            }
+            .run()
+            .await;
         });
     }
 
@@ -117,7 +130,16 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 }
             };
             info!("Incoming connection established with {}", peer);
-            Self::spawn_runner(socket, peer, self.handler.clone(), self.metrics.clone(), self.compress, self.acks, self.batch).await;
+            Self::spawn_runner(
+                socket,
+                peer,
+                self.handler.clone(),
+                self.metrics.clone(),
+                self.compress,
+                self.acks,
+                self.batch,
+            )
+            .await;
         }
     }
 
@@ -140,7 +162,9 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 match frame.map_err(|e| NetworkError::FailedToReceiveMessage(peer, e)) {
                     Ok(message) => {
                         if let Some(metrics) = &metrics {
-                            metrics.bytes_received_total.inc_by(message.len() as u64 + 4);
+                            metrics
+                                .bytes_received_total
+                                .inc_by(message.len() as u64 + 4);
                         }
                         // METRICS-DASHBOARD-SPEC.md §8: decompress AFTER length-prefix
                         // framing (the frame itself is already delimited by the codec
@@ -173,7 +197,9 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                             match decode_bundle(&payload) {
                                 Ok(messages) => {
                                     for sub_message in messages {
-                                        if let Err(e) = handler.dispatch(&mut writer, sub_message).await {
+                                        if let Err(e) =
+                                            handler.dispatch(&mut writer, sub_message).await
+                                        {
                                             warn!("{}", e);
                                             return;
                                         }

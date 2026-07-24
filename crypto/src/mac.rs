@@ -63,8 +63,15 @@ impl<'de> Deserialize<'de> for MacSecret {
         D: de::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        let bytes = BASE64_STANDARD.decode(&s).map_err(|e| de::Error::custom(e.to_string()))?;
-        let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| de::Error::custom(format!("mac secret must decode to exactly 32 bytes, got {}", bytes.len())))?;
+        let bytes = BASE64_STANDARD
+            .decode(&s)
+            .map_err(|e| de::Error::custom(e.to_string()))?;
+        let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            de::Error::custom(format!(
+                "mac secret must decode to exactly 32 bytes, got {}",
+                bytes.len()
+            ))
+        })?;
         Ok(Self(array))
     }
 }
@@ -97,8 +104,15 @@ impl PairwiseKeys {
     /// `members` must include `me` itself -- the degenerate self-pair key backs both
     /// the worker<->primary intra-authority channel (both ends share the same
     /// authority public key) and `tag_unverified`'s placeholder tag.
-    pub fn build(secret: &MacSecret, me: PublicKey, members: impl IntoIterator<Item = PublicKey>) -> Self {
-        let keys = members.into_iter().map(|peer| (peer, derive_pairwise_key(secret, &me, &peer))).collect();
+    pub fn build(
+        secret: &MacSecret,
+        me: PublicKey,
+        members: impl IntoIterator<Item = PublicKey>,
+    ) -> Self {
+        let keys = members
+            .into_iter()
+            .map(|peer| (peer, derive_pairwise_key(secret, &me, &peer)))
+            .collect();
         Self { me, keys }
     }
 
@@ -107,7 +121,9 @@ impl PairwiseKeys {
     /// if `dest` isn't a committee member we hold a key for (never the case for a real
     /// committee peer -- `build` is always seeded from the full committee).
     pub fn tag_for(&self, dest: &PublicKey, payload: &[u8]) -> Option<[u8; TAG_LEN]> {
-        self.keys.get(dest).map(|key| *blake3::keyed_hash(key, payload).as_bytes())
+        self.keys
+            .get(dest)
+            .map(|key| *blake3::keyed_hash(key, payload).as_bytes())
     }
 
     /// A framing-only placeholder tag for message variants that carry no sender claim
@@ -119,7 +135,10 @@ impl PairwiseKeys {
     /// it against). It exists purely so the wire format's "every message carries
     /// exactly one trailing tag" framing stays uniform across every variant.
     pub fn tag_unverified(&self, payload: &[u8]) -> [u8; TAG_LEN] {
-        let key = self.keys.get(&self.me).expect("PairwiseKeys::build's `members` must include `me`");
+        let key = self
+            .keys
+            .get(&self.me)
+            .expect("PairwiseKeys::build's `members` must include `me`");
         *blake3::keyed_hash(key, payload).as_bytes()
     }
 

@@ -1,5 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::{primary::{Height, View}, messages::Timeout};
+use crate::{
+    messages::Timeout,
+    primary::{Height, View},
+};
 use crypto::{CryptoError, Digest, PublicKey};
 use store::StoreError;
 use thiserror::Error;
@@ -19,7 +22,6 @@ macro_rules! ensure {
         }
     };
 }
-
 
 pub type DagResult<T> = Result<T, DagError>;
 
@@ -81,10 +83,7 @@ pub enum DagError {
 
     #[error("Wrong QC ticket")]
     InvalidQCTicket,
-
 }
-
-
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
 
@@ -168,5 +167,4 @@ pub enum ConsensusError {
 
     #[error("Header of parent ticket not committed")]
     MissingParentTicketHeader,
-        
 }

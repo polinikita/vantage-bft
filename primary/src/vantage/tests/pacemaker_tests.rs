@@ -44,7 +44,11 @@ fn w1_genesis_sets_own_wish_to_2_and_broadcasts_with_self_delivery() {
     let mut pm = Pacemaker::new(name, &test_committee());
     let effects = pm.genesis();
 
-    assert_eq!(broadcast_wish(&effects), Some(2), "genesis must broadcast wish(2)");
+    assert_eq!(
+        broadcast_wish(&effects),
+        Some(2),
+        "genesis must broadcast wish(2)"
+    );
     // "Self-delivery immediate": the own slot is updated synchronously, right here --
     // no separate self-addressed message round-trip is needed to observe it.
     assert_eq!(pm.own_watermark(), 2);
@@ -70,12 +74,23 @@ fn w2_omega_plus_boundary_exactly_f_plus_1_senders() {
     let mut pm = Pacemaker::new(name, &test_committee());
 
     let effects = pm.on_wish(p1, 5);
-    assert!(effects.is_empty(), "f+1 boundary not yet met with only 1 of 2 senders");
+    assert!(
+        effects.is_empty(),
+        "f+1 boundary not yet met with only 1 of 2 senders"
+    );
     assert_eq!(pm.own_watermark(), 0);
 
     let effects = pm.on_wish(p2, 5);
-    assert_eq!(broadcast_wish(&effects), Some(5), "the 2nd (= f+1) distinct sender must trigger amplification");
-    assert_eq!(pm.own_watermark(), 5, "amplification must update the own slot/watermark");
+    assert_eq!(
+        broadcast_wish(&effects),
+        Some(5),
+        "the 2nd (= f+1) distinct sender must trigger amplification"
+    );
+    assert_eq!(
+        pm.own_watermark(),
+        5,
+        "amplification must update the own slot/watermark"
+    );
     assert_eq!(pm.omega_of_for_test(name), 5);
 }
 
@@ -92,13 +107,22 @@ fn w2_omega_q_boundary_exactly_two_f_plus_1_senders_independent_of_amplification
     let (p1, _) = all[0];
     let (p2, _) = all[1];
     let mut pm = Pacemaker::new(name, &test_committee());
-    assert!(pm.raise_own_wish(5).is_empty(), "1 of 4 slots at 5 is nowhere near 2f+1=3");
+    assert!(
+        pm.raise_own_wish(5).is_empty(),
+        "1 of 4 slots at 5 is nowhere near 2f+1=3"
+    );
 
     let effects = pm.on_wish(p1, 5);
-    assert!(entries(&effects).is_empty(), "2f+1 boundary not yet met with only 2 of 3 (self + 1 external)");
+    assert!(
+        entries(&effects).is_empty(),
+        "2f+1 boundary not yet met with only 2 of 3 (self + 1 external)"
+    );
 
     let effects = pm.on_wish(p2, 5);
-    assert!(broadcast_wish(&effects).is_none(), "own watermark already at the target -- no re-amplification");
+    assert!(
+        broadcast_wish(&effects).is_none(),
+        "own watermark already at the target -- no re-amplification"
+    );
     assert_eq!(entries(&effects), vec![1, 2, 3, 4, 5], "the 3rd (= 2f+1) party crossing the target must enter every missing view through it, in order");
 }
 
@@ -121,11 +145,21 @@ fn w2_amplification_precedes_entry_and_entry_is_recorded_in_increasing_order() {
 
     let effects = pm.on_wish(p2, 5);
     assert_eq!(broadcast_wish(&effects), Some(5));
-    assert_eq!(entries(&effects), vec![2, 3, 4, 5], "view 1 already entered by genesis -- must never be re-scheduled");
+    assert_eq!(
+        entries(&effects),
+        vec![2, 3, 4, 5],
+        "view 1 already entered by genesis -- must never be re-scheduled"
+    );
     // Amplification's `Effect::BroadcastWish` must precede every `Effect::Enter` in
     // the returned order.
-    let wish_pos = effects.iter().position(|e| matches!(e, Effect::BroadcastWish(_))).unwrap();
-    let first_enter_pos = effects.iter().position(|e| matches!(e, Effect::Enter(_))).unwrap();
+    let wish_pos = effects
+        .iter()
+        .position(|e| matches!(e, Effect::BroadcastWish(_)))
+        .unwrap();
+    let first_enter_pos = effects
+        .iter()
+        .position(|e| matches!(e, Effect::Enter(_)))
+        .unwrap();
     assert!(wish_pos < first_enter_pos);
 }
 
@@ -147,9 +181,16 @@ fn w2_a_wish_for_x_supports_every_view_up_to_x() {
     assert_eq!(entries(&effects), vec![1, 2, 3]);
 
     let effects = pm.on_wish(p1, 5);
-    assert!(effects.is_empty(), "only 2 of 3 senders now at >= 5 (self is still at 3)");
+    assert!(
+        effects.is_empty(),
+        "only 2 of 3 senders now at >= 5 (self is still at 3)"
+    );
     let effects = pm.on_wish(p2, 5);
-    assert_eq!(entries(&effects), vec![4, 5], "only the missing suffix through the new target is scheduled");
+    assert_eq!(
+        entries(&effects),
+        vec![4, 5],
+        "only the missing suffix through the new target is scheduled"
+    );
 }
 
 #[test]
@@ -163,7 +204,11 @@ fn w2_stale_wish_causes_no_transition() {
 
     let effects = pm.on_wish(p1, 3); // stale: 3 <= the sender's already-recorded 5
     assert!(effects.is_empty());
-    assert_eq!(pm.omega_of_for_test(p1), 5, "a stale wish must never lower the sender's slot");
+    assert_eq!(
+        pm.omega_of_for_test(p1),
+        5,
+        "a stale wish must never lower the sender's slot"
+    );
 
     let effects = pm.on_wish(p1, 5); // stale: equal, not "larger"
     assert!(effects.is_empty());
@@ -178,7 +223,10 @@ fn raise_own_wish_never_broadcasts_and_is_a_no_op_below_current_watermark() {
     let (name, _) = authors()[0];
     let mut pm = Pacemaker::new(name, &test_committee());
     let effects = pm.raise_own_wish(4);
-    assert!(broadcast_wish(&effects).is_none(), "W3's raise must never itself broadcast a standalone VantageWish");
+    assert!(
+        broadcast_wish(&effects).is_none(),
+        "W3's raise must never itself broadcast a standalone VantageWish"
+    );
     assert_eq!(pm.own_watermark(), 4);
 
     let effects = pm.raise_own_wish(2); // not larger than the current watermark

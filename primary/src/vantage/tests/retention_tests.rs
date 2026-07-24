@@ -26,7 +26,10 @@ async fn acked_prefix_served_to_later_requester() {
     );
     let effects = repairer.on_request(requester, header.id.clone());
     assert_eq!(
-        effects.iter().filter(|e| matches!(e, Effect::ServeTo(p, b) if *p == requester && b.id == header.id)).count(),
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::ServeTo(p, b) if *p == requester && b.id == header.id))
+            .count(),
         1
     );
 }
@@ -44,7 +47,14 @@ async fn late_request_still_served_after_retention() {
     let (lm, _store) = new_lane_manager(watcher, ".db_test_vantage_retention_late");
     let sid = lm.sid().clone();
     let genesis = lm.genesis().clone();
-    let mut repairer = Repairer::new(watcher, test_committee(), sid.clone(), genesis.clone(), MAX_BLOCK_PAYLOAD, lm.blocks_handle());
+    let mut repairer = Repairer::new(
+        watcher,
+        test_committee(),
+        sid.clone(),
+        genesis.clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    );
 
     let block = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
     let h = block.id.clone();
@@ -54,7 +64,10 @@ async fn late_request_still_served_after_retention() {
     // Only now does a requester ask -- no request was pending when retention happened.
     let effects = repairer.on_request(requester, h.clone());
     assert_eq!(
-        effects.iter().filter(|e| matches!(e, Effect::ServeTo(p, b) if *p == requester && b.id == h)).count(),
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::ServeTo(p, b) if *p == requester && b.id == h))
+            .count(),
         1
     );
 }

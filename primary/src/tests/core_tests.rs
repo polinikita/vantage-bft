@@ -1,14 +1,18 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use super::*;
 use super::panic;
-use crate::{common::{
-    certificate, committee, committee_with_base_port, header, headers, keys, listener, votes, special_header, special_votes, header_from_cert,
-}, header_waiter::HeaderWaiter};
+use super::*;
+use crate::{
+    common::{
+        certificate, committee, committee_with_base_port, header, header_from_cert, headers, keys,
+        listener, special_header, special_votes, votes,
+    },
+    header_waiter::HeaderWaiter,
+};
 use config::Parameters;
 use crypto::Hash;
+use serial_test::serial;
 use std::{fs, time::Duration};
 use tokio::{sync::mpsc::channel, time::sleep};
-use serial_test::serial;
 
 /// METRICS-DASHBOARD-SPEC.md §1: a fresh, disposable metrics handle for tests that
 /// don't care about wire counters, matching every other `Core::spawn` caller's shape.
@@ -33,8 +37,8 @@ async fn process_header() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -111,7 +115,6 @@ async fn process_header() {
         .await
         .unwrap();
 
-
     let received = handle.await.unwrap();
     match bincode::deserialize(&received).unwrap() {
         PrimaryMessage::Vote(x) => assert_eq!(x, expected),
@@ -144,8 +147,8 @@ async fn process_header_missing_parent() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -208,8 +211,18 @@ async fn process_header_missing_parent() {
 
     let header_one = header();
     let cert_one = certificate(&header_one);
-    let header_two: Header = Header { author: header_one.author, height: header_one.height + 1, payload: header_one.payload,
-        parent_cert: cert_one, id: header_one.id, signature: header_one.signature, sid: None, consensus_messages: HashMap::new(), num_active_instances: 0, special: false};
+    let header_two: Header = Header {
+        author: header_one.author,
+        height: header_one.height + 1,
+        payload: header_one.payload,
+        parent_cert: cert_one,
+        id: header_one.id,
+        signature: header_one.signature,
+        sid: None,
+        consensus_messages: HashMap::new(),
+        num_active_instances: 0,
+        special: false,
+    };
     let id = header_two.digest().clone();
 
     // Send a header to the core.
@@ -221,7 +234,6 @@ async fn process_header_missing_parent() {
     // Ensure the header is not stored.
     assert!(store.read(id.to_vec()).await.unwrap().is_none());
 }
-
 
 #[tokio::test]
 #[serial]
@@ -236,8 +248,8 @@ async fn process_header_invalid_height() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -300,7 +312,7 @@ async fn process_header_invalid_height() {
 
     // Send a header to the core.
     let header = Header {
-        parent_cert: Certificate::genesis_cert(&committee()),//[Digest::default()].iter().cloned().collect(),
+        parent_cert: Certificate::genesis_cert(&committee()), //[Digest::default()].iter().cloned().collect(),
         height: 2,
         ..header()
     };
@@ -330,11 +342,10 @@ async fn process_header_missing_payload() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
-
 
     // Create a new test store.
     let path = ".db_test_process_header_missing_payload";
@@ -423,11 +434,10 @@ async fn process_votes() {
     let (tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
-
 
     // Create a new test store.
     let path = ".db_test_process_vote";
@@ -486,8 +496,6 @@ async fn process_votes() {
         BatchConfig::default(),
     );
 
-
-
     // Receive geneis parent cert from the proposer
     rx_parents.recv().await.unwrap();
 
@@ -496,15 +504,12 @@ async fn process_votes() {
     let expected = certificate(&header);
 
     //Note: core uses Header::genesis instead of Header::default now
-    tx_headers
-        .send(header.clone())
-        .await
-        .unwrap();
+    tx_headers.send(header.clone()).await.unwrap();
     sleep(Duration::from_millis(500)).await;
     /*tx_primary_messages
-        .send(PrimaryMessage::Header(header.clone()))
-        .await
-        .unwrap();*/
+    .send(PrimaryMessage::Header(header.clone()))
+    .await
+    .unwrap();*/
 
     // Send a votes to the core.
     for vote in votes(&header) {
@@ -543,8 +548,8 @@ async fn process_certificates() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(3);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(3);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -605,21 +610,12 @@ async fn process_certificates() {
         BatchConfig::default(),
     );
 
-
     // Send enough certificates to the core.
-    let certificates: Vec<Certificate> = headers()
-        .iter()
-        .map(certificate)
-        .collect();
+    let certificates: Vec<Certificate> = headers().iter().map(certificate).collect();
 
     // Send enough headers to the core.
-    let headers_from_certs: Vec<Header> = certificates
-        .iter()
-        .map(header_from_cert)
-        .collect();
+    let headers_from_certs: Vec<Header> = certificates.iter().map(header_from_cert).collect();
 
-
-   
     for x in headers().iter() {
         //println!("author is {:?}", x.author);
         tx_primary_messages
@@ -628,7 +624,6 @@ async fn process_certificates() {
             .unwrap();
     }
 
-   
     for x in headers_from_certs {
         //println!("Sending headers with author {:?}", x.author);
         tx_primary_messages
@@ -663,8 +658,8 @@ async fn process_prepare() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -732,7 +727,6 @@ async fn process_prepare() {
         BatchConfig::default(),
     );
 
-
     // Send headers to the core, so they won't request sync
     let header_list = headers();
     for x in header_list.clone() {
@@ -744,9 +738,21 @@ async fn process_prepare() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(
+            x.author,
+            Proposal {
+                header_digest: x.digest(),
+                height: x.height(),
+            },
+        );
     }
-    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals };
+    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare {
+        slot: 1,
+        view: 1,
+        tc: None,
+        qc_ticket: None,
+        proposals,
+    };
 
     let mut consensus_messages: HashMap<Digest, ConsensusMessage> = HashMap::new();
     consensus_messages.insert(prepare_message.digest(), prepare_message.clone());
@@ -759,7 +765,6 @@ async fn process_prepare() {
         .send(PrimaryMessage::Header(header.clone(), false))
         .await
         .unwrap();
-
 
     listener(address).await.unwrap();
 
@@ -775,7 +780,6 @@ async fn process_prepare() {
         }
         x => panic!("Unexpected message: {:?}", x),
     }
-
 
     // Ensure the header is correctly stored.
     let stored = store
@@ -803,8 +807,8 @@ async fn generate_confirm() {
     let (tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -872,23 +876,21 @@ async fn generate_confirm() {
         BatchConfig::default(),
     );
 
-
     // Receive the first prepare message from proposer
     rx_info.recv().await.unwrap();
     rx_parents.recv().await.unwrap();
 
     /*Proposer::spawn(
-        name, 
-        committee.clone(), 
-        signature_service, 
-        100, 
-        timeout_delay, 
-        rx_parents, 
-        rx_workers, 
-        rx_info, 
+        name,
+        committee.clone(),
+        signature_service,
+        100,
+        timeout_delay,
+        rx_parents,
+        rx_workers,
+        rx_info,
         tx_headers,
     );*/
-
 
     // Send headers to the core, so they won't request sync
     let header_list = headers();
@@ -901,9 +903,21 @@ async fn generate_confirm() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(
+            x.author,
+            Proposal {
+                header_digest: x.digest(),
+                height: x.height(),
+            },
+        );
     }
-    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket:None, proposals: proposals.clone() };
+    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare {
+        slot: 1,
+        view: 1,
+        tc: None,
+        qc_ticket: None,
+        proposals: proposals.clone(),
+    };
 
     let mut consensus_messages: HashMap<Digest, ConsensusMessage> = HashMap::new();
     consensus_messages.insert(prepare_message.digest().clone(), prepare_message.clone());
@@ -912,32 +926,28 @@ async fn generate_confirm() {
     let header = special_header(parent_cert, consensus_messages.clone());
     let consensus_digests = vec![prepare_message.digest()];
 
-
     // Send a header to the core.
-    tx_headers
-        .send(header.clone())
-        .await
-        .unwrap();
-
+    tx_headers.send(header.clone()).await.unwrap();
 
     for vote in special_votes(&header, consensus_digests) {
         //println!("sending special votes");
         let message = PrimaryMessage::Vote(vote);
-        tx_primary_messages
-            .send(message)
-            .await
-            .unwrap();
+        tx_primary_messages.send(message).await.unwrap();
     }
-
 
     let confirm_message = rx_info.recv().await.unwrap();
     match confirm_message {
-        ConsensusMessage::Confirm { slot, view, qc, proposals: _ } => {
+        ConsensusMessage::Confirm {
+            slot,
+            view,
+            qc,
+            proposals: _,
+        } => {
             assert_eq!(slot, 1);
             assert_eq!(view, 1);
             assert_eq!(qc.id, prepare_message.digest().clone());
             assert_eq!(qc.votes.len(), 3);
-        },
+        }
         _ => panic!("Wrong message type"),
     };
 }
@@ -959,8 +969,8 @@ async fn generate_commit() {
     let (tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
-    let(tx_committer, mut rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, mut rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -987,7 +997,6 @@ async fn generate_commit() {
 
     let leader_elector = LeaderElector::new(committee.clone());
     let _timeout_delay = 1000;
-
 
     let parameters = Parameters::default();
 
@@ -1029,23 +1038,21 @@ async fn generate_commit() {
         BatchConfig::default(),
     );
 
-
     // Receive the first prepare message from proposer
     rx_info.recv().await.unwrap();
     rx_parents.recv().await.unwrap();
 
     /*Proposer::spawn(
-        name, 
-        committee.clone(), 
-        signature_service, 
-        100, 
-        timeout_delay, 
-        rx_parents, 
-        rx_workers, 
-        rx_info, 
+        name,
+        committee.clone(),
+        signature_service,
+        100,
+        timeout_delay,
+        rx_parents,
+        rx_workers,
+        rx_info,
         tx_headers,
     );*/
-
 
     // Send headers to the core, so they won't request sync
     let header_list = headers();
@@ -1058,9 +1065,21 @@ async fn generate_commit() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(
+            x.author,
+            Proposal {
+                header_digest: x.digest(),
+                height: x.height(),
+            },
+        );
     }
-    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals: proposals.clone() };
+    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare {
+        slot: 1,
+        view: 1,
+        tc: None,
+        qc_ticket: None,
+        proposals: proposals.clone(),
+    };
 
     let mut consensus_messages: HashMap<Digest, ConsensusMessage> = HashMap::new();
     consensus_messages.insert(prepare_message.digest().clone(), prepare_message.clone());
@@ -1069,39 +1088,32 @@ async fn generate_commit() {
     let header = special_header(parent_cert, consensus_messages.clone());
     let consensus_digests = vec![prepare_message.digest()];
 
-
     // Send a header to the core.
-    tx_headers
-        .send(header.clone())
-        .await
-        .unwrap();
-
+    tx_headers.send(header.clone()).await.unwrap();
 
     for vote in special_votes(&header, consensus_digests) {
         //println!("sending special votes");
         let message = PrimaryMessage::Vote(vote);
-        tx_primary_messages
-            .send(message)
-            .await
-            .unwrap();
+        tx_primary_messages.send(message).await.unwrap();
     }
-
 
     let confirm_message = rx_info.recv().await.unwrap();
     match confirm_message.clone() {
-        ConsensusMessage::Confirm { slot: _, view: _, qc: _, proposals: _ } => {
+        ConsensusMessage::Confirm {
+            slot: _,
+            view: _,
+            qc: _,
+            proposals: _,
+        } => {
             consensus_messages.clear();
             consensus_messages.insert(confirm_message.digest().clone(), confirm_message.clone());
-            
+
             let confirm_parent_cert = certificate(&header);
             let confirm_header = special_header(confirm_parent_cert, consensus_messages.clone());
 
             //println!("confirm header height {:?} author {:?}", confirm_header.height, confirm_header.author);
 
-            tx_headers
-                .send(confirm_header.clone())
-                .await
-                .unwrap();
+            tx_headers.send(confirm_header.clone()).await.unwrap();
 
             sleep(Duration::from_millis(500)).await;
             let confirm_digests = vec![confirm_message.digest().clone()];
@@ -1109,10 +1121,7 @@ async fn generate_commit() {
             for vote in special_votes(&confirm_header, confirm_digests) {
                 //println!("sending special votes confirm");
                 let message = PrimaryMessage::Vote(vote);
-                tx_primary_messages
-                    .send(message)
-                    .await
-                    .unwrap();
+                tx_primary_messages.send(message).await.unwrap();
             }
 
             //println!("after sending votes");
@@ -1120,31 +1129,39 @@ async fn generate_commit() {
             let commit_message = rx_info.recv().await.unwrap();
             rx_parents.recv().await.unwrap();
 
-            if let ConsensusMessage::Commit { slot: slot1, view: view1, qc: _qc1, proposals: _proposals1 } = commit_message.clone() {
+            if let ConsensusMessage::Commit {
+                slot: slot1,
+                view: view1,
+                qc: _qc1,
+                proposals: _proposals1,
+            } = commit_message.clone()
+            {
                 consensus_messages.clear();
                 consensus_messages.insert(commit_message.digest().clone(), commit_message.clone());
-                
+
                 let commit_parent_cert = certificate(&confirm_header);
                 let commit_header = special_header(commit_parent_cert, consensus_messages.clone());
 
                 //println!("sending commit header: {:?}, {:?}", commit_header.height, commit_header.author);
-                
+
                 // Ensure that the confirm header is processed and received
                 //sleep(Duration::from_millis(500)).await;
-                tx_headers
-                    .send(commit_header)
-                    .await
-                    .unwrap();
-
+                tx_headers.send(commit_header).await.unwrap();
 
                 //println!("awaiting committer");
                 let receive_commit_message = rx_committer.recv().await.unwrap();
-                if let ConsensusMessage::Commit { slot: slot2, view: view2, qc: _qc2, proposals: _proposals2 } = receive_commit_message {
+                if let ConsensusMessage::Commit {
+                    slot: slot2,
+                    view: view2,
+                    qc: _qc2,
+                    proposals: _proposals2,
+                } = receive_commit_message
+                {
                     assert_eq!(slot1, slot2);
                     assert_eq!(view1, view2);
                 };
             };
-        },
+        }
         _ => panic!("Wrong message type"),
     };
 }
@@ -1166,8 +1183,8 @@ async fn generate_pipelined_prepare() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -1235,8 +1252,6 @@ async fn generate_pipelined_prepare() {
         BatchConfig::default(),
     );
 
-
-
     // Receive the first prepare message from proposer
     rx_info.recv().await.unwrap();
     rx_parents.recv().await.unwrap();
@@ -1250,12 +1265,23 @@ async fn generate_pipelined_prepare() {
             .unwrap();
     }
 
-
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(
+            x.author,
+            Proposal {
+                header_digest: x.digest(),
+                height: x.height(),
+            },
+        );
     }
-    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals };
+    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare {
+        slot: 1,
+        view: 1,
+        tc: None,
+        qc_ticket: None,
+        proposals,
+    };
 
     let mut consensus_messages: HashMap<Digest, ConsensusMessage> = HashMap::new();
     consensus_messages.insert(prepare_message.digest(), prepare_message.clone());
@@ -1269,14 +1295,8 @@ async fn generate_pipelined_prepare() {
         .await
         .unwrap();
 
-
     // Send enough certificates to the core.
-    let certificates: Vec<Certificate> = headers()
-        .iter()
-        .rev()
-        .skip(1)
-        .map(certificate)
-        .collect();
+    let certificates: Vec<Certificate> = headers().iter().rev().skip(1).map(certificate).collect();
 
     // Send enough headers to the core.
     let headers_from_certs: Vec<Header> = certificates
@@ -1286,7 +1306,6 @@ async fn generate_pipelined_prepare() {
         .map(header_from_cert)
         .collect();
 
-
     for x in headers_from_certs.clone() {
         //println!("header author is {:?}", x.author);
         tx_primary_messages
@@ -1295,7 +1314,6 @@ async fn generate_pipelined_prepare() {
             .unwrap();
     }
 
-
     // Send a header to the core.
     //println!("special header author is {:?}", header.author);
     tx_primary_messages
@@ -1303,15 +1321,20 @@ async fn generate_pipelined_prepare() {
         .await
         .unwrap();
 
-
     listener(address).await.unwrap();
     let output_message = rx_info.recv().await.unwrap();
 
-    if let ConsensusMessage::Prepare { slot, view, tc: _, qc_ticket: _, proposals: _ } = output_message {
+    if let ConsensusMessage::Prepare {
+        slot,
+        view,
+        tc: _,
+        qc_ticket: _,
+        proposals: _,
+    } = output_message
+    {
         assert_eq!(slot, 2);
         assert_eq!(view, 1);
     };
-
 
     // Ensure the header is correctly stored.
     let stored = store
@@ -1339,8 +1362,8 @@ async fn local_timeout_view() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -1408,7 +1431,6 @@ async fn local_timeout_view() {
         BatchConfig::default(),
     );
 
-
     /*let message = handle.await.unwrap();
 
     match bincode::deserialize(&message).unwrap() {
@@ -1437,8 +1459,8 @@ async fn sync_missing_proposals() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
-    let(tx_committer, _rx_committer) = channel(1);
-    let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
+    let (tx_committer, _rx_committer) = channel(1);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
     let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
@@ -1506,22 +1528,18 @@ async fn sync_missing_proposals() {
         BatchConfig::default(),
     );
 
-
-
     // Receive the first prepare message from proposer
     rx_info.recv().await.unwrap();
     rx_parents.recv().await.unwrap();
 
-
-
     HeaderWaiter::spawn(
-        name, 
-        committee, 
-        store.clone(), 
-        Arc::new(AtomicU64::new(0)), 
-        50, 
-        timeout_delay, 
-        1, 
+        name,
+        committee,
+        store.clone(),
+        Arc::new(AtomicU64::new(0)),
+        50,
+        timeout_delay,
+        1,
         rx_sync_headers,
         tx_headers_loopback,
         tx_header_waiter_instances,
@@ -1545,12 +1563,23 @@ async fn sync_missing_proposals() {
         .await
         .unwrap();
 
-
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(
+            x.author,
+            Proposal {
+                header_digest: x.digest(),
+                height: x.height(),
+            },
+        );
     }
-    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals };
+    let prepare_message: ConsensusMessage = ConsensusMessage::Prepare {
+        slot: 1,
+        view: 1,
+        tc: None,
+        qc_ticket: None,
+        proposals,
+    };
 
     let mut consensus_messages: HashMap<Digest, ConsensusMessage> = HashMap::new();
     consensus_messages.insert(prepare_message.digest(), prepare_message.clone());
@@ -1564,7 +1593,6 @@ async fn sync_missing_proposals() {
         .await
         .unwrap();
 
-
     sleep(Duration::from_millis(500)).await;
     // Send the misssing proposals
     for x in header_list.into_iter().skip(1) {
@@ -1574,7 +1602,6 @@ async fn sync_missing_proposals() {
             .await
             .unwrap();
     }
-
 
     // Wait for the proposals to appear in the store
     sleep(Duration::from_millis(500)).await;
@@ -1587,10 +1614,6 @@ async fn sync_missing_proposals() {
         .map(|x| bincode::deserialize(&x).unwrap());
     assert_eq!(stored, Some(header));
 }
-
-
-
-
 
 /*#[tokio::test]
 #[serial]
@@ -1632,7 +1655,7 @@ async fn process_special_header() {
         .unwrap()
         .primary_to_primary;
     let handle = listener(address.clone());
-    
+
 
     // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
@@ -1665,13 +1688,13 @@ async fn process_special_header() {
         rx_request_header_sync
     );
 
-//  // Send a normal header to the core. 
+//  // Send a normal header to the core.
 //     tx_primary_messages
 //         .send(PrimaryMessage::Header(header()))
 //         .await
 //         .unwrap();
 
-    
+
 //     //Generates vote:
 //     // Ensure the listener correctly received the vote.
 //     let received = handle.await.unwrap();
@@ -1688,7 +1711,7 @@ async fn process_special_header() {
 //         .map(|x| bincode::deserialize(&x).unwrap());
 //     assert_eq!(stored, Some(header()));
 
-    
+
 //     //// Start special header
 //     ////////// once we confirm parent is stored.
 //     let handle = listener(address.clone());
@@ -1699,15 +1722,15 @@ async fn process_special_header() {
         .await
         .unwrap();
 
-   
+
     //TODO: create receiver for validation
     //send back val result = correct
     let val = rx_special.recv().await.unwrap();
     tx_validation.send((val, 1u8, None, None)).await.unwrap();
-    
+
 
     // Ensure the listener correctly received the vote.
-    
+
     let received = handle.await.unwrap();
     match bincode::deserialize(&received).unwrap() {
         PrimaryMessage::Vote(x) => assert_eq!(x, special_expected),
@@ -1725,12 +1748,9 @@ async fn process_special_header() {
 
 //todo: process special vote
 
-
-
-
 /*#[tokio::test]
 #[serial]
-async fn process_special_votes() { 
+async fn process_special_votes() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
 
@@ -1827,7 +1847,7 @@ async fn process_special_votes() {
         if count == 2 { break;}
     }
 
-    //println!("count {}", count); 
+    //println!("count {}", count);
 
      //send back val result = correct ==> allows us to form our own vote.
      let val = rx_special.recv().await.unwrap();
@@ -1837,7 +1857,7 @@ async fn process_special_votes() {
 
     // Make the certificate we expect to receive.
     let expected = special_certificate(&special_header());
-    
+
     // let received = rx_committer.recv().await.unwrap();
     // assert_eq!(received, expected);
 
@@ -1858,7 +1878,6 @@ async fn process_special_votes() {
         }
     }
 }*/
-
 
 /*#[tokio::test]
 #[serial]
@@ -1937,10 +1956,10 @@ async fn process_special_certificate() {
 
     let received = rx_committer.recv().await.unwrap();
     assert_eq!(received, cert);
-    
+
     // Ensure the certificates are stored.
     let stored = store.read(cert.digest().to_vec()).await.unwrap();
     let serialized = bincode::serialize(&cert).unwrap();
     assert_eq!(stored, Some(serialized));
-    
+
 }*/

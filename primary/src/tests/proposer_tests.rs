@@ -1,7 +1,9 @@
-
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use crate::{common::{committee, keys}, messages::Vote};
+use crate::{
+    common::{committee, keys},
+    messages::Vote,
+};
 use serial_test::serial;
 use tokio::sync::mpsc::channel;
 
@@ -14,7 +16,7 @@ async fn propose_empty() {
     let (tx_parents, rx_parents) = channel(1);
     let (_tx_our_digests, rx_our_digests) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
-    let(_tx_ticket, rx_ticket) = channel(1);
+    let (_tx_ticket, rx_ticket) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
@@ -25,12 +27,14 @@ async fn propose_empty() {
         /* max_header_delay */ 20,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
-        rx_ticket, 
+        rx_ticket,
         /* tx_core */ tx_headers,
     );
 
-
-    let genesis_cert = Certificate::genesis_certs(&committee()).get(&name).unwrap().clone();
+    let genesis_cert = Certificate::genesis_certs(&committee())
+        .get(&name)
+        .unwrap()
+        .clone();
     tx_parents
         .send(genesis_cert)
         .await
@@ -53,7 +57,7 @@ async fn propose_payload() {
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
-    let(_tx_ticket, rx_ticket) = channel(1);
+    let (_tx_ticket, rx_ticket) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
@@ -68,8 +72,10 @@ async fn propose_payload() {
         /* tx_core */ tx_headers,
     );
 
-
-    let genesis_cert = Certificate::genesis_certs(&committee()).get(&name).unwrap().clone();
+    let genesis_cert = Certificate::genesis_certs(&committee())
+        .get(&name)
+        .unwrap()
+        .clone();
     tx_parents
         .send(genesis_cert)
         .await
@@ -102,7 +108,7 @@ async fn propose_normal() {
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
-    let(_tx_ticket, rx_ticket) = channel(1);
+    let (_tx_ticket, rx_ticket) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
@@ -117,8 +123,10 @@ async fn propose_normal() {
         /* tx_core */ tx_headers,
     );
 
-
-    let genesis_cert = Certificate::genesis_certs(&committee()).get(&name).unwrap().clone();
+    let genesis_cert = Certificate::genesis_certs(&committee())
+        .get(&name)
+        .unwrap()
+        .clone();
     tx_parents
         .send(genesis_cert)
         .await
@@ -151,7 +159,12 @@ async fn propose_normal() {
         .map(|x| (x.author, x.signature))
         .collect();
 
-    let certificate = Certificate { author: header.origin(), header_digest: header.digest(), height: header.height, votes };
+    let certificate = Certificate {
+        author: header.origin(),
+        header_digest: header.digest(),
+        height: header.height,
+        votes,
+    };
     tx_parents.send(certificate).await.unwrap();
 
     tx_our_digests
@@ -178,7 +191,7 @@ async fn propose_special_ticket_first() {
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
-    let(_tx_ticket, rx_ticket) = channel(1);
+    let (_tx_ticket, rx_ticket) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
@@ -193,8 +206,10 @@ async fn propose_special_ticket_first() {
         /* tx_core */ tx_headers,
     );
 
-
-    let genesis_cert = Certificate::genesis_certs(&committee()).get(&name).unwrap().clone();
+    let genesis_cert = Certificate::genesis_certs(&committee())
+        .get(&name)
+        .unwrap()
+        .clone();
     tx_parents
         .send(genesis_cert)
         .await
@@ -208,9 +223,9 @@ async fn propose_special_ticket_first() {
     let prepare_info: PrepareInfo = PrepareInfo { consensus_info, ticket, proposals: HashMap::new() };*/
 
     /*tx_ticket
-        .send(prepare_info)
-        .await
-        .unwrap();*/
+    .send(prepare_info)
+    .await
+    .unwrap();*/
 
     sleep(Duration::from_secs(1)).await; //just to guarantee ticket arrives before digest (else normal block can be triggered.)
 
@@ -224,11 +239,11 @@ async fn propose_special_ticket_first() {
 
     // Ensure the proposer makes a correct special header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
-   
+
     /*assert_eq!(header.prepare_info_list.is_empty(), false);
     assert_eq!(header.prepare_info_list.get(0).unwrap().consensus_info.slot, 2);
     assert_eq!(header.prepare_info_list.get(0).unwrap().consensus_info.view, 1);*/
-    
+
     assert_eq!(header.height, 1);
     assert_eq!(header.payload.get(&digest), Some(&worker_id));
     assert!(header.verify(&committee()).is_ok());
@@ -243,7 +258,7 @@ async fn propose_confirm_message() {
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
-    let(_tx_ticket, rx_ticket) = channel(1);
+    let (_tx_ticket, rx_ticket) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
@@ -258,13 +273,14 @@ async fn propose_confirm_message() {
         /* tx_core */ tx_headers,
     );
 
-
-    let genesis_cert = Certificate::genesis_certs(&committee()).get(&name).unwrap().clone();
+    let genesis_cert = Certificate::genesis_certs(&committee())
+        .get(&name)
+        .unwrap()
+        .clone();
     tx_parents
         .send(genesis_cert)
         .await
         .expect("failed to send cert to proposer");
-
 
     //Send ticket to form a special header
     let _gen_header = Header::genesis(&committee());
@@ -274,9 +290,9 @@ async fn propose_confirm_message() {
     let prepare_info: PrepareInfo = PrepareInfo { consensus_info, ticket, proposals: HashMap::new() };*/
 
     /*tx_ticket
-        .send(prepare_info)
-        .await
-        .unwrap();*/
+    .send(prepare_info)
+    .await
+    .unwrap();*/
 
     sleep(Duration::from_secs(1)).await; //just to guarantee ticket arrives before digest (else normal block can be triggered.)
 
@@ -290,19 +306,15 @@ async fn propose_confirm_message() {
 
     // Ensure the proposer makes a correct special header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
-   
+
     /*assert_eq!(header.prepare_info_list.is_empty(), false);
     assert_eq!(header.prepare_info_list.get(0).unwrap().consensus_info.slot, 2);
     assert_eq!(header.prepare_info_list.get(0).unwrap().consensus_info.view, 1);*/
-    
+
     assert_eq!(header.height, 1);
     assert_eq!(header.payload.get(&digest), Some(&worker_id));
     assert!(header.verify(&committee()).is_ok());
 }
-
-
-
-
 
 /*#[tokio::test]
 async fn propose_special_ticket_after_requiring_parents() {
@@ -345,12 +357,12 @@ async fn propose_special_ticket_after_requiring_parents() {
      let last_header_round = header.height;
 
     //Send ticket to form a special header
-  
+
 
      //Send ticket to form a special header
      let gen_header = Header::genesis(&committee());
      let gen_qc = QC::genesis(&committee());
- 
+
      let view = 0; //gen_header.view = 0
      let round = 5; //gen_header.round = 0 ==> this is not a valid round, but we just use it to test
      let ticket: Ticket = Ticket::new(gen_header.digest(), view, round, gen_qc, None).await;
@@ -373,7 +385,7 @@ async fn propose_special_ticket_after_requiring_parents() {
 
     // Ensure the proposer makes a correct special header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
-   
+
     assert_eq!(header.is_special, true);
     assert_eq!(header.view, 1);
     assert_eq!(header.prev_view_round, 5);
@@ -381,7 +393,7 @@ async fn propose_special_ticket_after_requiring_parents() {
     assert_eq!(header.parent_cert_digest.len(), 0);
     assert_eq!(header.special_parent.is_some(), true);
     assert_eq!(header.special_parent_height, last_header_round);
-    let special_parent: &Digest = header.special_parent.as_ref().unwrap(); 
+    let special_parent: &Digest = header.special_parent.as_ref().unwrap();
     assert_eq!(*special_parent, last_header_id);
 
     assert_eq!(header.height, 6);
@@ -397,13 +409,13 @@ async fn propose_special_ticket_after_requiring_parents() {
     let view = 1; //gen_header.view = 0 ==> this is not a valid view for the ticket, but we use it to test
     let last_round = 6; //gen_header.round = 0 ==> this is not a valid round for the ticket, but we just use it to test
     let ticket: Ticket = Ticket::new(gen_header.digest(), view, last_round, gen_qc, None).await;
-    
+
     tx_ticket
         .send(ticket)
         .await
         .unwrap();
 
-    
+
 
     // Send enough digests for the header payload.
     let digest = Digest(name.0);
@@ -444,4 +456,3 @@ async fn propose_special_ticket_after_requiring_parents() {
     assert!(header.verify(&committee()).is_ok());
 
 }*/
-

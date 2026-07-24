@@ -82,7 +82,9 @@ impl Resolver {
 
     /// D7-1: is `u` currently suppressed (an in-flight marker younger than `expiry`)?
     fn is_in_flight(&self, u: View, now: Instant) -> bool {
-        self.in_flight.get(&u).is_some_and(|t| now.saturating_duration_since(*t) < self.expiry)
+        self.in_flight
+            .get(&u)
+            .is_some_and(|t| now.saturating_duration_since(*t) < self.expiry)
     }
 
     /// D7-1: record fresh in-flight evidence for `u` at `now` -- called both by
@@ -98,8 +100,12 @@ impl Resolver {
     /// leading `bool` component dominates the comparison).
     fn canonical_key(entry: &ResolutionEntry) -> (bool, Vec<u8>, u8) {
         match entry {
-            ResolutionEntry::Full(_, c, t) => (false, bincode::serialize(&(c, t)).expect("serializes"), 0),
-            ResolutionEntry::Core(_, c, t) => (false, bincode::serialize(&(c, t)).expect("serializes"), 1),
+            ResolutionEntry::Full(_, c, t) => {
+                (false, bincode::serialize(&(c, t)).expect("serializes"), 0)
+            }
+            ResolutionEntry::Core(_, c, t) => {
+                (false, bincode::serialize(&(c, t)).expect("serializes"), 1)
+            }
             ResolutionEntry::Skip(_) => (true, Vec::new(), 2),
         }
     }
@@ -141,7 +147,11 @@ impl Resolver {
     /// somehow isn't present -- unreachable under the monotonic-evidence model, but
     /// harmless). Advances the stored pointer to the cyclically-next candidate for the
     /// FOLLOWING attempt.
-    fn pick_and_advance(&mut self, target: View, candidates: &[ResolutionEntry]) -> ResolutionEntry {
+    fn pick_and_advance(
+        &mut self,
+        target: View,
+        candidates: &[ResolutionEntry],
+    ) -> ResolutionEntry {
         let len = candidates.len();
         let start = match self.candidate_pointer.get(&target) {
             Some(prev) => candidates.iter().position(|c| c == prev).unwrap_or(0),
@@ -162,7 +172,13 @@ impl Resolver {
     /// or the bit selected data-only this turn at the first qualifying target, which
     /// still flips the bit); `Some(entry)` for a recovery proposal targeting the first
     /// qualifying view. `now` -- D7-1's in-flight age check and marker refresh.
-    pub fn decide(&mut self, agb: &AgbEngine, w: View, now: Instant, resolved: impl Fn(View) -> bool) -> Option<ResolutionEntry> {
+    pub fn decide(
+        &mut self,
+        agb: &AgbEngine,
+        w: View,
+        now: Instant,
+        resolved: impl Fn(View) -> bool,
+    ) -> Option<ResolutionEntry> {
         let scan_limit = w.saturating_sub(3);
         // Advance the watermark over the (possibly newly-grown) contiguous resolved
         // prefix before scanning -- sound by the monotonicity argument on the field
@@ -195,7 +211,11 @@ impl Resolver {
             // behavior change) -- every recovery attempt actually attached to a
             // proposal, so a run's log can show how many carrier views ever attempt a
             // given target and how far apart (in view number / wall clock) they are.
-            log::info!("vantage resolver: recovery target u={} attached at carrier turn w={}", u, w);
+            log::info!(
+                "vantage resolver: recovery target u={} attached at carrier turn w={}",
+                u,
+                w
+            );
             return Some(entry);
         }
         None // no target qualifies at all -- bit unchanged (§4 step 2)

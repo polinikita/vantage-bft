@@ -123,7 +123,14 @@ impl BlockCache {
     /// bytes exactly (that field is dead on every vantage read path, so this is purely
     /// about staying byte-identical, not correctness). The overwrite is a cheap move of
     /// an already-owned `Header`, not a clone.
-    pub fn upsert(&mut self, block: Header, direct: bool, repaired: bool, payload_ok: bool, block_ok_verified: bool) {
+    pub fn upsert(
+        &mut self,
+        block: Header,
+        direct: bool,
+        repaired: bool,
+        payload_ok: bool,
+        block_ok_verified: bool,
+    ) {
         let digest = block.id.clone();
         let author = block.author;
         let height = block.height;
@@ -185,7 +192,9 @@ impl BlockCache {
             .map(|heights| {
                 heights
                     .iter()
-                    .flat_map(|(height, digests)| digests.iter().map(move |d| (*author, *height, d.clone())))
+                    .flat_map(|(height, digests)| {
+                        digests.iter().map(move |d| (*author, *height, d.clone()))
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -454,7 +463,8 @@ pub type SharedBlocks = Arc<Mutex<BlockCache>>;
 
 /// Greatest height, ties broken by lexicographically smallest digest (§2 N5 "newest").
 fn newest(refs: Vec<BlockRef>) -> Option<BlockRef> {
-    refs.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
+    refs.into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
 }
 
 pub struct LaneManager {
@@ -483,8 +493,19 @@ pub struct LaneManager {
 }
 
 impl LaneManager {
-    pub fn new(name: PublicKey, committee: Committee, max_block_payload: usize, store: Store) -> Self {
-        Self::with_shared_blocks(name, committee, max_block_payload, store, Arc::new(Mutex::new(BlockCache::new())))
+    pub fn new(
+        name: PublicKey,
+        committee: Committee,
+        max_block_payload: usize,
+        store: Store,
+    ) -> Self {
+        Self::with_shared_blocks(
+            name,
+            committee,
+            max_block_payload,
+            store,
+            Arc::new(Mutex::new(BlockCache::new())),
+        )
     }
 
     pub fn with_shared_blocks(
@@ -535,7 +556,10 @@ impl LaneManager {
     /// self-creation -- lanes are ack-independent (no certificate wait, unlike
     /// Autobahn's `last_parent` gate at proposer.rs:241). Self-delivery counts: we
     /// process our own block as a direct publication and count our own ack.
-    pub async fn publish_own(&mut self, payload: BTreeMap<Digest, WorkerId>) -> (Header, Vec<Effect>) {
+    pub async fn publish_own(
+        &mut self,
+        payload: BTreeMap<Digest, WorkerId>,
+    ) -> (Header, Vec<Effect>) {
         let (height, prev) = self.own_frontier.clone();
         let next_height = height + 1;
         let header = Header::new_vantage(self.name, next_height, payload, prev, self.sid.clone());
@@ -584,7 +608,11 @@ impl LaneManager {
         }
 
         if direct && !payload_ok {
-            let missing: Vec<(Digest, WorkerId)> = header.payload.iter().map(|(d, w)| (d.clone(), *w)).collect();
+            let missing: Vec<(Digest, WorkerId)> = header
+                .payload
+                .iter()
+                .map(|(d, w)| (d.clone(), *w))
+                .collect();
             effects.push(Effect::SyncBatches(header.author, digest.clone(), missing));
         }
 
@@ -759,7 +787,9 @@ impl LaneManager {
 
     fn exact_coordinate(&self, r: &BlockRef) -> bool {
         let blocks = self.blocks.lock().unwrap();
-        blocks.get(&r.2).is_some_and(|e| e.block.author == r.0 && e.block.height == r.1)
+        blocks
+            .get(&r.2)
+            .is_some_and(|e| e.block.author == r.0 && e.block.height == r.1)
     }
 
     /// `DirectPub_i(a,k,h)` (§1 D1 / §2 N1-N3): whole prefix is both chain-valid
@@ -769,8 +799,13 @@ impl LaneManager {
             return false;
         }
         let mut blocks = self.blocks.lock().unwrap();
-        blocks.verified_prefix_through_genesis(&self.committee, &self.sid, self.max_block_payload, &self.genesis, &r.2)
-            && blocks.direct_prefix_ok(&self.genesis, &r.2)
+        blocks.verified_prefix_through_genesis(
+            &self.committee,
+            &self.sid,
+            self.max_block_payload,
+            &self.genesis,
+            &r.2,
+        ) && blocks.direct_prefix_ok(&self.genesis, &r.2)
     }
 
     /// §4 query: `locally_available(ref)` = holds the valid lane prefix, or
@@ -800,7 +835,13 @@ impl LaneManager {
         }
         let verified = {
             let mut blocks = self.blocks.lock().unwrap();
-            blocks.verified_prefix_through_genesis(&self.committee, &self.sid, self.max_block_payload, &self.genesis, &r.2)
+            blocks.verified_prefix_through_genesis(
+                &self.committee,
+                &self.sid,
+                self.max_block_payload,
+                &self.genesis,
+                &r.2,
+            )
         };
         if verified {
             self.retain_prefix(r);

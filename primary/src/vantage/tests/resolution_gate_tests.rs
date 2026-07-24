@@ -4,7 +4,7 @@
 // (f+1=2, 2f+1=3), equal stake -- `test_committee()`.
 
 use super::common::*;
-use crate::vantage::agb::{Echo, ReadyGrade, Ready, ResolutionEntry, ViewProposal};
+use crate::vantage::agb::{Echo, Ready, ReadyGrade, ResolutionEntry, ViewProposal};
 use crate::vantage::Effect;
 
 fn echo_effect(effects: &[Effect]) -> Option<&Echo> {
@@ -15,7 +15,9 @@ fn echo_effect(effects: &[Effect]) -> Option<&Echo> {
 }
 
 fn skip_effect(effects: &[Effect]) -> bool {
-    effects.iter().any(|e| matches!(e, Effect::BroadcastEchoSkip(_)))
+    effects
+        .iter()
+        .any(|e| matches!(e, Effect::BroadcastEchoSkip(_)))
 }
 
 fn ready_effect(effects: &[Effect]) -> Option<&Ready> {
@@ -41,9 +43,17 @@ async fn drive_own_positive_echo(
     let c_ref = block_ref(&chain[0]);
     agb.enter(u, now, lm, rep);
     let sender = proposer_of(u);
-    let proposal = ViewProposal { view: u, c: vec![c_ref.clone()], t: Vec::new(), m: None };
+    let proposal = ViewProposal {
+        view: u,
+        c: vec![c_ref.clone()],
+        t: Vec::new(),
+        m: None,
+    };
     let effects = agb.on_propose(sender, proposal.clone(), now, lm, rep);
-    assert!(echo_effect(&effects).is_some(), "own positive gate must fire for the setup view");
+    assert!(
+        echo_effect(&effects).is_some(),
+        "own positive gate must fire for the setup view"
+    );
     (c_ref, proposal)
 }
 
@@ -57,7 +67,12 @@ async fn carrying_proposal(
 ) -> ViewProposal {
     let chain = direct_chain(lm, author_w, 1).await;
     let c_w = block_ref(&chain[0]);
-    ViewProposal { view: w, c: vec![c_w], t: Vec::new(), m }
+    ViewProposal {
+        view: w,
+        c: vec![c_w],
+        t: Vec::new(),
+        m,
+    }
 }
 
 #[tokio::test]
@@ -71,7 +86,8 @@ async fn meta_ok_full_blocks_until_own_target_ready_emitted_then_unblocks() {
     let now = std::time::Instant::now();
 
     // u=1: fire our own positive echo, but do NOT yet complete its ready stage.
-    let (c_ref, _proposal_u) = drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let (c_ref, _proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
 
     // w=4 (u=1 <= w-3=1, boundary-exact): carrying proposal targets Full(1, [c_ref], []).
     agb.enter(4, now, &mut lm, &mut rep);
@@ -79,7 +95,10 @@ async fn meta_ok_full_blocks_until_own_target_ready_emitted_then_unblocks() {
     let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
     let sender_w = proposer_of(4);
     let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
-    assert!(echo_effect(&effects).is_none(), "MetaOK must block: own R_i(1) not yet emitted");
+    assert!(
+        echo_effect(&effects).is_none(),
+        "MetaOK must block: own R_i(1) not yet emitted"
+    );
     assert!(!skip_effect(&effects), "on_propose's positive-gate path simply doesn't fire when blocked -- no echo-skip either (that only comes from the fallback/absolute timers)");
 }
 
@@ -93,11 +112,25 @@ async fn meta_ok_full_passes_once_own_ready_is_grade_one_same_payload() {
     let mut agb = new_agb_engine(self_name);
     let now = std::time::Instant::now();
 
-    let (c_ref, proposal_u) = drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let (c_ref, proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
     // Complete u=1's ready stage at homogeneous grade-1 (2 more matching echoes).
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).take(2).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
     for (sender, _) in &others {
-        agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 1, sender: *sender, wish: 0, origin: None }, &mut rep);
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 1,
+                sender: *sender,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
 
     agb.enter(4, now, &mut lm, &mut rep);
@@ -105,7 +138,8 @@ async fn meta_ok_full_passes_once_own_ready_is_grade_one_same_payload() {
     let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
     let sender_w = proposer_of(4);
     let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
-    let echo = echo_effect(&effects).expect("MetaOK must now pass: own R_i(1) is grade-1 for exactly the entry's payload");
+    let echo = echo_effect(&effects)
+        .expect("MetaOK must now pass: own R_i(1) is grade-1 for exactly the entry's payload");
     assert_eq!(echo.grade, 1);
 }
 
@@ -122,12 +156,26 @@ async fn meta_ok_full_rejects_when_own_ready_is_grade_zero() {
     let chain = direct_chain(&mut lm, author_c, 1).await;
     let c_ref = block_ref(&chain[0]);
     agb.enter(1, now, &mut lm, &mut rep);
-    let proposal_u = ViewProposal { view: 1, c: vec![c_ref.clone()], t: Vec::new(), m: None };
+    let proposal_u = ViewProposal {
+        view: 1,
+        c: vec![c_ref.clone()],
+        t: Vec::new(),
+        m: None,
+    };
     // Every party's counted echo (including our own, via `on_echo` directly rather
     // than the engine's own gate) is grade-0 -- homogeneous ReadyGrade::Zero, so own
     // R_i(1) ends up recorded as grade-0 regardless of who contributed.
     for (s, _) in authors() {
-        agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 0, sender: s, wish: 0, origin: None }, &mut rep);
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 0,
+                sender: s,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
 
     agb.enter(4, now, &mut lm, &mut rep);
@@ -135,7 +183,10 @@ async fn meta_ok_full_rejects_when_own_ready_is_grade_zero() {
     let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
     let sender_w = proposer_of(4);
     let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
-    assert!(echo_effect(&effects).is_none(), "own R_i(1) is exactly grade-0 -- Full entry's rule excludes this outright");
+    assert!(
+        echo_effect(&effects).is_none(),
+        "own R_i(1) is exactly grade-0 -- Full entry's rule excludes this outright"
+    );
 }
 
 #[tokio::test]
@@ -149,10 +200,24 @@ async fn meta_ok_full_rejects_when_own_ready_names_different_payload() {
     let mut agb = new_agb_engine(self_name);
     let now = std::time::Instant::now();
 
-    let (_c_ref, proposal_u) = drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).take(2).collect();
+    let (_c_ref, proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
     for (sender, _) in &others {
-        agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 1, sender: *sender, wish: 0, origin: None }, &mut rep);
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 1,
+                sender: *sender,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
     // own R_i(1) is grade-1 for proposal_u's payload -- but the entry names a DIFFERENT
     // (unrelated) payload.
@@ -163,7 +228,10 @@ async fn meta_ok_full_rejects_when_own_ready_names_different_payload() {
     let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
     let sender_w = proposer_of(4);
     let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
-    assert!(echo_effect(&effects).is_none(), "own R_i(1) names a different payload than the entry");
+    assert!(
+        echo_effect(&effects).is_none(),
+        "own R_i(1) names a different payload than the entry"
+    );
 }
 
 #[tokio::test]
@@ -180,13 +248,27 @@ async fn meta_ok_core_passes_with_grade_zero_and_rejects_grade_one() {
     let chain = direct_chain(&mut lm, author_c, 1).await;
     let c_ref = block_ref(&chain[0]);
     agb.enter(1, now, &mut lm, &mut rep);
-    let proposal_u = ViewProposal { view: 1, c: vec![c_ref.clone()], t: Vec::new(), m: None };
+    let proposal_u = ViewProposal {
+        view: 1,
+        c: vec![c_ref.clone()],
+        t: Vec::new(),
+        m: None,
+    };
     // Homogeneous grade-0 quorum via `on_echo` (including a statement claiming to be
     // from `self_name`) -- `recheck_ready` always records ITS OWN ready determination
     // under `self.name` once quorum is reached, regardless of who contributed to the
     // tally, so own R_i(1) ends up grade-0.
     for (s, _) in authors() {
-        agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 0, sender: s, wish: 0, origin: None }, &mut rep);
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 0,
+                sender: s,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
     assert!(agb.ready_stage_total(1) > 0);
 
@@ -195,24 +277,42 @@ async fn meta_ok_core_passes_with_grade_zero_and_rejects_grade_one() {
     let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
     let sender_w = proposer_of(4);
     let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
-    let echo = echo_effect(&effects).expect("MetaOK Core must pass: own R_i(1) is grade-0 for exactly the entry's payload");
+    let echo = echo_effect(&effects)
+        .expect("MetaOK Core must pass: own R_i(1) is grade-0 for exactly the entry's payload");
     assert_eq!(echo.grade, 1);
 
     // Grade-1 (Core-incompatible) case, independent setup.
     let (mut lm2, _store2) = new_lane_manager(self_name, ".db_test_metaok_core_reject");
     let mut rep2 = new_repairer(self_name, &lm2);
     let mut agb2 = new_agb_engine(self_name);
-    let (c_ref2, proposal_u2) = drive_own_positive_echo(&mut agb2, &mut lm2, &mut rep2, 1, author_c, now).await;
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).take(2).collect();
+    let (c_ref2, proposal_u2) =
+        drive_own_positive_echo(&mut agb2, &mut lm2, &mut rep2, 1, author_c, now).await;
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
     for (s, _) in &others {
-        agb2.on_echo(Echo { proposal: proposal_u2.clone(), grade: 1, sender: *s, wish: 0, origin: None }, &mut rep2);
+        agb2.on_echo(
+            Echo {
+                proposal: proposal_u2.clone(),
+                grade: 1,
+                sender: *s,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep2,
+        );
     }
     agb2.enter(4, now, &mut lm2, &mut rep2);
     let m2 = Some(ResolutionEntry::Core(1, vec![c_ref2], Vec::new()));
     let proposal_w2 = carrying_proposal(&mut lm2, author_w, 4, m2).await;
     let sender_w2 = proposer_of(4);
     let effects2 = agb2.on_propose(sender_w2, proposal_w2, now, &mut lm2, &mut rep2);
-    assert!(echo_effect(&effects2).is_none(), "own R_i(1) is grade-1 -- Core entry's rule excludes exactly this");
+    assert!(
+        echo_effect(&effects2).is_none(),
+        "own R_i(1) is grade-1 -- Core entry's rule excludes exactly this"
+    );
 }
 
 #[tokio::test]
@@ -261,11 +361,25 @@ async fn meta_ok_lock_rule_blocks_non_matching_entry_while_lock_active() {
     let mut agb = new_agb_engine(self_name);
     let now = std::time::Instant::now();
 
-    let (c_ref, proposal_u) = drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let (c_ref, proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
     // Complete to grade-1 ready (lock stays active: 0 nonmatching the whole time).
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).take(2).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
     for (s, _) in &others {
-        agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 1, sender: *s, wish: 0, origin: None }, &mut rep);
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 1,
+                sender: *s,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
     assert_eq!(agb.lock_active_for_test(1), Some(true));
 
@@ -281,7 +395,10 @@ async fn meta_ok_lock_rule_blocks_non_matching_entry_while_lock_active() {
     let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
     let sender_w = proposer_of(4);
     let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
-    assert!(echo_effect(&effects).is_none(), "an active lock only lets the EXACT matching Full entry through");
+    assert!(
+        echo_effect(&effects).is_none(),
+        "an active lock only lets the EXACT matching Full entry through"
+    );
 
     // The exact matching Full entry, by contrast, passes the lock rule (and the rest
     // of MetaOK, since own R_i(1) is grade-1 for exactly this payload).
@@ -290,7 +407,10 @@ async fn meta_ok_lock_rule_blocks_non_matching_entry_while_lock_active() {
     let proposal_w2 = carrying_proposal(&mut lm, author_w, 5, m2).await;
     let sender_w2 = proposer_of(5);
     let effects2 = agb.on_propose(sender_w2, proposal_w2, now, &mut lm, &mut rep);
-    assert!(echo_effect(&effects2).is_some(), "the exact matching Full entry passes the active lock rule");
+    assert!(
+        echo_effect(&effects2).is_some(),
+        "the exact matching Full entry passes the active lock rule"
+    );
 }
 
 #[tokio::test]
@@ -303,10 +423,24 @@ async fn origin_bit_one_iff_own_echo_matches_full_payload_grade1() {
     let mut agb = new_agb_engine(self_name);
     let now = std::time::Instant::now();
 
-    let (c_ref, proposal_u) = drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).take(2).collect();
+    let (c_ref, proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
     for (s, _) in &others {
-        agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 1, sender: *s, wish: 0, origin: None }, &mut rep);
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 1,
+                sender: *s,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
 
     agb.enter(4, now, &mut lm, &mut rep);
@@ -315,7 +449,11 @@ async fn origin_bit_one_iff_own_echo_matches_full_payload_grade1() {
     let sender_w = proposer_of(4);
     let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
     let echo = echo_effect(&effects).expect("MetaOK must pass here");
-    assert_eq!(echo.origin, Some(1), "own E_i(1) is a grade-1 echo for exactly the entry's payload");
+    assert_eq!(
+        echo.origin,
+        Some(1),
+        "own E_i(1) is a grade-1 echo for exactly the entry's payload"
+    );
 }
 
 #[tokio::test]
@@ -334,10 +472,24 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
 
     // u=1: drive to a real grade-1 ready so at least ONE origin=1 echo (our own, on w)
     // is achievable.
-    let (c_ref, proposal_u) = drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).take(2).collect();
+    let (c_ref, proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
     for (s, _) in &others {
-        agb.on_echo(Echo { proposal: proposal_u.clone(), grade: 1, sender: *s, wish: 0, origin: None }, &mut rep);
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 1,
+                sender: *s,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
 
     // w=4: our own echo (origin=1, since own R_i... wait Ann reads own E_i(u), already
@@ -356,14 +508,35 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
     // which they never emitted, so `compute_origin` on their side would be `Some(0)`;
     // simulate that received bit directly).
     let (p1, _) = others[0];
-    let e1 = agb.on_echo(Echo { proposal: proposal_w.clone(), grade: 1, sender: p1, wish: 0, origin: Some(0) }, &mut rep);
+    let e1 = agb.on_echo(
+        Echo {
+            proposal: proposal_w.clone(),
+            grade: 1,
+            sender: p1,
+            wish: 0,
+            origin: Some(0),
+        },
+        &mut rep,
+    );
     assert!(ready_effect(&e1).is_none(), "2 counted echoes (self origin=1, p1 origin=0) -- quorum not yet reached (3 needed) and origin_ones=1 < f+1=2 anyway");
 
     // A third echo, ALSO origin=0, reaches the 2f+1=3 total-echo quorum but ReadyOK's
     // origin-ones count is still just 1 (< f+1=2) -- ready must NOT fire.
     let (p2, _) = others[1];
-    let e2 = agb.on_echo(Echo { proposal: proposal_w.clone(), grade: 1, sender: p2, wish: 0, origin: Some(0) }, &mut rep);
-    assert!(ready_effect(&e2).is_none(), "quorum reached but ReadyOK's origin=1 count (1) is below f+1=2 -- must not go ready");
+    let e2 = agb.on_echo(
+        Echo {
+            proposal: proposal_w.clone(),
+            grade: 1,
+            sender: p2,
+            wish: 0,
+            origin: Some(0),
+        },
+        &mut rep,
+    );
+    assert!(
+        ready_effect(&e2).is_none(),
+        "quorum reached but ReadyOK's origin=1 count (1) is below f+1=2 -- must not go ready"
+    );
 
     // Now replace the scenario with a 4th, origin=1 statement is impossible (each
     // sender counts once) -- instead verify the positive direction with a fresh
@@ -371,22 +544,53 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
     let (mut lm2, _store2) = new_lane_manager(self_name, ".db_test_ready_ok_pass");
     let mut rep2 = new_repairer(self_name, &lm2);
     let mut agb2 = new_agb_engine(self_name);
-    let (c_ref2, proposal_u2) = drive_own_positive_echo(&mut agb2, &mut lm2, &mut rep2, 1, author_c, now).await;
+    let (c_ref2, proposal_u2) =
+        drive_own_positive_echo(&mut agb2, &mut lm2, &mut rep2, 1, author_c, now).await;
     for (s, _) in &others {
-        agb2.on_echo(Echo { proposal: proposal_u2.clone(), grade: 1, sender: *s, wish: 0, origin: None }, &mut rep2);
+        agb2.on_echo(
+            Echo {
+                proposal: proposal_u2.clone(),
+                grade: 1,
+                sender: *s,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep2,
+        );
     }
     agb2.enter(4, now, &mut lm2, &mut rep2);
     let m2 = Some(ResolutionEntry::Full(1, vec![c_ref2], Vec::new()));
     let proposal_w2 = carrying_proposal(&mut lm2, author_w, 4, m2).await;
     let sender_w2 = proposer_of(4);
     let effects2 = agb2.on_propose(sender_w2, proposal_w2.clone(), now, &mut lm2, &mut rep2);
-    let our_echo2 = echo_effect(&effects2).expect("own echo for w2 fires").clone();
+    let our_echo2 = echo_effect(&effects2)
+        .expect("own echo for w2 fires")
+        .clone();
     assert_eq!(our_echo2.origin, Some(1));
     let (p1b, _) = others[0];
-    agb2.on_echo(Echo { proposal: proposal_w2.clone(), grade: 1, sender: p1b, wish: 0, origin: Some(1) }, &mut rep2);
+    agb2.on_echo(
+        Echo {
+            proposal: proposal_w2.clone(),
+            grade: 1,
+            sender: p1b,
+            wish: 0,
+            origin: Some(1),
+        },
+        &mut rep2,
+    );
     let (p2b, _) = others[1];
-    let e3 = agb2.on_echo(Echo { proposal: proposal_w2.clone(), grade: 1, sender: p2b, wish: 0, origin: Some(0) }, &mut rep2);
-    let ready = ready_effect(&e3).expect("quorum=3 reached AND origin_ones=2 >= f+1=2 -- ReadyOK now passes");
+    let e3 = agb2.on_echo(
+        Echo {
+            proposal: proposal_w2.clone(),
+            grade: 1,
+            sender: p2b,
+            wish: 0,
+            origin: Some(0),
+        },
+        &mut rep2,
+    );
+    let ready = ready_effect(&e3)
+        .expect("quorum=3 reached AND origin_ones=2 >= f+1=2 -- ReadyOK now passes");
     assert_eq!(ready.grade, ReadyGrade::One);
 }
 
@@ -401,7 +605,10 @@ async fn d6_5_noready_counted_in_ready_stage_census_by_sender() {
     assert_eq!(agb.noready_count(1), 0);
     assert_eq!(agb.ready_stage_total(1), 0);
 
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .collect();
     agb.on_noready(1, others[0].0);
     assert_eq!(agb.noready_count(1), 1);
     assert_eq!(agb.ready_stage_total(1), 1);
@@ -417,5 +624,8 @@ async fn d6_5_noready_counted_in_ready_stage_census_by_sender() {
     agb.on_ready_timer(1);
     assert_eq!(agb.noready_count(1), 3);
     assert_eq!(agb.ready_stage_total(1), 3);
-    assert!(agb.ready_stage_non_grade1_count(1) >= 3, "noready counts as non-grade-1 too");
+    assert!(
+        agb.ready_stage_non_grade1_count(1) >= 3,
+        "noready counts as non-grade-1 too"
+    );
 }

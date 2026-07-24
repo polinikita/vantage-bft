@@ -14,7 +14,10 @@ async fn frontier_trigger_boundary_a_i_v_minus_2_means_no_propose() {
     // boundary (a_i = v-2 = 0) -- must not fire yet.
     let proposer2 = crate::vantage::agb::proposer(&test_committee(), 2);
     let proposer1 = crate::vantage::agb::proposer(&test_committee(), 1);
-    assert_ne!(proposer1, proposer2, "test fixture requires distinct round-robin proposers");
+    assert_ne!(
+        proposer1, proposer2,
+        "test fixture requires distinct round-robin proposers"
+    );
 
     let mut frontier = Frontier::new(proposer2, test_committee());
     let (lm, _store) = new_lane_manager(proposer2, ".db_test_frontier_boundary");
@@ -32,7 +35,10 @@ async fn r1_proposes_exactly_once_for_its_own_turn() {
     let mut frontier = Frontier::new(proposer1, test_committee());
     let (lm, _store) = new_lane_manager(proposer1, ".db_test_frontier_propose_once");
     let first = frontier.try_propose(&lm, None);
-    assert!(first.is_some(), "a_i=0 >= view1-1=0 must allow proposer(1) to propose");
+    assert!(
+        first.is_some(),
+        "a_i=0 >= view1-1=0 must allow proposer(1) to propose"
+    );
     assert_eq!(first.unwrap().view, 1);
     // Re-checking the same frontier state (a_i unchanged) must never propose again.
     let second = frontier.try_propose(&lm, None);
@@ -42,7 +48,10 @@ async fn r1_proposes_exactly_once_for_its_own_turn() {
 #[tokio::test]
 async fn non_proposer_never_triggers_r1() {
     let proposer1 = crate::vantage::agb::proposer(&test_committee(), 1);
-    let (other, _) = authors().into_iter().find(|(pk, _)| *pk != proposer1).unwrap();
+    let (other, _) = authors()
+        .into_iter()
+        .find(|(pk, _)| *pk != proposer1)
+        .unwrap();
     let mut frontier = Frontier::new(other, test_committee());
     let (lm, _store) = new_lane_manager(other, ".db_test_frontier_not_proposer");
     assert!(frontier.try_propose(&lm, None).is_none());
@@ -101,7 +110,11 @@ fn enter_also_activates_independent_of_frontier_advance() {
     let activated = frontier.enter(1);
     assert_eq!(activated, vec![1]);
     assert!(frontier.is_active(1));
-    assert_eq!(frontier.a_i(), 0, "entering v=1 floors a_i to v-1=0, a no-op here");
+    assert_eq!(
+        frontier.a_i(),
+        0,
+        "entering v=1 floors a_i to v-1=0, a no-op here"
+    );
     // Idempotent.
     assert_eq!(frontier.enter(1), Vec::<crate::primary::View>::new());
 }
@@ -154,11 +167,17 @@ async fn enter_floor_enables_r1_without_having_seen_v_minus_1() {
     // first assertion below).
     let view = 6;
     let this_proposer = crate::vantage::agb::proposer(&test_committee(), view);
-    assert_ne!(this_proposer, crate::vantage::agb::proposer(&test_committee(), 1));
+    assert_ne!(
+        this_proposer,
+        crate::vantage::agb::proposer(&test_committee(), 1)
+    );
     let mut frontier = Frontier::new(this_proposer, test_committee());
     let (lm, _store) = new_lane_manager(this_proposer, ".db_test_frontier_floor_enables_r1");
 
-    assert!(frontier.try_propose(&lm, None).is_none(), "a_i=0 must not yet allow proposing view 6");
+    assert!(
+        frontier.try_propose(&lm, None).is_none(),
+        "a_i=0 must not yet allow proposing view 6"
+    );
     frontier.enter(view);
     assert_eq!(frontier.a_i(), view - 1);
     let proposal = frontier.try_propose(&lm, None);

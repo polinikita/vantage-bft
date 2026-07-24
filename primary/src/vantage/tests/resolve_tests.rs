@@ -25,9 +25,20 @@ fn payload(tag: u8) -> (crate::vantage::Manifest, crate::vantage::Manifest) {
     (vec![(a0, 1, Digest([tag; 32]))], Vec::new())
 }
 
-fn echo(view: u64, c: &crate::vantage::Manifest, t: &crate::vantage::Manifest, grade: u8, sender: crypto::PublicKey) -> Echo {
+fn echo(
+    view: u64,
+    c: &crate::vantage::Manifest,
+    t: &crate::vantage::Manifest,
+    grade: u8,
+    sender: crypto::PublicKey,
+) -> Echo {
     Echo {
-        proposal: crate::vantage::ViewProposal { view, c: c.clone(), t: t.clone(), m: None },
+        proposal: crate::vantage::ViewProposal {
+            view,
+            c: c.clone(),
+            t: t.clone(),
+            m: None,
+        },
         grade,
         sender,
         wish: 0,
@@ -48,9 +59,16 @@ async fn prerequisite_blocks_every_candidate_below_two_f_plus_1_ready_stage() {
     agb.on_echo(echo(1, &c, &t, 1, all[0].0), &mut rep);
     agb.on_echo(echo(1, &c, &t, 1, all[1].0), &mut rep);
     agb.on_noready(1, all[2].0);
-    assert_eq!(agb.ready_stage_total(1), 1, "on_echo alone never touches the ready-stage census");
+    assert_eq!(
+        agb.ready_stage_total(1),
+        1,
+        "on_echo alone never touches the ready-stage census"
+    );
 
-    assert!(resolver.justified_candidates(&agb, 1).is_empty(), "prerequisite (2f+1 ready-stage statements) not met");
+    assert!(
+        resolver.justified_candidates(&agb, 1).is_empty(),
+        "prerequisite (2f+1 ready-stage statements) not met"
+    );
 }
 
 #[tokio::test]
@@ -73,7 +91,9 @@ async fn full_justified_at_exactly_f_plus_1_grade1_echoes_with_prerequisite_met(
     agb.on_echo(echo(1, &c, &t, 1, all[1].0), &mut rep);
 
     let candidates = resolver.justified_candidates(&agb, 1);
-    assert!(candidates.iter().any(|e| matches!(e, ResolutionEntry::Full(1, cc, tt) if *cc == c && *tt == t)));
+    assert!(candidates
+        .iter()
+        .any(|e| matches!(e, ResolutionEntry::Full(1, cc, tt) if *cc == c && *tt == t)));
 }
 
 #[tokio::test]
@@ -93,7 +113,9 @@ async fn core_requires_both_the_no_grade1_ready_subset_and_f_plus_1_any_grade_ec
         }
         agb.on_echo(echo(1, &c, &t, 0, all[0].0), &mut rep);
         let candidates = resolver.justified_candidates(&agb, 1);
-        assert!(!candidates.iter().any(|e| matches!(e, ResolutionEntry::Core(..))));
+        assert!(!candidates
+            .iter()
+            .any(|e| matches!(e, ResolutionEntry::Core(..))));
     }
 
     // Case B: f+1=2 any-grade echoes, but the ready-stage subset never reaches 2f+1
@@ -106,7 +128,10 @@ async fn core_requires_both_the_no_grade1_ready_subset_and_f_plus_1_any_grade_ec
         agb.on_echo(echo(1, &c, &t, 0, all[0].0), &mut rep);
         agb.on_echo(echo(1, &c, &t, 1, all[1].0), &mut rep);
         let candidates = resolver.justified_candidates(&agb, 1);
-        assert!(candidates.is_empty(), "prerequisite (2f+1 ready-stage statements) not met at all");
+        assert!(
+            candidates.is_empty(),
+            "prerequisite (2f+1 ready-stage statements) not met at all"
+        );
     }
 
     // Case C: both clauses hold -- Core IS justified.
@@ -119,7 +144,9 @@ async fn core_requires_both_the_no_grade1_ready_subset_and_f_plus_1_any_grade_ec
         agb.on_echo(echo(1, &c, &t, 0, all[0].0), &mut rep);
         agb.on_echo(echo(1, &c, &t, 1, all[1].0), &mut rep); // "any grade" -- mixed is fine
         let candidates = resolver.justified_candidates(&agb, 1);
-        assert!(candidates.iter().any(|e| matches!(e, ResolutionEntry::Core(1, cc, tt) if *cc == c && *tt == t)));
+        assert!(candidates
+            .iter()
+            .any(|e| matches!(e, ResolutionEntry::Core(1, cc, tt) if *cc == c && *tt == t)));
     }
 }
 
@@ -132,11 +159,16 @@ async fn skip_justified_at_two_f_plus_1_noready() {
 
     agb.on_noready(1, all[0].0);
     agb.on_noready(1, all[1].0);
-    assert!(resolver.justified_candidates(&agb, 1).is_empty(), "only 2 noready -- prerequisite not met");
+    assert!(
+        resolver.justified_candidates(&agb, 1).is_empty(),
+        "only 2 noready -- prerequisite not met"
+    );
 
     agb.on_noready(1, all[2].0);
     let candidates = resolver.justified_candidates(&agb, 1);
-    assert!(candidates.iter().any(|e| matches!(e, ResolutionEntry::Skip(1))));
+    assert!(candidates
+        .iter()
+        .any(|e| matches!(e, ResolutionEntry::Skip(1))));
 }
 
 #[tokio::test]
@@ -163,22 +195,37 @@ async fn canonical_order_full_before_core_lex_by_payload_skip_last() {
     // above satisfy f+1 too).
 
     let candidates = resolver.justified_candidates(&agb, 1);
-    assert!(candidates.len() >= 3, "expected at least Full(1), Core(1), Core(9), Skip -- got {:?}", candidates);
+    assert!(
+        candidates.len() >= 3,
+        "expected at least Full(1), Core(1), Core(9), Skip -- got {:?}",
+        candidates
+    );
     // Skip must be strictly last.
-    assert!(matches!(candidates.last().unwrap(), ResolutionEntry::Skip(1)));
+    assert!(matches!(
+        candidates.last().unwrap(),
+        ResolutionEntry::Skip(1)
+    ));
     // Within the non-skip prefix, entries are grouped/ordered by ascending
     // bincode(C,T) bytes, Full before Core per payload.
-    let non_skip: Vec<_> = candidates.iter().filter(|e| !matches!(e, ResolutionEntry::Skip(_))).collect();
+    let non_skip: Vec<_> = candidates
+        .iter()
+        .filter(|e| !matches!(e, ResolutionEntry::Skip(_)))
+        .collect();
     let keys: Vec<Vec<u8>> = non_skip
         .iter()
         .map(|e| match e {
-            ResolutionEntry::Full(_, c, t) | ResolutionEntry::Core(_, c, t) => bincode::serialize(&(c, t)).unwrap(),
+            ResolutionEntry::Full(_, c, t) | ResolutionEntry::Core(_, c, t) => {
+                bincode::serialize(&(c, t)).unwrap()
+            }
             ResolutionEntry::Skip(_) => unreachable!(),
         })
         .collect();
     let mut sorted_keys = keys.clone();
     sorted_keys.sort();
-    assert_eq!(keys, sorted_keys, "non-skip entries must be sorted by bincode(C,T)");
+    assert_eq!(
+        keys, sorted_keys,
+        "non-skip entries must be sorted by bincode(C,T)"
+    );
 }
 
 #[tokio::test]
@@ -237,7 +284,10 @@ async fn bit_alternates_data_only_then_recovery_and_stays_unchanged_with_no_qual
     assert!(resolver.next_is_recovery_for_test());
 
     // Turn 2: bit is now recovery -> Some(Skip(1)), flips back to data-only.
-    assert_eq!(resolver.decide(&agb, 6, Instant::now(), |_| false), Some(ResolutionEntry::Skip(1)));
+    assert_eq!(
+        resolver.decide(&agb, 6, Instant::now(), |_| false),
+        Some(ResolutionEntry::Skip(1))
+    );
     assert!(!resolver.next_is_recovery_for_test());
 
     // Turn 3, no target qualifies at all (view 1 now treated as resolved) -- bit
@@ -265,7 +315,12 @@ async fn pointer_cycles_over_the_canonical_list_across_recovery_attempts() {
     agb.on_echo(echo(1, &c1, &t1, 1, all[0].0), &mut rep);
     agb.on_echo(echo(1, &c1, &t1, 1, all[1].0), &mut rep);
     let candidates = resolver.justified_candidates(&agb, 1);
-    assert_eq!(candidates.len(), 3, "expected Full(1,payload1), Core(1,payload1), Skip(1) -- got {:?}", candidates);
+    assert_eq!(
+        candidates.len(),
+        3,
+        "expected Full(1,payload1), Core(1,payload1), Skip(1) -- got {:?}",
+        candidates
+    );
 
     // Turn 1 (bit starts data-only): None, bit flips to recovery, pointer untouched.
     assert_eq!(resolver.decide(&agb, 5, Instant::now(), |_| false), None);
@@ -273,7 +328,9 @@ async fn pointer_cycles_over_the_canonical_list_across_recovery_attempts() {
 
     // Turn 2 (recovery): picks the FIRST canonical candidate, advances the pointer to
     // the second.
-    let first_pick = resolver.decide(&agb, 6, Instant::now(), |_| false).expect("recovery turn");
+    let first_pick = resolver
+        .decide(&agb, 6, Instant::now(), |_| false)
+        .expect("recovery turn");
     assert_eq!(first_pick, candidates[0]);
     assert_eq!(resolver.pointer_for_test(1), Some(candidates[1].clone()));
 
@@ -284,20 +341,26 @@ async fn pointer_cycles_over_the_canonical_list_across_recovery_attempts() {
 
     // Turn 4 (recovery): picks the SECOND canonical candidate, advances the pointer to
     // the third.
-    let second_pick = resolver.decide(&agb, 8, Instant::now(), |_| false).expect("recovery turn");
+    let second_pick = resolver
+        .decide(&agb, 8, Instant::now(), |_| false)
+        .expect("recovery turn");
     assert_eq!(second_pick, candidates[1]);
     assert_eq!(resolver.pointer_for_test(1), Some(candidates[2].clone()));
 
     // Turn 5 (data-only) then turn 6 (recovery): picks the THIRD candidate, wraps the
     // pointer back to the first.
     assert_eq!(resolver.decide(&agb, 9, Instant::now(), |_| false), None);
-    let third_pick = resolver.decide(&agb, 10, Instant::now(), |_| false).expect("recovery turn");
+    let third_pick = resolver
+        .decide(&agb, 10, Instant::now(), |_| false)
+        .expect("recovery turn");
     assert_eq!(third_pick, candidates[2]);
     assert_eq!(resolver.pointer_for_test(1), Some(candidates[0].clone()));
 
     // Turn 7 (data-only) then turn 8 (recovery): wraps back to the first candidate.
     assert_eq!(resolver.decide(&agb, 11, Instant::now(), |_| false), None);
-    let fourth_pick = resolver.decide(&agb, 12, Instant::now(), |_| false).expect("recovery turn");
+    let fourth_pick = resolver
+        .decide(&agb, 12, Instant::now(), |_| false)
+        .expect("recovery turn");
     assert_eq!(fourth_pick, candidates[0]);
 }
 
@@ -318,7 +381,12 @@ async fn repeated_decide_calls_over_many_views_never_disturb_an_unrelated_census
     for w in 5..2000u64 {
         let _ = resolver.decide(&agb, w, Instant::now(), |_u| false);
         if w % 500 == 0 {
-            assert_eq!(agb.noready_count(2), 3, "noready census corrupted at w={}", w);
+            assert_eq!(
+                agb.noready_count(2),
+                3,
+                "noready census corrupted at w={}",
+                w
+            );
         }
     }
     assert_eq!(agb.noready_count(2), 3);
@@ -346,24 +414,41 @@ async fn d7_1_in_flight_suppression_blocks_reattempt_then_expires() {
     // Turn 1 (bit starts data-only): None, flips to recovery. No in-flight marker yet.
     assert_eq!(resolver.decide(&agb, 5, t0, |_| false), None);
     // Turn 2 (recovery): Some(Skip(1)) -- our own attempt sets in_flight[1] = t0.
-    assert_eq!(resolver.decide(&agb, 6, t0, |_| false), Some(ResolutionEntry::Skip(1)));
+    assert_eq!(
+        resolver.decide(&agb, 6, t0, |_| false),
+        Some(ResolutionEntry::Skip(1))
+    );
 
     // Turn 3, an instant later (well inside the 120ms expiry): view 1 is still
     // justified (census unchanged) and not yet `resolved`, but D7-1 suppresses it --
     // decide finds no qualifying target at all, so the bit stays exactly as turn 2
     // left it (data-only/`false`), NOT flipped.
     let t1 = t0 + Duration::from_millis(1);
-    assert_eq!(resolver.decide(&agb, 7, t1, |_| false), None, "suppressed: must not re-attempt the same in-flight target");
-    assert!(!resolver.next_is_recovery_for_test(), "a suppressed-target turn must leave the bit untouched");
+    assert_eq!(
+        resolver.decide(&agb, 7, t1, |_| false),
+        None,
+        "suppressed: must not re-attempt the same in-flight target"
+    );
+    assert!(
+        !resolver.next_is_recovery_for_test(),
+        "a suppressed-target turn must leave the bit untouched"
+    );
 
     // Turn 4, past the 120ms expiry: view 1 is selectable again. Bit is data-only ->
     // None, flips to recovery (this IS the qualifying-target consult, just consumed
     // as a data-only turn, exactly like turn 1 was).
     let t2 = t0 + Duration::from_millis(12 * delta_ms + 1);
-    assert_eq!(resolver.decide(&agb, 8, t2, |_| false), None, "expired: the target qualifies again");
+    assert_eq!(
+        resolver.decide(&agb, 8, t2, |_| false),
+        None,
+        "expired: the target qualifies again"
+    );
     assert!(resolver.next_is_recovery_for_test());
     // Turn 5: recovery -> Some(Skip(1)) again, refreshing the marker.
-    assert_eq!(resolver.decide(&agb, 9, t2, |_| false), Some(ResolutionEntry::Skip(1)));
+    assert_eq!(
+        resolver.decide(&agb, 9, t2, |_| false),
+        Some(ResolutionEntry::Skip(1))
+    );
 }
 
 /// D7-1: `note_carrier_report` (fed from `Effect::CompletionReportable` in production
@@ -390,10 +475,16 @@ async fn d7_1_note_carrier_report_suppresses_like_our_own_attempt() {
     // target qualifies at all -- None, bit untouched.
     let t1 = t0 + Duration::from_millis(1);
     assert_eq!(resolver.decide(&agb, 5, t1, |_| false), None);
-    assert!(!resolver.next_is_recovery_for_test(), "no qualifying target -- the bit-consult branch must never run");
+    assert!(
+        !resolver.next_is_recovery_for_test(),
+        "no qualifying target -- the bit-consult branch must never run"
+    );
 
     // Past expiry: selectable again, exactly as if we had minted the attempt ourselves.
     let t2 = t0 + Duration::from_millis(12 * delta_ms + 1);
     assert_eq!(resolver.decide(&agb, 6, t2, |_| false), None); // data-only turn, flips the bit
-    assert_eq!(resolver.decide(&agb, 7, t2, |_| false), Some(ResolutionEntry::Skip(1)));
+    assert_eq!(
+        resolver.decide(&agb, 7, t2, |_| false),
+        Some(ResolutionEntry::Skip(1))
+    );
 }

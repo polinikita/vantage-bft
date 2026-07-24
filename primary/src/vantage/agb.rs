@@ -34,7 +34,9 @@ pub enum ResolutionEntry {
 impl ResolutionEntry {
     pub fn target_view(&self) -> View {
         match self {
-            ResolutionEntry::Full(u, _, _) | ResolutionEntry::Core(u, _, _) | ResolutionEntry::Skip(u) => *u,
+            ResolutionEntry::Full(u, _, _)
+            | ResolutionEntry::Core(u, _, _)
+            | ResolutionEntry::Skip(u) => *u,
         }
     }
 }
@@ -141,7 +143,13 @@ pub enum ResponseStage {
 /// same syntactic bounds -- checked only against each other (the entry's own C_u ∪ T_u
 /// distinctness), never against the carrying C ∪ T (§1: "the paper bounds only the
 /// entry's own manifests syntactically; cross-checks are semantic, not Formed").
-pub fn formed(committee: &Committee, view: View, c: &Manifest, t: &Manifest, m: &Option<ResolutionEntry>) -> bool {
+pub fn formed(
+    committee: &Committee,
+    view: View,
+    c: &Manifest,
+    t: &Manifest,
+    m: &Option<ResolutionEntry>,
+) -> bool {
     fn strictly_sorted_and_staked(committee: &Committee, m: &Manifest) -> bool {
         let mut last: Option<PublicKey> = None;
         for (author, height, _digest) in m {
@@ -183,7 +191,9 @@ pub fn formed(committee: &Committee, view: View, c: &Manifest, t: &Manifest, m: 
         }
         match entry {
             ResolutionEntry::Full(_, c_u, t_u) | ResolutionEntry::Core(_, c_u, t_u) => {
-                if !strictly_sorted_and_staked(committee, c_u) || !strictly_sorted_and_staked(committee, t_u) {
+                if !strictly_sorted_and_staked(committee, c_u)
+                    || !strictly_sorted_and_staked(committee, t_u)
+                {
                     return false;
                 }
                 if !distinct_hashes(c_u, t_u) {
@@ -201,7 +211,9 @@ pub fn formed(committee: &Committee, view: View, c: &Manifest, t: &Manifest, m: 
 /// `on_propose`) and on completion (§7 `recheck_completion_and_direct`).
 fn aux_refs(m: &Option<ResolutionEntry>) -> Vec<BlockRef> {
     match m {
-        Some(ResolutionEntry::Full(_, c, t)) | Some(ResolutionEntry::Core(_, c, t)) => c.iter().chain(t.iter()).cloned().collect(),
+        Some(ResolutionEntry::Full(_, c, t)) | Some(ResolutionEntry::Core(_, c, t)) => {
+            c.iter().chain(t.iter()).cloned().collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -394,12 +406,16 @@ impl AgbEngine {
         match stage {
             ResponseStage::Echo => {
                 let prev = view.saturating_sub(1);
-                let prev_ready_sent = prev == 0 || self.views.get(&prev).is_some_and(|s| s.ready_sent);
+                let prev_ready_sent =
+                    prev == 0 || self.views.get(&prev).is_some_and(|s| s.ready_sent);
                 prev_ready_sent.then(|| view + 2)
             }
             ResponseStage::Ready => {
                 let next = view + 1;
-                self.views.get(&next).is_some_and(|s| s.echo_sent).then(|| view + 3)
+                self.views
+                    .get(&next)
+                    .is_some_and(|s| s.echo_sent)
+                    .then(|| view + 3)
             }
         }
     }
@@ -408,7 +424,8 @@ impl AgbEngine {
     /// immediately before the corresponding response broadcast effect (or an empty
     /// iterator, so callers can `effects.extend(...)` unconditionally).
     fn wish_effect(&self, view: View, stage: ResponseStage) -> Option<Effect> {
-        self.two_response_wish_target(view, stage).map(Effect::RaiseWish)
+        self.two_response_wish_target(view, stage)
+            .map(Effect::RaiseWish)
     }
 
     fn state_mut(&mut self, view: View) -> &mut ViewState {
@@ -427,15 +444,22 @@ impl AgbEngine {
     /// callers can store it in `Fixed`/`EchoStatement`/`ReadyStatement` (Efficiency
     /// Item 3) as a refcount bump instead of a deep clone, and so repeated identical
     /// content shares one allocation.
-    fn canonical_proposal(&mut self, view: View, proposal: ViewProposal) -> (Arc<ViewProposal>, Digest) {
+    fn canonical_proposal(
+        &mut self,
+        view: View,
+        proposal: ViewProposal,
+    ) -> (Arc<ViewProposal>, Digest) {
         if let Some(state) = self.views.get(&view) {
-            if let Some((cached, digest)) = state.digest_cache.iter().find(|(p, _)| **p == proposal) {
+            if let Some((cached, digest)) = state.digest_cache.iter().find(|(p, _)| **p == proposal)
+            {
                 return (Arc::clone(cached), digest.clone());
             }
         }
         let digest = proposal.digest(&self.sid);
         let arc = Arc::new(proposal);
-        self.state_mut(view).digest_cache.push((Arc::clone(&arc), digest.clone()));
+        self.state_mut(view)
+            .digest_cache
+            .push((Arc::clone(&arc), digest.clone()));
         (arc, digest)
     }
 
@@ -453,26 +477,37 @@ impl AgbEngine {
     /// yet). Shared shape behind every `echo_*_count*` query below -- these query
     /// accessors differ only in `pred`, never in how the per-view census is read.
     fn echo_count(&self, view: View, pred: impl Fn(&EchoStatement) -> bool) -> usize {
-        self.views.get(&view).map_or(0, |s| s.echo_statements.values().filter(|stmt| pred(stmt)).count())
+        self.views.get(&view).map_or(0, |s| {
+            s.echo_statements.values().filter(|stmt| pred(stmt)).count()
+        })
     }
 
     /// Counted ready-stage statements for `view` matching `pred` (0 if `view` has no
     /// state yet). Shared shape behind every `ready_stage_*`/`noready_count` query
     /// below.
     fn ready_count(&self, view: View, pred: impl Fn(&ReadyStatement) -> bool) -> usize {
-        self.views.get(&view).map_or(0, |s| s.ready_statements.values().filter(|stmt| pred(stmt)).count())
+        self.views.get(&view).map_or(0, |s| {
+            s.ready_statements
+                .values()
+                .filter(|stmt| pred(stmt))
+                .count()
+        })
     }
 
     /// Total counted ready-stage statements for `view` (any kind, noready included) --
     /// §4's prerequisite for ANY candidate: `>= 2f+1` (party count) of these.
     pub fn ready_stage_total(&self, view: View) -> usize {
-        self.views.get(&view).map_or(0, |s| s.ready_statements.len())
+        self.views
+            .get(&view)
+            .map_or(0, |s| s.ready_statements.len())
     }
 
     /// Counted ready-stage statements for `view` that are NOT grade-1 proposal-readies
     /// (noready + grade-0/mix readies) -- §4's `Core` justification second clause.
     pub fn ready_stage_non_grade1_count(&self, view: View) -> usize {
-        self.ready_count(view, |stmt| !matches!(stmt, ReadyStatement::Graded(_, _, ReadyGrade::One)))
+        self.ready_count(view, |stmt| {
+            !matches!(stmt, ReadyStatement::Graded(_, _, ReadyGrade::One))
+        })
     }
 
     /// Counted noready statements for `view` -- §4's `Skip` justification (`>= 2f+1`).
@@ -483,13 +518,19 @@ impl AgbEngine {
     /// Counted grade-1 echoes for `view` naming exactly payload `(c,t)` -- §4's `Full`
     /// justification (`>= f+1`).
     pub fn echo_grade1_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
-        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Graded(p, _, 1, _) if p.c == *c && p.t == *t))
+        self.echo_count(
+            view,
+            |stmt| matches!(stmt, EchoStatement::Graded(p, _, 1, _) if p.c == *c && p.t == *t),
+        )
     }
 
     /// Counted echoes (any grade) for `view` naming exactly payload `(c,t)` -- §4's
     /// `Core` justification (`>= f+1`).
     pub fn echo_any_grade_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
-        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Graded(p, _, _, _) if p.c == *c && p.t == *t))
+        self.echo_count(
+            view,
+            |stmt| matches!(stmt, EchoStatement::Graded(p, _, _, _) if p.c == *c && p.t == *t),
+        )
     }
 
     /// Every distinct payload named by a counted (graded) echo for `view` -- the
@@ -564,7 +605,10 @@ impl AgbEngine {
 
     #[cfg(test)]
     pub(crate) fn lock_active_for_test(&self, view: View) -> Option<bool> {
-        self.views.get(&view).and_then(|s| s.lock.as_ref()).map(|l| l.active)
+        self.views
+            .get(&view)
+            .and_then(|s| s.lock.as_ref())
+            .map(|l| l.active)
     }
 
     #[cfg(test)]
@@ -590,7 +634,13 @@ impl AgbEngine {
     /// `first_proposal_instant` (`rho_i(v)`), using the exact same
     /// `min(max(e_i, rho_i) + Delta, e_i + theta_E)` formula `on_propose` uses (here
     /// `e_i(v) = now`, since entry is happening this instant).
-    pub fn enter(&mut self, view: View, now: Instant, lm: &mut LaneManager, rep: &mut Repairer) -> Vec<Effect> {
+    pub fn enter(
+        &mut self,
+        view: View,
+        now: Instant,
+        lm: &mut LaneManager,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         if self.state_mut(view).entered {
             return effects;
@@ -602,12 +652,24 @@ impl AgbEngine {
             s.entered = true;
             s.entry_instant = Some(now);
         }
-        effects.push(Effect::ArmTimer(view, TimerKind::EchoAbsolute, now + theta_echo));
-        effects.push(Effect::ArmTimer(view, TimerKind::ReadyAbsolute, now + theta_ready));
+        effects.push(Effect::ArmTimer(
+            view,
+            TimerKind::EchoAbsolute,
+            now + theta_echo,
+        ));
+        effects.push(Effect::ArmTimer(
+            view,
+            TimerKind::ReadyAbsolute,
+            now + theta_ready,
+        ));
 
         let (fixed_proposal, echo_sent, first_proposal_instant) = {
             let s = self.state_mut(view);
-            (matches!(s.fixed, Fixed::Proposal(_, _)), s.echo_sent, s.first_proposal_instant)
+            (
+                matches!(s.fixed, Fixed::Proposal(_, _)),
+                s.echo_sent,
+                s.first_proposal_instant,
+            )
         };
         if fixed_proposal && !echo_sent {
             if let Some(rho) = first_proposal_instant {
@@ -624,7 +686,13 @@ impl AgbEngine {
     /// §4: `activate(v)` -- called by the caller once `Frontier` determines `v` is
     /// newly active (either via the proposal-chain advance or via `enter(v)`, which
     /// calls this directly). Idempotent.
-    pub fn activate(&mut self, view: View, now: Instant, lm: &mut LaneManager, rep: &mut Repairer) -> Vec<Effect> {
+    pub fn activate(
+        &mut self,
+        view: View,
+        now: Instant,
+        lm: &mut LaneManager,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
         if self.state_mut(view).active {
             return Vec::new();
         }
@@ -670,7 +738,9 @@ impl AgbEngine {
         if !matches!(self.state_mut(view).fixed, Fixed::Unset) {
             return effects; // sticky: first direct proposal ever seen already resolved this
         }
-        self.state_mut(view).first_proposal_instant.get_or_insert(now);
+        self.state_mut(view)
+            .first_proposal_instant
+            .get_or_insert(now);
 
         if !formed(&self.committee, view, &proposal.c, &proposal.t, &proposal.m) {
             self.state_mut(view).fixed = Fixed::Reject;
@@ -688,7 +758,12 @@ impl AgbEngine {
         if self.state_mut(view).active && !self.state_mut(view).echo_sent {
             self.pending_gate.insert(view);
         }
-        for r in proposal.c.iter().chain(proposal.t.iter()).chain(aux_refs(&proposal.m).iter()) {
+        for r in proposal
+            .c
+            .iter()
+            .chain(proposal.t.iter())
+            .chain(aux_refs(&proposal.m).iter())
+        {
             effects.extend(rep.authorize(r.clone()));
         }
         effects.push(Effect::Fixed(view, true));
@@ -706,7 +781,12 @@ impl AgbEngine {
     /// R2's positive gate, re-evaluated whenever local state that could satisfy it
     /// changes (ack counts, payload arrivals, block cached, activation) -- call for
     /// every currently pending, active view after any such event.
-    pub fn recheck_all(&mut self, now: Instant, lm: &mut LaneManager, rep: &mut Repairer) -> Vec<Effect> {
+    pub fn recheck_all(
+        &mut self,
+        now: Instant,
+        lm: &mut LaneManager,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         // Efficiency Item 2: `pending_gate` is maintained incrementally (see its
         // field doc and the `activate`/`on_propose`/`echo_sent`-site comments) to
@@ -730,7 +810,13 @@ impl AgbEngine {
         effects
     }
 
-    fn recheck_gate(&mut self, view: View, _now: Instant, lm: &mut LaneManager, rep: &mut Repairer) -> Vec<Effect> {
+    fn recheck_gate(
+        &mut self,
+        view: View,
+        _now: Instant,
+        lm: &mut LaneManager,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let (active, echo_sent, proposal_digest) = {
             let s = self.state_mut(view);
@@ -762,7 +848,11 @@ impl AgbEngine {
         self.state_mut(view).echo_sent = true;
         self.pending_gate.remove(&view); // Efficiency Item 2 transition (c)
         let origin = self.compute_origin(&proposal.m);
-        self.count_echo_statement(view, self.name, EchoStatement::Graded(Arc::clone(&proposal), digest, 1, origin));
+        self.count_echo_statement(
+            view,
+            self.name,
+            EchoStatement::Graded(Arc::clone(&proposal), digest, 1, origin),
+        );
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
         effects.push(Effect::BroadcastEcho(Echo {
             // The wire type still carries an owned `ViewProposal`: exactly one deep
@@ -859,7 +949,8 @@ impl AgbEngine {
         if let Some(lock) = &state_u.lock {
             if lock.active {
                 match entry {
-                    ResolutionEntry::Full(_, c, t) if lock.proposal.c == *c && lock.proposal.t == *t => {}
+                    ResolutionEntry::Full(_, c, t)
+                        if lock.proposal.c == *c && lock.proposal.t == *t => {}
                     _ => return false,
                 }
             }
@@ -916,7 +1007,10 @@ impl AgbEngine {
     fn compute_origin(&self, m: &Option<ResolutionEntry>) -> Option<u8> {
         let entry = m.as_ref()?;
         let u = entry.target_view();
-        let own_echo = self.views.get(&u).and_then(|s| s.echo_statements.get(&self.name));
+        let own_echo = self
+            .views
+            .get(&u)
+            .and_then(|s| s.echo_statements.get(&self.name));
         let is_one = match entry {
             ResolutionEntry::Full(_, c, t) => {
                 matches!(own_echo, Some(EchoStatement::Graded(p, _, 1, _)) if p.c == *c && p.t == *t)
@@ -933,7 +1027,12 @@ impl AgbEngine {
     /// `fixed = B`, broadcast a grade-0 echo (if `CoreOK_i(C) ∧ MetaOK_i(w,M)` holds --
     /// PHASE6-SPEC.md §2: "Phase 4's fallback checked CoreOK only -- correct for M=∅,
     /// must change now") or an echo-skip.
-    pub fn on_echo_fallback_timer(&mut self, view: View, lm: &mut LaneManager, rep: &mut Repairer) -> Vec<Effect> {
+    pub fn on_echo_fallback_timer(
+        &mut self,
+        view: View,
+        lm: &mut LaneManager,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let (echo_sent, fixed) = {
             let s = self.state_mut(view);
@@ -947,13 +1046,17 @@ impl AgbEngine {
         };
         self.state_mut(view).echo_sent = true;
         self.pending_gate.remove(&view); // Efficiency Item 2 transition (c)
-        // PHASE7-PREP-NOTES.md Delta=1000 investigation: diagnostic-only observational
-        // log (no behavior change) -- the Delta-scaled fallback (grade-0) echo path.
+                                         // PHASE7-PREP-NOTES.md Delta=1000 investigation: diagnostic-only observational
+                                         // log (no behavior change) -- the Delta-scaled fallback (grade-0) echo path.
         log::info!("vantage agb: FALLBACK grade-0 echo view={}", view);
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
         if Self::core_ok(&proposal.c, lm) && self.meta_ok(&proposal.m, lm) {
             let origin = self.compute_origin(&proposal.m);
-            self.count_echo_statement(view, self.name, EchoStatement::Graded(Arc::clone(&proposal), digest, 0, origin));
+            self.count_echo_statement(
+                view,
+                self.name,
+                EchoStatement::Graded(Arc::clone(&proposal), digest, 0, origin),
+            );
             effects.push(Effect::BroadcastEcho(Echo {
                 // See `recheck_gate`'s matching comment: one deep clone here, same
                 // total count as before Efficiency Item 3.
@@ -1009,7 +1112,11 @@ impl AgbEngine {
         // Efficiency Item 1: reuse the per-view digest cache instead of always
         // recomputing `echo.proposal.digest(&self.sid)`.
         let (proposal, digest) = self.canonical_proposal(view, echo.proposal);
-        if !self.count_echo_statement(view, sender, EchoStatement::Graded(proposal, digest, grade, origin)) {
+        if !self.count_echo_statement(
+            view,
+            sender,
+            EchoStatement::Graded(proposal, digest, grade, origin),
+        ) {
             return effects;
         }
         self.recheck_lock_release(view);
@@ -1034,7 +1141,12 @@ impl AgbEngine {
     /// First-hand echo-stage dedup: at most one counted statement per (view, sender),
     /// ever -- the first one received wins. Returns whether this call was the one that
     /// counted (i.e. this sender had no prior statement for `view`).
-    fn count_echo_statement(&mut self, view: View, sender: PublicKey, statement: EchoStatement) -> bool {
+    fn count_echo_statement(
+        &mut self,
+        view: View,
+        sender: PublicKey,
+        statement: EchoStatement,
+    ) -> bool {
         let state = self.state_mut(view);
         if state.echo_statements.contains_key(&sender) {
             return false;
@@ -1056,7 +1168,12 @@ impl AgbEngine {
 
     /// First-hand ready-stage dedup: at most one counted statement per (view, sender),
     /// ever -- mirrors `count_echo_statement`. Returns whether this call newly counted.
-    fn count_ready_statement(&mut self, view: View, sender: PublicKey, statement: ReadyStatement) -> bool {
+    fn count_ready_statement(
+        &mut self,
+        view: View,
+        sender: PublicKey,
+        statement: ReadyStatement,
+    ) -> bool {
         let state = self.state_mut(view);
         if state.ready_statements.contains_key(&sender) {
             return false;
@@ -1086,7 +1203,9 @@ impl AgbEngine {
             for (sender, stmt) in &state.echo_statements {
                 if let EchoStatement::Graded(p, d, g, origin) = stmt {
                     let stake = self.committee.stake(sender);
-                    let entry = tallies.entry(d.clone()).or_insert_with(|| (Arc::clone(p), 0, 0, 0));
+                    let entry = tallies
+                        .entry(d.clone())
+                        .or_insert_with(|| (Arc::clone(p), 0, 0, 0));
                     if *g == 1 {
                         entry.1 += stake;
                     } else {
@@ -1106,7 +1225,9 @@ impl AgbEngine {
             // >= f+1 (party count) counted proposal echoes for THIS proposal with
             // origin = 1; skip/empty always passes.
             let ready_ok = match &proposal.m {
-                Some(ResolutionEntry::Full(..)) | Some(ResolutionEntry::Core(..)) => origin_ones >= self.f_plus_1_parties,
+                Some(ResolutionEntry::Full(..)) | Some(ResolutionEntry::Core(..)) => {
+                    origin_ones >= self.f_plus_1_parties
+                }
                 _ => true,
             };
             if !ready_ok {
@@ -1121,7 +1242,11 @@ impl AgbEngine {
             };
             let name = self.name;
             self.state_mut(view).ready_sent = true;
-            self.count_ready_statement(view, name, ReadyStatement::Graded(Arc::clone(&proposal), digest, grade));
+            self.count_ready_statement(
+                view,
+                name,
+                ReadyStatement::Graded(Arc::clone(&proposal), digest, grade),
+            );
             effects.extend(self.wish_effect(view, ResponseStage::Ready));
             effects.push(Effect::BroadcastReady(Ready {
                 // The wire type still carries an owned `ViewProposal`: exactly one
@@ -1162,7 +1287,11 @@ impl AgbEngine {
         // Efficiency Item 1: reuse the per-view digest cache instead of always
         // recomputing `ready.proposal.digest(&self.sid)`.
         let (proposal, digest) = self.canonical_proposal(view, ready.proposal);
-        if !self.count_ready_statement(view, sender, ReadyStatement::Graded(proposal, digest, grade)) {
+        if !self.count_ready_statement(
+            view,
+            sender,
+            ReadyStatement::Graded(proposal, digest, grade),
+        ) {
             return Vec::new();
         }
         self.recheck_completion_and_direct(view, rep)
@@ -1193,7 +1322,9 @@ impl AgbEngine {
             for (sender, stmt) in &state.ready_statements {
                 if let ReadyStatement::Graded(proposal, digest, grade) = stmt {
                     let stake = self.committee.stake(sender);
-                    let entry = tallies.entry(digest.clone()).or_insert_with(|| (Arc::clone(proposal), 0, 0, 0));
+                    let entry = tallies
+                        .entry(digest.clone())
+                        .or_insert_with(|| (Arc::clone(proposal), 0, 0, 0));
                     entry.1 += stake;
                     match grade {
                         ReadyGrade::One => entry.2 += stake,
@@ -1251,7 +1382,13 @@ impl AgbEngine {
     /// anchor). Only the FIRST-acceptance submission (the one that actually wins the
     /// arbiter) increments the counter -- a later, merely-compatible submission is not
     /// itself a distinct "route" this view was sealed by.
-    fn try_seal(&mut self, view: View, outcome: Outcome, route: &'static str, effects: &mut Vec<Effect>) {
+    fn try_seal(
+        &mut self,
+        view: View,
+        outcome: Outcome,
+        route: &'static str,
+        effects: &mut Vec<Effect>,
+    ) {
         let state = self.state_mut(view);
         match &state.sealed {
             None => {
@@ -1277,7 +1414,8 @@ impl AgbEngine {
         match (a, b) {
             (Outcome::Full(c1, t1), Outcome::Full(c2, t2)) => c1 == c2 && t1 == t2,
             (Outcome::Core(c1), Outcome::Core(c2)) => c1 == c2,
-            (Outcome::Full(c1, _), Outcome::Core(c2)) | (Outcome::Core(c2), Outcome::Full(c1, _)) => c1 == c2,
+            (Outcome::Full(c1, _), Outcome::Core(c2))
+            | (Outcome::Core(c2), Outcome::Full(c1, _)) => c1 == c2,
             (Outcome::Skip, Outcome::Skip) => true,
             _ => false,
         }

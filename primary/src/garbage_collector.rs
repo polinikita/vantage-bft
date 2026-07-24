@@ -72,7 +72,10 @@ impl GarbageCollector {
                 rx_consensus,
                 tx_loopback,
                 addresses,
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
+                network: SimpleSender::new()
+                    .with_metrics(metrics)
+                    .with_compression(compress_network)
+                    .with_batching(batch),
                 name,
                 channel_auth,
             }
@@ -87,7 +90,9 @@ impl GarbageCollector {
         match &self.channel_auth {
             None => Bytes::from(payload),
             Some(auth) => {
-                let tag = auth.tag_for(&self.name, &payload).expect("self is a committee member");
+                let tag = auth
+                    .tag_for(&self.name, &payload)
+                    .expect("self is a committee member");
                 let mut tagged = payload;
                 tagged.extend_from_slice(&tag);
                 Bytes::from(tagged)

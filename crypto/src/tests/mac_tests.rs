@@ -18,7 +18,9 @@ fn tag_for_matches_verify_from_the_other_side() {
     let b_keys = PairwiseKeys::build(&secret, b, members.iter().cloned());
 
     let payload = b"a well-formed committee message";
-    let tag = a_keys.tag_for(&b, payload).expect("b is a committee member");
+    let tag = a_keys
+        .tag_for(&b, payload)
+        .expect("b is a committee member");
 
     // b, receiving a message claiming to be from a, verifies with k_{a,b} == k_{b,a}.
     assert!(b_keys.verify(&a, payload, &tag));
@@ -128,5 +130,8 @@ fn pairwise_key_derivation_is_order_independent() {
     let secret = MacSecret::generate();
     let members = keys(2);
     let (a, b) = (members[0], members[1]);
-    assert_eq!(derive_pairwise_key(&secret, &a, &b), derive_pairwise_key(&secret, &b, &a));
+    assert_eq!(
+        derive_pairwise_key(&secret, &a, &b),
+        derive_pairwise_key(&secret, &b, &a)
+    );
 }

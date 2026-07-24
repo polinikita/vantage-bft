@@ -59,7 +59,11 @@ impl Helper {
                 committee,
                 store,
                 rx_request,
-                network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics).with_compression(compress_network).with_batching(batch),
+                network: SimpleSender::new()
+                    .with_latency(latency_map)
+                    .with_metrics(metrics)
+                    .with_compression(compress_network)
+                    .with_batching(batch),
             }
             .run()
             .await;
@@ -82,7 +86,11 @@ impl Helper {
             // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send_typed(address, Bytes::from(data), "Batch").await,
+                    Ok(Some(data)) => {
+                        self.network
+                            .send_typed(address, Bytes::from(data), "Batch")
+                            .await
+                    }
                     Ok(None) => (),
                     Err(e) => error!("{}", e),
                 }

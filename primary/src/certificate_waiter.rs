@@ -54,7 +54,6 @@ impl CertificateWaiter {
             .map_err(DagError::from)
     }
 
-
     async fn run(&mut self) {
         let mut waiting = FuturesUnordered::new();
 

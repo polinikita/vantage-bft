@@ -6,13 +6,13 @@ use crate::synchronizer::Synchronizer;
 use crate::{Certificate, Header, Height};
 #[cfg(feature = "benchmark")]
 use bytes::Bytes;
+use config::Committee;
 #[cfg(feature = "benchmark")]
 use config::WorkerId;
-use config::Committee;
-use crypto::Hash as _;
-use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
+use crypto::Hash as _;
+use crypto::PublicKey;
 use log::{debug, info};
 use metrics::Metrics;
 use network::BatchConfig;
@@ -142,7 +142,10 @@ impl Committer {
                 #[cfg(feature = "benchmark")]
                 worker_addresses,
                 #[cfg(feature = "benchmark")]
-                network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
+                network: SimpleSender::new()
+                    .with_metrics(metrics)
+                    .with_compression(compress_network)
+                    .with_batching(batch),
                 #[cfg(feature = "benchmark")]
                 name,
                 #[cfg(feature = "benchmark")]
@@ -162,7 +165,9 @@ impl Committer {
         match &self.channel_auth {
             None => Bytes::from(payload),
             Some(auth) => {
-                let tag = auth.tag_for(&self.name, &payload).expect("self is a committee member");
+                let tag = auth
+                    .tag_for(&self.name, &payload)
+                    .expect("self is a committee member");
                 let mut tagged = payload;
                 tagged.extend_from_slice(&tag);
                 Bytes::from(tagged)
@@ -170,8 +175,18 @@ impl Committer {
         }
     }
 
-    async fn process_commit_message(&mut self, state: &mut State, commit_message: ConsensusMessage) {
-        if let ConsensusMessage::Commit{slot, view: _, qc: _, proposals: _} = commit_message.clone() {
+    async fn process_commit_message(
+        &mut self,
+        state: &mut State,
+        commit_message: ConsensusMessage,
+    ) {
+        if let ConsensusMessage::Commit {
+            slot,
+            view: _,
+            qc: _,
+            proposals: _,
+        } = commit_message.clone()
+        {
             if slot <= state.last_executed_slot {
                 debug!("Already committed slot {}", slot);
                 return;
@@ -181,9 +196,19 @@ impl Committer {
             state.log.insert(slot, commit_message);
 
             while state.log.contains_key(&(state.last_executed_slot + 1)) {
-                let current_commit_message = state.log.get(&(state.last_executed_slot + 1)).unwrap();
-                debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
-                if let ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } = current_commit_message {
+                let current_commit_message =
+                    state.log.get(&(state.last_executed_slot + 1)).unwrap();
+                debug!(
+                    "Currently executing slot {:?}",
+                    state.last_executed_slot + 1
+                );
+                if let ConsensusMessage::Commit {
+                    slot: _,
+                    view: _,
+                    qc: _,
+                    proposals,
+                } = current_commit_message
+                {
                     for (pk, proposal) in proposals {
                         let stop_height = *state.last_executed_heights.get(pk).unwrap();
                         // Don't execute proposals which are too old
@@ -192,7 +217,9 @@ impl Committer {
                             continue;
                         }
 
-                        let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
+                        let headers = self
+                            .synchronizer
+                            .get_all_headers_for_proposal(proposal.clone(), stop_height)
                             .await
                             .expect("should have ancestors by now");
 
@@ -220,7 +247,8 @@ impl Committer {
                                 let commit_millis = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .expect("Failed to measure time")
-                                    .as_millis() as u64;
+                                    .as_millis()
+                                    as u64;
 
                                 // Notify our own local worker(s), grouped by
                                 // WorkerId, of the batches just committed so they
@@ -233,14 +261,23 @@ impl Committer {
                                 // (worker-side `latency_misses`, never blocks).
                                 let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
                                 for (digest, worker_id) in header.payload.iter() {
-                                    by_worker.entry(*worker_id).or_default().push(digest.clone());
+                                    by_worker
+                                        .entry(*worker_id)
+                                        .or_default()
+                                        .push(digest.clone());
                                 }
                                 for (worker_id, digests) in by_worker {
                                     if let Some(address) = self.worker_addresses.get(&worker_id) {
-                                        let bytes = bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests))
+                                        let bytes =
+                                            bincode::serialize(&PrimaryWorkerMessage::Committed(
+                                                commit_millis,
+                                                digests,
+                                            ))
                                             .expect("Failed to serialize committed message");
                                         let tagged = self.tag(bytes);
-                                        self.network.send_typed(*address, tagged, "Committed").await;
+                                        self.network
+                                            .send_typed(*address, tagged, "Committed")
+                                            .await;
                                     }
                                 }
                             }
@@ -255,7 +292,6 @@ impl Committer {
                     state.last_executed_slot += 1;
                 }
             }
-
         };
     }
 
@@ -274,5 +310,4 @@ impl Committer {
             }
         }
     }
-
 }

@@ -90,7 +90,14 @@ impl SimpleSender {
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(1_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.compress, self.batch);
+        Connection::spawn(
+            address,
+            rx,
+            extra_latency,
+            self.metrics.clone(),
+            self.compress,
+            self.batch,
+        );
         tx
     }
 
@@ -139,7 +146,12 @@ impl SimpleSender {
     }
 
     /// Typed variant of `broadcast`.
-    pub async fn broadcast_typed(&mut self, addresses: Vec<SocketAddr>, data: Bytes, msg_type: &'static str) {
+    pub async fn broadcast_typed(
+        &mut self,
+        addresses: Vec<SocketAddr>,
+        data: Bytes,
+        msg_type: &'static str,
+    ) {
         for address in addresses {
             self.send_typed(address, data.clone(), msg_type).await;
         }
@@ -186,7 +198,16 @@ impl Connection {
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
-            Self { address, receiver, extra_latency, metrics, compress, batch }.run().await;
+            Self {
+                address,
+                receiver,
+                extra_latency,
+                metrics,
+                compress,
+                batch,
+            }
+            .run()
+            .await;
         });
     }
 
@@ -198,7 +219,9 @@ impl Connection {
             return data.clone();
         }
         if let Some(metrics) = &self.metrics {
-            metrics.bytes_uncompressed_sent_total.inc_by(data.len() as u64);
+            metrics
+                .bytes_uncompressed_sent_total
+                .inc_by(data.len() as u64);
         }
         Bytes::from(lz4_flex::compress_prepend_size(data))
     }
@@ -340,7 +363,8 @@ impl Connection {
         // keep_alive_delayed` (every message on this link gets the identical fixed
         // delay, so arrival order implies release-order -- no jitter, no concurrency,
         // strict ordering preserved by construction).
-        let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> = std::collections::VecDeque::new();
+        let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> =
+            std::collections::VecDeque::new();
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
 

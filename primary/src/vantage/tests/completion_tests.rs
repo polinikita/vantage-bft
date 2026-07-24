@@ -2,7 +2,7 @@
 // driven directly against `AgbEngine::on_ready`.
 
 use super::common::*;
-use crate::vantage::agb::{Outcome, ReadyGrade, Ready, ViewProposal};
+use crate::vantage::agb::{Outcome, Ready, ReadyGrade, ViewProposal};
 use crate::vantage::Effect;
 use crypto::Digest;
 
@@ -17,7 +17,12 @@ fn sample_proposal(view: u64) -> ViewProposal {
 }
 
 fn ready(proposal: ViewProposal, grade: ReadyGrade, sender: crypto::PublicKey) -> Ready {
-    Ready { proposal, grade, sender, wish: 0 }
+    Ready {
+        proposal,
+        grade,
+        sender,
+        wish: 0,
+    }
 }
 
 /// Constructing a `LaneManager` opens a real (on-disk) `Store`, which spawns a tokio
@@ -40,7 +45,10 @@ fn sealed_effects(effects: &[Effect]) -> Vec<Outcome> {
 }
 
 fn completed_effects(effects: &[Effect]) -> usize {
-    effects.iter().filter(|e| matches!(e, Effect::Completed(_, _, _))).count()
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::Completed(_, _, _)))
+        .count()
 }
 
 #[tokio::test]
@@ -57,7 +65,10 @@ async fn completion_fires_once_on_mixed_grade_quorum() {
     assert_eq!(completed_effects(&e2), 0);
     // Third (mixed grade, e.g. Zero) reaches Q=3 total, but neither grade alone does --
     // completion (any grade) fires; direct does not.
-    let e3 = agb.on_ready(ready(proposal.clone(), ReadyGrade::Zero, all[2].0), &mut rep);
+    let e3 = agb.on_ready(
+        ready(proposal.clone(), ReadyGrade::Zero, all[2].0),
+        &mut rep,
+    );
     assert_eq!(completed_effects(&e3), 1);
     assert!(agb.completed_for_test(1).is_some());
     assert!(agb.directed_for_test(1).is_none());
@@ -114,7 +125,10 @@ async fn late_homogeneous_quorum_after_completion_still_seals() {
     // 2 grade-1 + 1 grade-0 = mixed-grade completion, no direct result yet.
     agb.on_ready(ready(proposal.clone(), ReadyGrade::One, all[0].0), &mut rep);
     agb.on_ready(ready(proposal.clone(), ReadyGrade::One, all[1].0), &mut rep);
-    let e3 = agb.on_ready(ready(proposal.clone(), ReadyGrade::Zero, all[2].0), &mut rep);
+    let e3 = agb.on_ready(
+        ready(proposal.clone(), ReadyGrade::Zero, all[2].0),
+        &mut rep,
+    );
     assert_eq!(completed_effects(&e3), 1);
     assert!(agb.directed_for_test(1).is_none());
 

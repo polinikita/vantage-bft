@@ -6,7 +6,10 @@ use crypto::Digest;
 use std::collections::BTreeMap;
 
 fn ack_count(effects: &[Effect]) -> usize {
-    effects.iter().filter(|e| matches!(e, Effect::BroadcastAck(_))).count()
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::BroadcastAck(_)))
+        .count()
 }
 
 /// N3: ack fires exactly once per tuple, even if the same (already-acked) direct
@@ -106,7 +109,9 @@ async fn ack_withheld_until_payload_arrives() {
     let effects = lm.process_publish(author, header.clone()).await;
     assert!(!effects.iter().any(|e| matches!(e, Effect::BroadcastAck(_))));
     assert!(!lm.direct_pub(&r));
-    assert!(effects.iter().any(|e| matches!(e, Effect::SyncBatches(a, _, _) if *a == author)));
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::SyncBatches(a, _, _) if *a == author)));
 
     mark_payload_present(&mut store, &batch_digest, 0u32).await;
     let effects = lm.set_payload_ready(&header.id);

@@ -47,8 +47,26 @@ async fn newest_tiebreak_by_smallest_digest() {
     let sid = lm.sid().clone();
 
     let h1 = publish_block(&mut lm, &mut store, author, 1, genesis, sid.clone(), 1).await;
-    let a2 = publish_block(&mut lm, &mut store, author, 2, h1.id.clone(), sid.clone(), 2).await;
-    let b2 = publish_block(&mut lm, &mut store, author, 2, h1.id.clone(), sid.clone(), 3).await;
+    let a2 = publish_block(
+        &mut lm,
+        &mut store,
+        author,
+        2,
+        h1.id.clone(),
+        sid.clone(),
+        2,
+    )
+    .await;
+    let b2 = publish_block(
+        &mut lm,
+        &mut store,
+        author,
+        2,
+        h1.id.clone(),
+        sid.clone(),
+        3,
+    )
+    .await;
     assert_ne!(a2.id, b2.id);
 
     let ra = (author, 2, a2.id.clone());
@@ -75,8 +93,26 @@ async fn fork_pins_one_branch_for_t() {
     let sid = lm.sid().clone();
 
     let h1 = publish_block(&mut lm, &mut store, author, 1, genesis, sid.clone(), 1).await;
-    let a2 = publish_block(&mut lm, &mut store, author, 2, h1.id.clone(), sid.clone(), 2).await;
-    let b2 = publish_block(&mut lm, &mut store, author, 2, h1.id.clone(), sid.clone(), 3).await;
+    let a2 = publish_block(
+        &mut lm,
+        &mut store,
+        author,
+        2,
+        h1.id.clone(),
+        sid.clone(),
+        2,
+    )
+    .await;
+    let b2 = publish_block(
+        &mut lm,
+        &mut store,
+        author,
+        2,
+        h1.id.clone(),
+        sid.clone(),
+        3,
+    )
+    .await;
 
     // Only branch A reaches quorum -- C is unambiguous.
     let ra2 = (author, 2, a2.id.clone());
@@ -88,12 +124,30 @@ async fn fork_pins_one_branch_for_t() {
     assert_eq!(lm.t_candidate(&author), None);
 
     // Branch B grows taller than C but never through it -- must never become T.
-    let b3 = publish_block(&mut lm, &mut store, author, 3, b2.id.clone(), sid.clone(), 4).await;
+    let b3 = publish_block(
+        &mut lm,
+        &mut store,
+        author,
+        3,
+        b2.id.clone(),
+        sid.clone(),
+        4,
+    )
+    .await;
     assert_ne!(lm.t_candidate(&author), Some((author, 3, b3.id.clone())));
     assert_eq!(lm.t_candidate(&author), None);
 
     // Branch A grows through C -- this (and only this) becomes T.
-    let a3 = publish_block(&mut lm, &mut store, author, 3, a2.id.clone(), sid.clone(), 5).await;
+    let a3 = publish_block(
+        &mut lm,
+        &mut store,
+        author,
+        3,
+        a2.id.clone(),
+        sid.clone(),
+        5,
+    )
+    .await;
     assert_eq!(lm.t_candidate(&author), Some((author, 3, a3.id.clone())));
 }
 
@@ -133,7 +187,16 @@ async fn cross_author_graft_never_selected_as_t_candidate() {
     let mut b_prev = genesis.clone();
     let mut b4 = None;
     for h in 1..=4u64 {
-        let block = publish_block(&mut lm, &mut store, author_b, h, b_prev.clone(), sid.clone(), 10 + h as u8).await;
+        let block = publish_block(
+            &mut lm,
+            &mut store,
+            author_b,
+            h,
+            b_prev.clone(),
+            sid.clone(),
+            10 + h as u8,
+        )
+        .await;
         b_prev = block.id.clone();
         b4 = Some(block);
     }
@@ -141,7 +204,10 @@ async fn cross_author_graft_never_selected_as_t_candidate() {
 
     // A's own, genuine height-1 tip -- the only *legitimate* T candidate it has.
     let a1 = publish_block(&mut lm, &mut store, author_a, 1, genesis, sid.clone(), 20).await;
-    assert_eq!(lm.t_candidate(&author_a), Some((author_a, 1, a1.id.clone())));
+    assert_eq!(
+        lm.t_candidate(&author_a),
+        Some((author_a, 1, a1.id.clone()))
+    );
 
     // A grafts a taller, height-5 block onto B's real height-4 block instead of onto
     // A's own chain. Without the author check this would win T-candidate selection

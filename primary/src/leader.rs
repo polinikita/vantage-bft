@@ -1,4 +1,4 @@
-use crate::primary::{View, Slot};
+use crate::primary::{Slot, View};
 use config::Committee;
 use crypto::PublicKey;
 
@@ -22,5 +22,3 @@ impl SemiParallelRRLeaderElector {
         //keys[1]
     }
 }
-
-

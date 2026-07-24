@@ -4,7 +4,7 @@
 
 use super::common::*;
 use super::harness::{drain_local, Node};
-use crate::vantage::agb::{Echo, ReadyGrade, Ready, ViewProposal};
+use crate::vantage::agb::{Echo, Ready, ReadyGrade, ViewProposal};
 use crate::vantage::node::Inbound;
 use crate::vantage::Effect;
 use crypto::Digest;
@@ -44,20 +44,43 @@ async fn w3_echo_stage_completes_pair_raises_wish_to_u_plus_2() {
     let senders: Vec<_> = authors().into_iter().take(3).collect();
     let mut last = Vec::new();
     for (pk, _) in &senders {
-        last = agb.on_echo(Echo { proposal: proposal1.clone(), grade: 1, sender: *pk, wish: 0, origin: None }, &mut rep);
+        last = agb.on_echo(
+            Echo {
+                proposal: proposal1.clone(),
+                grade: 1,
+                sender: *pk,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
     }
-    assert!(last.iter().any(|e| matches!(e, Effect::BroadcastReady(_))), "test setup: view 1's ready-stage response must be sent");
+    assert!(
+        last.iter().any(|e| matches!(e, Effect::BroadcastReady(_))),
+        "test setup: view 1's ready-stage response must be sent"
+    );
 
     // Now the echo-stage response for u=2 is about to be emitted (the absolute
     // deadline unconditionally emits an echo-skip -- no proposal/entry needed either)
     // with the ready-stage response for u-1=1 already sent -- W3 must raise the wish
     // to u+2=4, *before* the response effect.
     let effects = agb.on_echo_absolute_timer(2, &mut rep);
-    assert!(effects.iter().any(|e| matches!(e, Effect::BroadcastEchoSkip(2))));
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::BroadcastEchoSkip(2))));
     assert_eq!(raise_wish_target(&effects), Some(4));
-    let raise_pos = effects.iter().position(|e| matches!(e, Effect::RaiseWish(_))).unwrap();
-    let resp_pos = effects.iter().position(|e| matches!(e, Effect::BroadcastEchoSkip(_))).unwrap();
-    assert!(raise_pos < resp_pos, "the raise must precede the response effect it piggybacks on");
+    let raise_pos = effects
+        .iter()
+        .position(|e| matches!(e, Effect::RaiseWish(_)))
+        .unwrap();
+    let resp_pos = effects
+        .iter()
+        .position(|e| matches!(e, Effect::BroadcastEchoSkip(_)))
+        .unwrap();
+    assert!(
+        raise_pos < resp_pos,
+        "the raise must precede the response effect it piggybacks on"
+    );
 }
 
 #[tokio::test]
@@ -83,16 +106,26 @@ async fn w3_ready_stage_completes_pair_raises_wish_to_u_plus_3() {
     // Echo-stage response for view 2 already sent (an unconditional echo-skip at the
     // absolute deadline, no pairing needed for *this* one).
     let effects = agb.on_echo_absolute_timer(2, &mut rep);
-    assert!(effects.iter().any(|e| matches!(e, Effect::BroadcastEchoSkip(2))));
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::BroadcastEchoSkip(2))));
 
     // The ready-stage response for u=1 is about to be emitted (its own absolute
     // deadline) with the echo-stage response for u+1=2 already sent -- W3 must raise
     // the wish to u+3=4.
     let effects = agb.on_ready_timer(1);
-    assert!(effects.iter().any(|e| matches!(e, Effect::BroadcastNoReady(1))));
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::BroadcastNoReady(1))));
     assert_eq!(raise_wish_target(&effects), Some(4));
-    let raise_pos = effects.iter().position(|e| matches!(e, Effect::RaiseWish(_))).unwrap();
-    let resp_pos = effects.iter().position(|e| matches!(e, Effect::BroadcastNoReady(_))).unwrap();
+    let raise_pos = effects
+        .iter()
+        .position(|e| matches!(e, Effect::RaiseWish(_)))
+        .unwrap();
+    let resp_pos = effects
+        .iter()
+        .position(|e| matches!(e, Effect::BroadcastNoReady(_)))
+        .unwrap();
     assert!(raise_pos < resp_pos);
 }
 
@@ -118,20 +151,71 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
     let proposal = sample_proposal(1);
     let (sender, _) = authors()[0];
 
-    node.dispatch(Inbound::Echo(Echo { proposal: proposal.clone(), grade: 1, sender, wish: 3, origin: None }), now).await;
+    node.dispatch(
+        Inbound::Echo(Echo {
+            proposal: proposal.clone(),
+            grade: 1,
+            sender,
+            wish: 3,
+            origin: None,
+        }),
+        now,
+    )
+    .await;
     assert_eq!(node.pacemaker.omega_of_for_test(sender), 3);
 
-    node.dispatch(Inbound::Echo(Echo { proposal: proposal.clone(), grade: 1, sender, wish: 7, origin: None }), now).await;
-    assert_eq!(node.pacemaker.omega_of_for_test(sender), 7, "the duplicate's wish must still be absorbed");
+    node.dispatch(
+        Inbound::Echo(Echo {
+            proposal: proposal.clone(),
+            grade: 1,
+            sender,
+            wish: 7,
+            origin: None,
+        }),
+        now,
+    )
+    .await;
+    assert_eq!(
+        node.pacemaker.omega_of_for_test(sender),
+        7,
+        "the duplicate's wish must still be absorbed"
+    );
 
     // Confirm the statement really was counted only once: feeding this same `sender`
     // twice must not itself be enough progress toward the quorum -- two genuinely
     // distinct senders are still required afterward.
     let (s2, _) = authors()[1];
-    let effects = node.dispatch(Inbound::Echo(Echo { proposal: proposal.clone(), grade: 1, sender: s2, wish: 0, origin: None }), now).await;
-    assert!(!effects.iter().any(|e| matches!(e, Effect::BroadcastReady(_))), "quorum not yet reached (2 distinct senders)");
+    let effects = node
+        .dispatch(
+            Inbound::Echo(Echo {
+                proposal: proposal.clone(),
+                grade: 1,
+                sender: s2,
+                wish: 0,
+                origin: None,
+            }),
+            now,
+        )
+        .await;
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastReady(_))),
+        "quorum not yet reached (2 distinct senders)"
+    );
     let (s3, _) = authors()[2];
-    let effects = node.dispatch(Inbound::Echo(Echo { proposal, grade: 1, sender: s3, wish: 0, origin: None }), now).await;
+    let effects = node
+        .dispatch(
+            Inbound::Echo(Echo {
+                proposal,
+                grade: 1,
+                sender: s3,
+                wish: 0,
+                origin: None,
+            }),
+            now,
+        )
+        .await;
     assert!(
         effects.iter().any(|e| matches!(e, Effect::BroadcastReady(_))),
         "the 3rd genuinely distinct sender must complete the quorum -- the duplicate never counted a 2nd time"
@@ -140,10 +224,17 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
 
 #[tokio::test]
 async fn w4_piggybacked_wish_alone_drives_entry_with_no_standalone_wish_messages() {
-    let mut nodes = vec![Node::new(authors()[3].0, ".db_test_w4_piggyback_drives_entry", 6)];
+    let mut nodes = vec![Node::new(
+        authors()[3].0,
+        ".db_test_w4_piggyback_drives_entry",
+        6,
+    )];
     let now = Instant::now();
     let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != nodes[0].name).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != nodes[0].name)
+        .collect();
 
     // 3 distinct senders' `EchoSkip(view=1, wish=5)` -- pure piggyback, never an
     // `Inbound::Wish` datagram.
@@ -153,8 +244,15 @@ async fn w4_piggybacked_wish_alone_drives_entry_with_no_standalone_wish_messages
     }
 
     assert_eq!(nodes[0].pacemaker.entry_target(), 5);
-    assert!(nodes[0].frontier.is_active(5), "entry to view 5 must have been recorded");
-    assert_eq!(nodes[0].frontier.a_i(), 4, "W5(c)'s floor must have run too");
+    assert!(
+        nodes[0].frontier.is_active(5),
+        "entry to view 5 must have been recorded"
+    );
+    assert_eq!(
+        nodes[0].frontier.a_i(),
+        4,
+        "W5(c)'s floor must have run too"
+    );
 }
 
 #[tokio::test]
@@ -168,7 +266,17 @@ async fn w4_piggyback_rides_on_all_four_response_types() {
     let (s3, _) = authors()[2];
     let (s4, _) = authors()[1]; // reused sender is fine -- each check is independent
 
-    node.dispatch(Inbound::Echo(Echo { proposal: sample_proposal(1), grade: 1, sender: s1, wish: 9, origin: None }), now).await;
+    node.dispatch(
+        Inbound::Echo(Echo {
+            proposal: sample_proposal(1),
+            grade: 1,
+            sender: s1,
+            wish: 9,
+            origin: None,
+        }),
+        now,
+    )
+    .await;
     assert_eq!(node.pacemaker.omega_of_for_test(s1), 9);
 
     node.dispatch(Inbound::EchoSkip(1, s2, 10), now).await;

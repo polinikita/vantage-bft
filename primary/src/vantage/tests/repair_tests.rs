@@ -13,7 +13,14 @@ fn new_standalone_repairer(name: PublicKey) -> Repairer {
     let committee = test_committee();
     let sid = session_id(&committee);
     let genesis = genesis_digest(&sid);
-    Repairer::new(name, committee, sid, genesis, MAX_BLOCK_PAYLOAD, Arc::new(Mutex::new(BlockCache::new())))
+    Repairer::new(
+        name,
+        committee,
+        sid,
+        genesis,
+        MAX_BLOCK_PAYLOAD,
+        Arc::new(Mutex::new(BlockCache::new())),
+    )
 }
 
 fn requests_for(effects: &[Effect]) -> Vec<(PublicKey, Digest)> {
@@ -140,7 +147,9 @@ async fn false_coordinate_cached_not_advanced() {
     assert!(repairer_blocks(&repairer).contains(&h));
     // ...but the fake-coordinate walk did not complete (no serve to anyone -- there
     // were no pending requesters -- and, more importantly, no crash/false success).
-    assert!(effects.iter().all(|e| !matches!(e, Effect::RequestTo(_, _))));
+    assert!(effects
+        .iter()
+        .all(|e| !matches!(e, Effect::RequestTo(_, _))));
 
     // A later, exact-coordinate authorize consumes the cached body: no new request.
     let real_ref = (real_author, 1u64, h);
@@ -197,7 +206,10 @@ async fn pending_request_answered_once_on_retention() {
     repairer.authorize((author, 1, h.clone()));
     let effects = repairer.on_serve(block);
     assert_eq!(
-        effects.iter().filter(|e| matches!(e, Effect::ServeTo(p, _) if *p == requester)).count(),
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::ServeTo(p, _) if *p == requester))
+            .count(),
         1
     );
 
@@ -235,7 +247,13 @@ async fn settled_ref_is_retained_and_servable_and_leaves_pending() {
 
     // Servable: a request arriving after settlement is answered.
     let effects = repairer.on_request(requester, h.clone());
-    assert_eq!(effects.iter().filter(|e| matches!(e, Effect::ServeTo(p, _) if *p == requester)).count(), 1);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::ServeTo(p, _) if *p == requester))
+            .count(),
+        1
+    );
 }
 
 /// PHASE6-SPEC.md §9 gate amendment, R1: a cached block under the WRONG coordinate

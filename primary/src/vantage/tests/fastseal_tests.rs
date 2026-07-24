@@ -15,7 +15,13 @@ fn sealed_full(effects: &[Effect]) -> Option<(crate::vantage::Manifest, crate::v
 /// Sets up party `self_name`'s `LaneManager` with a real directly-published chain for
 /// `author_c`, its own positive gate firing for view 1 (so a fast-seal lock is
 /// recorded), and returns the engine/repairer plus the fixed proposal.
-async fn fired_scenario(path: &str) -> (crate::vantage::AgbEngine, crate::vantage::Repairer, ViewProposal) {
+async fn fired_scenario(
+    path: &str,
+) -> (
+    crate::vantage::AgbEngine,
+    crate::vantage::Repairer,
+    ViewProposal,
+) {
     let (self_name, _) = authors()[3];
     let (author_c, _) = authors()[0];
     let (mut lm, _store) = new_lane_manager(self_name, path);
@@ -26,9 +32,19 @@ async fn fired_scenario(path: &str) -> (crate::vantage::AgbEngine, crate::vantag
     let now = std::time::Instant::now();
     agb.enter(1, now, &mut lm, &mut rep);
     let sender = proposer_of(1);
-    let proposal = crate::vantage::agb::ViewProposal { view: 1, c: vec![c_ref], t: Vec::new(), m: None };
+    let proposal = crate::vantage::agb::ViewProposal {
+        view: 1,
+        c: vec![c_ref],
+        t: Vec::new(),
+        m: None,
+    };
     let effects = agb.on_propose(sender, proposal.clone(), now, &mut lm, &mut rep);
-    assert!(effects.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))), "our own positive gate must fire first");
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        "our own positive gate must fire first"
+    );
     (agb, rep, proposal)
 }
 
@@ -52,7 +68,7 @@ async fn fastseal_fires_on_all_n_matching_echoes() {
                 grade: 1,
                 sender,
                 wish: 0,
-            origin: None,
+                origin: None,
             },
             &mut rep,
         );
@@ -69,7 +85,10 @@ async fn fastseal_fires_on_all_n_matching_echoes() {
 async fn lock_deactivates_at_f_plus_1_nonmatching_and_never_reactivates() {
     let (mut agb, mut rep, proposal) = fired_scenario(".db_test_fastseal_deactivate").await;
     let all = authors();
-    let others: Vec<_> = all.into_iter().filter(|(pk, _)| *pk != authors()[3].0).collect();
+    let others: Vec<_> = all
+        .into_iter()
+        .filter(|(pk, _)| *pk != authors()[3].0)
+        .collect();
 
     // f+1 = 2 non-matching echo-stage statements (echo-skip counts as non-matching).
     agb.on_echo_skip(1, others[0].0);
@@ -84,7 +103,7 @@ async fn lock_deactivates_at_f_plus_1_nonmatching_and_never_reactivates() {
             grade: 1,
             sender: others[2].0,
             wish: 0,
-        origin: None,
+            origin: None,
         },
         &mut rep,
     );
@@ -103,7 +122,7 @@ async fn fastseal_produces_no_completion_or_direct_side_effects() {
                 grade: 1,
                 sender,
                 wish: 0,
-            origin: None,
+                origin: None,
             },
             &mut rep,
         );

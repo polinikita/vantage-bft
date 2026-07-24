@@ -134,7 +134,9 @@ impl Worker {
         // (would otherwise silently run unauthenticated) -- panic loudly rather than
         // let it pass.
         let channel_auth: Option<Arc<PairwiseKeys>> = if parameters.authenticate_channels {
-            let secret = parameters.mac_secret.expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
+            let secret = parameters
+                .mac_secret
+                .expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
             Some(Arc::new(committee.pairwise_keys(&name, &secret)))
         } else {
             None
@@ -155,9 +157,9 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages();                         //spawns async task that listens for network message from Primary
-        worker.handle_clients_transactions(tx_primary.clone());   //spawns async task that listens for network messages from Client
-        worker.handle_workers_messages(tx_primary);               //spawns async task that listens for network messages from other Workers
+        worker.handle_primary_messages(); //spawns async task that listens for network message from Primary
+        worker.handle_clients_transactions(tx_primary.clone()); //spawns async task that listens for network messages from Client
+        worker.handle_workers_messages(tx_primary); //spawns async task that listens for network messages from other Workers
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -166,8 +168,8 @@ impl Worker {
                 .committee
                 .primary(&worker.name)
                 .expect("Our public key is not in the committee")
-                .worker_to_primary,                              //filter primary associated with current worker based on the committee config.
-            rx_primary,                                          //receiver channel to connect to primary channel (i.e. how other listener functions can invoke to PrimaryConnector)
+                .worker_to_primary, //filter primary associated with current worker based on the committee config.
+            rx_primary, //receiver channel to connect to primary channel (i.e. how other listener functions can invoke to PrimaryConnector)
             worker.metrics.clone(),
             worker.parameters.compress_network,
             worker.batch,
@@ -189,8 +191,7 @@ impl Worker {
         (metrics, reporter, registry)
     }
 
-///////////////////////// TASK INSTANTIATORS ///////////////////////////////////
-
+    ///////////////////////// TASK INSTANTIATORS ///////////////////////////////////
 
     /// Spawn all tasks responsible to handle messages from our primary.
     fn handle_primary_messages(&self) {
@@ -204,13 +205,19 @@ impl Worker {
             .primary_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn_full(
-            address,                                    //socket to receive Primary messages from
+            address, //socket to receive Primary messages from
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer, metrics: self.metrics.clone(), name: self.name, channel_auth: self.channel_auth.clone() }, //handler for received Primary messages, forwards them to synchronizer
+            PrimaryReceiverHandler {
+                tx_synchronizer,
+                metrics: self.metrics.clone(),
+                name: self.name,
+                channel_auth: self.channel_auth.clone(),
+            }, //handler for received Primary messages, forwards them to synchronizer
             Some(self.metrics.clone()),
             self.parameters.compress_network,
             // This handler never acked (see its `dispatch`'s doc comment).
-            /* acks */ false,
+            /* acks */
+            false,
             self.parameters.batch_messages,
         );
 
@@ -239,10 +246,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {  //tx_primary: channel between processor and PrimaryConnector
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
-        //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
+    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+        //tx_primary: channel between processor and PrimaryConnector
+        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY); //channel between TxReceive (Client) and batch maker
+                                                                          //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
+        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY); //channel between quorum waiter and processor
 
         // We first receive clients' transactions from the network.
         let mut address = self
@@ -252,8 +260,12 @@ impl Worker {
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn_full(
-            address,                                            //socket to receive Client messages from
-            /* handler */ TxReceiverHandler { tx_batch_maker, yield_counter: Arc::new(AtomicU64::new(0)) }, //handler for received Client messages, forwards them to batch maker
+            address, //socket to receive Client messages from
+            /* handler */
+            TxReceiverHandler {
+                tx_batch_maker,
+                yield_counter: Arc::new(AtomicU64::new(0)),
+            }, //handler for received Client messages, forwards them to batch maker
             Some(self.metrics.clone()),
             // METRICS-DASHBOARD-SPEC.md §8: client traffic is NEVER compressed --
             // `node::client::Client` builds its own raw `Framed`/`TcpStream` directly
@@ -265,12 +277,14 @@ impl Worker {
             // `network::{Simple,Reliable}Sender`).
             false,
             // This handler never acked either (see its `dispatch`).
-            /* acks */ false,
+            /* acks */
+            false,
             // Client traffic is NEVER batched -- `node::client::Client` sends raw,
             // unbundled frames (same bypass-of-`network::{Simple,Reliable}Sender`
             // reasoning as the `compress` argument just above). Always `false` here,
             // independent of `self.parameters.batch_messages`.
-            /* batch */ false,
+            /* batch */
+            false,
         );
 
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
@@ -279,9 +293,11 @@ impl Worker {
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
-            /* rx_transaction */ rx_batch_maker,  //receiver channel to connect to TxReceiverHandler 
+            /* rx_transaction */
+            rx_batch_maker, //receiver channel to connect to TxReceiverHandler
             // tx_message tx_quorum_waiter,   //sender channel to connect to quorum waiter
-           /* tx_batch */ tx_processor,  //sender channel to connect to processor
+            /* tx_batch */
+            tx_processor, //sender channel to connect to processor
             /* workers_addresses */
             self.committee
                 .others_workers(&self.name, &self.id)
@@ -309,8 +325,8 @@ impl Worker {
         Processor::spawn(
             self.id,
             self.store.clone(),
-            /* rx_batch */ rx_processor,  //receiver channel to connect to quorum waiter
-            /* tx_digest */ tx_primary,   //sender channel to connect to PrimaryConnector
+            /* rx_batch */ rx_processor, //receiver channel to connect to quorum waiter
+            /* tx_digest */ tx_primary, //sender channel to connect to PrimaryConnector
             /* own_batch */ true,
         );
 
@@ -322,8 +338,8 @@ impl Worker {
 
     /// Spawn all tasks responsible to handle messages from other workers.
     fn handle_workers_messages(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
-        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);         //channel between WorkReceiverHandler and Helper
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);   //channel between WorkReceiverHandler and Processor
+        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY); //channel between WorkReceiverHandler and Helper
+        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY); //channel between WorkReceiverHandler and Processor
 
         // Receive incoming messages from other workers.
         let mut address = self
@@ -333,11 +349,12 @@ impl Worker {
             .worker_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn_full(
-            address,                     //socket to receive Worker messages from
+            address, //socket to receive Worker messages from
             /* handler */
-            WorkerReceiverHandler {      //handler for received Worker messages, forwards them either to helper, or processor -- depending on (?)
-                tx_helper,               //sender channel to connect to helper
-                tx_processor,            //sender channel to connect to processor
+            WorkerReceiverHandler {
+                //handler for received Worker messages, forwards them either to helper, or processor -- depending on (?)
+                tx_helper,    //sender channel to connect to helper
+                tx_processor, //sender channel to connect to processor
                 metrics: self.metrics.clone(),
                 channel_auth: self.channel_auth.clone(),
             },
@@ -345,7 +362,8 @@ impl Worker {
             self.parameters.compress_network,
             // This handler acks every received frame (moved out of `dispatch` -- see
             // its doc comment).
-            /* acks */ true,
+            /* acks */
+            true,
             self.parameters.batch_messages,
         );
 
@@ -354,7 +372,8 @@ impl Worker {
             self.id,
             self.committee.clone(),
             self.store.clone(),
-            /* rx_request */ rx_helper,   //receiver channel to connect to WorkerReceiverHandler
+            /* rx_request */
+            rx_helper, //receiver channel to connect to WorkerReceiverHandler
             self.latency_map.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
@@ -366,8 +385,9 @@ impl Worker {
         Processor::spawn(
             self.id,
             self.store.clone(),
-            /* rx_batch */ rx_processor,   //receiver channel to connect to WorkerReceiverHandler
-            /* tx_digest */ tx_primary,    //sender channel to connect to PrimaryConnector
+            /* rx_batch */
+            rx_processor, //receiver channel to connect to WorkerReceiverHandler
+            /* tx_digest */ tx_primary, //sender channel to connect to PrimaryConnector
             /* own_batch */ false,
         );
 
@@ -380,12 +400,11 @@ impl Worker {
 
 /////////////////////////// Network Handlers ///////////////////////////////
 
-
 /// Defines how the network receiver handles incoming transactions.
 //Note: Only expect to receive client messages submitting new transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
-    tx_batch_maker: Sender<Transaction>,  //sender channel to connect to batch maker
+    tx_batch_maker: Sender<Transaction>, //sender channel to connect to batch maker
     /// Fable perf audit item 1: shared (across every connection this handler's
     /// `Receiver` accepts -- `handler.clone()` per accepted connection, see
     /// `network::Receiver::run`) counter gating how often `dispatch` actually yields.
@@ -413,7 +432,11 @@ impl MessageHandler for TxReceiverHandler {
         // single transaction (Fable perf audit item 1) -- tokio's own cooperative
         // scheduling budget already yields periodically regardless; this just adds
         // an explicit, cheap backstop under sustained client load.
-        if self.yield_counter.fetch_add(1, Ordering::Relaxed).is_multiple_of(TX_YIELD_EVERY) {
+        if self
+            .yield_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(TX_YIELD_EVERY)
+        {
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -424,8 +447,8 @@ impl MessageHandler for TxReceiverHandler {
 //Note: Only expect to receive worker messages that are a) proposing batches, or b) acknowledging batches
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_helper: Sender<(Vec<Digest>, PublicKey)>,   //sender channel to connect to helper
-    tx_processor: Sender<SerializedBatchMessage>,  //sender channel to connect to processor
+    tx_helper: Sender<(Vec<Digest>, PublicKey)>, //sender channel to connect to helper
+    tx_processor: Sender<SerializedBatchMessage>, //sender channel to connect to processor
     metrics: Arc<Metrics>,
     /// SECURITY (Fable audit): `Parameters::authenticate_channels`. `None` is
     /// byte-identical to pre-MAC behavior. `WorkerMessage::Batch` carries no sender
@@ -444,7 +467,11 @@ struct WorkerReceiverHandler {
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(
+        &self,
+        _writer: &mut Writer,
+        serialized: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
         // The ack (kept for debugging -- `SimpleSender` never required it, it just
         // sinks whatever reply arrives) is now sent by `network::Receiver` itself,
         // once per received FRAME rather than once per `dispatch` call -- required
@@ -458,21 +485,28 @@ impl MessageHandler for WorkerReceiverHandler {
         // strip. See `channel_auth`'s doc comment for why `Batch`'s bytes are then
         // never touched, while `BatchRequest`'s tag IS split off and verified.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => {     //If receive batch message from another worker. Store the batch, and process.
-                self.metrics.network_messages_received_total.with_label_values(&["Batch"]).inc();
-                self.metrics.network_bytes_received_total.with_label_values(&["Batch"]).inc_by(serialized.len() as u64);
+            Ok(WorkerMessage::Batch(..)) => {
+                //If receive batch message from another worker. Store the batch, and process.
+                self.metrics
+                    .network_messages_received_total
+                    .with_label_values(&["Batch"])
+                    .inc();
+                self.metrics
+                    .network_bytes_received_total
+                    .with_label_values(&["Batch"])
+                    .inc_by(serialized.len() as u64);
                 // `serialized` is already an owned `Bytes` -- forward it directly
                 // instead of the previous `serialized.to_vec()`, which copied every
                 // received batch a second time for no reason (Fable perf audit item
                 // 3). `Processor` now does the one unavoidable `Bytes -> Vec<u8>`
                 // copy itself, right at `Store::write`'s fixed `Vec<u8>` boundary.
-                self
-                .tx_processor
-                .send(serialized)
-                .await
-                .expect("Failed to send batch")
-            },
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => {  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
+                self.tx_processor
+                    .send(serialized)
+                    .await
+                    .expect("Failed to send batch")
+            }
+            Ok(WorkerMessage::BatchRequest(missing, requestor)) => {
+                //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
                 if let Some(auth) = &self.channel_auth {
                     let Some((payload, tag)) = crypto::mac::split_tag(&serialized) else {
                         return Ok(());
@@ -482,14 +516,19 @@ impl MessageHandler for WorkerReceiverHandler {
                         return Ok(());
                     }
                 }
-                self.metrics.network_messages_received_total.with_label_values(&["BatchRequest"]).inc();
-                self.metrics.network_bytes_received_total.with_label_values(&["BatchRequest"]).inc_by(serialized.len() as u64);
-                self
-                .tx_helper
-                .send((missing, requestor))
-                .await
-                .expect("Failed to send batch request")
-            },
+                self.metrics
+                    .network_messages_received_total
+                    .with_label_values(&["BatchRequest"])
+                    .inc();
+                self.metrics
+                    .network_bytes_received_total
+                    .with_label_values(&["BatchRequest"])
+                    .inc_by(serialized.len() as u64);
+                self.tx_helper
+                    .send((missing, requestor))
+                    .await
+                    .expect("Failed to send batch request")
+            }
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())
@@ -500,7 +539,7 @@ impl MessageHandler for WorkerReceiverHandler {
 //Note: Only expect to receive primary messages requesting synchronization.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
-    tx_synchronizer: Sender<PrimaryWorkerMessage>,  //sender channel to connect to synchronizer.
+    tx_synchronizer: Sender<PrimaryWorkerMessage>, //sender channel to connect to synchronizer.
     metrics: Arc<Metrics>,
     /// SECURITY (Fable audit): this worker's own public key -- the worker<->primary
     /// channel is intra-authority (our own primary shares our own public key), so the
@@ -541,14 +580,19 @@ impl MessageHandler for PrimaryReceiverHandler {
                         return Ok(());
                     }
                 }
-                self.metrics.network_messages_received_total.with_label_values(&[message.type_name()]).inc();
-                self.metrics.network_bytes_received_total.with_label_values(&[message.type_name()]).inc_by(payload.len() as u64);
-                self
-                .tx_synchronizer
-                .send(message)
-                .await
-                .expect("Failed to send transaction")
-            },
+                self.metrics
+                    .network_messages_received_total
+                    .with_label_values(&[message.type_name()])
+                    .inc();
+                self.metrics
+                    .network_bytes_received_total
+                    .with_label_values(&[message.type_name()])
+                    .inc_by(payload.len() as u64);
+                self.tx_synchronizer
+                    .send(message)
+                    .await
+                    .expect("Failed to send transaction")
+            }
         }
         Ok(())
     }

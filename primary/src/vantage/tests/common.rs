@@ -58,7 +58,13 @@ pub async fn direct_chain(lm: &mut LaneManager, author: PublicKey, n: u64) -> Ve
 /// A header carrying one distinct payload entry (worker 0), so its digest differs from
 /// an otherwise-identical empty-payload header at the same coordinate -- used to build
 /// sibling forks.
-pub fn tagged_header(author: PublicKey, height: crate::primary::Height, prev: Digest, sid: Digest, tag: u8) -> Header {
+pub fn tagged_header(
+    author: PublicKey,
+    height: crate::primary::Height,
+    prev: Digest,
+    sid: Digest,
+    tag: u8,
+) -> Header {
     let mut payload = BTreeMap::new();
     let mut bytes = [0u8; 32];
     bytes[0] = tag;
@@ -87,17 +93,31 @@ pub fn fresh_store(path: &str) -> Store {
 /// report) the same way `payload_receiver::PayloadReceiver` would in production.
 pub fn new_lane_manager(name: PublicKey, path: &str) -> (LaneManager, Store) {
     let store = fresh_store(path);
-    (LaneManager::new(name, test_committee(), MAX_BLOCK_PAYLOAD, store.clone()), store)
+    (
+        LaneManager::new(name, test_committee(), MAX_BLOCK_PAYLOAD, store.clone()),
+        store,
+    )
 }
 
 pub fn new_repairer(name: PublicKey, lm: &LaneManager) -> Repairer {
-    Repairer::new(name, test_committee(), lm.sid().clone(), lm.genesis().clone(), MAX_BLOCK_PAYLOAD, lm.blocks_handle())
+    Repairer::new(
+        name,
+        test_committee(),
+        lm.sid().clone(),
+        lm.genesis().clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    )
 }
 
 /// Writes the payload-presence marker `payload_receiver::PayloadReceiver` would write
 /// on receiving `OthersBatch(digest, worker_id)` -- the same key shape
 /// `LaneManager::payload_present` (D1) probes.
-pub async fn mark_payload_present(store: &mut Store, digest: &crypto::Digest, worker_id: config::WorkerId) {
+pub async fn mark_payload_present(
+    store: &mut Store,
+    digest: &crypto::Digest,
+    worker_id: config::WorkerId,
+) {
     let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
     store.write(key, Vec::new()).await;
 }
