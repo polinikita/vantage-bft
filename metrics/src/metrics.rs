@@ -94,6 +94,10 @@ pub struct Metrics {
     pub vantage_repairs_served: IntCounter,
     /// Cumulative bincode-encoded size of every block this node has retained (N8).
     pub vantage_retained_bytes: IntCounter,
+    /// Fable-audit fix: inbound wire messages dropped by `VantageCore::dispatch_inbound`
+    /// because their declared sender is not a committee member. Always zero on the
+    /// honest-only path; a nonzero value means a Byzantine node is forging sender keys.
+    pub vantage_rejected_nonmember_total: IntCounter,
 
     // --- Phase 6 (PHASE6-SPEC.md §9 gate amendment): per-view seal-route breakdown.
     /// How each view got sealed/ordered, one label `"route"`, incremented exactly once
@@ -355,6 +359,12 @@ impl Metrics {
             vantage_retained_bytes: register_int_counter_with_registry!(
                 "vantage_retained_bytes",
                 "Cumulative bincode-encoded size of every vantage block this node retained",
+                registry,
+            )
+            .unwrap(),
+            vantage_rejected_nonmember_total: register_int_counter_with_registry!(
+                "vantage_rejected_nonmember_total",
+                "Inbound vantage wire messages dropped for a non-committee-member declared sender",
                 registry,
             )
             .unwrap(),

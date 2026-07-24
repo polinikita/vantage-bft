@@ -130,6 +130,18 @@ impl MessageHandler for VantageReceiverHandler {
 
 pub struct VantageCore {
     name: PublicKey,
+    /// SECURITY (Fable audit): the trusted committee-membership set, populated once at
+    /// `spawn`/`build` time from `committee.authorities` before it's consumed building
+    /// the sub-engines. `dispatch_inbound` checks every wire-declared sender against
+    /// this BEFORE any census/count path sees the message -- wire messages are
+    /// unsigned, so without this gate a single Byzantine node could emit messages
+    /// under arbitrarily many fabricated non-committee sender keys, each counted once
+    /// by the dedup-only census helpers (AGB echo/ready, control-log Bracha/timeout/
+    /// commit, comp-reports, lane availability), inflating any party-count quorum.
+    /// `Pacemaker::on_wish` already carries an equivalent members-only check (kept, as
+    /// defense in depth) -- this field makes that check the single, centralized
+    /// choke point for every other wire-message path too.
+    members: HashSet<PublicKey>,
     lm: LaneManager,
     rep: Repairer,
     agb: AgbEngine,
@@ -192,6 +204,10 @@ pub struct VantageCore {
     tx_output: Sender<Header>,
 }
 
+/// `VantageCore::build`'s return shape: the constructed core plus the three channel
+/// ends `spawn` still needs to wire up (or a test needs to drive directly).
+type BuildOutput = (VantageCore, Receiver<Inbound>, Receiver<(Digest, Digest, WorkerId)>, Sender<Inbound>);
+
 impl VantageCore {
     // clippy::too_many_arguments: see primary/src/committer.rs's identical justification.
     #[allow(clippy::too_many_arguments)]
@@ -204,8 +220,31 @@ impl VantageCore {
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
     ) -> Sender<Inbound> {
+        let (core, rx_vantage, rx_payload_ready, tx_vantage) = Self::build(name, committee, parameters, store, metrics, tx_output);
+        tokio::spawn(core.run(rx_vantage, rx_our_digests, rx_payload_ready));
+        tx_vantage
+    }
+
+    /// Everything `spawn` used to do up through constructing `core`, split out purely
+    /// so tests can obtain a real `VantageCore` and drive `dispatch_inbound` directly
+    /// without a live tokio task/network -- `spawn` itself is otherwise byte-identical
+    /// (same construction, same order), just calling this then spawning `core.run`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        name: PublicKey,
+        committee: Committee,
+        parameters: Parameters,
+        store: Store,
+        metrics: Option<Arc<Metrics>>,
+        tx_output: Sender<Header>,
+    ) -> BuildOutput {
         let (tx_vantage, rx_vantage) = channel(CHANNEL_CAPACITY);
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
+
+        // SECURITY (Fable audit): captured before `committee` is consumed below building
+        // the sub-engines -- the single source of truth `dispatch_inbound` checks every
+        // wire-declared sender against.
+        let members: HashSet<PublicKey> = committee.authorities.keys().cloned().collect();
 
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
@@ -251,6 +290,7 @@ impl VantageCore {
 
         let core = Self {
             name,
+            members,
             lm,
             rep,
             agb,
@@ -288,8 +328,7 @@ impl VantageCore {
             metrics: core_metrics,
             tx_output,
         };
-        tokio::spawn(core.run(rx_vantage, rx_our_digests, rx_payload_ready));
-        tx_vantage
+        (core, rx_vantage, rx_payload_ready, tx_vantage)
     }
 
     async fn run(
@@ -555,7 +594,52 @@ impl VantageCore {
         effects
     }
 
+    /// SECURITY (Fable audit): extracts the wire-declared sender to validate against
+    /// `self.members`, for every `Inbound` variant that carries one. `None` for the
+    /// four variants with no wire sender field at all: `Serve` (header content is
+    /// self-authenticating by digest), `Propose`/`ControlInit` (positionally
+    /// attributed to `proposer(view)`/`control_leader(round)`, D4's standing
+    /// claimed-by-position class -- see `dispatch_inbound`'s own comments on those two
+    /// arms), and `ControlServe` (gated downstream by `pending_fetch(view, digest)`).
+    fn wire_sender(inbound: &Inbound) -> Option<PublicKey> {
+        // `PublicKey` is `Copy` -- dereference rather than `.clone()` (clippy::clone_on_copy).
+        match inbound {
+            Inbound::Publish(sender, _) => Some(*sender),
+            Inbound::HeadersRequest(_, requestor) => Some(*requestor),
+            Inbound::Ack(ack) => Some(ack.sender),
+            Inbound::Echo(e) => Some(e.sender),
+            Inbound::EchoSkip(_, s, _) => Some(*s),
+            Inbound::Ready(r) => Some(r.sender),
+            Inbound::NoReady(_, s, _) => Some(*s),
+            Inbound::Wish(_, s) => Some(*s),
+            Inbound::CompReport(_, _, s) => Some(*s),
+            Inbound::ControlEcho(s, _) => Some(*s),
+            Inbound::ControlReady(s, _) => Some(*s),
+            Inbound::ControlCommit(s, _) => Some(*s),
+            Inbound::ControlTimeoutVote(s, _) => Some(*s),
+            Inbound::ControlTimeoutAccept(s, _) => Some(*s),
+            Inbound::ControlFetch(_, _, s) => Some(*s),
+            Inbound::Serve(_) | Inbound::Propose(_) | Inbound::ControlInit(_, _) | Inbound::ControlServe(_, _) => None,
+        }
+    }
+
     async fn dispatch_inbound(&mut self, inbound: Inbound, now: Instant) -> Vec<Effect> {
+        // SECURITY (Fable audit): the single centralized membership gate -- every
+        // wire-declared sender is checked against the trusted committee-membership
+        // set BEFORE any census/count path below ever sees the message. Wire messages
+        // carry no signature, so without this check a single Byzantine node could
+        // forge arbitrarily many distinct non-committee sender keys, each counted once
+        // by the dedup-only census helpers downstream, inflating any party-count
+        // quorum. Honest senders are always committee members, so this is a no-op on
+        // every honest path.
+        if let Some(sender) = Self::wire_sender(&inbound) {
+            if !self.members.contains(&sender) {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_rejected_nonmember_total.inc();
+                }
+                return Vec::new();
+            }
+        }
         match inbound {
             Inbound::Publish(sender, header) => self.lm.process_publish(sender, header).await,
             Inbound::Serve(header) => self.rep.on_serve(header),
@@ -880,5 +964,120 @@ impl VantageCore {
                 log::debug!("Failed to send block through the output channel: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // SECURITY (Fable audit) regression coverage: `dispatch_inbound`'s membership
+    // gate, exercised against a real `VantageCore` (via the private `build`
+    // constructor split out of `spawn` for exactly this purpose -- see `build`'s doc
+    // comment) rather than the separate synchronous harness in `vantage/tests/`
+    // (whose own `Node::dispatch`, `harness.rs`, is a hand-rolled mirror that never
+    // carried this gap in the first place: it always derives the sender from the
+    // direct method call the harness itself makes, never from an untrusted wire
+    // message -- see `harness::deliver_only_to`'s own doc comment on that boundary).
+    // This module lives inside `node.rs`, rather than alongside the rest of the
+    // `vantage/tests/` suite, because `VantageCore`'s fields (`members` among them)
+    // and `dispatch_inbound`/`build` are private to this module -- a sibling test
+    // module under `vantage/tests/` has no access to them without a broader,
+    // out-of-scope visibility change.
+    use super::*;
+    use crate::vantage::agb::{Echo, Ready, ReadyGrade, ViewProposal};
+    use crate::vantage::control::ControlProposal;
+    use crypto::generate_keypair;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng as _;
+    use store::Store;
+
+    /// A real `VantageCore` for authority `keys()[idx]`, built through the same
+    /// `build` path `spawn` uses (only skipping the final `tokio::spawn(core.run(..))`
+    /// so the test can call `dispatch_inbound` directly and inspect the result).
+    fn test_core(idx: usize, path_suffix: &str) -> VantageCore {
+        let (name, _) = crate::common::keys()[idx];
+        let committee = crate::common::committee();
+        let path = format!(".db_test_vantage_membership_gate_{}", path_suffix);
+        let _ = std::fs::remove_dir_all(&path);
+        let store = Store::new(&path).expect("store opens");
+        let registry = prometheus::Registry::new();
+        let (metrics, _reporter) = Metrics::new(&registry);
+        let (tx_output, _rx_output) = channel(1);
+        let (core, _rx_vantage, _rx_payload_ready, _tx_vantage) =
+            VantageCore::build(name, committee, Parameters::default(), store, Some(metrics), tx_output);
+        core
+    }
+
+    /// A keypair guaranteed not to be in `crate::common::committee()` (whose four
+    /// members are seeded from `StdRng::from_seed([0; 32])` -- a disjoint seed here
+    /// deterministically avoids any collision).
+    fn fabricated_key() -> PublicKey {
+        let mut rng = StdRng::from_seed([7; 32]);
+        let (pk, _sk) = generate_keypair(&mut rng);
+        pk
+    }
+
+    fn dummy_proposal() -> ViewProposal {
+        ViewProposal { view: 1, c: Vec::new(), t: Vec::new(), m: None }
+    }
+
+    fn rejected_count(core: &VantageCore) -> u64 {
+        core.metrics.as_ref().expect("test core has metrics").vantage_rejected_nonmember_total.get()
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_echo_from_nonmember_sender() {
+        let mut core = test_core(0, "echo_nonmember");
+        let fake = fabricated_key();
+        assert!(!core.members.contains(&fake));
+
+        let echo = Echo { proposal: dummy_proposal(), grade: 0, sender: fake, wish: 0, origin: None };
+        let effects = core.dispatch_inbound(Inbound::Echo(echo), Instant::now()).await;
+
+        assert!(effects.is_empty(), "a fabricated non-member Echo must be dropped with no effects");
+        assert_eq!(rejected_count(&core), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_ready_from_nonmember_sender() {
+        let mut core = test_core(0, "ready_nonmember");
+        let fake = fabricated_key();
+
+        let ready = Ready { proposal: dummy_proposal(), grade: ReadyGrade::Zero, sender: fake, wish: 0 };
+        let effects = core.dispatch_inbound(Inbound::Ready(ready), Instant::now()).await;
+
+        assert!(effects.is_empty(), "a fabricated non-member Ready must be dropped with no effects");
+        assert_eq!(rejected_count(&core), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_control_echo_from_nonmember_sender() {
+        let mut core = test_core(0, "control_echo_nonmember");
+        let fake = fabricated_key();
+        let proposal = ControlProposal { round: 1, parent: 0, value: None };
+
+        let effects = core.dispatch_inbound(Inbound::ControlEcho(fake, proposal), Instant::now()).await;
+
+        assert!(effects.is_empty(), "a fabricated non-member ControlEcho must be dropped with no effects");
+        assert_eq!(rejected_count(&core), 1);
+    }
+
+    /// Positive control: an honest, real committee member's Echo is NOT dropped by
+    /// the gate -- it reaches `AgbEngine::on_echo` and produces the same effects the
+    /// gate-free code path always did (the gate is a no-op on every honest path).
+    #[tokio::test]
+    async fn dispatch_accepts_echo_from_committee_member() {
+        let mut core = test_core(0, "echo_member");
+        let (member, _) = crate::common::keys()[1];
+        assert!(core.members.contains(&member));
+
+        let echo = Echo { proposal: dummy_proposal(), grade: 0, sender: member, wish: 0, origin: None };
+        let effects = core.dispatch_inbound(Inbound::Echo(echo), Instant::now()).await;
+
+        // Not dropped by the gate: the rejection counter stays at zero. (The specific
+        // downstream `AgbEngine`/`Pacemaker` effects for this exact input are already
+        // covered by `vantage/tests/agb_echo_tests.rs`; this test's only job is
+        // proving the gate doesn't also swallow honest, real-member traffic.)
+        assert_eq!(rejected_count(&core), 0);
+        let _ = effects;
     }
 }
