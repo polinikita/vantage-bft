@@ -602,21 +602,40 @@ impl VantageCore {
     /// recursive `async fn` calls. PHASE6-SPEC.md §4: when it's genuinely our turn,
     /// consult the `Resolver` for this turn's `M` (data-only `None`, or a recovery
     /// entry) before building the proposal -- computed only when it's actually our
-    /// turn, so `Frontier::try_propose`'s own gate (unaffected) stays the sole
+    /// turn, so `Frontier::propose_view`'s own gate (unaffected) stays the sole
     /// authority on whether a proposal is emitted at all.
+    ///
+    /// Paper R1, early-wish trigger: `p_i` proposes any view `v` it owns and hasn't
+    /// proposed yet with `v <= max(a_i + 1, omega_i^+)` -- not just `v = a_i + 1`.
+    /// `omega_i^+ > a_i + 1` lets this party mint a proposal for a view still ahead of
+    /// its own frontier; such an early proposal is PASSIVE by construction (receivers
+    /// buffer/fix it but it only activates once the frontier itself reaches it --
+    /// automatic in the existing echo-stage code, untouched here). Iterates the
+    /// concrete, small (`omega_i^+` tracks `a_i` within the entry spread) range
+    /// `a_i+1..=bound` in increasing order, so lower (sooner-needed) views are always
+    /// proposed/broadcast before higher ones; `propose_view`'s own proposed-once guard
+    /// makes every call in the range (and every redundant call to this whole method)
+    /// idempotent, so this always terminates and is safe to call more than once per
+    /// event.
     fn try_propose_effects(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let view = self.frontier.next_turn();
-        let m = if self.agb.proposer(view) == self.name && !self.frontier.already_proposed(view) {
-            let agb = &self.agb;
-            let control = &self.control;
-            self.resolver.decide(agb, view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
-        } else {
-            None
-        };
-        if let Some(proposal) = self.frontier.try_propose(&self.lm, m) {
-            effects.push(Effect::BroadcastPropose(proposal.clone()));
-            effects.extend(self.agb.on_propose(self.name, proposal, now, &mut self.lm, &mut self.rep));
+        let bound = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
+        let mut view = self.frontier.a_i() + 1;
+        while view <= bound {
+            if self.agb.proposer(view) != self.name || self.frontier.already_proposed(view) {
+                view += 1;
+                continue;
+            }
+            let m = {
+                let agb = &self.agb;
+                let control = &self.control;
+                self.resolver.decide(agb, view, now, |u| agb.is_sealed(u) || control.is_anchor_resolved(u))
+            };
+            if let Some(proposal) = self.frontier.propose_view(view, &self.lm, m) {
+                effects.push(Effect::BroadcastPropose(proposal.clone()));
+                effects.extend(self.agb.on_propose(self.name, proposal, now, &mut self.lm, &mut self.rep));
+            }
+            view += 1;
         }
         effects
     }
@@ -723,29 +742,43 @@ impl VantageCore {
                 let mut effects = self.pacemaker.on_wish(echo.sender, echo.wish);
                 effects.extend(self.agb.on_echo(echo, &mut self.rep));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                // Paper R1 early-wish trigger: `on_wish` above may just have raised
+                // `omega_i^+`, which can newly satisfy `v <= max(a_i+1, omega_i^+)` for
+                // an owned view this party hasn't proposed yet -- redundant/idempotent
+                // (`propose_view`'s proposed-once guard) when it hasn't.
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::EchoSkip(view, sender, wish) => {
                 let mut effects = self.pacemaker.on_wish(sender, wish);
                 effects.extend(self.agb.on_echo_skip(view, sender));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::Ready(ready) => {
                 let mut effects = self.pacemaker.on_wish(ready.sender, ready.wish);
                 effects.extend(self.agb.on_ready(ready, &mut self.rep));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::NoReady(view, sender, wish) => {
                 let mut effects = self.pacemaker.on_wish(sender, wish);
                 effects.extend(self.agb.on_noready(view, sender));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
             // A standalone `VantageWish` (W2 amplification): never an echo/ready/ack/
             // origin bit/resolution justification -- it only ever schedules views.
-            Inbound::Wish(view, sender) => self.pacemaker.on_wish(sender, view),
+            // Still a wish-bearing arm for R1's early-wish trigger purposes: `on_wish`
+            // can raise `omega_i^+` here exactly as in the four arms above.
+            Inbound::Wish(view, sender) => {
+                let mut effects = self.pacemaker.on_wish(sender, view);
+                effects.extend(self.try_propose_effects(now));
+                effects
+            }
 
             // --- PHASE6-SPEC.md §5 (reports + control log) ---
             Inbound::CompReport(view, digest, sender) => self.control.on_comp_report(view, digest, sender),

@@ -126,8 +126,22 @@ impl Frontier {
     /// advance (checks the new `a_i + 1`). PHASE6-SPEC.md §4 extension: `m`, computed
     /// by the caller's `Resolver` (data-only `None`, or a recovery entry) -- this
     /// method's own gate (proposed-once, proposer-turn) is unaffected either way.
+    /// Thin wrapper over `propose_view` for the `a_i + 1` case (the frontier-advance
+    /// path); the paper's `omega_i^+` early-wish trigger reaches other owned views
+    /// through `propose_view` directly.
     pub fn try_propose(&mut self, lm: &LaneManager, m: Option<ResolutionEntry>) -> Option<ViewProposal> {
-        let view = self.a_i + 1;
+        self.propose_view(self.a_i + 1, lm, m)
+    }
+
+    /// R1's trigger, generalized to an arbitrary owned `view` (paper: "p_i proposes any
+    /// view v it owns and hasn't proposed yet with `v <= max(a_i + 1, omega_i^+)`").
+    /// `view = a_i + 1` is the `try_propose` case; `view > a_i + 1` is the passive
+    /// early-wish proposal -- reachable only via the caller's `omega_i^+` bound, and
+    /// only ever buffered (not activated) downstream until the frontier actually
+    /// reaches it (automatic in the existing echo-stage code, unaffected by this
+    /// method). Same gate as `try_propose`: not-yet-proposed, and it must actually be
+    /// this party's turn for `view`.
+    pub fn propose_view(&mut self, view: View, lm: &LaneManager, m: Option<ResolutionEntry>) -> Option<ViewProposal> {
         if self.proposed.contains(&view) {
             return None;
         }

@@ -361,15 +361,17 @@ impl AgbEngine {
     }
 
     /// theta_E: absolute echo fallback deadline. Paper (signature-free.tex, timeout
-    /// display): theta_E = 4*Delta (tightened from 5*Delta).
+    /// display, commit b362084): theta_E = 3*Delta.
     pub fn theta_echo(&self) -> Duration {
-        self.delta * 4
+        self.delta * 3
     }
 
-    /// theta_R: absolute ready deadline. Paper: theta_R = 5*Delta (tightened from
-    /// 6*Delta). The control-round timer stays 6*Delta (paper: must exceed 5*Delta).
+    /// theta_R: absolute ready deadline. Paper (b362084): theta_R = 4*Delta. (The
+    /// control-round timer in control.rs is a separate constant with its own paper
+    /// requirement -- see `ControlLog::control_round_timeout` -- not derived from
+    /// theta_R.)
     pub fn theta_ready(&self) -> Duration {
-        self.delta * 5
+        self.delta * 4
     }
 
     pub fn proposer(&self, view: View) -> PublicKey {

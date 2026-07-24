@@ -64,6 +64,15 @@ impl Pacemaker {
         self.entry_target
     }
 
+    /// R1's early-wish trigger (paper): the current amplification statistic
+    /// `omega_i^+`, i.e. the `f+1`-th largest first-hand wish across `omega`. Recomputed
+    /// from `omega` on every call (not cached), so it is always current with respect to
+    /// the latest `on_wish`/`raise_own_wish` update -- exactly the same statistic
+    /// `on_wish` itself recomputes internally before deciding whether to amplify.
+    pub fn omega_plus(&self) -> View {
+        self.kth_largest(self.f_plus_1_parties)
+    }
+
     /// PHASE7-PREP-NOTES.md Finding A: metrics-only accessor -- the largest view this
     /// party has itself formally entered (W5). Distinct from the `#[cfg(test)]`
     /// accessor below only in that production code (the 1s progress-gauge sampler)
