@@ -1,11 +1,27 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+from datetime import datetime, timezone
+from os import makedirs
+from os.path import join
+
 from fabric import task
 
 from benchmark.logs import ParseError, LogParser
-from benchmark.utils import Print
+from benchmark.utils import Print, PathMaker
 from benchmark.plot import Ploter, PlotError
 from benchmark.instance import InstanceManager
 from benchmark.remote import Bench, BenchError
+
+
+def _log_cost(result):
+    ''' COST-ESTIMATE: append a timestamped cost-estimate block to
+    `results/cost-log.txt` (created, with its directory, if missing) -- one
+    block per `fab destroy` run, kept alongside the throughput/latency result
+    files already written under `results/`. '''
+    makedirs(PathMaker.results_path(), exist_ok=True)
+    path = join(PathMaker.results_path(), 'cost-log.txt')
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    with open(path, 'a') as f:
+        f.write(f'--- {timestamp} ---\n{result["formatted"]}\n\n')
 
 
 @task
@@ -19,9 +35,34 @@ def create(ctx, nodes=6):
 
 @task
 def destroy(ctx):
-    ''' Destroy the testbed '''
+    ''' Destroy the testbed.
+
+    COST-ESTIMATE: before terminating, computes + prints a deterministic AWS
+    cost estimate (alive-time x price; no Cost Explorer/CloudTrail -- both
+    denied for this IAM user; see `InstanceManager.estimate_cost`) and
+    appends it to `results/cost-log.txt`. This MUST happen before
+    `terminate_instances()`: LaunchTime (and Spot-vs-on-demand status) is
+    only visible on instances that are still pending/running. '''
     try:
-        InstanceManager.make().terminate_instances()
+        manager = InstanceManager.make()
+        result = manager.estimate_cost()
+        Print.info(result['formatted'])
+        _log_cost(result)
+        manager.terminate_instances()
+    except BenchError as e:
+        Print.error(e)
+
+
+@task
+def cost(ctx):
+    ''' Print the current AWS cost estimate for the live testbed, without
+    terminating anything -- the same computation `destroy` runs at teardown
+    (see `InstanceManager.estimate_cost`), callable mid-run to check spend
+    so far. Does not write to `results/cost-log.txt` (that log is one block
+    per actual teardown, not a running mid-campaign log). '''
+    try:
+        result = InstanceManager.make().estimate_cost()
+        Print.info(result['formatted'])
     except BenchError as e:
         Print.error(e)
 

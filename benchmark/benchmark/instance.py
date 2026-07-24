@@ -2,6 +2,7 @@
 import boto3
 from botocore.exceptions import ClientError
 from collections import defaultdict, OrderedDict
+from datetime import datetime, timezone
 from time import sleep
 
 from benchmark.utils import Print, BenchError, progress_bar
@@ -31,6 +32,20 @@ class InstanceManager:
     # port the *collector itself* listens on, queried by the coordinator laptop
     # after a run (remote.py's fetch_collector_metrics).
     MONITOR_PORT = 9090
+
+    # COST-ESTIMATE: static on-demand fallback price (USD/hr), used by
+    # `estimate_cost()` whenever an instance isn't Spot, or is Spot but its
+    # `describe_spot_price_history` lookup fails. Keyed by instance type;
+    # `DEFAULT_FALLBACK_PRICE` covers any type without its own entry.
+    # c5.xlarge/eu-west-1 on-demand was ~0.192 USD/hr at the time this was
+    # written -- re-check https://aws.amazon.com/ec2/pricing/on-demand/ if
+    # instance_type/region in settings.json changes; this is a documented
+    # approximation, not a live price feed (Cost Explorer/CloudTrail are
+    # denied for this IAM user).
+    ON_DEMAND_FALLBACK_PRICE = {
+        'c5.xlarge': 0.192,  # eu-west-1
+    }
+    DEFAULT_FALLBACK_PRICE = 0.192
 
     def __init__(self, settings):
         assert isinstance(settings, Settings)
@@ -380,6 +395,159 @@ class InstanceManager:
             Print.heading('Successfully created the metrics-collector instance')
         except ClientError as e:
             raise BenchError('Failed to create AWS instances', AWSError(e))
+
+    def _spot_price(self, client, instance_type):
+        ''' Latest Spot price (USD/hr, float) for `instance_type` in
+        `client`'s region, or None if the lookup fails (no history returned,
+        or an API error) -- callers fall back to a static on-demand estimate
+        in that case (see `ON_DEMAND_FALLBACK_PRICE`).
+
+        `MaxResults=1` relies on `describe_spot_price_history` returning
+        entries most-recent-timestamp-first when no explicit StartTime/
+        EndTime is given (the documented/observed default) -- this is a
+        "latest price" read, not a historical query. '''
+        try:
+            r = client.describe_spot_price_history(
+                InstanceTypes=[instance_type],
+                ProductDescriptions=['Linux/UNIX'],
+                MaxResults=1,
+            )
+        except ClientError:
+            return None
+        history = r.get('SpotPriceHistory', [])
+        if not history:
+            return None
+        return float(history[0]['SpotPrice'])
+
+    @staticmethod
+    def _format_cost(total_usd, breakdown):
+        lines = [
+            'AWS cost estimate (alive-time x price; EXCLUDES EBS storage and '
+            'data transfer; spot is billed per-second -- this is a close '
+            'estimate, not the invoice):'
+        ]
+        if not breakdown:
+            lines.append('  No pending/running instances.')
+        for row in breakdown:
+            price_note = ' [approx, on-demand fallback]' if row['approximate'] else ' [spot]'
+            lines.append(
+                f"  {row['region']:<12} {row['instance_type']:<12} "
+                f"x{row['count']:<3} @ ${row['price_per_hour']:.4f}/hr{price_note} "
+                f"-> {row['instance_hours']:.4f} instance-hours = "
+                f"${row['subtotal_usd']:.4f}"
+            )
+        lines.append(f'  TOTAL: ${total_usd:.4f}')
+        return '\n'.join(lines)
+
+    def estimate_cost(self, states=('pending', 'running')):
+        ''' Deterministic AWS EC2 cost estimate for every instance this
+        harness owns (validators AND the metrics-collector) currently in
+        `states` (default: the ones a teardown is about to terminate) --
+        computed entirely from `describe_instances`/
+        `describe_spot_price_history` (both allowed for this IAM user), with
+        NO Cost Explorer/CloudTrail calls (both denied).
+
+        For each instance: alive_hours = (now(UTC) - LaunchTime) / 3600.
+        Spot instances (`InstanceLifecycle == 'spot'`) get priced from the
+        latest `describe_spot_price_history` entry for their (region,
+        instance type), cached per (region, type) so each pair is queried at
+        most once regardless of instance count. Non-spot instances, and spot
+        instances whose price lookup fails, fall back to a static on-demand
+        estimate (`ON_DEMAND_FALLBACK_PRICE`/`DEFAULT_FALLBACK_PRICE`) and are
+        flagged `approximate=True`.
+
+        EXCLUDES EBS volume and data-transfer costs (the latter is minimal
+        here: node<->node traffic runs over private VPC IPs, see
+        `internal_hosts()`). Spot is billed per-second, so `alive_hours`
+        itself is exact -- the only approximation is the fallback price path.
+        This must be called while instances are still up (LaunchTime is only
+        visible pre-termination), i.e. BEFORE `terminate_instances()`.
+
+        Returns:
+          {
+            'total_usd': float,
+            'breakdown': [
+              {
+                'region': str, 'instance_type': str, 'count': int,
+                'price_per_hour': float, 'approximate': bool,
+                'instance_hours': float, 'subtotal_usd': float,
+              }, ...
+            ],
+            'formatted': str,  # multi-line human-readable report
+          }
+        '''
+        now = datetime.now(timezone.utc)
+        spot_price_cache = {}  # (region, instance_type) -> float or None
+        # (region, instance_type, approximate) -> {'count', 'instance_hours', 'price'}
+        aggregate = OrderedDict()
+
+        for region, client in self.clients.items():
+            try:
+                r = client.describe_instances(
+                    Filters=[
+                        {
+                            'Name': 'tag:Name',
+                            'Values': [self.INSTANCE_NAME, self.COLLECTOR_NAME]
+                        },
+                        {
+                            'Name': 'instance-state-name',
+                            'Values': list(states)
+                        },
+                    ]
+                )
+            except ClientError as e:
+                raise BenchError(
+                    'Failed to describe instances for cost estimate', AWSError(e)
+                )
+
+            instances = [y for x in r['Reservations'] for y in x['Instances']]
+            for inst in instances:
+                instance_type = inst['InstanceType']
+                launch_time = inst['LaunchTime']  # tz-aware UTC (boto3-provided)
+                alive_hours = max((now - launch_time).total_seconds(), 0.0) / 3600
+                is_spot = inst.get('InstanceLifecycle') == 'spot'
+
+                price, approximate = None, False
+                if is_spot:
+                    cache_key = (region, instance_type)
+                    if cache_key not in spot_price_cache:
+                        spot_price_cache[cache_key] = self._spot_price(
+                            client, instance_type
+                        )
+                    price = spot_price_cache[cache_key]
+                if price is None:
+                    price = self.ON_DEMAND_FALLBACK_PRICE.get(
+                        instance_type, self.DEFAULT_FALLBACK_PRICE
+                    )
+                    approximate = True
+
+                key = (region, instance_type, approximate)
+                entry = aggregate.setdefault(
+                    key, {'count': 0, 'instance_hours': 0.0, 'price': price}
+                )
+                entry['count'] += 1
+                entry['instance_hours'] += alive_hours
+
+        breakdown = []
+        total_usd = 0.0
+        for (region, instance_type, approximate), entry in aggregate.items():
+            subtotal = entry['instance_hours'] * entry['price']
+            total_usd += subtotal
+            breakdown.append({
+                'region': region,
+                'instance_type': instance_type,
+                'count': entry['count'],
+                'price_per_hour': entry['price'],
+                'approximate': approximate,
+                'instance_hours': entry['instance_hours'],
+                'subtotal_usd': subtotal,
+            })
+
+        return {
+            'total_usd': total_usd,
+            'breakdown': breakdown,
+            'formatted': self._format_cost(total_usd, breakdown),
+        }
 
     def terminate_instances(self):
         ''' Terminates every instance this harness owns -- validators AND the

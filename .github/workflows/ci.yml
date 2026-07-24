@@ -3,6 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'benchmark/**'
+      - '**/*.md'
+      - '.gitignore'
   pull_request:
     branches: [main]
 

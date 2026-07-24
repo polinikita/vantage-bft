@@ -3,6 +3,10 @@ name: Docker
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'benchmark/**'
+      - '**/*.md'
+      - '.gitignore'
   workflow_dispatch:
 
 permissions:
