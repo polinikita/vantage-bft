@@ -2,13 +2,16 @@
 use crate::worker::{Round, WorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
-use crypto::{Digest, PublicKey};
+use crypto::{Digest, PairwiseKeys, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use metrics::Metrics;
 use network::{BatchConfig, SimpleSender};
 use primary::PrimaryWorkerMessage;
+use rand::rngs::SmallRng;
+use rand::seq::SliceRandom as _;
+use rand::SeedableRng as _;
 use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::collections::HashSet;
@@ -65,6 +68,17 @@ pub struct Synchronizer {
     /// batch-count scale (a run is seconds to minutes, not committed-batches-forever).
     #[cfg(feature = "benchmark")]
     observed_commits: HashSet<Digest>,
+    /// SECURITY (Fable audit): `Parameters::authenticate_channels`. `None` is
+    /// byte-identical to pre-MAC behavior.
+    channel_auth: Option<Arc<PairwiseKeys>>,
+    /// Only consulted when `channel_auth` is `Some`, to shuffle+truncate the retry
+    /// broadcast's own `(PublicKey, SocketAddr)` pairs ourselves (needed so each
+    /// destination gets its own per-destination tag -- `SimpleSender::
+    /// lucky_broadcast_typed`'s internal shuffle only ever sees plain `SocketAddr`s,
+    /// with no way to carry a distinct tag per address). A no-op source of randomness
+    /// otherwise (this is a best-effort "pick some random peers to retry against"
+    /// selection, not a determinism-sensitive one).
+    rng: SmallRng,
 }
 
 impl Synchronizer {
@@ -89,6 +103,9 @@ impl Synchronizer {
         compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
+        // SECURITY (Fable audit): appended last, same convention as every other
+        // MAC-consuming `::spawn`.
+        channel_auth: Option<Arc<PairwiseKeys>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -106,10 +123,26 @@ impl Synchronizer {
                 metrics,
                 #[cfg(feature = "benchmark")]
                 observed_commits: HashSet::new(),
+                channel_auth,
+                rng: SmallRng::from_entropy(),
             }
             .run()
             .await;
         });
+    }
+
+    /// SECURITY (Fable audit): appends `dest`'s tag (byte-identical, unappended, when
+    /// `channel_auth` is off) to `payload`, keyed `k_{self.name, dest}`.
+    fn tagged(&self, dest: &PublicKey, payload: Vec<u8>) -> Bytes {
+        match &self.channel_auth {
+            None => Bytes::from(payload),
+            Some(auth) => {
+                let tag = auth.tag_for(dest, &payload).expect("dest is a committee member");
+                let mut tagged = payload;
+                tagged.extend_from_slice(&tag);
+                Bytes::from(tagged)
+            }
+        }
     }
 
     /// Helper function. It waits for a batch to become available in the storage
@@ -186,7 +219,8 @@ impl Synchronizer {
                         };
                         let message = WorkerMessage::BatchRequest(missing, self.name);
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-                        self.network.send_typed(address, Bytes::from(serialized), "BatchRequest").await;
+                        let tagged = self.tagged(&target, serialized);
+                        self.network.send_typed(address, tagged, "BatchRequest").await;
                     },
                     PrimaryWorkerMessage::Cleanup(round) => {
                         // Keep track of the primary's round number.
@@ -247,15 +281,38 @@ impl Synchronizer {
                         }
                     }
                     if !retry.is_empty() {
-                        let addresses = self.committee
-                            .others_workers(&self.name, &self.id)
-                            .iter().map(|(_, address)| address.worker_to_worker)
-                            .collect();
                         let message = WorkerMessage::BatchRequest(retry, self.name);
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-                        self.network
-                            .lucky_broadcast_typed(addresses, Bytes::from(serialized), self.sync_retry_nodes, "BatchRequest")
-                            .await;
+                        match self.channel_auth.clone() {
+                            None => {
+                                let addresses = self.committee
+                                    .others_workers(&self.name, &self.id)
+                                    .iter().map(|(_, address)| address.worker_to_worker)
+                                    .collect();
+                                self.network
+                                    .lucky_broadcast_typed(addresses, Bytes::from(serialized), self.sync_retry_nodes, "BatchRequest")
+                                    .await;
+                            }
+                            // SECURITY (Fable audit): each destination needs its own
+                            // per-destination tag (`k_{self.name, dest}`), so this
+                            // can't reuse `lucky_broadcast_typed`'s single-`Bytes`-
+                            // shared-across-addresses convenience -- shuffle+truncate
+                            // ourselves, then unicast each with its own tag appended.
+                            Some(auth) => {
+                                let mut peers: Vec<(PublicKey, SocketAddr)> = self.committee
+                                    .others_workers(&self.name, &self.id)
+                                    .iter().map(|(pk, address)| (*pk, address.worker_to_worker))
+                                    .collect();
+                                peers.shuffle(&mut self.rng);
+                                peers.truncate(self.sync_retry_nodes);
+                                for (peer, addr) in peers {
+                                    let tag = auth.tag_for(&peer, &serialized).expect("peer is a committee member");
+                                    let mut tagged = serialized.clone();
+                                    tagged.extend_from_slice(&tag);
+                                    self.network.send_typed(addr, Bytes::from(tagged), "BatchRequest").await;
+                                }
+                            }
+                        }
                     }
 
                     // Reschedule the timer.

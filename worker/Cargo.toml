@@ -14,6 +14,7 @@ log = { workspace = true }
 bincode = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
 
 crypto = { path = "../crypto" }
 store = { path = "../store" }
@@ -22,9 +23,6 @@ network = { path = "../network" }
 primary = { path = "../primary" }
 metrics = { path = "../metrics" }
 prometheus = { workspace = true }
-
-[dev-dependencies]
-rand = { workspace = true }
 
 [features]
 benchmark = []

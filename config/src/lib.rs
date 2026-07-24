@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crypto::{generate_production_keypair, PublicKey, SecretKey};
+use crypto::{generate_production_keypair, MacSecret, PublicKey, SecretKey};
 use log::{info, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -245,6 +245,27 @@ pub struct Parameters {
     /// cap still short-circuits this window the moment a burst fills it.
     #[serde(default = "default_batch_max_delay_ms")]
     pub batch_max_delay_ms: u64,
+
+    /// Symmetric pairwise-MAC authenticated channels (signature-free, quantum-safe):
+    /// off by default (`#[serde(default)]` = `false`) -- byte-identical wire when off,
+    /// no MAC is computed, appended, or verified anywhere. Committee-wide consistent
+    /// by construction, same reasoning as `compress_network`/`batch_messages`: every
+    /// node's `Parameters` comes from the same generated config, and every peer must
+    /// agree on whether the trailing tag is present. Closes wire-level sender
+    /// impersonation (a Byzantine node forging a message under an honest peer's
+    /// declared sender field) for every inter-validator channel this crate's `network`
+    /// senders/receivers carry, using only `mac_secret` -- no signatures, no PKI, no
+    /// handshake.
+    #[serde(default)]
+    pub authenticate_channels: bool,
+    /// The committee-wide symmetric master secret `authenticate_channels` derives
+    /// every pairwise key from (see `crypto::mac`). `None` unless
+    /// `authenticate_channels` is set; spawning with the flag on and no secret is a
+    /// misconfiguration (every `*::spawn` that reads this panics loudly rather than
+    /// silently running unauthenticated). `#[serde(default)]` keeps every pre-existing
+    /// parameter file (which never mentions this field) valid.
+    #[serde(default)]
+    pub mac_secret: Option<MacSecret>,
 }
 
 fn default_batch_max_bytes() -> usize {
@@ -371,6 +392,8 @@ impl Default for Parameters {
             batch_messages: false,
             batch_max_bytes: default_batch_max_bytes(),
             batch_max_delay_ms: default_batch_max_delay_ms(),
+            authenticate_channels: false,
+            mac_secret: None,
         }
     }
 }
@@ -423,6 +446,7 @@ impl Parameters {
             "Network batching enabled? {}. Max bytes: {}. Max delay: {} ms",
             self.batch_messages, self.batch_max_bytes, self.batch_max_delay_ms
         );
+        info!("Authenticated channels (symmetric pairwise MAC) enabled? {}", self.authenticate_channels);
     }
 }
 
@@ -763,6 +787,16 @@ impl Committee {
 
     pub fn address(&self, name: &PublicKey) -> Option<SocketAddr> {
         self.authorities.get(name).map(|x| x.consensus.consensus_to_consensus)
+    }
+
+    /// Symmetric pairwise-MAC authenticated channels: builds `myself`'s own
+    /// `PairwiseKeys` handle, one derived key per committee member (including
+    /// `myself` -- see `PairwiseKeys::build`'s doc comment). Every process belonging
+    /// to the same authority (a primary and each of its workers, which all share
+    /// `myself`'s public key) independently derives the IDENTICAL keys from the same
+    /// `secret` + `self`, with no handshake and no cross-process plumbing needed.
+    pub fn pairwise_keys(&self, myself: &PublicKey, secret: &MacSecret) -> crypto::PairwiseKeys {
+        crypto::PairwiseKeys::build(secret, *myself, self.authorities.keys().cloned())
     }
 
     pub fn broadcast_addresses(&self, myself: &PublicKey) -> Vec<(PublicKey, SocketAddr)> {

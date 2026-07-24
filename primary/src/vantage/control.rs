@@ -32,6 +32,21 @@ pub struct ControlProposal {
     pub value: Option<(View, Digest)>,
 }
 
+/// §5: round-robin control leader over the committee's authorities in their canonical
+/// sorted order (`Committee::authorities` is a `BTreeMap`, so iteration order already
+/// is that canonical order) -- index `(r - 1) mod n`, independent of the data-view
+/// proposer rotation (`agb::proposer`, a different counter). A free function (mirrors
+/// `agb::proposer`'s own top-level shape) so it can be called from anywhere that holds
+/// a `&Committee` without needing a live `ControlLog` -- e.g. `authenticate_channels`'
+/// MAC verification, which must derive the SAME positionally-claimed sender
+/// `ControlLog::on_control_init` trusts, at the network-receive boundary before a
+/// `ControlLog` even exists to ask.
+pub fn control_leader(committee: &Committee, round: Round) -> PublicKey {
+    let names: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
+    let n = names.len() as u64;
+    names[((round.saturating_sub(1)) % n) as usize]
+}
+
 /// Per-round validated-Bracha state (one instance per round; multiple rounds' RBC
 /// instances can be concurrently in flight since entering round r+1 only requires
 /// round r to be marked SAFE, not committed -- Fig. 1's pipelining).
@@ -66,7 +81,6 @@ pub struct ControlLog {
     committee: Committee,
     sid: Digest,
     delta: Duration,
-    n: usize,
     f_plus_1_parties: usize,
     two_f_plus_1_parties: usize,
     n_minus_f_parties: usize,
@@ -139,7 +153,6 @@ impl ControlLog {
             committee,
             sid,
             delta: Duration::from_millis(delta_ms),
-            n,
             f_plus_1_parties: thresholds.f_plus_1_parties,
             two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
             n_minus_f_parties: thresholds.n_minus_f_parties,
@@ -181,8 +194,7 @@ impl ControlLog {
     /// §5: round-robin control leader, independent of the data-view proposer rotation
     /// (a different counter -- `Round`, not `View`) -- same formula as `agb::proposer`.
     pub fn control_leader(&self, round: Round) -> PublicKey {
-        let names: Vec<PublicKey> = self.committee.authorities.keys().cloned().collect();
-        names[((round.saturating_sub(1)) % self.n as u64) as usize]
+        control_leader(&self.committee, round)
     }
 
     fn is_our_turn_to_lead(&self, round: Round) -> bool {

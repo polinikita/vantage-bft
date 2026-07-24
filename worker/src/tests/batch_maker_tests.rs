@@ -20,6 +20,7 @@ async fn make_batch() {
         Metrics::new(&prometheus::Registry::new()).0,
         false,
         BatchConfig::default(),
+        /* channel_auth */ None,
     );
 
     // Send enough transactions to seal a batch.
@@ -52,6 +53,7 @@ async fn batch_timeout() {
         Metrics::new(&prometheus::Registry::new()).0,
         false,
         BatchConfig::default(),
+        /* channel_auth */ None,
     );
 
     // Do not send enough transactions to seal a batch..

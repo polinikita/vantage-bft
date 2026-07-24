@@ -265,6 +265,19 @@ impl Primary {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        // SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
+        // (`Parameters::authenticate_channels`), resolved once here -- shared by
+        // every handler/sender below, both protocol branches, exactly like `batch`
+        // above. `authenticate_channels` on with no `mac_secret` is a misconfiguration
+        // (would otherwise silently run unauthenticated); panic loudly rather than
+        // let it pass.
+        let channel_auth: Option<Arc<crypto::PairwiseKeys>> = if parameters.authenticate_channels {
+            let secret = parameters.mac_secret.expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
+            Some(Arc::new(committee.pairwise_keys(&name, &secret)))
+        } else {
+            None
+        };
+
         match parameters.protocol {
             Protocol::Vantage => {
                 // PHASE4-SPEC.md §1: a single `VantageCore` task replaces
@@ -291,7 +304,7 @@ impl Primary {
                 NetworkReceiver::spawn_full(
                     address,
                     /* handler */
-                    crate::vantage::node::VantageReceiverHandler { tx: tx_vantage, metrics: Some(metrics.clone()) },
+                    crate::vantage::node::VantageReceiverHandler { tx: tx_vantage, metrics: Some(metrics.clone()), channel_auth: channel_auth.clone(), committee: committee.clone() },
                     Some(metrics.clone()),
                     parameters.compress_network,
                     // Acks every received frame (moved out of `dispatch` -- see
@@ -320,6 +333,8 @@ impl Primary {
                         tx_our_digests,
                         tx_others_digests,
                         metrics: metrics.clone(),
+                        name,
+                        channel_auth: channel_auth.clone(),
                     },
                     Some(metrics.clone()),
                     parameters.compress_network,
@@ -387,6 +402,8 @@ impl Primary {
                         tx_our_digests,
                         tx_others_digests,
                         metrics: metrics.clone(),
+                        name,
+                        channel_auth: channel_auth.clone(),
                     },
                     Some(metrics.clone()),
                     parameters.compress_network,
@@ -464,7 +481,7 @@ impl Primary {
                     batch,
                 );
 
-                Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer, metrics.clone(), parameters.compress_network, batch);
+                Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer, metrics.clone(), parameters.compress_network, batch, channel_auth.clone());
 
                 // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
                 GarbageCollector::spawn(
@@ -477,6 +494,7 @@ impl Primary {
                     metrics.clone(),
                     parameters.compress_network,
                     batch,
+                    channel_auth.clone(),
                 );
 
                 // Receives batch digests from other workers. They are only used to validate headers.
@@ -499,6 +517,7 @@ impl Primary {
                     metrics.clone(),
                     parameters.compress_network,
                     batch,
+                    channel_auth.clone(),
                 );
 
                 // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
@@ -593,6 +612,16 @@ struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
     metrics: Arc<Metrics>,
+    /// SECURITY (Fable audit): this authority's own public key -- the worker<->primary
+    /// channel is intra-authority (our own worker shares our own public key), so the
+    /// MAC candidate sender for every message on this port is always `name` itself
+    /// (`k_{name,name}`, the degenerate self-pair key -- see `PairwiseKeys::build`'s
+    /// doc comment). Unused when `channel_auth` is `None`.
+    name: PublicKey,
+    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
+    /// behavior -- every received frame is deserialized and routed exactly as
+    /// received, no trailing bytes stripped or checked.
+    channel_auth: Option<Arc<crypto::PairwiseKeys>>,
 }
 
 #[async_trait]
@@ -602,18 +631,37 @@ impl MessageHandler for WorkerReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
+        // SECURITY (Fable audit): strip and verify the trailing MAC tag before
+        // deserializing -- see `crate::vantage::node::VantageReceiverHandler::
+        // dispatch`'s identical contract/doc comment.
+        let (payload, tag): (&[u8], Option<[u8; crypto::mac::TAG_LEN]>) = match &self.channel_auth {
+            Some(_) => match crypto::mac::split_tag(&serialized) {
+                Some((payload, tag)) => (payload, Some(tag)),
+                None => return Ok(()),
+            },
+            None => (&serialized[..], None),
+        };
+
         // Deserialize and parse the message.
-        let message: WorkerPrimaryMessage = bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
+        let message: WorkerPrimaryMessage = bincode::deserialize(payload).map_err(DagError::SerializationError)?;
+
+        if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
+            if !auth.verify(&self.name, payload, &tag) {
+                self.metrics.authenticated_channel_rejected_total.inc();
+                return Ok(());
+            }
+        }
+
         match message {
             WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
-                record_typed_received(&self.metrics, "OurBatch", serialized.len());
+                record_typed_received(&self.metrics, "OurBatch", payload.len());
                 self.tx_our_digests                                         //sender channel to Proposer
                 .send((digest, worker_id))
                 .await
                 .expect("Failed to send workers' digests")
             },
             WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
-                record_typed_received(&self.metrics, "OthersBatch", serialized.len());
+                record_typed_received(&self.metrics, "OthersBatch", payload.len());
                 self.tx_others_digests                                      //sender channel to PayloadReceiver
                 .send((digest, worker_id))
                 .await

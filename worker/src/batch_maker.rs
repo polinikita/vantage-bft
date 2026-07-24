@@ -4,7 +4,7 @@ use crate::worker::WorkerMessage;
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::{Blake3Hasher, Digest};
-use crypto::PublicKey;
+use crypto::{PairwiseKeys, PublicKey};
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
@@ -60,6 +60,14 @@ pub struct BatchMaker {
     /// yielded unconditionally) -- purely a scheduling-fairness knob, no protocol
     /// effect either way.
     loop_ticks: u64,
+    /// SECURITY (Fable audit): `Parameters::authenticate_channels`. `None` is
+    /// byte-identical to pre-MAC behavior. `WorkerMessage::Batch` carries no sender
+    /// claim to bind (see `worker::WorkerReceiverHandler::channel_auth`'s doc
+    /// comment) -- the tag appended here is `PairwiseKeys::tag_unverified`'s
+    /// destination-independent placeholder, computed ONCE per seal (not once per
+    /// destination): correct, since no receiver ever checks it, and essential for
+    /// performance, since this is the highest-volume message this worker sends.
+    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 /// See `BatchMaker::loop_ticks`'s doc comment.
@@ -91,6 +99,9 @@ impl BatchMaker {
         compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
+        // SECURITY (Fable audit): appended last, same convention as every other
+        // MAC-consuming `::spawn`.
+        channel_auth: Option<Arc<PairwiseKeys>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -105,6 +116,7 @@ impl BatchMaker {
                 network: SimpleSender::new().with_latency(latency_map).with_metrics(metrics.clone()).with_compression(compress_network).with_batching(batch),
                 metrics,
                 loop_ticks: 0,
+                channel_auth,
             }
             .run()
             .await;
@@ -175,7 +187,18 @@ impl BatchMaker {
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
-        let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
+        let mut serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
+        // SECURITY (Fable audit): `Batch` carries no sender claim to bind (see
+        // `WorkerReceiverHandler::channel_auth`'s doc comment) -- append the
+        // destination-independent placeholder tag (byte-identical, unappended, when
+        // `channel_auth` is off) BEFORE wrapping in `Bytes`, so every downstream
+        // consumer (the benchmark diagnostic hash just below, `Processor`'s real
+        // content-addressed digest, and the broadcast itself) all see the exact same
+        // final bytes.
+        if let Some(auth) = &self.channel_auth {
+            let tag = auth.tag_unverified(&serialized);
+            serialized.extend_from_slice(&tag);
+        }
         // Fable perf audit item 2: wrap the freshly-serialized `Vec<u8>` into `Bytes`
         // once (a cheap pointer/len/cap move, not a copy -- `Bytes::from(Vec<u8>)`
         // takes ownership of the existing allocation). Both consumers below then just

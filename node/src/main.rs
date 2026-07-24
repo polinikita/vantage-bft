@@ -183,7 +183,14 @@ async fn main() -> Result<()> {
                         communication: on the external-consensus path, replicas broadcast \
                         Prepare-Votes/Confirm-Acks and assemble PrepareQC/ConfirmQC locally \
                         instead of unicasting to the leader for it to assemble and \
-                        re-broadcast. Off by default -- byte-identical behavior when off.")),
+                        re-broadcast. Off by default -- byte-identical behavior when off."))
+                .arg(Arg::new("authenticate-channels").long("authenticate-channels").action(ArgAction::SetTrue)
+                    .help("Symmetric pairwise-MAC authenticated channels: closes wire-level \
+                        sender impersonation on every inter-validator channel (BLAKE3-keyed \
+                        MAC over a shared committee master secret -- no signatures, no PKI, \
+                        no handshake). A fresh master secret is generated in-process and \
+                        shared across every node this run spawns. Off by default -- \
+                        byte-identical wire/behavior when off.")),
         )
         .subcommand_required(true)
         .arg_required_else_help(true)

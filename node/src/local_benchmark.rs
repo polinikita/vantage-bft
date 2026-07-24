@@ -12,7 +12,7 @@ use crate::CHANNEL_CAPACITY;
 use anyhow::{Context, Result};
 use clap::ArgMatches;
 use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol, WorkerId};
-use crypto::{PublicKey, SignatureService};
+use crypto::{MacSecret, PublicKey, SignatureService};
 use metrics::{
     aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot, read_vantage_progress, LatencySnapshot,
     MetricReporter,
@@ -151,6 +151,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         delta_ms, max_batch_delay_ms, max_header_delay_ms
     );
     println!("Data dir: {}", data_dir.display());
+    if matches.get_flag("authenticate-channels") {
+        println!("Authenticated channels: ON (symmetric pairwise MAC, fresh in-process master secret)");
+    }
     if crash > 0 {
         println!(
             "Crash fault: {} of {} nodes never spawned (committee unchanged; live = {})",
@@ -185,6 +188,13 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
         // behavior when off.
         all_to_all: matches.get_flag("all-to-all"),
+        // Symmetric pairwise-MAC authenticated channels: off by default, byte-identical
+        // wire/behavior when off. A fresh master secret is generated here, once, and
+        // shared (via this single in-process `Parameters` value, cloned into every
+        // node this run spawns) across every node -- exactly the in-process-shared-
+        // secret contract `authenticate_channels`'s own doc comment describes.
+        authenticate_channels: matches.get_flag("authenticate-channels"),
+        mac_secret: matches.get_flag("authenticate-channels").then(MacSecret::generate),
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which

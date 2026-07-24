@@ -19,7 +19,7 @@ use crate::vantage::Effect;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
-use crypto::{Digest, PublicKey};
+use crypto::{Digest, PairwiseKeys, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
 use network::{BatchConfig, CancelHandler, MessageHandler, ReliableSender, SimpleSender, Writer};
 use prometheus::IntCounter;
@@ -79,6 +79,59 @@ pub enum Inbound {
     ControlServe(View, ViewProposal),
 }
 
+/// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
+/// (`Parameters::authenticate_channels`) -- the candidate sender a MAC tag must verify
+/// against, for every `PrimaryMessage` variant this handler ever routes. Mirrors
+/// `VantageCore::wire_sender`'s classification exactly (declared wire sender field
+/// where one exists), PLUS the two D4-class positionally-attributed variants
+/// (`VantagePropose`/`ControlInit`), which carry no wire sender field at all but ARE
+/// still cryptographically bindable here: `agb::proposer`/`control::control_leader`
+/// are pure functions of `committee` alone, so this network-layer boundary can derive
+/// the identical trusted sender `VantageCore::dispatch_inbound` derives, without
+/// needing a live `VantageCore` (or its mutable AGB/control-log state) to ask.
+/// `None` for `Header(_, true)` ("Serve") and `ControlServe`: neither carries any
+/// sender claim (wire or positional) to bind -- the same pre-existing D4 gap
+/// `wire_sender` already carves out (content is self-authenticating by digest / gated
+/// downstream by `pending_fetch`, respectively). A MAC tag is still present on the wire
+/// for these two (uniform framing -- every message carries exactly one trailing tag
+/// when the flag is on), it is simply never checked, since there is nothing to check
+/// it against.
+fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Option<PublicKey> {
+    match message {
+        PrimaryMessage::Header(h, false) => Some(h.author),
+        PrimaryMessage::Header(_, true) => None,
+        PrimaryMessage::HeadersRequest(_, requestor) => Some(*requestor),
+        PrimaryMessage::VantageAck(a) => Some(a.sender),
+        PrimaryMessage::VantagePropose(p) => Some(crate::vantage::agb::proposer(committee, p.view)),
+        PrimaryMessage::VantageEcho(e) => Some(e.sender),
+        PrimaryMessage::VantageEchoSkip(_, s, _) => Some(*s),
+        PrimaryMessage::VantageReady(r) => Some(r.sender),
+        PrimaryMessage::VantageNoReady(_, s, _) => Some(*s),
+        PrimaryMessage::VantageWish(_, s) => Some(*s),
+        PrimaryMessage::CompReport(_, _, s) => Some(*s),
+        PrimaryMessage::ControlInit(p, _) => Some(crate::vantage::control::control_leader(committee, p.round)),
+        PrimaryMessage::ControlEcho(_, s) => Some(*s),
+        PrimaryMessage::ControlReady(_, s) => Some(*s),
+        PrimaryMessage::ControlCommit(_, s) => Some(*s),
+        PrimaryMessage::ControlTimeoutVote(_, s) => Some(*s),
+        PrimaryMessage::ControlTimeoutAccept(_, s) => Some(*s),
+        PrimaryMessage::ControlFetch(_, _, s) => Some(*s),
+        PrimaryMessage::ControlServe(_, _) => None,
+        // Autobahn-only variants never legitimately reach the Vantage assembly's port
+        // (`dispatch`'s own catch-all ignores them below); no candidate needed.
+        _ => None,
+    }
+}
+
+/// SECURITY (Fable audit): the OUTBOUND-side mirror of `mac_candidate_sender`'s `None`
+/// arms -- true for the two D4-class variants with no sender claim at all (wire or
+/// positional) to bind. This node always sends its OWN messages, so on the outbound
+/// side the candidate (when one exists) is trivially `self.name` -- only whether a
+/// candidate exists at all matters here, not its value, hence the plain `bool`.
+fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
+    matches!(message, PrimaryMessage::Header(_, true) | PrimaryMessage::ControlServe(_, _))
+}
+
 /// Network receiver handler for the Vantage assembly's `primary_to_primary` port.
 /// Deliberately a distinct type from Autobahn's `PrimaryReceiverHandler` (which stays
 /// byte-identical, untouched) -- the two assemblies never share a handler.
@@ -89,6 +142,16 @@ pub struct VantageReceiverHandler {
     /// directly without wiring metrics (matches `VantageCore`'s own optional-handle
     /// convention) -- production (`Primary::spawn`) always passes `Some`.
     pub metrics: Option<Arc<Metrics>>,
+    /// SECURITY (Fable audit): `Some` iff `Parameters::authenticate_channels` is on --
+    /// see `mac_candidate_sender`'s doc comment for the verification model. `None`
+    /// (the default) is byte-identical to pre-MAC behavior: every received frame is
+    /// deserialized and routed exactly as received, no trailing bytes stripped.
+    pub channel_auth: Option<Arc<PairwiseKeys>>,
+    /// Needed only to derive `VantagePropose`/`ControlInit`'s positionally-attributed
+    /// sender (see `mac_candidate_sender`) -- a small, immutable, once-built clone
+    /// (mirrors `VantageCore`'s own `committee.clone()` at `build` time). Unused when
+    /// `channel_auth` is `None`.
+    pub committee: Committee,
 }
 
 #[async_trait]
@@ -98,9 +161,43 @@ impl MessageHandler for VantageReceiverHandler {
         // rather than once per `dispatch` call -- required for batching (several
         // logical messages can share one frame, and only one ack may be sent per
         // frame). See `Receiver::acks`'s doc comment.
-        let message: PrimaryMessage = bincode::deserialize(&serialized)?;
+
+        // SECURITY (Fable audit): when authenticated channels are on, the trailing
+        // `crypto::mac::TAG_LEN` bytes of every frame are the MAC tag -- strip them
+        // BEFORE deserializing (a frame too short to even carry a tag is malformed/
+        // adversarial; drop it, same "drop, don't propagate/tear down" treatment as a
+        // deserialize failure below). `None` (flag off) is byte-identical to before:
+        // `payload` is `serialized` verbatim, no tag ever stripped or checked.
+        let (payload, tag): (&[u8], Option<[u8; crypto::mac::TAG_LEN]>) = match &self.channel_auth {
+            Some(_) => match crypto::mac::split_tag(&serialized) {
+                Some((payload, tag)) => (payload, Some(tag)),
+                None => return Ok(()),
+            },
+            None => (&serialized[..], None),
+        };
+
+        let message: PrimaryMessage = bincode::deserialize(payload)?;
+
+        // SECURITY (Fable audit): verify the MAC tag against the message's own
+        // declared/positionally-derived sender BEFORE this message is ever forwarded
+        // to `VantageCore` -- a mismatch is dropped here, never reaching the
+        // membership gate or any protocol logic. A `None` candidate (the D4-class
+        // `Header(_, true)`/`ControlServe` carve-out, see `mac_candidate_sender`) has
+        // no claim to check, so it passes through exactly as it did before this flag
+        // existed.
+        if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
+            if let Some(sender) = mac_candidate_sender(&message, &self.committee) {
+                if !auth.verify(&sender, payload, &tag) {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.authenticated_channel_rejected_total.inc();
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         if let Some(metrics) = &self.metrics {
-            crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
+            crate::primary::record_typed_received(metrics, message.type_name(), payload.len());
         }
         let inbound = match message {
             PrimaryMessage::Header(h, false) => Inbound::Publish(h.author, h),
@@ -156,6 +253,17 @@ pub struct VantageCore {
 
     network: ReliableSender,
     worker_network: SimpleSender,
+    /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
+    /// (`Parameters::authenticate_channels`). `None` (the default) is byte-identical
+    /// to pre-MAC behavior: `broadcast_message`/`send_message` hand `network`/
+    /// `worker_network` the bare serialized message, nothing appended. `Some` when the
+    /// flag is on: every outbound message gets a trailing tag over its own serialized
+    /// bytes, keyed `k_{self, dest}` (or `k_{self, self}` for the two D4-class
+    /// variants with no sender claim to bind -- see `PairwiseKeys::tag_unverified`'s
+    /// doc comment) -- computed once and shared across a broadcast's destinations
+    /// when the tag itself is destination-independent (the unverified-variant case),
+    /// per-destination when it isn't.
+    channel_auth: Option<Arc<PairwiseKeys>>,
     cancel_handlers: Vec<CancelHandler>,
     /// Fable perf audit item 4: `cancel_handlers.len()` at the last actual
     /// `prune_cancel_handlers` scan -- `maybe_prune_cancel_handlers` only re-scans
@@ -268,6 +376,19 @@ impl VantageCore {
         // wire-declared sender against.
         let members: HashSet<PublicKey> = committee.authorities.keys().cloned().collect();
 
+        // SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels.
+        // `parameters.authenticate_channels` on with no `mac_secret` set is a
+        // misconfiguration (it would otherwise silently run unauthenticated) --
+        // panic loudly rather than let it pass, the same "fail fast on
+        // misconfiguration" posture already used for `expect`s elsewhere in this
+        // constructor (e.g. "Our public key is not in the committee").
+        let channel_auth: Option<Arc<PairwiseKeys>> = if parameters.authenticate_channels {
+            let secret = parameters.mac_secret.expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
+            Some(Arc::new(committee.pairwise_keys(&name, &secret)))
+        } else {
+            None
+        };
+
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
         let blocks: SharedBlocks = Arc::new(Mutex::new(BlockCache::new()));
@@ -346,6 +467,7 @@ impl VantageCore {
                 }
                 s
             },
+            channel_auth,
             cancel_handlers: Vec::new(),
             last_prune_len: 0,
             other_primaries,
@@ -979,39 +1101,97 @@ impl VantageCore {
         // specifically the publish variant (`false` = not a serve/sync reply); the
         // metrics handle is `Option` (unit tests construct `VantageCore` without one).
         let is_own_publish = matches!(message, PrimaryMessage::Header(_, false));
+        // SECURITY (Fable audit): `Header(_, true)` ("Serve") never legitimately
+        // reaches `broadcast_message` (`ServeTo` always unicasts via `send_message`
+        // below), so the only D4-class placeholder-tag variant this method ever sees
+        // in practice is `ControlServe` -- kept as a real `match`, not an assert, so
+        // this stays correct even if a future effect ever does broadcast one of them.
+        let placeholder = message_needs_placeholder_tag(&message);
         let bytes = bincode::serialize(&message).expect("serializes");
         if is_own_publish {
             if let Some(metrics) = &self.metrics {
                 metrics.proposed_block_size_bytes.observe(bytes.len());
             }
         }
-        self.broadcast(Bytes::from(bytes), msg_type).await;
+        self.broadcast(bytes, msg_type, placeholder).await;
     }
 
     /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
     /// and unicasts it verbatim to one peer.
     async fn send_message(&mut self, peer: PublicKey, message: PrimaryMessage) {
         let msg_type = message.type_name();
+        let placeholder = message_needs_placeholder_tag(&message);
         let bytes = bincode::serialize(&message).expect("serializes");
-        self.send_to(peer, Bytes::from(bytes), msg_type).await;
+        self.send_to(peer, bytes, msg_type, placeholder).await;
     }
 
-    async fn broadcast(&mut self, data: Bytes, msg_type: &'static str) {
-        // Fable perf audit item 5a: `other_primary_addrs` is precomputed once (see its
-        // own doc comment) -- this `.clone()` is a straight contiguous
-        // `Vec<SocketAddr>` memcpy, versus the previous per-call
-        // `.iter().map(|(_, a)| *a).collect()` walking the larger `(PublicKey,
-        // SocketAddr)` tuples in `other_primaries` to re-extract the identical
-        // addresses every single broadcast.
-        let handlers = self.network.broadcast_typed(self.other_primary_addrs.clone(), data, msg_type).await;
-        self.cancel_handlers.extend(handlers);
-    }
-
-    async fn send_to(&mut self, peer: PublicKey, data: Bytes, msg_type: &'static str) {
-        if let Some(addr) = self.other_primaries.iter().find(|(pk, _)| *pk == peer).map(|(_, a)| *a) {
-            let handler = self.network.send_typed(addr, data, msg_type).await;
+    /// SECURITY (Fable audit): appends this message's MAC tag (when `channel_auth` is
+    /// on) before broadcasting to every other primary. `placeholder` (see
+    /// `message_needs_placeholder_tag`): the two D4-class variants with no sender
+    /// claim to bind get one destination-independent tag (`PairwiseKeys::
+    /// tag_unverified`), computed once and shared across every destination -- exactly
+    /// like the flag-off path's own `.clone()`-shared `Bytes` -- rather than N
+    /// per-destination tags nobody will ever check. Every other variant gets a
+    /// genuine per-destination tag (`k_{self, dest}`), since `dest` varies.
+    async fn broadcast(&mut self, payload: Vec<u8>, msg_type: &'static str, placeholder: bool) {
+        let Some(auth) = self.channel_auth.clone() else {
+            // Flag off: byte-identical to pre-MAC behavior. Fable perf audit item 5a:
+            // `other_primary_addrs` is precomputed once (see its own doc comment) --
+            // this `.clone()` is a straight contiguous `Vec<SocketAddr>` memcpy.
+            let handlers = self.network.broadcast_typed(self.other_primary_addrs.clone(), Bytes::from(payload), msg_type).await;
+            self.cancel_handlers.extend(handlers);
+            return;
+        };
+        if placeholder {
+            let mut tagged = payload;
+            tagged.extend_from_slice(&auth.tag_unverified(&tagged));
+            let handlers = self.network.broadcast_typed(self.other_primary_addrs.clone(), Bytes::from(tagged), msg_type).await;
+            self.cancel_handlers.extend(handlers);
+            return;
+        }
+        for (peer, addr) in self.other_primaries.clone() {
+            let tag = auth.tag_for(&peer, &payload).expect("every `other_primaries` entry is a committee member");
+            let mut tagged = payload.clone();
+            tagged.extend_from_slice(&tag);
+            let handler = self.network.send_typed(addr, Bytes::from(tagged), msg_type).await;
             self.cancel_handlers.push(handler);
         }
+    }
+
+    /// SECURITY (Fable audit): same tag-append contract as `broadcast`, for a single
+    /// destination.
+    async fn send_to(&mut self, peer: PublicKey, payload: Vec<u8>, msg_type: &'static str, placeholder: bool) {
+        let Some(addr) = self.other_primaries.iter().find(|(pk, _)| *pk == peer).map(|(_, a)| *a) else {
+            return;
+        };
+        let data = match &self.channel_auth {
+            None => Bytes::from(payload),
+            Some(auth) => {
+                let tag = if placeholder { auth.tag_unverified(&payload) } else { auth.tag_for(&peer, &payload).expect("peer is a committee member") };
+                let mut tagged = payload;
+                tagged.extend_from_slice(&tag);
+                Bytes::from(tagged)
+            }
+        };
+        let handler = self.network.send_typed(addr, data, msg_type).await;
+        self.cancel_handlers.push(handler);
+    }
+
+    /// SECURITY (Fable audit): appends a tag keyed `k_{self, self}` (the worker<->
+    /// primary channel is intra-authority: our own worker's public key IS `self.name`)
+    /// before sending to one of our own workers. A no-op (byte-identical) when
+    /// `channel_auth` is off.
+    async fn send_to_worker(&mut self, addr: SocketAddr, payload: Vec<u8>, msg_type: &'static str) {
+        let data = match &self.channel_auth {
+            None => Bytes::from(payload),
+            Some(auth) => {
+                let tag = auth.tag_for(&self.name, &payload).expect("self is a committee member");
+                let mut tagged = payload;
+                tagged.extend_from_slice(&tag);
+                Bytes::from(tagged)
+            }
+        };
+        self.worker_network.send_typed(addr, data, msg_type).await;
     }
 
     /// D1/§1: ask our own workers to sync `missing` batches for `author`'s block
@@ -1027,9 +1207,9 @@ impl VantageCore {
             by_worker.entry(*worker_id).or_default().push(digest.clone());
         }
         for (worker_id, digests) in by_worker {
-            if let Some(addr) = self.worker_addresses.get(&worker_id) {
+            if let Some(addr) = self.worker_addresses.get(&worker_id).copied() {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Synchronize(digests, author)).expect("serializes");
-                self.worker_network.send_typed(*addr, Bytes::from(bytes), "Synchronize").await;
+                self.send_to_worker(addr, bytes, "Synchronize").await;
             }
         }
 
@@ -1063,9 +1243,9 @@ impl VantageCore {
         headers: Vec<Header>,
     ) {
         for (worker_id, digests) in by_worker {
-            if let Some(addr) = self.worker_addresses.get(&worker_id) {
+            if let Some(addr) = self.worker_addresses.get(&worker_id).copied() {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests)).expect("serializes");
-                self.worker_network.send_typed(*addr, Bytes::from(bytes), "Committed").await;
+                self.send_to_worker(addr, bytes, "Committed").await;
             }
         }
         for header in headers {
@@ -1188,5 +1368,127 @@ mod tests {
         // proving the gate doesn't also swallow honest, real-member traffic.)
         assert_eq!(rejected_count(&core), 0);
         let _ = effects;
+    }
+
+    // --- SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels ---
+
+    /// `mac_candidate_sender`'s pure classification, exercised directly (no network):
+    /// declared-sender variants return that field; the two positionally-attributed
+    /// D4-class variants (`VantagePropose`/`ControlInit`) return the committee's own
+    /// `agb::proposer`/`control::control_leader` derivation; the two no-claim variants
+    /// (`Header(_, true)`/`ControlServe`) return `None`.
+    #[test]
+    fn mac_candidate_sender_classification() {
+        let committee = crate::common::committee();
+        let (author, _) = crate::common::keys()[0];
+        let (sender, _) = crate::common::keys()[1];
+
+        let header = Header { author, ..Header::default() };
+        assert_eq!(mac_candidate_sender(&PrimaryMessage::Header(header.clone(), false), &committee), Some(author));
+        assert_eq!(mac_candidate_sender(&PrimaryMessage::Header(header, true), &committee), None);
+
+        let ack = Ack::new(author, 1, Digest::default(), sender);
+        assert_eq!(mac_candidate_sender(&PrimaryMessage::VantageAck(ack), &committee), Some(sender));
+
+        let proposal = ViewProposal { view: 3, c: Vec::new(), t: Vec::new(), m: None };
+        assert_eq!(
+            mac_candidate_sender(&PrimaryMessage::VantagePropose(proposal), &committee),
+            Some(crate::vantage::agb::proposer(&committee, 3))
+        );
+
+        let control_proposal = ControlProposal { round: 2, parent: 0, value: None };
+        assert_eq!(
+            mac_candidate_sender(&PrimaryMessage::ControlInit(control_proposal.clone(), None), &committee),
+            Some(crate::vantage::control::control_leader(&committee, 2))
+        );
+        assert_eq!(mac_candidate_sender(&PrimaryMessage::ControlServe(3, dummy_proposal()), &committee), None);
+    }
+
+    #[test]
+    fn message_needs_placeholder_tag_classification() {
+        let header = Header::default();
+        assert!(message_needs_placeholder_tag(&PrimaryMessage::Header(header.clone(), true)));
+        assert!(!message_needs_placeholder_tag(&PrimaryMessage::Header(header, false)));
+        assert!(message_needs_placeholder_tag(&PrimaryMessage::ControlServe(1, dummy_proposal())));
+        assert!(!message_needs_placeholder_tag(&PrimaryMessage::VantageWish(1, crate::common::keys()[0].0)));
+    }
+
+    /// End-to-end over a real TCP loopback (mirrors `network::receiver_tests::receive`):
+    /// flag off (`channel_auth: None`) is byte-identical to pre-MAC behavior -- a plain,
+    /// untagged wire message still deserializes and reaches `VantageCore` untouched.
+    #[tokio::test]
+    async fn dispatch_flag_off_delivers_untagged_message_unchanged() {
+        use futures::SinkExt as _;
+        use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+        let committee = crate::common::committee();
+        let (sender, _) = crate::common::keys()[1];
+        let (tx_vantage, mut rx_vantage) = channel(4);
+        let handler = VantageReceiverHandler { tx: tx_vantage, metrics: None, channel_auth: None, committee };
+
+        let address: SocketAddr = "127.0.0.1:14510".parse().unwrap();
+        network::Receiver::spawn(address, handler);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let ack = Ack::new(sender, 7, Digest::default(), sender);
+        let payload = bincode::serialize(&PrimaryMessage::VantageAck(ack)).unwrap();
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+        transport.send(Bytes::from(payload)).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_millis(500), rx_vantage.recv()).await;
+        assert!(matches!(received, Ok(Some(Inbound::Ack(_)))), "flag off must deliver a plain untagged message exactly as before");
+    }
+
+    /// The core impersonation-closure property: a message tagged with the WRONG
+    /// sender's key (i.e. someone claiming to be `sender` who doesn't hold `k_{sender,
+    /// self}`) is dropped, never reaching `VantageCore`; the SAME message, correctly
+    /// tagged by the real `sender`, IS delivered.
+    #[tokio::test]
+    async fn dispatch_authenticated_rejects_forged_sender_accepts_genuine() {
+        use futures::SinkExt as _;
+        use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+        let committee = crate::common::committee();
+        let (name, _) = crate::common::keys()[0]; // this node ("self" / the receiver)
+        let (sender, _) = crate::common::keys()[1]; // the genuine, honest sender
+        let (impostor, _) = crate::common::keys()[2]; // a distinct committee member with no claim to `sender`'s key
+        let secret = crypto::MacSecret::generate();
+
+        let receiver_auth = Arc::new(committee.pairwise_keys(&name, &secret));
+        let sender_auth = committee.pairwise_keys(&sender, &secret);
+        let impostor_auth = committee.pairwise_keys(&impostor, &secret);
+
+        let (tx_vantage, mut rx_vantage) = channel(4);
+        let handler = VantageReceiverHandler { tx: tx_vantage, metrics: None, channel_auth: Some(receiver_auth), committee: committee.clone() };
+
+        let address: SocketAddr = "127.0.0.1:14511".parse().unwrap();
+        network::Receiver::spawn(address, handler);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A wire `Ack` whose DECLARED sender field is `sender` -- but physically
+        // produced (MAC'd) by `impostor`, who does not hold `k_{sender,name}`.
+        let ack = Ack::new(sender, 9, Digest::default(), sender);
+        let payload = bincode::serialize(&PrimaryMessage::VantageAck(ack.clone())).unwrap();
+        let forged_tag = impostor_auth.tag_for(&name, &payload).expect("impostor is a committee member");
+        let mut forged = payload.clone();
+        forged.extend_from_slice(&forged_tag);
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+        transport.send(Bytes::from(forged)).await.unwrap();
+
+        let rejected = tokio::time::timeout(Duration::from_millis(300), rx_vantage.recv()).await;
+        assert!(rejected.is_err(), "a forged sender claim (wrong holder of the claimed sender's key) must be dropped, not delivered");
+
+        // The identical logical message, genuinely tagged by `sender` itself.
+        let genuine_tag = sender_auth.tag_for(&name, &payload).expect("sender is a committee member");
+        let mut genuine = payload;
+        genuine.extend_from_slice(&genuine_tag);
+        transport.send(Bytes::from(genuine)).await.unwrap();
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx_vantage.recv()).await;
+        assert!(matches!(delivered, Ok(Some(Inbound::Ack(a))) if a.sender == sender), "a genuinely MAC'd message from the real declared sender must be delivered");
     }
 }

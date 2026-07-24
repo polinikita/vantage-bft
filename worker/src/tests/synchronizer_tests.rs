@@ -34,6 +34,7 @@ async fn synchronize() {
         metrics,
         false,
         BatchConfig::default(),
+        /* channel_auth */ None,
     );
 
     // Spawn a listener to receive our batch requests.

@@ -1528,6 +1528,7 @@ async fn sync_missing_proposals() {
         test_metrics(),
         false,
         BatchConfig::default(),
+        /* channel_auth */ None,
     );
 
     // Send headers to the core, so they won't request sync

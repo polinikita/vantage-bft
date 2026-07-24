@@ -27,6 +27,14 @@ pub struct GarbageCollector {
     addresses: Vec<SocketAddr>,
     /// A network sender to notify our workers of cleanup events.
     network: SimpleSender,
+    /// SECURITY (Fable audit): this authority's own public key -- the worker<->primary
+    /// channel is intra-authority, so the tag every `Cleanup` notification carries is
+    /// always keyed `k_{name,name}` (see `PairwiseKeys::build`'s doc comment),
+    /// identical for every one of our own workers regardless of `WorkerId`.
+    name: PublicKey,
+    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
+    /// behavior.
+    channel_auth: Option<Arc<crypto::PairwiseKeys>>,
 }
 
 impl GarbageCollector {
@@ -45,6 +53,9 @@ impl GarbageCollector {
         compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
+        // SECURITY (Fable audit): appended last, same convention as every other
+        // MAC-consuming `::spawn`.
+        channel_auth: Option<Arc<crypto::PairwiseKeys>>,
     ) {
         let addresses = committee
             .our_workers(name)
@@ -52,6 +63,7 @@ impl GarbageCollector {
             .iter()
             .map(|x| x.primary_to_worker)
             .collect();
+        let name = *name;
 
         tokio::spawn(async move {
             Self {
@@ -61,10 +73,26 @@ impl GarbageCollector {
                 tx_loopback,
                 addresses,
                 network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
+                name,
+                channel_auth,
             }
             .run()
             .await;
         });
+    }
+
+    /// SECURITY (Fable audit): appends a tag keyed `k_{name,name}` (byte-identical,
+    /// unappended, when `channel_auth` is off) before broadcasting to our own workers.
+    fn tag(&self, payload: Vec<u8>) -> Bytes {
+        match &self.channel_auth {
+            None => Bytes::from(payload),
+            Some(auth) => {
+                let tag = auth.tag_for(&self.name, &payload).expect("self is a committee member");
+                let mut tagged = payload;
+                tagged.extend_from_slice(&tag);
+                Bytes::from(tagged)
+            }
+        }
     }
 
     async fn run(&mut self) {
@@ -98,7 +126,7 @@ impl GarbageCollector {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
                     .expect("Failed to serialize our own message");
                 self.network
-                    .broadcast_typed(self.addresses.clone(), Bytes::from(bytes), "Cleanup")
+                    .broadcast_typed(self.addresses.clone(), self.tag(bytes), "Cleanup")
                     .await;
             }
         }

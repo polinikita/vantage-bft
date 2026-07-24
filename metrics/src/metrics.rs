@@ -185,6 +185,15 @@ pub struct Metrics {
     /// frame, so `network_messages_sent_total` (sum) / `network_frames_sent_total`
     /// reads directly as the coalescing ratio.
     pub network_frames_sent_total: IntCounter,
+    /// Symmetric pairwise-MAC authenticated channels (`Parameters::
+    /// authenticate_channels`): inbound frames dropped because the trailing MAC tag
+    /// didn't verify against the message's declared/positionally-derived sender (a
+    /// forged/tampered/replayed-under-a-different-key frame), across every handler
+    /// (Vantage primary, Autobahn worker-facing primary, worker<->worker,
+    /// worker<->primary) this node runs. Always zero on the honest-only path and
+    /// whenever the flag is off; a nonzero value means a Byzantine node attempted
+    /// message impersonation on an authenticated channel.
+    pub authenticated_channel_rejected_total: IntCounter,
 
     // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
     /// Transactions the worker's `BatchMaker` received from a client, before batching
@@ -477,6 +486,13 @@ impl Metrics {
                 "network_frames_sent_total",
                 "Physical wire frames sent (bundles count once); compare against \
                  network_messages_sent_total for the batching coalescing ratio",
+                registry,
+            )
+            .unwrap(),
+            authenticated_channel_rejected_total: register_int_counter_with_registry!(
+                "authenticated_channel_rejected_total",
+                "Inbound frames dropped for failing symmetric-pairwise-MAC verification \
+                 (authenticate_channels)",
                 registry,
             )
             .unwrap(),

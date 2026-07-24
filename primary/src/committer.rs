@@ -67,6 +67,16 @@ pub struct Committer {
     worker_addresses: HashMap<WorkerId, SocketAddr>,
     #[cfg(feature = "benchmark")]
     network: SimpleSender,
+    /// SECURITY (Fable audit): this authority's own public key -- the worker<->primary
+    /// `Committed` notification is intra-authority, so its tag is always keyed
+    /// `k_{name,name}` (see `PairwiseKeys::build`'s doc comment). Only read on the
+    /// benchmark path (the only one that ever sends `Committed` to a worker).
+    #[cfg(feature = "benchmark")]
+    name: PublicKey,
+    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
+    /// behavior.
+    #[cfg(feature = "benchmark")]
+    channel_auth: Option<Arc<crypto::PairwiseKeys>>,
 }
 
 impl Committer {
@@ -99,6 +109,11 @@ impl Committer {
         compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
+        // SECURITY (Fable audit): appended last, same convention as every other
+        // MAC-consuming `::spawn`. Only meaningfully read on the benchmark path (the
+        // existing whole-fn `#[allow(unused_variables)]` above already covers it being
+        // unused on the default build).
+        channel_auth: Option<Arc<crypto::PairwiseKeys>>,
     ) {
         let (_tx_deliver, rx_deliver) = channel(CHANNEL_CAPACITY);
 
@@ -128,10 +143,31 @@ impl Committer {
                 worker_addresses,
                 #[cfg(feature = "benchmark")]
                 network: SimpleSender::new().with_metrics(metrics).with_compression(compress_network).with_batching(batch),
+                #[cfg(feature = "benchmark")]
+                name,
+                #[cfg(feature = "benchmark")]
+                channel_auth,
             }
             .run()
             .await;
         });
+    }
+
+    /// SECURITY (Fable audit): appends a tag keyed `k_{name,name}` (the worker<->
+    /// primary channel is intra-authority -- byte-identical, unappended, when
+    /// `channel_auth` is off) before sending a `Committed` notification to one of our
+    /// own workers.
+    #[cfg(feature = "benchmark")]
+    fn tag(&self, payload: Vec<u8>) -> Bytes {
+        match &self.channel_auth {
+            None => Bytes::from(payload),
+            Some(auth) => {
+                let tag = auth.tag_for(&self.name, &payload).expect("self is a committee member");
+                let mut tagged = payload;
+                tagged.extend_from_slice(&tag);
+                Bytes::from(tagged)
+            }
+        }
     }
 
     async fn process_commit_message(&mut self, state: &mut State, commit_message: ConsensusMessage) {
@@ -203,7 +239,8 @@ impl Committer {
                                     if let Some(address) = self.worker_addresses.get(&worker_id) {
                                         let bytes = bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests))
                                             .expect("Failed to serialize committed message");
-                                        self.network.send_typed(*address, Bytes::from(bytes), "Committed").await;
+                                        let tagged = self.tag(bytes);
+                                        self.network.send_typed(*address, tagged, "Committed").await;
                                     }
                                 }
                             }

@@ -7,7 +7,7 @@ use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
-use crypto::{Digest, PublicKey};
+use crypto::{Digest, PairwiseKeys, PublicKey};
 use log::{error, info, warn};
 use metrics::{start_prometheus_server, MetricReporter, Metrics};
 use network::{BatchConfig, MessageHandler, Receiver, Writer};
@@ -76,6 +76,14 @@ pub struct Worker {
     /// matching `network::Receiver`s -- EXCEPT the client transaction port, which
     /// never batches (see `handle_clients_transactions`).
     batch: BatchConfig,
+    /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
+    /// (`Parameters::authenticate_channels`), resolved once at spawn time (same
+    /// convention as `latency_map`/`batch`). `None` (the default) is byte-identical
+    /// to pre-MAC behavior. Threaded into every worker-to-worker/worker-to-primary
+    /// sender and receiver this worker spawns -- EXCEPT the client transaction port
+    /// (clients aren't committee members and hold no key, same carve-out as
+    /// `compress_network`/`batch_messages`).
+    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 impl Worker {
@@ -120,6 +128,18 @@ impl Worker {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        // SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels,
+        // resolved once, same convention as `latency_map`/`batch` above.
+        // `authenticate_channels` on with no `mac_secret` set is a misconfiguration
+        // (would otherwise silently run unauthenticated) -- panic loudly rather than
+        // let it pass.
+        let channel_auth: Option<Arc<PairwiseKeys>> = if parameters.authenticate_channels {
+            let secret = parameters.mac_secret.expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
+            Some(Arc::new(committee.pairwise_keys(&name, &secret)))
+        } else {
+            None
+        };
+
         // Define a worker instance.
         let worker = Self {
             name,
@@ -130,6 +150,7 @@ impl Worker {
             metrics: metrics.clone(),
             latency_map,
             batch,
+            channel_auth,
         };
 
         // Spawn all worker tasks.
@@ -140,6 +161,7 @@ impl Worker {
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
+            worker.name,
             worker
                 .committee
                 .primary(&worker.name)
@@ -149,6 +171,7 @@ impl Worker {
             worker.metrics.clone(),
             worker.parameters.compress_network,
             worker.batch,
+            worker.channel_auth.clone(),
         );
 
         // NOTE: This log entry is used to compute performance.
@@ -183,7 +206,7 @@ impl Worker {
         Receiver::spawn_full(
             address,                                    //socket to receive Primary messages from
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer, metrics: self.metrics.clone() }, //handler for received Primary messages, forwards them to synchronizer
+            PrimaryReceiverHandler { tx_synchronizer, metrics: self.metrics.clone(), name: self.name, channel_auth: self.channel_auth.clone() }, //handler for received Primary messages, forwards them to synchronizer
             Some(self.metrics.clone()),
             self.parameters.compress_network,
             // This handler never acked (see its `dispatch`'s doc comment).
@@ -206,6 +229,7 @@ impl Worker {
             self.metrics.clone(),
             self.parameters.compress_network,
             self.batch,
+            self.channel_auth.clone(),
         );
 
         info!(
@@ -268,6 +292,7 @@ impl Worker {
             self.metrics.clone(),
             self.parameters.compress_network,
             self.batch,
+            self.channel_auth.clone(),
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -314,6 +339,7 @@ impl Worker {
                 tx_helper,               //sender channel to connect to helper
                 tx_processor,            //sender channel to connect to processor
                 metrics: self.metrics.clone(),
+                channel_auth: self.channel_auth.clone(),
             },
             Some(self.metrics.clone()),
             self.parameters.compress_network,
@@ -401,6 +427,19 @@ struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,   //sender channel to connect to helper
     tx_processor: Sender<SerializedBatchMessage>,  //sender channel to connect to processor
     metrics: Arc<Metrics>,
+    /// SECURITY (Fable audit): `Parameters::authenticate_channels`. `None` is
+    /// byte-identical to pre-MAC behavior. `WorkerMessage::Batch` carries no sender
+    /// claim at all (own-batch broadcasts and `Helper`'s cross-authority relays are
+    /// indistinguishable on the wire -- the same D4-class gap as `Header(_, true)`/
+    /// `ControlServe` on the primary side) -- its bytes (tag included, if the flag is
+    /// on) are forwarded to `Processor` completely untouched: `Processor` content-
+    /// addresses a batch by hashing EXACTLY the bytes it's handed, so every copy of
+    /// "the same" batch floating around the network (the original seal, and every
+    /// relayed/gossiped copy) must stay byte-identical for `store.read(digest)`
+    /// lookups to ever hit -- this handler must never strip or alter a `Batch`'s
+    /// bytes. `WorkerMessage::BatchRequest` DOES carry a genuine sender claim
+    /// (`origin`) and IS verified normally, once we know that's the variant we have.
+    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 #[async_trait]
@@ -412,7 +451,12 @@ impl MessageHandler for WorkerReceiverHandler {
         // for batching (several logical messages can share one frame, and only one
         // ack may be sent per frame). See `Receiver::acks`'s doc comment.
 
-        // Deserialize and parse the message.
+        // SECURITY (Fable audit): deserialize the FULL received bytes first -- bincode
+        // tolerates (ignores) any trailing bytes beyond what a value actually needs,
+        // so this succeeds identically whether or not a MAC tag is appended, without
+        // this handler needing to guess up front how many trailing bytes (if any) to
+        // strip. See `channel_auth`'s doc comment for why `Batch`'s bytes are then
+        // never touched, while `BatchRequest`'s tag IS split off and verified.
         match bincode::deserialize(&serialized) {
             Ok(WorkerMessage::Batch(..)) => {     //If receive batch message from another worker. Store the batch, and process.
                 self.metrics.network_messages_received_total.with_label_values(&["Batch"]).inc();
@@ -429,6 +473,15 @@ impl MessageHandler for WorkerReceiverHandler {
                 .expect("Failed to send batch")
             },
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => {  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
+                if let Some(auth) = &self.channel_auth {
+                    let Some((payload, tag)) = crypto::mac::split_tag(&serialized) else {
+                        return Ok(());
+                    };
+                    if !auth.verify(&requestor, payload, &tag) {
+                        self.metrics.authenticated_channel_rejected_total.inc();
+                        return Ok(());
+                    }
+                }
                 self.metrics.network_messages_received_total.with_label_values(&["BatchRequest"]).inc();
                 self.metrics.network_bytes_received_total.with_label_values(&["BatchRequest"]).inc_by(serialized.len() as u64);
                 self
@@ -449,6 +502,15 @@ impl MessageHandler for WorkerReceiverHandler {
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,  //sender channel to connect to synchronizer.
     metrics: Arc<Metrics>,
+    /// SECURITY (Fable audit): this worker's own public key -- the worker<->primary
+    /// channel is intra-authority (our own primary shares our own public key), so the
+    /// MAC candidate sender for every message on this port is always `name` itself
+    /// (`k_{name,name}`, the degenerate self-pair key). Unused when `channel_auth` is
+    /// `None`.
+    name: PublicKey,
+    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
+    /// behavior.
+    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 #[async_trait]
@@ -458,12 +520,29 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
+        // SECURITY (Fable audit): strip and verify the trailing MAC tag before
+        // deserializing -- same contract as `crate::vantage::node::
+        // VantageReceiverHandler::dispatch`.
+        let (payload, tag): (&[u8], Option<[u8; crypto::mac::TAG_LEN]>) = match &self.channel_auth {
+            Some(_) => match crypto::mac::split_tag(&serialized) {
+                Some((payload, tag)) => (payload, Some(tag)),
+                None => return Ok(()),
+            },
+            None => (&serialized[..], None),
+        };
+
         // Deserialize the message and send it to the synchronizer.
-        match bincode::deserialize::<PrimaryWorkerMessage>(&serialized) {
+        match bincode::deserialize::<PrimaryWorkerMessage>(payload) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
             Ok(message) => {
+                if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
+                    if !auth.verify(&self.name, payload, &tag) {
+                        self.metrics.authenticated_channel_rejected_total.inc();
+                        return Ok(());
+                    }
+                }
                 self.metrics.network_messages_received_total.with_label_values(&[message.type_name()]).inc();
-                self.metrics.network_bytes_received_total.with_label_values(&[message.type_name()]).inc_by(serialized.len() as u64);
+                self.metrics.network_bytes_received_total.with_label_values(&[message.type_name()]).inc_by(payload.len() as u64);
                 self
                 .tx_synchronizer
                 .send(message)
