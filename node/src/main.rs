@@ -239,11 +239,12 @@ async fn main() -> Result<()> {
                         .default_value("0")
                         .action(ArgAction::Set)
                         .help(
-                            "PHASE7-PREP-NOTES.md (WAN-shaped local runs): uniform shorthand for \
-                        --latency-table -- an RTT-ms value applied to every inter-authority \
-                        link (one-way = value/2), as if every cell of a --latency-table CSV \
-                        held this same number; 0 = off (default, current behavior). Ignored if \
-                        --latency-table is also given.",
+                            "PHASE7-PREP-NOTES.md (WAN-shaped local runs): uniform EXPLICIT \
+                        OVERRIDE RTT-ms value applied to every inter-authority link (one-way = \
+                        value/2), as if every cell of a --latency-table CSV held this same \
+                        number. 0 (default, i.e. unset) defers to the real 10-AWS-region RTT \
+                        matrix default (see --latency-table). Ignored if --latency-table is \
+                        also given.",
                         ),
                 )
                 .arg(
@@ -258,8 +259,11 @@ async fn main() -> Result<()> {
                         primary-to-primary/-worker connections (starfish-style per-connection \
                         injection, read-only reference: \
                         ~/code/starfish/crates/starfish-core/src/network.rs). Takes precedence \
-                        over --mimic-latency-ms. Unset (default) = zero injected delay, \
-                        current behavior unchanged for both protocols.",
+                        over --mimic-latency-ms. Unset (default): if --mimic-latency-ms is also \
+                        unset (0), defaults to the real 10-AWS-region RTT matrix \
+                        (`LatencyTable::aws_rtt`, ported VERBATIM from starfish, committee index \
+                        i -> region i % 10) -- mirroring starfish's own default for \
+                        single-region AWS benchmarking.",
                         ),
                 )
                 .arg(
@@ -393,25 +397,26 @@ async fn run(matches: &ArgMatches) -> Result<()> {
     // `protocol` is authoritative over the legacy `use_optimistic_tips` knob.
     parameters.reconcile_protocol();
 
-    // PHASE7 (AWS/distributed WAN-shaped runs): expand the DEPLOYABLE uniform-RTT
-    // mimic-latency knob (`mimic_latency_ms`, which -- unlike the `#[serde(skip)]`
-    // `latency_table` -- rides through `parameters.json`) into the in-process
-    // `latency_table` that `Primary::spawn`/`Worker::spawn` already consume via
-    // `Committee::latency_map`. This is the exact table `node local-benchmark
-    // --mimic-latency-ms` builds (`LatencyTable::uniform`, one-way = RTT/2), just
-    // sourced from the deployed config instead of a CLI flag, so mimic latency works
-    // identically on the distributed path with no primary/worker/Vantage changes.
-    // Only applied when `latency_table` isn't already set (never is on this path) and
-    // the RTT is positive; `None`/0 leaves behavior byte-identical to today.
+    // PHASE7 (AWS/distributed WAN-shaped runs): expand a DEPLOYABLE latency knob
+    // (which -- unlike the `#[serde(skip)]` `latency_table` -- rides through
+    // `parameters.json`) into the in-process `latency_table` that
+    // `Primary::spawn`/`Worker::spawn` already consume via `Committee::latency_map`.
+    // Sourced from the deployed config instead of a CLI flag, so latency injection
+    // works identically on the distributed path with no primary/worker/Vantage
+    // changes. Only applied when `latency_table` isn't already set (never is on this
+    // path). Precedence (mirrors starfish's own default for single-region AWS
+    // benchmarking): `mimic_latency_ms` present (`Some`, including `Some(0)`) is an
+    // EXPLICIT OVERRIDE to a uniform scalar; absent (`None` -- true of every
+    // pre-Phase-7 `parameters.json`, the field being absent) DEFAULTS to the real
+    // 10-AWS-region RTT matrix (`LatencyTable::aws_rtt`, ported VERBATIM from
+    // starfish). This default substitution is CLI-entry-only: `Parameters::default()`
+    // itself still yields `mimic_latency_ms: None` / `latency_table: None`, so library
+    // defaults and existing unit tests are unaffected.
     if parameters.latency_table.is_none() {
-        if let Some(rtt_ms) = parameters.mimic_latency_ms {
-            if rtt_ms > 0 {
-                parameters.latency_table = Some(std::sync::Arc::new(LatencyTable::uniform(
-                    committee.size(),
-                    rtt_ms as f64,
-                )));
-            }
-        }
+        parameters.latency_table = Some(std::sync::Arc::new(match parameters.mimic_latency_ms {
+            Some(rtt_ms) => LatencyTable::uniform(committee.size(), rtt_ms as f64),
+            None => LatencyTable::aws_rtt(committee.size()),
+        }));
     }
 
     // Select the node assembly by protocol. Both Autobahn variants share the

@@ -8,8 +8,20 @@ class CommandMaker:
 
     @staticmethod
     def cleanup():
+        # NVMe-INSTANCE-STORE: `rm -r .db-*` alone no longer clears the store --
+        # `--store` now points under `PathMaker.REMOTE_STORE_BASE` (the mounted
+        # NVMe instance-store disk, see remote.py's install()/`PathMaker.
+        # remote_db_path`), not the home directory. `-f` (not just `-r`) on the
+        # new clause: unlike home-dir `.db-*`, this runs on hosts that never
+        # got an NVMe device (the fallback path in install() still creates
+        # REMOTE_STORE_BASE on the EBS root) and on the coordinator itself
+        # (this same string also runs locally, see remote.py's `_config`),
+        # where the glob simply never matches -- `-f` makes that a silent
+        # no-op instead of a (harmless but noisy) "No such file or directory".
         return (
-            f'rm -r .db-* ; rm .*.json ; mkdir -p {PathMaker.results_path()}'
+            f'rm -r .db-* ; rm .*.json ; '
+            f'rm -rf {PathMaker.REMOTE_STORE_BASE}/.db-* ; '
+            f'mkdir -p {PathMaker.results_path()}'
         )
 
     @staticmethod

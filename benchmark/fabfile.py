@@ -192,7 +192,7 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
 
 
 @task
-def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
+def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_ms=100,
              nodes=20, duration=180, rates='50000,100000,150000,200000,250000',
              max_header_delay=50, batch_size=500_000, early_stop_margin=0.10,
              source_build=False):
@@ -222,78 +222,96 @@ def campaign(ctx, debug=False, protocol='vantage', mimic_latency_ms=100,
       - rate SWEEP ascending toward saturation:
           [50k, 100k, 150k, 200k, 250k] tx/s
       - protocol = vantage, delta_ms = 150
-      - UNIFORM one-region WAN mimic latency: `mimic_latency_ms` RTT (default
-        100 ms RTT = 50 ms one-way) injected on every inter-authority link even
-        though the 20 instances are co-located. `node run` expands this scalar
-        into a uniform 20x20 one-way (RTT/2) latency_table at spawn via
-        `Committee::latency_map` -- the SAME path both protocols already use for
-        `node local-benchmark --mimic-latency-ms`. This scalar is the only knob
-        that carries latency on the distributed path (Parameters.latency_table
-        is #[serde(skip)] and never travels through parameters.json).
+      - latency model (`--latency`), default 'aws': the real 10-AWS-region RTT
+        matrix (`config::LatencyTable::aws_rtt`, ported VERBATIM from
+        starfish) -- committee index i -> region i % 10. This is `node run`'s
+        own DEFAULT whenever `mimic_latency_ms` is absent from
+        parameters.json, so `--latency aws` simply omits that key rather than
+        setting anything. All instances are pinned to a single AZ (see
+        `instance.create_instances`), so this models real inter-region RTT
+        between AWS regions while keeping intra-run bandwidth free.
+        `--latency uniform` instead sets `mimic_latency_ms` (default 100 ms
+        RTT = 50 ms one-way) as an EXPLICIT override applied uniformly to
+        every inter-authority link -- the prior behavior. Either way `node
+        run` expands the resulting knob into an NxN one-way latency_table at
+        spawn via `Committee::latency_map` -- the SAME path both protocols
+        already use for `node local-benchmark`'s `--latency-table`/
+        `--mimic-latency-ms`. This is the only mechanism that carries latency
+        on the distributed path (Parameters.latency_table is #[serde(skip)]
+        and never travels through parameters.json).
 
     Prerequisite (coordinator): a settings.json sized for 20 instances (and, if
     desired, `"instances": { ..., "spot": true }` for Spot capacity), then
     `fab create --nodes 20`, `fab install`, `fab campaign`, `fab destroy`.
     '''
-    bench_params = {
-        'faults': 0,
-        'nodes': [int(nodes)],
-        'workers': 1,
-        'collocate': True,
-        'rate': [int(r) for r in str(rates).split(',') if r.strip()],
-        'tx_size': 512,
-        'tx_mode': 'all-zero',
-        'duration': int(duration),
-        'runs': 1,
-        'early_stop_margin': float(early_stop_margin),
-
-        # Partition simulation unused for this campaign.
-        'simulate_partition': False,
-        'partition_start': 0,
-        'partition_duration': 0,
-        'partition_nodes': 0,
-    }
-    node_params = {
-        'timeout_delay': 5_000,  # ms -- Autobahn's Core only (VantageCore doesn't
-                                  # read it, see primary/src/vantage/); left alone.
-        'header_size': 32,  # bytes -- ~1 digest (32 B): a header/car fires as
-                             # soon as ANY digest is ready, gated only by
-                             # max_header_delay below. Already Vantage-appropriate
-                             # (fast/frequent cars), unlike max_header_delay was.
-        'max_header_delay': int(max_header_delay),  # ms -- was 5_000 (Autobahn's
-                                  # own default; PREP FIX 2). `node
-                                  # local-benchmark`'s Vantage runs use 50 ms (its
-                                  # --max-header-delay-ms CLI default, and this
-                                  # arg's own default): at 5_000 ms almost every
-                                  # header waited out the full 5 s timer instead
-                                  # of firing on the ~50 ms cadence Vantage's
-                                  # AGB/car mechanism expects, throttling
-                                  # committed throughput independent of the
-                                  # public/private IP fix (PREP FIX 1). Now a
-                                  # `--max-header-delay` campaign arg (CHANGE C).
-        'gc_depth': 50,  # rounds -- Autobahn's Core/garbage_collector only.
-        'sync_retry_delay': 5_000,  # ms -- Autobahn's Core only.
-        'sync_retry_nodes': 3,  # number of nodes -- Autobahn's Core only.
-        'batch_size': int(batch_size),  # bytes -- matches Parameters::default() /
-                                 # local-benchmark's (unexposed) worker batch
-                                 # size; not a Vantage throttle. Now a
-                                 # `--batch-size` campaign arg (CHANGE C).
-        'max_batch_delay': 20,  # ms -- matches local-benchmark's own
-                                 # --max-batch-delay-ms CLI default; unchanged.
-        'protocol': protocol,
-        'use_parallel_proposals': True,
-        'k': 4,
-        'use_fast_path': True,
-        'fast_path_timeout': 5_000,
-        'use_ride_share': False,
-        'car_timeout': 5_000,
-        'delta_ms': 150,  # ms -- Vantage AGB/control-log base delay unit
-        'mimic_latency_ms': int(mimic_latency_ms),  # uniform WAN RTT (ms); node halves to one-way
-        'simulate_asynchrony': False,
-        'asynchrony_start': 15_000,  # ms
-        'asynchrony_duration': 3_000,  # ms
-    }
     try:
+        if latency not in ('aws', 'uniform'):
+            raise BenchError(
+                f"--latency must be 'aws' or 'uniform', got '{latency}'",
+                ValueError(latency),
+            )
+        bench_params = {
+            'faults': 0,
+            'nodes': [int(nodes)],
+            'workers': 1,
+            'collocate': True,
+            'rate': [int(r) for r in str(rates).split(',') if r.strip()],
+            'tx_size': 512,
+            'tx_mode': 'all-zero',
+            'duration': int(duration),
+            'runs': 1,
+            'early_stop_margin': float(early_stop_margin),
+
+            # Partition simulation unused for this campaign.
+            'simulate_partition': False,
+            'partition_start': 0,
+            'partition_duration': 0,
+            'partition_nodes': 0,
+        }
+        node_params = {
+            'timeout_delay': 5_000,  # ms -- Autobahn's Core only (VantageCore doesn't
+                                      # read it, see primary/src/vantage/); left alone.
+            'header_size': 32,  # bytes -- ~1 digest (32 B): a header/car fires as
+                                 # soon as ANY digest is ready, gated only by
+                                 # max_header_delay below. Already Vantage-appropriate
+                                 # (fast/frequent cars), unlike max_header_delay was.
+            'max_header_delay': int(max_header_delay),  # ms -- was 5_000 (Autobahn's
+                                      # own default; PREP FIX 2). `node
+                                      # local-benchmark`'s Vantage runs use 50 ms (its
+                                      # --max-header-delay-ms CLI default, and this
+                                      # arg's own default): at 5_000 ms almost every
+                                      # header waited out the full 5 s timer instead
+                                      # of firing on the ~50 ms cadence Vantage's
+                                      # AGB/car mechanism expects, throttling
+                                      # committed throughput independent of the
+                                      # public/private IP fix (PREP FIX 1). Now a
+                                      # `--max-header-delay` campaign arg (CHANGE C).
+            'gc_depth': 50,  # rounds -- Autobahn's Core/garbage_collector only.
+            'sync_retry_delay': 5_000,  # ms -- Autobahn's Core only.
+            'sync_retry_nodes': 3,  # number of nodes -- Autobahn's Core only.
+            'batch_size': int(batch_size),  # bytes -- matches Parameters::default() /
+                                     # local-benchmark's (unexposed) worker batch
+                                     # size; not a Vantage throttle. Now a
+                                     # `--batch-size` campaign arg (CHANGE C).
+            'max_batch_delay': 20,  # ms -- matches local-benchmark's own
+                                     # --max-batch-delay-ms CLI default; unchanged.
+            'protocol': protocol,
+            'use_parallel_proposals': True,
+            'k': 4,
+            'use_fast_path': True,
+            'fast_path_timeout': 5_000,
+            'use_ride_share': False,
+            'car_timeout': 5_000,
+            'delta_ms': 150,  # ms -- Vantage AGB/control-log base delay unit
+            'simulate_asynchrony': False,
+            'asynchrony_start': 15_000,  # ms
+            'asynchrony_duration': 3_000,  # ms
+        }
+        if latency == 'uniform':
+            # EXPLICIT override: uniform WAN RTT (ms), node halves to one-way.
+            node_params['mimic_latency_ms'] = int(mimic_latency_ms)
+        # else ('aws'): leave 'mimic_latency_ms' absent from node_params entirely --
+        # `node run` then defaults to the real 10-AWS-region RTT matrix (see docstring).
         Bench(ctx, source_build=source_build).run(bench_params, node_params, debug)
     except BenchError as e:
         Print.error(e)
@@ -374,17 +392,36 @@ def monitor_collector(ctx):
 
 
 @task
-def fetch_metrics(ctx):
+def fetch_metrics(ctx, start=None, end=None):
     ''' METRICS-COLLECTOR-PREP: pull the key metrics series (committed
     transactions, transaction-committed-latency, vantage_seals, network
     message/byte counters, submitted_transactions, utilization_timer,
-    core_queue_length, protocol_info/transaction_mode_info -- see
+    core_queue_length, protocol_info/transaction_mode_info, up, and the
+    per-node bytes-sent/received/committed-tps breakdowns -- see
     `remote.COLLECTOR_QUERIES`) off the metrics-collector's Prometheus HTTP
-    API into logs/collector/*.json. Safe to run any time after `fab remote`/
-    `fab campaign` has deployed monitoring and before `fab destroy` terminates
-    the collector. '''
+    API into collector-metrics/*.json. Safe to run any time after `fab
+    remote`/`fab campaign` has deployed monitoring and before `fab destroy`
+    terminates the collector.
+
+    `--start`/`--end` (unix epoch seconds, both or neither -- e.g. bounds
+    read back from collector-metrics/run-windows.json, which `fab campaign`
+    now writes automatically per rate point): pass both for a manual
+    `query_range` re-fetch over that exact window instead of an instant
+    query. Default (both omitted, unchanged prior behavior): an instant
+    query -- Prometheus's last-known value per series, which goes stale
+    (silently returns []) more than 5 minutes after the scraped nodes are
+    gone, so this default is only meaningful called promptly after a run,
+    before `fab destroy`. '''
     try:
-        Bench(ctx).fetch_collector_metrics()
+        if (start is None) != (end is None):
+            raise BenchError(
+                '--start and --end must be given together, or both omitted',
+                ValueError(f'start={start!r} end={end!r}'),
+            )
+        Bench(ctx).fetch_collector_metrics(
+            start=float(start) if start is not None else None,
+            end=float(end) if end is not None else None,
+        )
     except BenchError as e:
         Print.error(e)
 

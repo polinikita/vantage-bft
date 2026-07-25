@@ -22,7 +22,8 @@ class Settings:
     def __init__(self, key_name, key_path, base_port, repo_name, repo_url,
                  branch, instance_type, aws_regions, project_id=None,
                  templates=None, username='ubuntu', spot=False,
-                 monitor_instance_type=None, release_repo=None):
+                 monitor_instance_type=None, release_repo=None,
+                 availability_zone=None):
         inputs_str = [
             key_name, key_path, repo_name, repo_url, branch, instance_type
         ]
@@ -72,6 +73,14 @@ class Settings:
         # no release to download from and `Bench._update` raises a clear
         # error telling the user to fill this in (or pass --source-build).
         self.release_repo = release_repo
+        # Single-AZ pinning (instance.py's create_instances/_resolve_az_subnet):
+        # an explicit AWS availability zone (e.g. "eu-west-1a") every instance
+        # (validators AND the metrics-collector) launches into, so intra-committee
+        # private-IP traffic stays intra-AZ (free) rather than merely
+        # intra-region (still billed cross-AZ). Optional -- None (absent from
+        # settings.json, the default) makes instance.py auto-pick the first
+        # 'available' AZ in the (first) configured region instead.
+        self.availability_zone = availability_zone
 
     @classmethod
     def load(cls, filename):
@@ -94,6 +103,7 @@ class Settings:
                 bool(data['instances'].get('spot', False)),
                 data['instances'].get('monitor_type'),
                 data['repo'].get('release_repo'),
+                data['instances'].get('availability_zone'),
             )
         except (OSError, JSONDecodeError) as e:
             raise SettingsError(str(e))

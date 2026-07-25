@@ -12,8 +12,11 @@
     },
     "username": "ubuntu",
     "instances": {
-        "type": "c5.xlarge",
-        "regions": ["eu-west-1"],
+        "type": "c5d.xlarge",
+        "monitor_type": "c5.xlarge",
+        "regions": [
+            "eu-west-1"
+        ],
         "spot": true
     }
 }

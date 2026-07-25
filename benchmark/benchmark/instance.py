@@ -32,6 +32,12 @@ class InstanceManager:
     # port the *collector itself* listens on, queried by the coordinator laptop
     # after a run (remote.py's fetch_collector_metrics).
     MONITOR_PORT = 9090
+    # Grafana UI port on the metrics-collector instance (remote.py's
+    # `deploy_monitoring`), provisioned against the same collector-local
+    # Prometheus above -- same collector-only convention as MONITOR_PORT
+    # (validators get the ingress rule too, but nothing ever listens on
+    # their :3000).
+    GRAFANA_PORT = 3000
 
     # COST-ESTIMATE: static on-demand fallback price (USD/hr), used by
     # `estimate_cost()` whenever an instance isn't Spot, or is Spot but its
@@ -221,6 +227,23 @@ class InstanceManager:
                     'Description': 'Metrics-collector Prometheus HTTP API',
                 }],
             },
+            {
+                # Same rationale/posture as the MONITOR_PORT rule directly
+                # above: the metrics-collector's Grafana UI (remote.py's
+                # `deploy_monitoring`), browsed directly by the coordinator
+                # from a laptop, not just queried programmatically.
+                'IpProtocol': 'tcp',
+                'FromPort': self.GRAFANA_PORT,
+                'ToPort': self.GRAFANA_PORT,
+                'IpRanges': [{
+                    'CidrIp': '0.0.0.0/0',
+                    'Description': 'Metrics-collector Grafana UI',
+                }],
+                'Ipv6Ranges': [{
+                    'CidrIpv6': '::/0',
+                    'Description': 'Metrics-collector Grafana UI',
+                }],
+            },
         ]
         for permission in permissions:
             try:
@@ -231,6 +254,69 @@ class InstanceManager:
             except ClientError as e:
                 if AWSError(e).code != 'InvalidPermission.Duplicate':
                     raise
+
+    def _resolve_az_subnet(self, client, region):
+        ''' Single-AZ pinning: resolve the (availability_zone, subnet_id) EVERY
+        instance in `region` (validators AND the collector) launches into, so
+        intra-committee traffic -- already routed over private IPs, see
+        `internal_hosts()` -- stays INTRA-AZ, not merely intra-region: AWS bills
+        cross-AZ private-IP transfer (~$0.01/GB each way) even within a single
+        VPC/region, and only same-AZ private-IP traffic is genuinely free.
+
+        AZ selection: `settings.json`'s `instances.availability_zone` if set
+        (e.g. "eu-west-1a" -- configurable per the task's "or a configurable
+        one"), else the first AZ `describe_availability_zones` reports as
+        'available' in this region, sorted by name for a deterministic pick
+        across repeated `fab create` invocations.
+
+        The subnet is that AZ's DEFAULT-VPC default-for-az subnet (resolved via
+        `describe_subnets`) -- every account already has one per AZ (the same
+        implicit subnet `run_instances` picked before this pinning existed), so
+        no new VPC/subnet provisioning is required. '''
+        configured_az = getattr(self.settings, 'availability_zone', None)
+        if configured_az:
+            az = configured_az
+        else:
+            r = client.describe_availability_zones(
+                Filters=[{'Name': 'state', 'Values': ['available']}]
+            )
+            zones = sorted(z['ZoneName'] for z in r['AvailabilityZones'])
+            if not zones:
+                raise BenchError(
+                    'AZ resolution',
+                    Exception(f'No available availability zone found in {region}')
+                )
+            az = zones[0]
+
+        r = client.describe_subnets(
+            Filters=[
+                {'Name': 'availability-zone', 'Values': [az]},
+                {'Name': 'default-for-az', 'Values': ['true']},
+            ]
+        )
+        subnets = r.get('Subnets', [])
+        if not subnets:
+            raise BenchError(
+                'Subnet resolution',
+                Exception(f'No default-for-az subnet found in {az} ({region})')
+            )
+        return az, subnets[0]['SubnetId']
+
+    def _security_group_id(self, client):
+        ''' Resolves `SECURITY_GROUP_NAME` to its GroupId. Needed because
+        launching into an explicit `SubnetId` (single-AZ pinning) requires
+        `SecurityGroupIds`, not the `SecurityGroups` (by-name) form the prior
+        implicit-default-subnet launch used. '''
+        r = client.describe_security_groups(
+            Filters=[{'Name': 'group-name', 'Values': [self.SECURITY_GROUP_NAME]}]
+        )
+        groups = r.get('SecurityGroups', [])
+        if not groups:
+            raise BenchError(
+                'Security group resolution',
+                Exception(f"Security group '{self.SECURITY_GROUP_NAME}' not found")
+            )
+        return groups[0]['GroupId']
 
     # Canonical's official AWS account id (stable across regions/time).
     CANONICAL_OWNER_ID = '099720109477'
@@ -306,17 +392,30 @@ class InstanceManager:
                         },
                     }
                 }
+            # Single-AZ pinning (see `_resolve_az_subnet`'s doc comment): resolve
+            # once per region and cache, so the collector launch below (in the
+            # first region) reuses the EXACT SAME (az, subnet, security-group-id)
+            # a validator in that region gets, instead of a second, independent
+            # resolution that could -- in principle, if AWS's 'available' AZ
+            # ordering ever changed between calls -- disagree.
+            az_subnet_by_region = {}
+            sg_id_by_region = {}
             progress = progress_bar(
-                self.clients.values(), prefix=f'Creating {size} instances'
+                self.clients.items(), prefix=f'Creating {size} instances'
             )
-            for client in progress:
+            for region, client in progress:
+                az, subnet_id = self._resolve_az_subnet(client, region)
+                sg_id = self._security_group_id(client)
+                az_subnet_by_region[region] = (az, subnet_id)
+                sg_id_by_region[region] = sg_id
                 client.run_instances(
                     ImageId=self._get_ami(client),
                     InstanceType=self.settings.instance_type,
                     KeyName=self.settings.key_name,
                     MaxCount=instances,
                     MinCount=instances,
-                    SecurityGroups=[self.SECURITY_GROUP_NAME],
+                    SecurityGroupIds=[sg_id],
+                    SubnetId=subnet_id,
                     TagSpecifications=[{
                         'ResourceType': 'instance',
                         'Tags': [{
@@ -358,6 +457,13 @@ class InstanceManager:
             collector_type = getattr(
                 self.settings, 'monitor_instance_type', None
             ) or self.settings.instance_type
+            # Single-AZ pinning: reuse this region's already-resolved (az,
+            # subnet, security-group-id) -- see the validator loop above and
+            # `_resolve_az_subnet`'s doc comment -- so the collector lands in
+            # the SAME AZ as this region's validators (both spot launch calls
+            # agree), keeping collector<->validator scrape traffic intra-AZ too.
+            _, collector_subnet_id = az_subnet_by_region[region]
+            collector_sg_id = sg_id_by_region[region]
             Print.info(
                 f'Creating the metrics-collector instance ({collector_type}, '
                 f'{region})...'
@@ -368,7 +474,8 @@ class InstanceManager:
                 KeyName=self.settings.key_name,
                 MaxCount=1,
                 MinCount=1,
-                SecurityGroups=[self.SECURITY_GROUP_NAME],
+                SecurityGroupIds=[collector_sg_id],
+                SubnetId=collector_subnet_id,
                 TagSpecifications=[{
                     'ResourceType': 'instance',
                     'Tags': [{
@@ -422,9 +529,9 @@ class InstanceManager:
     @staticmethod
     def _format_cost(total_usd, breakdown):
         lines = [
-            'AWS cost estimate (alive-time x price; EXCLUDES EBS storage and '
-            'data transfer; spot is billed per-second -- this is a close '
-            'estimate, not the invoice):'
+            'AWS cost estimate (alive-time x price; EXCLUDES EBS storage; '
+            'spot is billed per-second -- this is a close estimate, not the '
+            'invoice):'
         ]
         if not breakdown:
             lines.append('  No pending/running instances.')
@@ -437,6 +544,14 @@ class InstanceManager:
                 f"${row['subtotal_usd']:.4f}"
             )
         lines.append(f'  TOTAL: ${total_usd:.4f}')
+        lines.append(
+            '  Data transfer: $0 -- every instance (validators AND the '
+            'metrics-collector) is pinned to a single availability zone '
+            '(see create_instances/_resolve_az_subnet), and all '
+            'node<->node/collector traffic already routes over private VPC '
+            'IPs (internal_hosts()); intra-AZ private-IP transfer is free, so '
+            'this is a genuine $0, not an omission.'
+        )
         return '\n'.join(lines)
 
     def estimate_cost(self, states=('pending', 'running')):
@@ -456,10 +571,13 @@ class InstanceManager:
         estimate (`ON_DEMAND_FALLBACK_PRICE`/`DEFAULT_FALLBACK_PRICE`) and are
         flagged `approximate=True`.
 
-        EXCLUDES EBS volume and data-transfer costs (the latter is minimal
-        here: node<->node traffic runs over private VPC IPs, see
-        `internal_hosts()`). Spot is billed per-second, so `alive_hours`
-        itself is exact -- the only approximation is the fallback price path.
+        EXCLUDES EBS volume cost. Data transfer is genuinely $0, not merely
+        excluded: node<->node/collector traffic runs over private VPC IPs
+        (see `internal_hosts()`) AND every instance is pinned to a single
+        availability zone (see `create_instances`/`_resolve_az_subnet`), so
+        this traffic is intra-AZ, which AWS does not bill. Spot is billed
+        per-second, so `alive_hours` itself is exact -- the only
+        approximation is the fallback price path.
         This must be called while instances are still up (LaunchTime is only
         visible pre-termination), i.e. BEFORE `terminate_instances()`.
 

@@ -386,11 +386,14 @@ class NodeParameters:
         #  - `protocol`: selects the node assembly; "vantage" runs Vantage (serde
         #    kebab-case of `Protocol::Vantage`), else one of the two autobahn labels.
         #  - `delta_ms`: Vantage AGB base delay unit (ms).
-        #  - `mimic_latency_ms`: DEPLOYABLE uniform RTT (ms) mimic latency. `node run`
-        #    expands it into a uniform NxN one-way (RTT/2) latency_table at spawn --
-        #    this is the ONLY way to inject WAN-shaped latency on the distributed
-        #    path, since `Parameters.latency_table` itself is `#[serde(skip)]` and
-        #    thus never travels through parameters.json.
+        #  - `mimic_latency_ms`: DEPLOYABLE uniform RTT (ms) mimic latency, an EXPLICIT
+        #    OVERRIDE. `node run` expands it into a uniform NxN one-way (RTT/2)
+        #    latency_table at spawn. When this key is ABSENT (the campaign's default
+        #    `--latency aws`), `node run` instead defaults to the real 10-AWS-region
+        #    RTT matrix (`config::LatencyTable::aws_rtt`, ported from starfish). This
+        #    is the ONLY way to inject latency on the distributed path, since
+        #    `Parameters.latency_table` itself is `#[serde(skip)]` and thus never
+        #    travels through parameters.json.
         if 'protocol' in json and json['protocol'] not in (
             'autobahn-optimistic', 'autobahn-seamless', 'vantage'
         ):

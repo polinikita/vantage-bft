@@ -15,6 +15,19 @@ class BenchError(Exception):
 
 
 class PathMaker:
+    # NVMe-INSTANCE-STORE: throwaway-testbed hardcode -- the local instance-store
+    # mount point every validator's install() (remote.py) formats + mounts (see
+    # the NVMe-detect-and-mount snippet there). Rooting the RocksDB store here
+    # instead of the EBS root volume was the fix for the c5.xlarge throughput
+    # collapse when validators ran on `c5d.xlarge` (local NVMe SSD, same 4
+    # vCPU/NIC as `c5.xlarge`). Validators are back on plain EBS-only
+    # `c5.xlarge` (settings.json -- this run cares about NIC saturation, not
+    # store I/O), so `install()`'s NVMe-detect step now always falls through to
+    # the plain-EBS-directory fallback; the path stays the same either way, and
+    # the metrics-collector (also `c5.xlarge`) never uses this at all -- it
+    # runs no node/store.
+    REMOTE_STORE_BASE = '/mnt/db'
+
     @staticmethod
     def binary_path():
         return join('..', 'target', 'release')
@@ -42,6 +55,16 @@ class PathMaker:
         assert (isinstance(j, int) and i >= 0) or j is None
         worker_id = f'-{j}' if j is not None else ''
         return f'.db-{i}{worker_id}'
+
+    @staticmethod
+    def remote_db_path(i, j=None):
+        ''' NVMe-INSTANCE-STORE: the remote (validator-only) RocksDB store
+        path passed to `--store` -- `db_path`'s name, rooted under the
+        NVMe instance-store mount (`REMOTE_STORE_BASE`) instead of the
+        node's home directory (which lives on the slow, NIC-competing EBS
+        root volume). No local/coordinator-side use: `db_path`'s bare name
+        remains what it was for any such caller. '''
+        return join(PathMaker.REMOTE_STORE_BASE, PathMaker.db_path(i, j))
 
     @staticmethod
     def logs_path():
@@ -82,13 +105,36 @@ class PathMaker:
         return '.collector-prometheus.yml'
 
     @staticmethod
-    def collector_metrics_dir():
-        return join(PathMaker.logs_path(), 'collector')
+    def collector_metrics_path():
+        ''' Top-level directory for metrics-collector JSON exports -- a
+        SIBLING of `logs_path()`/`results_path()`, deliberately NOT nested
+        under `logs/`: `CommandMaker.clean_logs()` (`rm -r logs`) runs once
+        per `_run_single`, i.e. once per rate point of a rate sweep, and MUST
+        NOT delete collector artifacts (or `run-windows.json`) written by an
+        earlier rate point -- or an earlier campaign -- of the same coordinator
+        session. '''
+        return 'collector-metrics'
 
     @staticmethod
-    def collector_metrics_file(name):
+    def collector_metrics_dir(subdir=None):
+        ''' `subdir`: optional path (may itself contain '/', e.g.
+        f'{protocol}-{campaign_tag}/{n}nodes-{rate}rate' -- see remote.py's
+        `Bench.run`) routing output to collector_metrics_path()/<subdir>/
+        instead of the flat top-level directory, so neither a later rate
+        point NOR a later campaign (different protocol/run against the same
+        testbed) ever overwrites an earlier one's same-named series files.
+        None (default) is the flat directory -- used by the standalone `fab
+        fetch-metrics` task's ad hoc fetch, and by `_record_run_window`'s
+        single run-windows.json that intentionally spans every campaign in
+        the session (differentiated internally by its own protocol/nodes/rate
+        fields, not by directory). '''
+        base = PathMaker.collector_metrics_path()
+        return join(base, subdir) if subdir else base
+
+    @staticmethod
+    def collector_metrics_file(name, subdir=None):
         assert isinstance(name, str)
-        return join(PathMaker.collector_metrics_dir(), f'{name}.json')
+        return join(PathMaker.collector_metrics_dir(subdir), f'{name}.json')
 
     @staticmethod
     def results_path():

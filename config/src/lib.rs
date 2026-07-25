@@ -220,14 +220,22 @@ pub struct Parameters {
     /// in-process value built only by `local-benchmark`, never carried in a config
     /// file), THIS field DOES round-trip through `parameters.json`/`fab`, so the fab
     /// harness can inject a WAN-like RTT into a co-located AWS committee where every
-    /// node reads its config from a deployed file rather than a CLI flag. `node run`
-    /// expands `Some(rtt)` into a uniform `latency_table` at spawn time
-    /// (`LatencyTable::uniform(committee.size(), rtt)`, one-way = rtt/2), which the
-    /// existing `Committee::latency_map` path then applies identically to both
-    /// protocols -- so no primary/worker/Vantage code changes are needed, only this
-    /// one expansion in `node`'s `run`. `None`/`Some(0)` (the default -- also what
-    /// every pre-Phase-7 `parameters.json` deserializes to, the field being absent)
-    /// means zero injected delay, i.e. byte-identical current behavior.
+    /// node reads its config from a deployed file rather than a CLI flag.
+    ///
+    /// `node run` treats this field as an EXPLICIT OVERRIDE to a uniform scalar:
+    /// `Some(rtt)` (including `Some(0)`) always wins and expands to
+    /// `LatencyTable::uniform(committee.size(), rtt)` at spawn time (one-way = rtt/2).
+    /// When this field is `None` (absent from `parameters.json` -- true of every
+    /// pre-Phase-7 file), `node run` instead DEFAULTS to the real 10-AWS-region RTT
+    /// matrix (`LatencyTable::aws_rtt(committee.size())`, ported VERBATIM from
+    /// starfish), mirroring starfish's own default for single-region AWS
+    /// benchmarking. Either way the existing `Committee::latency_map` path applies
+    /// the resulting table identically to both protocols -- no primary/worker/Vantage
+    /// code changes needed, only this one expansion in `node`'s `run`. This
+    /// default-substitution logic lives ONLY in the `node run`/`node local-benchmark`
+    /// CLI entry handlers, never in `Parameters::default()` (which keeps
+    /// `mimic_latency_ms: None` and, transitively, `latency_table: None` --
+    /// library defaults and existing unit tests are unaffected).
     #[serde(default)]
     pub mimic_latency_ms: Option<u64>,
 
@@ -304,6 +312,39 @@ fn default_delta_ms() -> u64 {
     1000
 }
 
+/// AWS region names for the 10-region RTT matrix below. Ported VERBATIM from
+/// `~/code/starfish/crates/starfish-core/src/network.rs` lines 51-62.
+#[allow(unused)]
+const REGIONS: [&str; 10] = [
+    "us-east-1",      // USE1
+    "us-west-1",      // USW1
+    "ca-central-1",   // CAC1
+    "eu-west-1",      // EUW1
+    "eu-south-1",     // EUS2
+    "eu-north-1",     // EUN1
+    "sa-east-1",      // SAE1
+    "ap-south-1",     // APS1
+    "ap-southeast-1", // APSE2
+    "ap-northeast-1", // APNE1
+];
+
+/// RTT table for the 10 AWS regions above, in milliseconds. Ported VERBATIM from
+/// `~/code/starfish/crates/starfish-core/src/network.rs` lines 65-76 (base,
+/// non-adversarial matrix only -- the adversarial-latency ramp in starfish's
+/// `generate_latency_table` is out of scope here).
+const RTT_LATENCY_TABLE: [[u32; 10]; 10] = [
+    [1, 14, 104, 112, 198, 65, 68, 110, 201, 146],
+    [14, 1, 106, 122, 196, 78, 67, 103, 189, 142],
+    [104, 106, 1, 215, 281, 163, 29, 50, 143, 238],
+    [112, 122, 215, 1, 309, 175, 176, 220, 299, 254],
+    [198, 196, 281, 309, 1, 137, 254, 268, 150, 101],
+    [65, 78, 163, 175, 137, 1, 127, 172, 226, 108],
+    [68, 67, 29, 176, 254, 127, 1, 38, 125, 199],
+    [110, 103, 50, 220, 268, 172, 38, 1, 148, 245],
+    [201, 189, 143, 299, 150, 226, 125, 148, 1, 140],
+    [146, 142, 238, 254, 101, 108, 199, 245, 140, 1],
+];
+
 /// PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item): an n x n one-way
 /// inter-authority latency table, indexed by committee order (`Committee::index_of`
 /// -- the same deterministic `BTreeMap<PublicKey, _>` order `Pacemaker`/
@@ -374,6 +415,23 @@ impl LatencyTable {
             .map(|row| row.into_iter().map(|rtt_ms| rtt_ms / 2.0).collect())
             .collect();
         Ok(Self { one_way_ms })
+    }
+
+    /// PHASE7 (AWS/distributed WAN-shaped runs): the real 10-AWS-region RTT matrix
+    /// (`RTT_LATENCY_TABLE` above), expanded to `n x n` by mapping committee index `i`
+    /// to region `i % 10` -- so `n > 10` reuses the 10 regions cyclically, matching
+    /// starfish's `generate_latency_table` (`~/code/starfish/crates/starfish-core/
+    /// src/network.rs` lines ~813-844). Same RTT/2 one-way halving convention as
+    /// `uniform`/`from_rtt_csv`. Every node builds the identical full `n x n` table;
+    /// `Committee::latency_map` picks out the row for `index_of(self)`.
+    pub fn aws_rtt(n: usize) -> Self {
+        let mut t = vec![vec![0.0; n]; n];
+        for (i, row) in t.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = RTT_LATENCY_TABLE[i % 10][j % 10] as f64 / 2.0;
+            }
+        }
+        Self { one_way_ms: t }
     }
 
     /// The one-way latency between committee-order indices `i` and `j` (`Duration::

@@ -109,10 +109,13 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default.
     let timeline: bool = matches.get_flag("timeline");
     // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `--latency-table <csv>` (an n x n
-    // RTT-ms matrix, node index = committee order) takes precedence; `--mimic-latency
-    // -ms <u64>` is the uniform shorthand (defined as exactly the trivial table whose
-    // every cell is that value -- see `LatencyTable::uniform`). Neither set (both
-    // default/0) => `None`, i.e. zero injected delay, current behavior unchanged.
+    // RTT-ms matrix, node index = committee order) takes precedence over
+    // `--mimic-latency-ms <u64>` (the uniform EXPLICIT OVERRIDE shorthand -- defined
+    // as exactly the trivial table whose every cell is that value -- see
+    // `LatencyTable::uniform`). If NEITHER is given (both default/0), DEFAULT to the
+    // real 10-AWS-region RTT matrix (`LatencyTable::aws_rtt`, ported VERBATIM from
+    // starfish) -- mirroring starfish's own default for single-region AWS
+    // benchmarking; flags above override this default.
     let mimic_latency_ms: u64 = matches
         .get_one::<String>("mimic-latency-ms")
         .unwrap()
@@ -140,7 +143,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         );
         Some(LatencyTable::uniform(nodes, mimic_latency_ms as f64))
     } else {
-        None
+        println!(
+            "Latency table: real 10-AWS-region RTT matrix (default, committee index i -> region i % 10)"
+        );
+        Some(LatencyTable::aws_rtt(nodes))
     };
 
     let protocol = match protocol_str.as_str() {
