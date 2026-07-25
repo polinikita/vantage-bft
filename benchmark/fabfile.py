@@ -286,7 +286,20 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
                                       # committed throughput independent of the
                                       # public/private IP fix (PREP FIX 1). Now a
                                       # `--max-header-delay` campaign arg (CHANGE C).
-            'gc_depth': 50,  # rounds -- Autobahn's Core/garbage_collector only.
+            'gc_depth': 50,  # rounds -- Autobahn's Core/garbage_collector only. This
+                             # comment was WRONG for a while: VantageCore's internal
+                             # GC used to read `gc_depth` as a count of VIEWS, so this
+                             # single integer sized two unrelated windows in two
+                             # different counter spaces. Vantage now has its own knob
+                             # (`vantage_gc_window_views`, below) and this one is once
+                             # again Autobahn-only.
+            'vantage_gc_window_views': 50,  # views -- how much per-view Vantage state
+                             # (AgbEngine/Frontier/ControlLog/Resolver) is retained
+                             # behind the resolved prefix. Carrier bodies are held one
+                             # further window back so a lagging peer can still fetch
+                             # them. Sets how far a party may fall behind and still
+                             # catch up, so do not shrink it without reading
+                             # `ControlLog::SERVE_MARGIN_WINDOWS`.
             'sync_retry_delay': 5_000,  # ms -- Autobahn's Core only.
             'sync_retry_nodes': 3,  # number of nodes -- Autobahn's Core only.
             'batch_size': int(batch_size),  # bytes -- matches Parameters::default() /

@@ -967,7 +967,23 @@ impl AgbEngine {
         };
         let u = entry.target_view();
         if self.is_pruned(u) {
-            return true;
+            // SAFETY: a pruned `u` means we dropped the very evidence MetaOK is defined
+            // over (our own E_i(u)/R_i(u), the active fast-seal lock, and `C_u`/`T_u`'s
+            // local availability), so we cannot honestly evaluate it. This branch
+            // originally returned `true`, which made every party whose GC floor had
+            // passed `u` endorse a carrier's resolution entry for `u` unconditionally --
+            // and `formed` bounds only `1 <= u <= w-3` (there is no lower bound on the
+            // target), so a Byzantine proposer of a live carrier view could name an
+            // arbitrarily old `u` with fabricated `(C_u,T_u)` and collect those free
+            // endorsements from everyone past the floor.
+            //
+            // Declining is the safe direction: echo-skip is a legitimate outcome, and a
+            // carrier targeting a view we have ALREADY resolved (pruning implies
+            // resolved -- `gc_floor` is `resolved_watermark - window`) is moot for us
+            // regardless. The cost is that a proposer lagging more than the GC window
+            // behind is echo-skipped by up-to-date parties, and its carrier resolves via
+            // the skip/recovery route instead of completing directly.
+            return false;
         }
         let Some(state_u) = self.views.get(&u) else {
             return false; // no state at all for u yet -- E_i(u)/R_i(u) certainly pending
@@ -1042,12 +1058,16 @@ impl AgbEngine {
     fn compute_origin(&self, m: &Option<ResolutionEntry>) -> Option<u8> {
         let entry = m.as_ref()?;
         let u = entry.target_view();
-        if self.is_pruned(u) {
-            return match entry {
-                ResolutionEntry::Full(..) | ResolutionEntry::Core(..) => Some(1),
-                ResolutionEntry::Skip(_) => None,
-            };
-        }
+        // SAFETY: deliberately NO pruned-view shortcut. This function used to return
+        // `Some(1)` for a pruned Full/Core target -- a wire-visible claim ("I myself
+        // emitted a matching grade-1 echo for exactly this `(C_u,T_u)`") that peers
+        // count verbatim toward `ReadyOK`'s `origin_ones >= f+1` threshold in
+        // `recheck_completion_and_direct`, asserted with no evidence whatsoever and even
+        // when our own E_i(u) had named a different payload. Since `views` holds no entry
+        // for a pruned `u`, falling through leaves `own_echo` as `None`, so the bit comes
+        // out `Some(0)` -- the truthful answer, and the one that simply does not
+        // contribute to the threshold. `meta_ok` already declines pruned targets, so a
+        // remote carrier never reaches here; this honest default is defence in depth.
         let own_echo = self
             .views
             .get(&u)

@@ -422,6 +422,20 @@ class NodeParameters:
                 if not isinstance(v, int) or isinstance(v, bool) or v < 0:
                     raise ConfigError(f"'{key}' must be a non-negative integer")
 
+        #  - `vantage_gc_window_views`: how many VIEWS of per-view internal state
+        #    VantageCore retains behind its resolved prefix before pruning. Distinct
+        #    from `gc_depth` below, which is a depth in Autobahn ROUNDS -- the Vantage
+        #    GC originally reused `gc_depth`, so tuning Autobahn's knob silently
+        #    resized Vantage's retention window. Must be >= 1 (a window of 0 puts the
+        #    GC floor at the resolved watermark itself); the node clamps it too, but
+        #    reject it here so the misconfiguration surfaces before deploying.
+        if 'vantage_gc_window_views' in json:
+            v = json['vantage_gc_window_views']
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ConfigError(
+                    "'vantage_gc_window_views' must be an integer >= 1"
+                )
+
         self.json = json
 
     def print(self, filename):
@@ -445,7 +459,20 @@ class BenchParameters:
             rate = rate if isinstance(rate, list) else [rate]
             if not rate:
                 raise ConfigError('Missing input rate')
-            self.rate = [int(x) for x in rate]
+            # Normalise to ASCENDING order here rather than trusting the
+            # caller: remote.py's `run()` peak-relative early-stop (CHANGE A,
+            # see BenchParameters.early_stop_margin below) walks self.rate in
+            # list order and `break`s the FIRST point whose TPS falls too far
+            # below the running peak, printing "stopping sweep (remaining
+            # higher rates skipped)" -- both the early-stop logic and that
+            # message assume the list is already low-to-high (matching
+            # fabfile.py's own "rate SWEEP ascending toward saturation"
+            # docstring). An out-of-order --rates (e.g.
+            # 50000,250000,100000) would otherwise let a spurious dip at
+            # 250000 `break` the sweep and silently skip the still-unrun
+            # (and perfectly valid, lower) 100000 point, while claiming to
+            # have skipped only "remaining higher rates".
+            self.rate = sorted(int(x) for x in rate)
 
             self.workers = int(json['workers'])
 
@@ -488,6 +515,23 @@ class BenchParameters:
             )
             if self.early_stop_margin < 0:
                 raise ConfigError('early_stop_margin must be non-negative')
+
+            # Opt-out for remote.py's `_update` binary-provenance check
+            # (fetch-binary deploy path only -- irrelevant under
+            # --source-build, which always compiles the current working
+            # tree and has nothing to compare against). By default, a SHA
+            # mismatch between the nightly release's commit.txt and the
+            # local working tree's HEAD hard-fails the deploy (see
+            # `_update`'s docstring: a stale binary silently invalidates the
+            # measurement, made worse by `config::Parameters` having no
+            # `#[serde(deny_unknown_fields)]`). Set true only once you've
+            # deliberately confirmed the drift is immaterial for what you're
+            # running -- the mismatch is then downgraded to a `Print.warn`
+            # instead of aborting the deploy.
+            self.allow_stale_binary = (
+                bool(json['allow_stale_binary'])
+                if 'allow_stale_binary' in json else False
+            )
         except KeyError as e:
             raise ConfigError(f'Malformed bench parameters: missing key {e}')
 

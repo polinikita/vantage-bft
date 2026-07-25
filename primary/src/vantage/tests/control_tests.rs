@@ -337,6 +337,40 @@ async fn fetch_serves_once_per_requester_and_pair() {
     );
 }
 
+/// A carrier body stays SERVABLE after its view drops below the state floor, down to the
+/// separate (wider) serve floor. Refusing on the state floor is what left a party more
+/// than one GC window behind with nobody to fetch `B_w` from: every up-to-date holder
+/// declined, `pending_fetch` never cleared, and `pump_log` blocked for good.
+#[tokio::test]
+async fn fetch_serves_below_state_floor_down_to_the_serve_floor() {
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    let requester = authors()[0].0;
+    let proposal = skip_proposal(4, 1);
+    control.on_completion_reportable(4, proposal.clone());
+    let digest = proposal.digest(&test_sid());
+
+    // View 4 is now below the state floor (6) but at/above the serve floor (3).
+    control.gc_below(6, 3);
+
+    assert!(
+        control
+            .on_control_fetch(requester, 4, digest.clone())
+            .iter()
+            .any(
+                |e| matches!(e, Effect::ControlServeTo(peer, v, _) if *peer == requester && *v == 4)
+            ),
+        "a body we still hold must be served even though its view is below min_live_view"
+    );
+
+    // Below the serve floor the body itself is gone, so there is nothing to answer with.
+    control.gc_below(9, 7);
+    assert!(
+        control.on_control_fetch(requester, 4, digest).is_empty(),
+        "past the serve floor the body is dropped and the fetch goes unanswered"
+    );
+}
+
 #[tokio::test]
 async fn end_to_end_completion_report_to_anchor_via_bottom_bracha() {
     // The non-Byzantine baseline this phase's marquee Byzantine test builds on: a

@@ -53,7 +53,7 @@ fn control_gc_drops_old_view_census_and_resolves_old_anchors() {
     control.on_comp_report(1, digest.clone(), sender);
     assert_eq!(control.report_count_for(1, &digest), 1);
 
-    control.gc_below(2);
+    control.gc_below(2, 2);
 
     assert_eq!(control.report_count_for(1, &digest), 0);
     assert!(control.is_anchor_resolved(1));

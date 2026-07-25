@@ -199,6 +199,25 @@ pub struct Parameters {
     #[serde(default = "default_delta_ms")]
     pub delta_ms: u64,
 
+    /// Vantage only: how many VIEWS of per-view internal state `VantageCore` retains
+    /// behind its resolved prefix before `collect_internal_garbage` prunes
+    /// (`AgbEngine`/`Frontier`/`ControlLog`/`Resolver`). Carrier bodies are additionally
+    /// kept `ControlLog::SERVE_MARGIN_WINDOWS` further windows back so a lagging peer can
+    /// still fetch them.
+    ///
+    /// This is deliberately SEPARATE from `gc_depth`, which the Vantage GC originally
+    /// reused. `gc_depth` is documented and consumed as a depth in Autobahn ROUNDS
+    /// (`Core`/`garbage_collector`); a Vantage view and an Autobahn round are different
+    /// counters with different cadence, so one integer cannot correctly serve both, and an
+    /// operator tuning `gc_depth` for Autobahn was silently resizing Vantage's retention
+    /// window. `#[serde(default)]` keeps every pre-existing parameter file valid, and the
+    /// default matches `gc_depth`'s so behaviour is unchanged for anyone who never sets it.
+    ///
+    /// `VantageCore::build` clamps this to >= 1: a window of 0 would put the GC floor at
+    /// the resolved watermark itself and prune state for the view being resolved.
+    #[serde(default = "default_vantage_gc_window_views")]
+    pub vantage_gc_window_views: u64,
+
     /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
     /// per-authority-pair one-way latency table, applied to THIS node's own
     /// primary-to-primary connections at spawn time via `Committee::latency_map`
@@ -332,6 +351,12 @@ fn default_max_block_payload() -> usize {
 
 fn default_delta_ms() -> u64 {
     1000
+}
+
+/// Matches `gc_depth`'s own default, so splitting the two knobs apart changes no
+/// existing deployment's behaviour.
+fn default_vantage_gc_window_views() -> u64 {
+    50
 }
 
 /// AWS region names for the 10-region RTT matrix below. Ported VERBATIM from
@@ -517,6 +542,7 @@ impl Default for Parameters {
             header_size: 1_000,
             max_header_delay: 100,
             gc_depth: 50,
+            vantage_gc_window_views: default_vantage_gc_window_views(),
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,
@@ -580,6 +606,10 @@ impl Parameters {
         info!("Header size set to {} B", self.header_size);
         info!("Max header delay set to {} ms", self.max_header_delay);
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
+        info!(
+            "Vantage internal GC window set to {} views",
+            self.vantage_gc_window_views
+        );
         info!("Sync retry delay set to {} ms", self.sync_retry_delay);
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Batch size set to {} B", self.batch_size);
@@ -1090,6 +1120,11 @@ mod tests {
         assert!(!params.authenticate_channels);
         assert!(!params.batch_messages);
         assert!(!params.compress_network);
+        // `vantage_gc_window_views` is absent from this (pre-existing shape) file and
+        // must default to the same 50 the Vantage GC previously took from `gc_depth`,
+        // so splitting the two knobs apart changes nothing for existing parameter files.
+        assert_eq!(params.vantage_gc_window_views, 50);
+        assert_eq!(params.vantage_gc_window_views, params.gc_depth);
         // `latency_table` is `#[serde(skip)]`: never present in the file, always
         // `None` after deserialization -- `node run` builds it from
         // `mimic_latency_ms` at spawn.

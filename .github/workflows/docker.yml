@@ -40,6 +40,9 @@ jobs:
           docker rm extract
           chmod +x ./target/node-linux-amd64 ./target/benchmark_client-linux-amd64
 
+      - name: Write commit provenance file
+        run: echo -n "${{ github.sha }}" > ./target/commit.txt
+
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -47,6 +50,7 @@ jobs:
           path: |
             ./target/node-linux-amd64
             ./target/benchmark_client-linux-amd64
+            ./target/commit.txt
           retention-days: 30
 
       - name: Update nightly release
@@ -58,6 +62,7 @@ jobs:
           files: |
             ./target/node-linux-amd64
             ./target/benchmark_client-linux-amd64
+            ./target/commit.txt
           body: |
             Rolling nightly build from `main` branch.
             **Commit**: ${{ github.sha }}

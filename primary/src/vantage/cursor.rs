@@ -29,8 +29,13 @@ pub struct Cursor {
     /// The lowest view not yet fully advanced past.
     next_view: View,
     output: HashSet<Digest>,
-    /// The committed block log in emission order (for equality checks / eventual
-    /// application use).
+    /// The committed block log in emission order, kept ONLY for tests (cross-node log
+    /// equality assertions in `byzantine_tests`/`crash_fault_tests`/`integration_tests`).
+    ///
+    /// `#[cfg(test)]` because nothing in production ever read it: the real output path is
+    /// `Effect::Output`/`tx_output`, and this `Vec` grew by one 32-byte `Digest` per
+    /// committed block for the process lifetime with no reader and no pruning.
+    #[cfg(test)]
     output_log: Vec<Digest>,
     /// Views whose core prefix `K` has already been emitted (either at a
     /// completed-but-open step, or inline while sealing).
@@ -63,6 +68,7 @@ impl Cursor {
             blocks,
             next_view: 1,
             output,
+            #[cfg(test)]
             output_log: Vec::new(),
             core_emitted: BTreeSet::new(),
             pending: BTreeMap::new(),
@@ -70,18 +76,13 @@ impl Cursor {
         }
     }
 
+    #[cfg(test)]
     pub fn output_log(&self) -> &[Digest] {
         &self.output_log
     }
 
     pub fn next_view(&self) -> View {
         self.next_view
-    }
-
-    pub fn gc_below(&mut self, floor: View) {
-        let floor = floor.min(self.next_view);
-        self.pending = self.pending.split_off(&floor);
-        self.core_emitted = self.core_emitted.split_off(&floor);
     }
 
     /// R4's `complete(v) -> B`: the core becomes irrevocable at a still-`gopen` view.
@@ -179,6 +180,7 @@ impl Cursor {
         }
         for h in &hashes {
             self.output.insert(h.clone());
+            #[cfg(test)]
             self.output_log.push(h.clone());
             log::info!("Committed vantage block {}", h);
         }

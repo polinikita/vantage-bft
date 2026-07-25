@@ -143,6 +143,62 @@ async fn meta_ok_full_passes_once_own_ready_is_grade_one_same_payload() {
     assert_eq!(echo.grade, 1);
 }
 
+/// Once view `u` is pruned, MetaOK must DECLINE a carrier targeting it rather than wave it
+/// through. The pruned branch used to `return true`, and `compute_origin` used to stamp
+/// `origin = Some(1)` alongside -- a first-hand attestation peers count toward ReadyOK's
+/// `origin_ones >= f+1`. Since `formed` puts no lower bound on the target view, a Byzantine
+/// proposer of a live carrier could name any pruned `u` with a fabricated payload and
+/// harvest those endorsements from every party past its own GC floor.
+///
+/// This is the same setup as `meta_ok_full_passes_once_own_ready_is_grade_one_same_payload`
+/// -- where the entry is genuinely justified and DOES echo -- with only a `gc_below` added,
+/// so it isolates pruning as the cause.
+#[tokio::test]
+async fn meta_ok_rejects_carrier_targeting_a_pruned_view() {
+    let (self_name, _) = authors()[3];
+    let (author_c, _) = authors()[0];
+    let (author_w, _) = authors()[1];
+    let (mut lm, _store) = new_lane_manager(self_name, ".db_test_metaok_pruned_target");
+    let mut rep = new_repairer(self_name, &lm);
+    let mut agb = new_agb_engine(self_name);
+    let now = std::time::Instant::now();
+
+    let (c_ref, proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
+    for (sender, _) in &others {
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 1,
+                sender: *sender,
+                wish: 0,
+                origin: None,
+            },
+            &mut rep,
+        );
+    }
+
+    // The only difference from the passing test: u=1's evidence is now gone.
+    agb.gc_below(2);
+
+    agb.enter(4, now, &mut lm, &mut rep);
+    let m = Some(ResolutionEntry::Full(1, vec![c_ref], Vec::new()));
+    let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
+    let sender_w = proposer_of(4);
+    let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
+
+    assert!(
+        echo_effect(&effects).is_none(),
+        "MetaOK must decline a target whose evidence we pruned -- endorsing it would \
+         assert a first-hand echo we can no longer substantiate"
+    );
+}
+
 #[tokio::test]
 async fn meta_ok_full_rejects_when_own_ready_is_grade_zero() {
     let (self_name, _) = authors()[3];

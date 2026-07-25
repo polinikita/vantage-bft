@@ -51,10 +51,20 @@ pub struct Resolver {
     /// is_anchor_resolved(u)`, the predicate the caller always passes as `resolved`) is
     /// sticky and never regresses: `AgbEngine::is_sealed` only flips a view's `sealed`
     /// field `None -> Some` (first submission wins; `submit_anchor`/the fastseal path
-    /// leave an already-`Some` field untouched), and no entry is ever removed from
-    /// `AgbEngine`'s per-view map, so it can never un-seal; `ControlLog::
-    /// is_anchor_resolved` only ever inserts into the `anchored` set (never removes),
-    /// so it can never un-anchor. Once `resolved(u)` is witnessed true for some `u`, it
+    /// leave an already-`Some` field untouched); `ControlLog::is_anchor_resolved` only
+    /// ever inserts into the `anchored` set.
+    ///
+    /// CORRECTION: this comment used to justify stickiness with "no entry is ever removed
+    /// from `AgbEngine`'s per-view map" and "(never removes)" from `anchored`. Both became
+    /// FALSE when view GC landed -- `AgbEngine::gc_below` and `ControlLog::gc_below` both
+    /// `split_off` those very collections. Stickiness survives for a different reason:
+    /// both predicates report `true` for a PRUNED view (`is_pruned`/`anchor_resolved`), so
+    /// removal flips them `false -> true` at worst, never `true -> false`. That is sound
+    /// here specifically because the floor is `resolved_watermark - window`, so a pruned
+    /// `u` is one this party already witnessed resolved; do not generalise the
+    /// "pruned means resolved" shortcut to predicates that gate a REMOTE claim (see
+    /// `AgbEngine::meta_ok`/`compute_origin`, which must not and no longer do).
+    /// Once `resolved(u)` is witnessed true for some `u`, it
     /// is true for every later call -- advancing past `u` here only ever skips a view
     /// this or an earlier call already confirmed resolved, never one whose resolved-
     /// ness was merely assumed. Starts at 1 (nothing resolved yet); only ever advances,

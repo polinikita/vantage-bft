@@ -123,6 +123,17 @@ pub struct ControlLog {
 
     bracha: HashMap<Round, BrachaRoundState>,
     notif: HashMap<Round, NotifRoundState>,
+    /// Exactly the rounds `retry_pending_echoes` would find by scanning `bracha` for
+    /// `!echo_sent && received_init.is_some()`, maintained incrementally at the only two
+    /// sites that can change that membership (`on_control_init` stores the init;
+    /// `try_echo` sets `echo_sent`) -- same technique as `AgbEngine::pending_gate`.
+    ///
+    /// `bracha` is keyed by `Round` and has no pruning (see this struct's `proposal`
+    /// field: "no pruning yet"), so it grows for the process lifetime. The scan it
+    /// replaces ran on EVERY received `CompReport` and every accepted `ControlServe`,
+    /// making steady-state per-message work grow linearly with uptime. This index makes
+    /// that cost proportional to the genuinely-pending set instead.
+    pending_echo_rounds: BTreeSet<Round>,
 
     // --- log assembly + anchors (§6) ---
     delivered_log: Vec<(View, Digest)>,
@@ -131,9 +142,22 @@ pub struct ControlLog {
     anchored: BTreeSet<View>,
 
     // --- fetch bookkeeping ---
-    pending_fetch: BTreeSet<(View, Digest)>,
+    /// Outstanding `B_w` fetches, mapped to the round we last fanned the request out in.
+    /// The round is what makes the request RETRYABLE: this was a `BTreeSet`, i.e. a
+    /// one-shot latch (`ensure_fetch` bailed on a failed `insert` and the entry was
+    /// removed only on the accepting path), so a round of requests that every peer
+    /// declined was never re-sent and `pump_log` blocked on that position forever.
+    pending_fetch: BTreeMap<(View, Digest), Round>,
     fetch_answered: BTreeSet<(View, Digest, PublicKey)>,
     min_live_view: View,
+    /// Floor for `blocks` alone, held `SERVE_MARGIN_WINDOWS` GC windows BELOW
+    /// `min_live_view`. Serving a carrier body is read-only -- `on_control_fetch` only
+    /// ever reads `blocks` and cannot resurrect any per-view protocol state -- so
+    /// retaining bodies after we are done with the view costs nothing but memory and is
+    /// what lets a peer that has fallen behind still catch up. Without it, every party
+    /// past its own floor refused, and a party more than one window behind could never
+    /// obtain `B_w` from anyone.
+    min_serve_view: View,
 
     /// Test-only cap on how far `try_propose` will ever lead a round (mirrors
     /// `harness::Node::max_views`'s exact reasoning): nothing throttles a `⊥`-valued
@@ -176,9 +200,11 @@ impl ControlLog {
             delivered_set: BTreeSet::new(),
             consume_pos: 0,
             anchored: BTreeSet::new(),
-            pending_fetch: BTreeSet::new(),
+            pending_fetch: BTreeMap::new(),
             fetch_answered: BTreeSet::new(),
             min_live_view: 1,
+            min_serve_view: 1,
+            pending_echo_rounds: BTreeSet::new(),
             #[cfg(test)]
             max_rounds_for_test: None,
         }
@@ -192,6 +218,21 @@ impl ControlLog {
     pub fn control_round_timeout(&self) -> Duration {
         self.delta * 6
     }
+
+    /// Re-fan an unanswered `B_w` fetch every this many control rounds. Rounds are the
+    /// natural clock here (`ensure_fetch` is already handed one, and a value-less Simple-IT
+    /// round costs only Bracha's three one-way hops), so this needs no timer plumbing.
+    /// Small enough that a lagging party recovers promptly, large enough that a genuinely
+    /// unobtainable body does not turn into a per-round broadcast storm.
+    const FETCH_RETRY_ROUNDS: Round = 8;
+
+    /// How many GC windows of carrier bodies to keep past `min_live_view`, purely to serve
+    /// peers that have fallen behind. One full extra window doubles the distance a party
+    /// can lag and still catch up, at the cost of retaining `ViewProposal` bodies for that
+    /// span. NOTE: this widens the catch-up window, it does not make it unbounded -- a
+    /// party lagging further than `(1 + SERVE_MARGIN_WINDOWS)` windows still cannot obtain
+    /// `B_w` from anyone, which needs a real state-transfer/snapshot path to fix properly.
+    pub const SERVE_MARGIN_WINDOWS: View = 1;
 
     fn is_pruned_view(&self, view: View) -> bool {
         view < self.min_live_view
@@ -209,20 +250,31 @@ impl ControlLog {
         self.consume_pos = 0;
     }
 
-    pub fn gc_below(&mut self, floor: View) {
+    /// Prune per-view state below `floor`, EXCEPT the held carrier bodies `blocks`, which
+    /// are kept down to `serve_floor` so a lagging peer can still fetch them (see
+    /// `min_serve_view`). `serve_floor` must be `<= floor`; the caller
+    /// (`VantageCore::collect_internal_garbage`) derives it from the same GC window.
+    pub fn gc_below(&mut self, floor: View, serve_floor: View) {
         if floor <= self.min_live_view {
             return;
         }
+        let serve_floor = serve_floor.min(floor);
         self.reports = self.reports.split_off(&floor);
-        self.blocks = self.blocks.split_off(&floor);
         self.reported = self.reported.split_off(&floor);
         self.delivered_set = self.delivered_set.split_off(&(floor, Digest::default()));
         self.anchored = self.anchored.split_off(&floor);
         self.pending_fetch = self.pending_fetch.split_off(&(floor, Digest::default()));
+        self.min_live_view = floor;
+
+        // Bodies and the per-requester answered-set live on the wider serve window: both
+        // are read-only inputs to `on_control_fetch`, so keeping them cannot resurrect
+        // any view state, and dropping them is what made a lagging peer unrecoverable.
+        self.blocks = self.blocks.split_off(&serve_floor);
         self.fetch_answered =
             self.fetch_answered
-                .split_off(&(floor, Digest::default(), PublicKey::default()));
-        self.min_live_view = floor;
+                .split_off(&(serve_floor, Digest::default(), PublicKey::default()));
+        self.min_serve_view = serve_floor;
+
         self.compact_delivered_log();
     }
 
@@ -434,6 +486,12 @@ impl ControlLog {
             return Vec::new();
         }
         state.received_init = Some((proposal, b_w));
+        // `pending_echo_rounds` membership is `!echo_sent && received_init.is_some()`.
+        // `echo_sent` can only have been set by `try_echo`, which requires
+        // `received_init` to already be `Some` -- and we just established it was `None` --
+        // so `echo_sent` is necessarily false here and this round joins the set
+        // unconditionally. `try_echo` below removes it again if it echoes immediately.
+        self.pending_echo_rounds.insert(round);
         let mut effects = self.try_echo(round);
         effects.extend(self.pump_log()); // a freshly-fetched-or-completed B_w might
                                          // unblock an already-pending log position
@@ -472,6 +530,8 @@ impl ControlLog {
         }
         let state = self.bracha.get_mut(&round).unwrap();
         state.echo_sent = true;
+        // Leaves `pending_echo_rounds`: the only site that sets `echo_sent`.
+        self.pending_echo_rounds.remove(&round);
         let name = self.name;
         state.echo_statements.insert(name, proposal.clone());
         let mut effects = vec![Effect::BroadcastControlEcho(proposal)];
@@ -483,12 +543,9 @@ impl ControlLog {
     /// init -- called whenever new reports arrive or a `B_w` becomes newly held (the
     /// same "persistent gate, explicit retry" pattern as `MetaOK`/`recheck_all`).
     fn retry_pending_echoes(&mut self) -> Vec<Effect> {
-        let pending: Vec<Round> = self
-            .bracha
-            .iter()
-            .filter(|(_, s)| !s.echo_sent && s.received_init.is_some())
-            .map(|(r, _)| *r)
-            .collect();
+        // Reads the incrementally-maintained index rather than scanning all of `bracha`,
+        // which is Round-keyed and never pruned -- see `pending_echo_rounds`.
+        let pending: Vec<Round> = self.pending_echo_rounds.iter().copied().collect();
         let mut effects = Vec::new();
         for r in pending {
             effects.extend(self.try_echo(r));
@@ -961,13 +1018,26 @@ impl ControlLog {
         out.into_iter().collect()
     }
 
-    fn ensure_fetch(&mut self, w: View, h: &Digest, _round: Round) -> Vec<Effect> {
-        if self.is_pruned_view(w) {
+    /// Request `B_w` from every matching report/echo author, at most once every
+    /// `FETCH_RETRY_ROUNDS` rounds for a given `(w,h)`.
+    ///
+    /// The retry is the point: this used to latch on a `BTreeSet::insert`, so if the one
+    /// round of requests it ever sent went unanswered -- every holder having pruned `w`,
+    /// or simply a dropped connection -- `pump_log` blocked on that log position for the
+    /// rest of the process's life, freezing `resolved_watermark` and therefore this
+    /// party's own GC floor too. Re-asking is cheap next to that.
+    fn ensure_fetch(&mut self, w: View, h: &Digest, round: Round) -> Vec<Effect> {
+        if self.is_pruned_view(w) || self.blocks.contains_key(&w) {
             return Vec::new();
         }
-        if self.blocks.contains_key(&w) || !self.pending_fetch.insert((w, h.clone())) {
-            return Vec::new();
+        let key = (w, h.clone());
+        match self.pending_fetch.get(&key) {
+            Some(&last) if round.saturating_sub(last) < Self::FETCH_RETRY_ROUNDS => {
+                return Vec::new()
+            }
+            _ => {}
         }
+        self.pending_fetch.insert(key, round);
         self.matching_report_and_echo_authors(w, h)
             .into_iter()
             .map(|peer| Effect::ControlFetchTo(peer, w, h.clone()))
@@ -976,8 +1046,14 @@ impl ControlLog {
 
     /// A peer's `ControlFetch(w, h)` request -- answer with our held, verified `B_w` if
     /// we have it and haven't already answered this requester for this pair.
+    ///
+    /// Gated on `min_serve_view`, NOT on `min_live_view`: we deliberately keep serving a
+    /// carrier body after we are done with the view itself, because refusing on the
+    /// narrower floor is what left a peer more than one GC window behind with nobody to
+    /// fetch from. `blocks.get` below is the real gate -- if we no longer hold it, we
+    /// answer nothing either way.
     pub fn on_control_fetch(&mut self, requester: PublicKey, w: View, h: Digest) -> Vec<Effect> {
-        if self.is_pruned_view(w) {
+        if w < self.min_serve_view {
             return Vec::new();
         }
         if self.fetch_answered.contains(&(w, h.clone(), requester)) {
@@ -1014,7 +1090,7 @@ impl ControlLog {
             return Vec::new();
         }
         let digest = proposal.digest(&self.sid);
-        if !self.pending_fetch.contains(&(view, digest.clone())) {
+        if !self.pending_fetch.contains_key(&(view, digest.clone())) {
             return Vec::new(); // unsolicited, or answers a DIFFERENT pending pair -- ignored
         }
         if proposal.m.is_none()

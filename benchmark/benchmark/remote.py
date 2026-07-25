@@ -559,7 +559,104 @@ class Bench:
     # release assets under (`<bin>-linux-amd64`).
     RELEASE_BINARIES = ('node', 'benchmark_client')
 
-    def _update(self, hosts, collocate):
+    def _check_binary_provenance(self, release_repo, allow_stale_binary):
+        ''' BINARY-PROVENANCE CHECK (fetch-binary deploy path only) --------
+        Why this exists: `_update`'s fetch-binary branch below downloads
+        `node`/`benchmark_client` from the `nightly` GitHub release tag, and
+        that tag is MUTABLE -- docker.yml's "Update nightly release" step
+        overwrites the same tag on every push to `main`. There is no
+        checksum on the download and no version/commit baked into either
+        binary (no GIT_SHA, no `git rev-parse`, no `--version`, no vergen
+        anywhere in this repo), and `curl -fL` only fails loudly on a
+        genuinely MISSING asset -- a STALE one (still the previous commit's
+        build, because docker.yml's ~12-minute build for the CURRENT commit
+        hasn't finished yet, or was never triggered for it) downloads and
+        `chmod +x`s without complaint. The campaign then silently measures
+        the wrong code.
+
+        This is worse than an ordinary stale-binary risk because
+        `config::Parameters` (config/src/lib.rs) has no
+        `#[serde(deny_unknown_fields)]`: a stale binary does not error out
+        on a parameter it doesn't recognize, it just silently ignores it.
+        Concretely, `mimic_latency_ms` was added recently -- a stale binary
+        predating that field would run with NO latency injection while
+        .parameters.json says e.g. 100, and nothing would report the
+        discrepancy; the campaign's results would simply be wrong.
+
+        Mechanism: docker.yml also uploads a `commit.txt` asset (the
+        `${{ github.sha }}` that produced the binaries) to the SAME
+        `nightly` release. Fetched here with a LOCAL curl -- on the
+        coordinator, BEFORE anything is deployed to the instances, so a
+        mismatch is caught before it can taint a run -- and compared against
+        the local working tree's own HEAD commit (`git rev-parse HEAD`,
+        run in the repo root).
+
+          - Match: the release is current, proceed silently.
+          - Mismatch: hard failure (`BenchError`) naming both SHAs, UNLESS
+            `allow_stale_binary` is set, in which case it is downgraded to
+            a `Print.warn` -- the explicit, opt-in escape hatch for someone
+            who has already confirmed the drift doesn't matter for what
+            they're about to run.
+          - `commit.txt` missing/unfetchable (e.g. an older release
+            published before this check existed): NOT a hard failure --
+            `Print.warn` and continue. Provenance being unverifiable must
+            never break an otherwise-working deploy. '''
+        local_head = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=self._repo_root(), capture_output=True, text=True,
+        )
+        if local_head.returncode != 0:
+            raise BenchError(
+                'Fetch-binary deploy failed',
+                ExecutionError(
+                    'Could not determine the local working tree\'s HEAD '
+                    f'commit via `git rev-parse HEAD`: '
+                    f'{local_head.stderr.strip()} -- needed for the '
+                    'binary-provenance check (see Bench._check_binary_provenance)'
+                )
+            )
+        local_sha = local_head.stdout.strip()
+
+        commit_url = (
+            f'https://github.com/{release_repo}/releases/download/'
+            'nightly/commit.txt'
+        )
+        # Anonymous, local curl -- same public-release assumption as the
+        # binary fetches themselves, just run HERE (coordinator) instead of
+        # on each instance, and BEFORE any instance is touched.
+        remote = subprocess.run(
+            ['curl', '-fsL', '--retry', '3', commit_url],
+            capture_output=True, text=True,
+        )
+        if remote.returncode != 0:
+            Print.warn(
+                f'Could not fetch {commit_url} (an older nightly release '
+                'that predates binary-provenance stamping, or a transient '
+                'network issue) -- skipping the binary-provenance check; '
+                'the deployed binaries may or may not match the working '
+                'tree'
+            )
+            return
+        remote_sha = remote.stdout.strip()
+
+        if remote_sha != local_sha:
+            message = (
+                f'Nightly release binary was built from commit '
+                f'{remote_sha}, but the local working tree\'s HEAD is '
+                f'{local_sha} -- the release predates this working tree, '
+                'so the campaign would measure the wrong binary. Either '
+                'wait for the docker.yml workflow run for this commit to '
+                'finish publishing the nightly release, or pass '
+                '--source-build to compile the working tree on the '
+                'instances instead. To proceed anyway, set '
+                '"allow_stale_binary": true in the bench parameters.'
+            )
+            if allow_stale_binary:
+                Print.warn(message)
+            else:
+                raise BenchError('Fetch-binary deploy failed', ConfigError(message))
+
+    def _update(self, hosts, collocate, allow_stale_binary=False):
         if collocate:
             ips = list(set(hosts))
         else:
@@ -590,6 +687,13 @@ class Bench:
                         'instead'
                     )
                 )
+
+            # BINARY-PROVENANCE CHECK: verify the nightly release actually
+            # corresponds to this working tree's HEAD before deploying
+            # anything -- see `_check_binary_provenance`'s docstring for why
+            # (silent staleness would otherwise invalidate the measurement).
+            self._check_binary_provenance(release_repo, allow_stale_binary)
+
             repo_name = self.settings.repo_name
             Print.info(f'Updating {len(ips)} machines (fetching pre-built binaries)...')
             cmd = [f'mkdir -p {repo_name}/target/release']
@@ -1273,7 +1377,10 @@ class Bench:
         # Update nodes.
         print(selected_hosts)
         try:
-            self._update(selected_hosts, bench_parameters.collocate)
+            self._update(
+                selected_hosts, bench_parameters.collocate,
+                bench_parameters.allow_stale_binary,
+            )
         except (GroupException, ExecutionError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to update nodes', e)

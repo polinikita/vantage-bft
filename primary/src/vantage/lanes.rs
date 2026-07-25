@@ -767,8 +767,17 @@ impl LaneManager {
             blocks.upsert(header.clone(), direct, false, payload_ok, true);
         }
         if direct && payload_ok {
-            self.pending_direct
-                .insert((header.author, header.height, digest.clone()));
+            let r = (header.author, header.height, digest.clone());
+            // Only track tuples we have NOT already acked. `refresh_author` removes a ref
+            // from `pending_direct` inside its `!acked && direct_pub` branch, so an
+            // already-acked ref re-inserted here could never be evicted again -- one
+            // permanently pinned entry per re-delivered publish, and `pending_direct` is
+            // scanned on every `refresh_author`. That defeats this set's whole purpose
+            // ("under steady honest traffic the pending set contains only the freshly-
+            // arrived tip"), and `LaneManager` has no GC to mop it up.
+            if !self.acked.contains(&r) {
+                self.pending_direct.insert(r);
+            }
         }
         effects.push(Effect::BlockCached(digest.clone()));
         if header.author != self.name {
@@ -823,7 +832,10 @@ impl LaneManager {
         };
         match direct_ready {
             Some(r) => {
-                self.pending_direct.insert(r.clone());
+                // Same already-acked guard as `process_publish` -- see its comment.
+                if !self.acked.contains(&r) {
+                    self.pending_direct.insert(r.clone());
+                }
                 self.refresh_author(r.0)
             }
             None => Vec::new(),

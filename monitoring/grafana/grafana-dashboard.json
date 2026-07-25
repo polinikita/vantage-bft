@@ -142,11 +142,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(committed_transactions{node=~\"$node\"}[10s]))",
+          "expr": "max(sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s])))",
           "legendFormat": "total TPS",
           "refId": "A"
         }
       ],
+      "description": "committed_transactions is a per-worker-process counter and every node counts the same replicated commit sequence, so this sums within each host first, then takes the max across hosts (a flat sum would inflate by committee size).",
       "title": "Committed TPS (total)",
       "type": "stat"
     },
@@ -200,11 +201,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(committed_bytes{node=~\"$node\"}[10s]))",
+          "expr": "max(sum by (host) (rate(committed_bytes{node=~\"$node\"}[10s])))",
           "legendFormat": "total BPS",
           "refId": "A"
         }
       ],
+      "description": "committed_bytes is a per-worker-process counter and every node counts the same replicated commit sequence, so this sums within each host first, then takes the max across hosts (a flat sum would inflate by committee size).",
       "title": "Committed bytes rate (total)",
       "type": "stat"
     },
@@ -362,12 +364,13 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(committed_transactions{node=~\"$node\"}[10s]))",
-          "legendFormat": "{{node}}",
+          "expr": "sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s]))",
+          "legendFormat": "{{host}}",
           "refId": "A"
         }
       ],
-      "title": "Committed TPS per node",
+      "description": "committed_transactions is a per-worker-process counter and every node counts the same replicated commit sequence, so this breaks down by host (one physical machine, collapsing collocated primary+worker) rather than by per-process node -- summing per-process values here would double count a collocated primary+worker pair.",
+      "title": "Committed TPS per host",
       "type": "timeseries"
     },
     {
@@ -590,8 +593,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_entered_view{node=~\"$node\"}[10s]))",
-          "legendFormat": "{{node}} entered/s",
+          "expr": "sum by (node) (vantage_entered_view{node=~\"$node\"})",
+          "legendFormat": "{{node}} entered_view",
           "refId": "A"
         },
         {
@@ -613,6 +616,7 @@
           "refId": "C"
         }
       ],
+      "description": "vantage_entered_view is a gauge (the highest view entered so far), not a counter -- rate() on it is meaningless, so refId A reads it directly rather than wrapping it in rate().",
       "title": "View entry / seal / anchor rates",
       "type": "timeseries"
     },
@@ -1070,11 +1074,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(bytes_sent_total{node=~\"$node\"}) / sum(committed_bytes{node=~\"$node\"})",
+          "expr": "sum(bytes_sent_total{node=~\"$node\"}) / max(sum by (host) (committed_bytes{node=~\"$node\"}))",
           "legendFormat": "overhead ratio",
           "refId": "A"
         }
       ],
+      "description": "bytes_sent_total is genuinely additive across processes (real network egress) so it stays a flat sum; committed_bytes is a replicated-counter, so its denominator sums within each host first, then takes the max across hosts.",
       "title": "Overhead bytes per sequenced byte",
       "type": "stat"
     },
@@ -1128,11 +1133,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(bytes_sent_total{node=~\"$node\"}[10s])) / sum(rate(committed_transactions{node=~\"$node\"}[10s])) / 512",
+          "expr": "sum(rate(bytes_sent_total{node=~\"$node\"}[10s])) / max(sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s]))) / 512",
           "legendFormat": "efficiency",
           "refId": "A"
         }
       ],
+      "description": "bytes_sent_total is genuinely additive across processes (real network egress) so it stays a flat sum; committed_transactions is a replicated-counter, so its denominator sums within each host first, then takes the max across hosts.",
       "title": "Bandwidth efficiency (512B-normalized)",
       "type": "stat"
     },
@@ -1527,11 +1533,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(committed_transactions{node=~\"$node\"}[10s]))",
+          "expr": "max(sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s])))",
           "legendFormat": "committed/s",
           "refId": "B"
         }
       ],
+      "description": "submitted_transactions is emitted client-side, each client submitting a distinct slice of the load, so it stays a flat sum; committed_transactions is a per-worker-process counter and every node counts the same replicated commit sequence, so it sums within each host first, then takes the max across hosts.",
       "title": "Submitted vs. sequenced (committed) transactions/s",
       "type": "timeseries"
     },

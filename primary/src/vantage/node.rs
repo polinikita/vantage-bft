@@ -350,10 +350,15 @@ pub struct VantageCore {
     store: Store,
     tx_payload_ready: Sender<(Digest, Digest, WorkerId)>,
 
-    /// Vantage internal-state retention window, in views. Uses `Parameters::gc_depth`
-    /// to preserve the existing deployment knob: once the resolver has proven a
+    /// Vantage internal-state retention window, in VIEWS: once the resolver has proven a
     /// contiguous resolved prefix, component state below `resolved_watermark - gc_window`
     /// can be dropped.
+    ///
+    /// Sourced from `Parameters::vantage_gc_window_views`, NOT from `gc_depth`. It
+    /// originally read `gc_depth`, which is documented and consumed as a depth in Autobahn
+    /// ROUNDS -- a different counter with a different cadence -- so the same integer was
+    /// silently sizing two unrelated windows and an operator tuning Autobahn's GC was
+    /// resizing Vantage's retention.
     gc_window: View,
     last_gc_floor: View,
 
@@ -569,7 +574,9 @@ impl VantageCore {
             pending_payload: HashMap::new(),
             store,
             tx_payload_ready,
-            gc_window: parameters.gc_depth,
+            // Clamped to >= 1: a window of 0 would place the GC floor at the resolved
+            // watermark itself and prune state for the view being resolved.
+            gc_window: parameters.vantage_gc_window_views.max(1),
             last_gc_floor: 1,
             metrics: core_metrics,
             ut_inbound_dispatch: None,
@@ -846,16 +853,32 @@ impl VantageCore {
         if floor <= self.last_gc_floor {
             return;
         }
+        // Carrier bodies are kept `SERVE_MARGIN_WINDOWS` extra windows below the state
+        // floor so a peer that has fallen behind can still fetch them -- see
+        // `ControlLog::min_serve_view`.
+        let serve_floor = floor
+            .saturating_sub(
+                self.gc_window
+                    .saturating_mul(ControlLog::SERVE_MARGIN_WINDOWS),
+            )
+            .max(1);
         self.agb.gc_below(floor);
         self.frontier.gc_below(floor);
-        self.cursor.gc_below(floor);
-        self.control.gc_below(floor);
+        // NOTE: `Cursor` deliberately has no `gc_below`. Every key in its `pending`/
+        // `core_emitted` maps is `>= next_view` by construction (both insertion sites
+        // reject `view < next_view`, and `advance` removes the entry it passes), so
+        // `next_view` already IS the cursor's floor and a view-GC pass has nothing to
+        // prune. The `gc_below` this replaced clamped its argument to `next_view` and was
+        // therefore a provable no-op -- misleading, because it implied a bound it did not
+        // provide.
+        self.control.gc_below(floor, serve_floor);
         self.resolver.gc_below(floor);
         self.timers.retain(|Reverse((_, view, _))| *view >= floor);
         self.last_gc_floor = floor;
         log::debug!(
-            "vantage node: internal GC floor advanced to {} (resolved_watermark={}, gc_window={})",
+            "vantage node: internal GC floor advanced to {} (serve floor {}, resolved_watermark={}, gc_window={})",
             floor,
+            serve_floor,
             self.resolver.resolved_watermark(),
             self.gc_window
         );
