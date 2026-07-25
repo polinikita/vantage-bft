@@ -163,6 +163,15 @@ def build_local_benchmark_args(cfg: dict, binary: Path) -> list:
     latency_table = str(cfg.get("latency_table") or "none").strip()
     if latency_table.lower() != "none":
         args += ["--latency-table", latency_table]
+    else:
+        # Fable audit FIX 1: `node local-benchmark` now distinguishes an EXPLICITLY
+        # passed `--mimic-latency-ms 0` (zero injected latency, pure loopback) from
+        # simply omitting the flag (which now defaults to the real 10-AWS-region RTT
+        # matrix, config/src/lib.rs's `LatencyTable::aws_rtt`). Passing no latency
+        # flags at all -- what this branch used to do -- would therefore silently
+        # inject that AWS matrix instead of the pure-loopback mode this config value
+        # documents, so the zero must be explicit.
+        args += ["--mimic-latency-ms", "0"]
     if cfg.get("compress_network"):
         args.append("--compress-network")
     # Transport-level batching: optional (not in REQUIRED_KEYS), off by default --

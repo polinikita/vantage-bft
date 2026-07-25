@@ -19,13 +19,20 @@ class PathMaker:
     # mount point every validator's install() (remote.py) formats + mounts (see
     # the NVMe-detect-and-mount snippet there). Rooting the RocksDB store here
     # instead of the EBS root volume was the fix for the c5.xlarge throughput
-    # collapse when validators ran on `c5d.xlarge` (local NVMe SSD, same 4
-    # vCPU/NIC as `c5.xlarge`). Validators are back on plain EBS-only
-    # `c5.xlarge` (settings.json -- this run cares about NIC saturation, not
-    # store I/O), so `install()`'s NVMe-detect step now always falls through to
-    # the plain-EBS-directory fallback; the path stays the same either way, and
-    # the metrics-collector (also `c5.xlarge`) never uses this at all -- it
-    # runs no node/store.
+    # collapse (EBS-only, so store I/O both is slow AND competes with the
+    # consensus NIC for the same network-attached bandwidth). settings.json's
+    # validator `instance_type` is `c5d.xlarge` (same 4 vCPU/NIC as
+    # `c5.xlarge`, plus exactly one local NVMe SSD), so `install()`'s
+    # NVMe-detect step actually finds and formats that disk on every
+    # validator -- this is the branch that runs in practice, not a dormant
+    # fallback. This directory is a REQUIRED part of install() (not
+    # best-effort): `_run_single` passes `--store` under this path
+    # unconditionally, and RocksDB only creates the leaf `.db-*` directory,
+    # never '/mnt/db' itself, so install() also chowns '/mnt/db' to the ssh
+    # user and verifies it's writable, whether or not the NVMe mount above
+    # succeeded (a plain directory on the EBS root, on a non-`*d` instance
+    # type). The metrics-collector (plain `c5.xlarge`) never uses this at
+    # all -- it runs no node/store.
     REMOTE_STORE_BASE = '/mnt/db'
 
     @staticmethod

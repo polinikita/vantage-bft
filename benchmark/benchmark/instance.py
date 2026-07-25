@@ -43,13 +43,16 @@ class InstanceManager:
     # `estimate_cost()` whenever an instance isn't Spot, or is Spot but its
     # `describe_spot_price_history` lookup fails. Keyed by instance type;
     # `DEFAULT_FALLBACK_PRICE` covers any type without its own entry.
-    # c5.xlarge/eu-west-1 on-demand was ~0.192 USD/hr at the time this was
+    # c5.xlarge/eu-west-1 on-demand was ~0.192 USD/hr, and c5d.xlarge/eu-west-1
+    # on-demand was ~0.216 USD/hr (settings.json's validator instance_type,
+    # added by the single-AZ-pinning change), both at the time this was
     # written -- re-check https://aws.amazon.com/ec2/pricing/on-demand/ if
     # instance_type/region in settings.json changes; this is a documented
     # approximation, not a live price feed (Cost Explorer/CloudTrail are
     # denied for this IAM user).
     ON_DEMAND_FALLBACK_PRICE = {
         'c5.xlarge': 0.192,  # eu-west-1
+        'c5d.xlarge': 0.216,  # eu-west-1
     }
     DEFAULT_FALLBACK_PRICE = 0.192
 
@@ -256,29 +259,94 @@ class InstanceManager:
                     raise
 
     def _resolve_az_subnet(self, client, region):
-        ''' Single-AZ pinning: resolve the (availability_zone, subnet_id) EVERY
-        instance in `region` (validators AND the collector) launches into, so
-        intra-committee traffic -- already routed over private IPs, see
+        ''' Single-AZ pinning: resolve the (availability_zone, subnet_id, vpc_id)
+        EVERY instance in `region` (validators AND the collector) launches into,
+        so intra-committee traffic -- already routed over private IPs, see
         `internal_hosts()` -- stays INTRA-AZ, not merely intra-region: AWS bills
         cross-AZ private-IP transfer (~$0.01/GB each way) even within a single
         VPC/region, and only same-AZ private-IP traffic is genuinely free.
 
-        AZ selection: `settings.json`'s `instances.availability_zone` if set
-        (e.g. "eu-west-1a" -- configurable per the task's "or a configurable
-        one"), else the first AZ `describe_availability_zones` reports as
-        'available' in this region, sorted by name for a deterministic pick
-        across repeated `fab create` invocations.
+        AZ selection: `settings.json`'s `instances.availability_zone`, if set,
+        in EITHER of two forms:
+          - a plain string (e.g. "eu-west-1a"), applied to every region -- only
+            sound for a single-region settings.json, since an AZ name is
+            region-scoped ("eu-west-1a" does not exist in us-east-1).
+          - a dict mapping region -> az (e.g. {"eu-west-1": "eu-west-1a",
+            "us-east-1": "us-east-1b"}), for a multi-region settings.json. A
+            region absent from the mapping is NOT an error -- it falls
+            through to auto-pick below, so only some regions need pinning.
+        Whichever form resolves an AZ for `region`, the result must start with
+        `region` or this raises `BenchError` naming both the AZ and `region`
+        -- see the region-scope check below. That check covers BOTH forms
+        deliberately: a wrong-region string and a typo'd mapping entry fail
+        identically, rather than the mapping form retaining the late,
+        confusing `describe_subnets` failure the check exists to replace.
+        Absent either form (or a dict with no entry for `region`): the first
+        AZ `describe_availability_zones` reports as 'available' in this
+        region -- restricted to ordinary AZs (see the zone-type/opt-in-status
+        filters below, which exclude Local/Wavelength Zones: an account
+        opted into one can have it sort before the plain AZs by name, and
+        Local/Wavelength Zones have no default-for-az subnet, so picking one
+        here would fail the `describe_subnets` call below) -- sorted by name
+        for a deterministic pick across repeated `fab create` invocations.
 
         The subnet is that AZ's DEFAULT-VPC default-for-az subnet (resolved via
         `describe_subnets`) -- every account already has one per AZ (the same
         implicit subnet `run_instances` picked before this pinning existed), so
-        no new VPC/subnet provisioning is required. '''
+        no new VPC/subnet provisioning is required. The subnet's `VpcId` is
+        also returned so `_security_group_id` can scope its lookup to that
+        same VPC: security-group names are unique only WITHIN a VPC, not
+        account-wide. '''
         configured_az = getattr(self.settings, 'availability_zone', None)
-        if configured_az:
+        az = None
+        mapping_form = isinstance(configured_az, dict)
+        if mapping_form:
+            # Per-region mapping form: a region with no entry falls through
+            # to auto-pick below -- not an error.
+            az = configured_az.get(region)
+        elif configured_az:
             az = configured_az
-        else:
+
+        # Region-scope check, applied to BOTH forms: an AZ name is
+        # region-scoped ("eu-west-1a" does not exist in us-east-1), so a
+        # configured value that does not name an AZ in THIS region is a
+        # configuration error. Checking the mapping form too matters because a
+        # typo'd entry ({"eu-west-1": "us-east-1a"}) would otherwise fail
+        # exactly as confusingly as the un-validated string form did -- late,
+        # at `describe_subnets`, with a "No default-for-az subnet found"
+        # message that names the wrong-region AZ without saying why it is
+        # wrong, and only after earlier regions' instances are already
+        # launched and accruing cost.
+        if az is not None and not az.startswith(region):
+            hint = (
+                f"entry for '{region}' in the instances.availability_zone "
+                f"mapping names an AZ in another region"
+                if mapping_form else
+                "For a multi-region settings.json, set "
+                "instances.availability_zone to a {region: az} mapping "
+                "instead of a single string"
+            )
+            raise BenchError(
+                'AZ resolution',
+                Exception(
+                    f"Configured availability_zone '{az}' is not in region "
+                    f"'{region}' (an AZ name must start with its own region "
+                    f"name). {hint}."
+                )
+            )
+
+        if az is None:
             r = client.describe_availability_zones(
-                Filters=[{'Name': 'state', 'Values': ['available']}]
+                Filters=[
+                    {'Name': 'state', 'Values': ['available']},
+                    # Exclude Local Zones/Wavelength Zones: they have no
+                    # default-for-az subnet, so one of them sorting first
+                    # (possible once an account is opted into one, regardless
+                    # of alphabetical position among ordinary AZ names) would
+                    # fail the describe_subnets lookup below.
+                    {'Name': 'zone-type', 'Values': ['availability-zone']},
+                    {'Name': 'opt-in-status', 'Values': ['opt-in-not-required']},
+                ]
             )
             zones = sorted(z['ZoneName'] for z in r['AvailabilityZones'])
             if not zones:
@@ -300,21 +368,49 @@ class InstanceManager:
                 'Subnet resolution',
                 Exception(f'No default-for-az subnet found in {az} ({region})')
             )
-        return az, subnets[0]['SubnetId']
+        return az, subnets[0]['SubnetId'], subnets[0]['VpcId']
 
-    def _security_group_id(self, client):
-        ''' Resolves `SECURITY_GROUP_NAME` to its GroupId. Needed because
-        launching into an explicit `SubnetId` (single-AZ pinning) requires
-        `SecurityGroupIds`, not the `SecurityGroups` (by-name) form the prior
-        implicit-default-subnet launch used. '''
+    def _security_group_id(self, client, vpc_id):
+        ''' Resolves `SECURITY_GROUP_NAME` to its GroupId, scoped to `vpc_id`
+        (the VPC of the subnet this launch is pinned into -- see
+        `_resolve_az_subnet`). Needed because launching into an explicit
+        `SubnetId` (single-AZ pinning) requires `SecurityGroupIds`, not the
+        `SecurityGroups` (by-name) form the prior implicit-default-subnet
+        launch used.
+
+        The `vpc-id` filter matters: security-group names are unique only
+        WITHIN a VPC, not account-wide, so without it an account with a
+        same-named group in a different VPC could resolve to a group that
+        does not belong to the pinned subnet's VPC, and `run_instances` would
+        then fail with "security group ... and subnet ... belong to different
+        networks". If more than one group still matches even scoped to one
+        VPC (should not happen -- names are unique per VPC -- but checked
+        rather than silently taking the first), this raises instead of
+        guessing which one to use. '''
         r = client.describe_security_groups(
-            Filters=[{'Name': 'group-name', 'Values': [self.SECURITY_GROUP_NAME]}]
+            Filters=[
+                {'Name': 'group-name', 'Values': [self.SECURITY_GROUP_NAME]},
+                {'Name': 'vpc-id', 'Values': [vpc_id]},
+            ]
         )
         groups = r.get('SecurityGroups', [])
         if not groups:
             raise BenchError(
                 'Security group resolution',
-                Exception(f"Security group '{self.SECURITY_GROUP_NAME}' not found")
+                Exception(
+                    f"Security group '{self.SECURITY_GROUP_NAME}' not found "
+                    f"in VPC '{vpc_id}'"
+                )
+            )
+        if len(groups) > 1:
+            raise BenchError(
+                'Security group resolution',
+                Exception(
+                    f"Multiple security groups named "
+                    f"'{self.SECURITY_GROUP_NAME}' found in VPC '{vpc_id}' "
+                    f"({[g['GroupId'] for g in groups]}); refusing to guess "
+                    f"which one to use"
+                )
             )
         return groups[0]['GroupId']
 
@@ -394,19 +490,20 @@ class InstanceManager:
                 }
             # Single-AZ pinning (see `_resolve_az_subnet`'s doc comment): resolve
             # once per region and cache, so the collector launch below (in the
-            # first region) reuses the EXACT SAME (az, subnet, security-group-id)
-            # a validator in that region gets, instead of a second, independent
-            # resolution that could -- in principle, if AWS's 'available' AZ
-            # ordering ever changed between calls -- disagree.
+            # first region) reuses the EXACT SAME (az, subnet, vpc,
+            # security-group-id) a validator in that region gets, instead of a
+            # second, independent resolution that could -- in principle, if
+            # AWS's 'available' AZ ordering ever changed between calls --
+            # disagree.
             az_subnet_by_region = {}
             sg_id_by_region = {}
             progress = progress_bar(
                 self.clients.items(), prefix=f'Creating {size} instances'
             )
             for region, client in progress:
-                az, subnet_id = self._resolve_az_subnet(client, region)
-                sg_id = self._security_group_id(client)
-                az_subnet_by_region[region] = (az, subnet_id)
+                az, subnet_id, vpc_id = self._resolve_az_subnet(client, region)
+                sg_id = self._security_group_id(client, vpc_id)
+                az_subnet_by_region[region] = (az, subnet_id, vpc_id)
                 sg_id_by_region[region] = sg_id
                 client.run_instances(
                     ImageId=self._get_ami(client),
@@ -458,11 +555,12 @@ class InstanceManager:
                 self.settings, 'monitor_instance_type', None
             ) or self.settings.instance_type
             # Single-AZ pinning: reuse this region's already-resolved (az,
-            # subnet, security-group-id) -- see the validator loop above and
-            # `_resolve_az_subnet`'s doc comment -- so the collector lands in
-            # the SAME AZ as this region's validators (both spot launch calls
-            # agree), keeping collector<->validator scrape traffic intra-AZ too.
-            _, collector_subnet_id = az_subnet_by_region[region]
+            # subnet, vpc, security-group-id) -- see the validator loop above
+            # and `_resolve_az_subnet`'s doc comment -- so the collector lands
+            # in the SAME AZ as this region's validators (both spot launch
+            # calls agree), keeping collector<->validator scrape traffic
+            # intra-AZ too.
+            _, collector_subnet_id, _ = az_subnet_by_region[region]
             collector_sg_id = sg_id_by_region[region]
             Print.info(
                 f'Creating the metrics-collector instance ({collector_type}, '
@@ -529,9 +627,10 @@ class InstanceManager:
     @staticmethod
     def _format_cost(total_usd, breakdown):
         lines = [
-            'AWS cost estimate (alive-time x price; EXCLUDES EBS storage; '
-            'spot is billed per-second -- this is a close estimate, not the '
-            'invoice):'
+            'AWS cost estimate (alive-time x price; EXCLUDES EBS storage, '
+            'EC2->internet egress, and in-use public IPv4 address charges '
+            '-- see below; spot is billed per-second -- this is a close '
+            'estimate, not the invoice):'
         ]
         if not breakdown:
             lines.append('  No pending/running instances.')
@@ -545,12 +644,12 @@ class InstanceManager:
             )
         lines.append(f'  TOTAL: ${total_usd:.4f}')
         lines.append(
-            '  Data transfer: $0 -- every instance (validators AND the '
-            'metrics-collector) is pinned to a single availability zone '
-            '(see create_instances/_resolve_az_subnet), and all '
-            'node<->node/collector traffic already routes over private VPC '
-            'IPs (internal_hosts()); intra-AZ private-IP transfer is free, so '
-            'this is a genuine $0, not an omission.'
+            '  Node<->node/collector transfer is genuinely free (private '
+            'IPs, single-AZ pinning -- see create_instances/'
+            '_resolve_az_subnet). NOT included above: EC2->internet egress '
+            "for this harness's own per-run log downloads and metrics pulls "
+            'over public IPs (remote.py), and in-use public IPv4 address '
+            'charges (~$0.005/hr each).'
         )
         return '\n'.join(lines)
 
@@ -571,13 +670,25 @@ class InstanceManager:
         estimate (`ON_DEMAND_FALLBACK_PRICE`/`DEFAULT_FALLBACK_PRICE`) and are
         flagged `approximate=True`.
 
-        EXCLUDES EBS volume cost. Data transfer is genuinely $0, not merely
-        excluded: node<->node/collector traffic runs over private VPC IPs
-        (see `internal_hosts()`) AND every instance is pinned to a single
-        availability zone (see `create_instances`/`_resolve_az_subnet`), so
-        this traffic is intra-AZ, which AWS does not bill. Spot is billed
-        per-second, so `alive_hours` itself is exact -- the only
-        approximation is the fallback price path.
+        EXCLUDES: EBS volume cost; EC2->internet egress; and the in-use
+        public IPv4 address charge. The egress exclusion is not negligible --
+        this harness itself generates billed EC2->internet egress on every
+        run, over each instance's PUBLIC ip: `_run_single` downloads every
+        primary/worker/client log file to the coordinator laptop (remote.py's
+        `c.get` calls), and `fetch_collector_metrics` pulls the metrics JSON
+        from the collector. A single 10-node rate point has been measured at
+        ~65 MB of logs in this repo, so a multi-node, multi-rate-point
+        campaign is on the order of 1-2 GB of metered egress. Likewise
+        excluded: the in-use public IPv4 address charge (~$0.005/hr per
+        address; a 20-validator + 1-collector testbed carries 21 of them,
+        ~$0.105/hr total), which is larger than the egress line for a short
+        run. What IS genuinely free, not merely excluded: node<->node/
+        collector traffic over private VPC IPs (see `internal_hosts()`),
+        because every instance is also pinned to a single availability zone
+        (see `create_instances`/`_resolve_az_subnet`), making that traffic
+        intra-AZ, which AWS does not bill. Spot is billed per-second, so
+        `alive_hours` itself is exact -- the only approximation is the
+        fallback price path.
         This must be called while instances are still up (LaunchTime is only
         visible pre-termination), i.e. BEFORE `terminate_instances()`.
 

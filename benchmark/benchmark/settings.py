@@ -74,12 +74,20 @@ class Settings:
         # error telling the user to fill this in (or pass --source-build).
         self.release_repo = release_repo
         # Single-AZ pinning (instance.py's create_instances/_resolve_az_subnet):
-        # an explicit AWS availability zone (e.g. "eu-west-1a") every instance
-        # (validators AND the metrics-collector) launches into, so intra-committee
+        # the AWS availability zone every instance (validators AND the
+        # metrics-collector) in a region launches into, so intra-committee
         # private-IP traffic stays intra-AZ (free) rather than merely
-        # intra-region (still billed cross-AZ). Optional -- None (absent from
-        # settings.json, the default) makes instance.py auto-pick the first
-        # 'available' AZ in the (first) configured region instead.
+        # intra-region (still billed cross-AZ). Either a plain string (e.g.
+        # "eu-west-1a"), applied to every region -- only sound for a
+        # single-region settings.json, since an AZ name is region-scoped and
+        # instance.py rejects a string that does not start with the region
+        # it's being applied to -- or a {region: az} dict for a multi-region
+        # settings.json (e.g. {"eu-west-1": "eu-west-1a"}), where a region
+        # missing from the dict falls back to auto-pick for that region only.
+        # Optional -- None (absent from settings.json, the default), or a
+        # dict/region combination that resolves to no entry, makes
+        # instance.py auto-pick the first 'available' ordinary AZ in that
+        # region instead.
         self.availability_zone = availability_zone
 
     @classmethod

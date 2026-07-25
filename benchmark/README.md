@@ -32,6 +32,12 @@ Key flags (all have defaults — see `node local-benchmark --help`):
   parameters (see `--help` for the exact semantics of each).
 * `--mimic-latency-ms` / `--latency-table`: inject uniform or WAN-shaped
   (NxN RTT-ms CSV matrix) artificial network latency between authorities.
+  Precedence: `--latency-table` wins; else an explicit `--mimic-latency-ms <n>`
+  applies `n` ms RTT uniformly (`n = 0` explicitly means zero injected latency,
+  pure loopback); else — neither flag given — the default is the real
+  10-AWS-region RTT matrix (`config::LatencyTable::aws_rtt`, committee index
+  `i` -> region `i % 10`). Note that omitting both flags therefore does NOT
+  mean "no latency".
 
 It generates keys, an in-memory committee, and `parameters.json`/`committee.json`
 (written under `--data-dir`, default `.local-bench/`, for reference — nothing

@@ -42,8 +42,12 @@ crash: 0
 # PHASE7-PREP-NOTES.md WAN-shaped local runs: path to an NxN RTT-ms CSV matrix
 # (relative to the repository root), or the literal string `none` for zero injected
 # latency (pure loopback -- measures machine capacity, not geography; this is what
-# METRICS-DASHBOARD-SPEC.md §7's scaling sweep uses). The commented default below is
-# the n=10 latency experiment's own table.
+# METRICS-DASHBOARD-SPEC.md §7's scaling sweep uses; dryrun.py passes an EXPLICIT
+# `--mimic-latency-ms 0` for this case, so it really means zero). The commented
+# default below is the n=10 latency experiment's own table. Note: `node
+# local-benchmark` itself defaults to the real 10-AWS-region RTT matrix
+# (`LatencyTable::aws_rtt`) whenever BOTH `--latency-table` and `--mimic-latency-ms`
+# are omitted -- irrelevant here since dryrun.py always passes one or the other.
 latency_table: wan-testbed-latency-10node.csv
 # latency_table: none
 

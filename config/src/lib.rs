@@ -204,13 +204,35 @@ pub struct Parameters {
     /// primary-to-primary connections at spawn time via `Committee::latency_map`
     /// (`Core::spawn`/`vantage::node::VantageCore::spawn`, both protocols
     /// identically). Never round-trips through `parameters.json`/`fab`
-    /// (`#[serde(skip)]`) -- it is a benchmark-diagnostic-only, in-process value built
-    /// by `node local-benchmark` from `--latency-table`/`--mimic-latency-ms`, not a
-    /// deployable setting. `None` (the default -- also what every EXISTING
-    /// `parameters.json` deserializes to, since the field is entirely absent from
-    /// their JSON) means zero injected delay, i.e. byte-identical current behavior --
-    /// required for invariant 4 (both Autobahn paths) and for Vantage's own
-    /// already-recorded fault-free/crash-fault gate numbers to stay reproducible.
+    /// (`#[serde(skip)]`) -- always `None` immediately after `Parameters::default()`
+    /// or `Parameters::import(..)`, since the field is entirely absent from every
+    /// JSON file (existing or new).
+    ///
+    /// Fable audit FIX 3: this field is populated ONLY by the two CLI entry handlers
+    /// below, never by library code, and both of them now DEFAULT to injecting the
+    /// real 10-AWS-region RTT matrix rather than to zero injected delay -- so, as of
+    /// this changeset, `None` no longer means "zero injected delay" / "byte-identical
+    /// current behavior" for a running node; it only means "the CLI entry hasn't
+    /// substituted a table yet". Precedence (see each handler's own doc comment for
+    /// the exact derivation):
+    ///   - `node run` (`node/src/main.rs::run`): expands the deployable
+    ///     `mimic_latency_ms` knob just below -- `Some(rtt)` (including `Some(0)`) is
+    ///     an EXPLICIT override to `LatencyTable::uniform(n, rtt)`; `None` (absent
+    ///     from `parameters.json`, true of every pre-Phase-7 file) DEFAULTS to
+    ///     `LatencyTable::aws_rtt(n)`. After this expansion the field is always
+    ///     `Some(..)` for a running node -- an all-zero uniform table (e.g. `fab
+    ///     remote`'s current `mimic_latency_ms: Some(0)` default) injects no delay,
+    ///     but is still a `Some`, never a `None`.
+    ///   - `node local-benchmark` (`node/src/local_benchmark.rs::run`):
+    ///     `--latency-table <csv>` wins; else an EXPLICITLY passed
+    ///     `--mimic-latency-ms <n>` (n > 0) gives `uniform(n, ..)`; else an EXPLICITLY
+    ///     passed `--mimic-latency-ms 0` gives `None` (the only remaining way to
+    ///     genuinely request zero injected latency, i.e. pure loopback); else
+    ///     (neither flag given) defaults to `aws_rtt(n)`.
+    ///
+    /// Neither handler's substitution touches `Parameters::default()` itself, which
+    /// still yields `latency_table: None` / `mimic_latency_ms: None` -- library
+    /// defaults and existing unit tests are unaffected.
     #[serde(skip)]
     pub latency_table: Option<Arc<LatencyTable>>,
 
@@ -424,12 +446,26 @@ impl LatencyTable {
     /// src/network.rs` lines ~813-844). Same RTT/2 one-way halving convention as
     /// `uniform`/`from_rtt_csv`. Every node builds the identical full `n x n` table;
     /// `Committee::latency_map` picks out the row for `index_of(self)`.
+    ///
+    /// Fable audit FIX 2: the diagonal is forced to 0 (matching `uniform` and this
+    /// struct's own `one_way_ms` doc, which states the diagonal is 0), a DELIBERATE
+    /// deviation from `RTT_LATENCY_TABLE`'s own diagonal (1 ms, i.e. 0.5 ms one-way).
+    /// Starfish's 1 ms diagonal is a same-region RTT placeholder (two distinct
+    /// authorities that happen to land in the same region, `i % 10 == j % 10` for
+    /// `i != j`) -- it is NOT a self-send delay, and that off-diagonal same-region
+    /// case is deliberately left untouched below (still 0.5 ms one-way). Zeroing only
+    /// `[i][i]` cannot change any injected delay either way: `Committee::latency_map`
+    /// never emits a self entry (it always skips `other == myself`), so `[i][i]` is
+    /// dead weight in this table regardless of its value.
     pub fn aws_rtt(n: usize) -> Self {
         let mut t = vec![vec![0.0; n]; n];
         for (i, row) in t.iter_mut().enumerate() {
             for (j, cell) in row.iter_mut().enumerate() {
                 *cell = RTT_LATENCY_TABLE[i % 10][j % 10] as f64 / 2.0;
             }
+        }
+        for (i, row) in t.iter_mut().enumerate() {
+            row[i] = 0.0;
         }
         Self { one_way_ms: t }
     }
@@ -445,6 +481,32 @@ impl LatencyTable {
             .map_or(Duration::ZERO, |ms| {
                 Duration::from_secs_f64(ms.max(0.0) / 1000.0)
             })
+    }
+
+    /// `n`, the committee size this table was built for (its row/column count).
+    /// Named `dimension` rather than `len` so clippy's `len_without_is_empty` doesn't
+    /// expect an `is_empty` counterpart that would make no sense here (an empty
+    /// `LatencyTable` is not a meaningful state -- every constructor above always
+    /// sizes it to the committee).
+    pub fn dimension(&self) -> usize {
+        self.one_way_ms.len()
+    }
+
+    /// Fable audit FIX 4: true if every off-diagonal entry is exactly 0, i.e. this
+    /// table injects no delay at all on any inter-authority link. Distinguishes a
+    /// genuinely WAN-shaping table (`uniform` with a positive RTT, `aws_rtt`, or a
+    /// non-trivial `from_rtt_csv`) from an all-zero `uniform(n, 0.0)` table -- the
+    /// latter is still `Some(LatencyTable)` on `Parameters::latency_table` (see that
+    /// field's doc comment), e.g. from `node run`'s EXPLICIT `mimic_latency_ms:
+    /// Some(0)` (`fab remote`'s current default), even though it delays nothing.
+    /// Diagonal entries are ignored (never looked up by `Committee::latency_map`,
+    /// which always skips `other == myself`) since they carry no injected delay
+    /// regardless of their value (see `aws_rtt`'s doc comment).
+    pub fn injects_delay(&self) -> bool {
+        self.one_way_ms
+            .iter()
+            .enumerate()
+            .any(|(i, row)| row.iter().enumerate().any(|(j, &ms)| i != j && ms > 0.0))
     }
 }
 
@@ -542,8 +604,26 @@ impl Parameters {
             self.max_block_payload
         );
         info!("Vantage delta set to {} ms", self.delta_ms);
-        if self.latency_table.is_some() {
-            info!("Mimic latency table active (PHASE7-PREP-NOTES.md)");
+        // Fable audit FIX 4: `node run` now populates `latency_table` unconditionally
+        // (see that field's doc comment) -- including for e.g. `fab remote`'s current
+        // `mimic_latency_ms: Some(0)` default, whose expanded table is `Some` but
+        // all-zero. Reporting `is_some()` alone would therefore claim latency was
+        // "active" even when the table injects no delay at all; report the table's
+        // dimension and whether it actually injects delay instead.
+        match &self.latency_table {
+            Some(table) if table.injects_delay() => {
+                info!(
+                    "Mimic latency table active (PHASE7-PREP-NOTES.md): {0}x{0} table, injecting delay",
+                    table.dimension()
+                );
+            }
+            Some(table) => {
+                info!(
+                    "Mimic latency table present but all-zero (PHASE7-PREP-NOTES.md): {0}x{0} table, no delay injected",
+                    table.dimension()
+                );
+            }
+            None => {}
         }
         info!("Network compression enabled? {}", self.compress_network);
         info!(

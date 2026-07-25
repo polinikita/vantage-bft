@@ -328,7 +328,24 @@ def generate_collector_scrape_config(
     'primary_to_primary'/'primary_to_worker' fields (always the private ip)
     and keeps the port from 'metrics' (primary: port+2 of
     'primary_to_primary'; worker: port+3 of 'primary_to_worker' -- see
-    `Committee.__init__`), rather than reading 'metrics' directly. '''
+    `Committee.__init__`), rather than reading 'metrics' directly.
+
+    Every target carries TWO labels, not one: `node` (per-PROCESS --
+    '<name[:8]>-primary' or '<name[:8]>-worker-<id>', one series per
+    primary/worker) and `host` (per-INSTANCE/NIC -- the same private ip this
+    target's own address is built from, below). They are not interchangeable
+    for aggregation: under the campaign's `collocate: True`, an authority's
+    primary and its worker run as two PROCESSES on the SAME instance sharing
+    ONE NIC, so `sum by (node) (...)` yields (up to) twice as many series as
+    there are physical hosts, and a max/peak taken over `node` silently
+    reports one process's share of the NIC's traffic instead of the
+    instance's actual total. `sum by (host) (...)` collapses a collocated
+    primary+worker pair onto the one series that actually corresponds to
+    their shared NIC, and is therefore the ONLY one of the two labels valid
+    to compare against a per-NIC bandwidth limit (see remote.py's
+    `Bench._report_nic_peak`, and `remote.COLLECTOR_QUERIES`'s
+    `bytes_sent_rate_by_host`/`bytes_received_rate_by_host`). `node` remains
+    useful on its own for per-process (not per-NIC) breakdowns. '''
     assert faults >= 0
     authorities = committee_json['authorities']
     names = list(authorities.keys())
@@ -340,11 +357,11 @@ def generate_collector_scrape_config(
         authority = authorities[name]
         primary_host = Committee.ip(authority['primary']['primary_to_primary'])
         primary_port = authority['primary']['metrics'].split(':')[1]
-        targets.append((f'{name[:8]}-primary', f'{primary_host}:{primary_port}'))
+        targets.append((f'{name[:8]}-primary', primary_host, f'{primary_host}:{primary_port}'))
         for wid, worker in authority['workers'].items():
             worker_host = Committee.ip(worker['primary_to_worker'])
             worker_port = worker['metrics'].split(':')[1]
-            targets.append((f'{name[:8]}-worker-{wid}', f'{worker_host}:{worker_port}'))
+            targets.append((f'{name[:8]}-worker-{wid}', worker_host, f'{worker_host}:{worker_port}'))
 
     lines = [
         'global:',
@@ -353,10 +370,11 @@ def generate_collector_scrape_config(
         f"  - job_name: '{job_name}'",
         '    static_configs:',
     ]
-    for label, addr in targets:
+    for label, host, addr in targets:
         lines.append(f"      - targets: ['{addr}']")
         lines.append('        labels:')
         lines.append(f"          node: '{label}'")
+        lines.append(f"          host: '{host}'")
     return '\n'.join(lines) + '\n'
 
 

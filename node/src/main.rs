@@ -242,9 +242,13 @@ async fn main() -> Result<()> {
                             "PHASE7-PREP-NOTES.md (WAN-shaped local runs): uniform EXPLICIT \
                         OVERRIDE RTT-ms value applied to every inter-authority link (one-way = \
                         value/2), as if every cell of a --latency-table CSV held this same \
-                        number. 0 (default, i.e. unset) defers to the real 10-AWS-region RTT \
-                        matrix default (see --latency-table). Ignored if --latency-table is \
-                        also given.",
+                        number. A value > 0, EXPLICITLY passed on the command line, selects \
+                        this uniform table. An EXPLICIT `--mimic-latency-ms 0` instead means \
+                        zero injected latency (pure loopback) -- distinguished from simply \
+                        omitting the flag via clap's value-source tracking. Omitting the flag \
+                        entirely (the default) defers to the real 10-AWS-region RTT matrix \
+                        default (see --latency-table). Ignored if --latency-table is also \
+                        given.",
                         ),
                 )
                 .arg(
@@ -259,8 +263,10 @@ async fn main() -> Result<()> {
                         primary-to-primary/-worker connections (starfish-style per-connection \
                         injection, read-only reference: \
                         ~/code/starfish/crates/starfish-core/src/network.rs). Takes precedence \
-                        over --mimic-latency-ms. Unset (default): if --mimic-latency-ms is also \
-                        unset (0), defaults to the real 10-AWS-region RTT matrix \
+                        over --mimic-latency-ms. Unset (default): falls back to \
+                        --mimic-latency-ms's own precedence -- an EXPLICIT \
+                        `--mimic-latency-ms 0` means zero injected latency (pure loopback); \
+                        omitting both flags defaults to the real 10-AWS-region RTT matrix \
                         (`LatencyTable::aws_rtt`, ported VERBATIM from starfish, committee index \
                         i -> region i % 10) -- mirroring starfish's own default for \
                         single-region AWS benchmarking.",

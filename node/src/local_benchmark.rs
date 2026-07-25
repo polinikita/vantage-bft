@@ -112,15 +112,29 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     // RTT-ms matrix, node index = committee order) takes precedence over
     // `--mimic-latency-ms <u64>` (the uniform EXPLICIT OVERRIDE shorthand -- defined
     // as exactly the trivial table whose every cell is that value -- see
-    // `LatencyTable::uniform`). If NEITHER is given (both default/0), DEFAULT to the
-    // real 10-AWS-region RTT matrix (`LatencyTable::aws_rtt`, ported VERBATIM from
-    // starfish) -- mirroring starfish's own default for single-region AWS
-    // benchmarking; flags above override this default.
+    // `LatencyTable::uniform`). If NEITHER is given, DEFAULT to the real 10-AWS-region
+    // RTT matrix (`LatencyTable::aws_rtt`, ported VERBATIM from starfish) -- mirroring
+    // starfish's own default for single-region AWS benchmarking; flags above override
+    // this default.
+    //
+    // Fable audit FIX 1: the clap default for `--mimic-latency-ms` is the string "0",
+    // which is indistinguishable from an EXPLICITLY PASSED `--mimic-latency-ms 0`
+    // unless the two are told apart via clap's value-source API -- otherwise, once
+    // "neither given" started defaulting to `aws_rtt` below, no flag combination could
+    // ever request zero injected latency again (every existing zero-latency
+    // invocation, e.g. local-dryrun's documented pure-loopback mode, would silently
+    // become WAN-shaped). Resulting precedence:
+    //   1. `--latency-table <csv>` given                   -> that CSV
+    //   2. `--mimic-latency-ms <n>` explicitly given, n > 0 -> `LatencyTable::uniform(nodes, n)`
+    //   3. `--mimic-latency-ms 0` explicitly given          -> `None` (zero injected latency, pure loopback)
+    //   4. neither given                                    -> `LatencyTable::aws_rtt(nodes)` (default)
     let mimic_latency_ms: u64 = matches
         .get_one::<String>("mimic-latency-ms")
         .unwrap()
         .parse()
         .context("--mimic-latency-ms must be a non-negative integer")?;
+    let mimic_latency_explicit =
+        matches.value_source("mimic-latency-ms") == Some(clap::parser::ValueSource::CommandLine);
     let latency_table_path = matches.get_one::<String>("latency-table").cloned();
     let latency_table: Option<LatencyTable> = if let Some(path) = &latency_table_path {
         let table = LatencyTable::from_rtt_csv(path, nodes).with_context(|| {
@@ -135,13 +149,18 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             path, nodes, nodes
         );
         Some(table)
-    } else if mimic_latency_ms > 0 {
+    } else if mimic_latency_explicit && mimic_latency_ms > 0 {
         println!(
             "Latency table: uniform {} ms RTT ({} ms one-way) on every inter-authority link (--mimic-latency-ms)",
             mimic_latency_ms,
             mimic_latency_ms / 2
         );
         Some(LatencyTable::uniform(nodes, mimic_latency_ms as f64))
+    } else if mimic_latency_explicit {
+        println!(
+            "Latency table: none -- zero injected latency, pure loopback (--mimic-latency-ms 0 explicitly given)"
+        );
+        None
     } else {
         println!(
             "Latency table: real 10-AWS-region RTT matrix (default, committee index i -> region i % 10)"

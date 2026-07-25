@@ -14,6 +14,7 @@ from math import ceil
 from statistics import mean
 from copy import deepcopy
 import subprocess
+import secrets
 
 from benchmark.config import (
     Committee, Key, NodeParameters, BenchParameters, ConfigError,
@@ -63,9 +64,19 @@ COLLECTOR_QUERIES = {
     # scrape config's `node` label (config.generate_collector_scrape_config).
     # 'committed_tps_by_node' is the same per-node breakdown for throughput,
     # for correlating a NIC-saturated node against its own committed rate.
+    # 'bytes_sent_rate_by_host'/'bytes_received_rate_by_host' aggregate the
+    # SAME counters by the scrape config's `host` label instead (one series
+    # per physical instance/NIC, not per primary/worker process) -- with the
+    # campaign's `collocate: True`, an authority's primary and its worker
+    # share one instance and one NIC, so `by (node)` yields up to 2x as many
+    # series as there are hosts and a max over it understates/mislabels the
+    # actual per-NIC rate. `_report_nic_peak` reads the by-host series for
+    # exactly this reason; the by-node series stay for per-process detail.
     'up': 'up',
     'bytes_sent_rate_by_node': 'sum by (node) (rate(bytes_sent_total[30s]))',
     'bytes_received_rate_by_node': 'sum by (node) (rate(bytes_received_total[30s]))',
+    'bytes_sent_rate_by_host': 'sum by (host) (rate(bytes_sent_total[30s]))',
+    'bytes_received_rate_by_host': 'sum by (host) (rate(bytes_received_total[30s]))',
     'committed_tps_by_node': 'sum by (node) (rate(committed_transactions[30s]))',
 }
 
@@ -216,52 +227,97 @@ class Bench:
         throughput collapse (16k tx/s vs 200k locally) on `c5.xlarge`: EBS-only,
         so store I/O both is slow AND competes with the consensus NIC for the
         same underlying bandwidth (EBS is network-attached). `c5d.xlarge` (same
-        4 vCPU/NIC) adds exactly one local NVMe SSD and was used for that
-        reason for a time; settings.json is now back on plain `c5.xlarge` (this
-        run is about NIC saturation, not store I/O), so in practice this
-        snippet's NVMe-detect loop always finds nothing and falls through to
-        the plain-EBS-directory fallback below -- kept in place (rather than
-        removed) since it's still correct, and still needed, on a `*d` instance
-        type.
+        4 vCPU/NIC) adds exactly one local NVMe SSD -- settings.json's validator
+        `instance_type` is `c5d.xlarge`, so this snippet's NVMe-detect loop
+        actually finds that disk and the `mkfs.ext4`/mount branch below is the
+        one that runs on every validator, not a dormant fallback.
 
         Validators only -- `install()`'s `hosts` is `manager.hosts(flat=True)`,
         which never includes the metrics-collector (see instance.py); the
         collector stays on plain `c5.xlarge`/EBS and runs no node.
 
-        Idempotent and safe to re-run (`install()` is retried up to 4x):
-        guarded by `mountpoint -q /mnt/db` so an already-mounted disk is never
-        reformatted, and the whole snippet is wrapped in a subshell + `|| true`
-        so a detection or format/mount failure never aborts `install()` --
-        this prep is best-effort, not required for the binaries themselves.
+        Idempotent and safe to re-run: guarded by `mountpoint -q /mnt/db` so
+        an already-mounted disk is never reformatted. The whole detect/format/
+        mount sequence is wrapped in a subshell ending in `true` (its exit
+        status is therefore always 0, but note there is no top-level `|| true`
+        after the closing paren -- see below) so a detection or format/mount
+        failure never aborts the `&&`-chained command list `install()` splices
+        this into. This snippet's own job is now best-effort (a failed mount
+        just leaves nothing at /mnt/db); provisioning /mnt/db itself as a
+        directory the ssh user can write to is a separate, REQUIRED step
+        `install()` runs immediately after this snippet (see its own comment
+        there) -- so a mount failure is no longer silently papered over, it
+        surfaces as that later step's `test -w` failing loudly.
+
+        On the `|| true` placement: a bare trailing `|| true` on this
+        snippet's own returned string, spliced into `' && '.join(cmd)`, would
+        do far more than make ITS OWN failure non-fatal. POSIX AND-OR lists
+        are left-associative with no precedence between `&&` and `||`, so
+        `A && B && (snippet) || true && D` parses as
+        `((((A && B) && (snippet)) || true) && D)` -- the `|| true` also
+        rescues A and B (e.g. a failing `sudo apt-get update`/`install`)
+        rather than just this snippet, and `install()` would then report
+        success on a testbed that never got its dependencies. Verified
+        empirically: `/bin/sh -c 'false && (echo B) || true && echo C'`
+        prints `C` and exits 0 even though the leading `false` failed. Ending
+        the subshell with `true` INSIDE the parens instead gives the
+        subshell its own always-0 exit status without any top-level `||`, so
+        a preceding command's failure still fails the whole chain.
 
         Detection: the instance-store NVMe disk is whichever disk is NEITHER
         the root device NOR already carrying a filesystem/mountpoint of its
-        own. The root device is resolved via `findmnt`/`lsblk -no PKNAME`
+        own (its own OR any of its partitions' -- see the per-device check
+        below). The root device is resolved via `findmnt`/`lsblk -no PKNAME`
         (the ACTUAL block device backing `/`, whatever its partition layout)
         rather than assumed to be a fixed name like `nvme0n1`: on a
         partitioned root (GPT/UEFI, e.g. a `nvme0n1p1` root partition on
         `nvme0n1`), `lsblk -d`'s disk-level MOUNTPOINT column for `nvme0n1`
-        itself is EMPTY (only the partition is mounted) -- an
-        empty-mountpoint-only filter would then also match the root disk, and
-        the `head -1` pick between it and the real instance-store device would
-        be a coin flip that can `mkfs.ext4` the root disk. Excluding the
-        resolved root device explicitly closes that hole regardless of the
-        AMI's partitioning scheme.
+        itself is EMPTY (only the partition is mounted) -- the per-device
+        check below, which inspects every row `lsblk` reports for a disk (not
+        just the disk's own row), catches this case on its own by seeing the
+        partition's mountpoint, but the root device is still excluded
+        explicitly here too, as a safety net that does not depend on that
+        reasoning holding for every AMI/partitioning scheme.
 
-        Per-device MOUNTPOINT check, not a single 3-column `awk` pass: `lsblk
-        -o NAME,MOUNTPOINT,TYPE` with an empty MOUNTPOINT collapses under
-        awk's default (whitespace-run) field splitting -- an empty middle
-        column isn't an empty field, it's simply not there, so the row has 2
-        tokens, not 3, and a `$3=="disk"` test never matches it (verified
-        empirically against real `awk`). Candidate disks and their mountpoint
-        status are therefore queried as two separate single-column `lsblk`
-        calls instead, each immune to that collapse since there is only one
-        column to (not) split.
+        Per-device MOUNTPOINT/FSTYPE check, not a single 3-column `awk` pass:
+        `lsblk -o NAME,MOUNTPOINT,TYPE` with an empty MOUNTPOINT collapses
+        under awk's default (whitespace-run) field splitting -- an empty
+        middle column isn't an empty field, it's simply not there, so the row
+        has 2 tokens, not 3, and a `$3=="disk"` test never matches it (verified
+        empirically against real `awk`). Candidate disks are therefore probed
+        with separate single-column `lsblk` calls instead, each immune to that
+        collapse since there is only one column to (not) split -- and each run
+        WITHOUT `head -1`: `lsblk -n -o MOUNTPOINT "$d"`/`lsblk -n -o FSTYPE
+        "$d"` list one row per partition of `$d`, not just `$d` itself, and
+        `head -1` reads only the whole-disk row, whose MOUNTPOINT/FSTYPE are
+        empty on any partitioned disk regardless of whether its partitions are
+        in use -- so a non-root disk with mounted partitions (or one that
+        merely carries a filesystem, no partitions needed) would pass that
+        test as "free" and get `mkfs.ext4 -F`'d over live data. Rejecting a
+        candidate if `grep -q .` matches ANY row of either column closes that
+        hole: a disk is only a candidate if NOTHING on it -- itself or any
+        partition -- is mounted or formatted.
 
         If found: mkfs.ext4 + mount at /mnt/db + chown to the ssh user. If not
-        found (e.g. `fab create` was pointed at a non-`d` instance type): fall
-        back to a plain directory at /mnt/db on the EBS root so the store path
-        still resolves -- slower, but never fails the install. '''
+        found (e.g. `fab create` was pointed at a non-`d` instance type): do
+        nothing here -- `install()`'s own required step right after this
+        snippet still provisions /mnt/db as a plain EBS-root directory, so the
+        store path resolves either way.
+
+        KNOWN LIMITATION of the never-touch-a-formatted-disk rule above: an
+        instance store that THIS snippet already formatted on an earlier
+        `install()`, and which is no longer mounted (only reachable by
+        rebooting a validator -- the mount is not in /etc/fstab, and a
+        stop/start hands back a blank device instead), now carries ext4 and is
+        therefore rejected as a candidate. A re-`install()` in that state
+        silently falls back to the plain-EBS-root directory rather than
+        re-mounting (or re-formatting) the NVMe disk: store I/O quietly
+        returns to EBS speed. That is the deliberate trade: re-`mkfs.ext4 -F`
+        of any disk that already holds a filesystem is exactly the data-loss
+        hole this rule closes, and it is not worth reopening for a state that
+        also throws away the store's contents anyway. Recreate the testbed
+        (`fab destroy` + `fab create` + `fab install`) rather than rebooting a
+        validator if you need the NVMe store back. '''
         base = PathMaker.REMOTE_STORE_BASE
         user = self.settings.username
         return (
@@ -274,20 +330,19 @@ class Bench:
             'for d in $(lsblk -dn -p -o NAME,TYPE | '
             'awk \'$2=="disk"{print $1}\'); do '
             'if [ "$d" = "$ROOT_DISK" ]; then continue; fi; '
-            'MP=$(lsblk -n -o MOUNTPOINT "$d" 2>/dev/null | head -1); '
-            'if [ -z "$MP" ]; then DEV="$d"; break; fi; '
+            'if lsblk -n -o MOUNTPOINT "$d" 2>/dev/null | grep -q . ; then continue; fi; '
+            'if lsblk -n -o FSTYPE "$d" 2>/dev/null | grep -q . ; then continue; fi; '
+            'DEV="$d"; break; '
             'done; '
             f'if ! mountpoint -q {base}; then '
             'if [ -n "$DEV" ]; then '
             f'sudo mkfs.ext4 -F -q "$DEV" && sudo mkdir -p {base} && '
             f'sudo mount "$DEV" {base} && '
             f'sudo chown -R {user}:{user} {base}; '
-            'else '
-            f'sudo mkdir -p {base} && sudo chown -R {user}:{user} {base}; '
             'fi; '
             'fi; '
-            f'mkdir -p {base}/db'
-            ') || true'
+            'true'
+            ')'
         )
 
     def install(self):
@@ -303,6 +358,8 @@ class Bench:
 
         if self.source_build:
             Print.info('Installing rust and syncing the working tree...')
+            base = PathMaker.REMOTE_STORE_BASE
+            user = self.settings.username
             cmd = [
                 'sudo apt-get update',
                 'sudo apt-get -y upgrade',
@@ -319,6 +376,31 @@ class Bench:
 
                 # This is missing from the Rocksdb installer (needed for Rocksdb).
                 'sudo apt-get install -y clang',
+                # e2fsprogs: provides mkfs.ext4 for the NVMe instance-store
+                # format step below -- same reason the fetch-binary branch
+                # below installs it; `_run_single` passes `--store` under
+                # `/mnt/db` regardless of which install mode provisioned the
+                # host, so this branch needs it too.
+                'sudo apt-get -y install e2fsprogs',
+                # NVMe-INSTANCE-STORE: format + mount the local instance-store
+                # NVMe disk (if any) at PathMaker.REMOTE_STORE_BASE ('/mnt/db')
+                # -- see `_nvme_mount_snippet`'s docstring for the full
+                # rationale and the `|| true`-placement pitfall it avoids.
+                self._nvme_mount_snippet(),
+                # STORE-BASE-REQUIRED: `_run_single` passes `--store
+                # PathMaker.remote_db_path(...)` = `/mnt/db/.db-*`
+                # unconditionally, and RocksDB (`store/src/lib.rs`,
+                # `create_if_missing(true)`) creates only that leaf
+                # directory, never `/mnt/db` itself -- and `/mnt` is
+                # root-owned. Run deliberately AFTER the NVMe mount attempt
+                # above (not folded into its best-effort subshell): it chowns
+                # whatever now sits at `{base}` -- the freshly mounted
+                # filesystem's root when the NVMe branch above succeeded, a
+                # plain directory on the EBS root otherwise -- to the ssh
+                # user, and `test -w` makes a failed/partial mount abort
+                # install() loudly here instead of surfacing only later as
+                # every primary/worker silently dying at boot.
+                f'sudo mkdir -p {base} && sudo chown -R {user}:{user} {base} && test -w {base}',
             ]
             try:
                 g = Group(*hosts, user=self.settings.username, connect_kwargs=self.connect)
@@ -331,6 +413,8 @@ class Bench:
         else:
             Print.info('Installing runtime dependencies (fetch-binary mode)...')
             repo_name = self.settings.repo_name
+            base = PathMaker.REMOTE_STORE_BASE
+            user = self.settings.username
             cmd = [
                 'sudo apt-get update',
                 # curl: downloads the release binaries in `_update`. ca-certificates:
@@ -345,9 +429,25 @@ class Bench:
                 # so the RocksDB store lands on fast local disk instead of the
                 # EBS root volume -- see `_nvme_mount_snippet`'s docstring for
                 # the full rationale (root cause of the AWS throughput
-                # collapse), the root-device-exclusion safety argument, and the
-                # idempotency/never-fails-install guarantees.
+                # collapse), the root-device-exclusion safety argument, and
+                # the `|| true`-placement pitfall it avoids. Best-effort: a
+                # failed detection/format/mount here leaves nothing at
+                # `{base}`, caught loudly by the required step right below.
                 self._nvme_mount_snippet(),
+                # STORE-BASE-REQUIRED: `_run_single` passes `--store
+                # PathMaker.remote_db_path(...)` = `/mnt/db/.db-*`
+                # unconditionally, and RocksDB (`store/src/lib.rs`,
+                # `create_if_missing(true)`) creates only that leaf
+                # directory, never `/mnt/db` itself -- and `/mnt` is
+                # root-owned. Run deliberately AFTER the NVMe mount attempt
+                # above (not folded into its best-effort subshell): it chowns
+                # whatever now sits at `{base}` -- the freshly mounted
+                # filesystem's root when the NVMe branch above succeeded, a
+                # plain directory on the EBS root otherwise -- to the ssh
+                # user, and `test -w` makes a failed/partial mount abort
+                # install() loudly here instead of surfacing only later as
+                # every primary/worker silently dying at boot.
+                f'sudo mkdir -p {base} && sudo chown -R {user}:{user} {base} && test -w {base}',
                 # Same directory layout `_config`/`_update`/`_background_run`
                 # already expect from the source-build path, just without a
                 # compiled-from-source tree underneath it.
@@ -639,9 +739,8 @@ class Bench:
 
         run_cmd = ' && '.join([
             # Idempotent: tolerates redeploying onto the same, already-running
-            # collector (e.g. between campaigns against the same testbed --
-            # see aws_run2.sh's back-to-back vantage / autobahn-optimistic
-            # campaigns). `docker rm -f` only removes the CONTAINER, never a
+            # collector (e.g. between back-to-back campaigns against the same
+            # testbed). `docker rm -f` only removes the CONTAINER, never a
             # named volume -- the TSDB itself lives in the `prometheus-data`
             # named volume mounted at `/prometheus` (Prometheus's own default
             # `--storage.tsdb.path`) below, so an earlier campaign's samples
@@ -695,6 +794,17 @@ class Bench:
             c.put(join(grafana_dir, 'grafana-dashboard.json'), 'grafana-dashboard.json')
 
             home = f'/home/{self.settings.username}'
+            # GRAFANA-ADMIN-PASSWORD: instance.py opens GRAFANA_PORT to
+            # 0.0.0.0/0 and ::/0 -- world-open BY DESIGN, so anyone on the
+            # team can browse the dashboard straight from a laptop -- which
+            # means the image's own default admin/admin login would accept
+            # logins from the whole internet, and Grafana's datasource proxy
+            # is then an SSRF pivot into the VPC. A random password per
+            # deploy (never persisted, only printed below) closes that
+            # without narrowing the port itself. Sign-up is also disabled --
+            # irrelevant with anonymous Viewer access below, but a
+            # wrong-default worth closing explicitly.
+            grafana_admin_password = secrets.token_urlsafe(12)
             grafana_cmd = ' && '.join([
                 'sudo docker rm -f grafana || true',
                 'sudo docker run -d --name grafana --restart unless-stopped '
@@ -703,6 +813,8 @@ class Bench:
                 '-e GF_AUTH_ANONYMOUS_ENABLED=true '
                 '-e GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer '
                 '-e "GF_AUTH_ANONYMOUS_ORG_NAME=Main Org." '
+                f'-e GF_SECURITY_ADMIN_PASSWORD={grafana_admin_password} '
+                '-e GF_USERS_ALLOW_SIGN_UP=false '
                 f'-v {home}/grafana-datasource.yaml:/etc/grafana/provisioning/datasources/datasource.yaml '
                 f'-v {home}/grafana-dashboard-provider.yaml:/etc/grafana/provisioning/dashboards/dashboard.yaml '
                 # Matches dashboard.yaml's own provider `path:
@@ -715,7 +827,8 @@ class Bench:
                 f'Grafana is running on the metrics-collector: '
                 f'http://{collector_public_ip}:{InstanceManager.GRAFANA_PORT} '
                 f'(dashboard: http://{collector_public_ip}:'
-                f'{InstanceManager.GRAFANA_PORT}/d/{dashboard_uid})'
+                f'{InstanceManager.GRAFANA_PORT}/d/{dashboard_uid}) '
+                f'-- admin login: admin / {grafana_admin_password}'
             )
         except Exception as e:
             Print.warn(f'Failed to deploy Grafana on the metrics-collector: {e}')
@@ -781,50 +894,86 @@ class Bench:
 
     def _report_nic_peak(self, subdir):
         ''' PER-RATE-POINT NIC-SATURATION VERDICT: read back this point's
-        just-written bytes_sent_rate_by_node.json (a query_range response --
-        data.result[] each with .metric.node and .values == [[ts, "v"], ...],
+        just-written bytes_sent_rate_by_host.json (a query_range response --
+        data.result[] each with .metric.host and .values == [[ts, "v"], ...],
         "v" a string per Prometheus's own JSON encoding) and print the single
-        peak per-node send rate observed anywhere in the window, so whether
+        peak per-HOST send rate observed anywhere in the window, so whether
         this point pegged the NIC is visible inline in the campaign log
-        without waiting for post-hoc analysis. c5.xlarge's NIC baseline is
-        ~1.25 Gbps (~156 MB/s, see instance.py/settings.json) -- a peak near
-        that is the signature of NIC saturation, not a consensus/store
-        bottleneck. Raises on a missing/malformed file; the caller (`run()`)
-        wraps this together with the fetch itself in one best-effort
-        try/except, so a bad read here never breaks the sweep. '''
-        with open(PathMaker.collector_metrics_file('bytes_sent_rate_by_node', subdir), 'r') as f:
-            body = load(f)
-        peak_node, peak_bytes_per_sec = None, -1.0
+        without waiting for post-hoc analysis.
+
+        Aggregated by `host` (one series per physical instance/NIC), NOT by
+        `node` (one series per primary/worker PROCESS): under the campaign's
+        `collocate: True`, an authority's primary and its worker are two
+        processes sharing one instance and one NIC, so a per-`node` max only
+        ever sees one of the two processes' share of that NIC's traffic and
+        understates the instance's actual total (see
+        `config.generate_collector_scrape_config`'s docstring for the
+        `node`-vs-`host` label distinction).
+
+        `self.settings.instance_type` (the c5/c5d.xlarge family this harness
+        currently uses, see settings.json) has a NIC baseline of ~1.25 Gbps
+        (~156 MB/s decimal) -- a peak near that is the signature of NIC
+        saturation, not a consensus/store bottleneck. `mb_s` uses the same
+        decimal (1e6) convention as that baseline, not the binary 1024*1024
+        MiB one, so the two numbers are directly comparable.
+
+        Missing/malformed file: `Print.warn`s and returns rather than
+        raising -- the caller (`run()`) also wraps this together with the
+        fetch itself in one best-effort try/except, so a bad read here never
+        breaks the sweep. '''
+        path = PathMaker.collector_metrics_file('bytes_sent_rate_by_host', subdir)
+        try:
+            with open(path, 'r') as f:
+                body = load(f)
+        except (OSError, ValueError) as e:
+            Print.warn(f'Failed to read {path} for the NIC-saturation verdict: {e}')
+            return
+        peak_host, peak_bytes_per_sec = None, -1.0
         for series in body.get('data', {}).get('result', []):
-            node = series.get('metric', {}).get('node', '?')
+            host = series.get('metric', {}).get('host', '?')
             for _, value in series.get('values', []):
                 v = float(value)
                 if v > peak_bytes_per_sec:
-                    peak_bytes_per_sec, peak_node = v, node
-        if peak_node is None:
+                    peak_bytes_per_sec, peak_host = v, host
+        if peak_host is None:
             return
-        mb_s = peak_bytes_per_sec / (1024 * 1024)
+        mb_s = peak_bytes_per_sec / 1e6
         gbps = (peak_bytes_per_sec * 8) / 1e9
         Print.info(
-            f'Peak wire TX per node: {peak_node} {mb_s:.1f} MB/s '
-            f'({gbps:.2f} Gbps) -- c5.xlarge baseline ~1.25 Gbps'
+            f'Peak wire TX per host: {peak_host} {mb_s:.1f} MB/s '
+            f'({gbps:.2f} Gbps) -- {self.settings.instance_type} '
+            f'(c5/c5d.xlarge family) NIC baseline ~1.25 Gbps'
         )
 
-    def _record_run_window(self, n, rate, protocol, start, end):
-        ''' RUN-WINDOWS LOG: append (or, on a rerun of the exact same point,
-        update in place) this rate point's wall-clock window to
-        collector_metrics_path()/run-windows.json -- a flat JSON list of
-        {nodes, rate, protocol, start, end} entries, one per rate point
-        across the WHOLE coordinator session (read-modify-write, not
-        truncate-and-write, so two `fab campaign` calls back-to-back against
-        the same testbed -- e.g. vantage then autobahn-optimistic, see
-        aws_run2.sh -- both land in the same file, distinguished from each
-        other by their own `protocol` field). Purpose: even where the
-        per-point `fetch_collector_metrics` call above failed outright
-        (collector briefly unreachable), the window bounds are still on
-        record, so a post-hoc `query_range` against the collector (while
-        it's still alive, pre-`fab destroy`) remains reconstructable from
-        this file alone -- this file lives under
+    def _record_run_window(self, n, rate, protocol, campaign, start, end):
+        ''' RUN-WINDOWS LOG: append (or, on a rerun of the exact same point OF
+        THE SAME CAMPAIGN, update in place) this rate point's wall-clock
+        window to collector_metrics_path()/run-windows.json -- a flat JSON
+        list of {nodes, rate, protocol, campaign, start, end} entries, one
+        per rate point across the WHOLE coordinator session (read-modify-
+        write, not truncate-and-write, so two `fab campaign` calls back-to-
+        back against the same testbed both land in the same file).
+
+        `campaign`: the caller's own `campaign_subdir` tag (protocol +
+        campaign-start timestamp, see `run()`) -- included in the entry AND
+        folded into the in-place-update key alongside nodes/rate/protocol.
+        Without it, a SECOND campaign of the SAME protocol at the same
+        nodes/rate (e.g. two `vantage` campaigns run back-to-back for
+        comparison) would match the first campaign's entry on
+        (nodes, rate, protocol) alone and silently overwrite its window
+        bounds -- defeating the very recovery path this method exists for,
+        and exactly the collision `campaign_subdir` was introduced to
+        prevent for the per-point series files themselves (see
+        `fetch_collector_metrics`'s docstring). Two DIFFERENT protocols (or
+        the same protocol from two different campaigns) are therefore now
+        distinguished by `campaign` first and foremost, not by `protocol`
+        alone.
+
+        Purpose: even where the per-point `fetch_collector_metrics` call
+        above failed outright (collector briefly unreachable), the window
+        bounds are still on record, so a post-hoc `query_range` against the
+        collector (while it's still alive, pre-`fab destroy`) remains
+        reconstructable from this file alone -- this file lives under
         `PathMaker.collector_metrics_path()` (a sibling of logs/, NOT nested
         under it), so the local `rm -r logs` every rate point runs
         (`_run_single`) never deletes it, and Prometheus's own TSDB now
@@ -841,13 +990,14 @@ class Bench:
             except (OSError, ValueError):
                 windows = []
         entry = {
-            'nodes': n, 'rate': rate, 'protocol': protocol,
+            'nodes': n, 'rate': rate, 'protocol': protocol, 'campaign': campaign,
             'start': start, 'end': end,
         }
         for i, existing in enumerate(windows):
             same_point = (
-                existing.get('nodes'), existing.get('rate'), existing.get('protocol')
-            ) == (n, rate, protocol)
+                existing.get('nodes'), existing.get('rate'),
+                existing.get('protocol'), existing.get('campaign'),
+            ) == (n, rate, protocol, campaign)
             if same_point:
                 windows[i] = entry
                 break
@@ -1089,12 +1239,14 @@ class Bench:
         # call writes (per-rate-point AND its own end-of-campaign convenience
         # export, both below) is namespaced under this subdirectory instead
         # of a flat/point-only name, so a SECOND `Bench.run()` against the
-        # same testbed -- e.g. aws_run2.sh's back-to-back vantage then
-        # autobahn-optimistic campaigns -- can never silently overwrite the
-        # first campaign's JSON (`fetch_collector_metrics` opens every file
-        # with 'w'). Keyed on protocol + this campaign's own start time
-        # (UTC, second resolution) rather than protocol alone, so even two
-        # campaigns of the SAME protocol run back-to-back stay distinct.
+        # same testbed -- e.g. back-to-back campaigns run for comparison --
+        # can never silently overwrite the first campaign's JSON
+        # (`fetch_collector_metrics` opens every file with 'w'). Keyed on
+        # protocol + this campaign's own start time (UTC, second resolution)
+        # rather than protocol alone, so even two campaigns of the SAME
+        # protocol run back-to-back stay distinct. Also passed to
+        # `_record_run_window` below as its own `campaign` discriminator, for
+        # the same reason applied to run-windows.json's entries.
         campaign_subdir = (
             f"{node_parameters.json.get('protocol', 'unknown')}-"
             f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(campaign_start))}"
@@ -1224,7 +1376,7 @@ class Bench:
                 # hiccup must not abort the remaining rate sweep. The NIC
                 # verdict read-back is folded into the same try/except: it
                 # depends on the fetch having just written that point's
-                # bytes_sent_rate_by_node.json, so a failed fetch already
+                # bytes_sent_rate_by_host.json, so a failed fetch already
                 # skips it via the exception.
                 point_subdir = join(campaign_subdir, f'{n}nodes-{r}rate')
                 try:
@@ -1245,7 +1397,7 @@ class Bench:
                 # a failure here never masks/duplicates the warning above.
                 try:
                     self._record_run_window(
-                        n, r, node_parameters.json.get('protocol'),
+                        n, r, node_parameters.json.get('protocol'), campaign_subdir,
                         point_start, point_end,
                     )
                 except Exception as e:
