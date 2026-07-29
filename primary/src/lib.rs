@@ -13,6 +13,7 @@ pub mod messages;
 mod payload_receiver;
 mod primary;
 mod proposer;
+pub mod simpleit;
 mod synchronizer;
 pub mod timer;
 pub mod vantage;
