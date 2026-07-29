@@ -17,6 +17,7 @@ pub mod pacemaker;
 pub mod repair;
 pub mod resolve;
 pub mod threshold;
+pub mod wire;
 
 pub use agb::{
     AgbEngine, Echo, Manifest, Outcome, Ready, ReadyGrade, ResolutionEntry, TimerKind, ViewProposal,

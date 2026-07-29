@@ -17,13 +17,14 @@ use crate::vantage::lanes::{
 use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
+use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PairwiseKeys, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
-use network::{BatchConfig, CancelHandler, MessageHandler, ReliableSender, SimpleSender, Writer};
+use network::{BatchConfig, MessageHandler, ReliableSender, SimpleSender, Writer};
 use prometheus::IntCounter;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -33,7 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::oneshot::error::TryRecvError;
 
 /// Inbound messages routed to `VantageCore`, either from the network
 /// (`VantageReceiverHandler`) or from `PrimaryReceiverHandler`'s `HeadersRequest` arm
@@ -137,7 +137,7 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
 /// positional) to bind. This node always sends its OWN messages, so on the outbound
 /// side the candidate (when one exists) is trivially `self.name` -- only whether a
 /// candidate exists at all matters here, not its value, hence the plain `bool`.
-fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
+pub(super) fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
     matches!(
         message,
         PrimaryMessage::Header(_, true) | PrimaryMessage::ControlServe(_, _)
@@ -292,33 +292,12 @@ pub struct VantageCore {
     resolver: Resolver,
     control: ControlLog,
 
-    network: ReliableSender,
-    worker_network: SimpleSender,
-    /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
-    /// (`Parameters::authenticate_channels`). `None` (the default) is byte-identical
-    /// to pre-MAC behavior: `broadcast_message`/`send_message` hand `network`/
-    /// `worker_network` the bare serialized message, nothing appended. `Some` when the
-    /// flag is on: every outbound message gets a trailing tag over its own serialized
-    /// bytes, keyed `k_{self, dest}` (or `k_{self, self}` for the two D4-class
-    /// variants with no sender claim to bind -- see `PairwiseKeys::tag_unverified`'s
-    /// doc comment) -- computed once and shared across a broadcast's destinations
-    /// when the tag itself is destination-independent (the unverified-variant case),
-    /// per-destination when it isn't.
-    channel_auth: Option<Arc<PairwiseKeys>>,
-    cancel_handlers: Vec<CancelHandler>,
-    /// Fable perf audit item 4: `cancel_handlers.len()` at the last actual
-    /// `prune_cancel_handlers` scan -- `maybe_prune_cancel_handlers` only re-scans
-    /// once this has (at least) doubled, instead of every single loop iteration.
-    last_prune_len: usize,
-
-    other_primaries: Vec<(PublicKey, SocketAddr)>,
-    /// Fable perf audit item 5a: `other_primaries`' addresses only, precomputed once
-    /// -- `other_primaries` itself is fixed for this node's whole lifetime (built
-    /// once here, never mutated), so `broadcast`'s previous per-call
-    /// `.iter().map(|(_, a)| *a).collect()` rebuilt an identical `Vec<SocketAddr>`
-    /// every single broadcast for no reason.
-    other_primary_addrs: Vec<SocketAddr>,
-    worker_addresses: HashMap<WorkerId, SocketAddr>,
+    /// Network/wire-transport state (typed senders, MAC-auth keying, cancel-handler
+    /// bookkeeping, resolved addresses) -- factored out into `Wire` (`vantage::wire`)
+    /// so a second consensus protocol can reuse it. See that module for the per-field
+    /// security/perf rationale (carried over verbatim from this struct's previous
+    /// copy of each field).
+    wire: Wire,
 
     header_size: usize,
     max_header_delay: u64,
@@ -539,32 +518,36 @@ impl VantageCore {
             pacemaker,
             resolver,
             control,
-            network: {
-                let mut s = ReliableSender::new()
-                    .with_latency(latency_map.clone())
-                    .with_compression(parameters.compress_network)
-                    .with_batching(batch);
-                if let Some(m) = &core_metrics {
-                    s = s.with_metrics(m.clone());
-                }
-                s
+            wire: Wire {
+                name,
+                network: {
+                    let mut s = ReliableSender::new()
+                        .with_latency(latency_map.clone())
+                        .with_compression(parameters.compress_network)
+                        .with_batching(batch);
+                    if let Some(m) = &core_metrics {
+                        s = s.with_metrics(m.clone());
+                    }
+                    s
+                },
+                worker_network: {
+                    let mut s = SimpleSender::new()
+                        .with_latency(latency_map)
+                        .with_compression(parameters.compress_network)
+                        .with_batching(batch);
+                    if let Some(m) = &core_metrics {
+                        s = s.with_metrics(m.clone());
+                    }
+                    s
+                },
+                channel_auth,
+                cancel_handlers: Vec::new(),
+                last_prune_len: 0,
+                other_primaries,
+                other_primary_addrs,
+                worker_addresses,
+                metrics: core_metrics.clone(),
             },
-            worker_network: {
-                let mut s = SimpleSender::new()
-                    .with_latency(latency_map)
-                    .with_compression(parameters.compress_network)
-                    .with_batching(batch);
-                if let Some(m) = &core_metrics {
-                    s = s.with_metrics(m.clone());
-                }
-                s
-            },
-            channel_auth,
-            cancel_handlers: Vec::new(),
-            last_prune_len: 0,
-            other_primaries,
-            other_primary_addrs,
-            worker_addresses,
             header_size: parameters.header_size,
             max_header_delay: parameters.max_header_delay,
             digests: Vec::new(),
@@ -626,7 +609,7 @@ impl VantageCore {
             // `maybe_prune_cancel_handlers`'s doc comment. The `metrics_tick` branch
             // below additionally forces an unconditional prune once/sec, bounding
             // staleness even if the list never doubles.
-            self.maybe_prune_cancel_handlers();
+            self.wire.maybe_prune_cancel_handlers();
 
             // D7-4: O(1) peek instead of the previous O(n) full-`Vec` rescan.
             let next_deadline = self.timers.peek().map(|Reverse((d, _, _))| *d);
@@ -699,7 +682,7 @@ impl VantageCore {
                     // Fable perf audit item 4: force an unconditional prune once/sec
                     // regardless of `maybe_prune_cancel_handlers`'s doubling
                     // condition, bounding worst-case staleness to ~1s.
-                    self.prune_cancel_handlers();
+                    self.wire.prune_cancel_handlers();
                     self.collect_internal_garbage();
                     self.sample_metrics();
                     // METRICS-DASHBOARD-SPEC.md §3: `core_queue_length` -- `rx_vantage`'s
@@ -844,7 +827,7 @@ impl VantageCore {
             "vantage node: timers.len()={} control_timers.len()={} cancel_handlers.len()={}",
             self.timers.len(),
             self.control_timers.len(),
-            self.cancel_handlers.len()
+            self.wire.cancel_handlers.len()
         );
     }
 
@@ -951,40 +934,6 @@ impl VantageCore {
         effects
     }
 
-    /// SECURITY (Fable audit): extracts the wire-declared sender to validate against
-    /// `self.members`, for every `Inbound` variant that carries one. `None` for
-    /// internal or positionally-attributed facts: `Serve` (header content is
-    /// self-authenticating by digest), `AckAvailability` (already checked by
-    /// `AckAggregator`), `Propose`/`ControlInit` (positionally attributed to
-    /// `proposer(view)`/`control_leader(round)`, D4's standing claimed-by-position
-    /// class -- see `dispatch_inbound`'s own comments on those two arms), and
-    /// `ControlServe` (gated downstream by `pending_fetch(view, digest)`).
-    fn wire_sender(inbound: &Inbound) -> Option<PublicKey> {
-        // `PublicKey` is `Copy` -- dereference rather than `.clone()` (clippy::clone_on_copy).
-        match inbound {
-            Inbound::Publish(sender, _) => Some(*sender),
-            Inbound::HeadersRequest(_, requestor) => Some(*requestor),
-            Inbound::Ack(ack) => Some(ack.sender),
-            Inbound::Echo(e) => Some(e.sender),
-            Inbound::EchoSkip(_, s, _) => Some(*s),
-            Inbound::Ready(r) => Some(r.sender),
-            Inbound::NoReady(_, s, _) => Some(*s),
-            Inbound::Wish(_, s) => Some(*s),
-            Inbound::CompReport(_, _, s) => Some(*s),
-            Inbound::ControlEcho(s, _) => Some(*s),
-            Inbound::ControlReady(s, _) => Some(*s),
-            Inbound::ControlCommit(s, _) => Some(*s),
-            Inbound::ControlTimeoutVote(s, _) => Some(*s),
-            Inbound::ControlTimeoutAccept(s, _) => Some(*s),
-            Inbound::ControlFetch(_, _, s) => Some(*s),
-            Inbound::Serve(_)
-            | Inbound::AckAvailability(_)
-            | Inbound::Propose(_)
-            | Inbound::ControlInit(_, _)
-            | Inbound::ControlServe(_, _) => None,
-        }
-    }
-
     fn on_ack_availability(&mut self, availability: AckAvailability, now: Instant) -> Vec<Effect> {
         let mut effects = self.lm.process_ack_availability(availability);
         effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
@@ -1032,13 +981,11 @@ impl VantageCore {
         // by the dedup-only census helpers downstream, inflating any party-count
         // quorum. Honest senders are always committee members, so this is a no-op on
         // every honest path.
-        if let Some(sender) = Self::wire_sender(&inbound) {
-            if !self.members.contains(&sender) {
-                if let Some(metrics) = &self.metrics {
-                    metrics.vantage_rejected_nonmember_total.inc();
-                }
-                return Vec::new();
+        if !wire::sender_is_member(&inbound, &self.members) {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_rejected_nonmember_total.inc();
             }
+            return Vec::new();
         }
         match inbound {
             Inbound::Publish(sender, header) => self.lm.process_publish(sender, header).await,
@@ -1159,26 +1106,30 @@ impl VantageCore {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::BroadcastPublish(header) => {
-                    self.broadcast_message(PrimaryMessage::Header(header, false))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::Header(header, false))
                         .await
                 }
                 Effect::BroadcastAck(ack) => {
                     queue.extend(self.record_local_ack(&ack, now));
-                    self.broadcast_message(PrimaryMessage::VantageAck(ack))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantageAck(ack))
                         .await
                 }
                 Effect::SyncBatches(author, header_digest, missing) => {
                     self.sync_batches(author, header_digest, missing).await;
                 }
                 Effect::RequestTo(peer, digest) => {
-                    self.send_message(
-                        peer,
-                        PrimaryMessage::HeadersRequest(vec![digest], self.name),
-                    )
-                    .await;
+                    self.wire
+                        .send_message(
+                            peer,
+                            PrimaryMessage::HeadersRequest(vec![digest], self.name),
+                        )
+                        .await;
                 }
                 Effect::ServeTo(peer, header) => {
-                    self.send_message(peer, PrimaryMessage::Header(header, true))
+                    self.wire
+                        .send_message(peer, PrimaryMessage::Header(header, true))
                         .await
                 }
                 Effect::BlockCached(digest) => {
@@ -1187,7 +1138,8 @@ impl VantageCore {
                     queue.extend(self.cursor.retry());
                 }
                 Effect::BroadcastPropose(p) => {
-                    self.broadcast_message(PrimaryMessage::VantagePropose(p))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantagePropose(p))
                         .await
                 }
                 // PHASE5-SPEC.md §3/D5-3: every response effect is stamped with our
@@ -1197,21 +1149,26 @@ impl VantageCore {
                 // effects carrying just a `View` to begin with).
                 Effect::BroadcastEcho(mut e) => {
                     e.wish = self.pacemaker.own_watermark();
-                    self.broadcast_message(PrimaryMessage::VantageEcho(e)).await;
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantageEcho(e))
+                        .await;
                 }
                 Effect::BroadcastEchoSkip(view) => {
                     let wish = self.pacemaker.own_watermark();
-                    self.broadcast_message(PrimaryMessage::VantageEchoSkip(view, self.name, wish))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantageEchoSkip(view, self.name, wish))
                         .await;
                 }
                 Effect::BroadcastReady(mut r) => {
                     r.wish = self.pacemaker.own_watermark();
-                    self.broadcast_message(PrimaryMessage::VantageReady(r))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantageReady(r))
                         .await;
                 }
                 Effect::BroadcastNoReady(view) => {
                     let wish = self.pacemaker.own_watermark();
-                    self.broadcast_message(PrimaryMessage::VantageNoReady(view, self.name, wish))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantageNoReady(view, self.name, wish))
                         .await;
                 }
                 Effect::Fixed(view, well_formed) => {
@@ -1235,7 +1192,8 @@ impl VantageCore {
                         .await;
                 }
                 Effect::BroadcastWish(view) => {
-                    self.broadcast_message(PrimaryMessage::VantageWish(view, self.name))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantageWish(view, self.name))
                         .await
                 }
                 Effect::Enter(view) => {
@@ -1260,39 +1218,48 @@ impl VantageCore {
                     queue.extend(self.control.on_completion_reportable(view, proposal));
                 }
                 Effect::BroadcastCompReport(view, digest) => {
-                    self.broadcast_message(PrimaryMessage::CompReport(view, digest, self.name))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::CompReport(view, digest, self.name))
                         .await;
                 }
                 Effect::BroadcastControlInit(proposal, b_w) => {
-                    self.broadcast_message(PrimaryMessage::ControlInit(proposal, b_w))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::ControlInit(proposal, b_w))
                         .await;
                 }
                 Effect::BroadcastControlEcho(proposal) => {
-                    self.broadcast_message(PrimaryMessage::ControlEcho(proposal, self.name))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::ControlEcho(proposal, self.name))
                         .await;
                 }
                 Effect::BroadcastControlReady(proposal) => {
-                    self.broadcast_message(PrimaryMessage::ControlReady(proposal, self.name))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::ControlReady(proposal, self.name))
                         .await;
                 }
                 Effect::BroadcastControlCommit(round) => {
-                    self.broadcast_message(PrimaryMessage::ControlCommit(round, self.name))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::ControlCommit(round, self.name))
                         .await;
                 }
                 Effect::BroadcastControlTimeoutVote(round) => {
-                    self.broadcast_message(PrimaryMessage::ControlTimeoutVote(round, self.name))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::ControlTimeoutVote(round, self.name))
                         .await;
                 }
                 Effect::BroadcastControlTimeoutAccept(round) => {
-                    self.broadcast_message(PrimaryMessage::ControlTimeoutAccept(round, self.name))
+                    self.wire
+                        .broadcast_message(PrimaryMessage::ControlTimeoutAccept(round, self.name))
                         .await;
                 }
                 Effect::ControlFetchTo(peer, view, digest) => {
-                    self.send_message(peer, PrimaryMessage::ControlFetch(view, digest, self.name))
+                    self.wire
+                        .send_message(peer, PrimaryMessage::ControlFetch(view, digest, self.name))
                         .await;
                 }
                 Effect::ControlServeTo(peer, view, proposal) => {
-                    self.send_message(peer, PrimaryMessage::ControlServe(view, proposal))
+                    self.wire
+                        .send_message(peer, PrimaryMessage::ControlServe(view, proposal))
                         .await;
                 }
                 Effect::ArmControlTimer(round, deadline) => {
@@ -1307,32 +1274,6 @@ impl VantageCore {
                     queue.extend(self.agb.submit_anchor(view, outcome));
                 }
             }
-        }
-    }
-
-    /// P4-3: drop every cancel handler that has already resolved (message ack'd) or
-    /// closed (connection gone, will never resolve) -- keeps only the ones
-    /// `ReliableSender` may still be actively retrying, so the retry-until-ack
-    /// semantics are unaffected (`Connection::keep_alive` treats a dropped receiver's
-    /// closed sender as cancellation, per `network::reliable_sender`, so we must never
-    /// drop one that's genuinely still pending).
-    fn prune_cancel_handlers(&mut self) {
-        self.cancel_handlers
-            .retain_mut(|handler| matches!(handler.try_recv(), Err(TryRecvError::Empty)));
-        self.last_prune_len = self.cancel_handlers.len();
-    }
-
-    /// Fable perf audit item 4: an O(1) length check on every `run` loop iteration,
-    /// only actually invoking `prune_cancel_handlers`'s O(n) `retain_mut` scan once
-    /// `cancel_handlers` has (at least) doubled since the last prune. `run`'s
-    /// `metrics_tick` branch additionally forces an unconditional prune once/sec, so a
-    /// slow-growing tail that never doubles is still bounded to ~1s of extra
-    /// staleness -- handlers surviving marginally longer than before is harmless (see
-    /// `prune_cancel_handlers`'s own doc comment for why dropping one early would
-    /// NOT be harmless).
-    fn maybe_prune_cancel_handlers(&mut self) {
-        if self.cancel_handlers.len() >= 2 * self.last_prune_len.max(1) {
-            self.prune_cancel_handlers();
         }
     }
 
@@ -1353,147 +1294,6 @@ impl VantageCore {
             .get_or_insert_with(|| metrics.utilization_timer.with_label_values(&[label]))
             .clone();
         Some(UtilizationTimer::from_counter(counter))
-    }
-
-    /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
-    /// and broadcasts it verbatim (`bincode::serialize` never fails on our own wire
-    /// types, hence the `expect`). METRICS-DASHBOARD-SPEC.md §1: `message.type_name()`
-    /// is computed before serializing, so it labels the exact variant sent.
-    async fn broadcast_message(&mut self, message: PrimaryMessage) {
-        let msg_type = message.type_name();
-        // METRICS-DASHBOARD-SPEC.md §3: `proposed_block_size_bytes` -- our own
-        // self-authored block's serialized size at publish time. `Header(_, false)` is
-        // specifically the publish variant (`false` = not a serve/sync reply); the
-        // metrics handle is `Option` (unit tests construct `VantageCore` without one).
-        let is_own_publish = matches!(message, PrimaryMessage::Header(_, false));
-        // SECURITY (Fable audit): `Header(_, true)` ("Serve") never legitimately
-        // reaches `broadcast_message` (`ServeTo` always unicasts via `send_message`
-        // below), so the only D4-class placeholder-tag variant this method ever sees
-        // in practice is `ControlServe` -- kept as a real `match`, not an assert, so
-        // this stays correct even if a future effect ever does broadcast one of them.
-        let placeholder = message_needs_placeholder_tag(&message);
-        let bytes = bincode::serialize(&message).expect("serializes");
-        if is_own_publish {
-            if let Some(metrics) = &self.metrics {
-                metrics.proposed_block_size_bytes.observe(bytes.len());
-            }
-        }
-        self.broadcast(bytes, msg_type, placeholder).await;
-    }
-
-    /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
-    /// and unicasts it verbatim to one peer.
-    async fn send_message(&mut self, peer: PublicKey, message: PrimaryMessage) {
-        let msg_type = message.type_name();
-        let placeholder = message_needs_placeholder_tag(&message);
-        let bytes = bincode::serialize(&message).expect("serializes");
-        self.send_to(peer, bytes, msg_type, placeholder).await;
-    }
-
-    /// SECURITY (Fable audit): appends this message's MAC tag (when `channel_auth` is
-    /// on) before broadcasting to every other primary. `placeholder` (see
-    /// `message_needs_placeholder_tag`): the two D4-class variants with no sender
-    /// claim to bind get one destination-independent tag (`PairwiseKeys::
-    /// tag_unverified`), computed once and shared across every destination -- exactly
-    /// like the flag-off path's own `.clone()`-shared `Bytes` -- rather than N
-    /// per-destination tags nobody will ever check. Every other variant gets a
-    /// genuine per-destination tag (`k_{self, dest}`), since `dest` varies.
-    async fn broadcast(&mut self, payload: Vec<u8>, msg_type: &'static str, placeholder: bool) {
-        let Some(auth) = self.channel_auth.clone() else {
-            // Flag off: byte-identical to pre-MAC behavior. Fable perf audit item 5a:
-            // `other_primary_addrs` is precomputed once (see its own doc comment) --
-            // this `.clone()` is a straight contiguous `Vec<SocketAddr>` memcpy.
-            let handlers = self
-                .network
-                .broadcast_typed(
-                    self.other_primary_addrs.clone(),
-                    Bytes::from(payload),
-                    msg_type,
-                )
-                .await;
-            self.cancel_handlers.extend(handlers);
-            return;
-        };
-        if placeholder {
-            let mut tagged = payload;
-            tagged.extend_from_slice(&auth.tag_unverified(&tagged));
-            let handlers = self
-                .network
-                .broadcast_typed(
-                    self.other_primary_addrs.clone(),
-                    Bytes::from(tagged),
-                    msg_type,
-                )
-                .await;
-            self.cancel_handlers.extend(handlers);
-            return;
-        }
-        for (peer, addr) in self.other_primaries.clone() {
-            let tag = auth
-                .tag_for(&peer, &payload)
-                .expect("every `other_primaries` entry is a committee member");
-            let mut tagged = payload.clone();
-            tagged.extend_from_slice(&tag);
-            let handler = self
-                .network
-                .send_typed(addr, Bytes::from(tagged), msg_type)
-                .await;
-            self.cancel_handlers.push(handler);
-        }
-    }
-
-    /// SECURITY (Fable audit): same tag-append contract as `broadcast`, for a single
-    /// destination.
-    async fn send_to(
-        &mut self,
-        peer: PublicKey,
-        payload: Vec<u8>,
-        msg_type: &'static str,
-        placeholder: bool,
-    ) {
-        let Some(addr) = self
-            .other_primaries
-            .iter()
-            .find(|(pk, _)| *pk == peer)
-            .map(|(_, a)| *a)
-        else {
-            return;
-        };
-        let data = match &self.channel_auth {
-            None => Bytes::from(payload),
-            Some(auth) => {
-                let tag = if placeholder {
-                    auth.tag_unverified(&payload)
-                } else {
-                    auth.tag_for(&peer, &payload)
-                        .expect("peer is a committee member")
-                };
-                let mut tagged = payload;
-                tagged.extend_from_slice(&tag);
-                Bytes::from(tagged)
-            }
-        };
-        let handler = self.network.send_typed(addr, data, msg_type).await;
-        self.cancel_handlers.push(handler);
-    }
-
-    /// SECURITY (Fable audit): appends a tag keyed `k_{self, self}` (the worker<->
-    /// primary channel is intra-authority: our own worker's public key IS `self.name`)
-    /// before sending to one of our own workers. A no-op (byte-identical) when
-    /// `channel_auth` is off.
-    async fn send_to_worker(&mut self, addr: SocketAddr, payload: Vec<u8>, msg_type: &'static str) {
-        let data = match &self.channel_auth {
-            None => Bytes::from(payload),
-            Some(auth) => {
-                let tag = auth
-                    .tag_for(&self.name, &payload)
-                    .expect("self is a committee member");
-                let mut tagged = payload;
-                tagged.extend_from_slice(&tag);
-                Bytes::from(tagged)
-            }
-        };
-        self.worker_network.send_typed(addr, data, msg_type).await;
     }
 
     /// D1/§1: ask our own workers to sync `missing` batches for `author`'s block
@@ -1517,10 +1317,10 @@ impl VantageCore {
                 .push(digest.clone());
         }
         for (worker_id, digests) in by_worker {
-            if let Some(addr) = self.worker_addresses.get(&worker_id).copied() {
+            if let Some(addr) = self.wire.worker_addr(worker_id) {
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Synchronize(digests, author))
                     .expect("serializes");
-                self.send_to_worker(addr, bytes, "Synchronize").await;
+                self.wire.send_to_worker(addr, bytes, "Synchronize").await;
             }
         }
 
@@ -1554,11 +1354,11 @@ impl VantageCore {
         headers: Vec<Header>,
     ) {
         for (worker_id, digests) in by_worker {
-            if let Some(addr) = self.worker_addresses.get(&worker_id).copied() {
+            if let Some(addr) = self.wire.worker_addr(worker_id) {
                 let bytes =
                     bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests))
                         .expect("serializes");
-                self.send_to_worker(addr, bytes, "Committed").await;
+                self.wire.send_to_worker(addr, bytes, "Committed").await;
             }
         }
         for header in headers {
