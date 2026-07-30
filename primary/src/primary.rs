@@ -109,6 +109,18 @@ pub enum PrimaryMessage {
     SimpleItDecide(crate::simpleit::Decide),
     SimpleItTimeout(crate::simpleit::Timeout),
     SimpleItTimeoutAccept(crate::simpleit::TimeoutAccept),
+    // Simple-IT cut-proposal repair: mirrors `ControlFetch`/`ControlServe` above
+    // exactly (see `vantage::control::ControlLog::on_control_fetch`/
+    // `on_control_serve`'s identical role for Vantage's own carrier bodies) -- closes
+    // a liveness gap where a party accepts round r's `CutCertificate` (naming only a
+    // `cut_id`) without ever receiving round r's own `CutProposal`. Appended last --
+    // same bincode wire-compat rule as every other protocol-specific variant above.
+    SimpleItCutFetch(
+        crate::simpleit::CutRound,
+        Digest,
+        /* requester */ PublicKey,
+    ),
+    SimpleItCutServe(crate::simpleit::CutProposal),
 }
 
 impl PrimaryMessage {
@@ -152,6 +164,8 @@ impl PrimaryMessage {
             PrimaryMessage::SimpleItDecide(..) => "SimpleItDecide",
             PrimaryMessage::SimpleItTimeout(..) => "SimpleItTimeout",
             PrimaryMessage::SimpleItTimeoutAccept(..) => "SimpleItTimeoutAccept",
+            PrimaryMessage::SimpleItCutFetch(..) => "SimpleItCutFetch",
+            PrimaryMessage::SimpleItCutServe(..) => "SimpleItCutServe",
         }
     }
 }

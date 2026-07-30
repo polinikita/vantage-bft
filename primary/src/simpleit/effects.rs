@@ -8,6 +8,7 @@
 use crate::simpleit::messages::{
     Cut, CutCertificate, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
 };
+use crypto::{Digest, PublicKey};
 use std::time::Instant;
 
 /// The wire-message payloads `CutEngine` ever broadcasts. One variant per upstream
@@ -50,4 +51,27 @@ pub enum CutEffect {
     /// `ConsensusMessage::Commit` -- that enum also carries Autobahn's dead
     /// `Prepare`/`Confirm` arms, which this port does not inherit.
     Commit { round: CutRound, proposals: Cut },
+
+    // --- Cut-proposal repair (not upstream -- see engine.rs's module doc comment and
+    // `CutEngine::ensure_cut_fetch`/`on_cut_fetch`/`on_cut_serve` for the liveness gap
+    // this closes) ---
+    /// Ask `peer` for the `CutProposal` identified by `(round, cut_id)`. Mirrors
+    /// `vantage::Effect::ControlFetchTo`'s identical role for Vantage's own carrier
+    /// bodies (fan-out is one `CutEffect` per target peer, emitted at most once per
+    /// `(round, cut_id)` pair every `CutEngine::FETCH_RETRY_ROUNDS` cut rounds -- see
+    /// `CutEngine::ensure_cut_fetch`). The requester is never named here -- exactly
+    /// like `ControlFetchTo`, the caller always asks on this node's own behalf, so
+    /// the production wiring (`SimpleItCore::execute_cut`) fills in `self.name` at
+    /// send time.
+    FetchTo {
+        peer: PublicKey,
+        round: CutRound,
+        cut_id: Digest,
+    },
+    /// Answer a peer's fetch with our own held `CutProposal`. Mirrors
+    /// `vantage::Effect::ControlServeTo`'s identical role.
+    ServeTo {
+        peer: PublicKey,
+        proposal: CutProposal,
+    },
 }

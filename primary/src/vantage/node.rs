@@ -134,14 +134,21 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
 }
 
 /// SECURITY (Fable audit): the OUTBOUND-side mirror of `mac_candidate_sender`'s `None`
-/// arms -- true for the two D4-class variants with no sender claim at all (wire or
-/// positional) to bind. This node always sends its OWN messages, so on the outbound
-/// side the candidate (when one exists) is trivially `self.name` -- only whether a
-/// candidate exists at all matters here, not its value, hence the plain `bool`.
+/// arms -- true for the three D4-class variants with no sender claim at all (wire or
+/// positional) to bind: `Header(_, true)`/`ControlServe` (Vantage's own carrier-body
+/// repair) and `SimpleItCutServe` (Simple-IT's sibling cut-proposal repair -- see
+/// `simpleit::node::mac_candidate_sender`'s identical `None` arm for that variant:
+/// its `CutProposal::proposer` field names the ORIGINAL round leader, never the
+/// relaying/serving party, so there is no sender claim here to bind either). This
+/// node always sends its OWN messages, so on the outbound side the candidate (when
+/// one exists) is trivially `self.name` -- only whether a candidate exists at all
+/// matters here, not its value, hence the plain `bool`.
 pub(super) fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
     matches!(
         message,
-        PrimaryMessage::Header(_, true) | PrimaryMessage::ControlServe(_, _)
+        PrimaryMessage::Header(_, true)
+            | PrimaryMessage::ControlServe(_, _)
+            | PrimaryMessage::SimpleItCutServe(_)
     )
 }
 
@@ -1540,6 +1547,17 @@ mod tests {
         ));
         assert!(!message_needs_placeholder_tag(
             &PrimaryMessage::VantageWish(1, crate::common::keys()[0].0)
+        ));
+        // Simple-IT's sibling repair-serve: same "no sender claim to bind" class as
+        // `ControlServe` above -- see this function's own doc comment.
+        assert!(message_needs_placeholder_tag(
+            &PrimaryMessage::SimpleItCutServe(crate::simpleit::CutProposal::default())
+        ));
+        // Its fetch counterpart, by contrast, carries a real declared requester (see
+        // `simpleit::node::mac_candidate_sender`'s `SimpleItCutFetch` arm) -- not in
+        // this no-claim class.
+        assert!(!message_needs_placeholder_tag(
+            &PrimaryMessage::SimpleItCutFetch(1, Digest::default(), crate::common::keys()[0].0)
         ));
     }
 

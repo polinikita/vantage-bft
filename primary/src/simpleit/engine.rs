@@ -57,6 +57,23 @@
 // (their fields are all `pub`) rather than requiring an async context for a
 // constructor that does no actual `.await` work. This matches `AgbEngine`/`ControlLog`,
 // neither of which has a single `async fn` either.
+//
+// REPAIR (not upstream -- new machinery, added after the port to close a liveness gap
+// it otherwise inherited): the paper (arXiv:2606.14404, Fig. 2) delivers `CutProposal`s
+// by reliable broadcast, whose totality property guarantees that once any correct
+// party rb-delivers, every correct party eventually does. This port replaces RBC with
+// vote-aggregation-plus-certificate (`process_cut_vote`/`process_cut_certificate`),
+// which carries no such guarantee: a `CutCertificate` names only a `cut_id`, and a
+// party can accept round r's certificate without ever having received round r's own
+// `CutProposal` -- `safe_cut_parent` cannot then resolve a citing child's parent
+// through `cut_round_by_id`, so the chain stalls rather than committing (see this
+// module's own test `missing_proposal_stalls_the_chain_rather_than_skipping_a_round`).
+// `ensure_cut_fetch`/`on_cut_fetch`/`on_cut_serve` restore the missing property
+// operationally, by pull rather than by broadcast -- mirroring
+// `vantage::control::ControlLog`'s own `ensure_fetch`/`on_control_fetch`/
+// `on_control_serve` for its carrier bodies exactly (see each method's own doc
+// comment for the parallel, and `process_cut_certificate`/`process_cut_proposal` for
+// the two triggers).
 
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
@@ -89,6 +106,14 @@ pub enum Inbound {
     /// A previously `CutEffect::ArmTimer`-requested deadline for this round has
     /// elapsed. Corresponds to upstream's `cut_timer_futures` yielding a round.
     TimerFired(CutRound),
+    /// A peer's request for the `CutProposal` identified by `(round, cut_id)`.
+    /// Repair machinery, not upstream (upstream has no equivalent -- see this
+    /// module's doc comment). The requester is carried explicitly, mirroring
+    /// `vantage::node::Inbound::ControlFetch`.
+    CutFetch(CutRound, Digest, /* requester */ PublicKey),
+    /// A peer's answer to our own fetch. Mirrors `vantage::node::Inbound::
+    /// ControlServe`.
+    CutServe(CutProposal),
 }
 
 /// Tip-availability oracle for the f+1 gate (deviation 3): "has this party itself seen
@@ -229,6 +254,19 @@ pub struct CutEngine {
     certified_timed_out: BTreeSet<CutRound>,
     /// Upstream `scheduled_cut_timers: HashSet<u64>`. Round-prunable; covered.
     scheduled_cut_timers: BTreeSet<CutRound>,
+
+    // --- Cut-proposal repair (not upstream -- see the module doc comment) ---
+    /// Outstanding `CutProposal` fetches, mapped to the cut round (this engine's own
+    /// retry clock, `self.cut_round`) we last fanned the request out in. Mirrors
+    /// `control::ControlLog::pending_fetch` exactly -- see that field's doc comment
+    /// for why this must be retryable (a one-shot latch left a request permanently
+    /// stuck if its one round of targets never answered) -- keyed by `(CutRound,
+    /// Digest)` so `split_off` prunes it in `prune_below`, same as every other
+    /// round-keyed field above.
+    pending_cut_fetch: BTreeMap<(CutRound, Digest), CutRound>,
+    /// Per-requester fetch-answered dedup, mirroring `control::ControlLog::
+    /// fetch_answered` exactly. Round-prunable; covered.
+    fetch_answered: BTreeSet<(CutRound, Digest, PublicKey)>,
 }
 
 impl CutEngine {
@@ -260,6 +298,8 @@ impl CutEngine {
             sent_timeout_accepts: BTreeSet::new(),
             certified_timed_out: BTreeSet::new(),
             scheduled_cut_timers: BTreeSet::new(),
+            pending_cut_fetch: BTreeMap::new(),
+            fetch_answered: BTreeSet::new(),
         }
     }
 
@@ -299,6 +339,10 @@ impl CutEngine {
                 self.process_timeout_accept(a, tips, oracle)
             }
             Inbound::TimerFired(r) => self.process_cut_timer(r, tips, oracle),
+            Inbound::CutFetch(round, cut_id, requester) => {
+                self.on_cut_fetch(requester, round, cut_id)
+            }
+            Inbound::CutServe(proposal) => self.on_cut_serve(proposal, tips, oracle),
         }
     }
 
@@ -388,7 +432,72 @@ impl CutEngine {
         self.certified_timed_out = self.certified_timed_out.split_off(&floor);
         self.scheduled_cut_timers = self.scheduled_cut_timers.split_off(&floor);
 
+        self.pending_cut_fetch = self
+            .pending_cut_fetch
+            .split_off(&(floor, Digest::default()));
+        self.fetch_answered =
+            self.fetch_answered
+                .split_off(&(floor, Digest::default(), PublicKey::default()));
+
         self.gc_floor = floor;
+    }
+
+    /// Re-fan an unanswered `CutProposal` fetch every this many cut rounds -- mirrors
+    /// `control::ControlLog::FETCH_RETRY_ROUNDS` exactly: cut rounds are this
+    /// engine's own natural clock (`self.cut_round`), exactly as control rounds are
+    /// `ControlLog`'s, and the identical retry rationale applies verbatim (a
+    /// one-shot latch left a request permanently unanswered if its one round of
+    /// targets never answered -- re-asking is cheap next to that).
+    const FETCH_RETRY_ROUNDS: CutRound = 8;
+
+    /// Every other committee member (never `self.name`) -- the fallback fetch-target
+    /// set for `process_cut_proposal`'s "parent unknown" trigger, which (unlike
+    /// `process_cut_certificate`'s certificate-driven trigger) has no per-voter
+    /// evidence to narrow to. See that call site's own comment for the full
+    /// justification.
+    fn all_other_committee_members(&self) -> Vec<PublicKey> {
+        self.committee
+            .authorities
+            .keys()
+            .filter(|k| **k != self.name)
+            .copied()
+            .collect()
+    }
+
+    /// Request the `CutProposal` identified by `(round, cut_id)` from every one of
+    /// `targets`, at most once every `FETCH_RETRY_ROUNDS` cut rounds for that exact
+    /// pair -- mirrors `control::ControlLog::ensure_fetch` exactly (see its doc
+    /// comment for the retry rationale). No-op if we already hold the proposal
+    /// (`cut_round_by_id`) or `round` is already pruned. Called from both repair
+    /// triggers: `process_cut_certificate` (an exact round, read directly off the
+    /// certificate) and `process_cut_proposal`'s buffering branch (a best-effort
+    /// round guess -- see that call site for why an exact round isn't available
+    /// there).
+    fn ensure_cut_fetch(
+        &mut self,
+        round: CutRound,
+        cut_id: &Digest,
+        targets: Vec<PublicKey>,
+    ) -> Vec<CutEffect> {
+        if round < self.gc_floor || self.cut_round_by_id.contains_key(cut_id) {
+            return Vec::new();
+        }
+        let key = (round, cut_id.clone());
+        match self.pending_cut_fetch.get(&key) {
+            Some(&last) if self.cut_round.saturating_sub(last) < Self::FETCH_RETRY_ROUNDS => {
+                return Vec::new();
+            }
+            _ => {}
+        }
+        self.pending_cut_fetch.insert(key, self.cut_round);
+        targets
+            .into_iter()
+            .map(|peer| CutEffect::FetchTo {
+                peer,
+                round,
+                cut_id: cut_id.clone(),
+            })
+            .collect()
     }
 
     /// Upstream primary/src/core.rs:448-478.
@@ -457,9 +566,40 @@ impl CutEngine {
             }
 
             if !self.safe_cut_parent(round, &proposal.parent_cut) {
-                let key = (round, proposal.parent_cut.clone());
+                let parent_cut = proposal.parent_cut.clone();
+                // REPAIR (see the module doc comment): fetch only when the parent is
+                // genuinely UNKNOWN (never recorded) -- NOT when it's known but
+                // simply not yet safe (an in-flight pipeline wait on intermediate
+                // rounds' own timeout certification, or a malformed parent_round >=
+                // round), which `safe_cut_parent` would also reject but which
+                // fetching cannot help. Target set: unlike
+                // `process_cut_certificate`'s trigger, no certificate or per-voter
+                // evidence exists for this specific digest (if it did, that
+                // certificate's own acceptance would already have triggered a fetch
+                // for it) -- there is no narrower evidence than "ask everyone", so
+                // this asks the full committee. Round guess: `round - 1`, exact
+                // whenever no timeout-skipped round sits between parent and child
+                // (the common/optimistic case: `make_cut_proposal` always cites
+                // `highest_certified_cut`, which a leader updates only immediately
+                // upon certifying the round it then builds on). A wrong guess (a
+                // skipped round sits between them) is not fatal: `ensure_cut_fetch`
+                // simply never matches a genuine answer for the true parent's real
+                // round, so it goes unanswered rather than corrupting state, and
+                // `process_cut_certificate`'s own trigger remains the fully general
+                // backstop -- it fires with the EXACT round once this party
+                // independently observes the true parent's own certificate.
+                if parent_cut != Digest::default()
+                    && !self.cut_round_by_id.contains_key(&parent_cut)
+                {
+                    let targets = self.all_other_committee_members();
+                    effects.extend(self.ensure_cut_fetch(
+                        round.saturating_sub(1),
+                        &parent_cut,
+                        targets,
+                    ));
+                }
                 self.pending_cut_children
-                    .entry(key)
+                    .entry((round, parent_cut))
                     .or_default()
                     .push(proposal);
                 continue;
@@ -589,6 +729,7 @@ impl CutEngine {
             return Vec::new();
         }
         let cut_id = certificate.cut_id.clone();
+        let voters = certificate.votes.clone();
         self.cut_certificates.entry(round).or_insert(certificate);
         if round + 1 >= self.cut_round {
             self.highest_certified_cut = cut_id.clone();
@@ -596,7 +737,15 @@ impl CutEngine {
         self.cut_round = self.cut_round.max(round + 1);
         self.advance_timed_out_cut_rounds();
 
-        let mut effects = Vec::new();
+        // REPAIR (see the module doc comment): the certificate names only a
+        // `cut_id` -- if we never independently received/recorded round `round`'s
+        // own `CutProposal`, nothing else will ever ask for it (`safe_cut_parent`'s
+        // "parent unknown" branch only BUFFERS a citing child, it never fetches on
+        // its own -- that is `process_cut_proposal`'s OWN, separate trigger, for
+        // when a child arrives before this certificate ever does). Every one of
+        // `certificate.votes` claimed, by voting, to have seen the proposal -- see
+        // `ensure_cut_fetch`'s doc comment.
+        let mut effects = self.ensure_cut_fetch(round, &cut_id, voters);
         if self.sent_decide_rounds.insert(round) {
             let decide = Decide {
                 id: cut_id,
@@ -940,6 +1089,75 @@ impl CutEngine {
         );
         Ok(())
     }
+
+    // ============================================================ Cut-proposal repair
+    //
+    // Not upstream -- upstream has no equivalent. Closes the liveness gap where a
+    // party accepts round r's `CutCertificate` (naming only a `cut_id`) without ever
+    // having received round r's own `CutProposal` -- see the module doc comment and
+    // `process_cut_certificate`/`process_cut_proposal` for the two triggers that call
+    // `ensure_cut_fetch` above. Mirrors `control::ControlLog`'s own carrier-body
+    // fetch/serve (`on_control_fetch`/`on_control_serve`) exactly.
+
+    /// A peer's request for `(round, cut_id)` -- answer with our own held
+    /// `CutProposal` if we have it and haven't already answered this requester for
+    /// this exact pair. Gated on `gc_floor`, this engine's one and only retention
+    /// floor (unlike `ControlLog`'s split `min_live_view`/`min_serve_view`:
+    /// `CutEngine::prune_below` drops `cut_proposals` at the same floor as every
+    /// other round-keyed field, so there is no wider serve-only window to gate on
+    /// separately here).
+    pub fn on_cut_fetch(
+        &mut self,
+        requester: PublicKey,
+        round: CutRound,
+        cut_id: Digest,
+    ) -> Vec<CutEffect> {
+        if round < self.gc_floor {
+            return Vec::new();
+        }
+        let answered_key = (round, cut_id.clone(), requester);
+        if self.fetch_answered.contains(&answered_key) {
+            return Vec::new();
+        }
+        let Some(proposal) = self.cut_proposals.get(&(round, cut_id)) else {
+            return Vec::new();
+        };
+        let proposal = proposal.clone();
+        self.fetch_answered.insert(answered_key);
+        vec![CutEffect::ServeTo {
+            peer: requester,
+            proposal,
+        }]
+    }
+
+    /// A peer's answer to our own fetch -- accept only if it hash-matches a pair we
+    /// actually requested: `proposal.id()` (`== CutProposal::digest()`, which hashes
+    /// `round` among its other fields) keyed together with `proposal.round` against
+    /// `pending_cut_fetch` is exactly that pair, so this single lookup checks BOTH
+    /// "is this cut_id one we asked for" AND "at the round we asked for it" in one
+    /// step. Mirrors `control::ControlLog::on_control_serve`'s RS1-class defense:
+    /// "valid" means hash-matching a REQUESTED pair, not merely well-formed.
+    /// Structural verification (leader authenticity, safety, dedup, the f+1 tip
+    /// gate, ...) is deliberately NOT duplicated here -- accepting hands off
+    /// entirely to `process_cut_proposal`, which already performs every one of
+    /// those checks for a directly-received proposal, so recording, reparenting of
+    /// `pending_cut_children`, voting, and `try_commit_round` all happen exactly as
+    /// they would have. Every rejecting path below changes no state
+    /// (`pending_cut_fetch` is only ever removed on the accepting path, after the
+    /// hash-match check has already passed).
+    pub fn on_cut_serve(
+        &mut self,
+        proposal: CutProposal,
+        tips: &Cut,
+        oracle: &dyn TipOracle,
+    ) -> Vec<CutEffect> {
+        let key = (proposal.round, proposal.id());
+        if !self.pending_cut_fetch.contains_key(&key) {
+            return Vec::new(); // unsolicited, or answers a pair we never requested
+        }
+        self.pending_cut_fetch.remove(&key);
+        self.process_cut_proposal(proposal, tips, oracle)
+    }
 }
 
 #[cfg(test)]
@@ -1026,6 +1244,20 @@ mod tests {
                     round: r,
                     proposals,
                 } if *r == round => Some((*r, proposals.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find_fetches(effects: &[CutEffect]) -> Vec<(PublicKey, CutRound, Digest)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                CutEffect::FetchTo {
+                    peer,
+                    round,
+                    cut_id,
+                } => Some((*peer, *round, cut_id.clone())),
                 _ => None,
             })
             .collect()
@@ -1254,6 +1486,334 @@ mod tests {
             tips: tips.clone(),
         }
         .id()
+    }
+
+    /// AUDIT FOLLOWUP (cut-proposal repair): the same missing-proposal scenario as
+    /// `missing_proposal_stalls_the_chain_rather_than_skipping_a_round` above, now
+    /// asserting the fix -- accepting round 1's certificate emits a fetch for its own
+    /// `(round, cut_id)` addressed to every one of the certificate's voters (every
+    /// listed voter claimed, by voting, to have seen the proposal -- see
+    /// `process_cut_certificate`'s own call to `ensure_cut_fetch`).
+    #[test]
+    fn certificate_with_unknown_proposal_triggers_fetch_to_its_voters() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let round1_leader = agb::proposer(&committee, 2);
+        let round2_leader = agb::proposer(&committee, 3);
+        let observer = *keys
+            .iter()
+            .find(|k| **k != round1_leader && **k != round2_leader)
+            .expect("n=4 has a non-leader");
+        let mut engine = CutEngine::new(observer, committee.clone(), 1_000);
+
+        let round1_cut = CutProposal {
+            round: 1,
+            proposer: round1_leader,
+            parent_cut: Digest::default(),
+            tips: tips.clone(),
+        };
+        let round1_id = round1_cut.id();
+        let voters: Vec<PublicKey> = keys
+            .iter()
+            .take(committee.quorum_threshold() as usize)
+            .copied()
+            .collect();
+        let cert = CutCertificate {
+            round: 1,
+            cut_id: round1_id.clone(),
+            votes: voters.clone(),
+        };
+        assert!(cert.verify(&committee).is_ok(), "test cert must be valid");
+
+        let effects = engine.process_cut_certificate(cert, &tips, &oracle);
+
+        let fetches = find_fetches(&effects);
+        assert!(
+            fetches.iter().all(|(_, r, id)| *r == 1 && *id == round1_id),
+            "every fetch should name round 1's own cut_id: {fetches:?}"
+        );
+        let mut fetch_targets: Vec<PublicKey> = fetches.iter().map(|(p, _, _)| *p).collect();
+        fetch_targets.sort();
+        let mut expected = voters;
+        expected.sort();
+        assert_eq!(
+            fetch_targets, expected,
+            "the fetch should be addressed to exactly the certificate's voters"
+        );
+        assert_eq!(
+            engine.pending_cut_fetch.get(&(1, round1_id)),
+            Some(&engine.cut_round),
+            "the fetch should be latched for retry bookkeeping"
+        );
+    }
+
+    /// AUDIT FOLLOWUP (cut-proposal repair, additional coverage beyond the task's
+    /// required list -- see the report): the OTHER trigger -- a proposal citing a
+    /// parent this engine has never heard of AT ALL (no certificate either) still
+    /// gets buffered exactly as before, but now ALSO fans a fetch out to the full
+    /// committee, since there is no narrower evidence available for who holds it
+    /// (see `process_cut_proposal`'s own comment at this call site).
+    #[test]
+    fn buffered_child_with_unknown_parent_triggers_fetch_to_committee() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let round2_leader = agb::proposer(&committee, 3);
+        let mut engine = CutEngine::new(keys[0], committee.clone(), 1_000);
+
+        let unknown_parent = Digest([42; 32]);
+        let round2_cut = CutProposal {
+            round: 2,
+            proposer: round2_leader,
+            parent_cut: unknown_parent.clone(),
+            tips: tips.clone(),
+        };
+
+        let effects = engine.process_cut_proposal(round2_cut, &tips, &oracle);
+
+        assert!(
+            !engine.pending_cut_children.is_empty(),
+            "the proposal should still be buffered, exactly as before this fix"
+        );
+        let fetches = find_fetches(&effects);
+        assert!(
+            fetches
+                .iter()
+                .all(|(_, r, id)| *r == 1 && *id == unknown_parent),
+            "the fetch should name round 1 (the best-effort round - 1 guess) and the \
+             unknown parent digest: {fetches:?}"
+        );
+        let mut fetch_targets: Vec<PublicKey> = fetches.iter().map(|(p, _, _)| *p).collect();
+        fetch_targets.sort();
+        let mut expected: Vec<PublicKey> =
+            keys.iter().filter(|k| **k != keys[0]).copied().collect();
+        expected.sort();
+        assert_eq!(
+            fetch_targets, expected,
+            "with no narrower evidence, the fetch should go to every other committee member"
+        );
+    }
+
+    /// A served proposal that hash-matches an outstanding request unblocks a
+    /// buffered child: the parent is recorded, the buffered round-2 child is
+    /// reparented and voted, and (its Decide quorum already in, exactly as in the
+    /// stall scenario) round 2 now commits.
+    #[test]
+    fn served_proposal_matching_request_unblocks_reparents_and_commits() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let round1_leader = agb::proposer(&committee, 2);
+        let round2_leader = agb::proposer(&committee, 3);
+        let observer = *keys
+            .iter()
+            .find(|k| **k != round1_leader && **k != round2_leader)
+            .expect("n=4 has a non-leader");
+        let mut engine = CutEngine::new(observer, committee.clone(), 1_000);
+
+        let round1_cut = CutProposal {
+            round: 1,
+            proposer: round1_leader,
+            parent_cut: Digest::default(),
+            tips: tips.clone(),
+        };
+        let round1_id = round1_cut.id();
+        let round2_cut = CutProposal {
+            round: 2,
+            proposer: round2_leader,
+            parent_cut: round1_id.clone(),
+            tips: tips.clone(),
+        };
+        let round2_id = round2_cut.id();
+
+        // Seed the exact state the stall scenario reaches (see
+        // `missing_proposal_stalls_the_chain_rather_than_skipping_a_round`): round 2
+        // buffered pending round 1's still-unknown proposal, and an outstanding
+        // fetch for it (as `process_cut_certificate`'s own trigger would have set up
+        // -- seeded directly here to isolate `on_cut_serve`'s own accept/dispatch
+        // behavior, mirroring `queue_with_invalid_sibling_still_processes_valid_one`'s
+        // identical direct-seeding style).
+        engine
+            .pending_cut_children
+            .insert((2, round1_id.clone()), vec![round2_cut.clone()]);
+        engine
+            .pending_cut_fetch
+            .insert((1, round1_id.clone()), engine.cut_round());
+
+        // A full quorum of round-2 Decides, exactly as the stall scenario feeds --
+        // these land BEFORE the parent is ever known and (per that scenario) cannot
+        // commit yet, since `leader_cut_by_round[2]` isn't set until the proposal is
+        // recorded.
+        for author in keys.iter().copied() {
+            let effects = engine.process_decide(Decide {
+                id: round2_id.clone(),
+                round: 2,
+                origin: round2_leader,
+                author,
+            });
+            assert!(find_commits(&effects, 2).is_empty());
+        }
+        assert!(engine.decides_by_round.contains_key(&2));
+
+        // The serve arrives.
+        let effects = engine.on_cut_serve(round1_cut, &tips, &oracle);
+
+        assert_eq!(
+            engine.cut_round_by_id.get(&round1_id),
+            Some(&1),
+            "the served proposal should have been recorded"
+        );
+        assert!(
+            !engine
+                .pending_cut_children
+                .contains_key(&(2, round1_id.clone())),
+            "the buffered round-2 child should have been reparented"
+        );
+        assert!(
+            find_vote_for_round(&effects, 2).is_some(),
+            "the reparented round-2 proposal should have been voted on"
+        );
+        assert_eq!(
+            find_commits(&effects, 2),
+            vec![(2, tips.clone())],
+            "round 2's already-quorate Decide should now commit"
+        );
+        assert!(
+            !engine.pending_cut_fetch.contains_key(&(1, round1_id)),
+            "the satisfied fetch should be cleared"
+        );
+    }
+
+    /// A served proposal that does NOT hash-match any outstanding request is
+    /// rejected and changes no engine state -- including when a DIFFERENT pending
+    /// fetch happens to share the same digest but a different round (`CutProposal::
+    /// id()` hashes `round` too, so `(2, cut_id)` and `(1, cut_id)` are distinct
+    /// pairs).
+    #[test]
+    fn served_proposal_not_matching_any_request_is_rejected() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let leader = agb::proposer(&committee, 2);
+        let mut engine = CutEngine::new(keys[0], committee, 1_000);
+
+        let proposal = CutProposal {
+            round: 1,
+            proposer: leader,
+            parent_cut: Digest::default(),
+            tips: tips.clone(),
+        };
+        let cut_id = proposal.id();
+
+        // An outstanding request exists, but for a DIFFERENT round.
+        engine.pending_cut_fetch.insert((2, cut_id.clone()), 1);
+
+        let effects = engine.on_cut_serve(proposal, &tips, &oracle);
+
+        assert!(
+            effects.is_empty(),
+            "a serve matching no requested pair must produce no effects"
+        );
+        assert!(
+            !engine.cut_round_by_id.contains_key(&cut_id),
+            "an unmatched serve must not be recorded"
+        );
+        assert!(engine.cut_proposals.is_empty());
+        assert!(
+            engine.pending_cut_fetch.contains_key(&(2, cut_id)),
+            "the unrelated pending entry must be untouched"
+        );
+    }
+
+    /// `on_cut_fetch` answers when the proposal is held, answers a given requester
+    /// only once for the same pair, and answers nothing once the round has been
+    /// pruned below the GC floor.
+    #[test]
+    fn on_cut_fetch_answers_when_held_once_per_requester_and_respects_gc_floor() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let leader = agb::proposer(&committee, 2);
+        let mut engine = CutEngine::new(keys[0], committee, 1_000);
+
+        let proposal = CutProposal {
+            round: 3,
+            proposer: leader,
+            parent_cut: Digest::default(),
+            tips: tips.clone(),
+        };
+        let cut_id = proposal.id();
+        engine.record_cut_proposal(proposal); // held directly -- isolates on_cut_fetch
+
+        let requester = keys[1];
+        let effects = engine.on_cut_fetch(requester, 3, cut_id.clone());
+        match effects.as_slice() {
+            [CutEffect::ServeTo {
+                peer,
+                proposal: served,
+            }] => {
+                assert_eq!(*peer, requester);
+                assert_eq!(served.id(), cut_id);
+            }
+            other => panic!("expected exactly one ServeTo effect, got {other:?}"),
+        }
+
+        // Same requester, same pair -- already answered, no repeat.
+        let effects = engine.on_cut_fetch(requester, 3, cut_id.clone());
+        assert!(
+            effects.is_empty(),
+            "the same requester must not be answered twice"
+        );
+
+        // A DIFFERENT requester for the same pair is still owed its own answer.
+        let other_requester = keys[2];
+        let effects = engine.on_cut_fetch(other_requester, 3, cut_id.clone());
+        assert_eq!(
+            effects.len(),
+            1,
+            "a different requester gets its own answer"
+        );
+
+        // Below the GC floor: nothing, even for a still-fresh requester.
+        engine.prune_below(4);
+        let fresh_requester = keys[3];
+        let effects = engine.on_cut_fetch(fresh_requester, 3, cut_id);
+        assert!(
+            effects.is_empty(),
+            "a round pruned below the GC floor must not be served"
+        );
+    }
+
+    /// Retry backoff: `ensure_cut_fetch` does not re-emit a fetch for the same
+    /// `(round, cut_id)` pair before `FETCH_RETRY_ROUNDS` cut rounds have elapsed
+    /// since the last fan-out, and does re-emit once they have.
+    #[test]
+    fn cut_fetch_retry_backoff_holds_until_the_window_elapses() {
+        let (committee, keys) = committee_of(4);
+        let mut engine = CutEngine::new(keys[0], committee, 1_000);
+        let cut_id = Digest([7; 32]);
+        let targets = vec![keys[1], keys[2]];
+
+        let first = engine.ensure_cut_fetch(1, &cut_id, targets.clone());
+        assert_eq!(first.len(), 2, "the first call fans out to every target");
+
+        // Immediately retried (still within FETCH_RETRY_ROUNDS of cut_round==1):
+        // no-op.
+        let again = engine.ensure_cut_fetch(1, &cut_id, targets.clone());
+        assert!(again.is_empty(), "retried too soon -- must not re-fan");
+
+        // Advance the engine's own retry clock short of the threshold: still no-op.
+        engine.cut_round = 1 + CutEngine::FETCH_RETRY_ROUNDS - 1;
+        let still_too_soon = engine.ensure_cut_fetch(1, &cut_id, targets.clone());
+        assert!(
+            still_too_soon.is_empty(),
+            "one round short of the window -- still no-op"
+        );
+
+        // Advance to exactly the threshold: re-fans.
+        engine.cut_round = 1 + CutEngine::FETCH_RETRY_ROUNDS;
+        let retried = engine.ensure_cut_fetch(1, &cut_id, targets);
+        assert_eq!(retried.len(), 2, "past the retry window -- fans out again");
     }
 
     /// Test 2: timeout path -- leader silent, timer fires, `Timeout` reaches quorum,
@@ -1525,6 +2085,10 @@ mod tests {
             set.insert(1);
             set.insert(2);
         }
+        engine.pending_cut_fetch.insert((1, d1.clone()), 1);
+        engine.pending_cut_fetch.insert((2, d2.clone()), 2);
+        engine.fetch_answered.insert((1, d1.clone(), key(1)));
+        engine.fetch_answered.insert((2, d2.clone(), key(1)));
 
         engine.prune_below(2);
 
@@ -1547,6 +2111,10 @@ mod tests {
         assert!(engine.leader_cut_by_round.contains_key(&2));
         assert!(!engine.cut_certificates.contains_key(&1));
         assert!(engine.cut_certificates.contains_key(&2));
+        assert!(!engine.pending_cut_fetch.contains_key(&(1, d1.clone())));
+        assert!(engine.pending_cut_fetch.contains_key(&(2, d2.clone())));
+        assert!(!engine.fetch_answered.contains(&(1, d1.clone(), key(1))));
+        assert!(engine.fetch_answered.contains(&(2, d2.clone(), key(1))));
         assert!(!engine.decide_aggregators.contains_key(&(1, d1)));
         assert!(engine.decide_aggregators.contains_key(&(2, d2)));
         assert!(!engine.decides_by_round.contains_key(&1));
