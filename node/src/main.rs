@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
                         .action(ArgAction::Set)
                         .help(
                             "Vantage AGB base delay unit Δ, ms \
-                        (theta_E=5Δ, theta_R=6Δ, control-round=6Δ derive from this \
+                        (theta_E=3Δ, theta_R=4Δ, control-round=6Δ derive from this \
                         automatically; irrelevant to the two Autobahn paths)",
                         ),
                 )
