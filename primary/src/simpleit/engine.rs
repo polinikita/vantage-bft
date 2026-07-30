@@ -1114,6 +1114,58 @@ mod tests {
         happy_path_commit(10);
     }
 
+    /// REGRESSION (audit fix, see `aggregators::mint_threshold`): a `CutCertificate` is
+    /// minted at `max(optimistic_threshold, quorum_threshold)` and verified at
+    /// `quorum_threshold`, so a freshly minted certificate always passes its own
+    /// `verify`. Before the clamp, `optimistic_threshold` alone was strictly smaller for
+    /// f <= 2 (n = 4, 5, 6, 8, 9, 12 -- and n=4 is `fab remote`'s default), so the
+    /// minting party rejected the certificate it had just built, no party ever sent a
+    /// `Decide`, and the round could never commit.
+    #[test]
+    fn minted_certificate_passes_its_own_verify_at_small_committees() {
+        for n in [4u8, 5, 6, 8, 9] {
+            let (committee, keys) = committee_of(n);
+            let tips = sample_tips(&keys);
+            let oracle = AllAvailable;
+            let leader = agb::proposer(&committee, 2);
+            let mut engine = CutEngine::new(leader, committee.clone(), 1_000);
+
+            let mut effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
+            let cut_id = find_proposal(&effects).expect("leader proposes").id();
+
+            let mut others = keys.iter().filter(|k| **k != leader);
+            let mut minted: Option<CutCertificate> = None;
+            while minted.is_none() {
+                let author = *others.next().expect("committee large enough");
+                effects = engine.process_cut_vote(
+                    CutVote {
+                        round: 1,
+                        cut_id: cut_id.clone(),
+                        author,
+                    },
+                    &tips,
+                    &oracle,
+                );
+                minted = effects.iter().find_map(|e| match e {
+                    CutEffect::Broadcast(CutOut::CutCertificate(c)) => Some(c.clone()),
+                    _ => None,
+                });
+            }
+
+            let cert = minted.expect("a certificate was broadcast");
+            assert!(
+                cert.verify(&committee).is_ok(),
+                "n={n}: certificate with {} votes failed its own verify (needs {})",
+                cert.votes.len(),
+                committee.quorum_threshold()
+            );
+            assert!(
+                engine.sent_decide_rounds.contains(&1),
+                "n={n}: the accepted certificate should have produced a Decide"
+            );
+        }
+    }
+
     /// Test 2: timeout path -- leader silent, timer fires, `Timeout` reaches quorum,
     /// `TimeoutAccept` amplifies at f+1 and certifies at quorum, the round is marked
     /// timed-out, `cut_round` advances, and a pending child whose parent was skipped is

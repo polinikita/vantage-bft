@@ -41,8 +41,10 @@ use std::collections::HashSet;
 /// Aggregates cut votes for one proposed cut into a `CutCertificate`. Upstream
 /// primary/src/aggregators.rs:56-60 (struct), 170-198 (impl).
 ///
-/// Threshold: `optimistic_threshold` (see the free function below, not a `Committee`
-/// method in this repo). At n=3f+1 this is `ceil((n+2f-2)/2)`: 7 at n=10, 40 at n=50.
+/// Threshold: `mint_threshold` -- `max(optimistic_threshold, quorum_threshold)`. See
+/// that function for why the clamp is required for correctness at small committee
+/// sizes. At n=3f+1 the optimistic term dominates from f >= 3 onwards: 7 at n=10,
+/// 40 at n=50.
 pub struct CutVoteAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
@@ -73,7 +75,7 @@ impl CutVoteAggregator {
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
         self.voters.push(author);
         self.weight += committee.stake(&author);
-        if self.weight >= optimistic_threshold(committee) {
+        if self.weight >= mint_threshold(committee) {
             self.weight = 0;
             return Ok(Some(CutCertificate {
                 round: vote.round,
@@ -83,6 +85,27 @@ impl CutVoteAggregator {
         }
         Ok(None)
     }
+}
+
+/// The threshold at which `CutVoteAggregator` mints a `CutCertificate`:
+/// `max(optimistic_threshold, quorum_threshold)`.
+///
+/// AUDIT FIX. Upstream mints at `optimistic_threshold` alone, but
+/// `CutCertificate::verify` (both upstream's and ours) requires `quorum_threshold`.
+/// Since `optimistic_threshold = ceil((5f-1)/2)` and `quorum_threshold = 2f+1` at
+/// n=3f+1, the former is STRICTLY SMALLER for f <= 2 -- it only overtakes from f >= 3
+/// (`ceil((5f-1)/2) >= 2f+1 <=> f >= 3`). At those sizes the minting party rejects the
+/// certificate it just built, so `sent_decide_rounds` is never set, no party ever sends
+/// a `Decide`, and the round can never commit. Concretely broken (mint < verify) at
+/// n = 4, 5, 6, 8, 9, 12 -- and n=4 is `fab remote`'s default committee size. Upstream
+/// only ever benchmarked n=10 and n=50, where the optimistic term already dominates.
+///
+/// Clamping to `quorum_threshold` is the minimal sound fix: a notarization carrying
+/// fewer than 2f+1 voters is not a quorum and could not be safely acted on anyway. It
+/// is provably a no-op at every size we benchmark -- n=10 (max(7,7) = 7) and n=50
+/// (max(40,34) = 40) -- so it cannot move any measured number.
+fn mint_threshold(committee: &Committee) -> Stake {
+    optimistic_threshold(committee).max(committee.quorum_threshold())
 }
 
 /// `optimistic_threshold` = ceil((n + 2f - 2) / 2), where n is total stake and f is
