@@ -1166,6 +1166,96 @@ mod tests {
         }
     }
 
+    /// AUDIT: what actually happens to a party that receives round r's CERTIFICATE but
+    /// never its PROPOSAL. Establishes whether the failure mode is a divergent commit
+    /// order (unsafe) or a stall (a liveness gap).
+    #[test]
+    fn missing_proposal_stalls_the_chain_rather_than_skipping_a_round() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let round1_leader = agb::proposer(&committee, 2);
+        let round2_leader = agb::proposer(&committee, 3);
+        // An observer that leads neither round, so it only ever *receives*.
+        let observer = *keys
+            .iter()
+            .find(|k| **k != round1_leader && **k != round2_leader)
+            .expect("n=4 has a non-leader");
+        let mut engine = CutEngine::new(observer, committee.clone(), 1_000);
+
+        // Round 1's cut, as some other party would have built it. This engine never
+        // sees the proposal itself -- only the certificate naming its id.
+        let round1_cut = CutProposal {
+            round: 1,
+            proposer: round1_leader,
+            parent_cut: Digest::default(),
+            tips: tips.clone(),
+        };
+        let round1_id = round1_cut.id();
+        let voters: Vec<PublicKey> = keys
+            .iter()
+            .take(committee.quorum_threshold() as usize)
+            .copied()
+            .collect();
+        let cert = CutCertificate {
+            round: 1,
+            cut_id: round1_id.clone(),
+            votes: voters,
+        };
+        assert!(cert.verify(&committee).is_ok(), "test cert must be valid");
+        let effects = engine.process_cut_certificate(cert, &tips, &oracle);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, CutEffect::Broadcast(CutOut::Decide(d)) if d.round == 1)),
+            "the certificate is accepted and produces a Decide for round 1"
+        );
+
+        // Round 2's proposal chains onto round 1's cut, whose digest this engine has
+        // never recorded (`record_cut_proposal` is the only writer of cut_round_by_id).
+        let round2 = CutProposal {
+            round: 2,
+            proposer: round2_leader,
+            parent_cut: round1_id,
+            tips: tips.clone(),
+        };
+        let effects = engine.process_cut_proposal(round2, &tips, &oracle);
+        assert!(
+            effects.is_empty(),
+            "round 2 cannot be recorded or voted: its parent is unknown here"
+        );
+        assert!(
+            !engine.pending_cut_children.is_empty(),
+            "round 2 is buffered pending round 1's proposal"
+        );
+
+        // Even a full quorum of Decides for round 2 cannot commit it, because
+        // try_commit_round requires leader_cut_by_round[2], set only when the proposal
+        // is recorded. So the chain STALLS -- it never emits round 2 ahead of round 1.
+        for author in keys.iter().copied() {
+            let effects = engine.process_decide(Decide {
+                id: round2_leader_cut_id(&tips, round2_leader),
+                round: 2,
+                origin: round2_leader,
+                author,
+            });
+            assert!(
+                find_commits(&effects, 2).is_empty(),
+                "round 2 must never commit while round 1's proposal is missing"
+            );
+        }
+    }
+
+    fn round2_leader_cut_id(tips: &Cut, leader: PublicKey) -> Digest {
+        CutProposal {
+            round: 2,
+            proposer: leader,
+            parent_cut: Digest::default(),
+            tips: tips.clone(),
+        }
+        .id()
+    }
+
     /// Test 2: timeout path -- leader silent, timer fires, `Timeout` reaches quorum,
     /// `TimeoutAccept` amplifies at f+1 and certifies at quorum, the round is marked
     /// timed-out, `cut_round` advances, and a pending child whose parent was skipped is
