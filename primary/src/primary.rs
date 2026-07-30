@@ -132,6 +132,14 @@ pub enum PrimaryMessage {
         /* requester */ PublicKey,
     ),
     SimpleItCutServe(crate::simpleit::CutProposal),
+    // Optional, flag-gated periodic per-lane availability watermark
+    // (`Parameters::ack_watermarks`) -- replaces per-block acks with one compact
+    // broadcast per period naming, for each author this party holds, the greatest
+    // DirectPub (height, head digest) pair (lanes are hash chains, so this one pair
+    // covers the whole verified prefix through that height). Shared by both Vantage
+    // and Simple-IT (same `LaneManager`/`AckAggregator` data plane). Appended last --
+    // same bincode wire-compat rule as every other protocol-specific variant above.
+    VantageAvail(Vec<crate::vantage::AvailEntry>, /* sender */ PublicKey),
 }
 
 impl PrimaryMessage {
@@ -176,6 +184,7 @@ impl PrimaryMessage {
             PrimaryMessage::SimpleItTimeoutAccept(..) => "SimpleItTimeoutAccept",
             PrimaryMessage::SimpleItCutFetch(..) => "SimpleItCutFetch",
             PrimaryMessage::SimpleItCutServe(..) => "SimpleItCutServe",
+            PrimaryMessage::VantageAvail(..) => "VantageAvail",
         }
     }
 }

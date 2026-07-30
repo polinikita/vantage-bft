@@ -6,7 +6,7 @@
 // PHASE4-NOTES.md/PHASE5-SPEC.md §4).
 
 use super::common::*;
-use super::harness::{boot, drain_local, run_to_quiescence, Node};
+use super::harness::{avail_tick, boot, drain_local, run_to_quiescence, Node};
 use crate::vantage::node::Inbound;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
@@ -87,4 +87,78 @@ async fn four_party_happy_path_three_consecutive_views_identical_output() {
         fast_full,
         direct_full
     );
+}
+
+/// Ack-watermarks (optional, flag-gated -- `Parameters::ack_watermarks`) end-to-end:
+/// the identical four-party happy path, but with per-block ack broadcasts suppressed
+/// and replaced by a periodic watermark flush (`harness::avail_tick`, the test-only
+/// substitute for `VantageCore::run`'s production tick). Committed output must still
+/// be byte-identical across all four parties -- the watermark front-end and the
+/// per-block-ack front-end are indistinguishable below the shared `AckAggregator`.
+#[tokio::test]
+async fn four_party_happy_path_identical_output_with_ack_watermarks() {
+    let all = authors();
+    let mut nodes: Vec<Node> = all
+        .iter()
+        .enumerate()
+        .map(|(i, (pk, _))| {
+            Node::new(
+                *pk,
+                &format!(".db_test_integration_node_avail_{}", i),
+                MAX_VIEWS,
+            )
+            .with_ack_watermarks(true)
+        })
+        .collect();
+    let now = Instant::now();
+    let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
+
+    // Seed round, exactly as the plain happy-path test -- but with `ack_watermarks`
+    // on, `drain_local`'s `Effect::BroadcastAck` fan-out is suppressed, so every
+    // node's own DirectPub-derived acks never reach its peers via a direct `Ack`
+    // message. `avail_tick` substitutes the periodic watermark broadcast a real
+    // `VantageCore::run` would schedule, letting every node's own N5 registers reach
+    // the same quorum-acked state as the plain test.
+    for i in 0..nodes.len() {
+        let (_, effects) = nodes[i].lm.publish_own(BTreeMap::new()).await;
+        drain_local(&mut nodes, i, effects, now, &mut outbox);
+    }
+    run_to_quiescence(&mut nodes, &mut outbox, now).await;
+    avail_tick(&mut nodes, now, &mut outbox).await;
+
+    boot(&mut nodes, now, &mut outbox).await;
+
+    for (i, node) in nodes.iter().enumerate() {
+        assert!(
+            node.cursor.next_view() >= 4,
+            "node {} only reached view {}",
+            i,
+            node.cursor.next_view()
+        );
+    }
+
+    let reference = nodes[0].cursor.output_log().to_vec();
+    for (i, node) in nodes.iter().enumerate().skip(1) {
+        assert_eq!(
+            node.cursor.output_log(),
+            reference.as_slice(),
+            "node {} output log diverged from node 0",
+            i
+        );
+    }
+    assert!(!reference.is_empty());
+
+    // Availability actually flowed through the watermark front-end, not just
+    // silently through some other path (e.g. repair) -- every seeded height-1 ref
+    // must have reached 2f+1 (quorum) via `resolve_watermark`'s crediting.
+    let quorum = test_committee().quorum_threshold();
+    for (author, _) in &all {
+        let refs = nodes[0].lm.blocks_handle().lock().unwrap().author_refs(author);
+        assert_eq!(refs.len(), 1, "exactly one seeded block per author");
+        assert!(
+            nodes[0].lm.is_q_available(&refs[0], quorum),
+            "author {:?}'s seeded block must be quorum-available via the watermark front-end",
+            author
+        );
+    }
 }

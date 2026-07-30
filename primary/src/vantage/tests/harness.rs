@@ -71,6 +71,13 @@ pub struct Node {
     /// `vantage::node::VantageCore::spawn`'s own `with_metrics` wiring) so tests can
     /// assert on `vantage_seals`'s per-route breakdown, same as production.
     pub metrics: Arc<Metrics>,
+    /// Mirrors `VantageCore::ack_watermarks` exactly: `false` (the default, via
+    /// `Node::new`) leaves `drain_local`'s `Effect::BroadcastAck` fan-out byte-
+    /// identical to before this field existed. `true` (opt in via
+    /// `with_ack_watermarks`) suppresses that fan-out -- a test must then drive
+    /// `avail_tick` itself to substitute the periodic watermark broadcast a real
+    /// `VantageCore::run` would schedule.
+    pub ack_watermarks: bool,
 }
 
 impl Node {
@@ -121,7 +128,16 @@ impl Node {
             wish_partitioned: false,
             held_wishes: Vec::new(),
             metrics,
+            ack_watermarks: false,
         }
+    }
+
+    /// Opt this node into the ack-watermark front-end (`Parameters::ack_watermarks`)
+    /// -- see the field's own doc comment. Test-only builder; production wiring
+    /// (`vantage::node::VantageCore::build`) reads the flag from `Parameters` instead.
+    pub fn with_ack_watermarks(mut self, on: bool) -> Self {
+        self.ack_watermarks = on;
+        self
     }
 
     pub fn try_propose_effects(&mut self, now: Instant) -> Vec<Effect> {
@@ -219,6 +235,14 @@ impl Node {
             }
             Inbound::AckAvailability(availability) => self.on_ack_availability(availability, now),
             Inbound::Ack(ack) => self.record_ack(ack.sender, ack.reference(), now),
+            Inbound::Avail(entries, sender) => {
+                let refs = self.lm.resolve_watermark(sender, &entries);
+                let mut effects = Vec::new();
+                for r in refs {
+                    effects.extend(self.record_ack(sender, r, now));
+                }
+                effects
+            }
             Inbound::Propose(proposal) => {
                 let sender = self.agb.proposer(proposal.view);
                 self.agb
@@ -372,13 +396,20 @@ pub fn drain_local(
                 }
             }
             Effect::BroadcastAck(ack) => {
+                // Self-ack path always runs; the fan-out to other nodes is suppressed
+                // when `ack_watermarks` is on, mirroring `VantageCore::execute`'s
+                // identical gating -- a test that turns this on must drive `avail_tick`
+                // itself to substitute the periodic watermark broadcast.
+                let ack_watermarks = nodes[idx].ack_watermarks;
                 {
                     let node = &mut nodes[idx];
                     queue.extend(node.record_ack(node.name, ack.reference(), now));
                 }
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::Ack(ack.clone())));
+                if !ack_watermarks {
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::Ack(ack.clone())));
+                        }
                     }
                 }
             }
@@ -400,6 +431,12 @@ pub fn drain_local(
             }
             Effect::BlockCached(digest) => {
                 let node = &mut nodes[idx];
+                // Ack-watermark front-end: retry any watermark pending on this
+                // author, before `on_block_available` consumes `digest` by value.
+                let retried = node.lm.retry_pending_avail(&digest);
+                for (sender, r) in retried {
+                    queue.extend(node.record_ack(sender, r, now));
+                }
                 queue.extend(node.rep.on_block_available(digest));
                 queue.extend(node.agb.recheck_all(now, &mut node.lm, &mut node.rep));
                 queue.extend(node.cursor.retry());
@@ -602,6 +639,30 @@ pub async fn run_to_quiescence(
         let effects = nodes[idx].dispatch(inbound, now).await;
         drain_local(nodes, idx, effects, now, outbox);
     }
+}
+
+/// Test-only substitute for `VantageCore::run`'s periodic ack-watermark tick: for
+/// every live node with `ack_watermarks` on, flushes `LaneManager::take_avail_flush`
+/// (if dirty) and fans the result out to every other live node as `Inbound::Avail`,
+/// then drains to quiescence -- mirrors the production tick's own broadcast + the
+/// receiving cores' immediate resolution. A no-op for a node with `ack_watermarks`
+/// off (byte-identical to never calling this at all).
+pub async fn avail_tick(nodes: &mut [Node], now: Instant, outbox: &mut VecDeque<(usize, Inbound)>) {
+    let n = nodes.len();
+    for idx in 0..n {
+        if !nodes[idx].alive || !nodes[idx].ack_watermarks {
+            continue;
+        }
+        if let Some(entries) = nodes[idx].lm.take_avail_flush() {
+            let sender = nodes[idx].name;
+            for j in 0..n {
+                if j != idx && nodes[j].alive {
+                    outbox.push_back((j, Inbound::Avail(entries.clone(), sender)));
+                }
+            }
+        }
+    }
+    run_to_quiescence(nodes, outbox, now).await;
 }
 
 /// Genesis bootstrap (§4/W1) for every live node: enter view 1, then the WISH

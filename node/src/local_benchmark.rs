@@ -106,6 +106,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--batch-max-delay-ms must be a non-negative integer")?;
+    let ack_watermark_period_ms: u64 = matches
+        .get_one::<String>("ack-watermark-period-ms")
+        .unwrap()
+        .parse()
+        .context("--ack-watermark-period-ms must be a non-negative integer")?;
     // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default.
     let timeline: bool = matches.get_flag("timeline");
     // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `--latency-table <csv>` (an n x n
@@ -199,6 +204,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             "Authenticated channels: ON (symmetric pairwise MAC, fresh in-process master secret)"
         );
     }
+    if matches.get_flag("ack-watermarks") {
+        println!(
+            "Ack watermarks: ON (periodic per-lane availability broadcast every {} ms, replaces per-block acks)",
+            ack_watermark_period_ms
+        );
+    }
     if crash > 0 {
         println!(
             "Crash fault: {} of {} nodes never spawned (committee unchanged; live = {})",
@@ -255,6 +266,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         mac_secret: matches
             .get_flag("authenticate-channels")
             .then(MacSecret::generate),
+        ack_watermarks: matches.get_flag("ack-watermarks"),
+        ack_watermark_period_ms,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
@@ -479,7 +492,7 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
     match protocol {
         Protocol::Vantage => match msg_type {
             "Header" | "Batch" => "dissemination",
-            "VantageAck" => "acks",
+            "VantageAck" | "VantageAvail" => "acks",
             "VantagePropose" | "VantageEcho" | "VantageEchoSkip" | "VantageReady"
             | "VantageNoReady" => "agb",
             "VantageWish" => "pacemaker",
@@ -508,7 +521,7 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
         // the other's message vocabulary as a valid `msg_type`.
         Protocol::SimpleIt => match msg_type {
             "Header" | "Batch" => "dissemination",
-            "VantageAck" => "acks",
+            "VantageAck" | "VantageAvail" => "acks",
             "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
             "SimpleItCutProposal"
             | "SimpleItCutVote"

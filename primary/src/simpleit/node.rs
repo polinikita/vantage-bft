@@ -19,7 +19,8 @@ use crate::simpleit::engine::{self, CutEngine, TipOracle};
 use crate::simpleit::messages::{Cut, CutRound};
 use crate::vantage::block;
 use crate::vantage::lanes::{
-    AckAggregator, AckAvailability, BlockCache, LaneManager, SharedAckAggregator, SharedBlocks,
+    AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager, SharedAckAggregator,
+    SharedBlocks,
 };
 use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
@@ -100,6 +101,9 @@ pub enum Inbound {
     /// Production network ACKs are accumulated by `AckAggregator` before reaching the
     /// core -- see `SimpleItReceiverHandler::dispatch`.
     AckAvailability(AckAvailability),
+    /// Optional ack-watermark front-end (`Parameters::ack_watermarks`), mirroring
+    /// `vantage::node::Inbound::Avail` exactly -- see `LaneManager::resolve_watermark`.
+    Avail(Vec<AvailEntry>, PublicKey),
     /// The five wire-received cut-consensus messages, forwarded to `CutEngine::handle`
     /// verbatim.
     Cut(engine::Inbound),
@@ -111,6 +115,7 @@ impl DeclaredSender for Inbound {
             Inbound::Publish(sender, _) => Some(*sender),
             Inbound::HeadersRequest(_, requestor) => Some(*requestor),
             Inbound::Serve(_) | Inbound::AckAvailability(_) => None,
+            Inbound::Avail(_, s) => Some(*s),
             Inbound::Cut(cut_inbound) => cut_inbound.declared_sender(),
         }
     }
@@ -134,6 +139,7 @@ fn mac_candidate_sender(message: &PrimaryMessage) -> Option<PublicKey> {
         PrimaryMessage::Header(_, true) => None,
         PrimaryMessage::HeadersRequest(_, requestor) => Some(*requestor),
         PrimaryMessage::VantageAck(a) => Some(a.sender),
+        PrimaryMessage::VantageAvail(_, sender) => Some(*sender),
         PrimaryMessage::SimpleItCutProposal(p) => Some(p.proposer),
         PrimaryMessage::SimpleItCutVote(v) => Some(v.author),
         PrimaryMessage::SimpleItDecide(d) => Some(d.author),
@@ -234,6 +240,7 @@ impl MessageHandler for SimpleItReceiverHandler {
                 };
                 Inbound::AckAvailability(availability)
             }
+            PrimaryMessage::VantageAvail(entries, sender) => Inbound::Avail(entries, sender),
             PrimaryMessage::SimpleItCutProposal(p) => Inbound::Cut(engine::Inbound::CutProposal(p)),
             PrimaryMessage::SimpleItCutVote(v) => Inbound::Cut(engine::Inbound::CutVote(v)),
             PrimaryMessage::SimpleItDecide(d) => Inbound::Cut(engine::Inbound::Decide(d)),
@@ -331,6 +338,16 @@ pub struct SimpleItCore {
     max_header_delay: u64,
     digests: Vec<(Digest, WorkerId)>,
     payload_size: usize,
+
+    /// `Parameters::ack_watermarks` -- mirrors `vantage::node::VantageCore`'s
+    /// identical field exactly: when `true`, the N3 per-block ack broadcast is
+    /// suppressed at EXECUTION time (`execute`'s `Effect::BroadcastAck` arm), while
+    /// the local self-ack path (`record_local_ack`) still runs unconditionally either
+    /// way. `LaneManager` itself never sees this flag.
+    ack_watermarks: bool,
+    /// The ack-watermark broadcast period, ms -- irrelevant when `ack_watermarks` is
+    /// off.
+    ack_watermark_period_ms: u64,
 
     /// Session id / genesis digest, computed once at `build` time (mirrors
     /// `VantageCore::build`'s identical locals) -- kept as fields because
@@ -531,6 +548,8 @@ impl SimpleItCore {
             max_header_delay: parameters.max_header_delay,
             digests: Vec::new(),
             payload_size: 0,
+            ack_watermarks: parameters.ack_watermarks,
+            ack_watermark_period_ms: parameters.ack_watermark_period_ms,
             sid,
             genesis,
             max_block_payload: parameters.max_block_payload,
@@ -586,6 +605,18 @@ impl SimpleItCore {
         let mut prune_tick = tokio::time::interval(Duration::from_secs(1));
         prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Optional ack-watermark front-end (`Parameters::ack_watermarks`): mirrors
+        // `VantageCore::run`'s identical construction -- constructed ONLY when the
+        // flag is on, so no tick is ever scheduled when it's off.
+        let mut avail_tick = if self.ack_watermarks {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(self.ack_watermark_period_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            Some(interval)
+        } else {
+            None
+        };
+
         loop {
             self.wire.maybe_prune_cancel_handlers();
 
@@ -626,6 +657,22 @@ impl SimpleItCore {
                         self.cut.handle(engine::Inbound::TimerFired(round), &tips, &oracle)
                     };
                     self.execute_cut(effects).await;
+                }
+
+                () = async {
+                    match avail_tick.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if avail_tick.is_some() => {
+                    if let Some(entries) = self.lm.take_avail_flush() {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_avail_sent.inc();
+                        }
+                        self.wire
+                            .broadcast_message(PrimaryMessage::VantageAvail(entries, self.name))
+                            .await;
+                    }
                 }
 
                 _ = prune_tick.tick() => {
@@ -691,6 +738,14 @@ impl SimpleItCore {
                 let effects = self.on_ack_availability(availability);
                 self.execute(effects).await;
             }
+            Inbound::Avail(entries, sender) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_avail_received.inc();
+                }
+                let refs = self.lm.resolve_watermark(sender, &entries);
+                let effects = self.credit_refs(sender, refs);
+                self.execute(effects).await;
+            }
             Inbound::Cut(cut_inbound) => {
                 let effects = {
                     let tips = self.build_cut();
@@ -721,6 +776,37 @@ impl SimpleItCore {
             .unwrap_or_default()
     }
 
+    /// Feeds `refs` (from `LaneManager::resolve_watermark`/`retry_pending_avail`)
+    /// through the SAME shared `AckAggregator` the per-block ack path uses, and the
+    /// SAME `on_ack_availability` path -- mirrors `vantage::node::VantageCore::
+    /// credit_refs` exactly (this is the load-bearing property of the whole design:
+    /// the watermark front-end and the per-block-ack front-end are indistinguishable
+    /// below the aggregator). `sender` is already known to be a committee member
+    /// (`dispatch_inbound`'s centralized gate ran before `Inbound::Avail` is ever
+    /// reached).
+    fn credit_refs(&mut self, sender: PublicKey, refs: Vec<BlockRef>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for r in refs {
+            let result = {
+                let mut aggregator = self.ack_aggregator.lock().unwrap();
+                aggregator.record_ack(sender, r)
+            };
+            if !result.accepted {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_rejected_nonmember_total.inc();
+                }
+                continue;
+            }
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_avail_credited_refs.inc();
+            }
+            if let Some(availability) = result.availability {
+                effects.extend(self.on_ack_availability(availability));
+            }
+        }
+        effects
+    }
+
     /// Drains `initial` (and every effect transitively produced while draining it)
     /// against real I/O -- mirrors `VantageCore::execute`'s identical `VecDeque`-based
     /// loop, restricted to the six `Effect` variants `lm`/`rep` can actually produce.
@@ -743,10 +829,15 @@ impl SimpleItCore {
                         .await
                 }
                 Effect::BroadcastAck(ack) => {
+                    // Self-ack path always runs; only the wire broadcast is
+                    // suppressed when the watermark front-end replaces it -- mirrors
+                    // `vantage::node::VantageCore::execute`'s identical gating.
                     queue.extend(self.record_local_ack(&ack));
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageAck(ack))
-                        .await
+                    if !self.ack_watermarks {
+                        self.wire
+                            .broadcast_message(PrimaryMessage::VantageAck(ack))
+                            .await
+                    }
                 }
                 Effect::SyncBatches(author, header_digest, missing) => {
                     self.payload
@@ -767,6 +858,14 @@ impl SimpleItCore {
                         .await
                 }
                 Effect::BlockCached(digest) => {
+                    // Ack-watermark front-end: retry any watermark pending on this
+                    // author before `on_block_available` consumes `digest` by value.
+                    // Extends the SAME queue this loop is draining (not a recursive
+                    // `self.execute` call -- this arm already runs inside `execute`'s
+                    // own drain loop).
+                    for (sender, r) in self.lm.retry_pending_avail(&digest) {
+                        queue.extend(self.credit_refs(sender, vec![r]));
+                    }
                     queue.extend(self.rep.on_block_available(digest));
                     // Re-attempt the commit-materialisation queue: a newly-cached
                     // block (direct publish or repaired serve) is exactly the event

@@ -26,7 +26,7 @@ pub use agb::{
 pub use block::BlockRef;
 pub use cursor::Cursor;
 pub use frontier::Frontier;
-pub use lanes::{BlockCache, BlockEntry, LaneManager, SharedBlocks};
+pub use lanes::{AvailEntry, BlockCache, BlockEntry, LaneManager, SharedBlocks};
 pub use node::VantageCore;
 pub use pacemaker::Pacemaker;
 pub use repair::Repairer;

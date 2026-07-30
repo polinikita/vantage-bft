@@ -7,12 +7,13 @@
 use crate::messages::{Ack, Header};
 use crate::primary::{PrimaryMessage, View, CHANNEL_CAPACITY};
 use crate::vantage::agb::{AgbEngine, Echo, Ready, TimerKind, ViewProposal};
-use crate::vantage::block;
+use crate::vantage::block::{self, BlockRef};
 use crate::vantage::control::{ControlLog, ControlProposal, Round};
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
 use crate::vantage::lanes::{
-    AckAggregator, AckAvailability, BlockCache, LaneManager, SharedAckAggregator, SharedBlocks,
+    AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager, SharedAckAggregator,
+    SharedBlocks,
 };
 use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::payload::PayloadIo;
@@ -61,6 +62,10 @@ pub enum Inbound {
     /// Test/direct-injection compatibility path. `VantageReceiverHandler` does not emit
     /// this in production.
     Ack(Ack),
+    /// Optional ack-watermark front-end (`Parameters::ack_watermarks`) -- see
+    /// `LaneManager::resolve_watermark`. `sender` is the broadcasting party's declared
+    /// identity, the same D4-trust/MAC-binding model as `Ack`'s own `sender` field.
+    Avail(Vec<AvailEntry>, PublicKey),
     /// `VantagePropose` carries no sender field on the wire (§2) -- see
     /// `VantageCore::dispatch_inbound` for how the trusted sender is derived.
     Propose(ViewProposal),
@@ -110,6 +115,7 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
         PrimaryMessage::Header(_, true) => None,
         PrimaryMessage::HeadersRequest(_, requestor) => Some(*requestor),
         PrimaryMessage::VantageAck(a) => Some(a.sender),
+        PrimaryMessage::VantageAvail(_, sender) => Some(*sender),
         PrimaryMessage::VantagePropose(p) => Some(crate::vantage::agb::proposer(committee, p.view)),
         PrimaryMessage::VantageEcho(e) => Some(e.sender),
         PrimaryMessage::VantageEchoSkip(_, s, _) => Some(*s),
@@ -249,6 +255,7 @@ impl MessageHandler for VantageReceiverHandler {
                 };
                 Inbound::AckAvailability(availability)
             }
+            PrimaryMessage::VantageAvail(entries, sender) => Inbound::Avail(entries, sender),
             PrimaryMessage::VantagePropose(p) => Inbound::Propose(p),
             PrimaryMessage::VantageEcho(e) => Inbound::Echo(e),
             PrimaryMessage::VantageEchoSkip(v, s, w) => Inbound::EchoSkip(v, s, w),
@@ -311,6 +318,17 @@ pub struct VantageCore {
     max_header_delay: u64,
     digests: Vec<(Digest, WorkerId)>,
     payload_size: usize,
+
+    /// `Parameters::ack_watermarks`: when `true`, the N3 per-block ack broadcast is
+    /// suppressed at EXECUTION time (`execute`'s `Effect::BroadcastAck` arm) -- the
+    /// local self-ack path (`record_local_ack`) still runs unconditionally either way,
+    /// preserving this party's own counting toward its own `AckAggregator` exactly.
+    /// `LaneManager` itself never sees this flag: it keeps emitting `Effect::
+    /// BroadcastAck` on every N3 confirmation exactly as before, byte-identically.
+    ack_watermarks: bool,
+    /// The ack-watermark broadcast period, ms -- irrelevant when `ack_watermarks` is
+    /// off (`run` never even constructs the periodic tick in that case).
+    ack_watermark_period_ms: u64,
 
     /// §10 timer queue: (deadline, view, kind), drained by the run loop's `sleep_until`
     /// branch (message channels are checked first every iteration -- §5's tie-break
@@ -549,6 +567,8 @@ impl VantageCore {
             max_header_delay: parameters.max_header_delay,
             digests: Vec::new(),
             payload_size: 0,
+            ack_watermarks: parameters.ack_watermarks,
+            ack_watermark_period_ms: parameters.ack_watermark_period_ms,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
             payload: PayloadIo {
@@ -600,6 +620,19 @@ impl VantageCore {
         // loop beyond the tick's own negligible CPU cost.
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));
         metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Optional ack-watermark front-end (`Parameters::ack_watermarks`): the
+        // periodic broadcast tick, constructed ONLY when the flag is on -- do not add
+        // a tick at all when it's off (mirrors the `agb_sleep`/`control_sleep`
+        // `Option`-guarded-select-arm idiom just below/above in this same loop).
+        let mut avail_tick = if self.ack_watermarks {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(self.ack_watermark_period_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            Some(interval)
+        } else {
+            None
+        };
 
         loop {
             // P4-3, amended by Fable perf audit item 4: bound `cancel_handlers`'
@@ -675,6 +708,22 @@ impl VantageCore {
                     let effects = self.fire_control_timers(now);
                     drop(timer_firing_timer);
                     self.execute(effects, now).await;
+                }
+
+                () = async {
+                    match avail_tick.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if avail_tick.is_some() => {
+                    if let Some(entries) = self.lm.take_avail_flush() {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_avail_sent.inc();
+                        }
+                        self.wire
+                            .broadcast_message(PrimaryMessage::VantageAvail(entries, self.name))
+                            .await;
+                    }
                 }
 
                 _ = metrics_tick.tick() => {
@@ -971,6 +1020,38 @@ impl VantageCore {
             .unwrap_or_default()
     }
 
+    /// Feeds `refs` (from `LaneManager::resolve_watermark`/`retry_pending_avail`)
+    /// through the SAME shared `AckAggregator` the per-block ack path uses
+    /// (`record_injected_ack`), and the SAME `on_ack_availability` path -- nothing
+    /// downstream of the aggregator differs between the two front-ends (see
+    /// `resolve_watermark`'s own doc comment: this is the load-bearing property of the
+    /// whole design). `sender` is already known to be a committee member
+    /// (`dispatch_inbound`'s centralized gate ran before `Inbound::Avail` is ever
+    /// reached); the redundant re-check via `record_ack`'s own return is defense in
+    /// depth, mirroring `record_injected_ack`'s identical pattern.
+    fn credit_refs(&mut self, sender: PublicKey, refs: Vec<BlockRef>, now: Instant) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for r in refs {
+            let result = {
+                let mut aggregator = self.ack_aggregator.lock().unwrap();
+                aggregator.record_ack(sender, r)
+            };
+            if !result.accepted {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_rejected_nonmember_total.inc();
+                }
+                continue;
+            }
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_avail_credited_refs.inc();
+            }
+            if let Some(availability) = result.availability {
+                effects.extend(self.on_ack_availability(availability, now));
+            }
+        }
+        effects
+    }
+
     async fn dispatch_inbound(&mut self, inbound: Inbound, now: Instant) -> Vec<Effect> {
         // SECURITY (Fable audit): the single centralized membership gate -- every
         // wire-declared sender is checked against the trusted committee-membership
@@ -998,6 +1079,13 @@ impl VantageCore {
             }
             Inbound::AckAvailability(availability) => self.on_ack_availability(availability, now),
             Inbound::Ack(ack) => self.record_injected_ack(ack, now),
+            Inbound::Avail(entries, sender) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_avail_received.inc();
+                }
+                let refs = self.lm.resolve_watermark(sender, &entries);
+                self.credit_refs(sender, refs, now)
+            }
             Inbound::Propose(proposal) => {
                 // D4 (PHASE4-SPEC.md §13's standing note): `ViewProposal` carries no
                 // sender field and there is no channel identity to check it against
@@ -1110,10 +1198,18 @@ impl VantageCore {
                         .await
                 }
                 Effect::BroadcastAck(ack) => {
+                    // The self-ack path always runs, flag on or off: our own
+                    // holdings must always count toward our own aggregator (see
+                    // `ack_watermarks`'s own field doc comment). Only the WIRE
+                    // broadcast is suppressed when the watermark front-end replaces
+                    // it -- `LaneManager` itself is unaware of the flag and keeps
+                    // emitting this effect exactly as before.
                     queue.extend(self.record_local_ack(&ack, now));
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageAck(ack))
-                        .await
+                    if !self.ack_watermarks {
+                        self.wire
+                            .broadcast_message(PrimaryMessage::VantageAck(ack))
+                            .await
+                    }
                 }
                 Effect::SyncBatches(author, header_digest, missing) => {
                     self.payload
@@ -1134,6 +1230,12 @@ impl VantageCore {
                         .await
                 }
                 Effect::BlockCached(digest) => {
+                    // Ack-watermark front-end: this newly-cached block may complete a
+                    // pending watermark's below-the-head segment for its author --
+                    // retry before `on_block_available` consumes `digest` by value.
+                    for (sender, r) in self.lm.retry_pending_avail(&digest) {
+                        queue.extend(self.credit_refs(sender, vec![r], now));
+                    }
                     queue.extend(self.rep.on_block_available(digest));
                     queue.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                     queue.extend(self.cursor.retry());

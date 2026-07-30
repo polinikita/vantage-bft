@@ -345,6 +345,31 @@ async fn main() -> Result<()> {
                         shared across every node this run spawns. Off by default -- \
                         byte-identical wire/behavior when off.",
                         ),
+                )
+                .arg(
+                    Arg::new("ack-watermarks")
+                        .long("ack-watermarks")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Optional, flag-gated replacement for per-block ACK broadcasts \
+                        (N3): each party periodically broadcasts one compact per-author \
+                        lane-availability watermark instead of one ack per (block, acker, \
+                        recipient). Digest-bound, so crediting still resolves to an exact \
+                        block reference before touching the shared ack aggregator. Applies \
+                        to both Vantage and Simple-IT. Off by default -- byte-identical \
+                        wire/behavior when off.",
+                        ),
+                )
+                .arg(
+                    Arg::new("ack-watermark-period-ms")
+                        .long("ack-watermark-period-ms")
+                        .value_name("INT")
+                        .default_value("50")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Ack-watermark broadcast period, ms -- irrelevant unless \
+                        --ack-watermarks is set",
+                        ),
                 ),
         )
         .subcommand_required(true)

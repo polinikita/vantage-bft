@@ -249,6 +249,28 @@ pub struct Parameters {
     #[serde(default = "default_simpleit_gc_window_rounds")]
     pub simpleit_gc_window_rounds: u64,
 
+    /// Optional, flag-gated replacement for per-block ACK broadcasts (N3): instead of
+    /// one ack per (block, acker, recipient), each party periodically broadcasts one
+    /// compact watermark per author it holds -- "for author a, I hold a's lane
+    /// through (height h, head digest d)". Lanes are hash chains with prefix
+    /// verification, so one (h, d) pair covers a's whole verified prefix through h;
+    /// this replaces O(n) messages/period/author with O(1). Digest-bound (never
+    /// height-only), so crediting still resolves to an exact `BlockRef` before
+    /// touching the shared `AckAggregator` -- the same soundness invariant a per-block
+    /// ack already satisfies (see `vantage::lanes::LaneManager::resolve_watermark`'s
+    /// doc comment for why a height-only watermark would be unsound under an
+    /// equivocating author). Shared by both Vantage and Simple-IT (same `LaneManager`/
+    /// `AckAggregator` data plane). `#[serde(default)]` = `false` -- byte-identical
+    /// wire/behavior when off: the per-block ack broadcast is unchanged, no periodic
+    /// watermark tick is even scheduled, and no `VantageAvail` message is ever sent.
+    #[serde(default)]
+    pub ack_watermarks: bool,
+    /// The ack-watermark broadcast period, in ms -- irrelevant when `ack_watermarks`
+    /// is off. `#[serde(default)]` (50ms) keeps every pre-existing parameter file
+    /// valid.
+    #[serde(default = "default_ack_watermark_period_ms")]
+    pub ack_watermark_period_ms: u64,
+
     /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
     /// per-authority-pair one-way latency table, applied to THIS node's own
     /// primary-to-primary connections at spawn time via `Committee::latency_map`
@@ -393,6 +415,11 @@ fn default_vantage_gc_window_views() -> u64 {
 /// Matches `vantage_gc_window_views`'/`gc_depth`'s own default -- see
 /// `simpleit_gc_window_rounds`'s doc comment.
 fn default_simpleit_gc_window_rounds() -> u64 {
+    50
+}
+
+/// `ack_watermarks`'s own doc comment.
+fn default_ack_watermark_period_ms() -> u64 {
     50
 }
 
@@ -581,6 +608,8 @@ impl Default for Parameters {
             gc_depth: 50,
             vantage_gc_window_views: default_vantage_gc_window_views(),
             simpleit_gc_window_rounds: default_simpleit_gc_window_rounds(),
+            ack_watermarks: false,
+            ack_watermark_period_ms: default_ack_watermark_period_ms(),
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,
@@ -705,6 +734,11 @@ impl Parameters {
         info!(
             "Authenticated channels (symmetric pairwise MAC) enabled? {}",
             self.authenticate_channels
+        );
+        info!(
+            "Ack watermarks (periodic per-lane availability broadcast, replaces \
+             per-block acks) enabled? {}. Period: {} ms",
+            self.ack_watermarks, self.ack_watermark_period_ms
         );
     }
 }

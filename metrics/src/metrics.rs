@@ -155,6 +155,20 @@ pub struct Metrics {
     /// exclusive per node/run, so there is no ambiguity in practice about which
     /// assembly a nonzero reading came from.
     pub vantage_rejected_nonmember_total: IntCounter,
+    /// Optional ack-watermark front-end (`Parameters::ack_watermarks`): periodic
+    /// per-lane availability broadcasts this node sent (one per period with a
+    /// nonempty flush -- see `vantage::lanes::LaneManager::take_avail_flush` --, not
+    /// one per author). Always zero when the flag is off (`VantageCore`/
+    /// `SimpleItCore::run` never even schedule the tick in that case).
+    pub vantage_avail_sent: IntCounter,
+    /// `VantageAvail` messages this node received and routed to `LaneManager::
+    /// resolve_watermark`. Always zero when the flag is off (no peer ever sends one).
+    pub vantage_avail_received: IntCounter,
+    /// `BlockRef`s actually credited into the shared `AckAggregator` via the
+    /// ack-watermark front-end (immediate resolution via `resolve_watermark` plus
+    /// later backfill via `retry_pending_avail`, combined) -- the watermark analogue
+    /// of `vantage_acks_received`. Always zero when the flag is off.
+    pub vantage_avail_credited_refs: IntCounter,
     /// `SimpleItCore`'s effect-execution loop received a `vantage::Effect` variant
     /// that `LaneManager`/`Repairer` can never actually construct (every
     /// AGB/pacemaker/control-log/anchor/cursor-output variant -- see that loop's own
@@ -553,6 +567,24 @@ impl Metrics {
             vantage_rejected_nonmember_total: register_int_counter_with_registry!(
                 "vantage_rejected_nonmember_total",
                 "Inbound vantage wire messages dropped for a non-committee-member declared sender",
+                registry,
+            )
+            .unwrap(),
+            vantage_avail_sent: register_int_counter_with_registry!(
+                "vantage_avail_sent",
+                "Ack-watermark broadcasts this node sent",
+                registry,
+            )
+            .unwrap(),
+            vantage_avail_received: register_int_counter_with_registry!(
+                "vantage_avail_received",
+                "Ack-watermark broadcasts this node received",
+                registry,
+            )
+            .unwrap(),
+            vantage_avail_credited_refs: register_int_counter_with_registry!(
+                "vantage_avail_credited_refs",
+                "BlockRefs credited into the shared AckAggregator via the ack-watermark front-end",
                 registry,
             )
             .unwrap(),

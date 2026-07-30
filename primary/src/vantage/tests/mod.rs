@@ -1,6 +1,7 @@
 // PHASE3-SPEC.md §7 / PHASE4-SPEC.md §12 test gate. Each module below cites the
 // rule(s) it covers.
 mod ack_tests;
+mod avail_tests;
 mod chain_tests;
 mod common;
 mod metrics_tests;

@@ -45,6 +45,7 @@ impl DeclaredSender for Inbound {
             Inbound::Publish(sender, _) => Some(*sender),
             Inbound::HeadersRequest(_, requestor) => Some(*requestor),
             Inbound::Ack(ack) => Some(ack.sender),
+            Inbound::Avail(_, s) => Some(*s),
             Inbound::Echo(e) => Some(e.sender),
             Inbound::EchoSkip(_, s, _) => Some(*s),
             Inbound::Ready(r) => Some(r.sender),

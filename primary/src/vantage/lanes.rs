@@ -14,6 +14,7 @@ use crate::vantage::Effect;
 use config::{Committee, Stake, WorkerId};
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use store::Store;
@@ -459,6 +460,20 @@ impl BlockCache {
     }
 }
 
+/// One entry of a periodic per-lane availability watermark (optional, flag-gated
+/// replacement for per-block ACKs -- `Parameters::ack_watermarks`): "for `author`, the
+/// declaring party holds `author`'s lane through (`height`, `head`)". Digest-bound,
+/// never height-only -- see `LaneManager::resolve_watermark`'s doc comment for why
+/// crediting must always resolve to an exact `BlockRef` before touching the shared
+/// `AckAggregator` (the same invariant a per-block ack already satisfies via
+/// `Ack::reference`). Derives mirror `Ack`'s own wire derives (`messages::Ack`).
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AvailEntry {
+    pub author: PublicKey,
+    pub height: Height,
+    pub head: Digest,
+}
+
 pub type SharedBlocks = Arc<Mutex<BlockCache>>;
 
 fn min_digest() -> Digest {
@@ -650,6 +665,29 @@ pub struct LaneManager {
     /// Our own lane frontier: (height, digest of that block, or genesis at height 0).
     own_frontier: (Height, Digest),
 
+    /// Optional ack-watermark front-end (flag-gated at the core level; see
+    /// `Parameters::ack_watermarks`). This party's own greatest DIRECT-PREFIX height
+    /// per author, and the digest at that height -- "the greatest h such that every
+    /// height <= h of that author's lane is DirectPub at this party". Advanced
+    /// incrementally, exactly where N3's DirectPub confirmation already fires
+    /// (`record_direct_pub`), never by rescanning. Bounded by committee size (one
+    /// entry per author) -- plain `HashMap`, no GC needed. This bookkeeping is
+    /// unconditional (LaneManager itself doesn't know the flag) and inert unless
+    /// `take_avail_flush` is ever called by the core.
+    own_avail_watermark: HashMap<PublicKey, (Height, Digest)>,
+    /// Set whenever `own_avail_watermark` advances; cleared by `take_avail_flush`.
+    avail_dirty: bool,
+    /// Per (sender, author) credited floor for INCOMING watermarks: the height up to
+    /// which `sender`'s watermark has already been credited for `author`'s lane.
+    /// Bounded by O(n^2) (sender x author pairs, n = committee size) -- plain
+    /// `HashMap`, no GC needed.
+    credited_floor: HashMap<(PublicKey, PublicKey), (Height, Digest)>,
+    /// Per (sender, author) latest-wins pending slot: a watermark entry whose head
+    /// resolved (attested, credited) but whose segment below the head did not fully
+    /// resolve locally yet -- retried by `retry_pending_avail` once a new block is
+    /// cached. Bounded by O(n^2), same as `credited_floor`, no GC needed.
+    pending_avail: HashMap<(PublicKey, PublicKey), AvailEntry>,
+
     /// §6.4 counters; `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
 }
@@ -695,6 +733,10 @@ impl LaneManager {
             c_candidate: HashMap::new(),
             t_candidate: HashMap::new(),
             own_frontier: (0, genesis),
+            own_avail_watermark: HashMap::new(),
+            avail_dirty: false,
+            credited_floor: HashMap::new(),
+            pending_avail: HashMap::new(),
             metrics: None,
         }
     }
@@ -1058,6 +1100,174 @@ impl LaneManager {
         self.direct_pub_refs.insert(r.clone());
         if self.is_q_available(r, self.committee.quorum_threshold()) {
             self.quorum_direct_refs.insert(r.clone());
+        }
+        // Ack-watermark front-end (see `own_avail_watermark`'s doc comment): advance
+        // this author's own DIRECT-PREFIX watermark. Absent a Byzantine fork,
+        // DirectPub confirmations for a fixed author are always recorded in strictly
+        // consecutive height order: `direct_prefix_ok`'s own chain walk requires every
+        // ancestor's `direct && payload_ok` flags, which -- by the same recursive
+        // argument applied to the ancestor -- means the ancestor's own DirectPub
+        // confirmation was already recorded first (this method is only ever reached
+        // from `refresh_author`'s ascending-`BTreeSet` range walk over `pending_direct`
+        // for one author, via `on_direct_pub_confirmed`). Tracking the greatest seen
+        // height regardless of exact contiguity (`>`, not `== + 1`) is a defensive
+        // choice under an equivocating author who gets two different DirectPub digests
+        // recorded at the SAME height at this party (last-recorded wins): harmless
+        // liveness-only degradation, never a soundness issue, since the RECEIVE side
+        // (`resolve_watermark`) always re-verifies the exact digest chain before
+        // crediting anything -- this value is only ever a candidate to ADVERTISE, not
+        // something trusted on its own.
+        let advances = match self.own_avail_watermark.get(&r.0) {
+            Some((h, _)) => r.1 > *h,
+            None => true,
+        };
+        if advances {
+            self.own_avail_watermark.insert(r.0, (r.1, r.2.clone()));
+            self.avail_dirty = true;
+        }
+    }
+
+    /// Full-vector-when-dirty ack-watermark flush (flag-gated at the core level -- see
+    /// `Parameters::ack_watermarks`): if this party's own watermark has advanced since
+    /// the last flush, clear the dirty bit and return the FULL current vector (every
+    /// author with a recorded watermark); else `None`. Deliberately not a delta: the
+    /// result is monotone and idempotent on the receive side (`resolve_watermark`'s own
+    /// credited floor silently re-ignores an already-covered or stale entry), so a
+    /// duplicate or slightly-stale full vector is always harmless, and an idle lane
+    /// (nothing new to report) goes silent instead of re-broadcasting forever.
+    pub fn take_avail_flush(&mut self) -> Option<Vec<AvailEntry>> {
+        if !self.avail_dirty {
+            return None;
+        }
+        self.avail_dirty = false;
+        Some(
+            self.own_avail_watermark
+                .iter()
+                .map(|(author, (height, head))| AvailEntry {
+                    author: *author,
+                    height: *height,
+                    head: head.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Resolves a peer's ack-watermark vector into the exact `BlockRef`s this party's
+    /// own cache lets it credit -- see this module's own header comment for why
+    /// crediting must always resolve to a specific `(author, height, digest)` before
+    /// touching `AckAggregator`: a height-only credit would let an equivocating
+    /// author's fork reach quorum with zero correct holders of the counted digest.
+    /// `sender` is the watermark's declaring party -- D4-trusted the same way an
+    /// `Ack::sender` already is; the caller (`VantageCore`/`SimpleItCore::
+    /// dispatch_inbound`) has already checked committee membership before reaching
+    /// here.
+    pub fn resolve_watermark(&mut self, sender: PublicKey, entries: &[AvailEntry]) -> Vec<BlockRef> {
+        let mut refs = Vec::new();
+        for entry in entries {
+            refs.extend(self.resolve_one(sender, entry));
+        }
+        refs
+    }
+
+    /// Re-attempt every `(sender, author)` watermark entry pending on `digest`'s
+    /// author, now that `digest` has just been cached -- hook: both cores'
+    /// `Effect::BlockCached` handling (mirroring `Repairer::on_block_available`'s
+    /// identical "retry on new cache content" role for repair, and `refresh_author`'s
+    /// own retry-on-new-content role for direct acks). Returns `(sender, ref)` pairs so
+    /// the caller can credit each through the shared aggregator under the correct
+    /// declaring sender.
+    pub fn retry_pending_avail(&mut self, digest: &Digest) -> Vec<(PublicKey, BlockRef)> {
+        let author = {
+            let blocks = self.blocks.lock().unwrap();
+            blocks.get(digest).map(|e| e.block.author)
+        };
+        let Some(author) = author else {
+            return Vec::new();
+        };
+        let keys: Vec<(PublicKey, PublicKey)> = self
+            .pending_avail
+            .keys()
+            .filter(|(_, a)| *a == author)
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for key in keys {
+            let sender = key.0;
+            let Some(entry) = self.pending_avail.get(&key).cloned() else {
+                continue;
+            };
+            for r in self.resolve_one(sender, &entry) {
+                out.push((sender, r));
+            }
+        }
+        out
+    }
+
+    /// Per-entry core of `resolve_watermark`/`retry_pending_avail`: resolves `entry`
+    /// against `sender`'s current credited floor for `entry.author`.
+    ///
+    /// Monotone: an entry whose DECLARED height is at or below the floor is ignored --
+    /// pure liveness (a stale/duplicate resend costs nothing).
+    ///
+    /// On a successful resolve, the credited refs and the new floor are derived from
+    /// the WALK's own result (`BlockCache::collect_verified_suffix`, which re-derives
+    /// every height from the ACTUAL cached chain, never from the caller's declared
+    /// `entry.height`) -- so a lying declared height can never advance the floor past
+    /// what was genuinely verified; it can only make this call a harmless no-op or
+    /// degrade to the head-alone case below.
+    ///
+    /// On failure (the segment below the head does not fully resolve -- including the
+    /// head itself not being cached at all, per `collect_verified_suffix`'s own
+    /// contract), the head ref alone is credited, EXACTLY as a direct ack for that
+    /// exact `(author, height, digest)` tuple would be (the declaring party attests
+    /// holding it), using the caller's DECLARED `entry.height` -- the same trust model
+    /// `Ack::reference` already applies to a wire-declared height (see `messages::Ack`'s
+    /// doc comment): if the declared height doesn't match the digest's real cached
+    /// height, the resulting ref is simply inert downstream (`exact_coordinate`'s
+    /// pinned-height check rejects it the same way a wrong-height Ack already would),
+    /// never unsound. The floor is NOT advanced past what's already recorded, and the
+    /// entry is stashed (latest-wins, keyed `(sender, author)`) for
+    /// `retry_pending_avail` to retry later.
+    fn resolve_one(&mut self, sender: PublicKey, entry: &AvailEntry) -> Vec<BlockRef> {
+        let key = (sender, entry.author);
+        let (floor_height, floor_digest) = self
+            .credited_floor
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| (0, self.genesis.clone()));
+        if entry.height <= floor_height {
+            return Vec::new();
+        }
+        let segment = {
+            let blocks = self.blocks.lock().unwrap();
+            blocks.collect_verified_suffix(
+                &self.committee,
+                &self.sid,
+                self.max_block_payload,
+                floor_height,
+                &floor_digest,
+                &entry.head,
+            )
+        };
+        match segment {
+            Some(suffix) => {
+                let mut refs = Vec::with_capacity(suffix.len());
+                for (i, d) in suffix.iter().enumerate() {
+                    refs.push((entry.author, floor_height + 1 + i as Height, d.clone()));
+                }
+                if let Some(last) = suffix.last() {
+                    self.credited_floor.insert(
+                        key,
+                        (floor_height + suffix.len() as Height, last.clone()),
+                    );
+                }
+                self.pending_avail.remove(&key);
+                refs
+            }
+            None => {
+                self.pending_avail.insert(key, entry.clone());
+                vec![(entry.author, entry.height, entry.head.clone())]
+            }
         }
     }
 
