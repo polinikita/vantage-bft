@@ -88,6 +88,13 @@ pub struct Core {
     votes_aggregator: VotesAggregator,
 
     network: ReliableSender,
+    /// METRICS-DASHBOARD-SPEC.md §3 addendum: this node's own metrics handle, kept
+    /// (not just handed to `network`'s `with_metrics` below) so `process_own_header`
+    /// can observe `proposed_header_size_bytes` at the same publish point Vantage's
+    /// `vantage::wire::Wire::broadcast_message` does. A bare `Arc`, not
+    /// `Option<Arc<_>>` (unlike `Wire`'s): `Core::spawn` always receives a real
+    /// handle and there is no unit-test construction path here that omits one.
+    metrics: Arc<Metrics>,
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Height, Vec<CancelHandler>>,
     consensus_cancel_handlers: HashMap<Slot, Vec<CancelHandler>>,
@@ -250,6 +257,7 @@ impl Core {
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 current_header: Header::default(),
                 votes_aggregator: VotesAggregator::new(),
+                metrics: metrics.clone(),
                 network: ReliableSender::new()
                     .with_latency(latency_map)
                     .with_metrics(metrics)
@@ -394,6 +402,20 @@ impl Core {
             .entry(header.height)
             .or_default()
             .extend(handlers);
+
+        // METRICS-DASHBOARD-SPEC.md §3 addendum (starfish parity): isolated
+        // serialized header size at publish time -- separate from the wire-envelope
+        // bytes just broadcast above (`PrimaryMessage::Header(_, false)` adds a
+        // small enum tag plus the `sync` bool on top of the header itself). Mirrors
+        // `vantage::wire::Wire::broadcast_message`'s own `proposed_header_size_bytes`
+        // observation, the shared instrumentation point for Vantage/Simple-IT's own
+        // `Header` publish; this call site is the equivalent shared point for both
+        // Autobahn variants (`process_own_header` is not specialized by
+        // `use_optimistic_tips`/`use_parallel_proposals` etc.).
+        let header_bytes = bincode::serialize(&header).expect("Failed to serialize header");
+        self.metrics
+            .proposed_header_size_bytes
+            .observe(header_bytes.len());
 
         // Process the header.
         self.process_header(header, false).await

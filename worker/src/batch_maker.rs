@@ -175,8 +175,19 @@ impl BatchMaker {
 
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
-        #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
+
+        // METRICS-DASHBOARD-SPEC.md §3 addendum (starfish parity, adapted): our own
+        // proposed transactions' total payload size, sealed into this batch. This
+        // repo's headers/proposals never carry transaction bytes inline -- only
+        // batch digests (`primary::messages::Header::payload:
+        // BTreeMap<Digest, WorkerId>`) -- so the batch, not the header, is the
+        // closest analogue of starfish's per-block `proposed_transaction_size_bytes`
+        // observation (see that field's doc comment on `Metrics`). Own batches
+        // only, matching `BatchMaker`'s scope: batches received from other workers
+        // never pass through here (see `Processor`'s `own_batch` split in
+        // `worker::Worker::handle_workers_messages`).
+        self.metrics.proposed_transaction_size_bytes.observe(size);
 
         // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]

@@ -12,7 +12,11 @@
 // push onto `HistogramSender`'s channel) and `log::info!`/`log::error!` instead of
 // `tracing` (this workspace's existing logging stack throughout primary/worker/node).
 
-use std::{ops::AddAssign, sync::Arc, sync::Mutex, time::Duration};
+use std::{
+    ops::AddAssign,
+    sync::{atomic::AtomicBool, Arc, Mutex},
+    time::Duration,
+};
 
 use prometheus::{
     register_int_counter_vec_with_registry, register_int_counter_with_registry,
@@ -86,13 +90,45 @@ pub struct Metrics {
     /// paired with the histogram's `sum`/`count` gauges this gives the harness an exact
     /// global stddev: `sqrt(squared_sum/count - (sum/count)^2)`.
     pub transaction_committed_latency_squared_micros: IntCounter,
+    /// Perf-audit fix (measurement bug): submit -> ordered ∧ MATERIALISED latency --
+    /// `commit_millis` is when the primary ordered the batch, but a worker that
+    /// didn't yet hold the payload only learns the transactions' contents (and can
+    /// only observe them into this histogram) later, once the batch actually lands
+    /// locally via `SyncBatches`/worker-to-worker gossip. Observed at that later
+    /// instant minus the same embedded submission timestamp, from the exact same
+    /// loop iteration as `transaction_committed_latency` above -- so every
+    /// transaction contributes to both. Starfish-comparable: starfish's own
+    /// `transaction_committed_latency` is observed only once the block's
+    /// transactions are locally available in the first place (see
+    /// `RealCommitHandler::transaction_observer`), i.e. it measures this same
+    /// submit -> ordered ∧ materialised quantity, not submit -> ordered alone. For
+    /// an immediate hit the two histograms are nearly identical; for a deferred miss
+    /// (see `latency_misses`) the gap between them is exactly the payload-
+    /// availability cost.
+    pub transaction_materialised_latency: HistogramSender<Duration>,
+    /// Mirrors `transaction_committed_latency_squared_micros` exactly (same batched
+    /// accumulate-then-`inc_by` treatment), for `transaction_materialised_latency`.
+    pub transaction_materialised_latency_squared_micros: IntCounter,
     /// Total transactions whose latency was successfully observed.
     pub committed_transactions: IntCounter,
     /// Total bytes of transactions whose latency was successfully observed.
     pub committed_bytes: IntCounter,
-    /// Commit-time batch lookups that missed the local store and were skipped (never
-    /// blocked on) -- see PHASE2-SPEC.md #5's worker metrics task.
+    /// Commit-time batch lookups that missed the local store and were DEFERRED for
+    /// retry, not dropped (perf-audit fix -- see
+    /// `worker::synchronizer::Synchronizer::observe_committed`'s doc comment for the
+    /// bug this replaced: a miss used to permanently mark the digest "observed",
+    /// silently undercounting `committed_transactions`/`committed_bytes` and the
+    /// latency histograms whenever the payload arrived after the commit
+    /// notification, which is the normal case for a remote author's batch). Every
+    /// deferral increments this counter exactly once, whether or not it later
+    /// resolves; `latency_misses_resolved` below tells the two apart.
     pub latency_misses: IntCounter,
+    /// Deferred misses (`latency_misses`) that later resolved when their batch
+    /// landed in the store and were counted. `latency_misses -
+    /// latency_misses_resolved` is the number still pending retry (mid-run) or
+    /// permanently unresolved (after the run has ended and any legitimately
+    /// in-flight sync has had time to finish).
+    pub latency_misses_resolved: IntCounter,
 
     // --- Phase 3 (PHASE3-SPEC.md §6.4): vantage data-plane counters. Always
     // registered (same pattern as the rest of this struct); only observed into on the
@@ -232,6 +268,32 @@ pub struct Metrics {
     /// reported via the same `HistogramReporter` pattern as
     /// `transaction_committed_latency`.
     pub proposed_block_size_bytes: HistogramSender<usize>,
+    /// Starfish parity: the proposed header/block's METADATA alone, serialized in
+    /// isolation from any payload -- at n=50 this is the metric that distinguishes
+    /// O(n^2) from O(n^3) metadata growth across protocols (a header whose own size
+    /// is O(n), e.g. an embedded vote list, times n headers/round times n peers/
+    /// broadcast). Self-authored proposals only, observed at the same publish call
+    /// site as `proposed_block_size_bytes` -- see `primary::core::Core::
+    /// process_own_header` (Autobahn, both optimistic and seamless) and
+    /// `vantage::wire::Wire::broadcast_message` (Vantage and Simple-IT, which reuses
+    /// Vantage's data plane verbatim). Identical value to `proposed_block_size_bytes`
+    /// on the two Vantage-family protocols today (their wire `Header` never carries
+    /// inline transactions, only payload digests -- see `proposed_transaction_size_
+    /// bytes`'s doc comment), computed as a separate serialization anyway so the two
+    /// metrics stay independently correct if that ever changes.
+    pub proposed_header_size_bytes: HistogramSender<usize>,
+    /// Starfish parity, adapted to this codebase's Narwhal-style architecture: this
+    /// repo's headers/proposals never carry transaction bytes inline (only batch
+    /// digests -- `primary::messages::Header::payload: BTreeMap<Digest, WorkerId>`),
+    /// unlike starfish's monolithic blocks, which do. The closest analogue of
+    /// starfish's per-block transaction-payload size is therefore observed one layer
+    /// down, at the point this node's own worker seals a batch of transactions for
+    /// inclusion (`worker::batch_maker::BatchMaker::seal`) -- own batches only,
+    /// matching every other `proposed_*` metric's self-authored-only scope. Lives on
+    /// the WORKER's own registry (a distinct scrape target from
+    /// `proposed_header_size_bytes`, which is primary-side), same split as
+    /// `submitted_transactions`/`committed_transactions`.
+    pub proposed_transaction_size_bytes: HistogramSender<usize>,
     /// Starfish-style (`metrics.rs:1325-1376`) busy-time accounting around
     /// `VantageCore`'s own major sections, in accumulated microseconds, labeled by
     /// `proc` (section name). A `Drop`-guard timer (see `stat::UtilizationTimer`)
@@ -256,6 +318,28 @@ pub struct Metrics {
     /// `compress_network` is on (mirrors starfish's own conditional exactly -- when
     /// compression is off this would just duplicate `bytes_sent_total`).
     pub bytes_uncompressed_sent_total: IntCounter,
+
+    // --- Perf-audit addendum: metrics-active window (starfish parity,
+    // `metrics.rs`'s own `metrics_active`/`transactions_generator.rs`'s early
+    // return in `RealCommitHandler::transaction_observer`).
+    /// True iff commit-time observations should feed the rate-relevant counters
+    /// (the two transaction-latency histograms and their squared-micros
+    /// accumulators, `committed_transactions`/`committed_bytes`, and
+    /// `latency_misses`/`latency_misses_resolved`) -- gated in
+    /// `worker::synchronizer::Synchronizer::observe_committed`/
+    /// `finish_deferred_retry`, mirroring starfish's identical early return in
+    /// `RealCommitHandler::transaction_observer`. Outside the active window (a
+    /// warmup before load generation starts, or a wind-down after it stops), a late
+    /// commit would otherwise skew TPS, the latency distribution, and the
+    /// bandwidth-efficiency denominator -- exactly starfish's own rationale.
+    /// Defaults to `true` (active): unlike starfish, nothing in this codebase's
+    /// benchmark harness currently flips this (see METRICS-NOTES.md/this change's
+    /// own report for what the equivalent hook would be), so every existing run's
+    /// numbers are unaffected until something does. `Arc`-wrapped (matching
+    /// starfish's own type exactly) so every clone of `Metrics` -- there is
+    /// currently one long-lived instance per primary/worker, but the struct is
+    /// `Clone` -- observes the same flag.
+    pub metrics_active: Arc<AtomicBool>,
 }
 
 /// Owns the receiving half of the latency histogram and periodically drains + publishes
@@ -264,7 +348,10 @@ pub struct Metrics {
 /// background task other than via `start`.
 pub struct MetricReporter {
     transaction_committed_latency: Mutex<HistogramReporter<Duration>>,
+    transaction_materialised_latency: Mutex<HistogramReporter<Duration>>,
     proposed_block_size_bytes: Mutex<HistogramReporter<usize>>,
+    proposed_header_size_bytes: Mutex<HistogramReporter<usize>>,
+    proposed_transaction_size_bytes: Mutex<HistogramReporter<usize>>,
 }
 
 /// Publishes a `PreciseHistogram<T>` as a `name{v="..."}` gauge vector: exact count, sum,
@@ -349,7 +436,10 @@ impl Metrics {
     /// only worker's copy is ever observed into in Phase 2 (see PHASE2-NOTES.md).
     pub fn new(registry: &Registry) -> (Arc<Self>, Arc<MetricReporter>) {
         let (transaction_committed_latency_hist, transaction_committed_latency) = histogram();
+        let (transaction_materialised_latency_hist, transaction_materialised_latency) = histogram();
         let (proposed_block_size_bytes_hist, proposed_block_size_bytes) = histogram();
+        let (proposed_header_size_bytes_hist, proposed_header_size_bytes) = histogram();
+        let (proposed_transaction_size_bytes_hist, proposed_transaction_size_bytes) = histogram();
 
         let reporter = MetricReporter {
             transaction_committed_latency: Mutex::new(HistogramReporter::new_in_registry(
@@ -357,10 +447,25 @@ impl Metrics {
                 registry,
                 "transaction_committed_latency",
             )),
+            transaction_materialised_latency: Mutex::new(HistogramReporter::new_in_registry(
+                transaction_materialised_latency_hist,
+                registry,
+                "transaction_materialised_latency",
+            )),
             proposed_block_size_bytes: Mutex::new(HistogramReporter::new_in_registry(
                 proposed_block_size_bytes_hist,
                 registry,
                 "proposed_block_size_bytes",
+            )),
+            proposed_header_size_bytes: Mutex::new(HistogramReporter::new_in_registry(
+                proposed_header_size_bytes_hist,
+                registry,
+                "proposed_header_size_bytes",
+            )),
+            proposed_transaction_size_bytes: Mutex::new(HistogramReporter::new_in_registry(
+                proposed_transaction_size_bytes_hist,
+                registry,
+                "proposed_transaction_size_bytes",
             )),
         };
 
@@ -369,6 +474,13 @@ impl Metrics {
             transaction_committed_latency_squared_micros: register_int_counter_with_registry!(
                 "transaction_committed_latency_squared_micros",
                 "Sum of (transaction commit latency in microseconds)^2, for exact stddev",
+                registry,
+            )
+            .unwrap(),
+            transaction_materialised_latency,
+            transaction_materialised_latency_squared_micros: register_int_counter_with_registry!(
+                "transaction_materialised_latency_squared_micros",
+                "Sum of (transaction materialised latency in microseconds)^2, for exact stddev",
                 registry,
             )
             .unwrap(),
@@ -386,7 +498,13 @@ impl Metrics {
             .unwrap(),
             latency_misses: register_int_counter_with_registry!(
                 "latency_misses",
-                "Commit-time batch lookups that missed the local store and were skipped",
+                "Commit-time batch lookups that missed the local store and were deferred for retry",
+                registry,
+            )
+            .unwrap(),
+            latency_misses_resolved: register_int_counter_with_registry!(
+                "latency_misses_resolved",
+                "Deferred commit-time misses (latency_misses) that later resolved and were counted",
                 registry,
             )
             .unwrap(),
@@ -560,6 +678,8 @@ impl Metrics {
             )
             .unwrap(),
             proposed_block_size_bytes,
+            proposed_header_size_bytes,
+            proposed_transaction_size_bytes,
             utilization_timer: register_int_counter_vec_with_registry!(
                 "utilization_timer",
                 "VantageCore busy time in microseconds, by proc (section name)",
@@ -593,6 +713,10 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            // Perf-audit addendum: defaults active (starfish parity for "preserves
+            // current behaviour when nothing sets it") -- see this field's own doc
+            // comment for what would need to set it false.
+            metrics_active: Arc::new(AtomicBool::new(true)),
         };
 
         (Arc::new(metrics), Arc::new(reporter))
@@ -646,8 +770,20 @@ impl MetricReporter {
         latency.receive_all();
         latency.report();
 
+        let mut materialised_latency = self.transaction_materialised_latency.lock().unwrap();
+        materialised_latency.receive_all();
+        materialised_latency.report();
+
         let mut block_size = self.proposed_block_size_bytes.lock().unwrap();
         block_size.receive_all();
         block_size.report();
+
+        let mut header_size = self.proposed_header_size_bytes.lock().unwrap();
+        header_size.receive_all();
+        header_size.report();
+
+        let mut tx_size = self.proposed_transaction_size_bytes.lock().unwrap();
+        tx_size.receive_all();
+        tx_size.report();
     }
 }

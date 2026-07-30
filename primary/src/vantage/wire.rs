@@ -158,11 +158,6 @@ impl Wire {
     /// is computed before serializing, so it labels the exact variant sent.
     pub(crate) async fn broadcast_message(&mut self, message: PrimaryMessage) {
         let msg_type = message.type_name();
-        // METRICS-DASHBOARD-SPEC.md §3: `proposed_block_size_bytes` -- our own
-        // self-authored block's serialized size at publish time. `Header(_, false)` is
-        // specifically the publish variant (`false` = not a serve/sync reply); the
-        // metrics handle is `Option` (unit tests construct `VantageCore` without one).
-        let is_own_publish = matches!(message, PrimaryMessage::Header(_, false));
         // SECURITY (Fable audit): `Header(_, true)` ("Serve") never legitimately
         // reaches `broadcast_message` (`ServeTo` always unicasts via `send_message`
         // below), so the only D4-class placeholder-tag variant this method ever sees
@@ -170,9 +165,20 @@ impl Wire {
         // this stays correct even if a future effect ever does broadcast one of them.
         let placeholder = message_needs_placeholder_tag(&message);
         let bytes = bincode::serialize(&message).expect("serializes");
-        if is_own_publish {
+        // METRICS-DASHBOARD-SPEC.md §3 (+ addendum): `proposed_block_size_bytes` (the
+        // full wire envelope) and `proposed_header_size_bytes` (the header serialized
+        // in isolation) -- our own self-authored block's size at publish time.
+        // `Header(_, false)` is specifically the publish variant (`false` = not a
+        // serve/sync reply); the metrics handle is `Option` (unit tests construct
+        // `VantageCore` without one). Reused verbatim by `SimpleItCore`, which
+        // broadcasts its own data-plane headers through this same `Wire`.
+        if let PrimaryMessage::Header(header, false) = &message {
             if let Some(metrics) = &self.metrics {
                 metrics.proposed_block_size_bytes.observe(bytes.len());
+                let header_bytes = bincode::serialize(header).expect("serializes");
+                metrics
+                    .proposed_header_size_bytes
+                    .observe(header_bytes.len());
             }
         }
         self.broadcast(bytes, msg_type, placeholder).await;
