@@ -46,10 +46,7 @@ pub use aggregators::{
 };
 pub use effects::{CutEffect, CutOut};
 pub use engine::{CrashSim, CutEngine, Inbound, TipOracle};
-pub use messages::{
-    Cut, CutCertificate, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
-    TimeoutCert,
-};
+pub use messages::{Cut, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert};
 // `node::SimpleItCore` only -- `node::SimpleItReceiverHandler`/`node::Inbound` are
 // reached via their full path (`crate::simpleit::node::...`), exactly mirroring
 // `vantage`'s own `pub use node::VantageCore;` (not `VantageReceiverHandler`). Note

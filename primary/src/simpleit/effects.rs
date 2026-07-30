@@ -6,21 +6,27 @@
 // execute. See engine.rs's module doc comment for the full architecture rationale.
 
 use crate::simpleit::messages::{
-    Cut, CutCertificate, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
+    Cut, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
 };
 use crypto::{Digest, PublicKey};
 use std::time::Instant;
 
 /// The wire-message payloads `CutEngine` ever broadcasts. One variant per upstream
-/// `PrimaryMessage::{CutProposal,CutVote,CutCertificate,Decide,Timeout,TimeoutAccept}`
-/// arm actually constructed by one of the 25 ported methods -- `TimeoutCert` is
-/// deliberately absent (upstream never broadcasts one; it is purely a local
-/// certificate `handle_timeout_accept_action` verifies and acts on).
+/// `PrimaryMessage::{CutProposal,CutVote,Decide,Timeout,TimeoutAccept}` arm actually
+/// constructed by one of the ported methods -- `TimeoutCert` is deliberately absent
+/// (upstream never broadcasts one; it is purely a local certificate
+/// `handle_timeout_accept_action` verifies and acts on). `CutCertificate` is likewise
+/// absent, but for a different reason: it WAS broadcast upstream (and by this crate,
+/// before this revision), and that broadcast is exactly the signature-free soundness
+/// defect Fig. 2's first-hand-counting design fixes -- see `engine.rs`'s module doc
+/// comment ("FIGURE-2 REWRITE"). There is now no `CutOut` variant a party could ever
+/// construct to assert a notarization to a peer; the only path into `safe` is each
+/// party's own `CutVoteAggregator` crossing `mint_threshold` on votes it individually
+/// verified.
 #[derive(Clone, Debug)]
 pub enum CutOut {
     CutProposal(CutProposal),
     CutVote(CutVote),
-    CutCertificate(CutCertificate),
     Decide(Decide),
     Timeout(Timeout),
     TimeoutAccept(TimeoutAccept),

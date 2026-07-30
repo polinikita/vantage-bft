@@ -4,7 +4,83 @@
 // that file -- header/vote/certificate processing, the Autobahn view-based consensus
 // (`process_consensus_*`), the run loop, every network/store/channel field -- is
 // Autobahn residue or data-plane wiring and is not ported. See each method's doc
-// comment below for its exact upstream line range.
+// comment below for its exact upstream line range -- EXCEPT where the FIGURE-2 REWRITE
+// paragraph below says otherwise: this module now implements the paper's Figure 2
+// directly, and where that disagrees with upstream's own implementation, Figure 2
+// governs. Upstream line citations on individual methods below are retained as
+// provenance (what upstream had at that call site), not as an implied claim that the
+// method still behaves as upstream did.
+//
+// FIGURE-2 REWRITE (this revision, arXiv:2606.14404 Fig. 2): upstream's cut-consensus
+// design -- ported here unchanged until now -- broadcasts a `CutCertificate` (a
+// `Vec<PublicKey>` of claimed voters) once any party's own vote count crosses
+// `mint_threshold`, and every OTHER party accepts that certificate on the strength of
+// `CutCertificate::verify` alone: checking only that the LISTED names are distinct,
+// stake-bearing committee members -- never that they actually voted. This protocol is
+// signature-free, so a vote carries no transferable proof of its own authorship; any
+// party could therefore assert a certificate for any `cut_id`, forging a notarization
+// that advances `cut_round`/`highest_safe_cut` (formerly `highest_certified_cut`) for a
+// round it never itself established. Commit itself stayed protected (`try_commit_round`
+// requires the locally-recorded leader proposal), but a forged certificate still let a
+// party stall the chain -- see the task history for the full liveness-attack argument.
+//
+// Figure 2 itself has NO certificate message anywhere. `safe[r]` is established purely
+// by rb-delivering `proposal[r]` and checking `SafeParent` (no vote-counting at all, in
+// the paper's own text -- that guarantee comes for free from the reliable broadcast's
+// totality property, which this port's `CutProposal`+`CutVote` pair only
+// APPROXIMATES, see the REPAIR paragraph below), and `committed[r]` by each party
+// counting `⟨commit, r⟩` (this engine's `Decide`) from n - f parties FIRST-HAND -- see
+// the module doc comment on `Decide` (messages.rs) for why it is exactly Fig. 2's Vote
+// step. This module's own design already has parties count `CutVote`s into a
+// `mint_threshold`-thresholded aggregator as its chosen stand-in for "the proposal is
+// corroborated enough to trust" (playing the role a real RBC's echo/ready phases would
+// play, at the message-pattern level this codebase works at); this revision's fix is
+// narrower than re-deriving that from scratch: keep the same threshold, but make EVERY
+// party evaluate it over votes it individually verified and counted itself
+// (`process_cut_vote` -> `mark_cut_safe`), and delete the one step that let a party
+// skip its own counting by trusting a peer's relayed aggregate instead
+// (`process_cut_certificate`'s old certificate-accept path, and the certificate
+// broadcast that fed it). No `CutOut`/`Inbound`/`PrimaryMessage` variant can carry a
+// notarization anymore -- the removal is enforced by the type system, not merely by
+// this module's own logic (see `mod tests`' `inbound_has_no_certificate_shaped_variant`
+// below for why that is a compile-time, not run-time, guarantee).
+//
+// FIELD MAPPING (old upstream-derived name -> Fig. 2's state variable -> this module's
+// name), for every field this revision renames:
+//   cut_certificates: BTreeMap<CutRound, CutCertificate>  -- safe[r] (+ its proposal)
+//     -> safe: BTreeMap<CutRound, Digest>  (key presence IS safe[r]; the value IS
+//        proposal[r]'s id -- the two are always established together here, so one map
+//        carries both, exactly as upstream's own bool-map/proposal-map pair would if
+//        upstream had used one map for each too)
+//   highest_certified_cut: Digest  -- no single Fig.-2 variable names this; it is this
+//     engine's own cache of "which safe cut should the next round's proposal parent
+//     onto", playing `make_cut_proposal`'s convenience role
+//     -> highest_safe_cut: Digest
+//   sent_timeouts: BTreeSet<CutRound>  -- timed_out
+//     -> timed_out: BTreeSet<CutRound>  (Fig. 2: one per-current-round bool, reset on
+//        round entry; here, one persistent latch per round, since this engine tracks
+//        many rounds' in-flight messages concurrently rather than only curr_round)
+//   decides_by_round: BTreeMap<CutRound, Decide>  -- committed[r]
+//     -> committed: BTreeMap<CutRound, Decide>  (key presence IS committed[r]; the
+//        value is the quorum-crossing `Decide` itself, needed by `try_commit_round`'s
+//        cut-id comparison against `leader_cut_by_round`)
+//   sent_decide_rounds: BTreeSet<CutRound>  -- voted ("has this party sent its own
+//     ⟨commit, r⟩ yet" -- `Decide` IS the paper's commit message)
+//     -> voted: BTreeSet<CutRound>
+//   voted_cut_rounds: BTreeSet<CutRound>  -- NO Fig.-2 equivalent: this is this
+//     engine's OWN CutVote-sent latch, standing in for RBC-echo participation, which
+//     the paper's `rb-broadcast` primitive absorbs and never names as a party-visible
+//     step at all
+//     -> sent_cut_votes: BTreeSet<CutRound>  (renamed FROM `voted_cut_rounds`
+//        specifically to stop colliding with the real `voted` above, which means
+//        something else -- see this module's own task report for the conflict this
+//        surfaced and why both names changed together)
+// Left deliberately UNCHANGED (not among the names the task asked to align -- `safe`,
+// `voted`, `timed_out`, `committed`): `certified_timed_out` (closest Fig.-2 analogue:
+// `disabled`), `sent_commit_rounds` (Fig. 2 names no flag for this at all -- it is the
+// **Deliver** action's own local, one-shot latch, distinct from `committed[r]` itself),
+// `cut_round_by_id`, `leader_cut_by_round`, `cut_proposals`, `pending_cut_children`,
+// every timeout-ladder/aggregator/repair field.
 //
 // Architecture: `CutEngine` is a pure state machine. It never holds a `ReliableSender`,
 // a `Wire`, a `LaneManager`, a `Store`, or any channel -- upstream's `Core` holds all of
@@ -58,22 +134,32 @@
 // constructor that does no actual `.await` work. This matches `AgbEngine`/`ControlLog`,
 // neither of which has a single `async fn` either.
 //
-// REPAIR (not upstream -- new machinery, added after the port to close a liveness gap
-// it otherwise inherited): the paper (arXiv:2606.14404, Fig. 2) delivers `CutProposal`s
-// by reliable broadcast, whose totality property guarantees that once any correct
-// party rb-delivers, every correct party eventually does. This port replaces RBC with
-// vote-aggregation-plus-certificate (`process_cut_vote`/`process_cut_certificate`),
-// which carries no such guarantee: a `CutCertificate` names only a `cut_id`, and a
-// party can accept round r's certificate without ever having received round r's own
-// `CutProposal` -- `safe_cut_parent` cannot then resolve a citing child's parent
+// REPAIR (not upstream, not the paper either -- new machinery, added after the port to
+// close a liveness gap this port's OWN message pattern creates that a real reliable
+// broadcast would not have): the paper's `rb-broadcast`/`rb-deliver` gives every
+// correct party the SAME `proposal[r]` once any correct party has it at all (RBC's
+// totality property). This port's stand-in for that -- `CutProposal` broadcast plus
+// all-to-all `CutVote` echo (`process_cut_vote`) -- carries no such guarantee on its
+// own: a `CutVote` names only a `round` and `cut_id`, so a party can cross
+// `mint_threshold` (and so call `mark_cut_safe`) for a round whose own `CutProposal`
+// it never received -- `safe_cut_parent` cannot then resolve a citing child's parent
 // through `cut_round_by_id`, so the chain stalls rather than committing (see this
 // module's own test `missing_proposal_stalls_the_chain_rather_than_skipping_a_round`).
-// `ensure_cut_fetch`/`on_cut_fetch`/`on_cut_serve` restore the missing property
-// operationally, by pull rather than by broadcast -- mirroring
+// This liveness gap predates the Figure-2 rewrite above and is UNCHANGED by it (before
+// the rewrite, the identical gap existed one step later: a party could accept a PEER's
+// certificate for round r without ever having received round r's own `CutProposal`
+// either) -- only the trigger that surfaces it moves, from certificate-acceptance to
+// locally reaching `safe`. `ensure_cut_fetch`/`on_cut_fetch`/`on_cut_serve` restore the
+// missing property operationally, by pull rather than by broadcast -- mirroring
 // `vantage::control::ControlLog`'s own `ensure_fetch`/`on_control_fetch`/
-// `on_control_serve` for its carrier bodies exactly (see each method's own doc
-// comment for the parallel, and `process_cut_certificate`/`process_cut_proposal` for
-// the two triggers).
+// `on_control_serve` for its carrier bodies exactly (see each method's own doc comment
+// for the parallel, and `mark_cut_safe`/`process_cut_proposal` for the two triggers).
+// The fetch TARGET set at `mark_cut_safe`'s trigger is exactly the `mint_threshold`-many
+// voters THIS party itself counted (`CutVoteAggregator::append`'s own returned
+// `voters`) -- the closest available analogue to the removed certificate's `votes`
+// list, but (unlike that list) never transmitted or trusted from a peer: it is this
+// party's own first-hand record of who it received a vote from, so asking exactly
+// those peers for the proposal carries no less assurance than the old design did.
 
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
@@ -82,8 +168,7 @@ use crate::simpleit::aggregators::{
 };
 use crate::simpleit::effects::{CutEffect, CutOut};
 use crate::simpleit::messages::{
-    Cut, CutCertificate, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
-    TimeoutCert,
+    Cut, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
 };
 use crate::vantage::agb;
 use config::{Committee, Stake};
@@ -95,11 +180,18 @@ use std::time::{Duration, Instant};
 /// armed timer firing). Wiring this to the real wire enum (`PrimaryMessage`) and to
 /// `vantage::node::Inbound` is a separate, later task -- this type is deliberately not
 /// related to either.
+///
+/// No certificate-shaped variant exists here (see the module doc comment's "FIGURE-2
+/// REWRITE" paragraph) -- this is this engine's ENTIRE inbound message surface, so the
+/// absence is a compile-time guarantee, not merely a run-time one: nothing outside this
+/// enum can ever reach `CutEngine::handle` at all, and `handle`'s own match over it is
+/// exhaustive with no wildcard arm (see `mod tests`'
+/// `inbound_has_no_certificate_shaped_variant` for a test that fails to COMPILE, not
+/// merely to pass, if a certificate-shaped variant is ever added back here).
 #[derive(Clone, Debug)]
 pub enum Inbound {
     CutProposal(CutProposal),
     CutVote(CutVote),
-    CutCertificate(CutCertificate),
     Decide(Decide),
     Timeout(Timeout),
     TimeoutAccept(TimeoutAccept),
@@ -176,8 +268,12 @@ pub struct CutEngine {
     /// `leader_for_round`'s doc comment for why this discrepancy from the task brief
     /// does not affect the round -> leader mapping either way).
     cut_round: CutRound,
-    /// Upstream `Core::highest_certified_cut`.
-    highest_certified_cut: Digest,
+    /// Upstream `Core::highest_certified_cut`, renamed `highest_safe_cut`: the paper
+    /// (Fig. 2) names no single variable for "the cut the next round's proposal should
+    /// parent onto", but this field's role is unchanged by the Fig.-2 rewrite -- only
+    /// what sets it changed (`mark_cut_safe`'s own local threshold-crossing, never a
+    /// received certificate; see the module doc comment's field-mapping table).
+    highest_safe_cut: Digest,
     /// The floor `prune_below` was last called with (0 if never). Doubles as
     /// `sanitize_timeout_accept`'s staleness floor -- see that method's doc comment for
     /// why this replaces upstream's Autobahn-typed `gc_round: Height`.
@@ -229,28 +325,67 @@ pub struct CutEngine {
     /// Upstream `leader_cut_by_round: HashMap<u64, Digest>`. Already round-keyed.
     /// Round-prunable; covered.
     leader_cut_by_round: BTreeMap<CutRound, Digest>,
-    /// Upstream `cut_certificates: HashMap<u64, CutCertificate>`. Already round-keyed.
-    /// Round-prunable; covered.
-    cut_certificates: BTreeMap<CutRound, CutCertificate>,
+    /// Upstream `cut_certificates: HashMap<u64, CutCertificate>`, renamed `safe` and
+    /// re-typed `BTreeMap<CutRound, Digest>` -- Fig. 2's `safe[r]` state variable: key
+    /// presence IS `safe[r] = true`; the value is `proposal[r]`'s id (Fig. 2 tracks
+    /// that separately, in `proposal[r]`, but the two are only ever established
+    /// together in this engine -- see `mark_cut_safe`). Populated ONLY by
+    /// `mark_cut_safe`, reached ONLY from `process_cut_vote`'s own
+    /// `CutVoteAggregator` crossing `mint_threshold` on first-hand-verified votes --
+    /// never from a received message asserting a round is safe (there is no such
+    /// message; see the module doc comment's "FIGURE-2 REWRITE" paragraph). Already
+    /// round-keyed. Round-prunable; covered.
+    safe: BTreeMap<CutRound, Digest>,
     /// Upstream `decide_aggregators: HashMap<(u64, Digest), DecideAggregator>`. Already
     /// tuple-keyed by round; container swap only. Round-prunable; covered.
     decide_aggregators: BTreeMap<(CutRound, Digest), DecideAggregator>,
-    /// Upstream `decides_by_round: HashMap<u64, Decide>`. Already round-keyed.
+    /// Upstream `decides_by_round: HashMap<u64, Decide>`, renamed `committed` -- Fig.
+    /// 2's `committed[r]` state variable: key presence IS `committed[r] = true`; the
+    /// value is the quorum-crossing `Decide` itself, needed by `try_commit_round`'s
+    /// cut-id comparison against `leader_cut_by_round`. Already round-keyed.
     /// Round-prunable; covered.
-    decides_by_round: BTreeMap<CutRound, Decide>,
-    /// Upstream `voted_cut_rounds: HashSet<u64>`. Round-prunable; covered.
-    voted_cut_rounds: BTreeSet<CutRound>,
+    committed: BTreeMap<CutRound, Decide>,
+    /// Upstream `voted_cut_rounds: HashSet<u64>`, renamed `sent_cut_votes`. NOT Fig.
+    /// 2's `voted` (that is the field below, `voted`) -- this is this engine's OWN
+    /// CutVote-sent latch, standing in for RBC-echo participation, a step the paper's
+    /// `rb-broadcast` primitive absorbs and never names. Renamed specifically to stop
+    /// colliding with the real `voted` below now that the Fig.-2 alignment makes the
+    /// distinction load-bearing -- see the module doc comment's field-mapping table.
+    /// Round-prunable; covered.
+    sent_cut_votes: BTreeSet<CutRound>,
     /// Upstream `proposed_cut_rounds: HashSet<u64>`. Round-prunable; covered.
     proposed_cut_rounds: BTreeSet<CutRound>,
-    /// Upstream `sent_decide_rounds: HashSet<u64>`. Round-prunable; covered.
-    sent_decide_rounds: BTreeSet<CutRound>,
-    /// Upstream `sent_commit_rounds: HashSet<u64>`. Round-prunable; covered.
+    /// Upstream `sent_decide_rounds: HashSet<u64>`, renamed `voted` -- Fig. 2's `voted`
+    /// flag ("has this party sent its own `⟨commit, r⟩` yet"; `Decide` IS the paper's
+    /// commit message, per messages.rs's own doc comment on `Decide`). Fig. 2 resets
+    /// this to `false` on every round entry (it is a single per-current-round bool
+    /// there); here it is one persistent latch per round, for the same reason
+    /// `timed_out` below is (this engine tracks many rounds' in-flight messages
+    /// concurrently, not only `curr_round`). Round-prunable; covered.
+    voted: BTreeSet<CutRound>,
+    /// Upstream `sent_commit_rounds: HashSet<u64>`. Fig. 2 names no flag for this at
+    /// all -- it is the **Deliver** action's own one-shot local latch (guards
+    /// `emit_commit_to_committer`), distinct from `committed[r]` itself (this engine's
+    /// `committed`, above): a round can be `committed` for a while before this engine
+    /// has locally resolved enough to deliver it (see `node.rs`'s `commit_queue`).
+    /// Round-prunable; covered.
     sent_commit_rounds: BTreeSet<CutRound>,
-    /// Upstream `sent_timeouts: HashSet<u64>`. Round-prunable; covered.
-    sent_timeouts: BTreeSet<CutRound>,
+    /// Upstream `sent_timeouts: HashSet<u64>`, renamed `timed_out` -- Fig. 2's
+    /// `timed_out` flag ("has this party raised its own timeout flag for the current
+    /// round"). Same per-round-latch-vs.-per-current-round-bool distinction as `voted`
+    /// above. Round-prunable; covered.
+    timed_out: BTreeSet<CutRound>,
     /// Upstream `sent_timeout_accepts: HashSet<u64>`. Round-prunable; covered.
     sent_timeout_accepts: BTreeSet<CutRound>,
-    /// Upstream `certified_timed_out: HashSet<u64>`. Round-prunable; covered.
+    /// Upstream `certified_timed_out: HashSet<u64>`. Closest Fig.-2 analogue:
+    /// `disabled[r]` (set upon `rn_confirm(⟨timeout, r⟩)`, i.e. exactly this engine's
+    /// own timeout-CERTIFIED state) -- deliberately NOT renamed to `disabled`: the
+    /// task's paper-alignment list names `safe`/`voted`/`timed_out`/`committed`
+    /// specifically, not `disabled`, and this name already says precisely what it
+    /// tracks (the TimeoutCert-backed certified state, as opposed to `timed_out`
+    /// above, this party's own un-certified raised flag) without the risk of a
+    /// same-named-but-not-quite field pair the `voted`/`sent_cut_votes` split above
+    /// was written to avoid. Round-prunable; covered.
     certified_timed_out: BTreeSet<CutRound>,
     /// Upstream `scheduled_cut_timers: HashSet<u64>`. Round-prunable; covered.
     scheduled_cut_timers: BTreeSet<CutRound>,
@@ -278,7 +413,7 @@ impl CutEngine {
             gate_tips: true,
             crash_sim: None,
             cut_round: 1,
-            highest_certified_cut: Digest::default(),
+            highest_safe_cut: Digest::default(),
             gc_floor: 0,
             cut_vote_aggregators: BTreeMap::new(),
             timeouts_aggregators: BTreeMap::new(),
@@ -287,14 +422,14 @@ impl CutEngine {
             pending_cut_children: BTreeMap::new(),
             cut_round_by_id: BTreeMap::new(),
             leader_cut_by_round: BTreeMap::new(),
-            cut_certificates: BTreeMap::new(),
+            safe: BTreeMap::new(),
             decide_aggregators: BTreeMap::new(),
-            decides_by_round: BTreeMap::new(),
-            voted_cut_rounds: BTreeSet::new(),
+            committed: BTreeMap::new(),
+            sent_cut_votes: BTreeSet::new(),
             proposed_cut_rounds: BTreeSet::new(),
-            sent_decide_rounds: BTreeSet::new(),
+            voted: BTreeSet::new(),
             sent_commit_rounds: BTreeSet::new(),
-            sent_timeouts: BTreeSet::new(),
+            timed_out: BTreeSet::new(),
             sent_timeout_accepts: BTreeSet::new(),
             certified_timed_out: BTreeSet::new(),
             scheduled_cut_timers: BTreeSet::new(),
@@ -329,7 +464,6 @@ impl CutEngine {
         match inbound {
             Inbound::CutProposal(p) => self.process_cut_proposal(p, tips, oracle),
             Inbound::CutVote(v) => self.process_cut_vote(v, tips, oracle),
-            Inbound::CutCertificate(c) => self.process_cut_certificate(c, tips, oracle),
             Inbound::Decide(d) => self.process_decide(d),
             Inbound::Timeout(t) => self.handle_timeout(t, tips, oracle),
             Inbound::TimeoutAccept(a) => {
@@ -421,13 +555,13 @@ impl CutEngine {
         self.timeouts_aggregators = self.timeouts_aggregators.split_off(&floor);
         self.timeout_accept_aggregators = self.timeout_accept_aggregators.split_off(&floor);
         self.leader_cut_by_round = self.leader_cut_by_round.split_off(&floor);
-        self.cut_certificates = self.cut_certificates.split_off(&floor);
-        self.decides_by_round = self.decides_by_round.split_off(&floor);
-        self.voted_cut_rounds = self.voted_cut_rounds.split_off(&floor);
+        self.safe = self.safe.split_off(&floor);
+        self.committed = self.committed.split_off(&floor);
+        self.sent_cut_votes = self.sent_cut_votes.split_off(&floor);
         self.proposed_cut_rounds = self.proposed_cut_rounds.split_off(&floor);
-        self.sent_decide_rounds = self.sent_decide_rounds.split_off(&floor);
+        self.voted = self.voted.split_off(&floor);
         self.sent_commit_rounds = self.sent_commit_rounds.split_off(&floor);
-        self.sent_timeouts = self.sent_timeouts.split_off(&floor);
+        self.timed_out = self.timed_out.split_off(&floor);
         self.sent_timeout_accepts = self.sent_timeout_accepts.split_off(&floor);
         self.certified_timed_out = self.certified_timed_out.split_off(&floor);
         self.scheduled_cut_timers = self.scheduled_cut_timers.split_off(&floor);
@@ -452,9 +586,9 @@ impl CutEngine {
 
     /// Every other committee member (never `self.name`) -- the fallback fetch-target
     /// set for `process_cut_proposal`'s "parent unknown" trigger, which (unlike
-    /// `process_cut_certificate`'s certificate-driven trigger) has no per-voter
-    /// evidence to narrow to. See that call site's own comment for the full
-    /// justification.
+    /// `mark_cut_safe`'s vote-driven trigger, which asks exactly the witnesses it
+    /// counted) has no per-voter evidence to narrow to. See that call site's own
+    /// comment for the full justification.
     fn all_other_committee_members(&self) -> Vec<PublicKey> {
         self.committee
             .authorities
@@ -469,10 +603,10 @@ impl CutEngine {
     /// pair -- mirrors `control::ControlLog::ensure_fetch` exactly (see its doc
     /// comment for the retry rationale). No-op if we already hold the proposal
     /// (`cut_round_by_id`) or `round` is already pruned. Called from both repair
-    /// triggers: `process_cut_certificate` (an exact round, read directly off the
-    /// certificate) and `process_cut_proposal`'s buffering branch (a best-effort
-    /// round guess -- see that call site for why an exact round isn't available
-    /// there).
+    /// triggers: `mark_cut_safe` (an exact round, read directly off the just-crossed
+    /// vote threshold, with `targets` the exact witnesses counted) and
+    /// `process_cut_proposal`'s buffering branch (a best-effort round guess -- see
+    /// that call site for why an exact round isn't available there).
     fn ensure_cut_fetch(
         &mut self,
         round: CutRound,
@@ -500,21 +634,27 @@ impl CutEngine {
             .collect()
     }
 
-    /// Upstream primary/src/core.rs:448-478.
+    /// Was upstream primary/src/core.rs:448-478 (minted+broadcast a `CutCertificate`
+    /// once THIS party's own vote count crossed `mint_threshold`). Now Fig. 2's
+    /// Mark-safe step, evaluated FIRST-HAND: every `CutVote` is individually verified
+    /// (`vote.verify`) and fed to this party's OWN `CutVoteAggregator` -- never a
+    /// peer's relayed claim -- and once weight crosses `mint_threshold`, this party
+    /// transitions straight into `mark_cut_safe` with the exact witnesses it counted.
+    /// No certificate is minted, broadcast, or received by anyone, anywhere -- see the
+    /// module doc comment's "FIGURE-2 REWRITE" paragraph for why this is the fix, not
+    /// merely a rename.
     pub fn process_cut_vote(&mut self, vote: CutVote, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
         if vote.verify(&self.committee).is_err() {
             return Vec::new();
         }
-        let key = (vote.round, vote.cut_id.clone());
+        let round = vote.round;
+        let cut_id = vote.cut_id.clone();
+        let key = (round, cut_id.clone());
         let aggregator = self.cut_vote_aggregators.entry(key).or_default();
-        let Ok(Some(certificate)) = aggregator.append(&vote, &self.committee) else {
+        let Ok(Some(witnesses)) = aggregator.append(&vote, &self.committee) else {
             return Vec::new();
         };
-        let mut effects = vec![CutEffect::Broadcast(CutOut::CutCertificate(
-            certificate.clone(),
-        ))];
-        effects.extend(self.process_cut_certificate(certificate, tips, oracle));
-        effects
+        self.mark_cut_safe(round, cut_id, witnesses, tips, oracle)
     }
 
     /// Upstream primary/src/core.rs:480-544.
@@ -536,11 +676,11 @@ impl CutEngine {
     /// design rather than a second, separate fix.)
     ///
     /// Deviation 3: the f+1 tip-availability gate sits immediately before the one
-    /// voting decision (`voted_cut_rounds.insert`), gating only the vote -- recording
+    /// voting decision (`sent_cut_votes.insert`), gating only the vote -- recording
     /// the proposal and reparenting its own pending children happen unconditionally,
     /// exactly as upstream does, since the paper's gate is about "casting a vote", not
     /// about learning of/relaying a proposal. A gate failure does not consume the
-    /// per-round vote latch (`voted_cut_rounds`), unlike upstream's original passing
+    /// per-round vote latch (`sent_cut_votes`), unlike upstream's original passing
     /// case (which always consumes it): this is deliberate, so a proposal that fails
     /// the gate leaves the round eligible to vote later if some other satisfying event
     /// re-drives processing for it -- this engine does not itself invent such a retry
@@ -572,22 +712,22 @@ impl CutEngine {
                 // simply not yet safe (an in-flight pipeline wait on intermediate
                 // rounds' own timeout certification, or a malformed parent_round >=
                 // round), which `safe_cut_parent` would also reject but which
-                // fetching cannot help. Target set: unlike
-                // `process_cut_certificate`'s trigger, no certificate or per-voter
-                // evidence exists for this specific digest (if it did, that
-                // certificate's own acceptance would already have triggered a fetch
-                // for it) -- there is no narrower evidence than "ask everyone", so
-                // this asks the full committee. Round guess: `round - 1`, exact
-                // whenever no timeout-skipped round sits between parent and child
-                // (the common/optimistic case: `make_cut_proposal` always cites
-                // `highest_certified_cut`, which a leader updates only immediately
-                // upon certifying the round it then builds on). A wrong guess (a
-                // skipped round sits between them) is not fatal: `ensure_cut_fetch`
-                // simply never matches a genuine answer for the true parent's real
-                // round, so it goes unanswered rather than corrupting state, and
-                // `process_cut_certificate`'s own trigger remains the fully general
-                // backstop -- it fires with the EXACT round once this party
-                // independently observes the true parent's own certificate.
+                // fetching cannot help. Target set: unlike `mark_cut_safe`'s trigger,
+                // no per-voter evidence exists for this specific digest (if it did,
+                // this party would itself already have crossed `mint_threshold` for
+                // it, which would already have triggered a fetch) -- there is no
+                // narrower evidence than "ask everyone", so this asks the full
+                // committee. Round guess: `round - 1`, exact whenever no
+                // timeout-skipped round sits between parent and child (the
+                // common/optimistic case: `make_cut_proposal` always cites
+                // `highest_safe_cut`, which a leader updates only immediately upon
+                // marking safe the round it then builds on). A wrong guess (a skipped
+                // round sits between them) is not fatal: `ensure_cut_fetch` simply
+                // never matches a genuine answer for the true parent's real round, so
+                // it goes unanswered rather than corrupting state, and
+                // `mark_cut_safe`'s own trigger remains the fully general backstop --
+                // it fires with the EXACT round once this party independently crosses
+                // `mint_threshold` for the true parent itself.
                 if parent_cut != Digest::default()
                     && !self.cut_round_by_id.contains_key(&parent_cut)
                 {
@@ -636,7 +776,7 @@ impl CutEngine {
                 }
             }
 
-            if tips_ok && self.voted_cut_rounds.insert(round) {
+            if tips_ok && self.sent_cut_votes.insert(round) {
                 let vote = CutVote {
                     round,
                     cut_id: cut_id.clone(),
@@ -714,43 +854,50 @@ impl CutEngine {
         cut_id
     }
 
-    /// Upstream primary/src/core.rs:652-687.
-    pub fn process_cut_certificate(
+    /// Was upstream primary/src/core.rs:652-687 (`process_cut_certificate`, verifying
+    /// and accepting a RECEIVED `CutCertificate`). Now Fig. 2's Mark-safe step
+    /// immediately followed by Vote ("send `⟨commit, curr_round⟩` to all parties"),
+    /// reached ONLY from `process_cut_vote` -- exclusively when THIS party's own
+    /// `CutVoteAggregator` crosses `mint_threshold` on votes it individually verified.
+    /// There is no longer a verify step here (there is nothing left to verify: every
+    /// vote that got `round`/`cut_id`/`witnesses` here already passed `CutVote::
+    /// verify` and the aggregator's own dedup, one at a time, in `process_cut_vote`).
+    /// `witnesses` is `CutVoteAggregator::append`'s own returned voter list -- this
+    /// party's first-hand record of who it received a vote from, used below only as
+    /// `ensure_cut_fetch`'s target set (see the module doc comment's REPAIR
+    /// paragraph), never transmitted anywhere.
+    fn mark_cut_safe(
         &mut self,
-        certificate: CutCertificate,
+        round: CutRound,
+        cut_id: Digest,
+        witnesses: Vec<PublicKey>,
         tips: &Cut,
         oracle: &dyn TipOracle,
     ) -> Vec<CutEffect> {
-        if certificate.verify(&self.committee).is_err() {
-            return Vec::new();
-        }
-        let round = certificate.round;
         if self.certified_timed_out.contains(&round) {
             return Vec::new();
         }
-        let cut_id = certificate.cut_id.clone();
-        let voters = certificate.votes.clone();
-        self.cut_certificates.entry(round).or_insert(certificate);
+        self.safe.entry(round).or_insert_with(|| cut_id.clone());
         if round + 1 >= self.cut_round {
-            self.highest_certified_cut = cut_id.clone();
+            self.highest_safe_cut = cut_id.clone();
         }
         self.cut_round = self.cut_round.max(round + 1);
         self.advance_timed_out_cut_rounds();
 
-        // REPAIR (see the module doc comment): the certificate names only a
-        // `cut_id` -- if we never independently received/recorded round `round`'s
-        // own `CutProposal`, nothing else will ever ask for it (`safe_cut_parent`'s
+        // REPAIR (see the module doc comment): crossing `mint_threshold` names only a
+        // `cut_id` -- if we never independently received/recorded round `round`'s own
+        // `CutProposal`, nothing else will ever ask for it (`safe_cut_parent`'s
         // "parent unknown" branch only BUFFERS a citing child, it never fetches on
-        // its own -- that is `process_cut_proposal`'s OWN, separate trigger, for
-        // when a child arrives before this certificate ever does). Every one of
-        // `certificate.votes` claimed, by voting, to have seen the proposal -- see
-        // `ensure_cut_fetch`'s doc comment.
-        let mut effects = self.ensure_cut_fetch(round, &cut_id, voters);
-        if self.sent_decide_rounds.insert(round) {
+        // its own -- that is `process_cut_proposal`'s OWN, separate trigger, for when
+        // a child arrives before this party ever crosses the threshold itself). Every
+        // one of `witnesses` sent us a `CutVote` naming this `cut_id`, i.e. claimed,
+        // by voting, to have seen the proposal -- see `ensure_cut_fetch`'s doc
+        // comment.
+        let mut effects = self.ensure_cut_fetch(round, &cut_id, witnesses);
+        if self.voted.insert(round) {
             let decide = Decide {
                 id: cut_id,
                 round,
-                origin: self.name,
                 author: self.name,
             };
             effects.push(CutEffect::Broadcast(CutOut::Decide(decide.clone())));
@@ -762,12 +909,16 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:689-712.
+    /// Upstream primary/src/core.rs:689-712. `Decide` is Fig. 2's `⟨commit, r⟩`; this
+    /// is the **Commit** step ("Upon receiving `⟨commit, r⟩` from n - f parties for
+    /// some round r, set `committed[r] ← true`"), counted FIRST-HAND exactly like
+    /// `process_cut_vote` above -- every `Decide` is individually verified
+    /// (`decide.verify`) and fed to this party's OWN `DecideAggregator`.
     pub fn process_decide(&mut self, decide: Decide) -> Vec<CutEffect> {
         if decide.verify(&self.committee).is_err() {
             return Vec::new();
         }
-        if self.decides_by_round.contains_key(&decide.round) {
+        if self.committed.contains_key(&decide.round) {
             return Vec::new();
         }
 
@@ -777,13 +928,13 @@ impl CutEngine {
             return Vec::new();
         };
         let round = quorum_decide.round;
-        self.decides_by_round.entry(round).or_insert(quorum_decide);
+        self.committed.entry(round).or_insert(quorum_decide);
         self.try_commit_round(round)
     }
 
     /// Upstream primary/src/core.rs:714-727.
     fn try_commit_round(&mut self, round: CutRound) -> Vec<CutEffect> {
-        let Some(decide) = self.decides_by_round.get(&round) else {
+        let Some(decide) = self.committed.get(&round) else {
             return Vec::new();
         };
         let Some(leader_cut) = self.leader_cut_by_round.get(&round) else {
@@ -825,7 +976,7 @@ impl CutEngine {
         if self.name != self.leader_for_round(round) {
             return Vec::new();
         }
-        if !self.safe_cut_parent(round, &self.highest_certified_cut) {
+        if !self.safe_cut_parent(round, &self.highest_safe_cut) {
             return Vec::new();
         }
         if !self.proposed_cut_rounds.insert(round) {
@@ -838,7 +989,7 @@ impl CutEngine {
             return Vec::new();
         }
 
-        let parent_cut = self.highest_certified_cut.clone();
+        let parent_cut = self.highest_safe_cut.clone();
         let proposal = self.make_cut_proposal(round, parent_cut, tips);
         let mut effects = vec![CutEffect::Broadcast(CutOut::CutProposal(proposal.clone()))];
         effects.extend(self.process_cut_proposal(proposal, tips, oracle));
@@ -879,7 +1030,7 @@ impl CutEngine {
     /// had.
     ///
     /// `pub` (production wiring, `simpleit::node::SimpleItCore`): every OTHER caller of
-    /// this method is internal (`process_cut_certificate`/`handle_timeout_accept_action`,
+    /// this method is internal (`mark_cut_safe`/`handle_timeout_accept_action`,
     /// both only ever reachable after `cut_round` has already advanced PAST round 1), so
     /// round 1 itself never gets a timer armed this way -- the production wiring calls
     /// this directly, once, at boot (`schedule_cut_timer(1)`), exactly mirroring how
@@ -921,7 +1072,7 @@ impl CutEngine {
     fn advance_timed_out_cut_rounds(&mut self) -> bool {
         let old_cut_round = self.cut_round;
         while self.certified_timed_out.contains(&self.cut_round)
-            && self.safe_cut_parent(self.cut_round + 1, &self.highest_certified_cut)
+            && self.safe_cut_parent(self.cut_round + 1, &self.highest_safe_cut)
         {
             self.cut_round += 1;
         }
@@ -936,9 +1087,9 @@ impl CutEngine {
         oracle: &dyn TipOracle,
     ) -> Vec<CutEffect> {
         if round != self.cut_round
-            || self.cut_certificates.contains_key(&round)
+            || self.safe.contains_key(&round)
             || self.certified_timed_out.contains(&round)
-            || !self.sent_timeouts.insert(round)
+            || !self.timed_out.insert(round)
         {
             return Vec::new();
         }
@@ -964,8 +1115,7 @@ impl CutEngine {
             return Vec::new();
         }
         let round = timeout.round;
-        if self.certified_timed_out.contains(&round) || self.cut_certificates.contains_key(&round)
-        {
+        if self.certified_timed_out.contains(&round) || self.safe.contains_key(&round) {
             return Vec::new();
         }
 
@@ -1013,8 +1163,7 @@ impl CutEngine {
             return (0, None);
         }
         let round = accept.round;
-        if self.certified_timed_out.contains(&round) || self.cut_certificates.contains_key(&round)
-        {
+        if self.certified_timed_out.contains(&round) || self.safe.contains_key(&round) {
             return (0, None);
         }
 
@@ -1093,11 +1242,11 @@ impl CutEngine {
     // ============================================================ Cut-proposal repair
     //
     // Not upstream -- upstream has no equivalent. Closes the liveness gap where a
-    // party accepts round r's `CutCertificate` (naming only a `cut_id`) without ever
-    // having received round r's own `CutProposal` -- see the module doc comment and
-    // `process_cut_certificate`/`process_cut_proposal` for the two triggers that call
-    // `ensure_cut_fetch` above. Mirrors `control::ControlLog`'s own carrier-body
-    // fetch/serve (`on_control_fetch`/`on_control_serve`) exactly.
+    // party locally marks round r safe (crossing `mint_threshold` on votes naming only
+    // a `cut_id`) without ever having received round r's own `CutProposal` -- see the
+    // module doc comment and `mark_cut_safe`/`process_cut_proposal` for the two
+    // triggers that call `ensure_cut_fetch` above. Mirrors `control::ControlLog`'s own
+    // carrier-body fetch/serve (`on_control_fetch`/`on_control_serve`) exactly.
 
     /// A peer's request for `(round, cut_id)` -- answer with our own held
     /// `CutProposal` if we have it and haven't already answered this requester for
@@ -1230,10 +1379,11 @@ mod tests {
         })
     }
 
-    fn find_certificate(effects: &[CutEffect], round: CutRound) -> bool {
-        effects.iter().any(
-            |e| matches!(e, CutEffect::Broadcast(CutOut::CutCertificate(c)) if c.round == round),
-        )
+    fn find_decide_for_round(effects: &[CutEffect], round: CutRound) -> Option<Decide> {
+        effects.iter().find_map(|e| match e {
+            CutEffect::Broadcast(CutOut::Decide(d)) if d.round == round => Some(d.clone()),
+            _ => None,
+        })
     }
 
     fn find_commits(effects: &[CutEffect], round: CutRound) -> Vec<(CutRound, Cut)> {
@@ -1264,8 +1414,10 @@ mod tests {
     }
 
     /// Test 1: happy path end to end, at both n=4 and n=10 -- proposal -> votes to
-    /// `optimistic_threshold` -> certificate -> decides to `quorum_threshold` -> commit
-    /// emitted exactly once for the round.
+    /// `mint_threshold` -> this party marks the round `safe` (and, in the SAME step,
+    /// sends its own `Decide` -- no certificate round-trip in between: one fewer
+    /// message delay than the removed certificate-broadcast design) -> decides to
+    /// `quorum_threshold` -> commit emitted exactly once for the round.
     fn happy_path_commit(n: u8) {
         let (committee, keys) = committee_of(n);
         let tips = sample_tips(&keys);
@@ -1284,18 +1436,19 @@ mod tests {
             find_vote_for_round(&effects, round).is_some(),
             "leader self-votes for its own proposal"
         );
-        assert!(!find_certificate(&effects, round));
+        assert!(!engine.safe.contains_key(&round));
 
-        // Votes: bring in other committee members' votes for the same cut_id until the
-        // certificate effect appears.
+        // Votes: bring in other committee members' votes for the same cut_id until
+        // this party's own count crosses `mint_threshold` and it marks the round safe
+        // locally -- no certificate is minted or broadcast anywhere on this path.
         let mut others = keys.iter().filter(|k| **k != leader);
         loop {
-            if find_certificate(&effects, round) {
+            if engine.safe.contains_key(&round) {
                 break;
             }
             let author = *others
                 .next()
-                .expect("committee is large enough to reach optimistic_threshold");
+                .expect("committee is large enough to reach mint_threshold");
             let vote = CutVote {
                 round,
                 cut_id: cut_id.clone(),
@@ -1303,10 +1456,17 @@ mod tests {
             };
             effects = engine.process_cut_vote(vote, &tips, &oracle);
         }
+        assert_eq!(engine.safe.get(&round), Some(&cut_id));
+        assert!(
+            find_decide_for_round(&effects, round).is_some(),
+            "the vote that crosses mint_threshold broadcasts this party's own Decide \
+             in the SAME step -- one fewer message delay than the old \
+             certificate-broadcast design"
+        );
 
         // Decides: bring in other committee members' decides for the same (round,
-        // cut_id) until commit appears. The certificate-forming call above already
-        // produced our own self-decide.
+        // cut_id) until commit appears. The safe-crossing call above already produced
+        // our own self-decide.
         let mut others = keys.iter().filter(|k| **k != leader);
         let mut commits = find_commits(&effects, round);
         while commits.is_empty() {
@@ -1316,7 +1476,6 @@ mod tests {
             let decide = Decide {
                 id: cut_id.clone(),
                 round,
-                origin: leader,
                 author,
             };
             effects = engine.process_decide(decide);
@@ -1346,15 +1505,22 @@ mod tests {
         happy_path_commit(10);
     }
 
-    /// REGRESSION (audit fix, see `aggregators::mint_threshold`): a `CutCertificate` is
-    /// minted at `max(optimistic_threshold, quorum_threshold)` and verified at
-    /// `quorum_threshold`, so a freshly minted certificate always passes its own
-    /// `verify`. Before the clamp, `optimistic_threshold` alone was strictly smaller for
-    /// f <= 2 (n = 4, 5, 6, 8, 9, 12 -- and n=4 is `fab remote`'s default), so the
-    /// minting party rejected the certificate it had just built, no party ever sent a
-    /// `Decide`, and the round could never commit.
+    /// REGRESSION (audit fix, see `aggregators::mint_threshold`); ADAPTED for the
+    /// Fig.-2 rewrite -- was `minted_certificate_passes_its_own_verify_at_small_
+    /// committees`. There is no certificate to verify anymore: each party marks a
+    /// round safe by counting its OWN `CutVote`s to `mint_threshold =
+    /// max(optimistic_threshold, quorum_threshold)`, with no separate verify step
+    /// downstream. Before the clamp, `optimistic_threshold` alone was strictly
+    /// smaller for f <= 2 (n = 4, 5, 6, 8, 9, 12 -- and n=4 is `fab remote`'s
+    /// default); under the OLD certificate design that meant the minting party
+    /// rejected the certificate it had just built (mint < verify), so no `Decide` was
+    /// ever sent and the round could never commit. Under THIS design there is no
+    /// verify step to catch an unclamped threshold at all -- `mint_threshold` alone
+    /// stands between "some party thinks it's safe" and actual safety -- so this
+    /// sweeps exactly the sizes where an unclamped threshold would fail silently
+    /// rather than loudly.
     #[test]
-    fn minted_certificate_passes_its_own_verify_at_small_committees() {
+    fn party_reaches_safe_at_the_correctly_clamped_local_vote_threshold() {
         for n in [4u8, 5, 6, 8, 9] {
             let (committee, keys) = committee_of(n);
             let tips = sample_tips(&keys);
@@ -1362,14 +1528,14 @@ mod tests {
             let leader = agb::proposer(&committee, 2);
             let mut engine = CutEngine::new(leader, committee.clone(), 1_000);
 
-            let mut effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
+            let effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
             let cut_id = find_proposal(&effects).expect("leader proposes").id();
+            assert!(!engine.safe.contains_key(&1), "n={n}: self-vote alone is not enough");
 
             let mut others = keys.iter().filter(|k| **k != leader);
-            let mut minted: Option<CutCertificate> = None;
-            while minted.is_none() {
-                let author = *others.next().expect("committee large enough");
-                effects = engine.process_cut_vote(
+            while !engine.safe.contains_key(&1) {
+                let author = *others.next().expect("committee large enough to reach mint_threshold");
+                engine.process_cut_vote(
                     CutVote {
                         round: 1,
                         cut_id: cut_id.clone(),
@@ -1378,29 +1544,123 @@ mod tests {
                     &tips,
                     &oracle,
                 );
-                minted = effects.iter().find_map(|e| match e {
-                    CutEffect::Broadcast(CutOut::CutCertificate(c)) => Some(c.clone()),
-                    _ => None,
-                });
             }
 
-            let cert = minted.expect("a certificate was broadcast");
-            assert!(
-                cert.verify(&committee).is_ok(),
-                "n={n}: certificate with {} votes failed its own verify (needs {})",
-                cert.votes.len(),
-                committee.quorum_threshold()
+            assert_eq!(
+                engine.safe.get(&1),
+                Some(&cut_id),
+                "n={n}: safe[1] should hold exactly the cut this party's own votes converged on"
             );
             assert!(
-                engine.sent_decide_rounds.contains(&1),
-                "n={n}: the accepted certificate should have produced a Decide"
+                engine.voted.contains(&1),
+                "n={n}: reaching safe should have sent this party's own Decide (Fig. 2's Vote step)"
             );
         }
     }
 
-    /// AUDIT: what actually happens to a party that receives round r's CERTIFICATE but
-    /// never its PROPOSAL. Establishes whether the failure mode is a divergent commit
-    /// order (unsafe) or a stall (a liveness gap).
+    /// REQUIRED (task): a party reaches `safe[r]` purely by counting votes, with no
+    /// certificate message ever crossing the wire -- proved at the type level, not
+    /// merely asserted at run time. `mint_threshold` (n=10: quorum_threshold = 7) is
+    /// never reached below `quorum_threshold` distinct votes -- so there is no
+    /// shortcut that marks a round safe on fewer than a quorum's worth of
+    /// first-hand-counted, individually-verified votes.
+    #[test]
+    fn safe_is_reached_only_by_counting_distinct_votes_never_below_quorum() {
+        let (committee, keys) = committee_of(10);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let leader = agb::proposer(&committee, 2);
+        let mut engine = CutEngine::new(leader, committee.clone(), 1_000);
+
+        let effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
+        let cut_id = find_proposal(&effects).expect("leader proposes").id();
+        assert!(!engine.safe.contains_key(&1), "the leader's own self-vote alone is not enough");
+
+        let quorum = committee.quorum_threshold();
+        let mut voted = 1u32; // the leader's own self-vote, above
+        for author in keys.iter().filter(|k| **k != leader) {
+            if engine.safe.contains_key(&1) {
+                break;
+            }
+            engine.process_cut_vote(
+                CutVote {
+                    round: 1,
+                    cut_id: cut_id.clone(),
+                    author: *author,
+                },
+                &tips,
+                &oracle,
+            );
+            voted += 1;
+            if !engine.safe.contains_key(&1) {
+                assert!(
+                    voted <= quorum,
+                    "still not safe with {voted} distinct votes counted (quorum is {quorum}) \
+                     -- mint_threshold should never exceed n"
+                );
+            }
+        }
+
+        assert!(engine.safe.contains_key(&1), "committee is large enough to reach mint_threshold");
+        assert_eq!(engine.safe.get(&1), Some(&cut_id));
+        assert!(
+            voted >= quorum,
+            "safe was reached with only {voted} distinct votes, fewer than quorum_threshold \
+             ({quorum}) -- mint_threshold's clamp is not holding"
+        );
+
+        // A single corrupt (or merely noisy) party resending its OWN already-counted
+        // vote cannot manufacture additional weight: `CutVoteAggregator`'s dedup
+        // (`used: HashSet<PublicKey>`) rejects a repeat from the same author, so
+        // crossing `mint_threshold` categorically requires that many DISTINCT
+        // authors, never fewer authors voting more times.
+        let repeat_author = keys[0];
+        let before = engine.safe.get(&1).cloned();
+        engine.process_cut_vote(
+            CutVote { round: 1, cut_id: cut_id.clone(), author: repeat_author },
+            &tips,
+            &oracle,
+        );
+        assert_eq!(engine.safe.get(&1), before.as_ref(), "a replayed vote changes nothing");
+    }
+
+    /// REQUIRED (task): a forged notarization is impossible -- there is no message a
+    /// party can send that makes ANOTHER party mark a round safe without that party
+    /// itself counting `mint_threshold` distinct votes. This is asserted
+    /// STRUCTURALLY, not merely at run time: `Inbound` is `CutEngine`'s entire
+    /// message surface (see `handle`'s own match over it), and the match below has NO
+    /// wildcard arm -- if a certificate-shaped variant is ever added back to
+    /// `Inbound`, this test module fails to COMPILE, not merely to pass, until it is
+    /// explicitly handled here. The only path that ever populates `safe` is
+    /// `process_cut_vote` -> `mark_cut_safe`, reached exclusively by this party's own
+    /// `CutVoteAggregator` crossing `mint_threshold` (see the two tests above) --
+    /// never by trusting a relayed aggregate asserted by another party.
+    #[test]
+    fn inbound_has_no_certificate_shaped_variant() {
+        fn assert_exhaustive_with_no_certificate_arm(inbound: Inbound) {
+            match inbound {
+                Inbound::CutProposal(_)
+                | Inbound::CutVote(_)
+                | Inbound::Decide(_)
+                | Inbound::Timeout(_)
+                | Inbound::TimeoutAccept(_)
+                | Inbound::TimerFired(_)
+                | Inbound::CutFetch(_, _, _)
+                | Inbound::CutServe(_) => {}
+            }
+        }
+        // Any one instance suffices: the exhaustiveness check above is performed by
+        // the compiler against the LIVE `Inbound` definition, not by this call.
+        assert_exhaustive_with_no_certificate_arm(Inbound::TimerFired(0));
+    }
+
+    /// AUDIT (ADAPTED for the Fig.-2 rewrite -- the trigger was a hand-built
+    /// `CutCertificate`, now `mint_threshold`-many `CutVote`s): what actually happens
+    /// to a party that counts enough votes to mark round r safe LOCALLY but never
+    /// itself received round r's own PROPOSAL. Establishes whether the failure mode
+    /// is a divergent commit order (unsafe) or a stall (a liveness gap) -- unchanged
+    /// by the rewrite, since a `CutVote` names only a `round` and `cut_id`, exactly
+    /// as a `CutCertificate` did.
     #[test]
     fn missing_proposal_stalls_the_chain_rather_than_skipping_a_round() {
         let (committee, keys) = committee_of(4);
@@ -1416,7 +1676,8 @@ mod tests {
         let mut engine = CutEngine::new(observer, committee.clone(), 1_000);
 
         // Round 1's cut, as some other party would have built it. This engine never
-        // sees the proposal itself -- only the certificate naming its id.
+        // sees the proposal itself -- only enough of its peers' CutVotes to cross
+        // mint_threshold locally.
         let round1_cut = CutProposal {
             round: 1,
             proposer: round1_leader,
@@ -1426,21 +1687,27 @@ mod tests {
         let round1_id = round1_cut.id();
         let voters: Vec<PublicKey> = keys
             .iter()
-            .take(committee.quorum_threshold() as usize)
+            .take(committee.quorum_threshold() as usize) // == mint_threshold at n=4
             .copied()
             .collect();
-        let cert = CutCertificate {
-            round: 1,
-            cut_id: round1_id.clone(),
-            votes: voters,
-        };
-        assert!(cert.verify(&committee).is_ok(), "test cert must be valid");
-        let effects = engine.process_cut_certificate(cert, &tips, &oracle);
+        let mut effects = Vec::new();
+        for author in voters {
+            effects = engine.process_cut_vote(
+                CutVote { round: 1, cut_id: round1_id.clone(), author },
+                &tips,
+                &oracle,
+            );
+        }
+        assert_eq!(
+            engine.safe.get(&1),
+            Some(&round1_id),
+            "mint_threshold distinct votes mark round 1 safe locally"
+        );
         assert!(
             effects
                 .iter()
                 .any(|e| matches!(e, CutEffect::Broadcast(CutOut::Decide(d)) if d.round == 1)),
-            "the certificate is accepted and produces a Decide for round 1"
+            "reaching safe locally produces a Decide for round 1"
         );
 
         // Round 2's proposal chains onto round 1's cut, whose digest this engine has
@@ -1468,7 +1735,6 @@ mod tests {
             let effects = engine.process_decide(Decide {
                 id: round2_leader_cut_id(&tips, round2_leader),
                 round: 2,
-                origin: round2_leader,
                 author,
             });
             assert!(
@@ -1488,14 +1754,17 @@ mod tests {
         .id()
     }
 
-    /// AUDIT FOLLOWUP (cut-proposal repair): the same missing-proposal scenario as
-    /// `missing_proposal_stalls_the_chain_rather_than_skipping_a_round` above, now
-    /// asserting the fix -- accepting round 1's certificate emits a fetch for its own
-    /// `(round, cut_id)` addressed to every one of the certificate's voters (every
-    /// listed voter claimed, by voting, to have seen the proposal -- see
-    /// `process_cut_certificate`'s own call to `ensure_cut_fetch`).
+    /// AUDIT FOLLOWUP (cut-proposal repair; ADAPTED for the Fig.-2 rewrite -- was
+    /// `certificate_with_unknown_proposal_triggers_fetch_to_its_voters`): the same
+    /// missing-proposal scenario as `missing_proposal_stalls_the_chain_rather_than_
+    /// skipping_a_round` above, now asserting the repair fix -- locally crossing
+    /// `mint_threshold` for round 1's cut_id emits a fetch for its own `(round,
+    /// cut_id)` addressed to exactly the witnesses THIS party itself counted (every
+    /// one of them sent a `CutVote` naming this cut_id, i.e. claimed, by voting, to
+    /// have seen the proposal -- see `mark_cut_safe`'s own call to `ensure_cut_fetch`
+    /// and `CutVoteAggregator::append`'s returned voter list).
     #[test]
-    fn certificate_with_unknown_proposal_triggers_fetch_to_its_voters() {
+    fn local_safe_with_unknown_proposal_triggers_fetch_to_its_witnesses() {
         let (committee, keys) = committee_of(4);
         let tips = sample_tips(&keys);
         let oracle = AllAvailable;
@@ -1516,17 +1785,19 @@ mod tests {
         let round1_id = round1_cut.id();
         let voters: Vec<PublicKey> = keys
             .iter()
-            .take(committee.quorum_threshold() as usize)
+            .take(committee.quorum_threshold() as usize) // == mint_threshold at n=4
             .copied()
             .collect();
-        let cert = CutCertificate {
-            round: 1,
-            cut_id: round1_id.clone(),
-            votes: voters.clone(),
-        };
-        assert!(cert.verify(&committee).is_ok(), "test cert must be valid");
 
-        let effects = engine.process_cut_certificate(cert, &tips, &oracle);
+        let mut effects = Vec::new();
+        for author in voters.clone() {
+            effects = engine.process_cut_vote(
+                CutVote { round: 1, cut_id: round1_id.clone(), author },
+                &tips,
+                &oracle,
+            );
+        }
+        assert!(engine.safe.contains_key(&1), "test setup must actually cross mint_threshold");
 
         let fetches = find_fetches(&effects);
         assert!(
@@ -1539,7 +1810,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             fetch_targets, expected,
-            "the fetch should be addressed to exactly the certificate's voters"
+            "the fetch should be addressed to exactly the witnesses whose votes were counted"
         );
         assert_eq!(
             engine.pending_cut_fetch.get(&(1, round1_id)),
@@ -1630,9 +1901,9 @@ mod tests {
         // Seed the exact state the stall scenario reaches (see
         // `missing_proposal_stalls_the_chain_rather_than_skipping_a_round`): round 2
         // buffered pending round 1's still-unknown proposal, and an outstanding
-        // fetch for it (as `process_cut_certificate`'s own trigger would have set up
-        // -- seeded directly here to isolate `on_cut_serve`'s own accept/dispatch
-        // behavior, mirroring `queue_with_invalid_sibling_still_processes_valid_one`'s
+        // fetch for it (as `mark_cut_safe`'s own trigger would have set up -- seeded
+        // directly here to isolate `on_cut_serve`'s own accept/dispatch behavior,
+        // mirroring `queue_with_invalid_sibling_still_processes_valid_one`'s
         // identical direct-seeding style).
         engine
             .pending_cut_children
@@ -1649,12 +1920,11 @@ mod tests {
             let effects = engine.process_decide(Decide {
                 id: round2_id.clone(),
                 round: 2,
-                origin: round2_leader,
                 author,
             });
             assert!(find_commits(&effects, 2).is_empty());
         }
-        assert!(engine.decides_by_round.contains_key(&2));
+        assert!(engine.committed.contains_key(&2));
 
         // The serve arrives.
         let effects = engine.on_cut_serve(round1_cut, &tips, &oracle);
@@ -2046,38 +2316,36 @@ mod tests {
         engine.cut_round_by_id.insert(d2.clone(), 2);
         engine.leader_cut_by_round.insert(1, d1.clone());
         engine.leader_cut_by_round.insert(2, d2.clone());
-        engine.cut_certificates.insert(1, CutCertificate::default());
-        engine.cut_certificates.insert(2, CutCertificate::default());
+        engine.safe.insert(1, d1.clone());
+        engine.safe.insert(2, d2.clone());
         engine
             .decide_aggregators
             .insert((1, d1.clone()), DecideAggregator::new());
         engine
             .decide_aggregators
             .insert((2, d2.clone()), DecideAggregator::new());
-        engine.decides_by_round.insert(
+        engine.committed.insert(
             1,
             Decide {
                 id: d1.clone(),
                 round: 1,
-                origin: key(1),
                 author: key(1),
             },
         );
-        engine.decides_by_round.insert(
+        engine.committed.insert(
             2,
             Decide {
                 id: d2.clone(),
                 round: 2,
-                origin: key(1),
                 author: key(1),
             },
         );
         for set in [
-            &mut engine.voted_cut_rounds,
+            &mut engine.sent_cut_votes,
             &mut engine.proposed_cut_rounds,
-            &mut engine.sent_decide_rounds,
+            &mut engine.voted,
             &mut engine.sent_commit_rounds,
-            &mut engine.sent_timeouts,
+            &mut engine.timed_out,
             &mut engine.sent_timeout_accepts,
             &mut engine.certified_timed_out,
             &mut engine.scheduled_cut_timers,
@@ -2109,22 +2377,22 @@ mod tests {
         assert!(engine.cut_round_by_id.contains_key(&d2));
         assert!(!engine.leader_cut_by_round.contains_key(&1));
         assert!(engine.leader_cut_by_round.contains_key(&2));
-        assert!(!engine.cut_certificates.contains_key(&1));
-        assert!(engine.cut_certificates.contains_key(&2));
+        assert!(!engine.safe.contains_key(&1));
+        assert!(engine.safe.contains_key(&2));
         assert!(!engine.pending_cut_fetch.contains_key(&(1, d1.clone())));
         assert!(engine.pending_cut_fetch.contains_key(&(2, d2.clone())));
         assert!(!engine.fetch_answered.contains(&(1, d1.clone(), key(1))));
         assert!(engine.fetch_answered.contains(&(2, d2.clone(), key(1))));
         assert!(!engine.decide_aggregators.contains_key(&(1, d1)));
         assert!(engine.decide_aggregators.contains_key(&(2, d2)));
-        assert!(!engine.decides_by_round.contains_key(&1));
-        assert!(engine.decides_by_round.contains_key(&2));
+        assert!(!engine.committed.contains_key(&1));
+        assert!(engine.committed.contains_key(&2));
         for set in [
-            &engine.voted_cut_rounds,
+            &engine.sent_cut_votes,
             &engine.proposed_cut_rounds,
-            &engine.sent_decide_rounds,
+            &engine.voted,
             &engine.sent_commit_rounds,
-            &engine.sent_timeouts,
+            &engine.timed_out,
             &engine.sent_timeout_accepts,
             &engine.certified_timed_out,
             &engine.scheduled_cut_timers,
@@ -2143,6 +2411,6 @@ mod tests {
 
         // Idempotent / monotonic: pruning to an earlier-or-equal floor is a no-op.
         engine.prune_below(1);
-        assert!(engine.cut_certificates.contains_key(&2));
+        assert!(engine.safe.contains_key(&2));
     }
 }

@@ -96,25 +96,36 @@ pub enum PrimaryMessage {
     ControlTimeoutAccept(crate::vantage::Round, /* sender */ PublicKey),
     // Simple-IT cut-consensus (a fourth, separate protocol assembly -- primary/src/
     // simpleit/**), reusing Vantage's own data plane (`Header`/`HeadersRequest`/
-    // `VantageAck` above) for dissemination and adding these six for its own
+    // `VantageAck` above) for dissemination and adding these five for its own
     // cut-consensus layer. Appended last -- same bincode wire-compat rule as every
     // other protocol-specific variant above. `SimpleItTimeout`/`SimpleItTimeoutAccept`
     // are deliberately distinct types from the pre-existing `Timeout` (Autobahn's,
     // above) and from `ControlTimeoutVote`/`ControlTimeoutAccept` (Vantage's own
     // resolution-layer notifications) -- three unrelated protocols' round-timeout
-    // messages, never unified into one wire type.
+    // messages, never unified into one wire type. NOTE: this used to be six variants,
+    // including `SimpleItCutCertificate` -- removed (arXiv:2606.14404 Fig.-2 rewrite,
+    // see `primary/src/simpleit/engine.rs`'s module doc comment): that message let a
+    // party assert a signature-free "notarization" for any `cut_id`, checked only for
+    // committee membership, never for whether its listed voters actually voted. Each
+    // party now marks a round safe by counting `SimpleItCutVote`s itself. Removing a
+    // non-last variant shifts every later discriminant by one, which the bincode
+    // wire-compat rule above would normally forbid -- safe here only because every
+    // node in a run is the same compiled binary (this codebase's actual deployment
+    // model; see `node/src/local_benchmark.rs` and the nightly-binary release flow),
+    // so there is no old/new version pair that ever needs to decode each other's
+    // bytes.
     SimpleItCutProposal(crate::simpleit::CutProposal),
     SimpleItCutVote(crate::simpleit::CutVote),
-    SimpleItCutCertificate(crate::simpleit::CutCertificate),
     SimpleItDecide(crate::simpleit::Decide),
     SimpleItTimeout(crate::simpleit::Timeout),
     SimpleItTimeoutAccept(crate::simpleit::TimeoutAccept),
     // Simple-IT cut-proposal repair: mirrors `ControlFetch`/`ControlServe` above
     // exactly (see `vantage::control::ControlLog::on_control_fetch`/
     // `on_control_serve`'s identical role for Vantage's own carrier bodies) -- closes
-    // a liveness gap where a party accepts round r's `CutCertificate` (naming only a
-    // `cut_id`) without ever receiving round r's own `CutProposal`. Appended last --
-    // same bincode wire-compat rule as every other protocol-specific variant above.
+    // a liveness gap where a party locally marks round r safe (via vote-counting,
+    // naming only a `cut_id`) without ever receiving round r's own `CutProposal`.
+    // Appended last -- same bincode wire-compat rule as every other
+    // protocol-specific variant above.
     SimpleItCutFetch(
         crate::simpleit::CutRound,
         Digest,
@@ -160,7 +171,6 @@ impl PrimaryMessage {
             PrimaryMessage::ControlTimeoutAccept(..) => "ControlTimeoutAccept",
             PrimaryMessage::SimpleItCutProposal(..) => "SimpleItCutProposal",
             PrimaryMessage::SimpleItCutVote(..) => "SimpleItCutVote",
-            PrimaryMessage::SimpleItCutCertificate(..) => "SimpleItCutCertificate",
             PrimaryMessage::SimpleItDecide(..) => "SimpleItDecide",
             PrimaryMessage::SimpleItTimeout(..) => "SimpleItTimeout",
             PrimaryMessage::SimpleItTimeoutAccept(..) => "SimpleItTimeoutAccept",

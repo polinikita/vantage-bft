@@ -499,7 +499,6 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
             "SimpleItCutProposal"
             | "SimpleItCutVote"
-            | "SimpleItCutCertificate"
             | "SimpleItDecide"
             | "SimpleItTimeout"
             | "SimpleItTimeoutAccept" => "consensus",

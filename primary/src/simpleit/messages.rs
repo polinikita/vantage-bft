@@ -2,11 +2,29 @@
 // `simpleit/Opt-Mempool-Simple-IT-Failure` branch's primary/src/messages.rs).
 //
 // Ported (exact upstream line ranges noted per type below): `Timeout`, `TimeoutAccept`,
-// `Decide`, `TimeoutCert`, `CutProposal`, `CutVote`, `CutCertificate`, plus the `Cut`
-// type alias. `Proposal` (upstream messages.rs:692-731) is deliberately NOT redefined
-// here: this crate's own `crate::messages::Proposal` already has the identical shape
-// (header digest + height) and already hashes with `Blake3Hasher`, so `Cut` below
-// aliases that type directly, exactly as upstream aliases its own local `Proposal`.
+// `Decide`, `TimeoutCert`, `CutProposal`, `CutVote`, plus the `Cut` type alias.
+// `Proposal` (upstream messages.rs:692-731) is deliberately NOT redefined here: this
+// crate's own `crate::messages::Proposal` already has the identical shape (header
+// digest + height) and already hashes with `Blake3Hasher`, so `Cut` below aliases that
+// type directly, exactly as upstream aliases its own local `Proposal`.
+//
+// NOT ported: upstream's `CutCertificate` (upstream messages.rs:813-836). Upstream's
+// `CutCertificate::verify` (and this crate's own former copy of it) checks only that
+// `votes: Vec<PublicKey>` names distinct, stake-bearing committee members -- never that
+// those parties actually voted, since this protocol is signature-free and a vote
+// carries no transferable proof of its own authorship. Any party could thus assert a
+// certificate for any `cut_id`. The paper this engine implements (arXiv:2606.14404,
+// Fig. 2) has no certificate message at all: safety comes from each party counting
+// votes/commits FIRST-HAND, never from accepting another party's relayed aggregate --
+// see `primary/src/simpleit/engine.rs`'s module doc comment ("FIGURE-2 REWRITE") for
+// the full rationale and the replacement mechanism (`CutVoteAggregator` plus
+// `CutEngine::mark_cut_safe`, both stage-1/stage-2 respectively).
+//
+// `Decide` additionally drops upstream's dead `origin: PublicKey` field (AUDIT FIX,
+// finding F5): never read anywhere in this crate, and upstream's own single call site
+// passes `&self.name` for both `origin` and `author`, so even upstream never
+// distinguished the two. `Decide` is this engine's `⟨commit, r⟩` (Fig. 2's Vote step);
+// only `id`/`round`/`author` are load-bearing.
 //
 // Required deviations from upstream (see primary/src/simpleit/mod.rs for the full
 // rationale):
@@ -16,19 +34,21 @@
 //      (matching `crate::messages`/`crate::vantage::block`), differ.
 //   2. `CutRound` (`= u64`, defined below) replaces upstream's local `Round` alias
 //      (used by `Timeout`/`TimeoutAccept`/`Decide`/`TimeoutCert`) and upstream's bare
-//      `u64` (used by `CutProposal`/`CutVote`/`CutCertificate`) uniformly, so there is
-//      one unambiguous cut-round type. Neither `primary::primary::Slot` nor
-//      `primary::primary::View` is used anywhere in this module, and `CutRound` is
-//      deliberately distinct from `crate::vantage::control::Round` (an unrelated
-//      control-round counter re-exported from `crate::vantage`).
-//   3. None of these seven types holds a collection keyed by cut round -- the
-//      per-round maps this rule targets (e.g. a future `BTreeMap<CutRound,
-//      CutVoteAggregator>`) belong to the not-yet-ported state machine. `Cut` itself
-//      (`BTreeMap<PublicKey, Proposal>`) is keyed by author, already a `BTreeMap`
-//      upstream, and unchanged.
+//      `u64` (used by `CutProposal`/`CutVote`) uniformly, so there is one unambiguous
+//      cut-round type. Neither `primary::primary::Slot` nor `primary::primary::View`
+//      is used anywhere in this module, and `CutRound` is deliberately distinct from
+//      `crate::vantage::control::Round` (an unrelated control-round counter re-exported
+//      from `crate::vantage`).
+//   3. None of these six types holds a collection keyed by cut round -- the per-round
+//      maps this rule targets (e.g. a future `BTreeMap<CutRound, CutVoteAggregator>`)
+//      belong to the not-yet-ported state machine. `Cut` itself (`BTreeMap<PublicKey,
+//      Proposal>`) is keyed by author, already a `BTreeMap` upstream, and unchanged.
 //   4. See primary/src/simpleit/aggregators.rs for the named-`Committee`-threshold
-//      requirement; `TimeoutCert::verify` and `CutCertificate::verify` below both use
-//      `quorum_threshold` (2f+1 at n=3f+1), noted inline.
+//      requirement; `TimeoutCert::verify` below uses `quorum_threshold` (2f+1 at
+//      n=3f+1), noted inline. `TimeoutCert` (unlike the removed `CutCertificate`) never
+//      had this defect: it is purely a LOCAL data structure, never broadcast (see
+//      `effects.rs`'s `CutOut` doc comment) -- each party only ever verifies its OWN,
+//      independently-assembled `TimeoutCert`, never one asserted by a peer.
 
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
@@ -40,8 +60,8 @@ use std::fmt;
 
 /// One cut-consensus round counter. Upstream mixes a local `Round = u64` alias (on
 /// `Timeout`/`TimeoutAccept`/`Decide`/`TimeoutCert`) with a bare `u64` (on
-/// `CutProposal`/`CutVote`/`CutCertificate`) for what is, across all seven types, the
-/// same counter. Unified here under one explicit name.
+/// `CutProposal`/`CutVote`) for what is, across all six types, the same counter.
+/// Unified here under one explicit name.
 pub type CutRound = u64;
 
 /// Upstream primary/src/messages.rs:172-213.
@@ -130,26 +150,25 @@ impl fmt::Display for TimeoutAccept {
     }
 }
 
-/// Commit message in the protocol. Upstream primary/src/messages.rs:375-417.
+/// Commit message in the protocol -- Fig. 2's `⟨commit, r⟩` (the **Vote** step: "send
+/// `⟨commit, curr_round⟩` to all parties"). Upstream primary/src/messages.rs:375-417,
+/// minus the dead `origin` field (AUDIT FIX F5 -- see the module doc comment).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Decide {
     pub id: Digest,
     pub round: CutRound,
-    pub origin: PublicKey,
     pub author: PublicKey,
 }
 
 impl Decide {
-    pub async fn new(
-        header_id: Digest,
-        round: CutRound,
-        origin: &PublicKey,
-        author: &PublicKey,
-    ) -> Self {
+    /// Mirrors `Timeout::new`/`TimeoutAccept::new`'s shape (round + author, no
+    /// `origin`) now that the dead field is gone -- upstream's own single call site
+    /// passed `&self.name` for both `origin` and `author`, so this loses no
+    /// information upstream itself ever populated distinctly.
+    pub async fn new(header_id: Digest, round: CutRound, author: &PublicKey) -> Self {
         Self {
             id: header_id,
             round,
-            origin: *origin,
             author: *author,
         }
     }
@@ -313,31 +332,3 @@ impl Hash for CutVote {
     }
 }
 
-/// Upstream primary/src/messages.rs:813-836. No `impl Hash` upstream either -- a
-/// certified `CutCertificate` is identified by its `(round, cut_id)` fields directly.
-#[derive(Clone, Serialize, Deserialize, Default, Debug)]
-pub struct CutCertificate {
-    pub round: CutRound,
-    pub cut_id: Digest,
-    pub votes: Vec<PublicKey>,
-}
-
-impl CutCertificate {
-    /// Requires `quorum_threshold` (2f+1 at n=3f+1) distinct, committee-recognized
-    /// voters.
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        let mut weight = 0;
-        let mut used = HashSet::new();
-        for author in &self.votes {
-            ensure!(used.insert(*author), DagError::AuthorityReuse(*author));
-            let stake = committee.stake(author);
-            ensure!(stake > 0, DagError::UnknownAuthority(*author));
-            weight += stake;
-        }
-        ensure!(
-            weight >= committee.quorum_threshold(),
-            DagError::CertificateRequiresQuorum
-        );
-        Ok(())
-    }
-}

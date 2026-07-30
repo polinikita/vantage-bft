@@ -31,15 +31,22 @@
 //     degenerate committee sizes.
 
 use crate::error::{DagError, DagResult};
-use crate::simpleit::messages::{
-    CutCertificate, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
-};
+use crate::simpleit::messages::{CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert};
 use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use std::collections::HashSet;
 
-/// Aggregates cut votes for one proposed cut into a `CutCertificate`. Upstream
-/// primary/src/aggregators.rs:56-60 (struct), 170-198 (impl).
+/// Aggregates cut votes for one proposed cut, counted strictly FIRST-HAND: every
+/// `append` call verifies and dedups one individual `CutVote` this party itself
+/// received, and once the accumulated weight reaches `mint_threshold` this returns the
+/// exact set of voters counted, for the caller (`CutEngine::process_cut_vote`) to mark
+/// the round `safe` locally -- see `engine.rs`'s module doc comment ("FIGURE-2
+/// REWRITE") for why this replaces the removed `CutCertificate`: a certificate would
+/// let a party accept ANOTHER party's relayed claim about who voted, which this
+/// signature-free protocol cannot authenticate. This aggregator never does that --
+/// each party runs its own, over votes it individually verified. Upstream
+/// primary/src/aggregators.rs:56-60 (struct), 170-198 (impl) minted a `CutCertificate`
+/// at this same point instead; the counting logic below is otherwise unchanged.
 ///
 /// Threshold: `mint_threshold` -- `max(optimistic_threshold, quorum_threshold)`. See
 /// that function for why the clamp is required for correctness at small committee
@@ -48,6 +55,13 @@ use std::collections::HashSet;
 pub struct CutVoteAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
+    /// Every distinct author counted so far towards `mint_threshold`, in arrival
+    /// order. Returned (not merely counted) once the threshold is crossed: this is
+    /// the fetch-target set `CutEngine::mark_cut_safe` hands to `ensure_cut_fetch`
+    /// when this round's own `CutProposal` is still unknown -- the closest available
+    /// analogue to the removed `CutCertificate::votes`, but never transmitted or
+    /// trusted from a peer; it is this party's own first-hand record of who it
+    /// received a vote from.
     voters: Vec<PublicKey>,
 }
 
@@ -70,40 +84,43 @@ impl CutVoteAggregator {
         &mut self,
         vote: &CutVote,
         committee: &Committee,
-    ) -> DagResult<Option<CutCertificate>> {
+    ) -> DagResult<Option<Vec<PublicKey>>> {
         let author = vote.author;
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
         self.voters.push(author);
         self.weight += committee.stake(&author);
         if self.weight >= mint_threshold(committee) {
             self.weight = 0;
-            return Ok(Some(CutCertificate {
-                round: vote.round,
-                cut_id: vote.cut_id.clone(),
-                votes: self.voters.clone(),
-            }));
+            return Ok(Some(std::mem::take(&mut self.voters)));
         }
         Ok(None)
     }
 }
 
-/// The threshold at which `CutVoteAggregator` mints a `CutCertificate`:
+/// The threshold at which `CutVoteAggregator` marks a round safe (Fig. 2's Mark-safe
+/// step, evaluated locally by each party rather than via a relayed certificate):
 /// `max(optimistic_threshold, quorum_threshold)`.
 ///
-/// AUDIT FIX. Upstream mints at `optimistic_threshold` alone, but
-/// `CutCertificate::verify` (both upstream's and ours) requires `quorum_threshold`.
-/// Since `optimistic_threshold = ceil((5f-1)/2)` and `quorum_threshold = 2f+1` at
-/// n=3f+1, the former is STRICTLY SMALLER for f <= 2 -- it only overtakes from f >= 3
-/// (`ceil((5f-1)/2) >= 2f+1 <=> f >= 3`). At those sizes the minting party rejects the
-/// certificate it just built, so `sent_decide_rounds` is never set, no party ever sends
-/// a `Decide`, and the round can never commit. Concretely broken (mint < verify) at
-/// n = 4, 5, 6, 8, 9, 12 -- and n=4 is `fab remote`'s default committee size. Upstream
-/// only ever benchmarked n=10 and n=50, where the optimistic term already dominates.
+/// AUDIT FIX (finding predates the Fig.-2 rewrite; still load-bearing under it).
+/// Upstream mints at `optimistic_threshold` alone, but upstream's own
+/// `CutCertificate::verify` required `quorum_threshold`. Since `optimistic_threshold =
+/// ceil((5f-1)/2)` and `quorum_threshold = 2f+1` at n=3f+1, the former is STRICTLY
+/// SMALLER for f <= 2, only catching up once f reaches 3 (`ceil((5f-1)/2)` first
+/// reaches `2f+1` exactly at f = 3). Under the old certificate design, at those sizes
+/// the minting party rejected the certificate it had just built, so
+/// `sent_decide_rounds` was never set, no party ever sent a `Decide`, and the round
+/// could never commit. Under this design there is no separate verify step at all --
+/// `mint_threshold` IS the only safety gate a round ever passes through -- so an
+/// unclamped threshold would be worse, not merely inert: it would let a round be
+/// marked `safe` on fewer than a quorum's worth of first-hand votes. Concretely
+/// would-be-broken (unclamped optimistic term alone) at n = 4, 5, 6, 8, 9, 12 -- and
+/// n=4 is `fab remote`'s default committee size. Upstream only ever benchmarked n=10
+/// and n=50, where the optimistic term already dominates.
 ///
-/// Clamping to `quorum_threshold` is the minimal sound fix: a notarization carrying
-/// fewer than 2f+1 voters is not a quorum and could not be safely acted on anyway. It
-/// is provably a no-op at every size we benchmark -- n=10 (max(7,7) = 7) and n=50
-/// (max(40,34) = 40) -- so it cannot move any measured number.
+/// Clamping to `quorum_threshold` is the minimal sound fix: marking a round safe on
+/// fewer than 2f+1 first-hand votes is not a quorum and could not be safely acted on
+/// anyway. It is provably a no-op at every size we benchmark -- n=10 (max(7,7) = 7) and
+/// n=50 (max(40,34) = 40) -- so it cannot move any measured number.
 fn mint_threshold(committee: &Committee) -> Stake {
     optimistic_threshold(committee).max(committee.quorum_threshold())
 }
