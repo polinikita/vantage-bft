@@ -114,7 +114,28 @@ pub struct Metrics {
     /// Fable-audit fix: inbound wire messages dropped by `VantageCore::dispatch_inbound`
     /// because their declared sender is not a committee member. Always zero on the
     /// honest-only path; a nonzero value means a Byzantine node is forging sender keys.
+    /// Reused as-is by `SimpleItCore::dispatch_inbound`'s own instance of the identical
+    /// gate (`vantage::wire::sender_is_member`) -- the two protocols are mutually
+    /// exclusive per node/run, so there is no ambiguity in practice about which
+    /// assembly a nonzero reading came from.
     pub vantage_rejected_nonmember_total: IntCounter,
+    /// `SimpleItCore`'s effect-execution loop received a `vantage::Effect` variant
+    /// that `LaneManager`/`Repairer` can never actually construct (every
+    /// AGB/pacemaker/control-log/anchor/cursor-output variant -- see that loop's own
+    /// doc comment for the full list). Always zero: the match arm that increments this
+    /// also fires a `debug_assert!(false, ..)`, so any nonzero reading in a debug build
+    /// is also an immediate panic during development; in a release build it is a
+    /// silent, observable drop instead of a validator crash.
+    pub simpleit_unexpected_effect_total: IntCounter,
+    /// `SimpleItCore`'s commit-materialisation queue depth: committed rounds
+    /// (`CutEffect::Commit`) whose cut has not yet been fully emitted because at
+    /// least one author's block chain isn't locally verified all the way from its
+    /// watermark yet (a correct node can commit a round it hasn't voted on -- `2f+1`
+    /// peers acking a tip is not the same as holding it -- so this is expected to be
+    /// briefly nonzero under normal repair latency, not just under a fault). A
+    /// sustained/growing value means the drain is stuck: repair for some author's
+    /// lane is not making progress.
+    pub simpleit_commit_queue_len: IntGauge,
 
     // --- Phase 6 (PHASE6-SPEC.md §9 gate amendment): per-view seal-route breakdown.
     /// How each view got sealed/ordered, one label `"route"`, incremented exactly once
@@ -414,6 +435,18 @@ impl Metrics {
             vantage_rejected_nonmember_total: register_int_counter_with_registry!(
                 "vantage_rejected_nonmember_total",
                 "Inbound vantage wire messages dropped for a non-committee-member declared sender",
+                registry,
+            )
+            .unwrap(),
+            simpleit_unexpected_effect_total: register_int_counter_with_registry!(
+                "simpleit_unexpected_effect_total",
+                "SimpleItCore received a vantage::Effect variant lm/rep can never produce",
+                registry,
+            )
+            .unwrap(),
+            simpleit_commit_queue_len: register_int_gauge_with_registry!(
+                "simpleit_commit_queue_len",
+                "SimpleItCore: committed rounds queued pending full materialisation",
                 registry,
             )
             .unwrap(),

@@ -82,17 +82,29 @@ pub enum Protocol {
     AutobahnSeamless,
     /// Signature-free AGB protocol (implemented in Phase 3+).
     Vantage,
+    /// Simple-IT cut-consensus (Fig. 4), driving `simpleit::CutEngine` over the same
+    /// data plane Vantage uses (`simpleit::node::SimpleItCore`).
+    SimpleIt,
 }
 
 impl Protocol {
     /// The `use_optimistic_tips` value implied by this protocol when the
-    /// Autobahn code paths run. `None` for Vantage (the flag is irrelevant on
-    /// that path).
+    /// Autobahn code paths run. `None` for Vantage and Simple-IT (the flag is
+    /// irrelevant on both paths -- neither ever runs Autobahn's `Core`).
+    ///
+    /// Open question (see the accompanying task report): Simple-IT has no
+    /// optimistic-tip notion of its own, exactly like Vantage -- `None` mirrors
+    /// Vantage's own treatment (the only existing precedent for a protocol that
+    /// never runs the Autobahn code path this method's own doc comment scopes
+    /// itself to), NOT `AutobahnSeamless`'s `Some(false)`: seamless's value is
+    /// meaningful precisely because that protocol still runs Autobahn's `Core`
+    /// with the flag pinned off, which Simple-IT never does either.
     pub fn implied_optimistic_tips(&self) -> Option<bool> {
         match self {
             Protocol::AutobahnOptimistic => Some(true),
             Protocol::AutobahnSeamless => Some(false),
             Protocol::Vantage => None,
+            Protocol::SimpleIt => None,
         }
     }
 
@@ -104,6 +116,7 @@ impl Protocol {
             Protocol::AutobahnOptimistic => "autobahn-optimistic",
             Protocol::AutobahnSeamless => "autobahn-seamless",
             Protocol::Vantage => "vantage",
+            Protocol::SimpleIt => "simple-it",
         }
     }
 }
@@ -217,6 +230,24 @@ pub struct Parameters {
     /// the resolved watermark itself and prune state for the view being resolved.
     #[serde(default = "default_vantage_gc_window_views")]
     pub vantage_gc_window_views: u64,
+
+    /// Simple-IT only: how many ROUNDS of per-round `CutEngine` state
+    /// (`SimpleItCore`'s own analogue of `collect_internal_garbage`) retains behind
+    /// its current round before `CutEngine::prune_below` is called.
+    ///
+    /// Deliberately SEPARATE from both `gc_depth` (Autobahn rounds) and
+    /// `vantage_gc_window_views` (Vantage views) for the identical reason
+    /// `vantage_gc_window_views`'s own doc comment gives: a Simple-IT cut round is yet
+    /// another counter with its own cadence, distinct from either. `#[serde(default)]`
+    /// keeps every pre-existing parameter file valid; the default matches the other
+    /// two windows' so behaviour is uniform across all three protocols for an operator
+    /// who never sets any of them.
+    ///
+    /// `SimpleItCore::build` clamps this to >= 1, matching `vantage_gc_window_views`'s
+    /// own clamp for the identical reason (a window of 0 would prune the round
+    /// currently being resolved).
+    #[serde(default = "default_simpleit_gc_window_rounds")]
+    pub simpleit_gc_window_rounds: u64,
 
     /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
     /// per-authority-pair one-way latency table, applied to THIS node's own
@@ -356,6 +387,12 @@ fn default_delta_ms() -> u64 {
 /// Matches `gc_depth`'s own default, so splitting the two knobs apart changes no
 /// existing deployment's behaviour.
 fn default_vantage_gc_window_views() -> u64 {
+    50
+}
+
+/// Matches `vantage_gc_window_views`'/`gc_depth`'s own default -- see
+/// `simpleit_gc_window_rounds`'s doc comment.
+fn default_simpleit_gc_window_rounds() -> u64 {
     50
 }
 
@@ -543,6 +580,7 @@ impl Default for Parameters {
             max_header_delay: 100,
             gc_depth: 50,
             vantage_gc_window_views: default_vantage_gc_window_views(),
+            simpleit_gc_window_rounds: default_simpleit_gc_window_rounds(),
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,
@@ -609,6 +647,10 @@ impl Parameters {
         info!(
             "Vantage internal GC window set to {} views",
             self.vantage_gc_window_views
+        );
+        info!(
+            "Simple-IT internal GC window set to {} rounds",
+            self.simpleit_gc_window_rounds
         );
         info!("Sync retry delay set to {} ms", self.sync_retry_delay);
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);

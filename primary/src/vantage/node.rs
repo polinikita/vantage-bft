@@ -5,7 +5,7 @@
 // the one piece of genuinely shared state (§3.3's cross-notification hook).
 
 use crate::messages::{Ack, Header};
-use crate::primary::{PrimaryMessage, PrimaryWorkerMessage, View, CHANNEL_CAPACITY};
+use crate::primary::{PrimaryMessage, View, CHANNEL_CAPACITY};
 use crate::vantage::agb::{AgbEngine, Echo, Ready, TimerKind, ViewProposal};
 use crate::vantage::block;
 use crate::vantage::control::{ControlLog, ControlProposal, Round};
@@ -15,6 +15,7 @@ use crate::vantage::lanes::{
     AckAggregator, AckAvailability, BlockCache, LaneManager, SharedAckAggregator, SharedBlocks,
 };
 use crate::vantage::pacemaker::Pacemaker;
+use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
 use crate::vantage::wire::{self, Wire};
@@ -89,8 +90,8 @@ pub enum Inbound {
 /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
 /// (`Parameters::authenticate_channels`) -- the candidate sender a MAC tag must verify
 /// against, for every `PrimaryMessage` variant this handler ever routes. Mirrors
-/// `VantageCore::wire_sender`'s classification exactly (declared wire sender field
-/// where one exists), PLUS the two D4-class positionally-attributed variants
+/// `DeclaredSender::declared_sender`'s classification exactly (declared wire sender
+/// field where one exists), PLUS the two D4-class positionally-attributed variants
 /// (`VantagePropose`/`ControlInit`), which carry no wire sender field at all but ARE
 /// still cryptographically bindable here: `agb::proposer`/`control::control_leader`
 /// are pure functions of `committee` alone, so this network-layer boundary can derive
@@ -98,8 +99,8 @@ pub enum Inbound {
 /// needing a live `VantageCore` (or its mutable AGB/control-log state) to ask.
 /// `None` for `Header(_, true)` ("Serve") and `ControlServe`: neither carries any
 /// sender claim (wire or positional) to bind -- the same pre-existing D4 gap
-/// `wire_sender` already carves out (content is self-authenticating by digest / gated
-/// downstream by `pending_fetch`, respectively). A MAC tag is still present on the wire
+/// `declared_sender` already carves out (content is self-authenticating by digest /
+/// gated downstream by `pending_fetch`, respectively). A MAC tag is still present on the wire
 /// for these two (uniform framing -- every message carries exactly one trailing tag
 /// when the flag is on), it is simply never checked, since there is nothing to check
 /// it against.
@@ -321,13 +322,11 @@ pub struct VantageCore {
     /// currency). D7-4: same min-heap fix as `timers`.
     control_timers: BinaryHeap<Reverse<(Instant, Round)>>,
 
-    /// D1 payload-sync bookkeeping: outstanding `(digest, worker_id)` keys per header
-    /// digest, so `LaneManager::set_payload_ready` (which unconditionally marks a block
-    /// payload-ready once called -- see its doc comment) is only called once *every*
-    /// missing batch for that header has actually arrived, not on the first one.
-    pending_payload: HashMap<Digest, HashSet<(Digest, WorkerId)>>,
-    store: Store,
-    tx_payload_ready: Sender<(Digest, Digest, WorkerId)>,
+    /// D1 payload-sync bookkeeping and commit-notification output state -- factored
+    /// out into `PayloadIo` (`vantage::payload`) so a second consensus protocol can
+    /// reuse it. See that module for the per-field rationale (carried over verbatim
+    /// from this struct's previous copy of each field).
+    payload: PayloadIo,
 
     /// Vantage internal-state retention window, in VIEWS: once the resolver has proven a
     /// contiguous resolved prefix, component state below `resolved_watermark - gc_window`
@@ -355,15 +354,6 @@ pub struct VantageCore {
     ut_payload_sync: Option<IntCounter>,
     ut_timer_firing: Option<IntCounter>,
     ut_effect_execution: Option<IntCounter>,
-
-    /// PHASE7-PREP-NOTES.md: pays down PHASE4-NOTES.md §6's scope cut -- forwards each
-    /// cursor-committed `Header` to the top-level application, the same output-channel
-    /// shape `Committer` (Autobahn) already feeds. `Primary::spawn`'s `Vantage` arm
-    /// used to drop the `tx_output` it's handed (never referenced it), so this
-    /// channel's receiver (`node`/`local_benchmark`'s `rx_output`) closed immediately;
-    /// `node::main`'s `analyze(rx_output)` loop returning on a closed channel is what
-    /// hit the `unreachable!()` right after every primary's boot line.
-    tx_output: Sender<Header>,
 }
 
 /// `VantageCore::build`'s return shape: the constructed core, channel ends `spawn`
@@ -554,9 +544,12 @@ impl VantageCore {
             payload_size: 0,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
-            pending_payload: HashMap::new(),
-            store,
-            tx_payload_ready,
+            payload: PayloadIo {
+                pending_payload: HashMap::new(),
+                store,
+                tx_payload_ready,
+                tx_output,
+            },
             // Clamped to >= 1: a window of 0 would place the GC floor at the resolved
             // watermark itself and prune state for the view being resolved.
             gc_window: parameters.vantage_gc_window_views.max(1),
@@ -566,7 +559,6 @@ impl VantageCore {
             ut_payload_sync: None,
             ut_timer_firing: None,
             ut_effect_execution: None,
-            tx_output,
         };
         (
             core,
@@ -724,12 +716,12 @@ impl VantageCore {
     ) {
         let now = Instant::now();
         let mut resolved = false;
-        if let Some(set) = self.pending_payload.get_mut(&header_digest) {
+        if let Some(set) = self.payload.pending_payload.get_mut(&header_digest) {
             set.remove(&(digest, worker_id));
             resolved = set.is_empty();
         }
         if resolved {
-            self.pending_payload.remove(&header_digest);
+            self.payload.pending_payload.remove(&header_digest);
             // P4-4: payload arriving can be the event that flips
             // `direct_pub`/`author_ok` for a C/T entry the positive gate is
             // waiting on -- re-poll it, same reasoning as the `Ack` arm.
@@ -1117,7 +1109,9 @@ impl VantageCore {
                         .await
                 }
                 Effect::SyncBatches(author, header_digest, missing) => {
-                    self.sync_batches(author, header_digest, missing).await;
+                    self.payload
+                        .sync_batches(&mut self.wire, author, header_digest, missing)
+                        .await;
                 }
                 Effect::RequestTo(peer, digest) => {
                     self.wire
@@ -1188,7 +1182,8 @@ impl VantageCore {
                     self.timers.push(Reverse((deadline, view, kind)));
                 }
                 Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
-                    self.notify_committed(commit_millis, by_worker, headers)
+                    self.payload
+                        .notify_committed(&mut self.wire, commit_millis, by_worker, headers)
                         .await;
                 }
                 Effect::BroadcastWish(view) => {
@@ -1296,77 +1291,6 @@ impl VantageCore {
         Some(UtilizationTimer::from_counter(counter))
     }
 
-    /// D1/§1: ask our own workers to sync `missing` batches for `author`'s block
-    /// (`header_digest`), then spawn one `store.notify_read` waiter per missing key;
-    /// once *every* key for this header has resolved, call
-    /// `LaneManager::set_payload_ready`.
-    async fn sync_batches(
-        &mut self,
-        author: PublicKey,
-        header_digest: Digest,
-        missing: Vec<(Digest, WorkerId)>,
-    ) {
-        if missing.is_empty() {
-            return;
-        }
-        let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
-        for (digest, worker_id) in &missing {
-            by_worker
-                .entry(*worker_id)
-                .or_default()
-                .push(digest.clone());
-        }
-        for (worker_id, digests) in by_worker {
-            if let Some(addr) = self.wire.worker_addr(worker_id) {
-                let bytes = bincode::serialize(&PrimaryWorkerMessage::Synchronize(digests, author))
-                    .expect("serializes");
-                self.wire.send_to_worker(addr, bytes, "Synchronize").await;
-            }
-        }
-
-        let set: HashSet<(Digest, WorkerId)> = missing.iter().cloned().collect();
-        self.pending_payload.insert(header_digest.clone(), set);
-        for (digest, worker_id) in missing {
-            let mut store = self.store.clone();
-            let tx = self.tx_payload_ready.clone();
-            let header_digest = header_digest.clone();
-            tokio::spawn(async move {
-                let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
-                if store.notify_read(key).await.is_ok() {
-                    let _ = tx.send((header_digest, digest, worker_id)).await;
-                }
-            });
-        }
-    }
-
-    /// Commit metric (Phase-2 parity, §9): forward the cursor's per-`WorkerId`
-    /// notification to our own workers -- the existing worker-side observe path
-    /// (`worker::synchronizer`) does the rest. Also (PHASE7-PREP-NOTES.md, paying down
-    /// PHASE4-NOTES.md §6's scope cut) forwards each committed `Header` to the
-    /// top-level application via `tx_output`, the same shape/tolerance as Autobahn's
-    /// `Committer` (`primary/src/committer.rs`): a closed or full receiver is logged,
-    /// not treated as fatal -- `node::main`'s `analyze` loop is a no-op consumer either
-    /// way, and other assemblies' equivalent sends already tolerate this identically.
-    async fn notify_committed(
-        &mut self,
-        commit_millis: u64,
-        by_worker: Vec<(WorkerId, Vec<Digest>)>,
-        headers: Vec<Header>,
-    ) {
-        for (worker_id, digests) in by_worker {
-            if let Some(addr) = self.wire.worker_addr(worker_id) {
-                let bytes =
-                    bincode::serialize(&PrimaryWorkerMessage::Committed(commit_millis, digests))
-                        .expect("serializes");
-                self.wire.send_to_worker(addr, bytes, "Committed").await;
-            }
-        }
-        for header in headers {
-            if let Err(e) = self.tx_output.send(header).await {
-                log::debug!("Failed to send block through the output channel: {}", e);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

@@ -19,6 +19,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::oneshot::error::TryRecvError;
 
+/// SECURITY (Fable audit): a message's wire-declared (or positionally-attributed)
+/// sender claim, for `sender_is_member`'s generic non-member gate to check. One `impl`
+/// per `Inbound` type a protocol assembly in this crate routes, so the gate itself
+/// (`sender_is_member`) needs exactly one definition regardless of how many protocols
+/// use it -- see `impl DeclaredSender for Inbound` immediately below for Vantage's own,
+/// and `simpleit::node`'s `impl DeclaredSender for simpleit::engine::Inbound` for
+/// Simple-IT's sibling implementation.
+pub trait DeclaredSender {
+    fn declared_sender(&self) -> Option<PublicKey>;
+}
+
 /// SECURITY (Fable audit): extracts the wire-declared sender to validate against
 /// `self.members`, for every `Inbound` variant that carries one. `None` for
 /// internal or positionally-attributed facts: `Serve` (header content is
@@ -27,39 +38,44 @@ use tokio::sync::oneshot::error::TryRecvError;
 /// `proposer(view)`/`control_leader(round)`, D4's standing claimed-by-position
 /// class -- see `dispatch_inbound`'s own comments on those two arms), and
 /// `ControlServe` (gated downstream by `pending_fetch(view, digest)`).
-pub fn wire_sender(inbound: &Inbound) -> Option<PublicKey> {
-    // `PublicKey` is `Copy` -- dereference rather than `.clone()` (clippy::clone_on_copy).
-    match inbound {
-        Inbound::Publish(sender, _) => Some(*sender),
-        Inbound::HeadersRequest(_, requestor) => Some(*requestor),
-        Inbound::Ack(ack) => Some(ack.sender),
-        Inbound::Echo(e) => Some(e.sender),
-        Inbound::EchoSkip(_, s, _) => Some(*s),
-        Inbound::Ready(r) => Some(r.sender),
-        Inbound::NoReady(_, s, _) => Some(*s),
-        Inbound::Wish(_, s) => Some(*s),
-        Inbound::CompReport(_, _, s) => Some(*s),
-        Inbound::ControlEcho(s, _) => Some(*s),
-        Inbound::ControlReady(s, _) => Some(*s),
-        Inbound::ControlCommit(s, _) => Some(*s),
-        Inbound::ControlTimeoutVote(s, _) => Some(*s),
-        Inbound::ControlTimeoutAccept(s, _) => Some(*s),
-        Inbound::ControlFetch(_, _, s) => Some(*s),
-        Inbound::Serve(_)
-        | Inbound::AckAvailability(_)
-        | Inbound::Propose(_)
-        | Inbound::ControlInit(_, _)
-        | Inbound::ControlServe(_, _) => None,
+impl DeclaredSender for Inbound {
+    fn declared_sender(&self) -> Option<PublicKey> {
+        // `PublicKey` is `Copy` -- dereference rather than `.clone()` (clippy::clone_on_copy).
+        match self {
+            Inbound::Publish(sender, _) => Some(*sender),
+            Inbound::HeadersRequest(_, requestor) => Some(*requestor),
+            Inbound::Ack(ack) => Some(ack.sender),
+            Inbound::Echo(e) => Some(e.sender),
+            Inbound::EchoSkip(_, s, _) => Some(*s),
+            Inbound::Ready(r) => Some(r.sender),
+            Inbound::NoReady(_, s, _) => Some(*s),
+            Inbound::Wish(_, s) => Some(*s),
+            Inbound::CompReport(_, _, s) => Some(*s),
+            Inbound::ControlEcho(s, _) => Some(*s),
+            Inbound::ControlReady(s, _) => Some(*s),
+            Inbound::ControlCommit(s, _) => Some(*s),
+            Inbound::ControlTimeoutVote(s, _) => Some(*s),
+            Inbound::ControlTimeoutAccept(s, _) => Some(*s),
+            Inbound::ControlFetch(_, _, s) => Some(*s),
+            Inbound::Serve(_)
+            | Inbound::AckAvailability(_)
+            | Inbound::Propose(_)
+            | Inbound::ControlInit(_, _)
+            | Inbound::ControlServe(_, _) => None,
+        }
     }
 }
 
 /// The membership half of `VantageCore::dispatch_inbound`'s centralized gate (see that
-/// call site for the full SECURITY rationale) -- built on `wire_sender`. `true` when
-/// `inbound` carries no wire-declared sender to check (`wire_sender`'s own `None`
-/// carve-outs), or when it does and that sender is in `members`; `false` only when a
-/// wire-declared sender is present and is NOT a member.
-pub fn sender_is_member(inbound: &Inbound, members: &HashSet<PublicKey>) -> bool {
-    match wire_sender(inbound) {
+/// call site for the full SECURITY rationale) -- built on `DeclaredSender`. `true` when
+/// `m` carries no declared sender to check (`DeclaredSender::declared_sender`'s own
+/// `None` carve-outs), or when it does and that sender is in `members`; `false` only
+/// when a declared sender is present and is NOT a member. Generic over `M:
+/// DeclaredSender` so this stays the ONE definition of the gate across every protocol
+/// assembly this crate routes, rather than each reimplementing the identical
+/// `Some(s) => members.contains(&s), None => true` logic for its own `Inbound` type.
+pub fn sender_is_member<M: DeclaredSender>(m: &M, members: &HashSet<PublicKey>) -> bool {
+    match m.declared_sender() {
         Some(sender) => members.contains(&sender),
         None => true,
     }

@@ -25,15 +25,21 @@
 //      repo's `Committee` forces.
 //
 // Autobahn types (`QC`, `TC`, `CommitQC`, `ConsensusMessage`, `Slot`, Autobahn's own
-// `View`) are never constructed here. Vantage is used in exactly the one place named
-// in point 2 above (`agb::proposer`, a pure leader-schedule function) -- no other
-// `crate::vantage::*` item (no `LaneManager`, no `Effect`, no engine) is ever
-// constructed or imported here.
+// `View`) are never constructed here. Within stages 1-2 (`messages`, `aggregators`,
+// `engine`, `effects`), Vantage is used in exactly the one place named in point 2 above
+// (`agb::proposer`, a pure leader-schedule function) -- no other `crate::vantage::*`
+// item (no `LaneManager`, no `Effect`, no engine) is ever constructed or imported in
+// those four submodules. `node` -- the wiring layer that runs `CutEngine` against real
+// I/O -- is deliberately exempt from that rule: its entire purpose is reusing Vantage's
+// own data-plane types (`vantage::wire::Wire`, `vantage::payload::PayloadIo`,
+// `vantage::lanes::LaneManager`, ...) rather than duplicating them, so it imports from
+// `crate::vantage::*` freely; see that submodule's own doc comment.
 
 pub mod aggregators;
 pub mod effects;
 pub mod engine;
 pub mod messages;
+pub mod node;
 
 pub use aggregators::{
     CutVoteAggregator, DecideAggregator, TimeoutAcceptAggregator, TimeoutAggregator,
@@ -44,3 +50,10 @@ pub use messages::{
     Cut, CutCertificate, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
     TimeoutCert,
 };
+// `node::SimpleItCore` only -- `node::SimpleItReceiverHandler`/`node::Inbound` are
+// reached via their full path (`crate::simpleit::node::...`), exactly mirroring
+// `vantage`'s own `pub use node::VantageCore;` (not `VantageReceiverHandler`). Note
+// `node::Inbound` is a DIFFERENT type from `engine::Inbound` re-exported above (the
+// wire/channel-level type that WRAPS the latter alongside Simple-IT's data-plane
+// messages) -- see `node.rs`'s own doc comment on `Inbound`.
+pub use node::SimpleItCore;

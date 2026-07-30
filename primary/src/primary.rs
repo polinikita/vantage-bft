@@ -94,6 +94,21 @@ pub enum PrimaryMessage {
     // requires (append last)".
     ControlTimeoutVote(crate::vantage::Round, /* sender */ PublicKey),
     ControlTimeoutAccept(crate::vantage::Round, /* sender */ PublicKey),
+    // Simple-IT cut-consensus (a fourth, separate protocol assembly -- primary/src/
+    // simpleit/**), reusing Vantage's own data plane (`Header`/`HeadersRequest`/
+    // `VantageAck` above) for dissemination and adding these six for its own
+    // cut-consensus layer. Appended last -- same bincode wire-compat rule as every
+    // other protocol-specific variant above. `SimpleItTimeout`/`SimpleItTimeoutAccept`
+    // are deliberately distinct types from the pre-existing `Timeout` (Autobahn's,
+    // above) and from `ControlTimeoutVote`/`ControlTimeoutAccept` (Vantage's own
+    // resolution-layer notifications) -- three unrelated protocols' round-timeout
+    // messages, never unified into one wire type.
+    SimpleItCutProposal(crate::simpleit::CutProposal),
+    SimpleItCutVote(crate::simpleit::CutVote),
+    SimpleItCutCertificate(crate::simpleit::CutCertificate),
+    SimpleItDecide(crate::simpleit::Decide),
+    SimpleItTimeout(crate::simpleit::Timeout),
+    SimpleItTimeoutAccept(crate::simpleit::TimeoutAccept),
 }
 
 impl PrimaryMessage {
@@ -131,6 +146,12 @@ impl PrimaryMessage {
             PrimaryMessage::ControlCommit(..) => "ControlCommit",
             PrimaryMessage::ControlTimeoutVote(..) => "ControlTimeoutVote",
             PrimaryMessage::ControlTimeoutAccept(..) => "ControlTimeoutAccept",
+            PrimaryMessage::SimpleItCutProposal(..) => "SimpleItCutProposal",
+            PrimaryMessage::SimpleItCutVote(..) => "SimpleItCutVote",
+            PrimaryMessage::SimpleItCutCertificate(..) => "SimpleItCutCertificate",
+            PrimaryMessage::SimpleItDecide(..) => "SimpleItDecide",
+            PrimaryMessage::SimpleItTimeout(..) => "SimpleItTimeout",
+            PrimaryMessage::SimpleItTimeoutAccept(..) => "SimpleItTimeoutAccept",
         }
     }
 }
@@ -367,6 +388,99 @@ impl Primary {
 
                 // Receives batch digests from other workers -- reused as-is (D1's
                 // payload-presence key shape is identical on both assemblies).
+                PayloadReceiver::spawn(store, /* rx_workers */ rx_others_digests);
+
+                info!(
+                    "Primary {} successfully booted on {}",
+                    name,
+                    committee
+                        .primary(&name)
+                        .expect("Our public key or worker id is not in the committee")
+                        .primary_to_primary
+                        .ip()
+                );
+            }
+            Protocol::SimpleIt => {
+                // Simple-IT cut-consensus: a single `SimpleItCore` task, mirroring
+                // `Protocol::Vantage`'s assembly exactly (same address setup, same
+                // `acks: true`, same compress/batch parameters) -- it drives
+                // `simpleit::CutEngine` over the identical data plane (`LaneManager`/
+                // `Repairer`/`Wire`/`PayloadIo`) Vantage uses, as its own separate
+                // instances (deliberately not shared mutable state -- see
+                // `simpleit::node::SimpleItCore`'s own doc comment).
+                let (tx_simpleit, ack_aggregator) = crate::simpleit::SimpleItCore::spawn(
+                    name,
+                    committee.clone(),
+                    parameters.clone(),
+                    store.clone(),
+                    Some(metrics.clone()),
+                    rx_our_digests,
+                    tx_output,
+                );
+
+                // Spawn the network receiver listening to messages from the other
+                // primaries, routed into `SimpleItCore` (not `Core`/`VantageCore`).
+                let mut address = committee
+                    .primary(&name)
+                    .expect("Our public key or worker id is not in the committee")
+                    .primary_to_primary;
+                address.set_ip("0.0.0.0".parse().unwrap());
+                NetworkReceiver::spawn_full(
+                    address,
+                    /* handler */
+                    crate::simpleit::node::SimpleItReceiverHandler {
+                        tx: tx_simpleit,
+                        ack_aggregator,
+                        metrics: Some(metrics.clone()),
+                        channel_auth: channel_auth.clone(),
+                    },
+                    Some(metrics.clone()),
+                    parameters.compress_network,
+                    // Acks every received frame (moved out of `dispatch` -- see
+                    // `SimpleItReceiverHandler`'s doc comment).
+                    /* acks */
+                    true,
+                    parameters.batch_messages,
+                );
+                info!(
+                    "Primary {} listening to primary messages on {}",
+                    name, address
+                );
+
+                // Spawn the network receiver listening to messages from our workers
+                // (unchanged handler/shape): `OurBatch` feeds `SimpleItCore`'s own-lane
+                // publication cadence via `rx_our_digests`; `OthersBatch` still feeds
+                // `PayloadReceiver`'s D1 payload-presence markers.
+                let mut address = committee
+                    .primary(&name)
+                    .expect("Our public key or worker id is not in the committee")
+                    .worker_to_primary;
+                address.set_ip("0.0.0.0".parse().unwrap());
+                NetworkReceiver::spawn_full(
+                    address,
+                    /* handler */
+                    WorkerReceiverHandler {
+                        tx_our_digests,
+                        tx_others_digests,
+                        metrics: metrics.clone(),
+                        name,
+                        channel_auth: channel_auth.clone(),
+                    },
+                    Some(metrics.clone()),
+                    parameters.compress_network,
+                    // This handler never acked (see its `dispatch`).
+                    /* acks */
+                    false,
+                    parameters.batch_messages,
+                );
+                info!(
+                    "Primary {} listening to workers messages on {}",
+                    name, address
+                );
+
+                // Receives batch digests from other workers -- reused as-is (D1's
+                // payload-presence key shape is identical across every data-plane-
+                // sharing assembly).
                 PayloadReceiver::spawn(store, /* rx_workers */ rx_others_digests);
 
                 info!(

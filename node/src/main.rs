@@ -138,7 +138,12 @@ async fn main() -> Result<()> {
                         .long("protocol")
                         .value_name("PROTOCOL")
                         .default_value("autobahn-optimistic")
-                        .value_parser(["autobahn-optimistic", "autobahn-seamless", "vantage"])
+                        .value_parser([
+                            "autobahn-optimistic",
+                            "autobahn-seamless",
+                            "vantage",
+                            "simple-it",
+                        ])
                         .action(ArgAction::Set)
                         .help("Consensus protocol"),
                 )

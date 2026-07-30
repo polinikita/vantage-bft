@@ -329,6 +329,16 @@ impl CutEngine {
         agb::proposer(&self.committee, round + 1)
     }
 
+    /// `pub` (production wiring, `simpleit::node::SimpleItCore`): a read-only accessor
+    /// so the wiring layer can compute its own GC floor (`cut_round.saturating_sub
+    /// (gc_window)`) for `prune_below` below -- neither `cut_round` itself nor any
+    /// other progress indicator was otherwise exposed. Not one of the 25 ported
+    /// methods; upstream has no equivalent (its own GC, if any, would have lived
+    /// inside the un-ported `run()` loop with direct field access).
+    pub fn cut_round(&self) -> CutRound {
+        self.cut_round
+    }
+
     /// GC floor: `split_off`-prune every round-prunable structure at `floor`. No-op if
     /// `floor` is at or behind the current floor (matching `AgbEngine::gc_below`/
     /// `ControlLog::gc_below`'s own monotonic-guard shape). Not one of the 25 ported
@@ -718,7 +728,16 @@ impl CutEngine {
     /// `schedule_cut_timer(&mut self, round: u64)` took no `now`-like parameter either;
     /// this preserves that signature exactly rather than introducing one upstream never
     /// had.
-    fn schedule_cut_timer(&mut self, round: CutRound) -> Vec<CutEffect> {
+    ///
+    /// `pub` (production wiring, `simpleit::node::SimpleItCore`): every OTHER caller of
+    /// this method is internal (`process_cut_certificate`/`handle_timeout_accept_action`,
+    /// both only ever reachable after `cut_round` has already advanced PAST round 1), so
+    /// round 1 itself never gets a timer armed this way -- the production wiring calls
+    /// this directly, once, at boot (`schedule_cut_timer(1)`), exactly mirroring how
+    /// `try_propose_cut_for_current_round` (already `pub`) must also be called directly
+    /// at boot for the round-1 leader to ever propose. Zero behavior change: same
+    /// one-shot-per-round latch (`scheduled_cut_timers`), same effect.
+    pub fn schedule_cut_timer(&mut self, round: CutRound) -> Vec<CutEffect> {
         if self.scheduled_cut_timers.insert(round) {
             log::info!(
                 "BENCH event=round_start round={} leader={:?} node={:?}",

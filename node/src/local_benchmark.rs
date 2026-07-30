@@ -172,8 +172,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         "autobahn-optimistic" => Protocol::AutobahnOptimistic,
         "autobahn-seamless" => Protocol::AutobahnSeamless,
         "vantage" => Protocol::Vantage,
+        "simple-it" => Protocol::SimpleIt,
         other => anyhow::bail!(
-            "Unknown --protocol '{}'; use autobahn-optimistic, autobahn-seamless, or vantage",
+            "Unknown --protocol '{}'; use autobahn-optimistic, autobahn-seamless, vantage, or simple-it",
             other
         ),
     };
@@ -479,6 +480,29 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             | "ControlCommit"
             | "ControlFetch"
             | "ControlServe" => "control",
+            "Committed" => "metricsplumbing",
+            _ => "other",
+        },
+        // Simple-IT reuses Vantage's own data plane verbatim (same `LaneManager`/
+        // `Repairer`, hence the identical `Header`/`VantageAck`/`HeadersRequest`/
+        // `Synchronize`/`BatchRequest` wire names and categories below) and adds its
+        // own cut-consensus message family on top, grouped under `consensus` -- the
+        // same category name Autobahn uses for its own consensus-layer messages
+        // below, since this is the same kind of traffic (round-based, leader/vote/
+        // certificate/timeout messages), just from a different protocol. Kept as a
+        // separate arm rather than folded into `Protocol::Vantage`'s (even though the
+        // data-plane lines are identical) so neither protocol's dashboard ever shows
+        // the other's message vocabulary as a valid `msg_type`.
+        Protocol::SimpleIt => match msg_type {
+            "Header" | "Batch" => "dissemination",
+            "VantageAck" => "acks",
+            "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
+            "SimpleItCutProposal"
+            | "SimpleItCutVote"
+            | "SimpleItCutCertificate"
+            | "SimpleItDecide"
+            | "SimpleItTimeout"
+            | "SimpleItTimeoutAccept" => "consensus",
             "Committed" => "metricsplumbing",
             _ => "other",
         },

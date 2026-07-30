@@ -14,6 +14,7 @@ pub mod frontier;
 pub mod lanes;
 pub mod node;
 pub mod pacemaker;
+pub mod payload;
 pub mod repair;
 pub mod resolve;
 pub mod threshold;
