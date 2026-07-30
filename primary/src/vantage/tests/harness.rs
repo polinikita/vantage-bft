@@ -16,7 +16,7 @@
 
 use super::common::*;
 use crate::primary::View;
-use crate::vantage::agb::{AgbEngine, TimerKind};
+use crate::vantage::agb::{AgbEngine, EchoOut, ProposalOut, ReadyOut, TimerKind};
 use crate::vantage::control::ControlLog;
 use crate::vantage::frontier::Frontier;
 use crate::vantage::lanes::{AckAggregator, AckAvailability, LaneManager, SharedAckAggregator};
@@ -25,6 +25,7 @@ use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
 use crate::vantage::{Cursor, Effect};
+use config::Committee;
 use crypto::PublicKey;
 use metrics::Metrics;
 use std::collections::VecDeque;
@@ -78,26 +79,42 @@ pub struct Node {
     /// `avail_tick` itself to substitute the periodic watermark broadcast a real
     /// `VantageCore::run` would schedule.
     pub ack_watermarks: bool,
+    /// Mirrors `VantageCore::batched_anchors` exactly: `false` (the default, via
+    /// `Node::new`) takes `Resolver::decide`'s exact pre-existing path (0/1
+    /// entries, `ViewProposal` only); `true` (opt in via `with_batched_anchors`)
+    /// takes `Resolver::decide_prefix`'s path (0..=f entries, possibly a
+    /// `BatchViewProposal`).
+    pub batched_anchors: bool,
 }
 
 impl Node {
     pub fn new(name: PublicKey, path: &str, max_views: View) -> Self {
-        let (lm, _store) = new_lane_manager(name, path);
-        let rep = new_repairer(name, &lm);
+        Self::new_with_committee(name, path, max_views, test_committee())
+    }
+
+    /// PHASE7 (`Parameters::batched_anchors`): `Node::new`'s generalization over an
+    /// arbitrary committee -- the fixed `test_committee()` (n=4, f=1) never allows a
+    /// genuine `k >= 2` batch (`agb::batch_cap` floors at `f`, which is 1 there), so
+    /// batching-specific end-to-end tests need a bigger one. `Node::new` itself is
+    /// unchanged (still `test_committee()`, byte/behavior-identical to before this
+    /// method existed) -- it just delegates here now.
+    pub fn new_with_committee(name: PublicKey, path: &str, max_views: View, committee: Committee) -> Self {
+        let (lm, _store) = new_lane_manager_with_committee(name, path, committee.clone());
+        let rep = new_repairer_with_committee(name, &lm, committee.clone());
         let registry = prometheus::Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
-        let agb = new_agb_engine(name).with_metrics(metrics.clone());
-        let frontier = Frontier::new(name, test_committee());
+        let agb = new_agb_engine_with_committee(name, committee.clone()).with_metrics(metrics.clone());
+        let frontier = Frontier::new(name, committee.clone());
         let cursor = Cursor::new(
-            test_committee(),
+            committee.clone(),
             lm.sid().clone(),
             lm.genesis().clone(),
             MAX_BLOCK_PAYLOAD,
             lm.blocks_handle(),
         );
-        let pacemaker = Pacemaker::new(name, &test_committee());
-        let resolver = Resolver::new(test_committee().size(), TEST_DELTA_MS);
-        let mut control = ControlLog::new(name, test_committee(), lm.sid().clone(), TEST_DELTA_MS);
+        let pacemaker = Pacemaker::new(name, &committee);
+        let resolver = Resolver::new(committee.size(), TEST_DELTA_MS);
+        let mut control = ControlLog::new(name, committee.clone(), lm.sid().clone(), TEST_DELTA_MS);
         // See `ControlLog::max_rounds_for_test`'s doc comment: nothing throttles a
         // `⊥`-valued control round's instantaneous advance in this synchronous
         // harness. Comfortably above whatever an owning test needs (mirrors
@@ -113,7 +130,7 @@ impl Node {
         Self {
             name,
             lm,
-            ack_aggregator: Arc::new(Mutex::new(AckAggregator::new(test_committee()))),
+            ack_aggregator: Arc::new(Mutex::new(AckAggregator::new(committee))),
             rep,
             agb,
             frontier,
@@ -129,6 +146,7 @@ impl Node {
             held_wishes: Vec::new(),
             metrics,
             ack_watermarks: false,
+            batched_anchors: false,
         }
     }
 
@@ -137,6 +155,14 @@ impl Node {
     /// (`vantage::node::VantageCore::build`) reads the flag from `Parameters` instead.
     pub fn with_ack_watermarks(mut self, on: bool) -> Self {
         self.ack_watermarks = on;
+        self
+    }
+
+    /// Opt this node into batched resolution entries (`Parameters::batched_anchors`)
+    /// -- see the field's own doc comment. Test-only builder; production wiring
+    /// (`vantage::node::VantageCore::build`) reads the flag from `Parameters` instead.
+    pub fn with_batched_anchors(mut self, on: bool) -> Self {
+        self.batched_anchors = on;
         self
     }
 
@@ -149,24 +175,44 @@ impl Node {
             return effects; // test-only cap, see the field's doc comment
         }
         let view = self.frontier.next_turn();
-        let m = if self.agb.proposer(view) == self.name && !self.frontier.already_proposed(view) {
-            let agb = &self.agb;
-            let control = &self.control;
-            self.resolver.decide(agb, view, now, |u| {
-                agb.is_sealed(u) || control.is_anchor_resolved(u)
-            })
-        } else {
-            None
+        let entries: Vec<crate::vantage::ResolutionEntry> =
+            if self.agb.proposer(view) == self.name && !self.frontier.already_proposed(view) {
+                let agb = &self.agb;
+                let control = &self.control;
+                let resolved = |u: View| agb.is_sealed(u) || control.is_anchor_resolved(u);
+                if self.batched_anchors {
+                    self.resolver.decide_prefix(agb, view, now, resolved)
+                } else {
+                    self.resolver.decide(agb, view, now, resolved).into_iter().collect()
+                }
+            } else {
+                Vec::new()
+            };
+        let proposal = match entries.len() {
+            0 => self.frontier.try_propose(&self.lm, None).map(ProposalOut::Single),
+            1 => self
+                .frontier
+                .try_propose(&self.lm, entries.into_iter().next())
+                .map(ProposalOut::Single),
+            _ => self
+                .frontier
+                .propose_view_batch(view, &self.lm, entries)
+                .map(ProposalOut::Batch),
         };
-        if let Some(proposal) = self.frontier.try_propose(&self.lm, m) {
+        if let Some(proposal) = proposal {
             effects.push(Effect::BroadcastPropose(proposal.clone()));
-            effects.extend(self.agb.on_propose(
-                self.name,
-                proposal,
-                now,
-                &mut self.lm,
-                &mut self.rep,
-            ));
+            effects.extend(match proposal {
+                ProposalOut::Single(p) => {
+                    self.agb.on_propose(self.name, p, now, &mut self.lm, &mut self.rep)
+                }
+                ProposalOut::Batch(p) => self.agb.on_propose_batch(
+                    self.name,
+                    p,
+                    now,
+                    &mut self.lm,
+                    &mut self.rep,
+                ),
+            });
         }
         effects
     }
@@ -244,13 +290,22 @@ impl Node {
                 effects
             }
             Inbound::Propose(proposal) => {
-                let sender = self.agb.proposer(proposal.view);
-                self.agb
-                    .on_propose(sender, proposal, now, &mut self.lm, &mut self.rep)
+                let sender = self.agb.proposer(proposal.view());
+                match proposal {
+                    ProposalOut::Single(p) => {
+                        self.agb.on_propose(sender, p, now, &mut self.lm, &mut self.rep)
+                    }
+                    ProposalOut::Batch(p) => {
+                        self.agb.on_propose_batch(sender, p, now, &mut self.lm, &mut self.rep)
+                    }
+                }
             }
             Inbound::Echo(echo) => {
-                let mut effects = self.absorb_wish(echo.sender, echo.wish);
-                effects.extend(self.agb.on_echo(echo, &mut self.rep));
+                let mut effects = self.absorb_wish(echo.sender(), echo.wish());
+                effects.extend(match echo {
+                    EchoOut::Single(e) => self.agb.on_echo(e, &mut self.rep),
+                    EchoOut::Batch(e) => self.agb.on_echo_batch(e, &mut self.rep),
+                });
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects
             }
@@ -261,8 +316,11 @@ impl Node {
                 effects
             }
             Inbound::Ready(ready) => {
-                let mut effects = self.absorb_wish(ready.sender, ready.wish);
-                effects.extend(self.agb.on_ready(ready, &mut self.rep));
+                let mut effects = self.absorb_wish(ready.sender(), ready.wish());
+                effects.extend(match ready {
+                    ReadyOut::Single(r) => self.agb.on_ready(r, &mut self.rep),
+                    ReadyOut::Batch(r) => self.agb.on_ready_batch(r, &mut self.rep),
+                });
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects
             }
@@ -449,7 +507,7 @@ pub fn drain_local(
                 }
             }
             Effect::BroadcastEcho(mut e) => {
-                e.wish = nodes[idx].pacemaker.own_watermark();
+                e.set_wish(nodes[idx].pacemaker.own_watermark());
                 for j in 0..n {
                     if j != idx && nodes[j].alive {
                         outbox.push_back((j, Inbound::Echo(e.clone())));
@@ -466,7 +524,7 @@ pub fn drain_local(
                 }
             }
             Effect::BroadcastReady(mut r) => {
-                r.wish = nodes[idx].pacemaker.own_watermark();
+                r.set_wish(nodes[idx].pacemaker.own_watermark());
                 for j in 0..n {
                     if j != idx && nodes[j].alive {
                         outbox.push_back((j, Inbound::Ready(r.clone())));

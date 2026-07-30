@@ -140,6 +140,23 @@ pub enum PrimaryMessage {
     // and Simple-IT (same `LaneManager`/`AckAggregator` data plane). Appended last --
     // same bincode wire-compat rule as every other protocol-specific variant above.
     VantageAvail(Vec<crate::vantage::AvailEntry>, /* sender */ PublicKey),
+    // Vantage only, flag-gated (`Parameters::batched_anchors`, signature-free.tex's
+    // "Batched resolution entries"): the vector-`M` counterparts of
+    // `VantagePropose`/`VantageEcho`/`VantageReady`/`ControlInit`/`ControlServe`.
+    // Deliberately NEVER on the pre-existing variants above (see `agb::ViewProposal`'s
+    // doc comment) -- constructed only when the flag is on AND the proposer's
+    // recovery-turn prefix has `>= 2` entries; a run with the flag off never
+    // constructs or sends any of these five, so the flag-off wire format is
+    // untouched. Appended last -- same bincode wire-compat rule as every other
+    // protocol-specific variant above.
+    VantageProposeBatch(crate::vantage::BatchViewProposal),
+    VantageEchoBatch(crate::vantage::EchoBatch),
+    VantageReadyBatch(crate::vantage::ReadyBatch),
+    ControlInitBatch(
+        crate::vantage::ControlProposal,
+        Option<crate::vantage::BatchViewProposal>,
+    ),
+    ControlServeBatch(View, crate::vantage::BatchViewProposal),
 }
 
 impl PrimaryMessage {
@@ -185,6 +202,11 @@ impl PrimaryMessage {
             PrimaryMessage::SimpleItCutFetch(..) => "SimpleItCutFetch",
             PrimaryMessage::SimpleItCutServe(..) => "SimpleItCutServe",
             PrimaryMessage::VantageAvail(..) => "VantageAvail",
+            PrimaryMessage::VantageProposeBatch(..) => "VantageProposeBatch",
+            PrimaryMessage::VantageEchoBatch(..) => "VantageEchoBatch",
+            PrimaryMessage::VantageReadyBatch(..) => "VantageReadyBatch",
+            PrimaryMessage::ControlInitBatch(..) => "ControlInitBatch",
+            PrimaryMessage::ControlServeBatch(..) => "ControlServeBatch",
         }
     }
 }

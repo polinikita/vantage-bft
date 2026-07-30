@@ -73,7 +73,9 @@ use super::harness::{
 };
 use crate::messages::Header;
 use crate::primary::View;
-use crate::vantage::agb::{self, Echo, Outcome, ReadyGrade, ResolutionEntry, ViewProposal};
+use crate::vantage::agb::{
+    self, Echo, EchoOut, Outcome, ProposalOut, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal,
+};
 use crate::vantage::control::{ControlLog, ControlProposal};
 use crate::vantage::node::Inbound;
 use crate::vantage::Effect;
@@ -181,7 +183,12 @@ async fn drive_carrying_proposal_to_anchor(
         drain_local(nodes, i, effects, now, outbox);
     }
     run_to_quiescence(nodes, outbox, now).await;
-    deliver_only_to(nodes, outbox, &everyone, Inbound::Propose(proposal));
+    deliver_only_to(
+        nodes,
+        outbox,
+        &everyone,
+        Inbound::Propose(ProposalOut::Single(proposal)),
+    );
     run_to_quiescence(nodes, outbox, now).await;
     start_control(nodes, now, outbox).await;
     drive_control_rounds(nodes, outbox, now, 6).await;
@@ -327,7 +334,10 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     // log's leader turn -> validated Bracha -> commit -> `ApplyAnchor` -> the try-seal
     // arbiter -> the cursor.
     for &i in &live {
-        outbox.push_back((i, Inbound::Propose(proposal.clone())));
+        outbox.push_back((
+            i,
+            Inbound::Propose(ProposalOut::Single(proposal.clone())),
+        ));
     }
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
 
@@ -492,13 +502,13 @@ async fn scenario_2_withheld_tip_author_mixed_grades_resolved_via_anchor() {
         &nodes,
         &mut outbox,
         &tip_holders,
-        Inbound::Propose(proposal_full),
+        Inbound::Propose(ProposalOut::Single(proposal_full)),
     );
     deliver_only_to(
         &nodes,
         &mut outbox,
         &core_only_holders,
-        Inbound::Propose(proposal_core),
+        Inbound::Propose(ProposalOut::Single(proposal_core)),
     );
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
 
@@ -686,8 +696,18 @@ async fn scenario_3_equivocating_leader_disjoint_halves_resolution_settles_it() 
 
     let half_a = [0usize, 1usize];
     let half_b = [2usize, 3usize];
-    deliver_only_to(&nodes, &mut outbox, &half_a, Inbound::Propose(proposal_x));
-    deliver_only_to(&nodes, &mut outbox, &half_b, Inbound::Propose(proposal_y));
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &half_a,
+        Inbound::Propose(ProposalOut::Single(proposal_x)),
+    );
+    deliver_only_to(
+        &nodes,
+        &mut outbox,
+        &half_b,
+        Inbound::Propose(ProposalOut::Single(proposal_y)),
+    );
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
 
     // Both halves' own positive gates fire immediately (CoreOK holds for either
@@ -885,13 +905,13 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
         &nodes,
         &mut outbox,
         &x_holders,
-        Inbound::Propose(proposal_x),
+        Inbound::Propose(ProposalOut::Single(proposal_x)),
     );
     deliver_only_to(
         &nodes,
         &mut outbox,
         &y_holders,
-        Inbound::Propose(proposal_y),
+        Inbound::Propose(ProposalOut::Single(proposal_y)),
     );
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
 
@@ -1078,12 +1098,12 @@ async fn scenario_5_byzantine_control_leader_totality_via_fetch_and_invalid_pair
         .iter()
         .map(|pk| ControlLog::new(*pk, test_committee(), sid.clone(), TEST_DELTA_MS))
         .collect();
-    let b_w = ViewProposal {
+    let b_w = ProposalOut::Single(ViewProposal {
         view: 4,
         c: Vec::new(),
         t: Vec::new(),
         m: Some(ResolutionEntry::Skip(1)),
-    };
+    });
     let digest = b_w.digest(&sid);
     let leader = controls[0].control_leader(1);
 
@@ -1302,7 +1322,7 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
         "the SECOND nonmatching echo must have released the lock"
     );
     let ready = effects2.iter().find_map(|e| match e {
-        Effect::BroadcastReady(r) if r.proposal.view == 1 => Some(r.grade),
+        Effect::BroadcastReady(ReadyOut::Single(r)) if r.proposal.view == 1 => Some(r.grade),
         _ => None,
     });
     assert_eq!(
@@ -1320,7 +1340,7 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
     assert!(
         effects3
             .iter()
-            .any(|e| matches!(e, Effect::BroadcastEcho(echo) if echo.proposal.view == 4)),
+            .any(|e| matches!(e, Effect::BroadcastEcho(EchoOut::Single(echo)) if echo.proposal.view == 4)),
         "once the lock releases, the carrying view's Core(1,...) entry must pass MetaOK and echo"
     );
 }

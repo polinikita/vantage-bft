@@ -7,7 +7,9 @@
 // `Effect::Fixed` and recorded here as a single bit (`record_fixed`).
 
 use crate::primary::View;
-use crate::vantage::agb::{formed, proposer, Manifest, ResolutionEntry, ViewProposal};
+use crate::vantage::agb::{
+    formed, proposer, BatchViewProposal, Manifest, ResolutionEntry, ViewProposal,
+};
 use crate::vantage::lanes::LaneManager;
 use config::Committee;
 use crypto::PublicKey;
@@ -182,6 +184,36 @@ impl Frontier {
         self.proposed.insert(view);
         let (c, t) = self.build_manifests(view, lm);
         Some(ViewProposal { view, c, t, m })
+    }
+
+    /// PHASE7 (`Parameters::batched_anchors`): `propose_view`'s vector-`M`
+    /// counterpart, for a recovery turn whose `Resolver::decide_prefix` chose `k >=
+    /// 2` entries. Same gate (not-yet-proposed, this party's turn), same shared
+    /// `proposed` set (a view is proposed via EITHER this or `propose_view`, never
+    /// both), same `build_manifests` -- only the resulting wire type differs.
+    pub fn propose_view_batch(
+        &mut self,
+        view: View,
+        lm: &LaneManager,
+        entries: Vec<ResolutionEntry>,
+    ) -> Option<BatchViewProposal> {
+        if view < self.min_live_view {
+            return None;
+        }
+        if self.proposed.contains(&view) {
+            return None;
+        }
+        if proposer(&self.committee, view) != self.name {
+            return None;
+        }
+        self.proposed.insert(view);
+        let (c, t) = self.build_manifests(view, lm);
+        Some(BatchViewProposal {
+            view,
+            c,
+            t,
+            m: entries,
+        })
     }
 
     /// Construct C/T from the N5 registers (§3.2), processing authors in canonical

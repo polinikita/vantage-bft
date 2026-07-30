@@ -34,6 +34,15 @@ pub fn new_agb_engine(name: PublicKey) -> AgbEngine {
     AgbEngine::new(name, test_committee(), test_sid(), TEST_DELTA_MS)
 }
 
+/// PHASE7 (`Parameters::batched_anchors`): `new_agb_engine`'s generalization over an
+/// arbitrary committee -- the fixed `test_committee()` (n=4, f=1) never allows a
+/// genuine `k >= 2` batch (`agb::batch_cap` floors at `f`, which is 1 there), so
+/// batching-specific tests need a bigger one.
+pub fn new_agb_engine_with_committee(name: PublicKey, committee: Committee) -> AgbEngine {
+    let sid = block::session_id(&committee);
+    AgbEngine::new(name, committee, sid, TEST_DELTA_MS)
+}
+
 pub fn proposer_of(view: crate::primary::View) -> PublicKey {
     agb::proposer(&test_committee(), view)
 }
@@ -114,10 +123,37 @@ pub fn new_lane_manager(name: PublicKey, path: &str) -> (LaneManager, Store) {
     )
 }
 
+/// PHASE7: `new_lane_manager`'s generalization over an arbitrary committee -- see
+/// `new_agb_engine_with_committee`'s identical rationale.
+pub fn new_lane_manager_with_committee(
+    name: PublicKey,
+    path: &str,
+    committee: Committee,
+) -> (LaneManager, Store) {
+    let store = fresh_store(path);
+    (
+        LaneManager::new(name, committee, MAX_BLOCK_PAYLOAD, store.clone()),
+        store,
+    )
+}
+
 pub fn new_repairer(name: PublicKey, lm: &LaneManager) -> Repairer {
     Repairer::new(
         name,
         test_committee(),
+        lm.sid().clone(),
+        lm.genesis().clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    )
+}
+
+/// PHASE7: `new_repairer`'s generalization over an arbitrary committee -- see
+/// `new_agb_engine_with_committee`'s identical rationale.
+pub fn new_repairer_with_committee(name: PublicKey, lm: &LaneManager, committee: Committee) -> Repairer {
+    Repairer::new(
+        name,
+        committee,
         lm.sid().clone(),
         lm.genesis().clone(),
         MAX_BLOCK_PAYLOAD,

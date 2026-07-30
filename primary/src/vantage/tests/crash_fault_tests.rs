@@ -202,7 +202,10 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
     run_to_quiescence(&mut nodes, &mut outbox, entry_instant).await;
 
     for &i in &live {
-        outbox.push_back((i, Inbound::Propose(proposal.clone())));
+        outbox.push_back((
+            i,
+            Inbound::Propose(crate::vantage::agb::ProposalOut::Single(proposal.clone())),
+        ));
     }
     run_to_quiescence(&mut nodes, &mut outbox, entry_instant).await;
 

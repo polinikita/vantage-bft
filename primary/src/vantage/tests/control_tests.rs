@@ -5,7 +5,7 @@
 // directly against `ControlLog` -- n=4, f=1 (f+1=2, 2f+1=3, n-f=3).
 
 use super::common::*;
-use crate::vantage::agb::{Outcome, ResolutionEntry};
+use crate::vantage::agb::{Outcome, ProposalOut, ResolutionEntry};
 use crate::vantage::control::{ControlLog, ControlProposal};
 use crate::vantage::Effect;
 use crate::vantage::ViewProposal;
@@ -16,14 +16,16 @@ fn new_control(name: PublicKey) -> ControlLog {
 }
 
 /// A `B_w`-shaped proposal for view `w` whose resolution entry targets `u` (Skip, the
-/// simplest shape -- no manifest content needed for `Formed_v`/verification).
-fn skip_proposal(w: u64, u: u64) -> ViewProposal {
-    ViewProposal {
+/// simplest shape -- no manifest content needed for `Formed_v`/verification). PHASE7:
+/// wrapped in `ProposalOut::Single` -- every call site in this file feeds it straight
+/// into `ControlLog`'s (now `ProposalOut`-typed) API, unchanged otherwise.
+fn skip_proposal(w: u64, u: u64) -> ProposalOut {
+    ProposalOut::Single(ViewProposal {
         view: w,
         c: Vec::new(),
         t: Vec::new(),
         m: Some(ResolutionEntry::Skip(u)),
-    }
+    })
 }
 
 fn echo_effect(effects: &[Effect]) -> bool {

@@ -4,7 +4,7 @@
 
 use super::common::*;
 use super::harness::{drain_local, Node};
-use crate::vantage::agb::{Echo, Ready, ReadyGrade, ViewProposal};
+use crate::vantage::agb::{Echo, EchoOut, Ready, ReadyGrade, ReadyOut, ViewProposal};
 use crate::vantage::node::Inbound;
 use crate::vantage::Effect;
 use crypto::Digest;
@@ -152,26 +152,26 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
     let (sender, _) = authors()[0];
 
     node.dispatch(
-        Inbound::Echo(Echo {
+        Inbound::Echo(EchoOut::Single(Echo {
             proposal: proposal.clone(),
             grade: 1,
             sender,
             wish: 3,
             origin: None,
-        }),
+        })),
         now,
     )
     .await;
     assert_eq!(node.pacemaker.omega_of_for_test(sender), 3);
 
     node.dispatch(
-        Inbound::Echo(Echo {
+        Inbound::Echo(EchoOut::Single(Echo {
             proposal: proposal.clone(),
             grade: 1,
             sender,
             wish: 7,
             origin: None,
-        }),
+        })),
         now,
     )
     .await;
@@ -187,13 +187,13 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
     let (s2, _) = authors()[1];
     let effects = node
         .dispatch(
-            Inbound::Echo(Echo {
+            Inbound::Echo(EchoOut::Single(Echo {
                 proposal: proposal.clone(),
                 grade: 1,
                 sender: s2,
                 wish: 0,
                 origin: None,
-            }),
+            })),
             now,
         )
         .await;
@@ -206,13 +206,13 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
     let (s3, _) = authors()[2];
     let effects = node
         .dispatch(
-            Inbound::Echo(Echo {
+            Inbound::Echo(EchoOut::Single(Echo {
                 proposal,
                 grade: 1,
                 sender: s3,
                 wish: 0,
                 origin: None,
-            }),
+            })),
             now,
         )
         .await;
@@ -267,13 +267,13 @@ async fn w4_piggyback_rides_on_all_four_response_types() {
     let (s4, _) = authors()[1]; // reused sender is fine -- each check is independent
 
     node.dispatch(
-        Inbound::Echo(Echo {
+        Inbound::Echo(EchoOut::Single(Echo {
             proposal: sample_proposal(1),
             grade: 1,
             sender: s1,
             wish: 9,
             origin: None,
-        }),
+        })),
         now,
     )
     .await;
@@ -283,12 +283,12 @@ async fn w4_piggyback_rides_on_all_four_response_types() {
     assert_eq!(node.pacemaker.omega_of_for_test(s2), 10);
 
     node.dispatch(
-        Inbound::Ready(Ready {
+        Inbound::Ready(ReadyOut::Single(Ready {
             proposal: sample_proposal(1),
             grade: ReadyGrade::One,
             sender: s3,
             wish: 11,
-        }),
+        })),
         now,
     )
     .await;

@@ -10,7 +10,7 @@
 // returning like every other Vantage component -- no direct network/timer I/O.
 
 use crate::primary::View;
-use crate::vantage::agb::{self, Outcome, ResolutionEntry, ViewProposal};
+use crate::vantage::agb::{Outcome, ProposalOut, ResolutionEntry};
 use crate::vantage::block::BlockRef;
 use crate::vantage::{Effect, Thresholds};
 use config::Committee;
@@ -54,7 +54,7 @@ pub fn control_leader(committee: &Committee, round: Round) -> PublicKey {
 struct BrachaRoundState {
     /// The FIRST complete proposal received from this round's leader (sticky), paired
     /// with its attached `B_w` (present only for a non-empty value).
-    received_init: Option<(ControlProposal, Option<ViewProposal>)>,
+    received_init: Option<(ControlProposal, Option<ProposalOut>)>,
     echo_sent: bool,
     ready_sent: bool,
     /// First-hand dedup: at most one counted ECHO per sender per round, whichever
@@ -90,7 +90,7 @@ pub struct ControlLog {
     reports: BTreeMap<View, HashMap<PublicKey, Digest>>,
     /// Held + verified `B_w`'s, keyed by view (at most one correct value can ever
     /// exist per view by quorum intersection).
-    blocks: BTreeMap<View, ViewProposal>,
+    blocks: BTreeMap<View, ProposalOut>,
     /// Fable audit pass 1, P6-1: views we have broadcast our OWN `CompReport` for,
     /// ever -- the once-guard `on_completion_reportable` uses. Deliberately SEPARATE
     /// from `blocks`' own keys: `blocks[w]` can be populated by `try_echo`'s
@@ -421,14 +421,20 @@ impl ControlLog {
                 continue;
             }
             // D7-2: leader-side "smallest STILL-USEFUL view" -- a reported view here
-            // always carries a resolution entry (reports are only ever populated for
-            // M != None proposals); if its target is already anchored, some earlier
-            // carrier already resolved it, so this pair is moot -- skip it to avoid
-            // burning this leader's own per-round bandwidth re-delivering a no-op.
-            if let Some(entry) = &proposal.m {
-                if self.anchor_resolved(entry.target_view()) {
-                    continue;
-                }
+            // always carries >= 1 resolution entries (reports are only ever
+            // populated for M != empty proposals); if EVERY target it names is
+            // already anchored, some earlier carrier(s) already resolved all of
+            // them, so this pair is moot -- skip it to avoid burning this leader's
+            // own per-round bandwidth re-delivering a no-op. PHASE7: generalized
+            // from "its one target" to "every target" -- a batch carrier with even
+            // one still-unresolved target is still worth delivering.
+            let entries = proposal.entries();
+            if !entries.is_empty()
+                && entries
+                    .iter()
+                    .all(|entry| self.anchor_resolved(entry.target_view()))
+            {
+                continue;
             }
             if best.as_ref().is_none_or(|(bv, _)| view < *bv) {
                 best = Some(pair);
@@ -475,7 +481,7 @@ impl ControlLog {
         &mut self,
         sender: PublicKey,
         proposal: ControlProposal,
-        b_w: Option<ViewProposal>,
+        b_w: Option<ProposalOut>,
     ) -> Vec<Effect> {
         if sender != self.control_leader(proposal.round) {
             return Vec::new();
@@ -945,7 +951,7 @@ impl ControlLog {
     /// quorum intersection, any two verified values for the same view can only ever be
     /// content-identical, so re-inserting here is harmless even when `blocks[view]`
     /// was already held).
-    pub fn on_completion_reportable(&mut self, view: View, proposal: ViewProposal) -> Vec<Effect> {
+    pub fn on_completion_reportable(&mut self, view: View, proposal: ProposalOut) -> Vec<Effect> {
         if self.is_pruned_view(view) {
             return Vec::new();
         }
@@ -978,17 +984,11 @@ impl ControlLog {
     /// §5: "verified `B_w`" -- view matches, `M_w != ∅`, digest matches, and the
     /// proposal itself is `Formed_v` (reuses `agb::formed`, the same well-formedness
     /// check the AGB layer applies to every fixed proposal).
-    fn verify_b_w(&self, view: View, digest: &Digest, proposal: &ViewProposal) -> bool {
-        proposal.view == view
-            && proposal.m.is_some()
+    fn verify_b_w(&self, view: View, digest: &Digest, proposal: &ProposalOut) -> bool {
+        proposal.view() == view
+            && !proposal.entries().is_empty()
             && proposal.digest(&self.sid) == *digest
-            && agb::formed(
-                &self.committee,
-                proposal.view,
-                &proposal.c,
-                &proposal.t,
-                &proposal.m,
-            )
+            && proposal.formed(&self.committee)
     }
 
     // ============================================================ Fetch (§5/§6)
@@ -1082,26 +1082,18 @@ impl ControlLog {
     /// (`pending_fetch` is only ever `.remove`d on the accepting path, after every
     /// other check has already passed, so a defensive check-then-remove ordering
     /// still leaves nothing partially mutated on a rejection).
-    pub fn on_control_serve(&mut self, view: View, proposal: ViewProposal) -> Vec<Effect> {
+    pub fn on_control_serve(&mut self, view: View, proposal: ProposalOut) -> Vec<Effect> {
         if self.is_pruned_view(view) {
             return Vec::new();
         }
-        if self.blocks.contains_key(&view) || proposal.view != view {
+        if self.blocks.contains_key(&view) || proposal.view() != view {
             return Vec::new();
         }
         let digest = proposal.digest(&self.sid);
         if !self.pending_fetch.contains_key(&(view, digest.clone())) {
             return Vec::new(); // unsolicited, or answers a DIFFERENT pending pair -- ignored
         }
-        if proposal.m.is_none()
-            || !agb::formed(
-                &self.committee,
-                proposal.view,
-                &proposal.c,
-                &proposal.t,
-                &proposal.m,
-            )
-        {
+        if proposal.entries().is_empty() || !proposal.formed(&self.committee) {
             return Vec::new();
         }
         self.pending_fetch.remove(&(view, digest));
@@ -1117,7 +1109,11 @@ impl ControlLog {
     /// FIRST occurrence of a resolution entry for view `u` (in log order) is `A_u`;
     /// later occurrences are skipped (still advance the pointer). Blocks (without
     /// advancing) at the first position whose `B_w` isn't held yet -- "obtain B_w
-    /// before processing".
+    /// before processing". PHASE7 (`Parameters::batched_anchors`): a position whose
+    /// proposal carries a `BatchViewProposal`'s several entries applies ALL of them
+    /// at this one position, in their stored (strictly increasing, `formed_batch`-
+    /// enforced) target order -- so a burst of unresolved views can be closed by a
+    /// single control-log position/anchor application instead of one per view.
     ///
     /// Invariant (Fable audit pass 1, recorded per the audit's request -- no code
     /// change needed): this function never re-checks `w >= u + 3` for the entry it
@@ -1166,29 +1162,38 @@ impl ControlLog {
                 self.consume_pos += 1;
                 continue;
             }
-            let Some(entry) = &proposal.m else {
-                self.consume_pos += 1;
-                continue;
-            };
-            let u = entry.target_view();
-            if self.anchor_resolved(u) {
-                self.consume_pos += 1;
-                continue; // a later anchor for an already-resolved u -- ignored
+            // PHASE7 (`Parameters::batched_anchors`): `proposal.entries()` is 0/1
+            // for a `Single` carrier (today's exact shape) or `2..=f`, strictly
+            // increasing targets, for a `Batch` one. Applying them IN STORED ORDER
+            // is exactly "increasing target order" (§6 point 5) -- `formed_batch`
+            // already rejected any batch proposal whose entries aren't strictly
+            // increasing, so this loop's iteration order is the paper's rule by
+            // construction, not merely this implementation's convention. A target
+            // already resolved (by an earlier anchor, possibly from an EARLIER
+            // entry in this SAME batched proposal, or by direct seal) is skipped
+            // idempotently, per entry -- never breaking out of the loop, so a batch
+            // with one already-resolved target still applies its other entries.
+            for entry in proposal.entries() {
+                let u = entry.target_view();
+                if self.anchor_resolved(u) {
+                    continue; // a later anchor for an already-resolved u -- ignored
+                }
+                self.anchored.insert(u);
+                let (outcome, refs) = Self::derive_anchor(entry);
+                // PHASE7-PREP-NOTES.md Finding A: diagnostic-only observational log
+                // (no behavior change) -- the FIRST-occurrence anchor application
+                // for each target view, with the carrier (w) and control round it
+                // rode in on, so a run's log can show the actual wall-clock/round
+                // distance between a target becoming unresolved and its anchor
+                // finally landing.
+                log::info!(
+                    "vantage control log: anchor applied for u={} via carrier w={} at control round={}",
+                    u,
+                    w,
+                    self.curr_round
+                );
+                effects.push(Effect::ApplyAnchor(u, outcome, refs));
             }
-            self.anchored.insert(u);
-            let (outcome, refs) = Self::derive_anchor(entry);
-            // PHASE7-PREP-NOTES.md Finding A: diagnostic-only observational log (no
-            // behavior change) -- the FIRST-occurrence anchor application for each
-            // target view, with the carrier (w) and control round it rode in on, so a
-            // run's log can show the actual wall-clock/round distance between a target
-            // becoming unresolved and its anchor finally landing.
-            log::info!(
-                "vantage control log: anchor applied for u={} via carrier w={} at control round={}",
-                u,
-                w,
-                self.curr_round
-            );
-            effects.push(Effect::ApplyAnchor(u, outcome, refs));
             self.consume_pos += 1;
         }
         effects

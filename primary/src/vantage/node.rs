@@ -6,7 +6,7 @@
 
 use crate::messages::{Ack, Header};
 use crate::primary::{PrimaryMessage, View, CHANNEL_CAPACITY};
-use crate::vantage::agb::{AgbEngine, Echo, Ready, TimerKind, ViewProposal};
+use crate::vantage::agb::{AgbEngine, EchoOut, ProposalOut, ReadyOut, TimerKind};
 use crate::vantage::block::{self, BlockRef};
 use crate::vantage::control::{ControlLog, ControlProposal, Round};
 use crate::vantage::cursor::Cursor;
@@ -66,30 +66,39 @@ pub enum Inbound {
     /// `LaneManager::resolve_watermark`. `sender` is the broadcasting party's declared
     /// identity, the same D4-trust/MAC-binding model as `Ack`'s own `sender` field.
     Avail(Vec<AvailEntry>, PublicKey),
-    /// `VantagePropose` carries no sender field on the wire (§2) -- see
-    /// `VantageCore::dispatch_inbound` for how the trusted sender is derived.
-    Propose(ViewProposal),
-    Echo(Echo),
+    /// `VantagePropose`/`VantageProposeBatch` carry no sender field on the wire (§2)
+    /// -- see `VantageCore::dispatch_inbound` for how the trusted sender is derived.
+    /// PHASE7 (`Parameters::batched_anchors`): `ProposalOut` -- `Single` normalizes
+    /// `VantagePropose`, `Batch` normalizes `VantageProposeBatch`.
+    Propose(ProposalOut),
+    /// PHASE7: `EchoOut` -- `Single` normalizes `VantageEcho`, `Batch` normalizes
+    /// `VantageEchoBatch`.
+    Echo(EchoOut),
     /// PHASE5-SPEC.md §2: trailing field is the piggybacked wish watermark (D5-2).
     EchoSkip(View, PublicKey, View),
-    Ready(Ready),
+    /// PHASE7: `ReadyOut` -- `Single` normalizes `VantageReady`, `Batch` normalizes
+    /// `VantageReadyBatch`.
+    Ready(ReadyOut),
     /// PHASE5-SPEC.md §2: trailing field is the piggybacked wish watermark (D5-2).
     NoReady(View, PublicKey, View),
     /// PHASE5-SPEC.md §2: a standalone `VantageWish` (W2 amplification).
     Wish(View, PublicKey),
     /// PHASE6-SPEC.md §5.
     CompReport(View, Digest, PublicKey),
-    /// `ControlInit` carries no sender field on the wire (same D4 class as `Propose`)
-    /// -- the trusted sender is derived as this round's control leader by
-    /// `VantageCore::dispatch_inbound`.
-    ControlInit(ControlProposal, Option<ViewProposal>),
+    /// `ControlInit`/`ControlInitBatch` carry no sender field on the wire (same D4
+    /// class as `Propose`) -- the trusted sender is derived as this round's control
+    /// leader by `VantageCore::dispatch_inbound`. PHASE7: `Option<ProposalOut>`,
+    /// mirroring `Propose`'s generalization.
+    ControlInit(ControlProposal, Option<ProposalOut>),
     ControlEcho(PublicKey, ControlProposal),
     ControlReady(PublicKey, ControlProposal),
     ControlCommit(PublicKey, Round),
     ControlTimeoutVote(PublicKey, Round),
     ControlTimeoutAccept(PublicKey, Round),
     ControlFetch(View, Digest, PublicKey),
-    ControlServe(View, ViewProposal),
+    /// PHASE7: `ProposalOut` -- `Single` normalizes `ControlServe`, `Batch`
+    /// normalizes `ControlServeBatch`.
+    ControlServe(View, ProposalOut),
 }
 
 /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
@@ -133,6 +142,17 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
         PrimaryMessage::ControlTimeoutAccept(_, s) => Some(*s),
         PrimaryMessage::ControlFetch(_, _, s) => Some(*s),
         PrimaryMessage::ControlServe(_, _) => None,
+        // PHASE7 (`Parameters::batched_anchors`): the vector-`M` counterparts, same
+        // D4/declared-sender classification as their singular siblings above.
+        PrimaryMessage::VantageProposeBatch(p) => {
+            Some(crate::vantage::agb::proposer(committee, p.view))
+        }
+        PrimaryMessage::VantageEchoBatch(e) => Some(e.sender),
+        PrimaryMessage::VantageReadyBatch(r) => Some(r.sender),
+        PrimaryMessage::ControlInitBatch(p, _) => {
+            Some(crate::vantage::control::control_leader(committee, p.round))
+        }
+        PrimaryMessage::ControlServeBatch(_, _) => None,
         // Autobahn-only variants never legitimately reach the Vantage assembly's port
         // (`dispatch`'s own catch-all ignores them below); no candidate needed.
         _ => None,
@@ -154,6 +174,7 @@ pub(super) fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
         message,
         PrimaryMessage::Header(_, true)
             | PrimaryMessage::ControlServe(_, _)
+            | PrimaryMessage::ControlServeBatch(_, _)
             | PrimaryMessage::SimpleItCutServe(_)
     )
 }
@@ -256,21 +277,36 @@ impl MessageHandler for VantageReceiverHandler {
                 Inbound::AckAvailability(availability)
             }
             PrimaryMessage::VantageAvail(entries, sender) => Inbound::Avail(entries, sender),
-            PrimaryMessage::VantagePropose(p) => Inbound::Propose(p),
-            PrimaryMessage::VantageEcho(e) => Inbound::Echo(e),
+            PrimaryMessage::VantagePropose(p) => Inbound::Propose(ProposalOut::Single(p)),
+            PrimaryMessage::VantageEcho(e) => Inbound::Echo(EchoOut::Single(e)),
             PrimaryMessage::VantageEchoSkip(v, s, w) => Inbound::EchoSkip(v, s, w),
-            PrimaryMessage::VantageReady(r) => Inbound::Ready(r),
+            PrimaryMessage::VantageReady(r) => Inbound::Ready(ReadyOut::Single(r)),
             PrimaryMessage::VantageNoReady(v, s, w) => Inbound::NoReady(v, s, w),
             PrimaryMessage::VantageWish(v, s) => Inbound::Wish(v, s),
             PrimaryMessage::CompReport(v, d, s) => Inbound::CompReport(v, d, s),
-            PrimaryMessage::ControlInit(p, b) => Inbound::ControlInit(p, b),
+            PrimaryMessage::ControlInit(p, b) => {
+                Inbound::ControlInit(p, b.map(ProposalOut::Single))
+            }
             PrimaryMessage::ControlEcho(p, s) => Inbound::ControlEcho(s, p),
             PrimaryMessage::ControlReady(p, s) => Inbound::ControlReady(s, p),
             PrimaryMessage::ControlCommit(r, s) => Inbound::ControlCommit(s, r),
             PrimaryMessage::ControlTimeoutVote(r, s) => Inbound::ControlTimeoutVote(s, r),
             PrimaryMessage::ControlTimeoutAccept(r, s) => Inbound::ControlTimeoutAccept(s, r),
             PrimaryMessage::ControlFetch(v, d, s) => Inbound::ControlFetch(v, d, s),
-            PrimaryMessage::ControlServe(v, p) => Inbound::ControlServe(v, p),
+            PrimaryMessage::ControlServe(v, p) => Inbound::ControlServe(v, ProposalOut::Single(p)),
+            // PHASE7 (`Parameters::batched_anchors`): the vector-`M` counterparts --
+            // normalized into the SAME `Inbound` variants above via `ProposalOut`/
+            // `EchoOut`/`ReadyOut`'s `Batch` case, so `dispatch_inbound` needs no new
+            // arms, only a shape dispatch at each existing one.
+            PrimaryMessage::VantageProposeBatch(p) => Inbound::Propose(ProposalOut::Batch(p)),
+            PrimaryMessage::VantageEchoBatch(e) => Inbound::Echo(EchoOut::Batch(e)),
+            PrimaryMessage::VantageReadyBatch(r) => Inbound::Ready(ReadyOut::Batch(r)),
+            PrimaryMessage::ControlInitBatch(p, b) => {
+                Inbound::ControlInit(p, b.map(ProposalOut::Batch))
+            }
+            PrimaryMessage::ControlServeBatch(v, p) => {
+                Inbound::ControlServe(v, ProposalOut::Batch(p))
+            }
             // Autobahn-only variants never reach the Vantage assembly's port; ignore
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
@@ -329,6 +365,13 @@ pub struct VantageCore {
     /// The ack-watermark broadcast period, ms -- irrelevant when `ack_watermarks` is
     /// off (`run` never even constructs the periodic tick in that case).
     ack_watermark_period_ms: u64,
+
+    /// `Parameters::batched_anchors` (PHASE7, "Batched resolution entries"): when
+    /// `true`, `try_propose_effects` consults `Resolver::decide_prefix` instead of
+    /// `decide`, and may build/broadcast a `BatchViewProposal` instead of a
+    /// `ViewProposal`. `false` (the default) takes the exact same `decide`/
+    /// `ViewProposal` path as before this flag existed -- byte-identical.
+    batched_anchors: bool,
 
     /// §10 timer queue: (deadline, view, kind), drained by the run loop's `sleep_until`
     /// branch (message channels are checked first every iteration -- §5's tie-break
@@ -569,6 +612,7 @@ impl VantageCore {
             payload_size: 0,
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
+            batched_anchors: parameters.batched_anchors,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
             payload: PayloadIo {
@@ -944,22 +988,47 @@ impl VantageCore {
                 view += 1;
                 continue;
             }
-            let m = {
+            // PHASE7 (`Parameters::batched_anchors`): off takes `decide`'s exact
+            // pre-existing path (0/1 entries); on takes `decide_prefix`'s prefix scan
+            // (0..=f entries) -- see `Resolver::decide_prefix`'s own doc comment.
+            let entries: Vec<crate::vantage::ResolutionEntry> = {
                 let agb = &self.agb;
                 let control = &self.control;
-                self.resolver.decide(agb, view, now, |u| {
-                    agb.is_sealed(u) || control.is_anchor_resolved(u)
-                })
+                let resolved = |u: View| agb.is_sealed(u) || control.is_anchor_resolved(u);
+                if self.batched_anchors {
+                    self.resolver.decide_prefix(agb, view, now, resolved)
+                } else {
+                    self.resolver.decide(agb, view, now, resolved).into_iter().collect()
+                }
             };
-            if let Some(proposal) = self.frontier.propose_view(view, &self.lm, m) {
+            let proposal = match entries.len() {
+                0 => self
+                    .frontier
+                    .propose_view(view, &self.lm, None)
+                    .map(ProposalOut::Single),
+                1 => self
+                    .frontier
+                    .propose_view(view, &self.lm, entries.into_iter().next())
+                    .map(ProposalOut::Single),
+                _ => self
+                    .frontier
+                    .propose_view_batch(view, &self.lm, entries)
+                    .map(ProposalOut::Batch),
+            };
+            if let Some(proposal) = proposal {
                 effects.push(Effect::BroadcastPropose(proposal.clone()));
-                effects.extend(self.agb.on_propose(
-                    self.name,
-                    proposal,
-                    now,
-                    &mut self.lm,
-                    &mut self.rep,
-                ));
+                effects.extend(match proposal {
+                    ProposalOut::Single(p) => {
+                        self.agb.on_propose(self.name, p, now, &mut self.lm, &mut self.rep)
+                    }
+                    ProposalOut::Batch(p) => self.agb.on_propose_batch(
+                        self.name,
+                        p,
+                        now,
+                        &mut self.lm,
+                        &mut self.rep,
+                    ),
+                });
             }
             view += 1;
         }
@@ -1087,16 +1156,27 @@ impl VantageCore {
                 self.credit_refs(sender, refs, now)
             }
             Inbound::Propose(proposal) => {
-                // D4 (PHASE4-SPEC.md §13's standing note): `ViewProposal` carries no
-                // sender field and there is no channel identity to check it against
-                // (same class of gap as `Header`'s publish path, PHASE3-NOTES.md §5) --
-                // production trusts any received proposal for `view` as if it came
-                // from `proposer(view)`. `AgbEngine::on_propose`'s `sender ==
-                // proposer(view)` guard remains meaningful for unit tests exercising a
-                // wrong-sender proposal directly.
-                let claimed_sender = self.agb.proposer(proposal.view);
-                self.agb
-                    .on_propose(claimed_sender, proposal, now, &mut self.lm, &mut self.rep)
+                // D4 (PHASE4-SPEC.md §13's standing note): a `ViewProposal`/
+                // `BatchViewProposal` carries no sender field and there is no channel
+                // identity to check it against (same class of gap as `Header`'s
+                // publish path, PHASE3-NOTES.md §5) -- production trusts any received
+                // proposal for `view` as if it came from `proposer(view)`.
+                // `AgbEngine::on_propose{,_batch}`'s `sender == proposer(view)` guard
+                // remains meaningful for unit tests exercising a wrong-sender
+                // proposal directly.
+                let claimed_sender = self.agb.proposer(proposal.view());
+                match proposal {
+                    ProposalOut::Single(p) => {
+                        self.agb.on_propose(claimed_sender, p, now, &mut self.lm, &mut self.rep)
+                    }
+                    ProposalOut::Batch(p) => self.agb.on_propose_batch(
+                        claimed_sender,
+                        p,
+                        now,
+                        &mut self.lm,
+                        &mut self.rep,
+                    ),
+                }
             }
             // PHASE5-SPEC.md §3: absorb every response's piggybacked wish (W2) BEFORE
             // handing the response to `AgbEngine` -- wish processing (amplification,
@@ -1104,8 +1184,11 @@ impl VantageCore {
             // the engine's own processing is fine either way; absorbing first keeps the
             // four arms below symmetric with `Inbound::Wish`'s own handling.
             Inbound::Echo(echo) => {
-                let mut effects = self.pacemaker.on_wish(echo.sender, echo.wish);
-                effects.extend(self.agb.on_echo(echo, &mut self.rep));
+                let mut effects = self.pacemaker.on_wish(echo.sender(), echo.wish());
+                effects.extend(match echo {
+                    EchoOut::Single(e) => self.agb.on_echo(e, &mut self.rep),
+                    EchoOut::Batch(e) => self.agb.on_echo_batch(e, &mut self.rep),
+                });
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 // Paper R1 early-wish trigger: `on_wish` above may just have raised
                 // `omega_i^+`, which can newly satisfy `v <= max(a_i+1, omega_i^+)` for
@@ -1122,8 +1205,11 @@ impl VantageCore {
                 effects
             }
             Inbound::Ready(ready) => {
-                let mut effects = self.pacemaker.on_wish(ready.sender, ready.wish);
-                effects.extend(self.agb.on_ready(ready, &mut self.rep));
+                let mut effects = self.pacemaker.on_wish(ready.sender(), ready.wish());
+                effects.extend(match ready {
+                    ReadyOut::Single(r) => self.agb.on_ready(r, &mut self.rep),
+                    ReadyOut::Batch(r) => self.agb.on_ready_batch(r, &mut self.rep),
+                });
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
@@ -1240,21 +1326,41 @@ impl VantageCore {
                     queue.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                     queue.extend(self.cursor.retry());
                 }
-                Effect::BroadcastPropose(p) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantagePropose(p))
-                        .await
-                }
+                // PHASE7 (`Parameters::batched_anchors`): `Single` is byte-identical
+                // to the pre-PHASE7 path (same `VantagePropose` message); `Batch`
+                // (only ever constructed when the flag is on) rides the separate,
+                // flag-gated `VantageProposeBatch` message.
+                Effect::BroadcastPropose(p) => match p {
+                    ProposalOut::Single(p) => {
+                        self.wire
+                            .broadcast_message(PrimaryMessage::VantagePropose(p))
+                            .await
+                    }
+                    ProposalOut::Batch(p) => {
+                        self.wire
+                            .broadcast_message(PrimaryMessage::VantageProposeBatch(p))
+                            .await
+                    }
+                },
                 // PHASE5-SPEC.md §3/D5-3: every response effect is stamped with our
                 // current wish watermark here, at serialization time -- `AgbEngine`
                 // itself stays watermark-free (its own construction sites use a `0`
                 // placeholder, or none at all for `EchoSkip`/`NoReady`, which are
                 // effects carrying just a `View` to begin with).
                 Effect::BroadcastEcho(mut e) => {
-                    e.wish = self.pacemaker.own_watermark();
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageEcho(e))
-                        .await;
+                    e.set_wish(self.pacemaker.own_watermark());
+                    match e {
+                        EchoOut::Single(e) => {
+                            self.wire
+                                .broadcast_message(PrimaryMessage::VantageEcho(e))
+                                .await
+                        }
+                        EchoOut::Batch(e) => {
+                            self.wire
+                                .broadcast_message(PrimaryMessage::VantageEchoBatch(e))
+                                .await
+                        }
+                    }
                 }
                 Effect::BroadcastEchoSkip(view) => {
                     let wish = self.pacemaker.own_watermark();
@@ -1263,10 +1369,19 @@ impl VantageCore {
                         .await;
                 }
                 Effect::BroadcastReady(mut r) => {
-                    r.wish = self.pacemaker.own_watermark();
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageReady(r))
-                        .await;
+                    r.set_wish(self.pacemaker.own_watermark());
+                    match r {
+                        ReadyOut::Single(r) => {
+                            self.wire
+                                .broadcast_message(PrimaryMessage::VantageReady(r))
+                                .await
+                        }
+                        ReadyOut::Batch(r) => {
+                            self.wire
+                                .broadcast_message(PrimaryMessage::VantageReadyBatch(r))
+                                .await
+                        }
+                    }
                 }
                 Effect::BroadcastNoReady(view) => {
                     let wish = self.pacemaker.own_watermark();
@@ -1314,9 +1429,12 @@ impl VantageCore {
                     // it ourselves or another party did -- so it's exactly the
                     // "observed CompReport for a carrier resolving u" evidence the
                     // in-flight marker should refresh on, independent of (and in
-                    // addition to) `Resolver::decide`'s own immediate refresh for its
-                    // own attempts.
-                    if let Some(entry) = &proposal.m {
+                    // addition to) `Resolver::decide{,_prefix}`'s own immediate
+                    // refresh for its own attempts. PHASE7: refreshed for EVERY
+                    // target this carrier's `M` names (0/1 for `Single`, `2..=f` for
+                    // `Batch`) -- this carrier's genuine completion is fresh
+                    // in-flight evidence for all of them, not just the first.
+                    for entry in proposal.entries() {
                         self.resolver.note_carrier_report(entry.target_view(), now);
                     }
                     queue.extend(self.control.on_completion_reportable(view, proposal));
@@ -1326,11 +1444,29 @@ impl VantageCore {
                         .broadcast_message(PrimaryMessage::CompReport(view, digest, self.name))
                         .await;
                 }
-                Effect::BroadcastControlInit(proposal, b_w) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::ControlInit(proposal, b_w))
-                        .await;
-                }
+                // PHASE7: `Single`/`None` are byte-identical to the pre-PHASE7 path
+                // (same `ControlInit` message); `Batch` rides the separate,
+                // flag-gated `ControlInitBatch` message.
+                Effect::BroadcastControlInit(proposal, b_w) => match b_w {
+                    None => {
+                        self.wire
+                            .broadcast_message(PrimaryMessage::ControlInit(proposal, None))
+                            .await
+                    }
+                    Some(ProposalOut::Single(p)) => {
+                        self.wire
+                            .broadcast_message(PrimaryMessage::ControlInit(proposal, Some(p)))
+                            .await
+                    }
+                    Some(ProposalOut::Batch(p)) => {
+                        self.wire
+                            .broadcast_message(PrimaryMessage::ControlInitBatch(
+                                proposal,
+                                Some(p),
+                            ))
+                            .await
+                    }
+                },
                 Effect::BroadcastControlEcho(proposal) => {
                     self.wire
                         .broadcast_message(PrimaryMessage::ControlEcho(proposal, self.name))
@@ -1361,11 +1497,21 @@ impl VantageCore {
                         .send_message(peer, PrimaryMessage::ControlFetch(view, digest, self.name))
                         .await;
                 }
-                Effect::ControlServeTo(peer, view, proposal) => {
-                    self.wire
-                        .send_message(peer, PrimaryMessage::ControlServe(view, proposal))
-                        .await;
-                }
+                // PHASE7: `Single` is byte-identical to the pre-PHASE7 path (same
+                // `ControlServe` message); `Batch` rides the separate, flag-gated
+                // `ControlServeBatch` message.
+                Effect::ControlServeTo(peer, view, proposal) => match proposal {
+                    ProposalOut::Single(p) => {
+                        self.wire
+                            .send_message(peer, PrimaryMessage::ControlServe(view, p))
+                            .await
+                    }
+                    ProposalOut::Batch(p) => {
+                        self.wire
+                            .send_message(peer, PrimaryMessage::ControlServeBatch(view, p))
+                            .await
+                    }
+                },
                 Effect::ArmControlTimer(round, deadline) => {
                     self.control_timers.push(Reverse((deadline, round)));
                 }
@@ -1489,7 +1635,7 @@ mod tests {
             origin: None,
         };
         let effects = core
-            .dispatch_inbound(Inbound::Echo(echo), Instant::now())
+            .dispatch_inbound(Inbound::Echo(EchoOut::Single(echo)), Instant::now())
             .await;
 
         assert!(
@@ -1511,7 +1657,7 @@ mod tests {
             wish: 0,
         };
         let effects = core
-            .dispatch_inbound(Inbound::Ready(ready), Instant::now())
+            .dispatch_inbound(Inbound::Ready(ReadyOut::Single(ready)), Instant::now())
             .await;
 
         assert!(
@@ -1559,7 +1705,7 @@ mod tests {
             origin: None,
         };
         let effects = core
-            .dispatch_inbound(Inbound::Echo(echo), Instant::now())
+            .dispatch_inbound(Inbound::Echo(EchoOut::Single(echo)), Instant::now())
             .await;
 
         // Not dropped by the gate: the rejection counter stays at zero. (The specific

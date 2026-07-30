@@ -4,12 +4,15 @@
 // (f+1=2, 2f+1=3), equal stake -- `test_committee()`.
 
 use super::common::*;
-use crate::vantage::agb::{Echo, Ready, ReadyGrade, ResolutionEntry, ViewProposal};
+use crate::vantage::agb::{Echo, EchoOut, Ready, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal};
 use crate::vantage::Effect;
 
+/// PHASE7: this file only ever drives the `Single` path (never
+/// `on_propose_batch`/`on_echo_batch`) -- see `agb_echo_tests.rs::echo_effect`'s
+/// identical doc comment.
 fn echo_effect(effects: &[Effect]) -> Option<&Echo> {
     effects.iter().find_map(|e| match e {
-        Effect::BroadcastEcho(echo) => Some(echo),
+        Effect::BroadcastEcho(EchoOut::Single(echo)) => Some(echo),
         _ => None,
     })
 }
@@ -22,7 +25,7 @@ fn skip_effect(effects: &[Effect]) -> bool {
 
 fn ready_effect(effects: &[Effect]) -> Option<&Ready> {
     effects.iter().find_map(|e| match e {
-        Effect::BroadcastReady(r) => Some(r),
+        Effect::BroadcastReady(ReadyOut::Single(r)) => Some(r),
         _ => None,
     })
 }
@@ -400,7 +403,7 @@ async fn meta_ok_skip_requires_own_noready_for_target() {
     let echo = effects
         .iter()
         .find_map(|e| match e {
-            Effect::BroadcastEcho(e) if e.proposal.view == 4 => Some(e),
+            Effect::BroadcastEcho(EchoOut::Single(e)) if e.proposal.view == 4 => Some(e),
             _ => None,
         })
         .expect("MetaOK Skip must now pass: own R_i(1) is a noready");

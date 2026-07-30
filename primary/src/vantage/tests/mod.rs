@@ -37,3 +37,6 @@ mod control_tests;
 
 // PHASE6-SPEC.md §8
 mod byzantine_tests;
+
+// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries")
+mod batched_anchors_tests;

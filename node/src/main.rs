@@ -370,6 +370,17 @@ async fn main() -> Result<()> {
                             "Ack-watermark broadcast period, ms -- irrelevant unless \
                         --ack-watermarks is set",
                         ),
+                )
+                .arg(
+                    Arg::new("batched-anchors")
+                        .long("batched-anchors")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Vantage only: batched resolution entries -- a recovery-turn \
+                        proposal may target the maximal qualifying prefix of unresolved \
+                        views (up to f entries, derived from the committee) instead of \
+                        just one. Off by default -- byte-identical wire/behavior when off.",
+                        ),
                 ),
         )
         .subcommand_required(true)

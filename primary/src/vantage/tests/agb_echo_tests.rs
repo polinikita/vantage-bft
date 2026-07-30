@@ -2,14 +2,19 @@
 // (§5), driven directly against `AgbEngine` (no network, per the test-style note).
 
 use super::common::*;
-use crate::vantage::agb::{self, formed, Echo, TimerKind, ViewProposal};
+use crate::vantage::agb::{self, formed, Echo, EchoOut, TimerKind, ViewProposal};
 use crate::vantage::Effect;
 use crypto::Digest;
 use std::time::{Duration, Instant};
 
+/// PHASE7: this file only ever drives `AgbEngine::on_propose`/`on_echo` (the
+/// `Single` path) directly, never `on_propose_batch`/`on_echo_batch` -- so a
+/// produced echo is always `EchoOut::Single`; matching only that variant keeps
+/// every existing assertion below reading the exact same `Echo` fields as before
+/// `EchoOut` existed.
 fn echo_effect(effects: &[Effect]) -> Option<&Echo> {
     effects.iter().find_map(|e| match e {
-        Effect::BroadcastEcho(echo) => Some(echo),
+        Effect::BroadcastEcho(EchoOut::Single(echo)) => Some(echo),
         _ => None,
     })
 }

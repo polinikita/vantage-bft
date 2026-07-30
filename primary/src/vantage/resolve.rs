@@ -45,6 +45,20 @@ pub struct Resolver {
     in_flight: BTreeMap<View, Instant>,
     /// 12Δ, per the coordinator's ruling (D7-1).
     expiry: Duration,
+    /// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries"): D7-2's
+    /// alternation state -- per FIXED oldest (first-qualifying) target, every OTHER
+    /// recovery attempt must carry the single-entry vector (`k=1`), never the full
+    /// prefix. Rationale: a batched proposal is refused whole if ANY coordinate is
+    /// refused, so without this, a rider coordinate cycling through refused
+    /// candidates could starve the oldest target forever. `alternation_target` is
+    /// the first-qualifying target this toggle currently pertains to (`None` until
+    /// `decide_prefix`'s first call); `alternation_force_single` is whether the
+    /// NEXT attempt for that SAME target must be truncated to `k=1` -- flips after
+    /// every attempt, and resets (to "next attempt is full") whenever the observed
+    /// first-qualifying target changes (the oldest target got resolved, or a new,
+    /// even-older target somehow became the first-qualifying one).
+    alternation_target: Option<View>,
+    alternation_force_single: bool,
     /// Fable perf audit: a monotone lower bound on where an unresolved view can be, so
     /// `decide` doesn't rescan the whole `1..=w-3` prefix on every own-proposer turn.
     /// Sound because "resolved" (`AgbEngine::is_sealed(u) || ControlLog::
@@ -84,6 +98,8 @@ impl Resolver {
             two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
             next_is_recovery: false,
             candidate_pointer: BTreeMap::new(),
+            alternation_target: None,
+            alternation_force_single: false,
             in_flight: BTreeMap::new(),
             expiry: Duration::from_millis(12 * delta_ms),
             resolved_watermark: 1,
@@ -247,9 +263,123 @@ impl Resolver {
         None // no target qualifies at all -- bit unchanged (§4 step 2)
     }
 
+    /// The vector cap, `f` -- derived from the committee (never a config knob),
+    /// floored at 1 so the single-entry case is always representable. Matches
+    /// `agb::batch_cap`'s identical formula (kept independently computed here since
+    /// `Resolver` only ever holds derived thresholds, not a `Committee` handle).
+    fn f_cap(&self) -> usize {
+        self.f_plus_1_parties.saturating_sub(1).max(1)
+    }
+
+    /// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries"):
+    /// `decide`'s prefix-scanning generalization. Returns 0 entries (data-only
+    /// turn, or no target qualifies at all -- exactly `decide`'s own `None` cases),
+    /// or `1..=f` entries for a recovery turn.
+    ///
+    /// Coordinate 1 (the first-qualifying target `u_1`) is found by EXACTLY
+    /// `decide`'s own scan: ascending from the (lazily advanced) resolved
+    /// watermark, transparently skipping already-resolved and no-evidence
+    /// (empty-candidate) views, and skipping (never blocking) a D7-1 in-flight
+    /// view, until a genuinely qualifying view is found. The data-only/recovery
+    /// bit (§4 step 2/3) is then consulted at `u_1` exactly as `decide` does.
+    ///
+    /// Coordinates 2..k extend the prefix rightward from `u_1`: resolved/no-
+    /// evidence views are, per the spec, "skipped by the scan as they are now" --
+    /// transparently passed over without breaking the prefix. The prefix STOPS
+    /// (does not skip through) at the first in-flight-suppressed view, at
+    /// `scan_limit`, or once `f` entries are collected. FLAGGED AMBIGUITY (see this
+    /// module's PHASE7 report): the spec's "the prefix stops at the first
+    /// non-qualifying view" is open to a second reading where an in-flight view
+    /// should ALSO be skipped-through for coordinates 2..k (mirroring coordinate
+    /// 1's own treatment) rather than stopping the prefix -- this implementation
+    /// takes the "stop" reading, since skipping an in-flight view here would let
+    /// the prefix silently reach past a target another attempt is already working
+    /// on to grab a further one, which seems at odds with "maximal qualifying
+    /// PREFIX" (a prefix with a gap is not a prefix of the contiguous
+    /// justified-and-live sequence starting at `u_1`).
+    ///
+    /// D7-2 alternation (`alternation_target`/`alternation_force_single`, see their
+    /// own doc comments): per fixed `u_1`, every OTHER attempt is truncated to the
+    /// single first entry -- applied AFTER the prefix is found, so it never affects
+    /// which candidates are picked, only how many of them ride this attempt.
+    pub fn decide_prefix(
+        &mut self,
+        agb: &AgbEngine,
+        w: View,
+        now: Instant,
+        resolved: impl Fn(View) -> bool,
+    ) -> Vec<ResolutionEntry> {
+        let scan_limit = w.saturating_sub(3);
+        while self.resolved_watermark <= scan_limit && resolved(self.resolved_watermark) {
+            self.resolved_watermark += 1;
+        }
+        let cap = self.f_cap();
+        let mut prefix: Vec<(View, Vec<ResolutionEntry>)> = Vec::new();
+        let mut u = self.resolved_watermark;
+        while u <= scan_limit && prefix.len() < cap {
+            if resolved(u) {
+                u += 1;
+                continue;
+            }
+            let candidates = self.justified_candidates(agb, u);
+            if candidates.is_empty() {
+                u += 1;
+                continue; // no-evidence view never blocks a later target
+            }
+            if self.is_in_flight(u, now) {
+                if prefix.is_empty() {
+                    u += 1;
+                    continue; // still hunting for u_1 -- identical to `decide`
+                }
+                break; // prefix stops at the first in-flight view once k >= 1
+            }
+            prefix.push((u, candidates));
+            u += 1;
+        }
+        let Some(&(u1, _)) = prefix.first() else {
+            return Vec::new(); // no target qualifies at all -- bit unchanged (§4 step 2)
+        };
+        // §4 step 2/3: the data-only/recovery bit, decided at u_1 exactly as `decide`.
+        if !self.next_is_recovery {
+            self.next_is_recovery = true;
+            return Vec::new();
+        }
+        self.next_is_recovery = false;
+
+        // D7-2: per-fixed-first-target alternation between full-prefix and k=1
+        // attempts -- resets whenever the observed first-qualifying target changes.
+        if self.alternation_target != Some(u1) {
+            self.alternation_target = Some(u1);
+            self.alternation_force_single = false;
+        }
+        let force_single = self.alternation_force_single;
+        self.alternation_force_single = !self.alternation_force_single;
+        let chosen_len = if force_single { 1 } else { prefix.len() };
+
+        let mut out = Vec::with_capacity(chosen_len);
+        for (u, candidates) in prefix.into_iter().take(chosen_len) {
+            let entry = self.pick_and_advance(u, &candidates);
+            // D7-1: our own attempt is itself in-flight evidence, immediately.
+            self.in_flight.insert(u, now);
+            log::info!(
+                "vantage resolver: recovery target u={} attached at carrier turn w={} (batch size {})",
+                u,
+                w,
+                chosen_len
+            );
+            out.push(entry);
+        }
+        out
+    }
+
     #[cfg(test)]
     pub(crate) fn next_is_recovery_for_test(&self) -> bool {
         self.next_is_recovery
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alternation_state_for_test(&self) -> (Option<View>, bool) {
+        (self.alternation_target, self.alternation_force_single)
     }
 
     #[cfg(test)]

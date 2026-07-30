@@ -43,6 +43,16 @@ impl ResolutionEntry {
 
 /// §2 `ViewProposal { view, c, t, m }` (PHASE6-SPEC.md §1 adds `m`; M structurally
 /// absent -- always `None` -- through Phase 5).
+///
+/// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries"): this type is
+/// deliberately UNTOUCHED -- every field, every derive, every byte `bincode::
+/// serialize` produces for it is identical to before this flag existed. The vector
+/// (`k >= 2` entries) case travels on a SEPARATE wire type, `BatchViewProposal`
+/// (below): changing `m` here to a `Vec` would change the serialized bytes for the
+/// `None`/single-entry case too (an `Option`'s wire encoding differs from a `Vec`'s
+/// even when both are "empty"/"one element"), breaking the flag-off byte-identity
+/// requirement. See `ProposalOut` for the internal (never-itself-serialized)
+/// abstraction `AgbEngine`/`control::ControlLog` use to treat both shapes uniformly.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct ViewProposal {
     pub view: View,
@@ -56,6 +66,89 @@ impl ViewProposal {
     pub fn digest(&self, sid: &Digest) -> Digest {
         let bytes = bincode::serialize(self).expect("ViewProposal always serializes");
         block::domain_hash(b"view-proposal", sid, &bytes)
+    }
+}
+
+/// PHASE7 (`Parameters::batched_anchors`): the vector form of `M`, `m.len() in
+/// 2..=f` (`f` derived from the committee -- see `formed_batch`), strictly
+/// increasing target views. Carried on its own wire messages
+/// (`VantageProposeBatch`/`VantageEchoBatch`/.../`ControlServeBatch`), appended
+/// last in `PrimaryMessage`, NEVER on `ViewProposal`'s own fields -- see that type's
+/// doc comment for why. Domain-separated digest (`"view-proposal-batch"`, distinct
+/// from `ViewProposal::digest`'s `"view-proposal"`) purely for hygiene -- the two
+/// types' bincode shapes already differ, so an actual collision is not the concern.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct BatchViewProposal {
+    pub view: View,
+    pub c: Manifest,
+    pub t: Manifest,
+    pub m: Vec<ResolutionEntry>,
+}
+
+impl BatchViewProposal {
+    pub fn digest(&self, sid: &Digest) -> Digest {
+        let bytes = bincode::serialize(self).expect("BatchViewProposal always serializes");
+        block::domain_hash(b"view-proposal-batch", sid, &bytes)
+    }
+}
+
+/// PHASE7: normalizes the two wire shapes `M` can travel on into one type that
+/// `AgbEngine`'s internal per-view state and every M-touching query operate over
+/// generically -- itself never serialized (each variant's own payload IS the wire
+/// type; this enum is purely an internal/`Effect`-payload abstraction, the same role
+/// `Fixed`/`EchoStatement` already play). `entries()` is the uniform view every
+/// per-entry check (`meta_ok`, `compute_origin`, `ReadyOK`, anchor application) reads:
+/// 0 or 1 entries for `Single`, `2..=f` for `Batch`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProposalOut {
+    Single(ViewProposal),
+    Batch(BatchViewProposal),
+}
+
+impl ProposalOut {
+    pub fn view(&self) -> View {
+        match self {
+            Self::Single(p) => p.view,
+            Self::Batch(p) => p.view,
+        }
+    }
+
+    pub fn c(&self) -> &Manifest {
+        match self {
+            Self::Single(p) => &p.c,
+            Self::Batch(p) => &p.c,
+        }
+    }
+
+    pub fn t(&self) -> &Manifest {
+        match self {
+            Self::Single(p) => &p.t,
+            Self::Batch(p) => &p.t,
+        }
+    }
+
+    /// The 0/1 (`Single`) or `2..=f` (`Batch`) resolution entries this proposal
+    /// carries, in canonical (strictly increasing target) order.
+    pub fn entries(&self) -> &[ResolutionEntry] {
+        match self {
+            Self::Single(p) => p.m.as_slice(),
+            Self::Batch(p) => &p.m,
+        }
+    }
+
+    pub fn digest(&self, sid: &Digest) -> Digest {
+        match self {
+            Self::Single(p) => p.digest(sid),
+            Self::Batch(p) => p.digest(sid),
+        }
+    }
+
+    /// `formed`/`formed_batch`, dispatched by shape.
+    pub fn formed(&self, committee: &Committee) -> bool {
+        match self {
+            Self::Single(p) => formed(committee, p.view, &p.c, &p.t, &p.m),
+            Self::Batch(p) => formed_batch(committee, p.view, &p.c, &p.t, &p.m),
+        }
     }
 }
 
@@ -83,6 +176,88 @@ pub struct Echo {
     pub origin: Option<u8>,
 }
 
+/// PHASE7 (`Parameters::batched_anchors`): `EchoBatch`'s vector generalization of
+/// `Echo::origin` -- one `Ann` bit per `proposal.m` position, each computed exactly
+/// as `Echo::origin` is for its own target (`None` for a skip entry).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct EchoBatch {
+    pub proposal: BatchViewProposal,
+    pub grade: u8,
+    pub sender: PublicKey,
+    pub wish: View,
+    pub origin: Vec<Option<u8>>,
+}
+
+/// PHASE7: normalizes `Echo`/`EchoBatch` for `AgbEngine`'s internal counting (never
+/// itself serialized -- see `ProposalOut`'s identical role for the propose message).
+#[derive(Clone, Debug)]
+pub enum EchoOut {
+    Single(Echo),
+    Batch(EchoBatch),
+}
+
+impl EchoOut {
+    pub fn proposal_view(&self) -> View {
+        match self {
+            Self::Single(e) => e.proposal.view,
+            Self::Batch(e) => e.proposal.view,
+        }
+    }
+
+    pub fn grade(&self) -> u8 {
+        match self {
+            Self::Single(e) => e.grade,
+            Self::Batch(e) => e.grade,
+        }
+    }
+
+    pub fn sender(&self) -> PublicKey {
+        match self {
+            Self::Single(e) => e.sender,
+            Self::Batch(e) => e.sender,
+        }
+    }
+
+    pub fn wish(&self) -> View {
+        match self {
+            Self::Single(e) => e.wish,
+            Self::Batch(e) => e.wish,
+        }
+    }
+
+    pub fn set_wish(&mut self, wish: View) {
+        match self {
+            Self::Single(e) => e.wish = wish,
+            Self::Batch(e) => e.wish = wish,
+        }
+    }
+
+    /// The per-entry `Ann` bits, aligned 1:1 with `self.proposal().entries()` --
+    /// `Echo::origin`'s single `Option<u8>` naturally covers the `Single` shape's 0/1
+    /// entries (`None` when `M` is empty is indistinguishable from `None` for a
+    /// one-entry skip, but the two cases are equivalent for every reader: `ReadyOK`
+    /// treats a skip position exactly like an absent one, always passing).
+    pub fn origin_vec(&self) -> Vec<Option<u8>> {
+        match self {
+            Self::Single(e) => {
+                if e.proposal.m.is_some() {
+                    vec![e.origin]
+                } else {
+                    Vec::new()
+                }
+            }
+            Self::Batch(e) => e.origin.clone(),
+        }
+    }
+
+    pub fn into_proposal_out(self) -> ProposalOut {
+        match self {
+            Self::Single(e) => ProposalOut::Single(e.proposal),
+            Self::Batch(e) => ProposalOut::Batch(e.proposal),
+        }
+    }
+}
+
 /// §6 `Ready`'s grade: `One` if a quorum of the counted echoes at emission were
 /// grade-1, `Zero` if a quorum were grade-0, else `Mix`.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -100,6 +275,69 @@ pub struct Ready {
     pub sender: PublicKey,
     /// See `Echo::wish`'s doc comment -- same piggyback convention (W4/D5-3).
     pub wish: View,
+}
+
+/// PHASE7 (`Parameters::batched_anchors`): `Ready`'s counterpart for a
+/// `BatchViewProposal` -- `grade` is unaffected by `M`'s plurality (it grades the
+/// carrying `(C,T)` payload alone, exactly as today), so only `proposal`'s type
+/// differs.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ReadyBatch {
+    pub proposal: BatchViewProposal,
+    pub grade: ReadyGrade,
+    pub sender: PublicKey,
+    pub wish: View,
+}
+
+/// PHASE7: normalizes `Ready`/`ReadyBatch`, mirroring `EchoOut`.
+#[derive(Clone, Debug)]
+pub enum ReadyOut {
+    Single(Ready),
+    Batch(ReadyBatch),
+}
+
+impl ReadyOut {
+    pub fn sender(&self) -> PublicKey {
+        match self {
+            Self::Single(r) => r.sender,
+            Self::Batch(r) => r.sender,
+        }
+    }
+
+    pub fn wish(&self) -> View {
+        match self {
+            Self::Single(r) => r.wish,
+            Self::Batch(r) => r.wish,
+        }
+    }
+
+    pub fn set_wish(&mut self, wish: View) {
+        match self {
+            Self::Single(r) => r.wish = wish,
+            Self::Batch(r) => r.wish = wish,
+        }
+    }
+
+    pub fn proposal_view(&self) -> View {
+        match self {
+            Self::Single(r) => r.proposal.view,
+            Self::Batch(r) => r.proposal.view,
+        }
+    }
+
+    pub fn grade(&self) -> ReadyGrade {
+        match self {
+            Self::Single(r) => r.grade,
+            Self::Batch(r) => r.grade,
+        }
+    }
+
+    pub fn into_proposal_out(self) -> ProposalOut {
+        match self {
+            Self::Single(r) => ProposalOut::Single(r.proposal),
+            Self::Batch(r) => ProposalOut::Batch(r.proposal),
+        }
+    }
 }
 
 /// §7/§9's terminal per-view result: `gfull(C,T)`, `gcore(C)`, or `gskip` (the last is
@@ -150,34 +388,6 @@ pub fn formed(
     t: &Manifest,
     m: &Option<ResolutionEntry>,
 ) -> bool {
-    fn strictly_sorted_and_staked(committee: &Committee, m: &Manifest) -> bool {
-        let mut last: Option<PublicKey> = None;
-        for (author, height, _digest) in m {
-            if *height < 1 {
-                return false;
-            }
-            if committee.stake(author) == 0 {
-                return false;
-            }
-            if let Some(prev) = last {
-                if *author <= prev {
-                    return false; // strictly increasing author order (also rejects
-                                  // duplicate authors within the same manifest)
-                }
-            }
-            last = Some(*author);
-        }
-        true
-    }
-    fn distinct_hashes(m1: &Manifest, m2: &Manifest) -> bool {
-        let mut hashes = std::collections::HashSet::new();
-        for (_, _, h) in m1.iter().chain(m2.iter()) {
-            if !hashes.insert(h.clone()) {
-                return false;
-            }
-        }
-        true
-    }
     if !strictly_sorted_and_staked(committee, c) || !strictly_sorted_and_staked(committee, t) {
         return false;
     }
@@ -185,37 +395,137 @@ pub fn formed(
         return false; // duplicate hash across C ∪ T
     }
     if let Some(entry) = m {
-        let u = entry.target_view();
-        if u < 1 || u > view.saturating_sub(3) {
+        if !formed_entry(committee, view, entry) {
             return false;
-        }
-        match entry {
-            ResolutionEntry::Full(_, c_u, t_u) | ResolutionEntry::Core(_, c_u, t_u) => {
-                if !strictly_sorted_and_staked(committee, c_u)
-                    || !strictly_sorted_and_staked(committee, t_u)
-                {
-                    return false;
-                }
-                if !distinct_hashes(c_u, t_u) {
-                    return false;
-                }
-            }
-            ResolutionEntry::Skip(_) => {}
         }
     }
     true
 }
 
-/// PHASE6-SPEC.md §1 `AuxRefs(M)`: the non-skip entry's manifests (empty for `None`/
-/// `Skip`) -- authorized alongside the carrying proposal's own C/T, both on fixing (§5
-/// `on_propose`) and on completion (§7 `recheck_completion_and_direct`).
-fn aux_refs(m: &Option<ResolutionEntry>) -> Vec<BlockRef> {
-    match m {
-        Some(ResolutionEntry::Full(_, c, t)) | Some(ResolutionEntry::Core(_, c, t)) => {
-            c.iter().chain(t.iter()).cloned().collect()
-        }
-        _ => Vec::new(),
+/// PHASE7 (`Parameters::batched_anchors`): well-formedness for the vector-`M` wire
+/// shape (`BatchViewProposal`). The carrying `C`/`T` bounds are identical to
+/// `formed`'s own (shared helpers below); additionally: `m.len()` is `2..=f` (`f`
+/// derived from the committee, never a config knob -- a Byzantine sender misusing
+/// this wire shape for the 0/1-entry case, which belongs on `ViewProposal`/`formed`,
+/// is rejected outright, so there is exactly one canonical wire representation per
+/// logical `M`), every entry's own bounds match `formed`'s single-entry checks, and
+/// targets are STRICTLY increasing (load-bearing for §6's "apply a batched anchor's
+/// entries in increasing target order" -- enforced here so a FIXED batch proposal
+/// already guarantees `pump_log`'s in-order iteration is the paper's rule, not
+/// merely this implementation's convention).
+pub fn formed_batch(
+    committee: &Committee,
+    view: View,
+    c: &Manifest,
+    t: &Manifest,
+    m: &[ResolutionEntry],
+) -> bool {
+    if !strictly_sorted_and_staked(committee, c) || !strictly_sorted_and_staked(committee, t) {
+        return false;
     }
+    if !distinct_hashes(c, t) {
+        return false;
+    }
+    let f_cap = batch_cap(committee);
+    if m.len() < 2 || m.len() > f_cap {
+        return false;
+    }
+    let mut prev: Option<View> = None;
+    for entry in m {
+        if !formed_entry(committee, view, entry) {
+            return false;
+        }
+        let u = entry.target_view();
+        if let Some(p) = prev {
+            if u <= p {
+                return false; // strictly increasing targets
+            }
+        }
+        prev = Some(u);
+    }
+    true
+}
+
+/// The vector cap, `f` -- derived from the committee, floored at 1 so a single-entry
+/// proposal is always representable regardless of committee size. Shared by
+/// `formed_batch` (receiver-side validation) and `Resolver::decide_prefix`
+/// (proposer-side construction), so both sides agree on the same bound.
+pub fn batch_cap(committee: &Committee) -> usize {
+    Thresholds::from_party_count(committee.size())
+        .f_plus_1_parties
+        .saturating_sub(1)
+        .max(1)
+}
+
+/// Shared by `formed`/`formed_batch`: one resolution entry's own bounds (`1 <= u <=
+/// view - 3`, its own `C_u`/`T_u` sorted/staked/distinct) -- PHASE6-SPEC.md §1's
+/// per-entry checklist, unchanged by batching (a view enters a batch only if it
+/// qualifies exactly as a lone entry would).
+fn formed_entry(committee: &Committee, view: View, entry: &ResolutionEntry) -> bool {
+    let u = entry.target_view();
+    if u < 1 || u > view.saturating_sub(3) {
+        return false;
+    }
+    match entry {
+        ResolutionEntry::Full(_, c_u, t_u) | ResolutionEntry::Core(_, c_u, t_u) => {
+            if !strictly_sorted_and_staked(committee, c_u) || !strictly_sorted_and_staked(committee, t_u)
+            {
+                return false;
+            }
+            if !distinct_hashes(c_u, t_u) {
+                return false;
+            }
+        }
+        ResolutionEntry::Skip(_) => {}
+    }
+    true
+}
+
+fn strictly_sorted_and_staked(committee: &Committee, m: &Manifest) -> bool {
+    let mut last: Option<PublicKey> = None;
+    for (author, height, _digest) in m {
+        if *height < 1 {
+            return false;
+        }
+        if committee.stake(author) == 0 {
+            return false;
+        }
+        if let Some(prev) = last {
+            if *author <= prev {
+                return false; // strictly increasing author order (also rejects
+                              // duplicate authors within the same manifest)
+            }
+        }
+        last = Some(*author);
+    }
+    true
+}
+
+fn distinct_hashes(m1: &Manifest, m2: &Manifest) -> bool {
+    let mut hashes = std::collections::HashSet::new();
+    for (_, _, h) in m1.iter().chain(m2.iter()) {
+        if !hashes.insert(h.clone()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// PHASE6-SPEC.md §1 `AuxRefs(M)`: the non-skip entries' manifests (empty for no
+/// entries) -- authorized alongside the carrying proposal's own C/T, both on fixing
+/// (§5 `on_propose`) and on completion (§7 `recheck_completion_and_direct`).
+/// PHASE7: generalized from a single optional entry to a slice, uniformly covering
+/// `ProposalOut::entries()`'s 0/1/many shapes.
+fn aux_refs_entries(entries: &[ResolutionEntry]) -> Vec<BlockRef> {
+    entries
+        .iter()
+        .flat_map(|entry| match entry {
+            ResolutionEntry::Full(_, c, t) | ResolutionEntry::Core(_, c, t) => {
+                c.iter().chain(t.iter()).cloned().collect::<Vec<_>>()
+            }
+            ResolutionEntry::Skip(_) => Vec::new(),
+        })
+        .collect()
 }
 
 /// §3 D4-2: `proposer(v)` = round-robin over the committee's authorities in their
@@ -232,28 +542,32 @@ pub fn proposer(committee: &Committee, view: View) -> PublicKey {
 enum Fixed {
     Unset,
     Reject,
-    /// The `ViewProposal` is `Arc`-wrapped purely as an internal ownership
-    /// optimization (Efficiency Item 3): every clone below is a refcount bump, never
-    /// a deep copy of `c`/`t`/`m`. Content, digest, and every comparison/query over it
-    /// are unchanged; the wrapper never crosses into a wire type (`Echo`/`Ready`
-    /// still carry an owned `ViewProposal`, materialized via `(*arc).clone()` at the
-    /// point an effect is actually built).
-    Proposal(Arc<ViewProposal>, Digest),
+    /// The proposal is `Arc`-wrapped purely as an internal ownership optimization
+    /// (Efficiency Item 3): every clone below is a refcount bump, never a deep copy
+    /// of `c`/`t`/`m`. Content, digest, and every comparison/query over it are
+    /// unchanged; the wrapper never crosses into a wire type (`Echo`/`Ready`/their
+    /// `*Batch` counterparts still carry an owned proposal, materialized via
+    /// `(*arc).clone()` at the point an effect is actually built). PHASE7: `Arc<
+    /// ProposalOut>`, not `Arc<ViewProposal>` -- generalized to cover the batch
+    /// shape too (see `ProposalOut`'s own doc comment; `Single` degenerates to
+    /// exactly today's behavior).
+    Proposal(Arc<ProposalOut>, Digest),
 }
 
 #[derive(Clone, Debug)]
 enum EchoStatement {
     /// A counted proposal echo: the proposal (`Arc`-wrapped, see `Fixed::Proposal`),
-    /// its digest, its grade (0 or 1), and its origin bit (PHASE6-SPEC.md §3 `Ann`;
-    /// `None` for skip entries/empty M).
-    Graded(Arc<ViewProposal>, Digest, u8, Option<u8>),
+    /// its digest, its grade (0 or 1), and its per-entry origin bits (PHASE6-SPEC.md
+    /// §3 `Ann`, generalized by PHASE7 from a single `Option<u8>` to a `Vec`, one
+    /// per `proposal.entries()` position -- `None` for a skip entry, aligned 1:1).
+    Graded(Arc<ProposalOut>, Digest, u8, Vec<Option<u8>>),
     Skip,
 }
 
 #[derive(Clone, Debug)]
 enum ReadyStatement {
     /// A counted proposal ready (`Arc`-wrapped, see `Fixed::Proposal`).
-    Graded(Arc<ViewProposal>, Digest, ReadyGrade),
+    Graded(Arc<ProposalOut>, Digest, ReadyGrade),
     /// PHASE6-SPEC.md D6-5: a counted no-ready -- Phase 4/5 recorded only that the
     /// one-shot ready-stage slot was used, never the content; §4's justification needs
     /// the content (a first-hand noready census per view), so it is stored now.
@@ -263,7 +577,7 @@ enum ReadyStatement {
 /// §8's fast-seal lock, `L_i(v, B)`.
 #[derive(Clone, Debug)]
 struct Lock {
-    proposal: ViewProposal,
+    proposal: ProposalOut,
     digest: Digest,
     /// "A lock may be born inactive; once inactive it never reactivates."
     active: bool,
@@ -296,7 +610,7 @@ struct ViewState {
     /// distinct payloads that can ever be justified for one view); worst case under
     /// Byzantine senders it is bounded by `n`, same order as `echo_statements`
     /// itself.
-    digest_cache: Vec<(Arc<ViewProposal>, Digest)>,
+    digest_cache: Vec<(Arc<ProposalOut>, Digest)>,
 }
 
 impl Default for ViewState {
@@ -464,8 +778,8 @@ impl AgbEngine {
     fn canonical_proposal(
         &mut self,
         view: View,
-        proposal: ViewProposal,
-    ) -> (Arc<ViewProposal>, Digest) {
+        proposal: ProposalOut,
+    ) -> (Arc<ProposalOut>, Digest) {
         if let Some(state) = self.views.get(&view) {
             if let Some((cached, digest)) = state.digest_cache.iter().find(|(p, _)| **p == proposal)
             {
@@ -537,7 +851,7 @@ impl AgbEngine {
     pub fn echo_grade1_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
         self.echo_count(
             view,
-            |stmt| matches!(stmt, EchoStatement::Graded(p, _, 1, _) if p.c == *c && p.t == *t),
+            |stmt| matches!(stmt, EchoStatement::Graded(p, _, 1, _) if p.c() == c && p.t() == t),
         )
     }
 
@@ -546,7 +860,7 @@ impl AgbEngine {
     pub fn echo_any_grade_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
         self.echo_count(
             view,
-            |stmt| matches!(stmt, EchoStatement::Graded(p, _, _, _) if p.c == *c && p.t == *t),
+            |stmt| matches!(stmt, EchoStatement::Graded(p, _, _, _) if p.c() == c && p.t() == t),
         )
     }
 
@@ -562,7 +876,7 @@ impl AgbEngine {
         let mut out = Vec::new();
         for stmt in state.echo_statements.values() {
             if let EchoStatement::Graded(p, _, _, _) = stmt {
-                let key = (p.c.clone(), p.t.clone());
+                let key = (p.c().clone(), p.t().clone());
                 if seen.insert(key.clone()) {
                     out.push(key);
                 }
@@ -750,7 +1064,32 @@ impl AgbEngine {
         lm: &mut LaneManager,
         rep: &mut Repairer,
     ) -> Vec<Effect> {
-        let view = proposal.view;
+        self.on_propose_any(sender, ProposalOut::Single(proposal), now, lm, rep)
+    }
+
+    /// PHASE7 (`Parameters::batched_anchors`): the `BatchViewProposal` counterpart of
+    /// `on_propose` -- same D4 declared-sender trust, same sticky-`fixed` semantics,
+    /// delegated to the same shared `on_propose_any` core.
+    pub fn on_propose_batch(
+        &mut self,
+        sender: PublicKey,
+        proposal: BatchViewProposal,
+        now: Instant,
+        lm: &mut LaneManager,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        self.on_propose_any(sender, ProposalOut::Batch(proposal), now, lm, rep)
+    }
+
+    fn on_propose_any(
+        &mut self,
+        sender: PublicKey,
+        proposal: ProposalOut,
+        now: Instant,
+        lm: &mut LaneManager,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        let view = proposal.view();
         let mut effects = Vec::new();
         if self.is_pruned(view) {
             return effects;
@@ -771,7 +1110,7 @@ impl AgbEngine {
             .first_proposal_instant
             .get_or_insert(now);
 
-        if !formed(&self.committee, view, &proposal.c, &proposal.t, &proposal.m) {
+        if !proposal.formed(&self.committee) {
             self.state_mut(view).fixed = Fixed::Reject;
             effects.push(Effect::Fixed(view, false));
             return effects;
@@ -788,10 +1127,10 @@ impl AgbEngine {
             self.pending_gate.insert(view);
         }
         for r in proposal
-            .c
+            .c()
             .iter()
-            .chain(proposal.t.iter())
-            .chain(aux_refs(&proposal.m).iter())
+            .chain(proposal.t().iter())
+            .chain(aux_refs_entries(proposal.entries()).iter())
         {
             effects.extend(rep.authorize(r.clone()));
         }
@@ -879,24 +1218,18 @@ impl AgbEngine {
         self.record_lock(view, &proposal, &digest);
         self.state_mut(view).echo_sent = true;
         self.pending_gate.remove(&view); // Efficiency Item 2 transition (c)
-        let origin = self.compute_origin(&proposal.m);
+        let origin = self.compute_origin(proposal.entries());
         self.count_echo_statement(
             view,
             self.name,
-            EchoStatement::Graded(Arc::clone(&proposal), digest, 1, origin),
+            EchoStatement::Graded(Arc::clone(&proposal), digest, 1, origin.clone()),
         );
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
-        effects.push(Effect::BroadcastEcho(Echo {
-            // The wire type still carries an owned `ViewProposal`: exactly one deep
-            // clone here (same total deep-clone count as before this file's
-            // efficiency changes -- the deep clone above simply moved from the
-            // now-Arc'd census entry to this required-owned wire value).
-            proposal: (*proposal).clone(),
-            grade: 1,
-            sender: self.name,
-            wish: 0, // D5-3: stamped by `VantageCore` at serialization time
-            origin,
-        }));
+        // The wire type still carries an owned proposal: exactly one deep clone here
+        // (same total deep-clone count as before this file's efficiency changes --
+        // the deep clone above simply moved from the now-Arc'd census entry to this
+        // required-owned wire value).
+        effects.push(Effect::BroadcastEcho(self.build_echo_out(&proposal, 1, origin)));
         // D6-4: release evaluation runs BEFORE R3's ready recheck on this same newly
         // counted echo-stage response; the all-n fastseal trigger stays after.
         self.recheck_lock_release(view);
@@ -905,20 +1238,68 @@ impl AgbEngine {
         effects
     }
 
+    /// PHASE7: builds the outbound `Echo`/`EchoBatch` (wrapped in `EchoOut`) for a
+    /// just-decided echo of `proposal`, dispatched by its own shape -- shared by the
+    /// organic (positive-gate), fallback, and echo-skip-adjacent (well-formed but
+    /// fallback) emission sites. `origin`'s length always matches
+    /// `proposal.entries().len()` (0/1 for `Single`, `2..=f` for `Batch`).
+    fn build_echo_out(
+        &self,
+        proposal: &Arc<ProposalOut>,
+        grade: u8,
+        origin: Vec<Option<u8>>,
+    ) -> EchoOut {
+        match proposal.as_ref() {
+            ProposalOut::Single(p) => EchoOut::Single(Echo {
+                proposal: p.clone(),
+                grade,
+                sender: self.name,
+                wish: 0, // D5-3: stamped by `VantageCore` at serialization time
+                origin: origin.into_iter().next().flatten(),
+            }),
+            ProposalOut::Batch(p) => EchoOut::Batch(EchoBatch {
+                proposal: p.clone(),
+                grade,
+                sender: self.name,
+                wish: 0,
+                origin,
+            }),
+        }
+    }
+
+    /// PHASE7: `build_echo_out`'s `Ready`/`ReadyBatch` counterpart -- `grade` is
+    /// unaffected by `M`'s plurality, so this is a pure shape dispatch.
+    fn build_ready_out(&self, proposal: &Arc<ProposalOut>, grade: ReadyGrade) -> ReadyOut {
+        match proposal.as_ref() {
+            ProposalOut::Single(p) => ReadyOut::Single(Ready {
+                proposal: p.clone(),
+                grade,
+                sender: self.name,
+                wish: 0, // D5-3: stamped by `VantageCore` at serialization time
+            }),
+            ProposalOut::Batch(p) => ReadyOut::Batch(ReadyBatch {
+                proposal: p.clone(),
+                grade,
+                sender: self.name,
+                wish: 0,
+            }),
+        }
+    }
+
     /// R2's positive gate predicate: `CoreOK_i(C) ∧ TipOK_i(C,T) ∧ MetaOK_i(w,M)`
     /// (PHASE6-SPEC.md §2 adds the `MetaOK` conjunct to what Phase 4 called
     /// `positive_gate_holds`).
-    fn positive_gate_holds(&self, proposal: &ViewProposal, lm: &mut LaneManager) -> bool {
-        if !Self::core_ok(&proposal.c, lm) {
+    fn positive_gate_holds(&self, proposal: &ProposalOut, lm: &mut LaneManager) -> bool {
+        if !Self::core_ok(proposal.c(), lm) {
             return false;
         }
-        if !proposal.t.iter().all(|r| lm.author_ok(r)) {
+        if !proposal.t().iter().all(|r| lm.author_ok(r)) {
             return false;
         }
-        if !Self::tip_ok(&proposal.c, &proposal.t, lm) {
+        if !Self::tip_ok(proposal.c(), proposal.t(), lm) {
             return false;
         }
-        self.meta_ok(&proposal.m, lm)
+        self.meta_ok(proposal.entries(), lm)
     }
 
     /// `CoreOK_i(C)`: every C entry is `author_ok`.
@@ -961,10 +1342,16 @@ impl AgbEngine {
     /// `MetaOK` depends on THIS party's own echo/ready for a *different*, earlier view
     /// `u`, which the existing Ack/BlockCached-triggered `recheck_all` call sites never
     /// covered).
-    fn meta_ok(&self, m: &Option<ResolutionEntry>, lm: &mut LaneManager) -> bool {
-        let Some(entry) = m else {
-            return true;
-        };
+    /// PHASE7 (`Parameters::batched_anchors`): the CONJUNCTION of `meta_ok_entry`
+    /// over every entry -- a party echoes the carrying proposal only if EVERY entry
+    /// passes the same single-entry predicate it always has. Degenerates exactly to
+    /// today's behavior for 0/1 entries (`entries.iter().all(..)` over an empty or
+    /// singleton slice).
+    fn meta_ok(&self, entries: &[ResolutionEntry], lm: &mut LaneManager) -> bool {
+        entries.iter().all(|entry| self.meta_ok_entry(entry, lm))
+    }
+
+    fn meta_ok_entry(&self, entry: &ResolutionEntry, lm: &mut LaneManager) -> bool {
         let u = entry.target_view();
         if self.is_pruned(u) {
             // SAFETY: a pruned `u` means we dropped the very evidence MetaOK is defined
@@ -1001,7 +1388,7 @@ impl AgbEngine {
             if lock.active {
                 match entry {
                     ResolutionEntry::Full(_, c, t)
-                        if lock.proposal.c == *c && lock.proposal.t == *t => {}
+                        if lock.proposal.c() == c && lock.proposal.t() == t => {}
                     _ => return false,
                 }
             }
@@ -1017,7 +1404,7 @@ impl AgbEngine {
                         if *grade == ReadyGrade::Zero {
                             return false; // grade-0 proposal-ready
                         }
-                        if p.c != *c_u || p.t != *t_u {
+                        if p.c() != c_u || p.t() != t_u {
                             return false; // proposal-ready naming a payload != (C_u,T_u)
                         }
                     }
@@ -1037,7 +1424,7 @@ impl AgbEngine {
                         if *grade == ReadyGrade::One {
                             return false; // grade-1 proposal-ready
                         }
-                        if p.c != *c_u || p.t != *t_u {
+                        if p.c() != c_u || p.t() != t_u {
                             return false; // proposal-ready for a different payload
                         }
                     }
@@ -1053,10 +1440,20 @@ impl AgbEngine {
         }
     }
 
-    /// PHASE6-SPEC.md §3 `Ann`: this party's own origin bit for a carrying proposal's
-    /// `M` entry, computed from its own already-emitted `E_i(u)` at emission time.
-    fn compute_origin(&self, m: &Option<ResolutionEntry>) -> Option<u8> {
-        let entry = m.as_ref()?;
+    /// PHASE6-SPEC.md §3 `Ann`, generalized by PHASE7 to a vector: this party's own
+    /// origin bit for EACH of the carrying proposal's `M` entries, each computed
+    /// exactly as `compute_origin_entry` does for a lone entry -- degenerates
+    /// exactly to today's single-bit behavior for 0/1 entries.
+    fn compute_origin(&self, entries: &[ResolutionEntry]) -> Vec<Option<u8>> {
+        entries
+            .iter()
+            .map(|entry| self.compute_origin_entry(entry))
+            .collect()
+    }
+
+    /// This party's own origin bit for ONE `M` entry, computed from its own
+    /// already-emitted `E_i(u)` at emission time.
+    fn compute_origin_entry(&self, entry: &ResolutionEntry) -> Option<u8> {
         let u = entry.target_view();
         // SAFETY: deliberately NO pruned-view shortcut. This function used to return
         // `Some(1)` for a pruned Full/Core target -- a wire-visible claim ("I myself
@@ -1074,10 +1471,10 @@ impl AgbEngine {
             .and_then(|s| s.echo_statements.get(&self.name));
         let is_one = match entry {
             ResolutionEntry::Full(_, c, t) => {
-                matches!(own_echo, Some(EchoStatement::Graded(p, _, 1, _)) if p.c == *c && p.t == *t)
+                matches!(own_echo, Some(EchoStatement::Graded(p, _, 1, _)) if p.c() == c && p.t() == t)
             }
             ResolutionEntry::Core(_, c, t) => {
-                matches!(own_echo, Some(EchoStatement::Graded(p, _, _, _)) if p.c == *c && p.t == *t)
+                matches!(own_echo, Some(EchoStatement::Graded(p, _, _, _)) if p.c() == c && p.t() == t)
             }
             ResolutionEntry::Skip(_) => return None,
         };
@@ -1114,22 +1511,16 @@ impl AgbEngine {
                                          // log (no behavior change) -- the Delta-scaled fallback (grade-0) echo path.
         log::info!("vantage agb: FALLBACK grade-0 echo view={}", view);
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
-        if Self::core_ok(&proposal.c, lm) && self.meta_ok(&proposal.m, lm) {
-            let origin = self.compute_origin(&proposal.m);
+        if Self::core_ok(proposal.c(), lm) && self.meta_ok(proposal.entries(), lm) {
+            let origin = self.compute_origin(proposal.entries());
             self.count_echo_statement(
                 view,
                 self.name,
-                EchoStatement::Graded(Arc::clone(&proposal), digest, 0, origin),
+                EchoStatement::Graded(Arc::clone(&proposal), digest, 0, origin.clone()),
             );
-            effects.push(Effect::BroadcastEcho(Echo {
-                // See `recheck_gate`'s matching comment: one deep clone here, same
-                // total count as before Efficiency Item 3.
-                proposal: (*proposal).clone(),
-                grade: 0,
-                sender: self.name,
-                wish: 0, // D5-3: stamped by `VantageCore` at serialization time
-                origin,
-            }));
+            // See `recheck_gate`'s matching comment: one deep clone here, same total
+            // count as before Efficiency Item 3.
+            effects.push(Effect::BroadcastEcho(self.build_echo_out(&proposal, 0, origin)));
         } else {
             self.count_echo_statement(view, self.name, EchoStatement::Skip);
             effects.push(Effect::BroadcastEchoSkip(view));
@@ -1168,20 +1559,30 @@ impl AgbEngine {
     /// one). The `origin` bit travels verbatim (it's the SENDER's own annotation, never
     /// recomputed here).
     pub fn on_echo(&mut self, echo: Echo, rep: &mut Repairer) -> Vec<Effect> {
+        self.on_echo_any(EchoOut::Single(echo), rep)
+    }
+
+    /// PHASE7 (`Parameters::batched_anchors`): the `EchoBatch` counterpart of
+    /// `on_echo`, delegated to the same shared `on_echo_any` core.
+    pub fn on_echo_batch(&mut self, echo: EchoBatch, rep: &mut Repairer) -> Vec<Effect> {
+        self.on_echo_any(EchoOut::Batch(echo), rep)
+    }
+
+    fn on_echo_any(&mut self, echo: EchoOut, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
-        if echo.grade > 1 {
+        if echo.grade() > 1 {
             return effects;
         }
-        let view = echo.proposal.view;
+        let view = echo.proposal_view();
         if self.is_pruned(view) {
             return effects;
         }
-        let sender = echo.sender;
-        let grade = echo.grade;
-        let origin = echo.origin;
+        let sender = echo.sender();
+        let grade = echo.grade();
+        let origin = echo.origin_vec();
         // Efficiency Item 1: reuse the per-view digest cache instead of always
-        // recomputing `echo.proposal.digest(&self.sid)`.
-        let (proposal, digest) = self.canonical_proposal(view, echo.proposal);
+        // recomputing the proposal's digest.
+        let (proposal, digest) = self.canonical_proposal(view, echo.into_proposal_out());
         if !self.count_echo_statement(
             view,
             sender,
@@ -1276,25 +1677,33 @@ impl AgbEngine {
         if self.state_mut(view).ready_sent {
             return effects;
         }
-        // Efficiency Item 3: the tally's proposal slot is `Arc<ViewProposal>` -- both
+        // Efficiency Item 3: the tally's proposal slot is `Arc<ProposalOut>` -- both
         // `or_insert_with` below (once per distinct digest re-derived on every call)
         // and the `.clone()` calls further down are now refcount bumps, not deep
-        // clones of `c`/`t`/`m`.
-        let mut tallies: HashMap<Digest, (Arc<ViewProposal>, Stake, Stake, usize)> = HashMap::new();
+        // clones of `c`/`t`/`m`. PHASE7: the 4th slot generalizes from a single
+        // origin-ones `usize` to a `Vec<usize>`, one counter per `M` position,
+        // monotonically incremented as more echoes are counted -- never shrinks, so
+        // `ReadyOK`'s AND-over-positions below only ever becomes true as the counted
+        // set grows (the same monotonicity today's single-counter version had).
+        let mut tallies: HashMap<Digest, (Arc<ProposalOut>, Stake, Stake, Vec<usize>)> =
+            HashMap::new();
         if let Some(state) = self.views.get(&view) {
             for (sender, stmt) in &state.echo_statements {
                 if let EchoStatement::Graded(p, d, g, origin) = stmt {
                     let stake = self.committee.stake(sender);
+                    let n_entries = p.entries().len();
                     let entry = tallies
                         .entry(d.clone())
-                        .or_insert_with(|| (Arc::clone(p), 0, 0, 0));
+                        .or_insert_with(|| (Arc::clone(p), 0, 0, vec![0; n_entries]));
                     if *g == 1 {
                         entry.1 += stake;
                     } else {
                         entry.2 += stake;
                     }
-                    if *origin == Some(1) {
-                        entry.3 += 1;
+                    for (i, bit) in origin.iter().enumerate() {
+                        if *bit == Some(1) {
+                            entry.3[i] += 1;
+                        }
                     }
                 }
             }
@@ -1303,15 +1712,21 @@ impl AgbEngine {
             if g1 + g0 < self.quorum {
                 continue;
             }
-            // PHASE6-SPEC.md §3 `ReadyOK`: for a full/core resolution entry, require
-            // >= f+1 (party count) counted proposal echoes for THIS proposal with
-            // origin = 1; skip/empty always passes.
-            let ready_ok = match &proposal.m {
-                Some(ResolutionEntry::Full(..)) | Some(ResolutionEntry::Core(..)) => {
-                    origin_ones >= self.f_plus_1_parties
-                }
-                _ => true,
-            };
+            // PHASE6-SPEC.md §3 `ReadyOK`, generalized by PHASE7 to a per-position
+            // guard: for EACH full/core entry, require >= f+1 (party count) counted
+            // proposal echoes for THIS proposal with origin = 1 AT THAT ENTRY'S
+            // POSITION; skip entries (and, trivially, an empty `M`) always pass.
+            // Degenerates exactly to today's single check for 0/1 entries.
+            let ready_ok = proposal
+                .entries()
+                .iter()
+                .enumerate()
+                .all(|(i, entry)| match entry {
+                    ResolutionEntry::Full(..) | ResolutionEntry::Core(..) => {
+                        origin_ones[i] >= self.f_plus_1_parties
+                    }
+                    ResolutionEntry::Skip(_) => true,
+                });
             if !ready_ok {
                 continue;
             }
@@ -1330,17 +1745,14 @@ impl AgbEngine {
                 ReadyStatement::Graded(Arc::clone(&proposal), digest, grade),
             );
             effects.extend(self.wish_effect(view, ResponseStage::Ready));
-            effects.push(Effect::BroadcastReady(Ready {
-                // The wire type still carries an owned `ViewProposal`: exactly one
-                // deep clone here, same total deep-clone count as before Efficiency
-                // Item 3 (previously the census `.clone()` above was the deep clone
-                // and this value was moved; now the census clone is free and this is
-                // the one remaining deep clone).
-                proposal: (*proposal).clone(),
-                grade,
-                sender: self.name,
-                wish: 0, // D5-3: stamped by `VantageCore` at serialization time
-            }));
+            // The wire type still carries an owned proposal: exactly one deep clone
+            // here, same total deep-clone count as before Efficiency Item 3
+            // (previously the census `.clone()` above was the deep clone and this
+            // value was moved; now the census clone is free and this is the one
+            // remaining deep clone).
+            effects.push(Effect::BroadcastReady(self.build_ready_out(
+                &proposal, grade,
+            )));
             effects.extend(self.recheck_completion_and_direct(view, rep));
             break; // one ready-stage statement per view, ever
         }
@@ -1366,15 +1778,25 @@ impl AgbEngine {
 
     /// A counted `VantageReady`.
     pub fn on_ready(&mut self, ready: Ready, rep: &mut Repairer) -> Vec<Effect> {
-        let view = ready.proposal.view;
+        self.on_ready_any(ReadyOut::Single(ready), rep)
+    }
+
+    /// PHASE7 (`Parameters::batched_anchors`): the `ReadyBatch` counterpart of
+    /// `on_ready`, delegated to the same shared `on_ready_any` core.
+    pub fn on_ready_batch(&mut self, ready: ReadyBatch, rep: &mut Repairer) -> Vec<Effect> {
+        self.on_ready_any(ReadyOut::Batch(ready), rep)
+    }
+
+    fn on_ready_any(&mut self, ready: ReadyOut, rep: &mut Repairer) -> Vec<Effect> {
+        let view = ready.proposal_view();
         if self.is_pruned(view) {
             return Vec::new();
         }
-        let sender = ready.sender;
-        let grade = ready.grade;
+        let sender = ready.sender();
+        let grade = ready.grade();
         // Efficiency Item 1: reuse the per-view digest cache instead of always
-        // recomputing `ready.proposal.digest(&self.sid)`.
-        let (proposal, digest) = self.canonical_proposal(view, ready.proposal);
+        // recomputing the proposal's digest.
+        let (proposal, digest) = self.canonical_proposal(view, ready.into_proposal_out());
         if !self.count_ready_statement(
             view,
             sender,
@@ -1410,8 +1832,8 @@ impl AgbEngine {
             return effects;
         }
         // Efficiency Item 3: see `recheck_ready`'s matching comment -- `Arc::clone`
-        // instead of a deep `ViewProposal` clone on every re-scan.
-        let mut tallies: HashMap<Digest, (Arc<ViewProposal>, Stake, Stake, Stake)> = HashMap::new();
+        // instead of a deep proposal clone on every re-scan.
+        let mut tallies: HashMap<Digest, (Arc<ProposalOut>, Stake, Stake, Stake)> = HashMap::new();
         if let Some(state) = self.views.get(&view) {
             for (sender, stmt) in &state.ready_statements {
                 if let ReadyStatement::Graded(proposal, digest, grade) = stmt {
@@ -1430,32 +1852,32 @@ impl AgbEngine {
         }
         for (_digest, (proposal, any_stake, g1_stake, g0_stake)) in tallies {
             if any_stake >= self.quorum && self.state_mut(view).completed.is_none() {
-                let c = proposal.c.clone();
-                let t = proposal.t.clone();
+                let c = proposal.c().clone();
+                let t = proposal.t().clone();
                 self.state_mut(view).completed = Some((c.clone(), t.clone()));
-                for r in c.iter().chain(aux_refs(&proposal.m).iter()) {
+                for r in c.iter().chain(aux_refs_entries(proposal.entries()).iter()) {
                     effects.extend(rep.authorize(r.clone()));
                 }
                 // PHASE6-SPEC.md §5: the FIRST genuine R4 completion with M != ∅
                 // triggers a completion report (fast-seal alone never does -- fastseal
                 // only ever produces `directed`/`sealed`, never `completed`, so this
                 // site -- and only this site -- is the right hook). `Effect::
-                // CompletionReportable` carries an owned `ViewProposal` (a downstream
+                // CompletionReportable` carries an owned proposal (a downstream
                 // effect consumer, not internal state), so this one deep clone is
                 // required and unchanged from before -- it only ever runs once per
                 // view, on the transition into `completed`.
-                if proposal.m.is_some() {
+                if !proposal.entries().is_empty() {
                     effects.push(Effect::CompletionReportable(view, (*proposal).clone()));
                 }
                 effects.push(Effect::Completed(view, c, t));
             }
             if self.state_mut(view).directed.is_none() {
                 if g1_stake >= self.quorum {
-                    let outcome = Outcome::Full(proposal.c.clone(), proposal.t.clone());
+                    let outcome = Outcome::Full(proposal.c().clone(), proposal.t().clone());
                     self.state_mut(view).directed = Some(outcome.clone());
                     self.try_seal(view, outcome, "direct_full", &mut effects);
                 } else if g0_stake >= self.quorum {
-                    let outcome = Outcome::Core(proposal.c.clone());
+                    let outcome = Outcome::Core(proposal.c().clone());
                     self.state_mut(view).directed = Some(outcome.clone());
                     self.try_seal(view, outcome, "direct_core", &mut effects);
                 }
@@ -1523,7 +1945,7 @@ impl AgbEngine {
     /// Records `L_i(v, B)` immediately before sending our own matching (grade-1, for
     /// exactly B) echo. Born inactive if ≥ f+1 parties already have non-matching
     /// echo-stage statements counted; otherwise born active. Recorded once per view.
-    fn record_lock(&mut self, view: View, proposal: &ViewProposal, digest: &Digest) {
+    fn record_lock(&mut self, view: View, proposal: &ProposalOut, digest: &Digest) {
         if self.is_pruned(view) {
             return;
         }
@@ -1581,7 +2003,7 @@ impl AgbEngine {
         let matching = self.matching_echo_count(view, &lock.digest);
         if matching == self.n {
             self.state_mut(view).fastsealed = true;
-            let outcome = Outcome::Full(lock.proposal.c.clone(), lock.proposal.t.clone());
+            let outcome = Outcome::Full(lock.proposal.c().clone(), lock.proposal.t().clone());
             self.try_seal(view, outcome, "fast_full", &mut effects);
         }
         effects

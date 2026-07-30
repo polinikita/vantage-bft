@@ -210,6 +210,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             ack_watermark_period_ms
         );
     }
+    if matches.get_flag("batched-anchors") {
+        println!(
+            "Batched resolution entries: ON (Vantage recovery-turn proposals may target several unresolved views at once)"
+        );
+    }
     if crash > 0 {
         println!(
             "Crash fault: {} of {} nodes never spawned (committee unchanged; live = {})",
@@ -268,6 +273,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             .then(MacSecret::generate),
         ack_watermarks: matches.get_flag("ack-watermarks"),
         ack_watermark_period_ms,
+        batched_anchors: matches.get_flag("batched-anchors"),
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which

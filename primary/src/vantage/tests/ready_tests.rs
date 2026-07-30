@@ -2,7 +2,7 @@
 // `AgbEngine::on_echo`/`on_echo_skip`/`on_ready_timer`.
 
 use super::common::*;
-use crate::vantage::agb::{Echo, Ready, ReadyGrade, ViewProposal};
+use crate::vantage::agb::{Echo, Ready, ReadyGrade, ReadyOut, ViewProposal};
 use crate::vantage::Effect;
 use crypto::Digest;
 
@@ -16,9 +16,12 @@ fn sample_proposal(view: u64) -> ViewProposal {
     }
 }
 
+/// PHASE7: this file only ever drives the `Single` path (never
+/// `on_propose_batch`/`on_ready_batch`) -- see `agb_echo_tests.rs::echo_effect`'s
+/// identical doc comment.
 fn ready_effect(effects: &[Effect]) -> Option<&Ready> {
     effects.iter().find_map(|e| match e {
-        Effect::BroadcastReady(r) => Some(r),
+        Effect::BroadcastReady(ReadyOut::Single(r)) => Some(r),
         _ => None,
     })
 }

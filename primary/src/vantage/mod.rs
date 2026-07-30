@@ -21,7 +21,8 @@ pub mod threshold;
 pub mod wire;
 
 pub use agb::{
-    AgbEngine, Echo, Manifest, Outcome, Ready, ReadyGrade, ResolutionEntry, TimerKind, ViewProposal,
+    AgbEngine, BatchViewProposal, Echo, EchoBatch, EchoOut, Manifest, Outcome, ProposalOut, Ready,
+    ReadyBatch, ReadyGrade, ReadyOut, ResolutionEntry, TimerKind, ViewProposal,
 };
 pub use block::BlockRef;
 pub use cursor::Cursor;
@@ -71,16 +72,23 @@ pub enum Effect {
     BlockCached(Digest),
 
     // --- PHASE4-SPEC.md §§3-8 (AGB engine) ---
-    /// R1: broadcast our own freshly-constructed view proposal.
-    BroadcastPropose(ViewProposal),
-    /// R2: broadcast a (grade-1 or grade-0) proposal echo.
-    BroadcastEcho(Echo),
+    /// R1: broadcast our own freshly-constructed view proposal. PHASE7 (`Parameters::
+    /// batched_anchors`): `ProposalOut` -- `Single` is byte-identical to the
+    /// pre-PHASE7 `ViewProposal` payload (same wire message, `VantagePropose`);
+    /// `Batch` rides a separate, flag-gated wire message (`VantageProposeBatch`),
+    /// chosen at the `execute`/`drain_local` call site by shape, never by the flag
+    /// itself (the flag only ever controls whether `Batch` is EVER constructed).
+    BroadcastPropose(ProposalOut),
+    /// R2: broadcast a (grade-1 or grade-0) proposal echo. PHASE7: `EchoOut`,
+    /// mirroring `BroadcastPropose`'s `ProposalOut` generalization.
+    BroadcastEcho(EchoOut),
     /// R2 fallback/absolute deadline: broadcast an echo-skip for `view` (sender is
     /// filled in by the caller, which always knows its own identity -- symmetric with
     /// `BroadcastNoReady` below).
     BroadcastEchoSkip(View),
-    /// R3: broadcast a proposal ready (grade One/Zero/Mix).
-    BroadcastReady(Ready),
+    /// R3: broadcast a proposal ready (grade One/Zero/Mix). PHASE7: `ReadyOut`,
+    /// mirroring `BroadcastPropose`'s `ProposalOut` generalization.
+    BroadcastReady(ReadyOut),
     /// R3 absolute deadline: broadcast a no-ready for `view`.
     BroadcastNoReady(View),
     /// §5's `Fixed` transition outcome for `view` (`true` = well-formed proposal now
@@ -140,14 +148,16 @@ pub enum Effect {
     // --- PHASE6-SPEC.md §5 (completion reports + control log) ---
     /// The FIRST genuine R4 completion for `view` with `M != None` -- a necessary,
     /// minimal channel from `AgbEngine` to `control::ControlLog` (mirrors `Completed`'s
-    /// own role for the cursor); carries the full `ViewProposal` (`B_w`) since
-    /// `control::ControlLog` both counts the report AND retains/serves `B_w`.
-    CompletionReportable(View, ViewProposal),
+    /// own role for the cursor); carries the full proposal (`B_w`) since
+    /// `control::ControlLog` both counts the report AND retains/serves `B_w`. PHASE7:
+    /// `ProposalOut`, mirroring `BroadcastPropose`'s generalization.
+    CompletionReportable(View, ProposalOut),
     /// Broadcast our own `CompReport` (sender filled in by the caller).
     BroadcastCompReport(View, Digest),
     /// The control round's leader step: broadcast `ControlInit` (the control proposal,
-    /// plus `B_w` as validation data when the value is non-empty).
-    BroadcastControlInit(control::ControlProposal, Option<ViewProposal>),
+    /// plus `B_w` as validation data when the value is non-empty). PHASE7:
+    /// `Option<ProposalOut>`, mirroring `BroadcastPropose`'s generalization.
+    BroadcastControlInit(control::ControlProposal, Option<ProposalOut>),
     /// Broadcast our own `ControlEcho` (sender filled in by the caller).
     BroadcastControlEcho(control::ControlProposal),
     /// Broadcast our own `ControlReady` (sender filled in by the caller).
@@ -168,8 +178,9 @@ pub enum Effect {
     /// Fan-out request for a still-missing `B_w`, one `Effect` per target peer (mirrors
     /// `RequestTo`'s shape).
     ControlFetchTo(PublicKey, View, Digest),
-    /// Answer a peer's `ControlFetch` with our own held, verified `B_w`.
-    ControlServeTo(PublicKey, View, ViewProposal),
+    /// Answer a peer's `ControlFetch` with our own held, verified `B_w`. PHASE7:
+    /// `ProposalOut`, mirroring `BroadcastPropose`'s generalization.
+    ControlServeTo(PublicKey, View, ProposalOut),
     /// Arm the control-round timer (`6Δ`, §5) at the given deadline.
     ArmControlTimer(Round, Instant),
 
