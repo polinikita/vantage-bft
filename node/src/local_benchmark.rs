@@ -15,7 +15,7 @@ use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol
 use crypto::{MacSecret, PublicKey, SignatureService};
 use metrics::{
     aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot,
-    read_vantage_progress, LatencySnapshot, MetricReporter,
+    read_materialised_latency_snapshot, read_vantage_progress, LatencySnapshot, MetricReporter,
 };
 use primary::Primary;
 use std::fs;
@@ -222,6 +222,19 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     let mut parameters = Parameters {
         protocol,
         delta_ms,
+        // FAIRNESS: derive Simple-IT's round timeout from the SAME Delta as Vantage's
+        // theta_E/theta_R rather than leaving it on Autobahn's unrelated 5s default.
+        // `CutEngine`'s timer is `parameters.timeout_delay` (simpleit/node.rs), so
+        // without this the two signature-free protocols would be timed off different
+        // bases and any timeout-path comparison would be meaningless. 8x matches the
+        // paper's own Delta_to = (d_s + d_t)Delta for the Opt-RBC variant
+        // (arXiv:2606.14404, Corollary 5: 8Delta + 4delta). Fault-free runs never fire
+        // these timers, so this does not affect happy-path latency either way -- it
+        // makes the comparison principled rather than accidental.
+        timeout_delay: match protocol {
+            Protocol::SimpleIt => delta_ms.saturating_mul(8),
+            _ => Parameters::default().timeout_delay,
+        },
         max_batch_delay: max_batch_delay_ms,
         max_header_delay: max_header_delay_ms,
         // METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when off.
@@ -678,6 +691,12 @@ async fn print_results(
     // sum is a no-op and the reported numbers are unchanged.
     let mut committed_by_node: std::collections::BTreeMap<usize, (u64, u64)> =
         std::collections::BTreeMap::new();
+    // The materialised-latency series, read from the same registries in the same pass.
+    // Kept in its own vector rather than folded into `LatencySnapshot` because the two
+    // series can legitimately have DIFFERENT counts: a batch still being fetched has
+    // contributed to neither yet, and a deferred-then-resolved batch contributes to both
+    // but with different values. Aggregated with the identical cross-node rules.
+    let mut materialised: Vec<LatencySnapshot> = Vec::new();
     for (node, registry, reporter) in worker_metrics {
         // Force a final drain so the gauges reflect every observation up to now, not
         // whatever the last periodic (every-10s) tick happened to see.
@@ -687,6 +706,9 @@ async fn print_results(
             entry.0 += snapshot.committed_transactions;
             entry.1 += snapshot.committed_bytes;
             snapshots.push(snapshot);
+        }
+        if let Some(snapshot) = read_materialised_latency_snapshot(registry) {
+            materialised.push(snapshot);
         }
     }
 
@@ -737,6 +759,29 @@ async fn print_results(
         None => {
             println!(
                 " Real transaction latency: no metrics observed (0/{} worker(s) reporting)",
+                worker_metrics.len()
+            );
+        }
+    }
+
+    // The starfish-comparable series: submit -> ordered AND materialised. The line above
+    // stops at the primary's ordering decision; this one stops when the batch's bytes are
+    // actually in hand locally, so the gap between them IS the payload-availability cost.
+    match aggregate_latency_snapshots(&materialised) {
+        Some(agg) => {
+            println!(
+                " Materialised transaction latency: avg {:.2} ms (stddev {:.2}), p50/p90/p99 {:.2}/{:.2}/{:.2} ms ({} txs)",
+                agg.avg_micros / 1_000.0,
+                agg.stddev_micros / 1_000.0,
+                agg.p50_micros as f64 / 1_000.0,
+                agg.p90_micros as f64 / 1_000.0,
+                agg.p99_micros as f64 / 1_000.0,
+                agg.count,
+            );
+        }
+        None => {
+            println!(
+                " Materialised transaction latency: no metrics observed (0/{} worker(s) reporting)",
                 worker_metrics.len()
             );
         }

@@ -37,7 +37,33 @@ pub struct LatencySnapshot {
 /// `transaction_committed_latency` gauge vector doesn't exist until the first
 /// observation -- see `HistogramReporter::report`).
 pub fn read_latency_snapshot(registry: &Registry) -> Option<LatencySnapshot> {
+    read_latency_snapshot_for(registry, "transaction_committed_latency")
+}
+
+/// The materialised-latency counterpart of `read_latency_snapshot`: same shape, read
+/// from `transaction_materialised_latency` instead.
+///
+/// The two series differ by exactly the payload-availability cost. `transaction_
+/// committed_latency` stops at the primary's ordering decision (`commit_millis`, stamped
+/// at commit and carried to the worker); `transaction_materialised_latency` stops when
+/// the batch is actually read and deserialised locally, so a batch this node had to
+/// fetch contributes its ORIGINAL commit instant to the first series and its LATER
+/// arrival instant to the second. Only the second is comparable to starfish, whose
+/// `block_handler::transaction_observer` likewise stamps at the moment the block's
+/// transactions are in hand.
+///
+/// `misses`/`committed_transactions`/`committed_bytes` are shared, not per-series --
+/// both snapshots report the same underlying counters.
+pub fn read_materialised_latency_snapshot(registry: &Registry) -> Option<LatencySnapshot> {
+    read_latency_snapshot_for(registry, "transaction_materialised_latency")
+}
+
+/// Shared body of the two readers above. `base` names the histogram-gauge family; the
+/// sum-of-squares counter is always `{base}_squared_micros` (see `Metrics`'s own
+/// registration of both pairs).
+fn read_latency_snapshot_for(registry: &Registry, base: &str) -> Option<LatencySnapshot> {
     let families = registry.gather();
+    let squared = format!("{base}_squared_micros");
 
     let gauge = |metric: &str, label: &str| -> Option<u64> {
         families
@@ -63,18 +89,18 @@ pub fn read_latency_snapshot(registry: &Registry) -> Option<LatencySnapshot> {
             .unwrap_or(0)
     };
 
-    let count = gauge("transaction_committed_latency", "count")?;
+    let count = gauge(base, "count")?;
 
     Some(LatencySnapshot {
         count,
-        sum_micros: gauge("transaction_committed_latency", "sum").unwrap_or(0),
-        squared_sum_micros: counter("transaction_committed_latency_squared_micros"),
-        p25_micros: gauge("transaction_committed_latency", "p25").unwrap_or(0),
-        p50_micros: gauge("transaction_committed_latency", "p50").unwrap_or(0),
-        p75_micros: gauge("transaction_committed_latency", "p75").unwrap_or(0),
-        p90_micros: gauge("transaction_committed_latency", "p90").unwrap_or(0),
-        p99_micros: gauge("transaction_committed_latency", "p99").unwrap_or(0),
-        max_micros: gauge("transaction_committed_latency", "max").unwrap_or(0),
+        sum_micros: gauge(base, "sum").unwrap_or(0),
+        squared_sum_micros: counter(&squared),
+        p25_micros: gauge(base, "p25").unwrap_or(0),
+        p50_micros: gauge(base, "p50").unwrap_or(0),
+        p75_micros: gauge(base, "p75").unwrap_or(0),
+        p90_micros: gauge(base, "p90").unwrap_or(0),
+        p99_micros: gauge(base, "p99").unwrap_or(0),
+        max_micros: gauge(base, "max").unwrap_or(0),
         misses: counter("latency_misses"),
         committed_transactions: counter("committed_transactions"),
         committed_bytes: counter("committed_bytes"),
