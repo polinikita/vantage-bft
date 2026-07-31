@@ -6,7 +6,7 @@
 // execute. See engine.rs's module doc comment for the full architecture rationale.
 
 use crate::simpleit::messages::{
-    Cut, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
+    Cut, CutProposal, CutReady, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
 };
 use crypto::{Digest, PublicKey};
 use std::time::Instant;
@@ -21,8 +21,12 @@ use std::time::Instant;
 /// defect Fig. 2's first-hand-counting design fixes -- see `engine.rs`'s module doc
 /// comment ("FIGURE-2 REWRITE"). There is now no `CutOut` variant a party could ever
 /// construct to assert a notarization to a peer; the only path into `safe` is each
-/// party's own `CutVoteAggregator` crossing `mint_threshold` on votes it individually
-/// verified.
+/// party's own `CutVoteAggregator`/`CutReadyAggregator` crossing threshold on votes/
+/// readys it individually verified.
+///
+/// `CutReady` (BRACHA VARIANT ADDITION -- `engine::Variant::Bracha` only, arXiv:
+/// 2606.14404 Table 1/2 + Corollary 5, variant S): Bracha-RBC's own second echo round.
+/// Never constructed under `Variant::Opt`.
 #[derive(Clone, Debug)]
 pub enum CutOut {
     CutProposal(CutProposal),
@@ -30,6 +34,7 @@ pub enum CutOut {
     Decide(Decide),
     Timeout(Timeout),
     TimeoutAccept(TimeoutAccept),
+    CutReady(CutReady),
 }
 
 /// Everything a `CutEngine` method can ask its caller to do. Three shapes, matching the

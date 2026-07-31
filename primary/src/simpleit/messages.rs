@@ -26,6 +26,16 @@
 // distinguished the two. `Decide` is this engine's `⟨commit, r⟩` (Fig. 2's Vote step);
 // only `id`/`round`/`author` are load-bearing.
 //
+// BRACHA VARIANT ADDITION (separate task, separate upstream branch): `CutReady` is
+// ported from a DIFFERENT upstream branch, `simpleit/Bracha-Mempool-Simple-IT`
+// (fetched as the same `simpleit` remote, read-only, never checked out/merged/applied
+// -- primary/src/messages.rs:781-805 there), not from Opt-Mempool-Simple-IT-Failure
+// like every other type in this file. It backs `engine::Variant::Bracha` -- Bracha-
+// RBC's own second echo round (arXiv:2606.14404 Table 1/2 + Corollary 5, variant S).
+// Same shape as `CutVote` (round + cut_id + author) -- upstream defines the two
+// identically there too. See `engine.rs`'s module doc comment for the variant
+// mechanism this feeds.
+//
 // Required deviations from upstream (see primary/src/simpleit/mod.rs for the full
 // rationale):
 //   1. Every `impl Hash` uses `Blake3Hasher`, not `Sha512`. The sequence of fields fed
@@ -332,3 +342,38 @@ impl Hash for CutVote {
     }
 }
 
+/// Bracha variant only (`engine::Variant::Bracha`) -- see this module's own doc
+/// comment ("BRACHA VARIANT ADDITION") for provenance. Bracha-RBC's second echo round:
+/// broadcast once a party's own `CutVote` census crosses `quorum_threshold`
+/// (`engine::CutEngine::broadcast_cut_ready`), and counted first-hand by every other
+/// party into its own `CutReadyAggregator` (aggregators.rs) exactly like `CutVote`
+/// above. Same shape as `CutVote` deliberately -- upstream
+/// (`Bracha-Mempool-Simple-IT` branch) defines the two identically
+/// (primary/src/messages.rs:754-768 there is `CutVote`, :781-795 is this type).
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+pub struct CutReady {
+    pub round: CutRound,
+    pub cut_id: Digest,
+    pub author: PublicKey,
+}
+
+impl CutReady {
+    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
+        // Ensure the authority has voting rights.
+        ensure!(
+            committee.stake(&self.author) > 0,
+            DagError::UnknownAuthority(self.author)
+        );
+        Ok(())
+    }
+}
+
+impl Hash for CutReady {
+    fn digest(&self) -> Digest {
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(&self.round.to_le_bytes());
+        hasher.update(&self.cut_id.0);
+        hasher.update(&self.author.0);
+        Digest(hasher.finalize().into())
+    }
+}

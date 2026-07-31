@@ -160,15 +160,67 @@
 // list, but (unlike that list) never transmitted or trusted from a peer: it is this
 // party's own first-hand record of who it received a vote from, so asking exactly
 // those peers for the proposal carries no less assurance than the old design did.
+//
+// BRACHA VARIANT (separate task, separate upstream branch, `simpleit/
+// Bracha-Mempool-Simple-IT` -- fetched as the same `simpleit` remote, read-only, never
+// checked out/merged/applied; primary/src/core.rs there, cited per method below):
+// arXiv:2606.14404 Table 1/2 + Corollary 5 name TWO cut-consensus variants -- "Opt"
+// (everything above this paragraph) and "S" (Bracha-RBC), the latter trading Opt's
+// larger `mint_threshold` first-hand census for a second, plain-`quorum_threshold`
+// echo round, in exchange for never needing more than `quorum_threshold`-many live
+// authors to make progress (Opt's `mint_threshold` can exceed `quorum_threshold` at
+// large committees -- see `aggregators::mint_threshold`'s own doc comment). `variant:
+// Variant` (below) selects between them; `Variant::Opt` is the default and is
+// byte-for-byte the engine described above -- every method already documented above
+// is unchanged by this addition, and reading them, `variant` never appears.
+//
+// Mechanism (`Variant::Bracha`): `process_cut_vote`'s own first-hand `CutVote` census
+// -- the SAME `cut_vote_aggregators` map `Variant::Opt` uses, just thresholded at
+// plain `quorum_threshold` instead of `mint_threshold` (see `CutVoteAggregator::
+// append`'s `threshold` parameter) -- crossing threshold broadcasts one-shot
+// `CutReady(round, cut_id, author)` (`broadcast_cut_ready`, latched once per round by
+// `sent_cut_ready`, mirroring `sent_cut_votes`'s identical shape) instead of calling
+// `mark_cut_safe` directly. Every party then counts `CutReady`s first-hand, exactly
+// like `CutVote`s, into its own `cut_ready_aggregators` (`process_cut_ready`); crossing
+// `quorum_threshold` there calls `mark_cut_safe` with the `CutReady` senders as the
+// fetch-witness set -- the identical REPAIR mechanism above, just fed from the second
+// echo round's own census instead of the first's. `mark_cut_safe` itself, and every
+// downstream step it reaches (self-Decide, `try_commit_round`, the timeout ladder,
+// `try_propose_cut_for_current_round`, `schedule_cut_timer`), is IDENTICAL for both
+// variants -- neither reads `self.variant` anywhere.
+//
+// Upstream citations: `Core::process_cut_vote` (primary/src/core.rs:417-433 there)
+// crossing `quorum_threshold` calls `broadcast_cut_ready` (:435-459), which -- unlike
+// this port -- unconditionally re-broadcasts (no per-round latch upstream); `Core::
+// process_cut_ready` (:646-679) mints+broadcasts a `CutCertificate` on crossing
+// `quorum_threshold` at its `CutReadyAggregator` (primary/src/aggregators.rs:59-65,
+// 138-182 there) -- the exact same Fig.-2-rewrite defect the module doc comment above
+// already fixed for the Opt variant's own certificate, fixed here identically (first-
+// hand `mark_cut_safe`, no certificate ever minted or broadcast). Upstream's own
+// `CutVoteAggregator` on THIS branch (:54-57, 114-136) is a separately-shaped type
+// from the Opt branch's (returns a bare `bool`, no witness list -- Bracha's
+// certificate design never needed one); this port's `CutVoteAggregator` unifies both
+// into one type via the `threshold` parameter, as noted above.
+//
+// NOT reproduced (deliberate, flagged in the accompanying task report, not a defect
+// in the port): upstream's `Core::process_cut_ready` has no f+1-ready amplification
+// step at all -- unlike its OWN `handle_timeout_accept_action`'s f+1-triggered
+// re-broadcast of `TimeoutAccept` (ported above, unchanged, and shared by both
+// variants), a `CutReady` census that reaches f+1 (short of the full
+// `quorum_threshold` needed to mark safe) never causes upstream to do anything at all
+// -- no re-broadcast, no amplification, nothing. This port reproduces that absence
+// faithfully rather than inventing an amplification step upstream itself does not
+// have.
 
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
 use crate::simpleit::aggregators::{
-    CutVoteAggregator, DecideAggregator, TimeoutAcceptAggregator, TimeoutAggregator,
+    mint_threshold, CutReadyAggregator, CutVoteAggregator, DecideAggregator,
+    TimeoutAcceptAggregator, TimeoutAggregator,
 };
 use crate::simpleit::effects::{CutEffect, CutOut};
 use crate::simpleit::messages::{
-    Cut, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
+    Cut, CutProposal, CutReady, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
 };
 use crate::vantage::agb;
 use config::{Committee, Stake};
@@ -187,7 +239,10 @@ use std::time::{Duration, Instant};
 /// enum can ever reach `CutEngine::handle` at all, and `handle`'s own match over it is
 /// exhaustive with no wildcard arm (see `mod tests`'
 /// `inbound_has_no_certificate_shaped_variant` for a test that fails to COMPILE, not
-/// merely to pass, if a certificate-shaped variant is ever added back here).
+/// merely to pass, if a certificate-shaped variant is ever added back here). `CutReady`
+/// (BRACHA VARIANT ADDITION, see the module doc comment's "BRACHA VARIANT" paragraph)
+/// is not certificate-shaped either -- same single-named-author shape as `CutVote` --
+/// and is included in that same exhaustive, no-wildcard guarantee.
 #[derive(Clone, Debug)]
 pub enum Inbound {
     CutProposal(CutProposal),
@@ -195,6 +250,9 @@ pub enum Inbound {
     Decide(Decide),
     Timeout(Timeout),
     TimeoutAccept(TimeoutAccept),
+    /// Bracha variant only (`Variant::Bracha`) -- Bracha-RBC's own second echo round.
+    /// Never constructed under `Variant::Opt`; see `CutEngine::process_cut_ready`.
+    CutReady(CutReady),
     /// A previously `CutEffect::ArmTimer`-requested deadline for this round has
     /// elapsed. Corresponds to upstream's `cut_timer_futures` yielding a round.
     TimerFired(CutRound),
@@ -246,6 +304,27 @@ impl CrashSim {
     }
 }
 
+/// BRACHA VARIANT ADDITION -- see the module doc comment's "BRACHA VARIANT" paragraph
+/// for the full mechanism. Selects which cut-consensus census/echo shape
+/// `CutEngine::process_cut_vote` (and, for `Bracha`, `process_cut_ready`) runs;
+/// `CutEngine::new`'s default (`Opt`) is byte-for-byte the engine as it existed before
+/// this addition. `config::Protocol::SimpleItBracha` selects `Bracha`; every other
+/// protocol selects (or defaults to) `Opt` -- see `simpleit::node::SimpleItCore::build`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Variant {
+    /// arXiv:2606.14404's "Opt" cut-consensus variant: a single first-hand `CutVote`
+    /// census, thresholded at `mint_threshold`, reaches `mark_cut_safe` directly. Every
+    /// method documented in the module doc comment ABOVE the "BRACHA VARIANT"
+    /// paragraph describes this variant.
+    #[default]
+    Opt,
+    /// arXiv:2606.14404's "S" cut-consensus variant (Bracha-RBC, Table 1/2 +
+    /// Corollary 5): a first-hand `CutVote` census, thresholded at plain
+    /// `quorum_threshold`, broadcasts `CutReady`; a second first-hand `CutReady`
+    /// census, also at `quorum_threshold`, reaches `mark_cut_safe`.
+    Bracha,
+}
+
 /// The Simple-IT cut-consensus state machine. See the module doc comment above for the
 /// architecture; see each method below for its upstream provenance.
 pub struct CutEngine {
@@ -261,6 +340,10 @@ pub struct CutEngine {
     /// Deviation from upstream's always-present crash fields -- see `CrashSim`'s doc
     /// comment.
     crash_sim: Option<CrashSim>,
+    /// BRACHA VARIANT ADDITION -- see `Variant`'s own doc comment. `CutEngine::new`'s
+    /// default (`Variant::Opt`) is byte-for-byte the engine as it existed before this
+    /// field was added.
+    variant: Variant,
 
     /// Upstream `Core::cut_round`. Starts at 1 (confirmed by reading upstream's own
     /// `Core::spawn` constructor -- NOT 0; round 0 is reserved as `safe_cut_parent`'s
@@ -284,6 +367,13 @@ pub struct CutEngine {
     /// in hand, so keying by `(CutRound, Digest)` costs nothing at the lookup sites and
     /// makes this `prune_below`-able by `split_off`. Round-prunable; covered.
     cut_vote_aggregators: BTreeMap<(CutRound, Digest), CutVoteAggregator>,
+    /// BRACHA VARIANT ADDITION (`Variant::Bracha` only -- see the module doc
+    /// comment's "BRACHA VARIANT" paragraph): first-hand `CutReady` census, mirroring
+    /// `cut_vote_aggregators` exactly (same key shape, same `split_off`-pruning
+    /// reason). Never populated under `Variant::Opt` -- that variant never
+    /// constructs or accepts a `CutReady` at all (see `process_cut_ready`'s own
+    /// variant guard). Round-prunable; covered.
+    cut_ready_aggregators: BTreeMap<(CutRound, Digest), CutReadyAggregator>,
     /// Upstream `timeouts_aggregators: HashMap<u64, TimeoutAggregator>`. Already
     /// round-keyed; container swap only. Round-prunable; covered.
     timeouts_aggregators: BTreeMap<CutRound, TimeoutAggregator>,
@@ -353,6 +443,11 @@ pub struct CutEngine {
     /// distinction load-bearing -- see the module doc comment's field-mapping table.
     /// Round-prunable; covered.
     sent_cut_votes: BTreeSet<CutRound>,
+    /// BRACHA VARIANT ADDITION (`Variant::Bracha` only): this party's own one-shot
+    /// `CutReady`-broadcast latch per round, mirroring `sent_cut_votes` immediately
+    /// above exactly (same per-round-not-per-current-round-bool shape, same
+    /// rationale). Never populated under `Variant::Opt`. Round-prunable; covered.
+    sent_cut_ready: BTreeSet<CutRound>,
     /// Upstream `proposed_cut_rounds: HashSet<u64>`. Round-prunable; covered.
     proposed_cut_rounds: BTreeSet<CutRound>,
     /// Upstream `sent_decide_rounds: HashSet<u64>`, renamed `voted` -- Fig. 2's `voted`
@@ -412,10 +507,12 @@ impl CutEngine {
             timeout_delay,
             gate_tips: true,
             crash_sim: None,
+            variant: Variant::default(),
             cut_round: 1,
             highest_safe_cut: Digest::default(),
             gc_floor: 0,
             cut_vote_aggregators: BTreeMap::new(),
+            cut_ready_aggregators: BTreeMap::new(),
             timeouts_aggregators: BTreeMap::new(),
             timeout_accept_aggregators: BTreeMap::new(),
             cut_proposals: BTreeMap::new(),
@@ -426,6 +523,7 @@ impl CutEngine {
             decide_aggregators: BTreeMap::new(),
             committed: BTreeMap::new(),
             sent_cut_votes: BTreeSet::new(),
+            sent_cut_ready: BTreeSet::new(),
             proposed_cut_rounds: BTreeSet::new(),
             voted: BTreeSet::new(),
             sent_commit_rounds: BTreeSet::new(),
@@ -451,6 +549,14 @@ impl CutEngine {
         self
     }
 
+    /// BRACHA VARIANT ADDITION's switch -- see `Variant`'s own doc comment. Defaults
+    /// to `Variant::Opt` (byte-for-byte the engine as it existed before this method
+    /// was added); pass `Variant::Bracha` to run the Bracha-RBC variant instead.
+    pub fn with_variant(mut self, variant: Variant) -> Self {
+        self.variant = variant;
+        self
+    }
+
     /// Single dispatch entry point over `Inbound` -- not itself one of the 25 ported
     /// methods (upstream has no equivalent single function; its `run()` select-loop,
     /// not ported, plays this role there), but required by the "engine consumes
@@ -464,6 +570,7 @@ impl CutEngine {
         match inbound {
             Inbound::CutProposal(p) => self.process_cut_proposal(p, tips, oracle),
             Inbound::CutVote(v) => self.process_cut_vote(v, tips, oracle),
+            Inbound::CutReady(r) => self.process_cut_ready(r, tips, oracle),
             Inbound::Decide(d) => self.process_decide(d),
             Inbound::Timeout(t) => self.handle_timeout(t, tips, oracle),
             Inbound::TimeoutAccept(a) => {
@@ -545,6 +652,13 @@ impl CutEngine {
         self.cut_vote_aggregators = self
             .cut_vote_aggregators
             .split_off(&(floor, Digest::default()));
+        // BRACHA VARIANT ADDITION: always spliced, even under `Variant::Opt` (where
+        // both maps/sets stay empty the whole run) -- a no-op `split_off` on an empty
+        // map, mirroring how every OTHER round-prunable field here is unconditional
+        // regardless of which upstream deviation populates it.
+        self.cut_ready_aggregators = self
+            .cut_ready_aggregators
+            .split_off(&(floor, Digest::default()));
         self.pending_cut_children = self
             .pending_cut_children
             .split_off(&(floor, Digest::default()));
@@ -558,6 +672,7 @@ impl CutEngine {
         self.safe = self.safe.split_off(&floor);
         self.committed = self.committed.split_off(&floor);
         self.sent_cut_votes = self.sent_cut_votes.split_off(&floor);
+        self.sent_cut_ready = self.sent_cut_ready.split_off(&floor);
         self.proposed_cut_rounds = self.proposed_cut_rounds.split_off(&floor);
         self.voted = self.voted.split_off(&floor);
         self.sent_commit_rounds = self.sent_commit_rounds.split_off(&floor);
@@ -638,11 +753,23 @@ impl CutEngine {
     /// once THIS party's own vote count crossed `mint_threshold`). Now Fig. 2's
     /// Mark-safe step, evaluated FIRST-HAND: every `CutVote` is individually verified
     /// (`vote.verify`) and fed to this party's OWN `CutVoteAggregator` -- never a
-    /// peer's relayed claim -- and once weight crosses `mint_threshold`, this party
-    /// transitions straight into `mark_cut_safe` with the exact witnesses it counted.
-    /// No certificate is minted, broadcast, or received by anyone, anywhere -- see the
+    /// peer's relayed claim. Under `Variant::Opt` (unchanged from before the Bracha
+    /// addition), once weight crosses `mint_threshold`, this party transitions
+    /// straight into `mark_cut_safe` with the exact witnesses it counted. No
+    /// certificate is minted, broadcast, or received by anyone, anywhere -- see the
     /// module doc comment's "FIGURE-2 REWRITE" paragraph for why this is the fix, not
     /// merely a rename.
+    ///
+    /// BRACHA VARIANT ADDITION: under `Variant::Bracha`, this is instead Bracha-RBC's
+    /// own FIRST echo round -- the SAME `CutVoteAggregator`/`cut_vote_aggregators` map,
+    /// just thresholded at plain `quorum_threshold` (see `CutVoteAggregator::append`'s
+    /// `threshold` parameter) rather than `mint_threshold`, and crossing it broadcasts
+    /// a `CutReady` (`broadcast_cut_ready`) rather than calling `mark_cut_safe`
+    /// directly -- `witnesses` (the vote senders) are not used as a fetch-witness set
+    /// at this step; see `broadcast_cut_ready`/`process_cut_ready` below for the
+    /// second echo round that actually reaches `mark_cut_safe`. See the module doc
+    /// comment's "BRACHA VARIANT" paragraph for the full mechanism and upstream
+    /// citation.
     pub fn process_cut_vote(&mut self, vote: CutVote, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
         if vote.verify(&self.committee).is_err() {
             return Vec::new();
@@ -650,8 +777,92 @@ impl CutEngine {
         let round = vote.round;
         let cut_id = vote.cut_id.clone();
         let key = (round, cut_id.clone());
+        let threshold = match self.variant {
+            Variant::Opt => mint_threshold(&self.committee),
+            Variant::Bracha => self.committee.quorum_threshold(),
+        };
         let aggregator = self.cut_vote_aggregators.entry(key).or_default();
-        let Ok(Some(witnesses)) = aggregator.append(&vote, &self.committee) else {
+        let Ok(Some(witnesses)) = aggregator.append(&vote, &self.committee, threshold) else {
+            return Vec::new();
+        };
+        match self.variant {
+            Variant::Opt => self.mark_cut_safe(round, cut_id, witnesses, tips, oracle),
+            Variant::Bracha => self.broadcast_cut_ready(round, cut_id, tips, oracle),
+        }
+    }
+
+    /// BRACHA VARIANT ADDITION (`Variant::Bracha` only): reached when this party's own
+    /// first-hand `CutVote` census (`process_cut_vote` above) crosses
+    /// `quorum_threshold` -- Bracha-RBC's own first echo-to-ready transition (arXiv:
+    /// 2606.14404 Table 1/2 + Corollary 5, variant S). One-shot per round
+    /// (`sent_cut_ready`), mirroring `sent_cut_votes`'s identical latch shape exactly
+    /// -- upstream has the identical one-shot guard on its own `broadcast_cut_ready`
+    /// (`sent_ready_rounds.insert(round)`, primary/src/core.rs:436-438 there), so this
+    /// part is faithfully mirrored, not a deviation. Broadcasts, then immediately
+    /// processes its own `CutReady` locally through the SAME
+    /// first-hand path a peer's `CutReady` would take (`process_cut_ready`) -- mirrors
+    /// `process_cut_proposal`'s own self-vote dispatch and `mark_cut_safe`'s own
+    /// self-Decide dispatch: never a shortcut that credits this party's own message
+    /// without also counting it.
+    ///
+    /// Upstream (`simpleit/Bracha-Mempool-Simple-IT` branch) primary/src/core.rs:
+    /// 435-459 (`broadcast_cut_ready`) is the direct ancestor of this method plus
+    /// `process_cut_ready` below combined -- upstream inlines the self-processing call
+    /// at the end of its own `broadcast_cut_ready`; split here only by which method
+    /// each half lives in, mirroring this port's existing `mark_cut_safe`/
+    /// `process_decide` split for the identical self-Decide pattern.
+    fn broadcast_cut_ready(
+        &mut self,
+        round: CutRound,
+        cut_id: Digest,
+        tips: &Cut,
+        oracle: &dyn TipOracle,
+    ) -> Vec<CutEffect> {
+        if !self.sent_cut_ready.insert(round) {
+            return Vec::new();
+        }
+        let ready = CutReady {
+            round,
+            cut_id,
+            author: self.name,
+        };
+        let mut effects = vec![CutEffect::Broadcast(CutOut::CutReady(ready.clone()))];
+        effects.extend(self.process_cut_ready(ready, tips, oracle));
+        effects
+    }
+
+    /// BRACHA VARIANT ADDITION: `Inbound::CutReady`'s entry point -- Bracha-RBC's own
+    /// second echo round (see `broadcast_cut_ready`'s doc comment for the first).
+    /// Mirrors `process_cut_vote`'s shape exactly: individually verifies, dedups via
+    /// this party's OWN first-hand `CutReadyAggregator`, and on crossing
+    /// `quorum_threshold` transitions straight into `mark_cut_safe` with the exact
+    /// `CutReady` senders counted as the fetch-witness set -- see `mark_cut_safe`'s
+    /// own doc comment for how `witnesses` is used there (`ensure_cut_fetch`'s target
+    /// set). No certificate is minted or broadcast anywhere -- see the module doc
+    /// comment's "FIGURE-2 REWRITE" paragraph; this is that identical fix applied to
+    /// the separate soundness gap upstream's OWN Bracha branch has at this exact
+    /// point (`Core::process_cut_ready`, primary/src/core.rs:646-679 there, which
+    /// minted+broadcast a `CutCertificate` on crossing `quorum_threshold` -- see the
+    /// module doc comment's "BRACHA VARIANT" paragraph for the upstream citation and
+    /// the "NOT reproduced" note on upstream's own missing f+1-ready amplification).
+    ///
+    /// No-op for `Variant::Opt` (defensive: an Opt-configured engine never constructs
+    /// a `CutReady` itself, and no correct Bracha-configured peer ever sends one to an
+    /// Opt-configured committee -- `config::Protocol` selects exactly one variant for
+    /// an entire run -- but a stray/Byzantine `CutReady` should not be able to make an
+    /// Opt engine take a Bracha-shaped path it was never configured to run).
+    pub fn process_cut_ready(&mut self, ready: CutReady, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
+        if self.variant != Variant::Bracha {
+            return Vec::new();
+        }
+        if ready.verify(&self.committee).is_err() {
+            return Vec::new();
+        }
+        let round = ready.round;
+        let cut_id = ready.cut_id.clone();
+        let key = (round, cut_id.clone());
+        let aggregator = self.cut_ready_aggregators.entry(key).or_default();
+        let Ok(Some(witnesses)) = aggregator.append(&ready, &self.committee) else {
             return Vec::new();
         };
         self.mark_cut_safe(round, cut_id, witnesses, tips, oracle)
@@ -1413,6 +1624,15 @@ mod tests {
             .collect()
     }
 
+    /// BRACHA VARIANT ADDITION: mirrors `find_vote_for_round`/`find_decide_for_round`
+    /// exactly, for the new `CutOut::CutReady` broadcast.
+    fn find_ready_for_round(effects: &[CutEffect], round: CutRound) -> Option<CutReady> {
+        effects.iter().find_map(|e| match e {
+            CutEffect::Broadcast(CutOut::CutReady(r)) if r.round == round => Some(r.clone()),
+            _ => None,
+        })
+    }
+
     /// Test 1: happy path end to end, at both n=4 and n=10 -- proposal -> votes to
     /// `mint_threshold` -> this party marks the round `safe` (and, in the SAME step,
     /// sends its own `Decide` -- no certificate round-trip in between: one fewer
@@ -1503,6 +1723,343 @@ mod tests {
     #[test]
     fn happy_path_commit_n10() {
         happy_path_commit(10);
+    }
+
+    /// BRACHA VARIANT ADDITION -- Test 1's Bracha analogue, at both n=4 and n=10:
+    /// proposal -> votes to `quorum_threshold` -> this party broadcasts+self-processes
+    /// its own `CutReady` -> readys to `quorum_threshold` -> safe (and, in the SAME
+    /// step, this party's own `Decide`) -> decides to `quorum_threshold` -> commit
+    /// emitted exactly once for the round.
+    fn happy_path_commit_bracha(n: u8) {
+        let (committee, keys) = committee_of(n);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let round: CutRound = 1;
+        let leader = agb::proposer(&committee, 2);
+
+        let mut engine = CutEngine::new(leader, committee, 1_000).with_variant(Variant::Bracha);
+
+        let mut effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
+        let proposal = find_proposal(&effects).expect("leader broadcasts a cut proposal");
+        let cut_id = proposal.id();
+        assert!(
+            find_vote_for_round(&effects, round).is_some(),
+            "leader self-votes for its own proposal"
+        );
+        assert!(
+            find_ready_for_round(&effects, round).is_none(),
+            "a single self-vote is not enough to cross quorum_threshold"
+        );
+        assert!(!engine.safe.contains_key(&round));
+
+        // Votes: bring in other committee members' votes until this party's own
+        // CutVote census crosses quorum_threshold -- this broadcasts (and
+        // self-processes) our own CutReady in the SAME step, but does NOT yet mark
+        // the round safe.
+        let mut others = keys.iter().filter(|k| **k != leader);
+        loop {
+            if find_ready_for_round(&effects, round).is_some() {
+                break;
+            }
+            let author = *others
+                .next()
+                .expect("committee is large enough to reach quorum_threshold");
+            let vote = CutVote {
+                round,
+                cut_id: cut_id.clone(),
+                author,
+            };
+            effects = engine.process_cut_vote(vote, &tips, &oracle);
+        }
+        assert!(
+            !engine.safe.contains_key(&round),
+            "crossing the FIRST echo (vote) threshold only broadcasts CutReady -- it \
+             does not mark the round safe directly"
+        );
+
+        // Readys: bring in other committee members' CutReadys until this party's own
+        // CutReady census crosses quorum_threshold and it marks the round safe
+        // locally. The vote-threshold crossing above already produced our own
+        // self-ready.
+        let mut others = keys.iter().filter(|k| **k != leader);
+        while !engine.safe.contains_key(&round) {
+            let author = *others
+                .next()
+                .expect("committee is large enough to reach quorum_threshold");
+            let ready = CutReady {
+                round,
+                cut_id: cut_id.clone(),
+                author,
+            };
+            effects = engine.process_cut_ready(ready, &tips, &oracle);
+        }
+        assert_eq!(engine.safe.get(&round), Some(&cut_id));
+        assert!(
+            find_decide_for_round(&effects, round).is_some(),
+            "the CutReady that crosses quorum_threshold broadcasts this party's own \
+             Decide in the SAME step, exactly like the Opt variant's mark_cut_safe"
+        );
+
+        // Decides: bring in other committee members' decides for the same (round,
+        // cut_id) until commit appears -- identical to the Opt variant (DecideAggregator
+        // is shared, unmodified by the variant).
+        let mut others = keys.iter().filter(|k| **k != leader);
+        let mut commits = find_commits(&effects, round);
+        while commits.is_empty() {
+            let author = *others
+                .next()
+                .expect("committee is large enough to reach quorum_threshold");
+            let decide = Decide {
+                id: cut_id.clone(),
+                round,
+                author,
+            };
+            effects = engine.process_decide(decide);
+            commits = find_commits(&effects, round);
+        }
+
+        assert_eq!(
+            commits.len(),
+            1,
+            "commit should be emitted exactly once for the round"
+        );
+        assert_eq!(commits[0].1, proposal.tips);
+
+        let repeat = engine.try_commit_round(round);
+        assert!(find_commits(&repeat, round).is_empty());
+    }
+
+    #[test]
+    fn happy_path_commit_bracha_n4() {
+        happy_path_commit_bracha(4);
+    }
+
+    #[test]
+    fn happy_path_commit_bracha_n10() {
+        happy_path_commit_bracha(10);
+    }
+
+    /// BRACHA VARIANT ADDITION: `broadcast_cut_ready` broadcasts at most once per
+    /// round, even if the internal trigger (crossing `quorum_threshold` on the vote
+    /// census) somehow fires again for a DIFFERENT `cut_id` in the same round (e.g. an
+    /// equivocating leader) -- `sent_cut_ready` is a per-ROUND latch, mirroring
+    /// `sent_cut_votes`'s identical round-only shape, not a per-(round, cut_id) one.
+    #[test]
+    fn bracha_cut_ready_broadcasts_at_most_once_per_round() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let mut engine = CutEngine::new(keys[0], committee, 1_000).with_variant(Variant::Bracha);
+
+        let cut_id_a = Digest([1; 32]);
+        let effects = engine.broadcast_cut_ready(1, cut_id_a.clone(), &tips, &oracle);
+        match effects.first() {
+            Some(CutEffect::Broadcast(CutOut::CutReady(r))) => {
+                assert_eq!(r.cut_id, cut_id_a, "the first call for a round broadcasts CutReady");
+            }
+            other => panic!("expected a CutReady broadcast first, got {other:?}"),
+        }
+
+        let cut_id_b = Digest([2; 32]);
+        let effects = engine.broadcast_cut_ready(1, cut_id_b, &tips, &oracle);
+        assert!(
+            effects.is_empty(),
+            "a second CutReady for the same round must not be sent, even for a \
+             different cut_id: {effects:?}"
+        );
+    }
+
+    /// BRACHA VARIANT ADDITION: `process_cut_ready`'s own `CutReadyAggregator` census
+    /// dedups by author exactly like `CutVoteAggregator` does (see
+    /// `safe_is_reached_only_by_counting_distinct_votes_never_below_quorum`'s
+    /// identical final assertion for votes) -- `safe` is reached at exactly
+    /// `quorum_threshold` distinct `CutReady`s, and a replay from an already-counted
+    /// author manufactures no additional weight.
+    #[test]
+    fn bracha_cut_ready_census_dedups_by_author_and_reaches_safe_at_quorum() {
+        let (committee, keys) = committee_of(10);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let mut engine =
+            CutEngine::new(keys[0], committee.clone(), 1_000).with_variant(Variant::Bracha);
+        let cut_id = Digest([9; 32]);
+        let round: CutRound = 1;
+
+        let quorum = committee.quorum_threshold();
+        let mut counted = 0u32;
+        for author in keys.iter().copied() {
+            if engine.safe.contains_key(&round) {
+                break;
+            }
+            engine.process_cut_ready(
+                CutReady {
+                    round,
+                    cut_id: cut_id.clone(),
+                    author,
+                },
+                &tips,
+                &oracle,
+            );
+            counted += 1;
+        }
+        assert!(
+            engine.safe.contains_key(&round),
+            "n=10 has enough distinct authors to reach quorum_threshold"
+        );
+        assert_eq!(
+            counted, quorum,
+            "safe should be reached at exactly quorum_threshold distinct CutReadys"
+        );
+
+        let before = engine.safe.get(&round).cloned();
+        let repeat_author = keys[0];
+        engine.process_cut_ready(
+            CutReady {
+                round,
+                cut_id: cut_id.clone(),
+                author: repeat_author,
+            },
+            &tips,
+            &oracle,
+        );
+        assert_eq!(
+            engine.safe.get(&round),
+            before.as_ref(),
+            "a replayed CutReady changes nothing"
+        );
+    }
+
+    /// BRACHA VARIANT ADDITION: `process_cut_ready` is a no-op under `Variant::Opt` --
+    /// a stray/Byzantine `CutReady` cannot make an Opt-configured engine take the
+    /// Bracha-shaped path it was never configured to run.
+    #[test]
+    fn bracha_cut_ready_is_a_no_op_under_variant_opt() {
+        let (committee, keys) = committee_of(4);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let mut engine = CutEngine::new(keys[0], committee, 1_000); // Variant::Opt (default)
+
+        let effects = engine.process_cut_ready(
+            CutReady {
+                round: 1,
+                cut_id: Digest([1; 32]),
+                author: keys[1],
+            },
+            &tips,
+            &oracle,
+        );
+        assert!(effects.is_empty());
+        assert!(engine.cut_ready_aggregators.is_empty());
+        assert!(!engine.safe.contains_key(&1));
+    }
+
+    /// BRACHA VARIANT ADDITION -- the motivating case: at n=20, Opt's own
+    /// `mint_threshold` (15) exceeds the number of live authors in this scenario (14),
+    /// so no Opt-variant engine could ever reach `safe` here, no matter how long it
+    /// waited. Bracha's own threshold (plain `quorum_threshold`, 14 at n=20) is exactly
+    /// the number of live authors -- a round reaches `safe` and commits under Bracha
+    /// using ONLY messages from those 14 live authors (which include the round-1
+    /// leader); the other 6 committee members ("crashed") never contribute a single
+    /// message anywhere in this test.
+    #[test]
+    fn bracha_reaches_safe_and_commits_with_only_fourteen_of_twenty_live_authors() {
+        let (committee, keys) = committee_of(20);
+        let tips = sample_tips(&keys);
+        let oracle = AllAvailable;
+        let round: CutRound = 1;
+        let leader = agb::proposer(&committee, 2);
+
+        assert_eq!(
+            committee.quorum_threshold(),
+            14,
+            "test setup assumes n=20's quorum_threshold is exactly 14"
+        );
+        assert_eq!(
+            mint_threshold(&committee),
+            15,
+            "test setup assumes n=20's mint_threshold is exactly 15 -- one MORE than \
+             the number of live authors below, which is exactly why Opt could never \
+             reach safe in this scenario"
+        );
+
+        let live: Vec<PublicKey> = keys.iter().copied().take(14).collect();
+        assert!(
+            live.contains(&leader),
+            "test setup requires the round-1 leader to be among the live authors"
+        );
+
+        let mut engine = CutEngine::new(leader, committee, 1_000).with_variant(Variant::Bracha);
+
+        let mut effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
+        let proposal = find_proposal(&effects).expect("leader broadcasts a cut proposal");
+        let cut_id = proposal.id();
+
+        // Votes from the 13 OTHER live authors (the leader's own self-vote already
+        // landed above) -- never from any of the 6 crashed authors.
+        for author in live.iter().filter(|k| **k != leader) {
+            effects = engine.process_cut_vote(
+                CutVote {
+                    round,
+                    cut_id: cut_id.clone(),
+                    author: *author,
+                },
+                &tips,
+                &oracle,
+            );
+        }
+        assert!(
+            find_ready_for_round(&effects, round).is_some(),
+            "14 live authors is exactly quorum_threshold -- the vote census should \
+             have crossed it and broadcast our own CutReady"
+        );
+        assert!(!engine.safe.contains_key(&round));
+
+        // Readys from the same 13 other live authors (our own self-ready already
+        // landed via broadcast_cut_ready's self-processing) -- again, never from a
+        // crashed author.
+        for author in live.iter().filter(|k| **k != leader) {
+            if engine.safe.contains_key(&round) {
+                break;
+            }
+            effects = engine.process_cut_ready(
+                CutReady {
+                    round,
+                    cut_id: cut_id.clone(),
+                    author: *author,
+                },
+                &tips,
+                &oracle,
+            );
+        }
+        assert_eq!(
+            engine.safe.get(&round),
+            Some(&cut_id),
+            "14 live authors are exactly quorum_threshold under Bracha"
+        );
+
+        // Decides from live authors only, until commit (quorum_threshold = 14, exactly
+        // the number of live authors -- the leader's own self-decide already landed
+        // via mark_cut_safe above).
+        let mut commits = find_commits(&effects, round);
+        for author in live.iter().filter(|k| **k != leader) {
+            if !commits.is_empty() {
+                break;
+            }
+            effects = engine.process_decide(Decide {
+                id: cut_id.clone(),
+                round,
+                author: *author,
+            });
+            commits = find_commits(&effects, round);
+        }
+
+        assert_eq!(
+            commits.len(),
+            1,
+            "the round should commit exactly once, using only the 14 live authors' \
+             own messages"
+        );
+        assert_eq!(commits[0].1, proposal.tips);
     }
 
     /// REGRESSION (audit fix, see `aggregators::mint_threshold`); ADAPTED for the
@@ -1641,6 +2198,14 @@ mod tests {
             match inbound {
                 Inbound::CutProposal(_)
                 | Inbound::CutVote(_)
+                // BRACHA VARIANT ADDITION: `Inbound::CutReady` is exactly the kind of
+                // new variant this test's own doc comment describes -- adding it here
+                // is REQUIRED (the match would fail to COMPILE otherwise, per this
+                // test's stated purpose), not a behavior change to the test itself.
+                // Same single-named-author shape as `CutVote`, so it belongs on this
+                // side of the match, not a certificate-shaped arm this test would need
+                // to reject.
+                | Inbound::CutReady(_)
                 | Inbound::Decide(_)
                 | Inbound::Timeout(_)
                 | Inbound::TimeoutAccept(_)
@@ -2412,5 +2977,37 @@ mod tests {
         // Idempotent / monotonic: pruning to an earlier-or-equal floor is a no-op.
         engine.prune_below(1);
         assert!(engine.safe.contains_key(&2));
+    }
+
+    /// BRACHA VARIANT ADDITION: `prune_below` covers the two new round-prunable
+    /// fields (`cut_ready_aggregators`, `sent_cut_ready`) exactly like
+    /// `prune_below_is_exact` above covers every pre-existing one -- a separate test
+    /// (rather than an addition to that one) so no pre-existing test is modified.
+    #[test]
+    fn prune_below_covers_bracha_ready_state() {
+        let (committee, _keys) = committee_of(4);
+        let mut engine = CutEngine::new(key(1), committee, 1_000).with_variant(Variant::Bracha);
+
+        let d1 = Digest([1; 32]);
+        let d2 = Digest([2; 32]);
+        engine
+            .cut_ready_aggregators
+            .insert((1, d1.clone()), CutReadyAggregator::new());
+        engine
+            .cut_ready_aggregators
+            .insert((2, d2.clone()), CutReadyAggregator::new());
+        engine.sent_cut_ready.insert(1);
+        engine.sent_cut_ready.insert(2);
+
+        engine.prune_below(2);
+
+        assert!(!engine.cut_ready_aggregators.contains_key(&(1, d1)));
+        assert!(engine.cut_ready_aggregators.contains_key(&(2, d2)));
+        assert!(!engine.sent_cut_ready.contains(&1));
+        assert!(engine.sent_cut_ready.contains(&2));
+
+        // Idempotent / monotonic, mirroring `prune_below_is_exact`'s identical check.
+        engine.prune_below(1);
+        assert!(engine.sent_cut_ready.contains(&2));
     }
 }

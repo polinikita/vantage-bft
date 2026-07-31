@@ -176,6 +176,13 @@ pub enum PrimaryMessage {
     VantageReadyDigest(crate::vantage::ReadyDigest),
     VantageBodyFetch(View, Digest, /* requester */ PublicKey),
     VantageBodyServe(View, ViewProposal),
+    // Simple-IT's Bracha-RBC variant (a fifth protocol assembly, `--protocol
+    // simple-it-bracha` -- arXiv:2606.14404 Table 1/2 + Corollary 5, variant S):
+    // Bracha-RBC's own second echo round ("ready"), sent once a party's own
+    // `SimpleItCutVote` census crosses `quorum_threshold` (see
+    // `simpleit::engine::CutEngine::broadcast_cut_ready`). Appended last -- same
+    // bincode wire-compat rule as every other protocol-specific variant above.
+    SimpleItCutReady(crate::simpleit::CutReady),
 }
 
 impl PrimaryMessage {
@@ -231,6 +238,7 @@ impl PrimaryMessage {
             PrimaryMessage::VantageReadyDigest(..) => "VantageReadyDigest",
             PrimaryMessage::VantageBodyFetch(..) => "VantageBodyFetch",
             PrimaryMessage::VantageBodyServe(..) => "VantageBodyServe",
+            PrimaryMessage::SimpleItCutReady(..) => "SimpleItCutReady",
         }
     }
 }
@@ -479,14 +487,18 @@ impl Primary {
                         .ip()
                 );
             }
-            Protocol::SimpleIt => {
+            Protocol::SimpleIt | Protocol::SimpleItBracha => {
                 // Simple-IT cut-consensus: a single `SimpleItCore` task, mirroring
                 // `Protocol::Vantage`'s assembly exactly (same address setup, same
                 // `acks: true`, same compress/batch parameters) -- it drives
                 // `simpleit::CutEngine` over the identical data plane (`LaneManager`/
                 // `Repairer`/`Wire`/`PayloadIo`) Vantage uses, as its own separate
                 // instances (deliberately not shared mutable state -- see
-                // `simpleit::node::SimpleItCore`'s own doc comment).
+                // `simpleit::node::SimpleItCore`'s own doc comment). One shared arm
+                // for BOTH `SimpleIt` (Opt) and `SimpleItBracha` (Bracha-RBC, arXiv:
+                // 2606.14404 Table 1/2 + Corollary 5, variant S) -- `SimpleItCore::
+                // build` reads `parameters.protocol` (already threaded through below)
+                // to select `simpleit::engine::Variant::{Opt,Bracha}`.
                 let (tx_simpleit, ack_aggregator) = crate::simpleit::SimpleItCore::spawn(
                     name,
                     committee.clone(),

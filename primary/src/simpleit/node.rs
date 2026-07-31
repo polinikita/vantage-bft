@@ -28,7 +28,7 @@ use crate::vantage::wire::{self, DeclaredSender, Wire};
 use crate::vantage::{BlockRef, Effect};
 use async_trait::async_trait;
 use bytes::Bytes;
-use config::{Committee, Parameters, WorkerId};
+use config::{Committee, Parameters, Protocol, WorkerId};
 use crypto::{Digest, PairwiseKeys, PublicKey};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::Metrics;
@@ -61,11 +61,14 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 /// the relaying/serving party -- there is no sender claim on this variant to bind,
 /// exactly like Vantage's own `ControlServe`, so it maps to `None` too (gated
 /// downstream instead, by `CutEngine::on_cut_serve`'s own `pending_cut_fetch` check).
+/// `CutReady` (BRACHA VARIANT ADDITION) carries a real, per-destination-verifiable
+/// `author` field, same class as `CutVote`/`Decide`/`Timeout`/`TimeoutAccept` above.
 impl DeclaredSender for engine::Inbound {
     fn declared_sender(&self) -> Option<PublicKey> {
         match self {
             engine::Inbound::CutProposal(p) => Some(p.proposer),
             engine::Inbound::CutVote(v) => Some(v.author),
+            engine::Inbound::CutReady(r) => Some(r.author),
             engine::Inbound::Decide(d) => Some(d.author),
             engine::Inbound::Timeout(t) => Some(t.author),
             engine::Inbound::TimeoutAccept(a) => Some(a.author),
@@ -145,6 +148,9 @@ fn mac_candidate_sender(message: &PrimaryMessage) -> Option<PublicKey> {
         PrimaryMessage::SimpleItDecide(d) => Some(d.author),
         PrimaryMessage::SimpleItTimeout(t) => Some(t.author),
         PrimaryMessage::SimpleItTimeoutAccept(a) => Some(a.author),
+        // BRACHA VARIANT ADDITION: a real, per-destination-verifiable sender field,
+        // same class as `SimpleItCutVote`/`SimpleItDecide` above.
+        PrimaryMessage::SimpleItCutReady(r) => Some(r.author),
         PrimaryMessage::SimpleItCutFetch(_, _, requester) => Some(*requester),
         // `CutProposal::proposer` inside names the ORIGINAL round leader, not the
         // relaying/serving party -- no sender claim to bind here, exactly like
@@ -254,6 +260,8 @@ impl MessageHandler for SimpleItReceiverHandler {
             PrimaryMessage::SimpleItTimeoutAccept(a) => {
                 Inbound::Cut(engine::Inbound::TimeoutAccept(a))
             }
+            // BRACHA VARIANT ADDITION.
+            PrimaryMessage::SimpleItCutReady(r) => Inbound::Cut(engine::Inbound::CutReady(r)),
             PrimaryMessage::SimpleItCutFetch(round, digest, requester) => {
                 Inbound::Cut(engine::Inbound::CutFetch(round, digest, requester))
             }
@@ -476,8 +484,24 @@ impl SimpleItCore {
 
         // Paper-faithful defaults: `gate_tips: true`, no crash-injection scaffolding.
         // Neither is exposed via `Parameters` -- not asked for, and inventing a CLI
-        // knob for either is out of scope here.
-        let cut = CutEngine::new(name, committee.clone(), parameters.timeout_delay);
+        // knob for either is out of scope here. `variant` IS exposed, indirectly,
+        // through `parameters.protocol`: `Protocol::SimpleItBracha` selects
+        // `engine::Variant::Bracha`, every other `Protocol` value selects
+        // `engine::Variant::Opt` (the only one of the five `SimpleItCore::build` is
+        // ever ACTUALLY reached under in practice -- `primary.rs`'s own
+        // `Protocol::SimpleIt | Protocol::SimpleItBracha` match arm is this
+        // function's only caller; the other three arms are covered here anyway,
+        // matching this crate's own no-wildcard-match convention rather than relying
+        // on that external invariant).
+        let variant = match parameters.protocol {
+            Protocol::SimpleItBracha => engine::Variant::Bracha,
+            Protocol::SimpleIt
+            | Protocol::AutobahnOptimistic
+            | Protocol::AutobahnSeamless
+            | Protocol::Vantage => engine::Variant::Opt,
+        };
+        let cut =
+            CutEngine::new(name, committee.clone(), parameters.timeout_delay).with_variant(variant);
 
         let other_primaries: Vec<(PublicKey, SocketAddr)> = committee
             .others_primaries(&name)
@@ -960,6 +984,8 @@ impl SimpleItCore {
                         CutOut::Decide(d) => PrimaryMessage::SimpleItDecide(d),
                         CutOut::Timeout(t) => PrimaryMessage::SimpleItTimeout(t),
                         CutOut::TimeoutAccept(a) => PrimaryMessage::SimpleItTimeoutAccept(a),
+                        // BRACHA VARIANT ADDITION.
+                        CutOut::CutReady(r) => PrimaryMessage::SimpleItCutReady(r),
                     };
                     self.wire.broadcast_message(message).await;
                 }

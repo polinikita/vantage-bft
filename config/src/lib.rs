@@ -85,12 +85,22 @@ pub enum Protocol {
     /// Simple-IT cut-consensus (Fig. 4), driving `simpleit::CutEngine` over the same
     /// data plane Vantage uses (`simpleit::node::SimpleItCore`).
     SimpleIt,
+    /// Simple-IT's Bracha-RBC variant (arXiv:2606.14404 Table 1/2 + Corollary 5,
+    /// variant S) -- the same `simpleit::node::SimpleItCore`/`simpleit::CutEngine`
+    /// assembly as `SimpleIt` above, with `CutEngine`'s own `Variant::Bracha`
+    /// selected instead of the default `Variant::Opt`: an extra RBC echo round (own
+    /// `CutVote` census at `quorum_threshold` broadcasts a `CutReady`; a `CutReady`
+    /// census at `quorum_threshold` marks the round safe) in exchange for never
+    /// needing more than `quorum_threshold`-many live authors to make progress,
+    /// unlike `SimpleIt`'s own (larger, at big committees) `mint_threshold`.
+    SimpleItBracha,
 }
 
 impl Protocol {
     /// The `use_optimistic_tips` value implied by this protocol when the
-    /// Autobahn code paths run. `None` for Vantage and Simple-IT (the flag is
-    /// irrelevant on both paths -- neither ever runs Autobahn's `Core`).
+    /// Autobahn code paths run. `None` for Vantage and both Simple-IT variants (the
+    /// flag is irrelevant on all three paths -- none of them ever runs Autobahn's
+    /// `Core`).
     ///
     /// Open question (see the accompanying task report): Simple-IT has no
     /// optimistic-tip notion of its own, exactly like Vantage -- `None` mirrors
@@ -105,6 +115,9 @@ impl Protocol {
             Protocol::AutobahnSeamless => Some(false),
             Protocol::Vantage => None,
             Protocol::SimpleIt => None,
+            // Same reasoning as `SimpleIt` immediately above -- `SimpleItBracha`
+            // never runs Autobahn's `Core` either.
+            Protocol::SimpleItBracha => None,
         }
     }
 
@@ -117,6 +130,7 @@ impl Protocol {
             Protocol::AutobahnSeamless => "autobahn-seamless",
             Protocol::Vantage => "vantage",
             Protocol::SimpleIt => "simple-it",
+            Protocol::SimpleItBracha => "simple-it-bracha",
         }
     }
 }

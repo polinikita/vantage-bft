@@ -178,8 +178,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         "autobahn-seamless" => Protocol::AutobahnSeamless,
         "vantage" => Protocol::Vantage,
         "simple-it" => Protocol::SimpleIt,
+        "simple-it-bracha" => Protocol::SimpleItBracha,
         other => anyhow::bail!(
-            "Unknown --protocol '{}'; use autobahn-optimistic, autobahn-seamless, vantage, or simple-it",
+            "Unknown --protocol '{}'; use autobahn-optimistic, autobahn-seamless, vantage, \
+             simple-it, or simple-it-bracha",
             other
         ),
     };
@@ -249,6 +251,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // makes the comparison principled rather than accidental.
         timeout_delay: match protocol {
             Protocol::SimpleIt => delta_ms.saturating_mul(8),
+            // arXiv:2606.14404 Corollary 5, variant S (Bracha-RBC): Delta_to = 5Delta
+            // + 2delta -- same treatment as `SimpleIt`'s own 8Delta+4delta comment
+            // just above (the +2delta/+4delta terms are dropped: this local-benchmark
+            // model has no separate delta parameter of its own, only delta_ms).
+            Protocol::SimpleItBracha => delta_ms.saturating_mul(5),
             _ => Parameters::default().timeout_delay,
         },
         max_batch_delay: max_batch_delay_ms,
@@ -546,6 +553,25 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             | "SimpleItDecide"
             | "SimpleItTimeout"
             | "SimpleItTimeoutAccept" => "consensus",
+            "Committed" => "metricsplumbing",
+            _ => "other",
+        },
+        // Bracha-RBC variant (`--protocol simple-it-bracha`, arXiv:2606.14404 Table
+        // 1/2 + Corollary 5, variant S): identical wire vocabulary to `SimpleIt`
+        // above, plus its own extra echo-round message (`SimpleItCutReady`) -- kept
+        // as its own arm for the same reason `SimpleIt` is kept separate from
+        // `Protocol::Vantage` just above (so neither protocol's dashboard ever shows
+        // a msg_type the OTHER one can produce but it can't).
+        Protocol::SimpleItBracha => match msg_type {
+            "Header" | "Batch" => "dissemination",
+            "VantageAck" | "VantageAvail" => "acks",
+            "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
+            "SimpleItCutProposal"
+            | "SimpleItCutVote"
+            | "SimpleItDecide"
+            | "SimpleItTimeout"
+            | "SimpleItTimeoutAccept"
+            | "SimpleItCutReady" => "consensus",
             "Committed" => "metricsplumbing",
             _ => "other",
         },

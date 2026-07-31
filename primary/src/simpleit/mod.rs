@@ -1,7 +1,11 @@
 // Simple-IT cut-consensus protocol -- a port from the upstream
 // `simpleit/Opt-Mempool-Simple-IT-Failure` branch (fetched as remote `simpleit`, never
 // checked out/merged/applied -- see each submodule's doc comment for exact upstream
-// line ranges).
+// line ranges). `engine::CutEngine`'s Bracha variant (`engine::Variant::Bracha`,
+// `config::Protocol::SimpleItBracha`) additionally ports select pieces from a
+// SEPARATE branch, `simpleit/Bracha-Mempool-Simple-IT` (same remote, same read-only
+// contract) -- each such addition is flagged "BRACHA VARIANT ADDITION" at its own
+// definition site, with that branch's own line ranges cited there instead.
 //
 // Stage 1 (`messages`, `aggregators`) covers the wire types and the vote aggregators.
 // Stage 2 (`engine`, `effects`) covers the state machine itself: `engine::CutEngine`
@@ -42,11 +46,14 @@ pub mod messages;
 pub mod node;
 
 pub use aggregators::{
-    CutVoteAggregator, DecideAggregator, TimeoutAcceptAggregator, TimeoutAggregator,
+    CutReadyAggregator, CutVoteAggregator, DecideAggregator, TimeoutAcceptAggregator,
+    TimeoutAggregator,
 };
 pub use effects::{CutEffect, CutOut};
-pub use engine::{CrashSim, CutEngine, Inbound, TipOracle};
-pub use messages::{Cut, CutProposal, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert};
+pub use engine::{CrashSim, CutEngine, Inbound, TipOracle, Variant};
+pub use messages::{
+    Cut, CutProposal, CutReady, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
+};
 // `node::SimpleItCore` only -- `node::SimpleItReceiverHandler`/`node::Inbound` are
 // reached via their full path (`crate::simpleit::node::...`), exactly mirroring
 // `vantage`'s own `pub use node::VantageCore;` (not `VantageReceiverHandler`). Note

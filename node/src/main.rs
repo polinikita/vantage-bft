@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
                             "autobahn-seamless",
                             "vantage",
                             "simple-it",
+                            "simple-it-bracha",
                         ])
                         .action(ArgAction::Set)
                         .help("Consensus protocol"),

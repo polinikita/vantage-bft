@@ -29,9 +29,27 @@
 //     `validity_threshold` already do (`f = (n - 1) / 3`, i.e. `n = 3f + 1`). See its
 //     doc comment for the worked values and the (strictly more defined) handling of
 //     degenerate committee sizes.
+//
+//   - BRACHA VARIANT ADDITION (separate task, separate upstream branch):
+//     `CutReadyAggregator` is ported from a DIFFERENT upstream branch,
+//     `simpleit/Bracha-Mempool-Simple-IT` (fetched as the same `simpleit` remote,
+//     read-only, never checked out/merged/applied -- primary/src/aggregators.rs:59-65
+//     (struct), 138-182 (impl) there), not from Opt-Mempool-Simple-IT-Failure like
+//     every other type in this file. It backs `engine::Variant::Bracha`. This
+//     addition also gives `CutVoteAggregator::append` an explicit `threshold`
+//     parameter: upstream's two branches each hardcode ONE threshold into their own,
+//     separately-shaped `CutVoteAggregator` (`mint_threshold` on
+//     Opt-Mempool-Simple-IT-Failure; `quorum_threshold`, returning a bare `bool`, no
+//     witness list, on Bracha-Mempool-Simple-IT); this port unifies both variants
+//     into one binary and one `CutVoteAggregator` type, so the one thing that must
+//     still vary (which threshold) is supplied by the caller
+//     (`engine::CutEngine::process_cut_vote`) instead of being duplicated into a
+//     second struct.
 
 use crate::error::{DagError, DagResult};
-use crate::simpleit::messages::{CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert};
+use crate::simpleit::messages::{
+    CutReady, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
+};
 use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use std::collections::HashSet;
@@ -48,10 +66,10 @@ use std::collections::HashSet;
 /// primary/src/aggregators.rs:56-60 (struct), 170-198 (impl) minted a `CutCertificate`
 /// at this same point instead; the counting logic below is otherwise unchanged.
 ///
-/// Threshold: `mint_threshold` -- `max(optimistic_threshold, quorum_threshold)`. See
-/// that function for why the clamp is required for correctness at small committee
-/// sizes. At n=3f+1 the optimistic term dominates from f >= 3 onwards: 7 at n=10,
-/// 40 at n=50.
+/// Threshold: caller-supplied (see `append`'s own doc comment) -- `mint_threshold`
+/// (`max(optimistic_threshold, quorum_threshold)`) for `engine::Variant::Opt`,
+/// `quorum_threshold` for `engine::Variant::Bracha`. At n=3f+1 the optimistic term
+/// dominates from f >= 3 onwards: 7 at n=10, 40 at n=50.
 pub struct CutVoteAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
@@ -80,16 +98,24 @@ impl CutVoteAggregator {
         }
     }
 
+    /// `threshold`: the crossing point this census must reach before returning the
+    /// accumulated witnesses. BRACHA VARIANT ADDITION: this parameter (upstream's own
+    /// two branches each hardcode ONE threshold instead -- see this file's own module
+    /// doc comment). The caller (`engine::CutEngine::process_cut_vote`) passes
+    /// `aggregators::mint_threshold(committee)` for `engine::Variant::Opt` (unchanged
+    /// behavior from before this parameter existed) and `committee.quorum_threshold()`
+    /// for `engine::Variant::Bracha`.
     pub fn append(
         &mut self,
         vote: &CutVote,
         committee: &Committee,
+        threshold: Stake,
     ) -> DagResult<Option<Vec<PublicKey>>> {
         let author = vote.author;
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
         self.voters.push(author);
         self.weight += committee.stake(&author);
-        if self.weight >= mint_threshold(committee) {
+        if self.weight >= threshold {
             self.weight = 0;
             return Ok(Some(std::mem::take(&mut self.voters)));
         }
@@ -97,9 +123,12 @@ impl CutVoteAggregator {
     }
 }
 
-/// The threshold at which `CutVoteAggregator` marks a round safe (Fig. 2's Mark-safe
-/// step, evaluated locally by each party rather than via a relayed certificate):
-/// `max(optimistic_threshold, quorum_threshold)`.
+/// The threshold at which `CutVoteAggregator` marks a round safe under
+/// `engine::Variant::Opt` (Fig. 2's Mark-safe step, evaluated locally by each party
+/// rather than via a relayed certificate): `max(optimistic_threshold,
+/// quorum_threshold)`. `pub(super)`: `engine.rs` (stage 2) computes this at its own
+/// call site, alongside `Variant::Bracha`'s own `committee.quorum_threshold()` -- see
+/// `CutVoteAggregator::append`'s `threshold` parameter.
 ///
 /// AUDIT FIX (finding predates the Fig.-2 rewrite; still load-bearing under it).
 /// Upstream mints at `optimistic_threshold` alone, but upstream's own
@@ -121,7 +150,7 @@ impl CutVoteAggregator {
 /// fewer than 2f+1 first-hand votes is not a quorum and could not be safely acted on
 /// anyway. It is provably a no-op at every size we benchmark -- n=10 (max(7,7) = 7) and
 /// n=50 (max(40,34) = 40) -- so it cannot move any measured number.
-fn mint_threshold(committee: &Committee) -> Stake {
+pub(super) fn mint_threshold(committee: &Committee) -> Stake {
     optimistic_threshold(committee).max(committee.quorum_threshold())
 }
 
@@ -144,6 +173,69 @@ fn optimistic_threshold(committee: &Committee) -> Stake {
     let f = (total_stake - 1) / 3;
     let numerator = (total_stake + 2 * f - 2).max(0);
     ((numerator + 1) / 2) as Stake
+}
+
+/// Aggregates `CutReady` messages for one (round, cut) pair, counted strictly
+/// FIRST-HAND exactly like `CutVoteAggregator` above -- Bracha variant only
+/// (`engine::Variant::Bracha`; see `engine::CutEngine::process_cut_ready`). Same
+/// shape as `CutVoteAggregator` (weight/used/voters, returns the exact witness set on
+/// crossing threshold) -- a separate type rather than a shared generic one, matching
+/// this module's existing house style of one small dedicated aggregator per message
+/// kind (`DecideAggregator`/`TimeoutAggregator`/`TimeoutAcceptAggregator` below are
+/// none of them unified either, despite similarly-shaped bodies).
+///
+/// Threshold: always `quorum_threshold` (2f+1 at n=3f+1) -- unlike `CutVoteAggregator`,
+/// never `mint_threshold`: `CutReady` is Bracha-RBC's own SECOND echo round (arXiv:
+/// 2606.14404 Table 1/2 + Corollary 5, variant S), which has no "optimistic" shortcut
+/// of its own to clamp against (only the Opt-RBC variant's first echo round does --
+/// see `mint_threshold`'s doc comment). Upstream (`Bracha-Mempool-Simple-IT` branch)
+/// primary/src/aggregators.rs:59-65 (struct), 138-182 (impl) minted a `CutCertificate`
+/// at this same crossing point instead -- not ported, for the identical Fig.-2-rewrite
+/// reason `CutVoteAggregator`'s own doc comment gives for the Opt variant: a
+/// certificate lets a party accept another party's relayed claim about who sent a
+/// `CutReady`, which this signature-free protocol cannot authenticate. Each party
+/// counts its own, over `CutReady`s it individually verified.
+pub struct CutReadyAggregator {
+    weight: Stake,
+    used: HashSet<PublicKey>,
+    /// Every distinct author counted so far towards `quorum_threshold`, in arrival
+    /// order -- mirrors `CutVoteAggregator::voters` exactly: this is the fetch-target
+    /// set `CutEngine::mark_cut_safe` hands to `ensure_cut_fetch` when this round's
+    /// own `CutProposal` is still unknown, this party's own first-hand record of who
+    /// it received a `CutReady` from.
+    voters: Vec<PublicKey>,
+}
+
+impl Default for CutReadyAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CutReadyAggregator {
+    pub fn new() -> Self {
+        Self {
+            weight: 0,
+            used: HashSet::new(),
+            voters: Vec::new(),
+        }
+    }
+
+    pub fn append(
+        &mut self,
+        ready: &CutReady,
+        committee: &Committee,
+    ) -> DagResult<Option<Vec<PublicKey>>> {
+        let author = ready.author;
+        ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
+        self.voters.push(author);
+        self.weight += committee.stake(&author);
+        if self.weight >= committee.quorum_threshold() {
+            self.weight = 0;
+            return Ok(Some(std::mem::take(&mut self.voters)));
+        }
+        Ok(None)
+    }
 }
 
 /// Aggregates `Decide` messages for one (round, cut) pair into a certified decision.
