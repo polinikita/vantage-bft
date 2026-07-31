@@ -31,6 +31,7 @@ async fn synchronize() {
         /* sync_retry_nodes */ 3, // Not used in this test.
         rx_message,
         /* latency_map */ std::collections::HashMap::new(),
+        /* blip_gate */ None,
         metrics,
         false,
         BatchConfig::default(),

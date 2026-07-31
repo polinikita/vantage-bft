@@ -21,7 +21,7 @@ use primary::Primary;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use store::{Store, StoreProfile};
 use tokio::sync::mpsc::channel;
 use worker::Worker;
@@ -120,6 +120,40 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold,
         nodes
     );
+    // Transient network-level "blip" fault injector (Autobahn SOSP'24 Figs. 1/7/8
+    // repro): `--blip-at`'s presence is the sole enable switch -- absent (the
+    // default) means no blip, byte-identical behavior. Unlike `--mimic-latency-ms`,
+    // there is no "explicit 0 vs. absent" ambiguity to resolve here: `--blip-at 0`
+    // (blip starts immediately at measurement start) is just an ordinary value.
+    let blip_at_secs: Option<u64> = matches
+        .get_one::<String>("blip-at")
+        .map(|s| s.parse().context("--blip-at must be a non-negative integer"))
+        .transpose()?;
+    let blip_for_secs: u64 = matches
+        .get_one::<String>("blip-for")
+        .unwrap()
+        .parse()
+        .context("--blip-for must be a non-negative integer")?;
+    let blip_node: usize = matches
+        .get_one::<String>("blip-node")
+        .unwrap()
+        .parse()
+        .context("--blip-node must be a non-negative integer")?;
+    if blip_at_secs.is_some() {
+        // Must be a LIVE node -- a blip targeting a crashed (trailing) index would be
+        // indistinguishable from no blip at all (nothing is spawned there to pause),
+        // which is almost certainly not what was intended.
+        anyhow::ensure!(
+            blip_node < live_nodes,
+            "--blip-node ({}) must be a live node index (< {} live node(s); indices \
+             {}..{} are crashed via --crash {})",
+            blip_node,
+            live_nodes,
+            live_nodes,
+            nodes,
+            crash
+        );
+    }
     let delta_ms: u64 = matches
         .get_one::<String>("delta-ms")
         .unwrap()
@@ -150,8 +184,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--ack-watermark-period-ms must be a non-negative integer")?;
-    // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default.
-    let timeline: bool = matches.get_flag("timeline");
+    // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default. Auto-enabled
+    // whenever a blip is configured (`--blip-at`), since the blip's whole point is to
+    // make the committed-throughput dip/recovery shape visible (see the `TIMELINE:`
+    // series below).
+    let timeline: bool = matches.get_flag("timeline") || blip_at_secs.is_some();
     // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `--latency-table <csv>` (an n x n
     // RTT-ms matrix, node index = committee order) takes precedence over
     // `--mimic-latency-ms <u64>` (the uniform EXPLICIT OVERRIDE shorthand -- defined
@@ -279,6 +316,13 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             withhold, reachable, nodes
         );
     }
+    if let Some(at) = blip_at_secs {
+        println!(
+            "Blip: node {} network-paused (all traffic held, not dropped) for {}s \
+             starting at T+{}s (Autobahn SOSP'24 Figs. 1/7/8 repro)",
+            blip_node, blip_for_secs, at
+        );
+    }
     println!("======================================\n");
 
     // Wipe and recreate the data dir (starfish's own local-benchmark does the same).
@@ -292,6 +336,16 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     committee
         .export(data_dir.join("committee.json").to_str().unwrap())
         .context("Failed to write committee.json")?;
+
+    // Transient network-level "blip" fault injector: the shared, in-process "has the
+    // window opened yet" cell (see `Parameters::blip_window`'s own doc comment) --
+    // created empty here, BEFORE any node spawns, and cloned into every node's own
+    // `Parameters` below; armed (via `.set(..)`) once `run_start` is known, further
+    // down, at which point every already-spawned node's connections see it instantly
+    // (same `Arc`). `None` whenever `--blip-at` isn't given, so no cell is even
+    // allocated on the default path.
+    let blip_window_cell: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>> =
+        blip_at_secs.map(|_| Arc::new(OnceLock::new()));
 
     let mut parameters = Parameters {
         protocol,
@@ -338,6 +392,15 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         ack_watermark_period_ms,
         digest_statements: matches.get_flag("digest-statements"),
         withhold_senders: withhold,
+        // Transient network-level "blip" fault injector: `blip_node_index` is the
+        // sole enable switch (mirrors `blip_at_secs.is_some()` above); `blip_at_ms`/
+        // `blip_for_ms` are meaningless/unused whenever it's `None`. `blip_window` is
+        // the shared cell created just above -- `#[serde(skip)]`, same
+        // never-round-trips-through-JSON treatment as `latency_table` below.
+        blip_node_index: blip_at_secs.map(|_| blip_node),
+        blip_at_ms: blip_at_secs.unwrap_or(0) * 1000,
+        blip_for_ms: blip_for_secs * 1000,
+        blip_window: blip_window_cell.clone(),
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
@@ -458,6 +521,24 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         println!("Running benchmark ({} sec)...", duration);
     }
     let run_start = tokio::time::Instant::now();
+    // Transient network-level "blip" fault injector: the window is anchored to THIS
+    // benchmark's own measurement start (`run_start`, just captured) rather than to
+    // process-spawn time (which happened earlier, in the loop above) -- `--blip-at`
+    // is defined as an offset from measurement start, and every node's own
+    // `Parameters::blip_window` clone (set at spawn time, before this point) observes
+    // this `.set(..)` the instant it happens, since they all share the same `Arc`.
+    if let (Some(cell), Some(at)) = (&blip_window_cell, blip_at_secs) {
+        let start = run_start.into_std() + std::time::Duration::from_secs(at);
+        let end = start + std::time::Duration::from_secs(blip_for_secs);
+        cell.set((start, end))
+            .expect("blip window is set exactly once, right after run_start");
+        println!(
+            "TIMELINE-BLIP: start={} end={} node={}",
+            at,
+            at + blip_for_secs,
+            blip_node
+        );
+    }
     if timeline {
         // PHASE7-PREP-NOTES.md Finding A: once/sec progress-gauge line per live
         // primary, for the whole run -- reads the same registries `print_results`
@@ -467,6 +548,19 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume"
         );
         let mut elapsed: u64 = 0;
+        // Committed-throughput series (grep-parseable `TIMELINE:` lines): matches
+        // `print_results`' own `max_committed_transactions` formula exactly -- sum
+        // `committed_transactions` within each node's own workers (handles
+        // `--workers > 1`, where each worker registry only sees its own worker-id
+        // slice of the replicated commit stream), then take the MAX across live
+        // nodes (every node counts ~the same replicated stream once summed, not a
+        // disjoint partition of it). `committed_transactions` is a plain `IntCounter`
+        // incremented directly at commit time (`worker::synchronizer::Synchronizer::
+        // observe_committed`) -- reading it needs no `MetricReporter::force_report`
+        // (that only flushes the separate, buffered histogram gauges) and doesn't
+        // perturb anything: a lock-free atomic read, once per second, same source the
+        // final summary's own "Sequenced (committed)" line uses.
+        let mut prev_committed_total: u64 = 0;
         'timeline: loop {
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
@@ -480,6 +574,20 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                             );
                         }
                     }
+                    let mut committed_by_node: std::collections::BTreeMap<usize, u64> =
+                        std::collections::BTreeMap::new();
+                    for (node, registry, _reporter) in &worker_metrics {
+                        *committed_by_node.entry(*node).or_insert(0) +=
+                            read_counter(registry, "committed_transactions");
+                    }
+                    let committed_total = committed_by_node.values().copied().max().unwrap_or(0);
+                    println!(
+                        "TIMELINE: sec={} committed_total={} committed_delta={}",
+                        elapsed,
+                        committed_total,
+                        committed_total.saturating_sub(prev_committed_total)
+                    );
+                    prev_committed_total = committed_total;
                     if duration != 0 && elapsed >= duration {
                         break 'timeline;
                     }

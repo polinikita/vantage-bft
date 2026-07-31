@@ -707,6 +707,17 @@ impl Primary {
                     // "doesn't otherwise take a `Parameters`" reasoning as
                     // `latency_map` just above.
                     config::withheld_destinations(&committee, &name, parameters.withhold_senders),
+                    // Transient network-level "blip" fault injector (`--blip-at`):
+                    // resolved once here, same convention as `latency_map`/
+                    // `withheld_destinations` just above -- `None` (the default, and
+                    // always the case when `--blip-at` isn't given, or when this
+                    // node's own `Parameters::blip_window` was never armed -- e.g. the
+                    // distributed `node run` path, which exposes no CLI flag for this)
+                    // means this node's primary-to-primary traffic is untouched.
+                    parameters.blip_window.clone().and_then(|window| {
+                        config::blip_targets(&committee, &name, parameters.blip_node_index)
+                            .map(|targets| Arc::new(network::BlipGate::new(targets, window)))
+                    }),
                     metrics.clone(),
                     parameters.compress_network,
                     batch,

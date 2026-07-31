@@ -7,7 +7,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, BlipGate, SimpleSender};
 use primary::PrimaryWorkerMessage;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom as _;
@@ -205,6 +205,10 @@ impl Synchronizer {
         // `BatchMaker::spawn`'s -- see its doc comment). Applied to worker-to-worker
         // sync requests, previously undelayed even under a WAN-shaped run.
         latency_map: HashMap<SocketAddr, Duration>,
+        // Transient network-level "blip" fault injector: this authority's own gate
+        // (same contract/construction as `BatchMaker::spawn`'s -- see its doc
+        // comment). Applied to worker-to-worker sync requests.
+        blip_gate: Option<Arc<BlipGate>>,
         metrics: Arc<Metrics>,
         // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention as `metrics`.
         compress_network: bool,
@@ -226,6 +230,7 @@ impl Synchronizer {
                 rx_message,
                 network: SimpleSender::new()
                     .with_latency(latency_map)
+                    .with_blip(blip_gate)
                     .with_metrics(metrics.clone())
                     .with_compression(compress_network)
                     .with_batching(batch),

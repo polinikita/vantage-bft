@@ -28,6 +28,7 @@ async fn batch_reply() {
         store,
         rx_request,
         /* latency_map */ std::collections::HashMap::new(),
+        /* blip_gate */ None,
         Metrics::new(&prometheus::Registry::new()).0,
         false,
         BatchConfig::default(),

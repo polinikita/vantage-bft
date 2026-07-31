@@ -8,8 +8,8 @@ use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -432,6 +432,54 @@ pub struct Parameters {
     /// perturbs a send path in that case.
     #[serde(default)]
     pub withhold_senders: usize,
+
+    /// Transient network-level "blip" fault injector (`node local-benchmark --blip-at/
+    /// --blip-for/--blip-node`): reproduces the Autobahn paper's (Giridharan et al.,
+    /// SOSP'24, Figs. 1/7/8) blip experiment -- "we ... trigger a three second blip by
+    /// simulating a single leader failure". The committee index (0-based, sorted
+    /// order -- same convention `--crash`/`--load-nodes`/`--withhold` already use) of
+    /// the node that blips. `None` (default) = no blip configured -- `blip_targets`
+    /// (this crate) then returns `None` for every node, so no `network::BlipGate` is
+    /// ever constructed at any spawn site and the send path is byte-identical to
+    /// before this feature existed. `#[serde(default)]` keeps every pre-existing
+    /// parameter file valid.
+    ///
+    /// Only ever populated by `node local-benchmark`'s CLI entry handler
+    /// (`node/src/local_benchmark.rs::run`) -- like `latency_table`, never by library
+    /// code. `node run`'s distributed path exposes no CLI flag for this: an imported
+    /// `parameters.json` that happened to set this field would still resolve a gate's
+    /// TARGET set, but `blip_window` below (`#[serde(skip)]`, so always `None` after
+    /// import) would never arm, making the gate permanently inert -- see that field's
+    /// own doc comment.
+    #[serde(default)]
+    pub blip_node_index: Option<usize>,
+    /// Offset from measurement start (ms) when the blip window begins. Only consulted
+    /// when `blip_node_index` is `Some`. `#[serde(default)]` keeps every pre-existing
+    /// parameter file valid.
+    #[serde(default)]
+    pub blip_at_ms: u64,
+    /// Blip window duration (ms). Only consulted when `blip_node_index` is `Some`.
+    /// `#[serde(default)]` (3000 ms, the Autobahn paper's own blip duration) keeps
+    /// every pre-existing parameter file valid.
+    #[serde(default = "default_blip_for_ms")]
+    pub blip_for_ms: u64,
+    /// The shared, in-process "has the window opened yet" cell every node's own
+    /// `network::BlipGate` clones (same `Arc`, so `node local-benchmark::run`'s single
+    /// `.set(..)` call -- made once measurement start is known, see
+    /// `local_benchmark.rs` -- is instantly visible to every already-spawned node's
+    /// connections, even ones mid-`keep_alive_delayed`/`run_delayed`). Stores
+    /// `std::time::Instant` rather than `tokio::time::Instant` so this crate never
+    /// needs a `tokio` dependency just for this one skip-serialized field;
+    /// `network::BlipGate::clamp` (which DOES depend on tokio already) converts via
+    /// `tokio::time::Instant::from_std` at the point of use. `#[serde(skip)]` (never
+    /// round-trips through `parameters.json`, exactly like `latency_table`) -- always
+    /// `None` immediately after `Parameters::default()`/`Parameters::import(..)`.
+    /// `None` here makes every gate permanently inert regardless of
+    /// `blip_node_index` (see that field's own doc comment): `node local-benchmark`
+    /// is the only populator, and always sets this whenever it sets
+    /// `blip_node_index`.
+    #[serde(skip)]
+    pub blip_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 }
 
 fn default_batch_max_bytes() -> usize {
@@ -465,6 +513,12 @@ fn default_simpleit_gc_window_rounds() -> u64 {
 /// `ack_watermarks`'s own doc comment.
 fn default_ack_watermark_period_ms() -> u64 {
     50
+}
+
+/// `Parameters::blip_for_ms`'s own doc comment -- matches the Autobahn paper's own
+/// three-second blip.
+fn default_blip_for_ms() -> u64 {
+    3_000
 }
 
 /// AWS region names for the 10-region RTT matrix below. Ported VERBATIM from
@@ -687,6 +741,10 @@ impl Default for Parameters {
             authenticate_channels: false,
             mac_secret: None,
             withhold_senders: 0,
+            blip_node_index: None,
+            blip_at_ms: 0,
+            blip_for_ms: default_blip_for_ms(),
+            blip_window: None,
         }
     }
 }
@@ -796,6 +854,13 @@ impl Parameters {
                 "Data-plane withholding: first {} node(s) withhold payload dissemination \
                  from a staggered half of the committee",
                 self.withhold_senders
+            );
+        }
+        if let Some(idx) = self.blip_node_index {
+            info!(
+                "Blip fault injector (Autobahn SOSP'24 Figs. 1/7/8 repro): node index {} \
+                 network-paused for {} ms starting at T+{} ms",
+                idx, self.blip_for_ms, self.blip_at_ms
             );
         }
     }
@@ -1217,6 +1282,50 @@ pub fn withheld_destinations(
     Some((1..=half).map(|offset| order[(i + offset) % n]).collect())
 }
 
+/// Transient network-level "blip" fault injector (`node local-benchmark --blip-at/
+/// --blip-for/--blip-node`, `Parameters::blip_node_index`): reproduces the Autobahn
+/// paper's (Giridharan et al., SOSP'24, Figs. 1/7/8) blip experiment -- a transient
+/// single-node stall in which every byte to/from one node is HELD (not dropped) for a
+/// fixed window, then released. Every node derives this PURELY locally (its own
+/// identity, `committee`'s own sorted order, and the configured index) -- the same
+/// resolve-once-at-spawn convention `withheld_destinations`/`Committee::latency_map`
+/// already use.
+///
+/// Returns the set of socket addresses THIS node's own `ReliableSender`/`SimpleSender`
+/// connections should hold traffic to during the blip window (fed straight into
+/// `network::BlipGate::new`, the same way `Committee::latency_map`'s return value
+/// feeds `with_latency`):
+///   - if `self_pk` IS the blipped node: every OTHER authority's addresses -- this
+///     node's own outbound is held regardless of destination, since a genuinely
+///     stalled node cannot selectively single out which peer it happens to be
+///     talking to.
+///   - otherwise: only the blipped node's own addresses -- every other destination is
+///     unaffected.
+///
+/// `None` when `blip_node_index` is `None` (the default -- no blip configured) or
+/// doesn't resolve to a committee member (defensive; `node local-benchmark` validates
+/// the index eagerly against the live range and should never pass an out-of-range one
+/// here).
+pub fn blip_targets(
+    committee: &Committee,
+    self_pk: &PublicKey,
+    blip_node_index: Option<usize>,
+) -> Option<HashSet<SocketAddr>> {
+    let blip_pk = *committee.authorities.keys().nth(blip_node_index?)?;
+    if *self_pk == blip_pk {
+        Some(
+            committee
+                .authorities
+                .keys()
+                .filter(|&&k| k != blip_pk)
+                .flat_map(|k| committee.addresses_of(k))
+                .collect(),
+        )
+    } else {
+        Some(committee.addresses_of(&blip_pk).into_iter().collect())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct KeyPair {
     /// The node's public key (and identifier).
@@ -1360,5 +1469,53 @@ mod tests {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         assert!(withheld_destinations(&committee, &keypairs[2].name, 3).is_some());
         assert!(withheld_destinations(&committee, &keypairs[3].name, 3).is_none());
+    }
+
+    /// `blip_targets`: the blipped node itself holds every OTHER authority's
+    /// addresses (regardless of destination), and never any of its own.
+    #[test]
+    fn blip_targets_self_is_blip_node_targets_everyone_else() {
+        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9500);
+        let targets =
+            blip_targets(&committee, &keypairs[2].name, Some(2)).expect("index 2 is the blip node");
+        let expected: HashSet<SocketAddr> = keypairs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 2)
+            .flat_map(|(_, k)| committee.addresses_of(&k.name))
+            .collect();
+        assert_eq!(targets, expected);
+        for addr in committee.addresses_of(&keypairs[2].name) {
+            assert!(!targets.contains(&addr));
+        }
+    }
+
+    /// A non-blip node only holds connections addressed to the blip node itself.
+    #[test]
+    fn blip_targets_peer_targets_only_blip_node() {
+        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9600);
+        let targets = blip_targets(&committee, &keypairs[0].name, Some(2))
+            .expect("index 0 is a peer, not the blip node");
+        let expected: HashSet<SocketAddr> =
+            committee.addresses_of(&keypairs[2].name).into_iter().collect();
+        assert_eq!(targets, expected);
+    }
+
+    /// `blip_node_index: None` (the default): every node gets `None`, regardless of
+    /// committee size or its own position.
+    #[test]
+    fn blip_targets_disabled_is_none_for_everyone() {
+        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9700);
+        for keypair in &keypairs {
+            assert!(blip_targets(&committee, &keypair.name, None).is_none());
+        }
+    }
+
+    /// An out-of-range index resolves to `None` defensively -- the CLI is expected to
+    /// validate this eagerly and never actually pass one through.
+    #[test]
+    fn blip_targets_out_of_range_index_is_none() {
+        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9800);
+        assert!(blip_targets(&committee, &keypairs[0].name, Some(99)).is_none());
     }
 }

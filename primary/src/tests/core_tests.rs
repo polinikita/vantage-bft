@@ -106,6 +106,9 @@ async fn process_header() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -208,6 +211,9 @@ async fn process_header_missing_parent() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
         None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
@@ -313,6 +319,9 @@ async fn process_header_invalid_height() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -410,6 +419,9 @@ async fn process_header_missing_payload() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -504,6 +516,9 @@ async fn process_votes() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
         None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
@@ -621,6 +636,9 @@ async fn process_certificates() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
         None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
@@ -741,6 +759,9 @@ async fn process_prepare() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
         None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
@@ -893,6 +914,9 @@ async fn generate_confirm() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
         None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
@@ -1058,6 +1082,9 @@ async fn generate_commit() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
         None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
@@ -1276,6 +1303,9 @@ async fn generate_pipelined_prepare() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -1458,6 +1488,9 @@ async fn local_timeout_view() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -1557,6 +1590,9 @@ async fn sync_missing_proposals() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Transient network-level "blip" fault injector: `None` matches every other
+        // existing test's expectations (byte-identical to no blip).
         None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),

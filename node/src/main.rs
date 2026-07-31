@@ -418,6 +418,44 @@ async fn main() -> Result<()> {
                         Emission-only: reception handles both encodings unconditionally \
                         either way. Off by default -- byte-identical wire/behavior when off.",
                         ),
+                )
+                .arg(
+                    Arg::new("blip-at")
+                        .long("blip-at")
+                        .value_name("SEC")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Transient network-level fault injector reproducing the Autobahn \
+                        paper's (Giridharan et al., SOSP'24, Figs. 1/7/8) blip experiment: \
+                        offset from measurement start, in seconds, when a single node's \
+                        network traffic is HELD (every byte to/from it is paused, not \
+                        dropped, and released the moment the window ends). Absent (default): \
+                        no blip, byte-identical behavior. --blip-node/--blip-for select which \
+                        node and for how long; --timeline is auto-enabled whenever this is set.",
+                        ),
+                )
+                .arg(
+                    Arg::new("blip-for")
+                        .long("blip-for")
+                        .value_name("SEC")
+                        .default_value("3")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Blip window duration, in seconds (the Autobahn paper's own \
+                        three-second blip). Irrelevant unless --blip-at is set.",
+                        ),
+                )
+                .arg(
+                    Arg::new("blip-node")
+                        .long("blip-node")
+                        .value_name("INT")
+                        .default_value("0")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Committee index (0-based, sorted order -- same convention as \
+                        --crash/--load-nodes/--withhold) of the node that blips. Must be a \
+                        LIVE node (< nodes - crash). Irrelevant unless --blip-at is set.",
+                        ),
                 ),
         )
         .subcommand_required(true)

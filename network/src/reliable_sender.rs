@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch::{encode_bundle, sleep_until_or_pending, BatchConfig, Coalescer};
+use crate::blip::BlipGate;
 use crate::error::NetworkError;
 use bytes::Bytes;
 use futures::sink::SinkExt as _;
@@ -48,6 +49,12 @@ pub struct ReliableSender {
     /// latency, empty by default (current behavior, byte-identical). See
     /// `network/src/lib.rs`'s module doc for the injection point/semantics.
     latency: HashMap<SocketAddr, Duration>,
+    /// Transient network-level "blip" fault injector (`node local-benchmark
+    /// --blip-at`), attached via `with_blip` the same way `latency` is attached via
+    /// `with_latency`. `None` by default -- every connection this sender spawns then
+    /// skips the blip-clamp check entirely (see `Connection::keep_alive`'s branch
+    /// condition), zero added cost on the untouched path.
+    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: optional wire-metrics handle, attached the same
     /// way as `latency` (`with_metrics`, called once right after construction).
     /// `None` by default -- every connection this sender spawns then skips the
@@ -75,6 +82,7 @@ impl ReliableSender {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
             latency: HashMap::new(),
+            blip: None,
             metrics: None,
             compress: false,
             batch: BatchConfig::default(),
@@ -89,6 +97,14 @@ impl ReliableSender {
     /// simply isn't a key in `map`.
     pub fn with_latency(mut self, map: HashMap<SocketAddr, Duration>) -> Self {
         self.latency = map;
+        self
+    }
+
+    /// Attach a blip gate (same contract as `with_latency`: call before any
+    /// connection is spawned). `None` -- the default, and always the case when
+    /// `--blip-at` isn't given -- is a no-op.
+    pub fn with_blip(mut self, gate: Option<Arc<BlipGate>>) -> Self {
+        self.blip = gate;
         self
     }
 
@@ -122,10 +138,15 @@ impl ReliableSender {
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(1_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
+        // Resolved ONCE here (mirrors `extra_latency` just above), not per-message:
+        // `None` unless a blip gate is attached AND `address` is one of its held
+        // destinations (see `BlipGate::targets`'s doc comment).
+        let blip = self.blip.clone().filter(|gate| gate.targets(&address));
         Connection::spawn(
             address,
             rx,
             extra_latency,
+            blip,
             self.metrics.clone(),
             self.compress,
             self.batch,
@@ -285,6 +306,12 @@ struct Connection {
     /// resolved once at spawn time and applied before every real send for this
     /// connection's whole life -- see `keep_alive`.
     extra_latency: Duration,
+    /// Transient network-level "blip" fault injector: resolved once at spawn time
+    /// (mirrors `extra_latency`) via `ReliableSender::spawn_connection`'s own
+    /// `BlipGate::targets` check -- `None` unless a blip gate is attached to the
+    /// owning `ReliableSender` AND `address` is one of its held destinations. See
+    /// `keep_alive`'s branch condition and `scheduled_release`.
+    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: resolved once at spawn time (mirrors
     /// `extra_latency`); `bytes_sent_total` is incremented at every successful
     /// physical write, length prefix included, whether the first attempt or a retry.
@@ -303,6 +330,7 @@ impl Connection {
         address: SocketAddr,
         receiver: Receiver<InnerMessage>,
         extra_latency: Duration,
+        blip: Option<Arc<BlipGate>>,
         metrics: Option<Arc<Metrics>>,
         compress: bool,
         batch: BatchConfig,
@@ -314,6 +342,7 @@ impl Connection {
                 retry_delay: 200,
                 buffer: VecDeque::new(),
                 extra_latency,
+                blip,
                 metrics,
                 compress,
                 batch,
@@ -427,14 +456,33 @@ impl Connection {
     }
 
     /// Transmit messages once we have established a connection. D7-3 (PHASE7-PREP-
-    /// NOTES.md): the default (`extra_latency.is_zero()`) path is BYTE-IDENTICAL to
-    /// the pre-existing code (no scheduling overhead at all, not even one extra
-    /// `Instant::now()` call) -- the WAN-shaped-run path is a separate method.
+    /// NOTES.md): the default (`extra_latency.is_zero()` AND no blip gate attached)
+    /// path is BYTE-IDENTICAL to the pre-existing code (no scheduling overhead at
+    /// all, not even one extra `Instant::now()` call) -- the WAN-shaped-run/blip path
+    /// is a separate method. `self.blip.is_none()` is one cheap extra `Option` check
+    /// on this branch (mirrors `extra_latency.is_zero()` itself), added because a
+    /// blip-gated connection needs the SAME dynamic per-message scheduling
+    /// `keep_alive_delayed` already provides even when `extra_latency` itself is
+    /// zero (see `scheduled_release`).
     async fn keep_alive(&mut self, stream: TcpStream) -> NetworkError {
-        if self.extra_latency.is_zero() {
+        if self.extra_latency.is_zero() && self.blip.is_none() {
             self.keep_alive_immediate(stream).await
         } else {
             self.keep_alive_delayed(stream).await
+        }
+    }
+
+    /// The release instant for a message being scheduled right now: `now() +
+    /// extra_latency`, further clamped forward to the blip window's end if this
+    /// connection is gated and that natural release would otherwise land inside the
+    /// window (see `BlipGate::clamp`'s doc comment for the ordering-preservation
+    /// argument -- this is the ONLY point `keep_alive_delayed` computes a release
+    /// instant, so that argument covers this whole connection).
+    fn scheduled_release(&self) -> Instant {
+        let natural_release = Instant::now() + self.extra_latency;
+        match &self.blip {
+            Some(gate) => gate.clamp(natural_release),
+            None => natural_release,
         }
     }
 
@@ -593,7 +641,7 @@ impl Connection {
                 if all_closed(&handlers) {
                     continue;
                 }
-                delay_queue.push_back((Instant::now() + self.extra_latency, data, handlers));
+                delay_queue.push_back((self.scheduled_release(), data, handlers));
             }
 
             let due = async {

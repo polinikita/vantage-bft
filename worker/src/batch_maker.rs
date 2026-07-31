@@ -9,7 +9,7 @@ use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, BlipGate, SimpleSender};
 use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
@@ -92,6 +92,11 @@ impl BatchMaker {
         // current behavior). Applied to worker-to-worker batch broadcast, the
         // dominant bandwidth path a WAN-shaped run previously left undelayed.
         latency_map: HashMap<SocketAddr, Duration>,
+        // Transient network-level "blip" fault injector: this authority's own gate
+        // (same contract/construction as `latency_map`'s -- resolved once by
+        // `Worker::spawn`). Applied to worker-to-worker batch broadcast, the same
+        // dominant path `latency_map` above already covers.
+        blip_gate: Option<Arc<BlipGate>>,
         // METRICS-DASHBOARD-SPEC.md §1/§2: appended last, same convention as
         // primary-side `::spawn` functions.
         metrics: Arc<Metrics>,
@@ -115,6 +120,7 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: SimpleSender::new()
                     .with_latency(latency_map)
+                    .with_blip(blip_gate)
                     .with_metrics(metrics.clone())
                     .with_compression(compress_network)
                     .with_batching(batch),

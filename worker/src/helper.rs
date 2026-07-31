@@ -4,7 +4,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, BlipGate, SimpleSender};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,6 +45,10 @@ impl Helper {
         // batch-request replies to other workers, previously undelayed even under a
         // WAN-shaped run.
         latency_map: HashMap<SocketAddr, Duration>,
+        // Transient network-level "blip" fault injector: this authority's own gate
+        // (same contract/construction as `BatchMaker::spawn`'s -- see its doc
+        // comment). Applied to this worker's batch-request replies to other workers.
+        blip_gate: Option<Arc<BlipGate>>,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as primary-side
         // `::spawn` functions.
         metrics: Arc<Metrics>,
@@ -61,6 +65,7 @@ impl Helper {
                 rx_request,
                 network: SimpleSender::new()
                     .with_latency(latency_map)
+                    .with_blip(blip_gate)
                     .with_metrics(metrics)
                     .with_compression(compress_network)
                     .with_batching(batch),

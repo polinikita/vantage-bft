@@ -10,7 +10,7 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PairwiseKeys, PublicKey};
 use log::{error, info, warn};
 use metrics::{start_prometheus_server, MetricReporter, Metrics};
-use network::{BatchConfig, MessageHandler, Receiver, Writer};
+use network::{BatchConfig, BlipGate, MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,14 @@ pub struct Worker {
     /// (`BatchMaker`, `Synchronizer`, `Helper`), which previously ran at zero
     /// injected delay even under a WAN-shaped run.
     latency_map: HashMap<SocketAddr, Duration>,
+    /// Transient network-level "blip" fault injector (`Parameters::blip_node_index`),
+    /// resolved once at spawn time (same convention as `latency_map` above) via
+    /// `config::blip_targets` + `Parameters::blip_window`. `None` -- the default, and
+    /// always the case when `--blip-at` isn't given -- means every worker-to-worker/
+    /// worker-to-primary-reply sender this worker spawns never checks the blip
+    /// window. Threaded into every `SimpleSender` this worker spawns (`BatchMaker`,
+    /// `Synchronizer`, `Helper`), same convention as `latency_map`.
+    blip_gate: Option<Arc<BlipGate>>,
     /// Data-plane withholding fault injector (`Parameters::withhold_senders`),
     /// resolved once at spawn time (same convention as `latency_map` above) via
     /// `config::withheld_destinations`. `None` -- the default, and always the case
@@ -135,6 +143,13 @@ impl Worker {
         let withheld_destinations =
             config::withheld_destinations(&committee, &name, parameters.withhold_senders);
 
+        // Transient network-level "blip" fault injector: resolved once, same
+        // convention as `latency_map` above.
+        let blip_gate = parameters.blip_window.clone().and_then(|window| {
+            config::blip_targets(&committee, &name, parameters.blip_node_index)
+                .map(|targets| Arc::new(BlipGate::new(targets, window)))
+        });
+
         // Resolved once, same convention as `latency_map` above.
         let batch = BatchConfig {
             enabled: parameters.batch_messages,
@@ -165,6 +180,7 @@ impl Worker {
             store,
             metrics: metrics.clone(),
             latency_map,
+            blip_gate,
             withheld_destinations,
             batch,
             channel_auth,
@@ -248,6 +264,7 @@ impl Worker {
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
             self.latency_map.clone(),
+            self.blip_gate.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
             self.batch,
@@ -329,6 +346,7 @@ impl Worker {
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
             self.latency_map.clone(),
+            self.blip_gate.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
             self.batch,
@@ -399,6 +417,7 @@ impl Worker {
             /* rx_request */
             rx_helper, //receiver channel to connect to WorkerReceiverHandler
             self.latency_map.clone(),
+            self.blip_gate.clone(),
             self.metrics.clone(),
             self.parameters.compress_network,
             self.batch,

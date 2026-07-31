@@ -540,6 +540,14 @@ impl SimpleItCore {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
+        // Transient network-level "blip" fault injector (`--blip-at`): resolved once,
+        // same convention as `latency_map` just above -- see `vantage::node::
+        // VantageCore::build`'s identical treatment for the exact reasoning.
+        let blip_gate = parameters.blip_window.clone().and_then(|window| {
+            config::blip_targets(&committee, &name, parameters.blip_node_index)
+                .map(|targets| Arc::new(network::BlipGate::new(targets, window)))
+        });
+
         let batch = BatchConfig {
             enabled: parameters.batch_messages,
             max_bytes: parameters.batch_max_bytes,
@@ -558,6 +566,7 @@ impl SimpleItCore {
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
+                        .with_blip(blip_gate.clone())
                         .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {
@@ -568,6 +577,7 @@ impl SimpleItCore {
                 worker_network: {
                     let mut s = SimpleSender::new()
                         .with_latency(latency_map)
+                        .with_blip(blip_gate)
                         .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {

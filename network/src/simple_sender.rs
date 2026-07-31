@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch::{sleep_until_or_pending, BatchConfig, Coalescer};
+use crate::blip::BlipGate;
 use crate::error::NetworkError;
 use crate::reliable_sender::record_typed_sent;
 use bytes::Bytes;
@@ -33,6 +34,9 @@ pub struct SimpleSender {
     /// latency, empty by default (current behavior, byte-identical). See
     /// `network/src/lib.rs`'s module doc for the injection point/semantics.
     latency: HashMap<SocketAddr, Duration>,
+    /// Transient network-level "blip" fault injector, same contract as
+    /// `ReliableSender::blip` -- attached via `with_blip`, `None` by default.
+    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::metrics`.
     metrics: Option<Arc<Metrics>>,
     /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::compress`.
@@ -53,6 +57,7 @@ impl SimpleSender {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
             latency: HashMap::new(),
+            blip: None,
             metrics: None,
             compress: false,
             batch: BatchConfig::default(),
@@ -64,6 +69,12 @@ impl SimpleSender {
     /// call BEFORE any connection to an address in the map is spawned.
     pub fn with_latency(mut self, map: HashMap<SocketAddr, Duration>) -> Self {
         self.latency = map;
+        self
+    }
+
+    /// Attach a blip gate (same contract as `ReliableSender::with_blip`).
+    pub fn with_blip(mut self, gate: Option<Arc<BlipGate>>) -> Self {
+        self.blip = gate;
         self
     }
 
@@ -90,10 +101,14 @@ impl SimpleSender {
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(1_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
+        // Resolved ONCE here (mirrors `extra_latency` just above), not per-message --
+        // see `ReliableSender::spawn_connection`'s identical comment.
+        let blip = self.blip.clone().filter(|gate| gate.targets(&address));
         Connection::spawn(
             address,
             rx,
             extra_latency,
+            blip,
             self.metrics.clone(),
             self.compress,
             self.batch,
@@ -180,6 +195,10 @@ struct Connection {
     /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): this connection's own fixed
     /// artificial one-way delay to `address` (`Duration::ZERO` = off, the default).
     extra_latency: Duration,
+    /// Transient network-level "blip" fault injector: same contract as
+    /// `ReliableSender::Connection::blip` -- resolved once at spawn time via
+    /// `SimpleSender::spawn_connection`'s own `BlipGate::targets` check.
+    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::Connection::metrics`.
     metrics: Option<Arc<Metrics>>,
     /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::Connection::compress`.
@@ -193,6 +212,7 @@ impl Connection {
         address: SocketAddr,
         receiver: Receiver<Bytes>,
         extra_latency: Duration,
+        blip: Option<Arc<BlipGate>>,
         metrics: Option<Arc<Metrics>>,
         compress: bool,
         batch: BatchConfig,
@@ -202,6 +222,7 @@ impl Connection {
                 address,
                 receiver,
                 extra_latency,
+                blip,
                 metrics,
                 compress,
                 batch,
@@ -236,12 +257,25 @@ impl Connection {
     /// audit item 6: dispatches to one of two loops depending on whether a
     /// per-destination latency is actually configured -- mirrors `ReliableSender::
     /// keep_alive`'s existing `extra_latency.is_zero()` split (`keep_alive_immediate`
-    /// vs. `keep_alive_delayed`).
+    /// vs. `keep_alive_delayed`). `self.blip.is_none()` extends that split the same
+    /// way `ReliableSender::keep_alive`'s does -- see its doc comment.
     async fn run(&mut self) {
-        if self.extra_latency.is_zero() {
+        if self.extra_latency.is_zero() && self.blip.is_none() {
             self.run_immediate().await
         } else {
             self.run_delayed().await
+        }
+    }
+
+    /// The release instant for a message being scheduled right now -- same contract
+    /// as `ReliableSender::Connection::scheduled_release` (see its doc comment for
+    /// the ordering-preservation argument, which applies identically here: every
+    /// call site below runs inside this same connection's single sequential task).
+    fn scheduled_release(&self) -> tokio::time::Instant {
+        let natural_release = tokio::time::Instant::now() + self.extra_latency;
+        match &self.blip {
+            Some(gate) => gate.clamp(natural_release),
+            None => natural_release,
         }
     }
 
@@ -396,7 +430,7 @@ impl Connection {
                 () = coalesce_due, if self.batch.enabled && !coalescer.is_empty() => {
                     let (bundle, _) = coalescer.flush();
                     coalesce_deadline = None;
-                    delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, bundle));
+                    delay_queue.push_back((self.scheduled_release(), bundle));
                 },
                 Some(data) = self.receiver.recv() => {
                     if self.batch.enabled {
@@ -406,10 +440,10 @@ impl Connection {
                         if coalescer.over_cap(self.batch.max_bytes) {
                             let (bundle, _) = coalescer.flush();
                             coalesce_deadline = None;
-                            delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, bundle));
+                            delay_queue.push_back((self.scheduled_release(), bundle));
                         }
                     } else {
-                        delay_queue.push_back((tokio::time::Instant::now() + self.extra_latency, data));
+                        delay_queue.push_back((self.scheduled_release(), data));
                     }
                 },
                 response = reader.next() => {

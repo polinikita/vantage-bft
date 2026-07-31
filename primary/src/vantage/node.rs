@@ -629,6 +629,16 @@ impl VantageCore {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
+        // Transient network-level "blip" fault injector (`--blip-at`): resolved once,
+        // same convention as `latency_map` just above -- `None` (the default, and
+        // always the case when `--blip-at` isn't given, or `Parameters::blip_window`
+        // was never armed -- e.g. the distributed `node run` path) means both senders
+        // below never even check the blip window.
+        let blip_gate = parameters.blip_window.clone().and_then(|window| {
+            config::blip_targets(&committee, &name, parameters.blip_node_index)
+                .map(|targets| Arc::new(network::BlipGate::new(targets, window)))
+        });
+
         // Transport-level batching, resolved once (mirrors `latency_map`/
         // `compress_network`'s own resolve-once-at-spawn convention).
         let batch = BatchConfig {
@@ -655,6 +665,7 @@ impl VantageCore {
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
+                        .with_blip(blip_gate.clone())
                         .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {
@@ -665,6 +676,7 @@ impl VantageCore {
                 worker_network: {
                     let mut s = SimpleSender::new()
                         .with_latency(latency_map)
+                        .with_blip(blip_gate)
                         .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {
