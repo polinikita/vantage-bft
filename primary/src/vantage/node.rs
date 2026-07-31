@@ -1139,6 +1139,13 @@ impl VantageCore {
         metrics
             .vantage_entered_view
             .set(self.pacemaker.entered_view() as i64);
+        metrics
+            .vantage_own_watermark
+            .set(self.pacemaker.own_watermark() as i64);
+        metrics
+            .vantage_entry_target
+            .set(self.pacemaker.entry_target() as i64);
+        metrics.vantage_omega_q.set(self.pacemaker.omega_q() as i64);
         metrics.vantage_frontier_a_i.set(self.frontier.a_i() as i64);
         metrics
             .vantage_cursor_next_view

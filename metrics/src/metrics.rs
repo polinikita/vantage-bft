@@ -253,6 +253,12 @@ pub struct Metrics {
     // cursor vs. the resolution control-log's round/log-consumption position.
     /// `Pacemaker::entered_view` -- the largest view this party has formally entered (W5).
     pub vantage_entered_view: IntGauge,
+    /// `Pacemaker::own_watermark` -- this party's own current wish.
+    pub vantage_own_watermark: IntGauge,
+    /// `Pacemaker::entry_target` -- the entry target `advance_entry_target` last set.
+    pub vantage_entry_target: IntGauge,
+    /// `Pacemaker::omega_q` -- the (2f+1)-party wish statistic driving entry.
+    pub vantage_omega_q: IntGauge,
     /// `Frontier::a_i` -- the responsive proposal frontier.
     pub vantage_frontier_a_i: IntGauge,
     /// `Cursor::next_view` -- the lowest view the output cursor has not yet advanced past.
@@ -697,6 +703,24 @@ impl Metrics {
             vantage_entered_view: register_int_gauge_with_registry!(
                 "vantage_entered_view",
                 "Pacemaker: largest view formally entered (W5)",
+                registry,
+            )
+            .unwrap(),
+            vantage_own_watermark: register_int_gauge_with_registry!(
+                "vantage_own_watermark",
+                "Pacemaker: this party's own current wish",
+                registry,
+            )
+            .unwrap(),
+            vantage_entry_target: register_int_gauge_with_registry!(
+                "vantage_entry_target",
+                "Pacemaker: current entry target",
+                registry,
+            )
+            .unwrap(),
+            vantage_omega_q: register_int_gauge_with_registry!(
+                "vantage_omega_q",
+                "Pacemaker: (2f+1)-party wish statistic omega_q",
                 registry,
             )
             .unwrap(),

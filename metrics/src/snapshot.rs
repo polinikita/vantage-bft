@@ -195,6 +195,9 @@ pub struct VantageProgress {
     pub control_round: i64,
     pub control_delivered_len: i64,
     pub control_consume_pos: i64,
+    pub own_watermark: i64,
+    pub entry_target: i64,
+    pub omega_q: i64,
 }
 
 /// Reads the six Finding-A progress gauges. These `IntGauge`s are always registered
@@ -219,6 +222,9 @@ pub fn read_vantage_progress(registry: &Registry) -> Option<VantageProgress> {
         control_round: gauge("vantage_control_round")?,
         control_delivered_len: gauge("vantage_control_delivered_len")?,
         control_consume_pos: gauge("vantage_control_consume_pos")?,
+        own_watermark: gauge("vantage_own_watermark").unwrap_or(0),
+        entry_target: gauge("vantage_entry_target").unwrap_or(0),
+        omega_q: gauge("vantage_omega_q").unwrap_or(0),
     })
 }
 

@@ -76,6 +76,14 @@ impl Pacemaker {
         self.kth_largest(self.f_plus_1_parties)
     }
 
+    /// Metrics-only accessor: the current `2f+1`-party wish statistic `omega_q` --
+    /// exactly the value `advance_entry_target` is driven by, recomputed fresh like
+    /// `omega_plus` above. Exported so the `--timeline` progress table can show WHY a
+    /// node's entry target is (or is not) advancing.
+    pub fn omega_q(&self) -> View {
+        self.kth_largest(self.two_f_plus_1_parties)
+    }
+
     /// PHASE7-PREP-NOTES.md Finding A: metrics-only accessor -- the largest view this
     /// party has itself formally entered (W5). Distinct from the `#[cfg(test)]`
     /// accessor below only in that production code (the 1s progress-gauge sampler)
