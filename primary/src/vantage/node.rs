@@ -691,6 +691,7 @@ impl VantageCore {
                 other_primary_addrs,
                 worker_addresses,
                 withheld_header_dests,
+                withhold_window: parameters.withhold_window.clone(),
                 metrics: core_metrics.clone(),
             },
             header_size: parameters.header_size,

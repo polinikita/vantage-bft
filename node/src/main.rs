@@ -233,6 +233,30 @@ async fn main() -> Result<()> {
                         ),
                 )
                 .arg(
+                    Arg::new("withhold-at")
+                        .long("withhold-at")
+                        .value_name("SEC")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Time-windows --withhold: offset from measurement start, in \
+                        seconds, when withholding begins. Absent (default): whole-run \
+                        withholding, byte-identical to --withhold's original (unwindowed) \
+                        behavior. Requires --withhold > 0. --withhold-for selects the window \
+                        duration; --timeline is auto-enabled whenever this is set.",
+                        ),
+                )
+                .arg(
+                    Arg::new("withhold-for")
+                        .long("withhold-for")
+                        .value_name("SEC")
+                        .default_value("30")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Withholding window duration, in seconds. Irrelevant unless \
+                        --withhold-at is set.",
+                        ),
+                )
+                .arg(
                     Arg::new("delta-ms")
                         .long("delta-ms")
                         .value_name("INT")

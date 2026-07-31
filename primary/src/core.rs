@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 //use std::task::Poll;
 use std::cmp::max;
@@ -97,6 +97,13 @@ pub struct Core {
     /// as before. `Some(blocked)` means this node IS a withholding sender -- its own
     /// header-broadcast address list excludes every peer in `blocked`.
     withheld_header_dests: Option<HashSet<PublicKey>>,
+    /// Data-plane withholding fault injector, TIME-WINDOWED variant
+    /// (`Parameters::withhold_window`), resolved once by the caller (`Primary::
+    /// spawn`, a plain clone of `parameters.withhold_window`) -- same
+    /// resolved-by-caller convention as `withheld_header_dests` just above. Consulted
+    /// (via `config::withhold_active`) once per header in `process_own_header`, ONLY
+    /// when `withheld_header_dests` is `Some` -- see that method's own comment.
+    withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     /// METRICS-DASHBOARD-SPEC.md §3 addendum: this node's own metrics handle, kept
     /// (not just handed to `network`'s `with_metrics` below) so `process_own_header`
     /// can observe `proposed_header_size_bytes` at the same publish point Vantage's
@@ -239,6 +246,11 @@ impl Core {
         // pair post-move). Appended immediately after `latency_map` to keep every
         // resolved-once-at-spawn value grouped together.
         withheld_header_dests: Option<HashSet<PublicKey>>,
+        // Data-plane withholding fault injector, time-windowed variant: resolved once
+        // by the caller (`Primary::spawn`, a plain clone of `parameters.
+        // withhold_window`) -- appended immediately after `withheld_header_dests`,
+        // same "keep every resolved-once-at-spawn value grouped together" reasoning.
+        withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
         // Transient network-level "blip" fault injector (`--blip-at`): resolved once
         // by the caller (`Primary::spawn`, via `config::blip_targets` +
         // `Parameters::blip_window`) -- same resolved-by-caller convention as
@@ -288,6 +300,7 @@ impl Core {
                     .with_compression(compress_network)
                     .with_batching(batch),
                 withheld_header_dests,
+                withhold_window,
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 already_proposed_slots: HashSet::new(),
@@ -413,7 +426,14 @@ impl Core {
         // Broadcast the new header in a reliable manner. Data-plane withholding fault
         // injector: `withheld_header_dests` is `None` unless THIS node is a
         // withholding sender (`--withhold`), so the `is_none_or` below is a single
-        // cheap branch -- no allocation, no perturbation -- on the default path.
+        // cheap branch -- no allocation, no perturbation -- on the default path. When
+        // it IS `Some`, whether the filter actually excludes anyone additionally
+        // depends on `withhold_window` (`--withhold-at`/`--withhold-for`) -- see
+        // `config::withhold_active`'s own doc comment. `--withhold` without
+        // `--withhold-at` (`withhold_window: None`) is always active, so this
+        // reproduces c35fc4a's original whole-run filtering exactly.
+        let withhold_active =
+            config::withhold_active(self.withhold_window.as_deref(), Instant::now());
         let addresses = self
             .committee
             .others_primaries(&self.name)
@@ -421,7 +441,7 @@ impl Core {
             .filter(|(pk, _)| {
                 self.withheld_header_dests
                     .as_ref()
-                    .is_none_or(|blocked| !blocked.contains(pk))
+                    .is_none_or(|blocked| !withhold_active || !blocked.contains(pk))
             })
             .map(|(_, x)| x.primary_to_primary)
             .collect();

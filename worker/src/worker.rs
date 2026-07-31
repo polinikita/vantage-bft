@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 
@@ -86,6 +86,18 @@ pub struct Worker {
     /// at the same point it's otherwise constructed -- `BatchMaker` itself never sees
     /// this field, and its own broadcast in `seal` is completely unchanged either way.
     withheld_destinations: Option<HashSet<PublicKey>>,
+    /// Data-plane withholding fault injector, TIME-WINDOWED variant
+    /// (`Parameters::withhold_window`): the shared, in-process "has the window opened
+    /// yet" cell, cloned straight from `parameters` (same convention as `blip_gate`'s
+    /// own `parameters.blip_window.clone()` above -- no `config::` resolution needed
+    /// here, unlike `withheld_destinations`, since this cell doesn't depend on OUR OWN
+    /// committee position at all). Threaded through to `BatchMaker::spawn`, which
+    /// consults it (via `config::withhold_active`) once per seal to decide whether
+    /// `withheld_destinations`' filter is currently active -- see `handle_clients_
+    /// transactions`'s own comment at that call site. `None` whenever `--withhold-at`
+    /// isn't given (including whenever `withheld_destinations` itself is already
+    /// `None`), in which case `BatchMaker` never even looks at it.
+    withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     /// Transport-level batching config, resolved once at spawn time from
     /// `parameters.batch_{messages,max_bytes,max_delay_ms}` (mirrors `latency_map`'s
     /// own resolve-once-at-spawn convention). Threaded into every worker-to-worker/
@@ -143,6 +155,11 @@ impl Worker {
         let withheld_destinations =
             config::withheld_destinations(&committee, &name, parameters.withhold_senders);
 
+        // Data-plane withholding fault injector, time-windowed variant: just a clone
+        // of the shared cell (no `config::` resolution needed -- see this field's own
+        // doc comment on `Worker`).
+        let withhold_window = parameters.withhold_window.clone();
+
         // Transient network-level "blip" fault injector: resolved once, same
         // convention as `latency_map` above.
         let blip_gate = parameters.blip_window.clone().and_then(|window| {
@@ -182,6 +199,7 @@ impl Worker {
             latency_map,
             blip_gate,
             withheld_destinations,
+            withhold_window,
             batch,
             channel_auth,
         };
@@ -319,6 +337,30 @@ impl Worker {
             false,
         );
 
+        // Data-plane withholding fault injector, time-windowed variant: `BatchMaker`
+        // now makes the filtered-vs-full choice PER SEAL (time-windowed withholding
+        // can turn on/off mid-run, unlike c35fc4a's original whole-run filter), so
+        // BOTH the full and the filtered address list must be resolved here --
+        // `full_workers_addresses` is exactly `workers_addresses`' old (unfiltered)
+        // construction; `withheld_workers_addresses` is `None` unless THIS authority
+        // is a withholding sender at all (`--withhold`), in which case `BatchMaker::
+        // seal` never even consults `self.withhold_window` -- one cheap `match`
+        // discriminant, no allocation, no perturbation, on that default path.
+        let full_workers_addresses: Vec<(PublicKey, SocketAddr)> = self
+            .committee
+            .others_workers(&self.name, &self.id)
+            .iter()
+            .map(|(name, addresses)| (*name, addresses.worker_to_worker))
+            .collect();
+        let withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>> =
+            self.withheld_destinations.as_ref().map(|blocked| {
+                full_workers_addresses
+                    .iter()
+                    .filter(|(name, _)| !blocked.contains(name))
+                    .copied()
+                    .collect()
+            });
+
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
         // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
         // gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
@@ -330,21 +372,9 @@ impl Worker {
             // tx_message tx_quorum_waiter,   //sender channel to connect to quorum waiter
             /* tx_batch */
             tx_processor, //sender channel to connect to processor
-            /* workers_addresses */
-            // Data-plane withholding fault injector: `withheld_destinations` is `None`
-            // unless THIS authority is a withholding sender (`--withhold`), so the
-            // `is_none_or` below is a single cheap branch -- no allocation, no
-            // perturbation -- on the default path.
-            self.committee
-                .others_workers(&self.name, &self.id)
-                .iter()
-                .filter(|(name, _)| {
-                    self.withheld_destinations
-                        .as_ref()
-                        .is_none_or(|blocked| !blocked.contains(name))
-                })
-                .map(|(name, addresses)| (*name, addresses.worker_to_worker))
-                .collect(),
+            /* workers_addresses */ full_workers_addresses,
+            /* withheld_workers_addresses */ withheld_workers_addresses,
+            /* withhold_window */ self.withhold_window.clone(),
             self.latency_map.clone(),
             self.blip_gate.clone(),
             self.metrics.clone(),

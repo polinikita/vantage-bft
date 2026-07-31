@@ -16,7 +16,8 @@ use metrics::Metrics;
 use network::{CancelHandler, ReliableSender, SimpleSender};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tokio::sync::oneshot::error::TryRecvError;
 
 /// SECURITY (Fable audit): a message's wire-declared (or positionally-attributed)
@@ -152,6 +153,17 @@ pub struct Wire {
     /// `other_primaries`/`other_primary_addrs` unfiltered, regardless of this field.
     pub(crate) withheld_header_dests: WithheldHeaderDests,
 
+    /// Data-plane withholding fault injector, TIME-WINDOWED variant
+    /// (`Parameters::withhold_window`): the shared, in-process "has the window opened
+    /// yet" cell, cloned straight from `parameters` at construction (`VantageCore::
+    /// build`/`SimpleItCore::build`) -- same `Arc`-clone convention as `network`'s own
+    /// `blip_gate`. Consulted (via `config::withhold_active`) in `broadcast_message`'s
+    /// `Header(_, false)` arm, ONLY when `withheld_header_dests` is `Some` -- see that
+    /// method's own comment. `None` whenever `--withhold-at` isn't given (including
+    /// whenever `withheld_header_dests` itself is already `None`), in which case it's
+    /// never even looked at.
+    pub(crate) withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
+
     /// Cloned from `VantageCore::metrics` at construction time (kept there too, for
     /// `sample_metrics`'s progress gauges) -- `broadcast_message` is the only wire
     /// method that observes a metric (`proposed_block_size_bytes`).
@@ -218,11 +230,20 @@ impl Wire {
             // true)` reply unicasts via `send_message`/`send_to`, never through here) --
             // `.clone()` on a `None` `Option` is a no-op, so a non-withholding node
             // (every node when `--withhold` is 0) falls straight through to the
-            // untouched `broadcast` call below with no extra allocation.
+            // untouched `broadcast` call below with no extra allocation. When this
+            // node IS a withholding sender, whether the filtered path is actually
+            // taken additionally depends on `withhold_window`
+            // (`--withhold-at`/`--withhold-for`, `config::withhold_active`) --
+            // active: filtered `broadcast_to`; inactive (including the unwindowed
+            // `None` case, which is always active -- see that fn's own doc comment):
+            // fall through to the untouched `broadcast` below, exactly as if this
+            // node were not withholding at all right now.
             if let Some((addrs, full)) = self.withheld_header_dests.clone() {
-                self.broadcast_to(bytes, msg_type, placeholder, addrs, full)
-                    .await;
-                return;
+                if config::withhold_active(self.withhold_window.as_deref(), Instant::now()) {
+                    self.broadcast_to(bytes, msg_type, placeholder, addrs, full)
+                        .await;
+                    return;
+                }
             }
         }
         self.broadcast(bytes, msg_type, placeholder).await;

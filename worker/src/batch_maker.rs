@@ -14,7 +14,7 @@ use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -42,8 +42,30 @@ pub struct BatchMaker {
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_batch: Sender<SerializedBatchMessage>, // channel to forward batch digest to processor in order for primary to propose.
 
-    /// The network addresses of the other workers that share our worker id.
+    /// The network addresses of the other workers that share our worker id. UNFILTERED
+    /// -- always the full set, regardless of `--withhold`/`--withhold-at` (see
+    /// `withheld_workers_addresses` below for the filtered variant `seal` picks
+    /// between). Renamed-in-place from c35fc4a's own field of the same name, which
+    /// held an ALREADY-FILTERED list baked in once at spawn -- time-windowed
+    /// withholding needs the choice made dynamically, per seal, instead.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
+    /// Data-plane withholding fault injector (`Parameters::withhold_senders`):
+    /// `workers_addresses` above, with this authority's own blocked half already
+    /// removed (`config::withheld_destinations`, resolved once by `Worker::spawn`).
+    /// `None` -- the default, and always the case when `--withhold` is 0 -- means this
+    /// authority is not a withholding sender at all: `seal`'s address list is built
+    /// exactly as it was before this field existed (one cheap `match` discriminant,
+    /// no allocation). `Some(filtered)` is used ONLY when `withhold_window` (below)
+    /// says withholding is currently ACTIVE -- see `seal`'s own comment.
+    withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
+    /// Data-plane withholding fault injector, TIME-WINDOWED variant
+    /// (`Parameters::withhold_window`): the shared, in-process "has the window opened
+    /// yet" cell (same `Arc`-clone convention as `BlipGate`'s own `window` field) --
+    /// consulted (via `config::withhold_active`) once per seal, ONLY when
+    /// `withheld_workers_addresses` is `Some` (see `seal`). `None` whenever
+    /// `withheld_workers_addresses` itself is already `None`, i.e. THIS authority
+    /// isn't a withholding sender at all -- irrelevant on that path.
+    withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
     /// Holds the current batch.
     current_batch: Batch,
     /// Holds the size of the current batch (in bytes).
@@ -85,6 +107,16 @@ impl BatchMaker {
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<SerializedBatchMessage>, // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        // Data-plane withholding fault injector: this authority's own filtered variant
+        // of `workers_addresses` above (resolved once by `Worker::spawn`'s own
+        // `handle_clients_transactions`, via `config::withheld_destinations`). `None`
+        // unless THIS authority is a withholding sender at all.
+        withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
+        // Data-plane withholding fault injector, time-windowed variant: this
+        // authority's own shared window cell (resolved once by `Worker::spawn`, a
+        // plain clone of `Parameters::withhold_window`). `None` whenever
+        // `--withhold-at` isn't given.
+        withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
         // Fable audit item 4 (WAN latency injection): this authority's own
         // per-destination artificial latency map (same contract as
         // `Core::spawn`/`vantage::node::VantageCore::spawn`'s `latency_map` --
@@ -116,6 +148,8 @@ impl BatchMaker {
                 //tx_message, //previously forwarded batch to Quorum_waiter; now skipping this step.
                 tx_batch,
                 workers_addresses,
+                withheld_workers_addresses,
+                withhold_window,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: SimpleSender::new()
@@ -253,7 +287,30 @@ impl BatchMaker {
 
         //NEW:
         //Best-effort broadcast only. Any failure is correlated with the primary operating this node (running on same machine)
-        let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+        // Data-plane withholding fault injector: `withheld_workers_addresses` is
+        // `None` unless THIS authority is a withholding sender at all (`--withhold`),
+        // so the guard on the `Some` arm below is never even evaluated on that
+        // (default) path -- one cheap `match` discriminant, no `Instant::now()` call,
+        // no perturbation. When it IS `Some`, the guard consults the shared window
+        // cell (`config::withhold_active`) to decide, per seal, whether withholding
+        // is currently ACTIVE -- `--withhold` without `--withhold-at`
+        // (`withhold_window: None`) is always active, reproducing c35fc4a's original
+        // whole-run behavior exactly.
+        let addresses: Vec<SocketAddr> = match &self.withheld_workers_addresses {
+            Some(filtered)
+                if config::withhold_active(
+                    self.withhold_window.as_deref(),
+                    std::time::Instant::now(),
+                ) =>
+            {
+                filtered.iter().map(|(_, addr)| *addr).collect()
+            }
+            _ => self
+                .workers_addresses
+                .iter()
+                .map(|(_, addr)| *addr)
+                .collect(),
+        };
         self.network
             .broadcast_typed(addresses, bytes.clone(), "Batch")
             .await;

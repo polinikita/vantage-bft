@@ -707,6 +707,10 @@ impl Primary {
                     // "doesn't otherwise take a `Parameters`" reasoning as
                     // `latency_map` just above.
                     config::withheld_destinations(&committee, &name, parameters.withhold_senders),
+                    // Data-plane withholding fault injector, time-windowed variant:
+                    // resolved once here, a plain clone of the shared cell (`None`
+                    // whenever `--withhold-at` isn't given).
+                    parameters.withhold_window.clone(),
                     // Transient network-level "blip" fault injector (`--blip-at`):
                     // resolved once here, same convention as `latency_map`/
                     // `withheld_destinations` just above -- `None` (the default, and

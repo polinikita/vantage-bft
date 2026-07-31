@@ -106,6 +106,10 @@ async fn process_header() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
+        None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
         None,
@@ -211,6 +215,10 @@ async fn process_header_missing_parent() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
         None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
@@ -319,6 +327,10 @@ async fn process_header_invalid_height() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
+        None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
         None,
@@ -419,6 +431,10 @@ async fn process_header_missing_payload() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
+        None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
         None,
@@ -516,6 +532,10 @@ async fn process_votes() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
         None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
@@ -636,6 +656,10 @@ async fn process_certificates() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
         None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
@@ -759,6 +783,10 @@ async fn process_prepare() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
         None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
@@ -914,6 +942,10 @@ async fn generate_confirm() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
         None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
@@ -1082,6 +1114,10 @@ async fn generate_commit() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
         None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
@@ -1303,6 +1339,10 @@ async fn generate_pipelined_prepare() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
+        None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
         None,
@@ -1488,6 +1528,10 @@ async fn local_timeout_view() {
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
         None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
+        None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).
         None,
@@ -1590,6 +1634,10 @@ async fn sync_missing_proposals() {
         HashMap::new(),
         // Data-plane withholding fault injector: `None` matches every other existing
         // test's expectations (byte-identical to no withholding).
+        None,
+        // Data-plane withholding fault injector, time-windowed variant: `None`
+        // matches every other existing test's expectations (whole-run mode
+        // whenever the (disabled, here) withholding filter above is `Some`).
         None,
         // Transient network-level "blip" fault injector: `None` matches every other
         // existing test's expectations (byte-identical to no blip).

@@ -433,6 +433,43 @@ pub struct Parameters {
     #[serde(default)]
     pub withhold_senders: usize,
 
+    /// Time-windows the data-plane withholding fault injector above (`node
+    /// local-benchmark --withhold-at`): offset from measurement start (ms) when
+    /// withholding begins. `None` (default, and the ONLY value reachable when
+    /// `--withhold-at` is absent) means WHOLE-RUN withholding -- `withhold_active`
+    /// (this crate) then returns `true` unconditionally for every withholding
+    /// sender's whole lifetime, reproducing c35fc4a's original (pre-window) behavior
+    /// exactly. `#[serde(default)]` keeps every pre-existing parameter file valid.
+    ///
+    /// Only ever populated by `node local-benchmark`'s CLI entry handler -- mirrors
+    /// `blip_at_ms`'s own doc comment (same "library code/`node run` never sets this"
+    /// scoping, for the identical reason).
+    #[serde(default)]
+    pub withhold_at_ms: Option<u64>,
+    /// Withholding window duration (ms). Only consulted when `withhold_at_ms` is
+    /// `Some`. `#[serde(default = "default_withhold_for_ms")]` (30_000 ms,
+    /// `--withhold-for`'s own CLI default) keeps every pre-existing parameter file
+    /// valid.
+    #[serde(default = "default_withhold_for_ms")]
+    pub withhold_for_ms: u64,
+    /// The shared, in-process "has the window opened yet" cell every withholding
+    /// sender's own filter site (`worker::BatchMaker::seal`, `primary::Core::
+    /// process_own_header`, `primary::vantage::wire::Wire::broadcast_message`)
+    /// consults via `withhold_active` (this crate) -- same `Arc`-shared-cell/
+    /// arm-once-at-measurement-start convention as `blip_window` below (see its own
+    /// doc comment); `node local-benchmark::run` arms both cells at the identical
+    /// point, right after `run_start` is captured. Stores `std::time::Instant` for
+    /// the identical "this crate never needs a `tokio` dependency" reason
+    /// `blip_window`'s own doc comment gives. `#[serde(skip)]` -- always `None`
+    /// immediately after `Parameters::default()`/`Parameters::import(..)`.
+    ///
+    /// `None` here makes `withhold_active` treat withholding as WHOLE-RUN (see that
+    /// fn's own doc comment) -- it does NOT disable withholding; disabling
+    /// withholding entirely is `withhold_senders: 0`'s job, a completely separate
+    /// knob this field never touches.
+    #[serde(skip)]
+    pub withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
+
     /// Transient network-level "blip" fault injector (`node local-benchmark --blip-at/
     /// --blip-for/--blip-node`): reproduces the Autobahn paper's (Giridharan et al.,
     /// SOSP'24, Figs. 1/7/8) blip experiment -- "we ... trigger a three second blip by
@@ -519,6 +556,12 @@ fn default_ack_watermark_period_ms() -> u64 {
 /// three-second blip.
 fn default_blip_for_ms() -> u64 {
     3_000
+}
+
+/// `Parameters::withhold_for_ms`'s own doc comment -- matches `--withhold-for`'s own
+/// CLI default.
+fn default_withhold_for_ms() -> u64 {
+    30_000
 }
 
 /// AWS region names for the 10-region RTT matrix below. Ported VERBATIM from
@@ -741,6 +784,9 @@ impl Default for Parameters {
             authenticate_channels: false,
             mac_secret: None,
             withhold_senders: 0,
+            withhold_at_ms: None,
+            withhold_for_ms: default_withhold_for_ms(),
+            withhold_window: None,
             blip_node_index: None,
             blip_at_ms: 0,
             blip_for_ms: default_blip_for_ms(),
@@ -850,11 +896,20 @@ impl Parameters {
             self.digest_statements
         );
         if self.withhold_senders > 0 {
-            info!(
-                "Data-plane withholding: first {} node(s) withhold payload dissemination \
-                 from a staggered half of the committee",
-                self.withhold_senders
-            );
+            match self.withhold_at_ms {
+                Some(at) => info!(
+                    "Data-plane withholding: first {} node(s) withhold payload dissemination \
+                     from a staggered half of the committee, active [{}, {}) ms after start",
+                    self.withhold_senders,
+                    at,
+                    at + self.withhold_for_ms
+                ),
+                None => info!(
+                    "Data-plane withholding: first {} node(s) withhold payload dissemination \
+                     from a staggered half of the committee",
+                    self.withhold_senders
+                ),
+            }
         }
         if let Some(idx) = self.blip_node_index {
             info!(
@@ -1282,6 +1337,41 @@ pub fn withheld_destinations(
     Some((1..=half).map(|offset| order[(i + offset) % n]).collect())
 }
 
+/// Data-plane withholding fault injector, TIME-WINDOWED variant (`node local-benchmark
+/// --withhold-at`/`--withhold-for`, `Parameters::withhold_at_ms`/`withhold_for_ms`/
+/// `withhold_window`): whether withholding is ACTIVE at instant `now`, i.e. whether a
+/// withholding sender's own `withheld_destinations` filter should actually be applied
+/// right now. `window` is `Parameters::withhold_window.as_deref()` -- the SAME shared,
+/// in-process "has the window opened yet" cell every withholding node's own filter
+/// site consults (mirrors `network::BlipGate::clamp`'s own `self.window.get()` check).
+///
+///   - `window` is `None` (`--withhold-at` was never given): WHOLE-RUN withholding,
+///     exactly c35fc4a's original behavior -- ALWAYS active. This is the only case
+///     reached when `--withhold-at` is absent, so a withholding sender with no window
+///     configured filters for the entire run, byte-identical to before this feature
+///     existed.
+///   - `window` is `Some(cell)` and UNARMED (`cell.get()` is `None`, i.e. `node
+///     local-benchmark::run` hasn't yet reached measurement start): NOT active -- the
+///     window's start-to-be is necessarily still in the future, so there is nothing to
+///     withhold from yet (same reasoning `network::BlipGate`'s own unarmed-cell case
+///     relies on for its no-op -- see that type's doc comment).
+///   - `window` is `Some(cell)` and ARMED (`Some((start, end))`): active iff `now` is
+///     in the half-open interval `[start, end)` -- same inclusive-start/exclusive-end
+///     boundary convention as `network::BlipGate::clamp`'s own window.
+///
+/// Callers consult this ONCE per send (never cached), the same convention `network::
+/// BlipGate::clamp` uses for its own per-message window check -- time-windowed
+/// withholding can turn on/off mid-run, unlike the spatial `withheld_destinations`
+/// filter (which is fixed for a node's whole lifetime and IS resolved once at spawn).
+pub fn withhold_active(window: Option<&OnceLock<(Instant, Instant)>>, now: Instant) -> bool {
+    match window {
+        None => true,
+        Some(cell) => cell
+            .get()
+            .is_some_and(|&(start, end)| now >= start && now < end),
+    }
+}
+
 /// Transient network-level "blip" fault injector (`node local-benchmark --blip-at/
 /// --blip-for/--blip-node`, `Parameters::blip_node_index`): reproduces the Autobahn
 /// paper's (Giridharan et al., SOSP'24, Figs. 1/7/8) blip experiment -- a transient
@@ -1469,6 +1559,46 @@ mod tests {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         assert!(withheld_destinations(&committee, &keypairs[2].name, 3).is_some());
         assert!(withheld_destinations(&committee, &keypairs[3].name, 3).is_none());
+    }
+
+    /// `withhold_active`: no window configured (`--withhold-at` absent) is ALWAYS
+    /// active, regardless of `now` -- whole-run withholding, matching c35fc4a's
+    /// original (pre-window) behavior exactly.
+    #[test]
+    fn withhold_active_no_window_is_always_active() {
+        let now = Instant::now();
+        assert!(withhold_active(None, now));
+        assert!(withhold_active(None, now + Duration::from_secs(1_000_000)));
+    }
+
+    /// A configured-but-UNARMED window (`node local-benchmark::run` hasn't yet
+    /// reached measurement start) is NOT active -- the window's start-to-be is
+    /// necessarily still in the future.
+    #[test]
+    fn withhold_active_configured_unarmed_is_inactive() {
+        let cell: OnceLock<(Instant, Instant)> = OnceLock::new();
+        assert!(!withhold_active(Some(&cell), Instant::now()));
+    }
+
+    /// An ARMED window is active strictly inside `[start, end)`, and inactive
+    /// everywhere else (before `start`, at/after `end`) -- the same half-open
+    /// boundary convention `network::BlipGate::clamp` uses for its own window.
+    #[test]
+    fn withhold_active_armed_inside_and_outside_window() {
+        let cell: OnceLock<(Instant, Instant)> = OnceLock::new();
+        let base = Instant::now();
+        let start = base + Duration::from_secs(10);
+        let end = base + Duration::from_secs(20);
+        cell.set((start, end)).unwrap();
+
+        assert!(!withhold_active(Some(&cell), base + Duration::from_secs(5))); // before
+        assert!(withhold_active(Some(&cell), start)); // at start (inclusive)
+        assert!(withhold_active(Some(&cell), base + Duration::from_secs(15))); // inside
+        assert!(!withhold_active(Some(&cell), end)); // at end (exclusive)
+        assert!(!withhold_active(
+            Some(&cell),
+            base + Duration::from_secs(25)
+        )); // after
     }
 
     /// `blip_targets`: the blipped node itself holds every OTHER authority's
