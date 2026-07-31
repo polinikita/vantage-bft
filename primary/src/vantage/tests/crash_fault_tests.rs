@@ -1,24 +1,24 @@
 // PHASE5-SPEC.md §4 -- crash-fault integration (in-proc, 4 engines, injected clocks):
 // kill proposer(v); confirm correct parties still formally enter v via wishes,
 // echo-skip at theta_E, no-ready at theta_R, and enter v+1 and beyond (lemma (a)'s
-// inductive step, observable); later views with live proposers still complete and seal
-// normally; the output cursor TRANSIENTLY blocks at the dead view (never advances past
-// it on its own, at the AGB layer alone).
+// inductive step, observable); later views with live proposers still complete and
+// seal normally.
 //
-// PHASE6-SPEC.md §9 gate amendment: updated. The transient block above was Phase 5's
-// own documented boundary (entry/wish liveness continues past a dead proposer, output
-// liveness did not, yet) -- Phase 6's resolver + control log + anchor adapter close it.
-// This test now drives that closure the rest of the way (the identical
-// `Resolver::decide` -> carrying-proposal -> control-log-anchor pipeline
-// `byzantine_tests.rs`'s scenario 1 exercises, since this crash-fault scenario is
-// exactly scenario 1's own setup) and asserts the cursor advances past the dead view --
-// i.e. the pre-resolver blocking behavior asserted above is NOT the final state; it is
-// superseded once resolution runs. Both checkpoints are kept in one test so the
-// "before" and "after" of this phase's fix are both visible in the same place.
-
+// PHASE6-SPEC.md §9 gate amendment / signature-free.tex 704fb29 (par:skip-seal,
+// cor:crash-skip): this test originally demonstrated a TWO-PHASE story for the dead
+// view -- the output cursor TRANSIENTLY blocks at it until Phase 6's resolver/
+// control-log/anchor adapter closes the gap via a manually-constructed carrying
+// proposal plus control-round advancement. The grounded post-ready skip vote
+// (unconditional protocol behavior, no flag) supersedes that second phase for this
+// EXACT scenario: n=4/f=1's 3 live parties are exactly Q=2f+1, so every live party's
+// own echo-skip quorum and own no-ready are already in place the instant theta_ready
+// fires -- the dead view seals gskip via the vote quorum immediately, with zero
+// control-log involvement, well before any carrying proposal could even be built.
+// Renamed and adapted accordingly; the now-unreachable manual anchor dance is
+// replaced by an explicit assertion that the resolver finds nothing left to justify.
 use super::common::*;
 use super::harness::{advance_time, boot, drain_local, run_to_quiescence, Node};
-use crate::vantage::agb::{Outcome, ResolutionEntry, ViewProposal};
+use crate::vantage::agb::Outcome;
 use crate::vantage::node::Inbound;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 const MAX_VIEWS: crate::primary::View = 8;
 
 #[tokio::test]
-async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_proceed() {
+async fn crash_fault_dead_proposer_view_seals_via_grounded_skip_vote() {
     let all = authors();
     let mut nodes: Vec<Node> = all
         .iter()
@@ -78,7 +78,9 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
     let entry_instant = now;
 
     // Advance to theta_E(2): no proposal ever arrived (`fixed` stays Unset forever)
-    // -- the absolute deadline must fire an echo-skip for every live party.
+    // -- the absolute deadline must fire an echo-skip for every live party. Own
+    // no-ready has not fired yet (theta_R > theta_E), so the vote gate cannot have
+    // fired either.
     advance_time(
         &mut nodes,
         &mut outbox,
@@ -89,13 +91,17 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
         assert_eq!(
             nodes[i].agb.sealed_for_test(dead_view),
             None,
-            "the dead view must never seal"
+            "the dead view must never seal before every live party's own no-ready exists"
         );
     }
 
     // Advance to theta_R(2): no ready quorum ever formed (only echo-skips were ever
     // counted, never a graded proposal echo) -- the absolute deadline fires a
-    // no-ready.
+    // no-ready. Every live party now has both its own durable no-ready AND a
+    // first-hand 2f+1 echo-skip quorum (from the theta_E step above), and no other
+    // resolution stance/terminal-outcome conjunct is in play -- the grounded skip
+    // vote fires within this same advance, and self+peer counting reaches the
+    // 2f+1 vote quorum within the same synchronous drain.
     advance_time(
         &mut nodes,
         &mut outbox,
@@ -105,11 +111,7 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
 
     // Lemma (a)'s inductive step, observable: entry continued past the dead view --
     // W3's amplification rides out on the very echo-skip/no-ready responses just
-    // emitted for view 2, so views beyond it must have been formally entered too
-    // (this is also the only way `try_propose` could ever fire again at all: the
-    // *true* well-formed contiguous prefix is permanently stuck at view 1, since view
-    // 2's proposal never arrives -- only W5(c)'s formal-entry floor can unblock R1 for
-    // view 3 and beyond).
+    // emitted for view 2, so views beyond it must have been formally entered too.
     for &i in &live {
         assert!(
             nodes[i].frontier.is_active(dead_view + 1),
@@ -118,43 +120,28 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
         );
     }
 
-    // Let the now-unblocked live-proposer views actually run their course.
-    run_to_quiescence(
-        &mut nodes,
-        &mut outbox,
-        entry_instant + theta_ready + Duration::from_millis(1),
-    )
-    .await;
-
-    // Later views with live proposers must complete and seal normally.
-    let mut any_live_view_sealed = false;
-    for v in (dead_view + 1)..=(dead_view + 3) {
-        if nodes[live[0]].agb.sealed_for_test(v).is_some() {
-            any_live_view_sealed = true;
-        }
-    }
-    assert!(
-        any_live_view_sealed,
-        "at least one live-proposer view beyond the dead one must seal at the AGB layer"
-    );
-
-    // The pre-resolver checkpoint (Phase 5's own documented boundary, kept here as the
-    // "before" half of this test): the output cursor is TRANSIENTLY blocked exactly at
-    // the dead view, even though later views sealed at the AGB layer above.
+    // par:skip-seal / cor:crash-skip: every live party has already sealed the dead
+    // view gskip via the grounded vote quorum, with NO control-log anchor involved.
     for &i in &live {
         assert_eq!(
-            nodes[i].cursor.next_view(),
-            dead_view,
-            "node {} cursor must be transiently blocked exactly at the dead view (pre-resolution)",
+            nodes[i].agb.sealed_for_test(dead_view),
+            Some(Outcome::Skip),
+            "node {} must have sealed gskip for the dead view via the grounded skip-vote quorum",
+            i
+        );
+        assert!(
+            !nodes[i].control.is_anchor_resolved(dead_view),
+            "node {} must NOT have anchored the dead view -- the vote quorum sealed it directly",
             i
         );
     }
 
-    // PHASE6-SPEC.md §9: drive the resolver -> anchor pipeline the rest of the way
-    // (identical to `byzantine_tests.rs`'s scenario 1, since this is the same setup).
-    // A later live proposer's recovery turn must carry `Skip(dead_view)` -- the only
-    // justified candidate, given the refusal census (echo-skip/no-ready) just
-    // established above.
+    // The legacy fallback is now unreachable for this scenario: a later recovery
+    // turn's resolver scan finds NOTHING left to justify for the dead view, since it
+    // is already sealed -- `Resolver::decide` returns `None` rather than
+    // `Some(Skip(dead_view))`. (The first call consumes the per-proposer data-only/
+    // recovery alternation bit, exactly as an ordinary proposer turn would; the
+    // second is the actual recovery-turn evaluation this assertion is about.)
     let carrying_view: crate::primary::View = 1000;
     let carrier_name = crate::vantage::agb::proposer(&test_committee(), carrying_view);
     let carrier_idx = live
@@ -166,72 +153,31 @@ async fn crash_fault_dead_proposer_view_blocks_output_but_entry_and_later_views_
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
         let control = &node.control;
-        // Consume the (initially data-only) next-turn bit first, exactly like
-        // `Node::try_propose_effects` would at this party's own proposer turn.
-        node.resolver
-            .decide(agb, carrying_view, entry_instant, |u| {
-                agb.is_sealed(u) || control.is_anchor_resolved(u)
-            });
-        node.resolver
-            .decide(agb, carrying_view, entry_instant, |u| {
-                agb.is_sealed(u) || control.is_anchor_resolved(u)
-            })
+        let resolved = |u: crate::primary::View| agb.is_sealed(u) || control.is_anchor_resolved(u);
+        node.resolver.decide(agb, carrying_view, entry_instant, resolved);
+        node.resolver.decide(agb, carrying_view, entry_instant, resolved)
     };
     assert_eq!(
-        m,
-        Some(ResolutionEntry::Skip(dead_view)),
-        "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate"
+        m, None,
+        "the dead view is already sealed via the vote quorum -- no carrying proposal is needed"
     );
 
-    let (author0, _) = all[0];
-    let c_ref = nodes[carrier_idx]
-        .lm
-        .c_candidate(&author0)
-        .expect("seeded C candidate");
-    let proposal = ViewProposal {
-        view: carrying_view,
-        c: vec![c_ref],
-        t: Vec::new(),
-        m,
-    };
+    // Let the now-unblocked live-proposer views actually run their course. The output
+    // cursor has ALREADY advanced past the dead view (via the vote-sealed skip) by
+    // this point -- no anchor was ever needed.
+    run_to_quiescence(
+        &mut nodes,
+        &mut outbox,
+        entry_instant + theta_ready + Duration::from_millis(1),
+    )
+    .await;
 
     for &i in &live {
-        let effects = nodes[i].enter_view_effects(carrying_view, entry_instant);
-        drain_local(&mut nodes, i, effects, entry_instant, &mut outbox);
-    }
-    run_to_quiescence(&mut nodes, &mut outbox, entry_instant).await;
-
-    for &i in &live {
-        outbox.push_back((
-            i,
-            Inbound::Propose(crate::vantage::agb::ProposalOut::Single(proposal.clone())),
-        ));
-    }
-    run_to_quiescence(&mut nodes, &mut outbox, entry_instant).await;
-
-    // Drive the control-round timer forward so a fresh round's leader picks up the
-    // now-submittable pair (see `byzantine_tests.rs`'s scenario 1 for the full
-    // reasoning -- the control round in flight when the report lands may already be
-    // stuck on a stale/`⊥` proposal until reliable-notification disables it).
-    let control_timeout = nodes[live[0]].control.control_round_timeout();
-    let mut ct = entry_instant;
-    for _ in 0..6 {
-        ct += control_timeout + Duration::from_millis(1);
-        advance_time(&mut nodes, &mut outbox, ct).await;
-        run_to_quiescence(&mut nodes, &mut outbox, ct).await;
-    }
-
-    // The post-resolution checkpoint (this phase's fix, the "after" half): every live
-    // node has sealed `gskip` for the dead view via the anchor, and the cursor has
-    // ADVANCED PAST it -- the pre-resolver blocking behavior asserted above is gone.
-    for &i in &live {
-        assert_eq!(
-            nodes[i].agb.sealed_for_test(dead_view),
-            Some(Outcome::Skip),
-            "node {} must have sealed gskip for the dead view via the anchor",
+        assert!(
+            nodes[i].cursor.next_view() > dead_view,
+            "node {} cursor must have advanced past the dead view via the vote-sealed skip",
             i
         );
-        assert!(nodes[i].cursor.next_view() > dead_view, "node {} cursor must have advanced past the dead view -- the pre-resolver block is gone", i);
     }
     let reference = nodes[live[0]].cursor.output_log().to_vec();
     for &i in &live[1..] {

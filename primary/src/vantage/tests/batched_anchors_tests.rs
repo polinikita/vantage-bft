@@ -1,27 +1,47 @@
-// PHASE7 (`Parameters::batched_anchors`, signature-free.tex's "Batched resolution
-// entries" paragraph) -- items 2-6 of the feature's required test list (item 1, the
-// flag-off byte-identity gate, is simply "every pre-existing test in this suite still
-// passes", verified by leaving them untouched).
+// signature-free.tex's "Batched resolution entries" paragraph, narrowed by the
+// 704fb29 audit (par:batched-anchors) to a skip-only, manifest-free vector -- "a
+// vector with a full or core entry is malformed; those outcomes use one general
+// entry". Unconditional protocol behavior (no flag): `Resolver::decide_prefix` is the
+// only recovery-turn entry point production wiring ever calls.
 //
 // `test_committee()` (n=4, f=1) can never exercise a genuine `k >= 2` batch --
 // `agb::batch_cap` floors the vector cap at `f`, which is 1 there. Every test below
 // therefore builds its own bigger committee (`Committee::local_benchmark`, n=7, f=2,
 // f+1=3, 2f+1=5, n-f=5 -- comfortably enough headroom for a real k=2 batch and its
 // surrounding quorums).
+//
+// Two tests from this file's PHASE7 original (`ready_guard_requires_f_plus_1_
+// origin_one_independently_per_position`, `ready_guard_skip_entries_pass_trivially_
+// alongside_a_gated_full_entry`) tested a full/core-carrying batch vector's
+// per-position `ReadyOK`/origin-vector machinery -- a shape `formed_batch` now
+// rejects outright (`ResolutionEntry::Full`/`Core` can never appear in a `Batch`
+// proposal's `m`), and `EchoBatch` no longer even has an origin field to construct
+// them with. Removed rather than adapted: there is no longer a well-formed vector to
+// build around a full/core coordinate, so the scenario they drove is unreachable.
+//
+// A third test (`e2e_batched_burst_resolved_by_one_carrier_output_matches_flag_off`,
+// plus its dedicated `boot_cluster_with_two_dead_adjacent_proposers` helper) compared
+// `Node::with_batched_anchors(true)` against `with_batched_anchors(false)` -- pure
+// flag-plumbing coverage that no longer applies now that `batched_anchors` and
+// `skip_votes` are both unconditional. It is also not adaptable into an equivalent
+// always-on test: with the grounded post-ready skip vote (par:skip-seal) also always
+// on, a clean 2-adjacent-crash burst with n-f=5=2f+1 live parties seals BOTH views via
+// the vote quorum before either ever reaches an unresolved state a batched CARRIER
+// could still attach to (cor:crash-skip) -- the anchor path this test specifically
+// exercised is unreachable for this exact scenario. Removed; the vote-based
+// equivalent is `skip_vote_tests.rs`'s integration test, and this file's remaining
+// `anchor_batch_application_resolves_two_targets_in_one_apply_and_ignores_a_later_
+// duplicate` test still directly covers batched anchor APPLICATION (bypassing AGB
+// entirely, so it is unaffected by the vote shortcut).
 
 use super::common::*;
-use super::harness::{advance_time, boot, drain_local, run_to_quiescence, Node};
-use crate::vantage::agb::{
-    self, AgbEngine, BatchViewProposal, EchoBatch, Outcome, ProposalOut, ResolutionEntry,
-};
+use crate::vantage::agb::{self, AgbEngine, BatchViewProposal, ProposalOut, ResolutionEntry};
 use crate::vantage::block;
 use crate::vantage::control::ControlLog;
-use crate::vantage::node::Inbound;
 use crate::vantage::resolve::Resolver;
 use crate::vantage::Effect;
 use config::Committee;
 use crypto::PublicKey;
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// A 7-party committee (f=2, f+1=3, 2f+1=5, n-f=5) -- `batch_cap` = 2, so a
@@ -51,7 +71,7 @@ fn make_skip_qualified(agb: &mut AgbEngine, name: PublicKey, u: crate::primary::
     agb.on_ready_timer(u);
 }
 
-// ============================================================ 2. Echo conjunction
+// ============================================================ Echo conjunction
 
 #[tokio::test]
 async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
@@ -123,110 +143,7 @@ async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
     }
 }
 
-// ============================================================ 3. Ready guard per position
-
-#[tokio::test]
-async fn ready_guard_requires_f_plus_1_origin_one_independently_per_position() {
-    let (committee, keys) = batch_committee(9310);
-    let self_name = keys[0].name;
-    let (mut agb, _lm, mut rep) = setup_engine(&committee, self_name, ".db_test_batch_ready_guard");
-    let senders: Vec<PublicKey> = keys.iter().map(|k| k.name).collect();
-
-    let proposal = BatchViewProposal {
-        view: 10,
-        c: Vec::new(),
-        t: Vec::new(),
-        m: vec![
-            ResolutionEntry::Full(1, Vec::new(), Vec::new()),
-            ResolutionEntry::Full(2, Vec::new(), Vec::new()),
-        ],
-    };
-
-    // 5 senders (== the n=7 stake quorum) all grade-1 -- position 0 gets a 1 from
-    // every one of them, position 1 gets a 1 from only 2 (< f+1=3). Both positions are
-    // non-skip, so `ReadyOK` must withhold the ready while position 1 lags.
-    for (i, &sender) in senders.iter().enumerate().take(5) {
-        let origin = if i < 2 {
-            vec![Some(1), Some(1)]
-        } else {
-            vec![Some(1), Some(0)]
-        };
-        let echo = EchoBatch {
-            proposal: proposal.clone(),
-            grade: 1,
-            sender,
-            wish: 0,
-            origin,
-        };
-        let effects = agb.on_echo_batch(echo, &mut rep);
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::BroadcastReady(_))),
-            "position 1 has fewer than f+1=3 origin-one echoes at sender #{i} -- ready must not fire"
-        );
-    }
-
-    // A 6th distinct sender also names origin=1 at position 1, bringing IT to f+1=3
-    // too -- now both positions clear the guard and the (already quorum-met) ready
-    // fires. Monotonicity check folded in: position 0's own count only ever grew.
-    let echo6 = EchoBatch {
-        proposal: proposal.clone(),
-        grade: 1,
-        sender: senders[5],
-        wish: 0,
-        origin: vec![Some(1), Some(1)],
-    };
-    let effects = agb.on_echo_batch(echo6, &mut rep);
-    assert!(
-        effects.iter().any(|e| matches!(e, Effect::BroadcastReady(_))),
-        "once BOTH positions independently reach f+1 origin-one echoes, the ready must fire"
-    );
-}
-
-#[tokio::test]
-async fn ready_guard_skip_entries_pass_trivially_alongside_a_gated_full_entry() {
-    // A companion to the test above: a Skip entry at one position must never itself
-    // gate the ready (§4's "skip entries ... pass as today"), even while the OTHER
-    // (Full) position is still below its own f+1 threshold.
-    let (committee, keys) = batch_committee(9320);
-    let self_name = keys[0].name;
-    let (mut agb, _lm, mut rep) = setup_engine(&committee, self_name, ".db_test_batch_ready_skip");
-    let senders: Vec<PublicKey> = keys.iter().map(|k| k.name).collect();
-
-    let proposal = BatchViewProposal {
-        view: 10,
-        c: Vec::new(),
-        t: Vec::new(),
-        m: vec![
-            ResolutionEntry::Full(1, Vec::new(), Vec::new()),
-            ResolutionEntry::Skip(2),
-        ],
-    };
-
-    // 5 senders reach quorum, but only 1 of them ever names origin=1 at position 0
-    // (well below f+1=3) -- position 1 is Skip, so its own origin bit is always
-    // `None`, yet the ready must still be withheld purely because of position 0.
-    for (i, &sender) in senders.iter().enumerate().take(5) {
-        let origin = if i == 0 {
-            vec![Some(1), None]
-        } else {
-            vec![Some(0), None]
-        };
-        let echo = EchoBatch {
-            proposal: proposal.clone(),
-            grade: 1,
-            sender,
-            wish: 0,
-            origin,
-        };
-        let effects = agb.on_echo_batch(echo, &mut rep);
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::BroadcastReady(_))),
-            "position 0 (Full) is still below f+1 -- the Skip at position 1 must not paper over it"
-        );
-    }
-}
-
-// ============================================================ 4. Anchor batch application
+// ============================================================ Anchor batch application
 
 #[tokio::test]
 async fn anchor_batch_application_resolves_two_targets_in_one_apply_and_ignores_a_later_duplicate() {
@@ -356,7 +273,7 @@ async fn anchor_batch_application_resolves_two_targets_in_one_apply_and_ignores_
     );
 }
 
-// ============================================================ 5. Alternation
+// ============================================================ Alternation
 
 #[tokio::test]
 async fn alternation_fixed_oldest_target_alternates_full_prefix_and_single_entry() {
@@ -398,245 +315,4 @@ async fn alternation_fixed_oldest_target_alternates_full_prefix_and_single_entry
     // never resolved), and the NEXT attempt would be full-prefix again (mirrors the
     // observed [.., 1] tail above -- one more flip due next).
     assert_eq!(resolver.alternation_state_for_test(), (Some(1), false));
-}
-
-// ============================================================ 6. End-to-end
-
-const E2E_MAX_VIEWS: crate::primary::View = 10;
-
-/// Shared setup for the end-to-end comparison below: an n=7 committee with 2 ADJACENT
-/// committee-order authorities crashed before boot, so their respective proposer
-/// turns land on two CONSECUTIVE views (round-robin over adjacent indices) -- the
-/// "burst of >= 2 consecutive views with silent proposers" the spec's test item asks
-/// for. Returns the live nodes' outbox-driven cluster already past both dead views'
-/// echo/no-ready deadlines (mirrors `crash_fault_tests.rs`'s single-dead-view setup,
-/// extended to two).
-async fn boot_cluster_with_two_dead_adjacent_proposers(
-    committee: &Committee,
-    keys: &[config::KeyPair],
-    db_prefix: &str,
-    batched_anchors: bool,
-) -> (Vec<Node>, VecDeque<(usize, Inbound)>, Instant, Vec<usize>, crate::primary::View) {
-    let mut nodes: Vec<Node> = keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| {
-            Node::new_with_committee(
-                k.name,
-                &format!("{}_{}", db_prefix, i),
-                E2E_MAX_VIEWS,
-                committee.clone(),
-            )
-            .with_batched_anchors(batched_anchors)
-        })
-        .collect();
-    let now = Instant::now();
-    let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
-
-    for i in 0..nodes.len() {
-        let (_, effects) = nodes[i].lm.publish_own(std::collections::BTreeMap::new()).await;
-        drain_local(&mut nodes, i, effects, now, &mut outbox);
-    }
-    run_to_quiescence(&mut nodes, &mut outbox, now).await;
-
-    // Committee-order indices 1 and 2 (adjacent) -> views (1+1)=2 and (2+1)=3 are
-    // BOTH dead and CONSECUTIVE (view v's proposer is committee-order index (v-1)%n).
-    let dead_view: crate::primary::View = 2;
-    let dead_names = [
-        agb::proposer(committee, dead_view),
-        agb::proposer(committee, dead_view + 1),
-    ];
-    assert_ne!(
-        dead_names[0], dead_names[1],
-        "two DISTINCT adjacent-index authorities must be dead for a 2-view burst"
-    );
-    for dead_name in dead_names {
-        let idx = nodes.iter().position(|n| n.name == dead_name).unwrap();
-        nodes[idx].alive = false;
-    }
-    let live: Vec<usize> = (0..nodes.len())
-        .filter(|&i| nodes[i].alive)
-        .collect();
-    assert_eq!(live.len(), 5, "n=7, f=2 -- exactly n-f=5 correct parties remain");
-
-    boot(&mut nodes, now, &mut outbox).await;
-    for &i in &live {
-        assert!(nodes[i].frontier.is_active(dead_view + 1));
-    }
-
-    let theta_echo = nodes[live[0]].agb.theta_echo();
-    let theta_ready = nodes[live[0]].agb.theta_ready();
-    advance_time(&mut nodes, &mut outbox, now + theta_echo + Duration::from_millis(1)).await;
-    advance_time(&mut nodes, &mut outbox, now + theta_ready + Duration::from_millis(1)).await;
-    run_to_quiescence(&mut nodes, &mut outbox, now + theta_ready + Duration::from_millis(1)).await;
-
-    for &i in &live {
-        assert!(
-            nodes[i].frontier.is_active(dead_view + 2),
-            "entry must have proceeded past the whole 2-view burst"
-        );
-    }
-
-    (nodes, outbox, now, live, dead_view)
-}
-
-#[tokio::test]
-async fn e2e_batched_burst_resolved_by_one_carrier_output_matches_flag_off() {
-    let (committee, keys) = batch_committee(9350);
-
-    // ---------------- Flag ON: one batched carrier resolves BOTH dead views ----------------
-    let (mut nodes_on, mut outbox_on, now_on, live_on, dead_view) =
-        boot_cluster_with_two_dead_adjacent_proposers(
-            &committee,
-            &keys,
-            ".db_test_e2e_batch_on",
-            true,
-        )
-        .await;
-
-    let carrying_view: crate::primary::View = 1000;
-    let carrier_name = agb::proposer(&committee, carrying_view);
-    let carrier_idx = live_on
-        .iter()
-        .find(|&&i| nodes_on[i].name == carrier_name)
-        .copied()
-        .expect("a live party must lead the carrying view");
-    let entries = {
-        let node = &mut nodes_on[carrier_idx];
-        let agb = &node.agb;
-        let control = &node.control;
-        let resolved = |u: crate::primary::View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-        node.resolver.decide_prefix(agb, carrying_view, now_on, resolved); // consume the data-only bit
-        node.resolver.decide_prefix(agb, carrying_view, now_on, resolved)
-    };
-    assert_eq!(
-        entries,
-        vec![
-            ResolutionEntry::Skip(dead_view),
-            ResolutionEntry::Skip(dead_view + 1)
-        ],
-        "one recovery turn must carry BOTH dead views -- the burst needs only ONE carrier \
-         (fewer anchor applications than the 2 unresolved views), not two"
-    );
-
-    let c_ref = nodes_on[carrier_idx]
-        .lm
-        .c_candidate(&keys[0].name)
-        .expect("seeded C candidate");
-    let batch_proposal = BatchViewProposal {
-        view: carrying_view,
-        c: vec![c_ref],
-        t: Vec::new(),
-        m: entries,
-    };
-
-    for &i in &live_on {
-        let effects = nodes_on[i].enter_view_effects(carrying_view, now_on);
-        drain_local(&mut nodes_on, i, effects, now_on, &mut outbox_on);
-    }
-    run_to_quiescence(&mut nodes_on, &mut outbox_on, now_on).await;
-    for &i in &live_on {
-        outbox_on.push_back((
-            i,
-            Inbound::Propose(ProposalOut::Batch(batch_proposal.clone())),
-        ));
-    }
-    run_to_quiescence(&mut nodes_on, &mut outbox_on, now_on).await;
-
-    let control_timeout = nodes_on[live_on[0]].control.control_round_timeout();
-    let mut ct = now_on;
-    for _ in 0..6 {
-        ct += control_timeout + Duration::from_millis(1);
-        advance_time(&mut nodes_on, &mut outbox_on, ct).await;
-        run_to_quiescence(&mut nodes_on, &mut outbox_on, ct).await;
-    }
-
-    for &i in &live_on {
-        assert_eq!(nodes_on[i].agb.sealed_for_test(dead_view), Some(Outcome::Skip));
-        assert_eq!(
-            nodes_on[i].agb.sealed_for_test(dead_view + 1),
-            Some(Outcome::Skip)
-        );
-        assert!(nodes_on[i].cursor.next_view() > dead_view + 1);
-    }
-    let output_on = nodes_on[live_on[0]].cursor.output_log().to_vec();
-    for &i in &live_on[1..] {
-        assert_eq!(nodes_on[i].cursor.output_log(), output_on.as_slice());
-    }
-
-    // ---------------- Flag OFF: the SAME burst, resolved via TWO single-entry carriers ----------------
-    let (mut nodes_off, mut outbox_off, now_off, live_off, dead_view_off) =
-        boot_cluster_with_two_dead_adjacent_proposers(
-            &committee,
-            &keys,
-            ".db_test_e2e_batch_off",
-            false,
-        )
-        .await;
-    assert_eq!(dead_view_off, dead_view, "identical crash pattern on both runs");
-
-    for (carrying_view, target) in [(1000u64, dead_view), (1001u64, dead_view + 1)] {
-        let carrier_name = agb::proposer(&committee, carrying_view);
-        let carrier_idx = live_off
-            .iter()
-            .find(|&&i| nodes_off[i].name == carrier_name)
-            .copied()
-            .expect("a live party must lead the carrying view");
-        let m = {
-            let node = &mut nodes_off[carrier_idx];
-            let agb = &node.agb;
-            let control = &node.control;
-            let resolved = |u: crate::primary::View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-            node.resolver.decide(agb, carrying_view, now_off, resolved);
-            node.resolver.decide(agb, carrying_view, now_off, resolved)
-        };
-        assert_eq!(m, Some(ResolutionEntry::Skip(target)));
-        let c_ref = nodes_off[carrier_idx]
-            .lm
-            .c_candidate(&keys[0].name)
-            .expect("seeded C candidate");
-        let proposal = crate::vantage::ViewProposal {
-            view: carrying_view,
-            c: vec![c_ref],
-            t: Vec::new(),
-            m,
-        };
-        for &i in &live_off {
-            let effects = nodes_off[i].enter_view_effects(carrying_view, now_off);
-            drain_local(&mut nodes_off, i, effects, now_off, &mut outbox_off);
-        }
-        run_to_quiescence(&mut nodes_off, &mut outbox_off, now_off).await;
-        for &i in &live_off {
-            outbox_off.push_back((i, Inbound::Propose(ProposalOut::Single(proposal.clone()))));
-        }
-        run_to_quiescence(&mut nodes_off, &mut outbox_off, now_off).await;
-
-        let control_timeout = nodes_off[live_off[0]].control.control_round_timeout();
-        let mut ct = now_off;
-        for _ in 0..6 {
-            ct += control_timeout + Duration::from_millis(1);
-            advance_time(&mut nodes_off, &mut outbox_off, ct).await;
-            run_to_quiescence(&mut nodes_off, &mut outbox_off, ct).await;
-        }
-    }
-
-    for &i in &live_off {
-        assert_eq!(nodes_off[i].agb.sealed_for_test(dead_view), Some(Outcome::Skip));
-        assert_eq!(
-            nodes_off[i].agb.sealed_for_test(dead_view + 1),
-            Some(Outcome::Skip)
-        );
-        assert!(nodes_off[i].cursor.next_view() > dead_view + 1);
-    }
-    let output_off = nodes_off[live_off[0]].cursor.output_log().to_vec();
-    for &i in &live_off[1..] {
-        assert_eq!(nodes_off[i].cursor.output_log(), output_off.as_slice());
-    }
-
-    // The headline comparison: identical committed output whether the burst rode in
-    // on one batched carrier (flag on) or two single-entry ones (flag off).
-    assert_eq!(
-        output_on, output_off,
-        "committed output must be identical regardless of how many carriers resolved the burst"
-    );
 }

@@ -45,7 +45,7 @@ pub struct Resolver {
     in_flight: BTreeMap<View, Instant>,
     /// 12Δ, per the coordinator's ruling (D7-1).
     expiry: Duration,
-    /// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries"): D7-2's
+    /// signature-free.tex's "Batched resolution entries" paragraph: D7-2's
     /// alternation state -- per FIXED oldest (first-qualifying) target, every OTHER
     /// recovery attempt must carry the single-entry vector (`k=1`), never the full
     /// prefix. Rationale: a batched proposal is refused whole if ANY coordinate is
@@ -205,22 +205,27 @@ impl Resolver {
         pick
     }
 
-    /// §4's full per-turn decision: scan unsealed/un-anchor-resolved views `u <= w-3`
-    /// ascending (`resolved` folds in both "sealed at the AGB layer" and, once §6
-    /// lands, "already anchor-resolved"), skipping any view whose justified set is
-    /// empty (never blocks a later target) OR whose D7-1 in-flight marker hasn't yet
-    /// expired (same "never blocks a later target" treatment). Returns `None` for a
-    /// data-only proposal (either no target qualifies at all -- bit left untouched --
-    /// or the bit selected data-only this turn at the first qualifying target, which
-    /// still flips the bit); `Some(entry)` for a recovery proposal targeting the first
-    /// qualifying view. `now` -- D7-1's in-flight age check and marker refresh.
-    pub fn decide(
+    /// §4's coordinate-1 core, shared by `decide` (which returns exactly this) and
+    /// `decide_prefix` (which may extend past it): scan unsealed/un-anchor-resolved
+    /// views `u <= w-3` ascending (`resolved` folds in both "sealed at the AGB layer"
+    /// and "already anchor-resolved"), skipping any view whose justified set is empty
+    /// (never blocks a later target) OR whose D7-1 in-flight marker hasn't yet
+    /// expired (same "never blocks a later target" treatment), until a genuinely
+    /// qualifying view is found. The data-only/recovery bit then decides (§4 step
+    /// 2/3): `None` for a data-only turn (either no target qualifies at all -- bit
+    /// left untouched -- or the bit selected data-only this turn at the first
+    /// qualifying target, which still flips the bit); otherwise the bit flips to
+    /// data-only for next time, `pick_and_advance` chooses this target's candidate by
+    /// its cyclic per-target pointer, and the target is marked in-flight immediately
+    /// (D7-1: our own attempt is itself in-flight evidence). `now` -- D7-1's
+    /// in-flight age check and marker refresh.
+    fn decide_head(
         &mut self,
         agb: &AgbEngine,
         w: View,
         now: Instant,
-        resolved: impl Fn(View) -> bool,
-    ) -> Option<ResolutionEntry> {
+        resolved: &impl Fn(View) -> bool,
+    ) -> Option<(View, ResolutionEntry)> {
         let scan_limit = w.saturating_sub(3);
         // Advance the watermark over the (possibly newly-grown) contiguous resolved
         // prefix before scanning -- sound by the monotonicity argument on the field
@@ -229,38 +234,59 @@ impl Resolver {
         while self.resolved_watermark <= scan_limit && resolved(self.resolved_watermark) {
             self.resolved_watermark += 1;
         }
-        for u in self.resolved_watermark..=scan_limit {
+        let mut u = self.resolved_watermark;
+        let (u1, candidates) = loop {
+            if u > scan_limit {
+                return None; // no target qualifies at all -- bit unchanged (§4 step 2)
+            }
             if resolved(u) {
+                u += 1;
                 continue;
             }
             let candidates = self.justified_candidates(agb, u);
             if candidates.is_empty() {
+                u += 1;
                 continue; // no-evidence view never blocks a later target
             }
             if self.is_in_flight(u, now) {
+                u += 1;
                 continue; // D7-1: suppressed, not yet expired -- never blocks a later target
             }
-            // A qualifying target was found -- the bit decides, then flips (§4 step 3).
-            if !self.next_is_recovery {
-                self.next_is_recovery = true;
-                return None;
-            }
-            self.next_is_recovery = false;
-            let entry = self.pick_and_advance(u, &candidates);
-            // D7-1: our own attempt is itself in-flight evidence, immediately.
-            self.in_flight.insert(u, now);
-            // PHASE7-PREP-NOTES.md Finding A: diagnostic-only observational log (no
-            // behavior change) -- every recovery attempt actually attached to a
-            // proposal, so a run's log can show how many carrier views ever attempt a
-            // given target and how far apart (in view number / wall clock) they are.
-            log::info!(
-                "vantage resolver: recovery target u={} attached at carrier turn w={}",
-                u,
-                w
-            );
-            return Some(entry);
+            break (u, candidates);
+        };
+        // A qualifying target was found -- the bit decides, then flips (§4 step 3).
+        if !self.next_is_recovery {
+            self.next_is_recovery = true;
+            return None;
         }
-        None // no target qualifies at all -- bit unchanged (§4 step 2)
+        self.next_is_recovery = false;
+        let entry = self.pick_and_advance(u1, &candidates);
+        // D7-1: our own attempt is itself in-flight evidence, immediately.
+        self.in_flight.insert(u1, now);
+        Some((u1, entry))
+    }
+
+    /// §4's full per-turn decision, single-entry shape: `decide_head` alone, with a
+    /// diagnostic log line. `None` for a data-only proposal; `Some(entry)` for a
+    /// recovery proposal targeting the first qualifying view.
+    pub fn decide(
+        &mut self,
+        agb: &AgbEngine,
+        w: View,
+        now: Instant,
+        resolved: impl Fn(View) -> bool,
+    ) -> Option<ResolutionEntry> {
+        let (u, entry) = self.decide_head(agb, w, now, &resolved)?;
+        // PHASE7-PREP-NOTES.md Finding A: diagnostic-only observational log (no
+        // behavior change) -- every recovery attempt actually attached to a
+        // proposal, so a run's log can show how many carrier views ever attempt a
+        // given target and how far apart (in view number / wall clock) they are.
+        log::info!(
+            "vantage resolver: recovery target u={} attached at carrier turn w={}",
+            u,
+            w
+        );
+        Some(entry)
     }
 
     /// The vector cap, `f` -- derived from the committee (never a config knob),
@@ -271,37 +297,52 @@ impl Resolver {
         self.f_plus_1_parties.saturating_sub(1).max(1)
     }
 
-    /// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries"):
-    /// `decide`'s prefix-scanning generalization. Returns 0 entries (data-only
-    /// turn, or no target qualifies at all -- exactly `decide`'s own `None` cases),
-    /// or `1..=f` entries for a recovery turn.
+    /// signature-free.tex 704fb29, par:batched-anchors ("the audit narrows the
+    /// previously added recovery batching rule"): is `u` skip-justified specifically
+    /// (a first-hand `2f+1` no-ready census) -- the only candidate shape a batch
+    /// coordinate beyond `u_1` may ever carry (`agb::formed_batch` rejects a
+    /// full/core coordinate outright). Equivalent to `justified_candidates`'s own
+    /// `Skip` clause, factored out so the prefix scan below can check it without
+    /// building the full (possibly full/core-inclusive) candidate list per target.
+    fn skip_justified(&self, agb: &AgbEngine, u: View) -> bool {
+        agb.noready_count(u) >= self.two_f_plus_1_parties
+    }
+
+    /// signature-free.tex's "Batched resolution entries" paragraph, narrowed by the
+    /// 704fb29 audit (par:batched-anchors): `decide`'s prefix-scanning
+    /// generalization, and the only recovery-turn entry point production wiring
+    /// calls (unconditional protocol behavior, not a flag). Returns 0 entries
+    /// (data-only turn, or no target qualifies at all -- exactly `decide_head`'s own
+    /// `None` cases), or `1..=f` entries for a recovery turn.
     ///
-    /// Coordinate 1 (the first-qualifying target `u_1`) is found by EXACTLY
-    /// `decide`'s own scan: ascending from the (lazily advanced) resolved
-    /// watermark, transparently skipping already-resolved and no-evidence
-    /// (empty-candidate) views, and skipping (never blocking) a D7-1 in-flight
-    /// view, until a genuinely qualifying view is found. The data-only/recovery
-    /// bit (§4 step 2/3) is then consulted at `u_1` exactly as `decide` does.
+    /// Coordinate 1 (the first-qualifying target `u_1`) is `decide_head` itself --
+    /// same scan, same data-only/recovery bit consumption, same cyclic
+    /// `pick_and_advance` choice a lone single-entry attempt would use (a full/core
+    /// pick is exactly as likely here as on any other turn).
     ///
-    /// Coordinates 2..k extend the prefix rightward from `u_1`: resolved/no-
-    /// evidence views are, per the spec, "skipped by the scan as they are now" --
-    /// transparently passed over without breaking the prefix. The prefix STOPS
-    /// (does not skip through) at the first in-flight-suppressed view, at
-    /// `scan_limit`, or once `f` entries are collected. FLAGGED AMBIGUITY (see this
-    /// module's PHASE7 report): the spec's "the prefix stops at the first
-    /// non-qualifying view" is open to a second reading where an in-flight view
-    /// should ALSO be skipped-through for coordinates 2..k (mirroring coordinate
-    /// 1's own treatment) rather than stopping the prefix -- this implementation
-    /// takes the "stop" reading, since skipping an in-flight view here would let
-    /// the prefix silently reach past a target another attempt is already working
-    /// on to grab a further one, which seems at odds with "maximal qualifying
-    /// PREFIX" (a prefix with a gap is not a prefix of the contiguous
-    /// justified-and-live sequence starting at `u_1`).
+    /// What may extend past `u_1` is narrowed by the same audit: the vector wire
+    /// shape is skip-only ("a vector with a full or core entry is malformed; those
+    /// outcomes use one general entry"), so a multi-entry batch can only ever be
+    /// attempted when `u_1`'s OWN picked candidate is `Skip` -- otherwise (a
+    /// full/core pick, or this being a `force_single` turn per the D7-2 alternation
+    /// below) this attempt is `u_1`'s ordinary single-entry attempt, full stop,
+    /// exactly what `decide` itself would have produced. When `u_1` picked `Skip`
+    /// and this is a "may extend" turn, coordinates 2..k extend rightward, "the
+    /// maximal consecutive prefix ... for which every target justifies skip":
+    /// resolved views are transparently skipped through (never block or end the run,
+    /// mirroring coordinate 1's own scan); a genuinely no-evidence view is ALSO
+    /// skipped through ("an older no-evidence view does not prevent an attempt for a
+    /// later target") since it justifies nothing at all yet, not even non-skip; but a
+    /// view with enough ready-stage evidence to justify something OTHER than skip
+    /// (or nothing skip-specific) is treated as "the first other target" and ends the
+    /// run there, as does the first in-flight-suppressed view or `scan_limit`/the `f`
+    /// cap.
     ///
     /// D7-2 alternation (`alternation_target`/`alternation_force_single`, see their
     /// own doc comments): per fixed `u_1`, every OTHER attempt is truncated to the
-    /// single first entry -- applied AFTER the prefix is found, so it never affects
-    /// which candidates are picked, only how many of them ride this attempt.
+    /// single first entry -- applied BEFORE the extension is even attempted (a
+    /// `force_single` turn never looks past `u_1`), so it never affects which
+    /// candidate `u_1` itself picks, only whether riders may ride along.
     pub fn decide_prefix(
         &mut self,
         agb: &AgbEngine,
@@ -310,65 +351,67 @@ impl Resolver {
         resolved: impl Fn(View) -> bool,
     ) -> Vec<ResolutionEntry> {
         let scan_limit = w.saturating_sub(3);
-        while self.resolved_watermark <= scan_limit && resolved(self.resolved_watermark) {
-            self.resolved_watermark += 1;
-        }
-        let cap = self.f_cap();
-        let mut prefix: Vec<(View, Vec<ResolutionEntry>)> = Vec::new();
-        let mut u = self.resolved_watermark;
-        while u <= scan_limit && prefix.len() < cap {
-            if resolved(u) {
-                u += 1;
-                continue;
-            }
-            let candidates = self.justified_candidates(agb, u);
-            if candidates.is_empty() {
-                u += 1;
-                continue; // no-evidence view never blocks a later target
-            }
-            if self.is_in_flight(u, now) {
-                if prefix.is_empty() {
-                    u += 1;
-                    continue; // still hunting for u_1 -- identical to `decide`
-                }
-                break; // prefix stops at the first in-flight view once k >= 1
-            }
-            prefix.push((u, candidates));
-            u += 1;
-        }
-        let Some(&(u1, _)) = prefix.first() else {
-            return Vec::new(); // no target qualifies at all -- bit unchanged (§4 step 2)
-        };
-        // §4 step 2/3: the data-only/recovery bit, decided at u_1 exactly as `decide`.
-        if !self.next_is_recovery {
-            self.next_is_recovery = true;
+        let Some((u1, u1_entry)) = self.decide_head(agb, w, now, &resolved) else {
             return Vec::new();
-        }
-        self.next_is_recovery = false;
+        };
 
-        // D7-2: per-fixed-first-target alternation between full-prefix and k=1
-        // attempts -- resets whenever the observed first-qualifying target changes.
+        // D7-2: per-fixed-first-target alternation between a "may extend" turn and a
+        // forced single-entry turn -- resets whenever the observed first-qualifying
+        // target changes.
         if self.alternation_target != Some(u1) {
             self.alternation_target = Some(u1);
             self.alternation_force_single = false;
         }
         let force_single = self.alternation_force_single;
         self.alternation_force_single = !self.alternation_force_single;
-        let chosen_len = if force_single { 1 } else { prefix.len() };
 
-        let mut out = Vec::with_capacity(chosen_len);
-        for (u, candidates) in prefix.into_iter().take(chosen_len) {
-            let entry = self.pick_and_advance(u, &candidates);
-            // D7-1: our own attempt is itself in-flight evidence, immediately.
-            self.in_flight.insert(u, now);
+        // A batch can only ever be headed by a Skip pick -- `formed_batch` rejects a
+        // full/core coordinate outright, so there is no valid vector to build around
+        // anything else. This attempt is then just u_1's ordinary single-entry
+        // attempt, exactly what `decide` itself would have produced.
+        if force_single || u1_entry != ResolutionEntry::Skip(u1) {
             log::info!(
-                "vantage resolver: recovery target u={} attached at carrier turn w={} (batch size {})",
-                u,
-                w,
-                chosen_len
+                "vantage resolver: recovery target u={} attached at carrier turn w={} (batch size 1)",
+                u1,
+                w
             );
-            out.push(entry);
+            return vec![u1_entry];
         }
+
+        let cap = self.f_cap();
+        let mut out = vec![u1_entry];
+        let mut u = u1 + 1;
+        while u <= scan_limit && out.len() < cap {
+            if resolved(u) {
+                u += 1;
+                continue; // transparently skipped through, mirrors coordinate 1's scan
+            }
+            if agb.ready_stage_total(u) < self.two_f_plus_1_parties {
+                u += 1;
+                continue; // no evidence at all yet -- never blocks a later target
+            }
+            if !self.skip_justified(agb, u) {
+                break; // has evidence, but does not justify skip -- "the first other target"
+            }
+            if self.is_in_flight(u, now) {
+                break; // mirrors the pre-704fb29 prefix's own "stop" treatment for in-flight
+            }
+            out.push(ResolutionEntry::Skip(u));
+            // D7-1: this rider is ALSO itself in-flight evidence, immediately --
+            // deliberately not touched via `pick_and_advance`/`candidate_pointer`:
+            // riding along in an opportunistic batch is independent of `u`'s own
+            // per-target candidate cycle (its `justified_candidates` may include a
+            // full/core entry the pointer is presently on; the batch always uses
+            // `Skip` specifically, regardless of that unrelated cycle's state).
+            self.in_flight.insert(u, now);
+            u += 1;
+        }
+        log::info!(
+            "vantage resolver: recovery target u={} attached at carrier turn w={} (batch size {})",
+            u1,
+            w,
+            out.len()
+        );
         out
     }
 

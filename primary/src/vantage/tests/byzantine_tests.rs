@@ -13,13 +13,19 @@
 // PHASE4-SPEC.md §13's standing note) -- it does not model an attack.
 //
 // Scenario 1 (the marquee test): a silent/withheld proposer never proposes for its
-// view -> refusals at deadlines (echo-skip, no-ready) -> a later correct proposer's
-// recovery turn carries `Skip(u)` -> the control log anchors it -> every (live) node
-// seals `gskip` and the cursor advances past `u`. This is Phase 5's documented,
-// asserted-as-correct-at-the-time blocking behavior, now resolved: the crash-fault
-// scenario's "cursor permanently blocks at the dead view" boundary from
-// PHASE5-NOTES.md/`crash_fault_tests.rs` is exactly what this phase's resolver +
-// control log + anchor adapter close.
+// view -> refusals at deadlines (echo-skip, no-ready). This is Phase 5's documented,
+// asserted-as-correct-at-the-time blocking behavior; Phase 6's resolver + control log
+// + anchor adapter closed it via a later correct proposer's recovery turn carrying
+// `Skip(u)`, anchored through the control log. signature-free.tex 704fb29
+// (par:skip-seal, cor:crash-skip) closes it EARLIER still, unconditionally, for this
+// EXACT clean-crash scenario: n=4/f=1's 3 live parties are exactly Q=2f+1, so the
+// grounded post-ready skip vote seals `gskip` directly off the refusal census itself
+// -- every live node seals and the cursor advances past `u` before any carrying
+// proposal could even be built, with zero control-log involvement. Scenario 1 below
+// asserts exactly this now; the anchor path it used to drive is unreachable for this
+// scenario and is covered instead by scenarios 2-4 below (which keep every party
+// ALIVE, so no echo-skip census -- and hence no vote grounding -- ever forms; see
+// each scenario's own note).
 //
 // Scenarios 2-6 (below scenario 1) use the SAME methodology established here: real
 // multi-node harness interaction wherever the mechanism under test genuinely spans
@@ -195,7 +201,7 @@ async fn drive_carrying_proposal_to_anchor(
 }
 
 #[tokio::test]
-async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
+async fn scenario_1_silent_proposer_sealed_via_grounded_skip_vote() {
     let all = authors();
     let mut nodes: Vec<Node> = all
         .iter()
@@ -258,24 +264,71 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
     .await;
 
     for &i in &live {
-        assert_eq!(
-            nodes[i].agb.sealed_for_test(dead_view),
-            None,
-            "the dead view never seals directly"
-        );
         assert!(
             nodes[i].agb.noready_count(dead_view) >= 3,
             "D6-5: every live party's first-hand no-ready is counted (2f+1=3)"
         );
     }
 
-    // A later correct proposer's recovery turn: pick a fresh view (well past
-    // `dead_view + 3` and past anything the WISH cascade above could have already
-    // used) whose round-robin proposer is one of the live parties, and call the
-    // IDENTICAL `Resolver::decide` production uses at that party's own proposer turn
-    // -- first consuming the (initially data-only) bit, then obtaining the recovery
-    // entry, exactly as `Node::try_propose_effects` would if this view happened to be
-    // that party's next unproposed turn.
+    // signature-free.tex 704fb29 (par:skip-seal, cor:crash-skip): by the time the
+    // no-ready census above is complete, every live party ALSO already has a
+    // first-hand 2f+1 echo-skip census (from the theta_E advance above) and a free
+    // resolution stance -- the grounded skip vote fires within the SAME
+    // `advance_time(theta_ready)` call this test already made, and the 2f+1 vote
+    // quorum is reached within that same synchronous drain. The dead view is
+    // therefore already sealed here -- no carrying proposal, no control log.
+    for &i in &live {
+        assert_eq!(
+            nodes[i].agb.sealed_for_test(dead_view),
+            Some(Outcome::Skip),
+            "node {} must have sealed gskip for the dead view via the grounded skip-vote quorum",
+            i
+        );
+        assert!(
+            !nodes[i].control.is_anchor_resolved(dead_view),
+            "node {} must NOT have anchored the dead view -- the vote quorum sealed it directly",
+            i
+        );
+        assert!(
+            nodes[i].cursor.next_view() > dead_view,
+            "node {} cursor must have advanced past the dead view",
+            i
+        );
+        // The dead view can ONLY ever have been sealed via the grounded vote's
+        // `vote_skip` route (direct-AGB never produces gskip at all, and this test
+        // never builds a carrying proposal at all, so the anchor never runs) -- the
+        // two checks just above already pin that down precisely FOR THE DEAD VIEW.
+        // The aggregate `vote_skip` counter below is `>= 1` rather than `== 1`: this
+        // test's generous `MAX_VIEWS`/WISH-cascade setup (documented at the top of
+        // this file) lets formal entry race far ahead of `try_propose_effects`'s own
+        // organic-proposing cap, so views well beyond `MAX_VIEWS` also end up
+        // genuinely unproposed and independently pick up the SAME grounded vote --
+        // additional (incidental, harmless) confirmation of the same mechanism, not a
+        // conflated count.
+        assert!(
+            nodes[i]
+                .metrics
+                .vantage_seals
+                .with_label_values(&["vote_skip"])
+                .get()
+                >= 1,
+            "node {} must show at least one vote_skip route increment",
+            i
+        );
+        assert_eq!(
+            nodes[i]
+                .metrics
+                .vantage_seals
+                .with_label_values(&["anchor_skip"])
+                .get(),
+            0,
+            "node {} must show zero anchor_skip route increments -- the anchor never ran",
+            i
+        );
+    }
+
+    // The legacy fallback is now unreachable for this scenario: a later correct
+    // proposer's recovery turn finds NOTHING left to justify for the dead view.
     let carrying_view: crate::primary::View = 1000;
     let carrier_name = crate::vantage::agb::proposer(&test_committee(), carrying_view);
     let carrier_idx = live
@@ -283,7 +336,6 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
         .find(|&&i| nodes[i].name == carrier_name)
         .copied()
         .expect("a live party must lead the carrying view");
-
     let now = Instant::now();
     let first = {
         let node = &mut nodes[carrier_idx];
@@ -299,91 +351,9 @@ async fn scenario_1_silent_proposer_sealed_via_skip_anchor_cursor_advances() {
             .decide(agb, carrying_view, now, |u| agb.is_sealed(u))
     };
     assert_eq!(
-        m,
-        Some(ResolutionEntry::Skip(dead_view)),
-        "the recovery turn must carry Skip(dead_view) -- it is the only justified candidate"
+        m, None,
+        "the dead view is already sealed via the vote quorum -- no carrying proposal is needed"
     );
-
-    // Build the carrying proposal over the SAME seeded, already-quorum'd content every
-    // other view in this harness uses (author 0's height-1 block).
-    let (author0, _) = all[0];
-    let c_ref = nodes[carrier_idx]
-        .lm
-        .c_candidate(&author0)
-        .expect("seeded C candidate");
-    let proposal = ViewProposal {
-        view: carrying_view,
-        c: vec![c_ref],
-        t: Vec::new(),
-        m,
-    };
-
-    // Every live party must formally activate the carrying view before it can process
-    // a direct proposal for it (mirrors `Frontier::enter`'s "also activates" -- WISH
-    // itself would do this in production; done directly here since the deliberately
-    // small `MAX_VIEWS` cap keeps this test's own WISH cascade well below 1000).
-    for &i in &live {
-        let effects = nodes[i].enter_view_effects(carrying_view, now);
-        drain_local(&mut nodes, i, effects, now, &mut outbox);
-    }
-    run_to_quiescence(&mut nodes, &mut outbox, now).await;
-
-    // Dispatch the direct proposal to every live party (mirrors `BroadcastPropose`) and
-    // let the full pipeline run: R2 echo -> R3 ready -> R4 completion (M != None) ->
-    // `CompletionReportable` -> `CompReport` census -> submittable -> the control
-    // log's leader turn -> validated Bracha -> commit -> `ApplyAnchor` -> the try-seal
-    // arbiter -> the cursor.
-    for &i in &live {
-        outbox.push_back((
-            i,
-            Inbound::Propose(ProposalOut::Single(proposal.clone())),
-        ));
-    }
-    run_to_quiescence(&mut nodes, &mut outbox, now).await;
-
-    // The carrying view's own completion/report lands quickly, but whichever control
-    // round was already in flight when it did may already be stuck with a sticky,
-    // stale (pre-submittable) proposal (possibly `⊥`, possibly led by a since-timed-out
-    // leader) -- drive the control-round timer (6Δ) forward a few rounds so the
-    // reliable-notification disable path frees up a FRESH round whose leader's own
-    // entry-time `Propose` step picks up the now-submittable pair.
-    let control_timeout = nodes[live[0]].control.control_round_timeout();
-    let mut ct = now;
-    for _ in 0..6 {
-        ct += control_timeout + Duration::from_millis(1);
-        advance_time(&mut nodes, &mut outbox, ct).await;
-        run_to_quiescence(&mut nodes, &mut outbox, ct).await;
-    }
-
-    // The defense's payoff: every live node has sealed `gskip` for the dead view
-    // (reachable at last -- Direct-AGB alone could never produce it, PHASE4-NOTES.md)
-    // and the cursor has advanced PAST it -- the exact Phase-5 boundary this phase
-    // closes.
-    for &i in &live {
-        assert_eq!(
-            nodes[i].agb.sealed_for_test(dead_view),
-            Some(Outcome::Skip),
-            "node {} must have sealed gskip for the dead view via the anchor",
-            i
-        );
-        assert!(
-            nodes[i].cursor.next_view() > dead_view,
-            "node {} cursor must have advanced past the dead view",
-            i
-        );
-        // PHASE6-SPEC.md §9 gate amendment: the dead view can ONLY ever have been
-        // sealed via the anchor's Skip route (direct-AGB never produces gskip at all).
-        assert_eq!(
-            nodes[i]
-                .metrics
-                .vantage_seals
-                .with_label_values(&["anchor_skip"])
-                .get(),
-            1,
-            "node {} must show exactly one anchor_skip route increment for the dead view",
-            i
-        );
-    }
 
     // Identical outputs across live nodes (the resolver's canonical order + the
     // control log's own totality make this deterministic).

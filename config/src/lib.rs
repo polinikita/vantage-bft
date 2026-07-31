@@ -271,22 +271,6 @@ pub struct Parameters {
     #[serde(default = "default_ack_watermark_period_ms")]
     pub ack_watermark_period_ms: u64,
 
-    /// Vantage only: batched resolution entries -- signature-free.tex's "Batched
-    /// resolution entries" paragraph. Off (`false`) is byte-identical to today: a
-    /// recovery-turn proposal still carries at most one resolution entry, on the
-    /// existing `ViewProposal`/`Echo`/`Ready` wire types, exactly as before this flag
-    /// existed. On: the proposer's recovery-turn scan targets the maximal qualifying
-    /// PREFIX of the scan (up to `f` entries, `f` derived from the committee, never a
-    /// config knob), carried on a separate, flag-gated set of wire types/messages
-    /// appended last (`VantageProposeBatch`/`VantageEchoBatch`/`VantageReadyBatch`/
-    /// `ControlInitBatch`/`ControlServeBatch`) -- never on the pre-existing types, so
-    /// the flag-off wire format is unaffected even when this is compiled in. Every
-    /// node in a run shares one build and one flag value (this codebase's actual
-    /// deployment model), so there is no cross-flag interop concern.
-    /// `#[serde(default)]` keeps every pre-existing parameter file valid.
-    #[serde(default)]
-    pub batched_anchors: bool,
-
     /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
     /// per-authority-pair one-way latency table, applied to THIS node's own
     /// primary-to-primary connections at spawn time via `Committee::latency_map`
@@ -626,7 +610,6 @@ impl Default for Parameters {
             simpleit_gc_window_rounds: default_simpleit_gc_window_rounds(),
             ack_watermarks: false,
             ack_watermark_period_ms: default_ack_watermark_period_ms(),
-            batched_anchors: false,
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,
@@ -756,11 +739,6 @@ impl Parameters {
             "Ack watermarks (periodic per-lane availability broadcast, replaces \
              per-block acks) enabled? {}. Period: {} ms",
             self.ack_watermarks, self.ack_watermark_period_ms
-        );
-        info!(
-            "Batched resolution entries (Vantage recovery-turn proposals may target \
-             several unresolved views at once) enabled? {}",
-            self.batched_anchors
         );
     }
 }

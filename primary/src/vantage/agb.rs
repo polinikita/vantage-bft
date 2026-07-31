@@ -13,7 +13,7 @@ use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,14 +44,12 @@ impl ResolutionEntry {
 /// §2 `ViewProposal { view, c, t, m }` (PHASE6-SPEC.md §1 adds `m`; M structurally
 /// absent -- always `None` -- through Phase 5).
 ///
-/// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries"): this type is
-/// deliberately UNTOUCHED -- every field, every derive, every byte `bincode::
-/// serialize` produces for it is identical to before this flag existed. The vector
-/// (`k >= 2` entries) case travels on a SEPARATE wire type, `BatchViewProposal`
-/// (below): changing `m` here to a `Vec` would change the serialized bytes for the
-/// `None`/single-entry case too (an `Option`'s wire encoding differs from a `Vec`'s
-/// even when both are "empty"/"one element"), breaking the flag-off byte-identity
-/// requirement. See `ProposalOut` for the internal (never-itself-serialized)
+/// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): the vector
+/// (`k >= 2` entries) case of `M` travels on a SEPARATE wire type, `BatchViewProposal`
+/// (below), rather than generalizing `m` here to a `Vec` -- an `Option`'s wire
+/// encoding differs from a `Vec`'s even when both are "empty"/"one element", so
+/// keeping the two logical shapes on two wire types keeps each one's own encoding
+/// simple and stable. See `ProposalOut` for the internal (never-itself-serialized)
 /// abstraction `AgbEngine`/`control::ControlLog` use to treat both shapes uniformly.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct ViewProposal {
@@ -69,7 +67,7 @@ impl ViewProposal {
     }
 }
 
-/// PHASE7 (`Parameters::batched_anchors`): the vector form of `M`, `m.len() in
+/// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): the vector form of `M`, `m.len() in
 /// 2..=f` (`f` derived from the committee -- see `formed_batch`), strictly
 /// increasing target views. Carried on its own wire messages
 /// (`VantageProposeBatch`/`VantageEchoBatch`/.../`ControlServeBatch`), appended
@@ -176,16 +174,20 @@ pub struct Echo {
     pub origin: Option<u8>,
 }
 
-/// PHASE7 (`Parameters::batched_anchors`): `EchoBatch`'s vector generalization of
-/// `Echo::origin` -- one `Ann` bit per `proposal.m` position, each computed exactly
-/// as `Echo::origin` is for its own target (`None` for a skip entry).
+/// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): `EchoBatch`, the batch-proposal echo.
+/// PHASE8 (signature-free.tex 704fb29, par:batched-anchors): carries no `Ann`/origin
+/// field at all -- `formed_batch` now requires every `proposal.m` entry to be `Skip`,
+/// and a skip entry's origin bit is always `None` (`Echo::origin`'s own doc comment),
+/// so a per-position origin vector here would carry zero bits of real information.
+/// (An earlier revision of this type carried `origin: Vec<Option<u8>>`, PHASE7's
+/// vector generalization of `Echo::origin`, back when a batch could still contain a
+/// full/core coordinate.)
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct EchoBatch {
     pub proposal: BatchViewProposal,
     pub grade: u8,
     pub sender: PublicKey,
     pub wish: View,
-    pub origin: Vec<Option<u8>>,
 }
 
 /// PHASE7: normalizes `Echo`/`EchoBatch` for `AgbEngine`'s internal counting (never
@@ -236,7 +238,13 @@ impl EchoOut {
     /// `Echo::origin`'s single `Option<u8>` naturally covers the `Single` shape's 0/1
     /// entries (`None` when `M` is empty is indistinguishable from `None` for a
     /// one-entry skip, but the two cases are equivalent for every reader: `ReadyOK`
-    /// treats a skip position exactly like an absent one, always passing).
+    /// treats a skip position exactly like an absent one, always passing). PHASE8:
+    /// always empty for `Batch` -- every batch entry is `Skip` (`formed_batch`), whose
+    /// origin is always `None`, so there is no per-position bit left to carry;
+    /// `recheck_ready`'s tally loop is bounded by this Vec's own length, so an empty
+    /// result here simply contributes zero origin-one counts, which is correct (a
+    /// batch's `ReadyOK` never reads them -- every position is `Skip`, which always
+    /// passes independent of origin).
     pub fn origin_vec(&self) -> Vec<Option<u8>> {
         match self {
             Self::Single(e) => {
@@ -246,7 +254,7 @@ impl EchoOut {
                     Vec::new()
                 }
             }
-            Self::Batch(e) => e.origin.clone(),
+            Self::Batch(_) => Vec::new(),
         }
     }
 
@@ -277,7 +285,7 @@ pub struct Ready {
     pub wish: View,
 }
 
-/// PHASE7 (`Parameters::batched_anchors`): `Ready`'s counterpart for a
+/// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): `Ready`'s counterpart for a
 /// `BatchViewProposal` -- `grade` is unaffected by `M`'s plurality (it grades the
 /// carrying `(C,T)` payload alone, exactly as today), so only `proposal`'s type
 /// differs.
@@ -402,17 +410,23 @@ pub fn formed(
     true
 }
 
-/// PHASE7 (`Parameters::batched_anchors`): well-formedness for the vector-`M` wire
-/// shape (`BatchViewProposal`). The carrying `C`/`T` bounds are identical to
-/// `formed`'s own (shared helpers below); additionally: `m.len()` is `2..=f` (`f`
-/// derived from the committee, never a config knob -- a Byzantine sender misusing
-/// this wire shape for the 0/1-entry case, which belongs on `ViewProposal`/`formed`,
-/// is rejected outright, so there is exactly one canonical wire representation per
-/// logical `M`), every entry's own bounds match `formed`'s single-entry checks, and
-/// targets are STRICTLY increasing (load-bearing for §6's "apply a batched anchor's
-/// entries in increasing target order" -- enforced here so a FIXED batch proposal
-/// already guarantees `pump_log`'s in-order iteration is the paper's rule, not
-/// merely this implementation's convention).
+/// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph) / PHASE8
+/// (signature-free.tex 704fb29, par:batched-anchors, "The audit narrows the
+/// previously added recovery batching rule"): well-formedness for the vector-`M`
+/// wire shape (`BatchViewProposal`). The
+/// carrying `C`/`T` bounds are identical to `formed`'s own (shared helpers below);
+/// additionally: `m.len()` is `2..=f` (`f` derived from the committee, never a config
+/// knob -- a Byzantine sender misusing this wire shape for the 0/1-entry case, which
+/// belongs on `ViewProposal`/`formed`, is rejected outright, so there is exactly one
+/// canonical wire representation per logical `M`), EVERY entry is `Skip` --
+/// manifest-free, skip-only ("a vector with a full or core entry is malformed; those
+/// outcomes use one general entry" -- narrowed from PHASE7's original full/core-
+/// capable vector, which the paper's own audit found put `f` independent manifest
+/// pairs in one statement, breaking the proved `O(n*lambda)` by-value statement
+/// bound) -- and targets are STRICTLY increasing (load-bearing for §6's "apply a
+/// batched anchor's entries in increasing target order" -- enforced here so a FIXED
+/// batch proposal already guarantees `pump_log`'s in-order iteration is the paper's
+/// rule, not merely this implementation's convention).
 pub fn formed_batch(
     committee: &Committee,
     view: View,
@@ -432,6 +446,12 @@ pub fn formed_batch(
     }
     let mut prev: Option<View> = None;
     for entry in m {
+        // PHASE8: "a vector with a full or core entry is malformed" -- the vector
+        // form is skip-only; full/core outcomes always use the single general entry
+        // on `ViewProposal`/`formed`.
+        if !matches!(entry, ResolutionEntry::Skip(_)) {
+            return false;
+        }
         if !formed_entry(committee, view, entry) {
             return false;
         }
@@ -583,6 +603,23 @@ struct Lock {
     active: bool,
 }
 
+/// signature-free.tex's "Grounded post-ready skip" -- the resolution-stance paragraph
+/// beginning "Vantage also maintains a persistent per-target resolution stance": a
+/// correct party's persistent per-target stance `z_i(u)`, unconditional protocol
+/// state (every party maintains one for every target, always). `Free` is the initial
+/// value; `TryMetaOK` may claim `Free -> NonSkip` (before echoing a carrier with a
+/// non-skip entry for this target); the post-ready skip-vote rule may claim `Free ->
+/// SkipVoted` -- see `AgbEngine::try_meta_ok`/`recheck_skip_vote_trigger`.
+/// `pub(crate)` purely so `#[cfg(test)]` accessors elsewhere in this module can
+/// return it to sibling test modules; never re-exported via `vantage::mod`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Stance {
+    #[default]
+    Free,
+    NonSkip,
+    SkipVoted,
+}
+
 #[derive(Debug)]
 struct ViewState {
     fixed: Fixed,
@@ -611,6 +648,24 @@ struct ViewState {
     /// Byzantine senders it is bounded by `n`, same order as `echo_statements`
     /// itself.
     digest_cache: Vec<(Arc<ProposalOut>, Digest)>,
+    /// This view's persistent resolution stance `z_i(u)` (see `Stance`,
+    /// `AgbEngine::try_meta_ok`, `AgbEngine::recheck_skip_vote_trigger`). Read when
+    /// this `View` is a resolution TARGET `u`; written by both `try_meta_ok` (Free ->
+    /// NonSkip, on this same target) and the skip-vote rule (Free -> SkipVoted).
+    stance: Stance,
+    /// This carrying view's persistent accepted-metadata latch -- the concrete
+    /// realization of Direct AGB's abstract, persistent `AuxOK_i(w,M)` predicate
+    /// (`try_meta_ok`'s doc comment). Read/written when this `View` is a CARRYING view
+    /// `w`. Never cleared once set.
+    aux_accepted: bool,
+    /// PHASE8: first-hand counted `SkipVote(u)` statements for this view as a
+    /// resolution TARGET `u`, deduped by sender (mirrors `echo_statements`/
+    /// `ready_statements`'s "first counted wins" census).
+    skip_vote_statements: HashSet<PublicKey>,
+    /// PHASE8: one-shot latch -- have we already submitted `skip-seal(u) -> gskip` to
+    /// the try-seal arbiter via the vote-quorum route (mirrors `fastsealed`'s identical
+    /// role for the fast-seal route).
+    skip_sealed: bool,
 }
 
 impl Default for ViewState {
@@ -631,6 +686,10 @@ impl Default for ViewState {
             ready_statements: HashMap::new(),
             lock: None,
             digest_cache: Vec::new(),
+            stance: Stance::Free,
+            aux_accepted: false,
+            skip_vote_statements: HashSet::new(),
+            skip_sealed: false,
         }
     }
 }
@@ -647,6 +706,13 @@ pub struct AgbEngine {
     n: usize,
     /// D4-3: fast-seal thresholds count *parties*, not stake.
     f_plus_1_parties: usize,
+    /// `Q = 2f+1`, party count -- the grounded skip-vote/skip-seal quorum. Shares
+    /// D4-3's fast-seal convention (party count, not stake): both mechanisms live in
+    /// the same "fast- and skip-seal wrappers" algorithm box, both are caller-side
+    /// quorum-intersection arguments over first-hand per-author censuses (lem:fast-
+    /// seal / lem:skip-seal), neither is the stake-weighted `quorum` field below that
+    /// R3/R4 use to certify a VALUE.
+    two_f_plus_1_parties: usize,
     quorum: Stake,
     views: BTreeMap<View, ViewState>,
     /// Efficiency Item 2: exactly the views `recheck_all` would find by scanning
@@ -667,7 +733,7 @@ pub struct AgbEngine {
 impl AgbEngine {
     pub fn new(name: PublicKey, committee: Committee, sid: Digest, delta_ms: u64) -> Self {
         let n = committee.size();
-        let f_plus_1_parties = Thresholds::from_party_count(n).f_plus_1_parties;
+        let thresholds = Thresholds::from_party_count(n);
         let quorum = committee.quorum_threshold();
         Self {
             name,
@@ -675,7 +741,8 @@ impl AgbEngine {
             sid,
             delta: Duration::from_millis(delta_ms),
             n,
-            f_plus_1_parties,
+            f_plus_1_parties: thresholds.f_plus_1_parties,
+            two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
             quorum,
             views: BTreeMap::new(),
             pending_gate: BTreeSet::new(),
@@ -950,6 +1017,21 @@ impl AgbEngine {
         self.views.get(&view).and_then(|s| s.directed.clone())
     }
 
+    /// PHASE8: this view's persistent resolution stance `z_i(u)` -- `Free` both for a
+    /// genuinely untouched view and for a pruned one (matching every other query
+    /// accessor's "pruned reads as the default/already-resolved value" convention).
+    #[cfg(test)]
+    pub(crate) fn stance_for_test(&self, view: View) -> Stance {
+        self.views.get(&view).map_or(Stance::Free, |s| s.stance)
+    }
+
+    /// PHASE8: first-hand counted `SkipVote(u)` statements -- exposed for tests that
+    /// want to assert the census directly rather than only through `Effect::Sealed`.
+    #[cfg(test)]
+    pub(crate) fn skip_vote_count_for_test(&self, view: View) -> usize {
+        self.views.get(&view).map_or(0, |s| s.skip_vote_statements.len())
+    }
+
     // ---------------------------------------------------------------- §4 wrapper API
 
     /// §4: formal entry into `view` (Phase 4: only ever called for v = 1, at genesis
@@ -1067,7 +1149,7 @@ impl AgbEngine {
         self.on_propose_any(sender, ProposalOut::Single(proposal), now, lm, rep)
     }
 
-    /// PHASE7 (`Parameters::batched_anchors`): the `BatchViewProposal` counterpart of
+    /// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): the `BatchViewProposal` counterpart of
     /// `on_propose` -- same D4 declared-sender trust, same sticky-`fixed` semantics,
     /// delegated to the same shared `on_propose_any` core.
     pub fn on_propose_batch(
@@ -1235,6 +1317,12 @@ impl AgbEngine {
         self.recheck_lock_release(view);
         effects.extend(self.recheck_ready(view, rep));
         effects.extend(self.recheck_fastseal_trigger(view));
+        // PHASE8: this is a GRADED echo, never an ECHO-SKIP, so `echo_skip_count`
+        // cannot have changed here -- the skip-vote trigger's echo-skip-quorum conjunct
+        // is unaffected and this call is a guaranteed no-op. Kept anyway, mirroring
+        // `recheck_fastseal_trigger`'s own call-site set exactly, so every echo-census-
+        // changing site uniformly rechecks every echo-driven trigger.
+        effects.extend(self.recheck_skip_vote_trigger(view));
         effects
     }
 
@@ -1242,7 +1330,12 @@ impl AgbEngine {
     /// just-decided echo of `proposal`, dispatched by its own shape -- shared by the
     /// organic (positive-gate), fallback, and echo-skip-adjacent (well-formed but
     /// fallback) emission sites. `origin`'s length always matches
-    /// `proposal.entries().len()` (0/1 for `Single`, `2..=f` for `Batch`).
+    /// `proposal.entries().len()` for `Single` (0 or 1) -- PHASE8: `EchoBatch` no
+    /// longer has an origin field at all (every batch entry is `Skip`, whose origin is
+    /// always `None`), so `origin` is simply dropped on that path; callers still
+    /// compute it generically via `compute_origin(proposal.entries())` either way (a
+    /// harmless, always-`None` computation for a batch), rather than branching by
+    /// shape before calling in.
     fn build_echo_out(
         &self,
         proposal: &Arc<ProposalOut>,
@@ -1262,7 +1355,6 @@ impl AgbEngine {
                 grade,
                 sender: self.name,
                 wish: 0,
-                origin,
             }),
         }
     }
@@ -1286,10 +1378,12 @@ impl AgbEngine {
         }
     }
 
-    /// R2's positive gate predicate: `CoreOK_i(C) ∧ TipOK_i(C,T) ∧ MetaOK_i(w,M)`
+    /// R2's positive gate predicate: `CoreOK_i(C) ∧ TipOK_i(C,T) ∧ TryMetaOK_i(w,M)`
     /// (PHASE6-SPEC.md §2 adds the `MetaOK` conjunct to what Phase 4 called
-    /// `positive_gate_holds`).
-    fn positive_gate_holds(&self, proposal: &ProposalOut, lm: &mut LaneManager) -> bool {
+    /// `positive_gate_holds`; PHASE8 renames the conjunct `TryMetaOK` -- see
+    /// `try_meta_ok`'s doc comment). `&mut self` since PHASE8: `try_meta_ok` may
+    /// atomically claim this carrying view's persistent stances/latch on success.
+    fn positive_gate_holds(&mut self, proposal: &ProposalOut, lm: &mut LaneManager) -> bool {
         if !Self::core_ok(proposal.c(), lm) {
             return false;
         }
@@ -1299,7 +1393,7 @@ impl AgbEngine {
         if !Self::tip_ok(proposal.c(), proposal.t(), lm) {
             return false;
         }
-        self.meta_ok(proposal.entries(), lm)
+        self.try_meta_ok(proposal.view(), proposal.entries(), lm)
     }
 
     /// `CoreOK_i(C)`: every C entry is `author_ok`.
@@ -1342,7 +1436,7 @@ impl AgbEngine {
     /// `MetaOK` depends on THIS party's own echo/ready for a *different*, earlier view
     /// `u`, which the existing Ack/BlockCached-triggered `recheck_all` call sites never
     /// covered).
-    /// PHASE7 (`Parameters::batched_anchors`): the CONJUNCTION of `meta_ok_entry`
+    /// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): the CONJUNCTION of `meta_ok_entry`
     /// over every entry -- a party echoes the carrying proposal only if EVERY entry
     /// passes the same single-entry predicate it always has. Degenerates exactly to
     /// today's behavior for 0/1 entries (`entries.iter().all(..)` over an empty or
@@ -1440,6 +1534,196 @@ impl AgbEngine {
         }
     }
 
+    /// signature-free.tex's "Grounded post-ready skip": `TryMetaOK_i(w, M)`, the
+    /// metadata-acceptance transition R2 invokes in place of the pre-existing
+    /// `MetaOK` conjunct -- the SOLE gate through which a carrier ECHO for nonempty
+    /// `M` is ever decided (`positive_gate_holds` and `on_echo_fallback_timer` are its
+    /// only two callers, both of which unconditionally proceed to build+push the
+    /// ECHO/EchoSkip effect immediately after this returns, in the same synchronous
+    /// call -- there is no intervening yield point in this single-threaded engine, so
+    /// "atomically claim the stance, then emit" is simply "claim it in this function,
+    /// return, and let the caller's very next statements run").
+    ///
+    /// Realizes two things the abstract Direct AGB contract requires of
+    /// `AuxOK_i(w,M)` (persistence) that the raw per-entry conjunction (`meta_ok`)
+    /// cannot provide by itself:
+    ///   - the resolution-stance exclusion (`stance_excludes`): a non-skip entry for
+    ///     target `u` additionally fails when this party's stance for `u` is already
+    ///     `SkipVoted`, or it has already learned a terminal `gskip` for `u` (skip
+    ///     entries never consult or affect the stance -- "the ordinary all-NO-READY
+    ///     resolver path remains available after an unsuccessful skip-vote attempt");
+    ///   - the persistent accepted-metadata latch `aux_accepted`, keyed by the
+    ///     CARRYING view `w`: once every entry has passed once, further evaluation for
+    ///     the SAME `w` short-circuits true without re-deriving anything. This matters
+    ///     because the per-entry stance/terminal-outcome checks are the one place this
+    ///     predicate is not itself monotone in time (a free stance that is still free
+    ///     right now could, in principle, later become `SkipVoted`) -- exactly the
+    ///     paper's "a free stance that could later change is not itself the abstract
+    ///     predicate" remark. The latch is the named artifact later lemmas' proofs
+    ///     point to ("by its accepted AuxOK latch, p_i emitted its target-view echo
+    ///     before accepting the entry") -- structurally, `echo_sent`'s own one-shot
+    ///     guard at both call sites already prevents this engine from ever reaching a
+    ///     SECOND real evaluation for a `w` that already succeeded, so the latch's
+    ///     short-circuit is not reachable via any current call path; it is still
+    ///     implemented as the paper's own explicit, persistent predicate rather than
+    ///     relying on that structural accident, so a future additional call site can
+    ///     never regress persistence silently.
+    ///
+    /// On success, atomically (before returning, so before the caller's next
+    /// statement -- the carrier ECHO): claims the at-most-one non-skip entry's target
+    /// stance `Free -> NonSkip` (a no-op if already `NonSkip` -- "a later non-skip
+    /// carrier may reuse that stance"), and sets `aux_accepted` for `w`.
+    ///
+    /// The stance-exclusion and the plain per-entry conjunction are independent,
+    /// side-effect-free boolean checks evaluated before any commit below, so
+    /// evaluating all entries' stance-exclusion first and then the existing `meta_ok`
+    /// conjunction (rather than interleaving the two per entry, as the displayed
+    /// pseudocode's single per-entry loop does) computes the identical AND of the same
+    /// conjuncts -- a pure reassociation, not a behavior change.
+    fn try_meta_ok(&mut self, w: View, entries: &[ResolutionEntry], lm: &mut LaneManager) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+        if self.views.get(&w).is_some_and(|s| s.aux_accepted) {
+            return true;
+        }
+        if entries.iter().any(|entry| self.stance_excludes(entry)) {
+            return false;
+        }
+        if !self.meta_ok(entries, lm) {
+            return false;
+        }
+        for entry in entries {
+            if let ResolutionEntry::Full(u, ..) | ResolutionEntry::Core(u, ..) = entry {
+                let target = self.state_mut(*u);
+                if target.stance == Stance::Free {
+                    target.stance = Stance::NonSkip;
+                }
+            }
+        }
+        self.state_mut(w).aux_accepted = true;
+        true
+    }
+
+    /// True (reject) iff `entry` is non-skip and this party's stance for its target
+    /// is already `SkipVoted`, or it has already learned a terminal `gskip` for that
+    /// target. Skip entries are never excluded here -- "skip entries neither require
+    /// nor change the stance". A pruned target is handled by `meta_ok_entry`'s own
+    /// pruned branch (declines outright), so this returns `false` (no ADDITIONAL
+    /// exclusion) rather than duplicating that decline.
+    fn stance_excludes(&self, entry: &ResolutionEntry) -> bool {
+        let u = match entry {
+            ResolutionEntry::Full(u, ..) | ResolutionEntry::Core(u, ..) => *u,
+            ResolutionEntry::Skip(_) => return false,
+        };
+        if self.is_pruned(u) {
+            return false;
+        }
+        self.views.get(&u).is_some_and(|s| {
+            s.stance == Stance::SkipVoted || matches!(s.sealed, Some(Outcome::Skip))
+        })
+    }
+
+    /// First-hand counted `ECHO-SKIP(u)` responses -- the grounding census the
+    /// skip-vote rule requires a `2f+1` quorum of (`par:skip-seal`). Reuses the
+    /// existing echo-stage census (`echo_statements`, already deduped one-per-author,
+    /// first-hand-only -- counted only via `count_echo_statement`) rather than adding
+    /// a parallel tally, per the reuse rule the rest of this module already follows
+    /// for `noready_count`/`echo_grade1_count_for`/etc.
+    fn echo_skip_count(&self, view: View) -> usize {
+        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Skip))
+    }
+
+    /// The grounded post-ready skip vote's Upon-rule (par:skip-seal) -- re-evaluated
+    /// at every site that can newly satisfy it: every echo-stage-census-changing site
+    /// (mirroring `recheck_fastseal_trigger`'s own call sites exactly -- "process
+    /// every enabled optimistic-lock release" before this rule is already guaranteed
+    /// there, since `recheck_lock_release` always runs first at each of them) plus
+    /// `on_ready_timer`, the one and only site where this party's own `R_i(u)`
+    /// becomes `NoReady`.
+    ///
+    /// On success: persists the stance BEFORE broadcasting (`Free -> SkipVoted` is set
+    /// before `Effect::BroadcastSkipVote` is pushed, matching "persist-before-send");
+    /// self-counts our own vote immediately, mirroring the existing echo/ready
+    /// self-counting convention (`recheck_gate`/`on_ready_timer` etc. count `self.name`
+    /// in the same census a remote statement would land in); then rechecks the
+    /// seal-quorum trigger, since counting our own vote can itself complete the
+    /// quorum.
+    fn recheck_skip_vote_trigger(&mut self, u: View) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if self.is_pruned(u) {
+            return effects;
+        }
+        let ready_for_vote = self.views.get(&u).is_some_and(|s| {
+            s.stance == Stance::Free
+                && matches!(s.ready_statements.get(&self.name), Some(ReadyStatement::NoReady))
+                && !matches!(s.sealed, Some(Outcome::Full(..)) | Some(Outcome::Core(..)))
+        });
+        if !ready_for_vote || self.echo_skip_count(u) < self.two_f_plus_1_parties {
+            return effects;
+        }
+        self.state_mut(u).stance = Stance::SkipVoted;
+        let name = self.name;
+        self.count_skip_vote_statement(u, name);
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_skip_votes_sent.inc();
+        }
+        effects.push(Effect::BroadcastSkipVote(u));
+        effects.extend(self.recheck_skip_seal_trigger(u));
+        effects
+    }
+
+    /// First-hand skip-vote dedup: at most one counted statement per (view, sender),
+    /// ever -- mirrors `count_echo_statement`/`count_ready_statement`. Returns
+    /// whether this call newly counted (`sender` had no prior statement for `view`)
+    /// -- "count only the first directly received statement per author".
+    fn count_skip_vote_statement(&mut self, view: View, sender: PublicKey) -> bool {
+        if self.is_pruned(view) {
+            return false;
+        }
+        self.state_mut(view).skip_vote_statements.insert(sender)
+    }
+
+    /// The skip-seal wrapper's Upon-rule -- upon counting a first-hand `Q = 2f+1`
+    /// quorum of `SkipVote(u)` statements, submit `gskip` to the SAME caller-side
+    /// try-seal arbiter the fast-seal/direct/anchor routes use (route `"vote_skip"`).
+    /// No completion, no direct-seal, no completion report, R1--R4 unchanged.
+    /// Idempotent with a later anchor submission for the same view -- `try_seal`
+    /// itself provides that (first submission wins; a later compatible one is a
+    /// no-op).
+    fn recheck_skip_seal_trigger(&mut self, u: View) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if self.is_pruned(u) {
+            return effects;
+        }
+        if self.views.get(&u).is_some_and(|s| s.skip_sealed) {
+            return effects;
+        }
+        let count = self.views.get(&u).map_or(0, |s| s.skip_vote_statements.len());
+        if count < self.two_f_plus_1_parties {
+            return effects;
+        }
+        self.state_mut(u).skip_sealed = true;
+        self.try_seal(u, Outcome::Skip, "vote_skip", &mut effects);
+        effects
+    }
+
+    /// A counted `VantageSkipVote`.
+    pub fn on_skip_vote(&mut self, view: View, sender: PublicKey) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if self.is_pruned(view) {
+            return effects;
+        }
+        if !self.count_skip_vote_statement(view, sender) {
+            return effects;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_skip_votes_received.inc();
+        }
+        effects.extend(self.recheck_skip_seal_trigger(view));
+        effects
+    }
+
     /// PHASE6-SPEC.md §3 `Ann`, generalized by PHASE7 to a vector: this party's own
     /// origin bit for EACH of the carrying proposal's `M` entries, each computed
     /// exactly as `compute_origin_entry` does for a lone entry -- degenerates
@@ -1482,9 +1766,10 @@ impl AgbEngine {
     }
 
     /// R2 fallback's `min(t + Δ, e_i + θE)` deadline: if echo is still pending and
-    /// `fixed = B`, broadcast a grade-0 echo (if `CoreOK_i(C) ∧ MetaOK_i(w,M)` holds --
-    /// PHASE6-SPEC.md §2: "Phase 4's fallback checked CoreOK only -- correct for M=∅,
-    /// must change now") or an echo-skip.
+    /// `fixed = B`, broadcast a grade-0 echo (if `CoreOK_i(C) ∧ TryMetaOK_i(w,M)` holds
+    /// -- PHASE6-SPEC.md §2: "Phase 4's fallback checked CoreOK only -- correct for
+    /// M=∅, must change now"; PHASE8 renames the conjunct `TryMetaOK`, see
+    /// `try_meta_ok`'s doc comment) or an echo-skip.
     pub fn on_echo_fallback_timer(
         &mut self,
         view: View,
@@ -1511,7 +1796,7 @@ impl AgbEngine {
                                          // log (no behavior change) -- the Delta-scaled fallback (grade-0) echo path.
         log::info!("vantage agb: FALLBACK grade-0 echo view={}", view);
         effects.extend(self.wish_effect(view, ResponseStage::Echo));
-        if Self::core_ok(proposal.c(), lm) && self.meta_ok(proposal.entries(), lm) {
+        if Self::core_ok(proposal.c(), lm) && self.try_meta_ok(view, proposal.entries(), lm) {
             let origin = self.compute_origin(proposal.entries());
             self.count_echo_statement(
                 view,
@@ -1528,6 +1813,11 @@ impl AgbEngine {
         self.recheck_lock_release(view);
         effects.extend(self.recheck_ready(view, rep));
         effects.extend(self.recheck_fastseal_trigger(view));
+        // PHASE8: this branch's own echo may be Graded (no-op for the reason
+        // `recheck_gate`'s matching comment gives) or Skip (this DOES grow
+        // `echo_skip_count` -- either way, rechecking here is correct and mirrors
+        // `recheck_fastseal_trigger`'s own call-site set).
+        effects.extend(self.recheck_skip_vote_trigger(view));
         effects
     }
 
@@ -1550,6 +1840,8 @@ impl AgbEngine {
         self.recheck_lock_release(view);
         effects.extend(self.recheck_ready(view, rep));
         effects.extend(self.recheck_fastseal_trigger(view));
+        // PHASE8: this IS our own ECHO-SKIP for `view` -- grows `echo_skip_count(view)`.
+        effects.extend(self.recheck_skip_vote_trigger(view));
         effects
     }
 
@@ -1562,7 +1854,7 @@ impl AgbEngine {
         self.on_echo_any(EchoOut::Single(echo), rep)
     }
 
-    /// PHASE7 (`Parameters::batched_anchors`): the `EchoBatch` counterpart of
+    /// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): the `EchoBatch` counterpart of
     /// `on_echo`, delegated to the same shared `on_echo_any` core.
     pub fn on_echo_batch(&mut self, echo: EchoBatch, rep: &mut Repairer) -> Vec<Effect> {
         self.on_echo_any(EchoOut::Batch(echo), rep)
@@ -1593,6 +1885,11 @@ impl AgbEngine {
         self.recheck_lock_release(view);
         effects.extend(self.recheck_ready(view, rep));
         effects.extend(self.recheck_fastseal_trigger(view));
+        // PHASE8: a remote statement here may itself be an ECHO-SKIP (grows
+        // `echo_skip_count`) or Graded (a guaranteed no-op for this trigger) --
+        // rechecking unconditionally mirrors `recheck_fastseal_trigger`'s own
+        // call-site set, which does not distinguish the two either.
+        effects.extend(self.recheck_skip_vote_trigger(view));
         effects
     }
 
@@ -1609,6 +1906,8 @@ impl AgbEngine {
         // fast-seal non-matching count.
         self.recheck_lock_release(view);
         effects.extend(self.recheck_fastseal_trigger(view));
+        // PHASE8: this IS a (remote) ECHO-SKIP for `view` -- grows `echo_skip_count`.
+        effects.extend(self.recheck_skip_vote_trigger(view));
         effects
     }
 
@@ -1716,7 +2015,12 @@ impl AgbEngine {
             // guard: for EACH full/core entry, require >= f+1 (party count) counted
             // proposal echoes for THIS proposal with origin = 1 AT THAT ENTRY'S
             // POSITION; skip entries (and, trivially, an empty `M`) always pass.
-            // Degenerates exactly to today's single check for 0/1 entries.
+            // Degenerates exactly to today's single check for 0/1 entries. PHASE8:
+            // `formed_batch` now requires every `Batch` entry to be `Skip`, so the
+            // `Full`/`Core` arm below is reachable only through `ProposalOut::Single`
+            // (0/1 entries) -- a runtime invariant enforced there, not something the
+            // type system encodes, so the per-position generality here is kept rather
+            // than special-cased.
             let ready_ok = proposal
                 .entries()
                 .iter()
@@ -1773,6 +2077,12 @@ impl AgbEngine {
         self.count_ready_statement(view, self.name, ReadyStatement::NoReady);
         effects.extend(self.wish_effect(view, ResponseStage::Ready));
         effects.push(Effect::BroadcastNoReady(view));
+        // PHASE8: this is the ONE and only site where our own R_i(view) becomes
+        // NoReady -- "after durably emitting NO-READY(u)" (par:skip-seal). The
+        // echo-skip-quorum conjunct cannot have changed here, but the own-noready
+        // conjunct just did, so the vote may now be immediately due if the quorum was
+        // already counted.
+        effects.extend(self.recheck_skip_vote_trigger(view));
         effects
     }
 
@@ -1781,7 +2091,7 @@ impl AgbEngine {
         self.on_ready_any(ReadyOut::Single(ready), rep)
     }
 
-    /// PHASE7 (`Parameters::batched_anchors`): the `ReadyBatch` counterpart of
+    /// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): the `ReadyBatch` counterpart of
     /// `on_ready`, delegated to the same shared `on_ready_any` core.
     pub fn on_ready_batch(&mut self, ready: ReadyBatch, rep: &mut Repairer) -> Vec<Effect> {
         self.on_ready_any(ReadyOut::Batch(ready), rep)

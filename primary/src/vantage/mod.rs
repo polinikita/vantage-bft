@@ -91,6 +91,13 @@ pub enum Effect {
     BroadcastReady(ReadyOut),
     /// R3 absolute deadline: broadcast a no-ready for `view`.
     BroadcastNoReady(View),
+    /// signature-free.tex's "Grounded post-ready skip" (par:skip-seal): the one-shot
+    /// statement `<skip-vote, u>` -- broadcast at most once per target, after this
+    /// party's own durably-emitted `NO-READY(u)`, a first-hand `2f+1` `ECHO-SKIP(u)`
+    /// census, a `free` resolution stance, and no known non-skip terminal seal for
+    /// `u` (sender is filled in by the caller, symmetric with `BroadcastEchoSkip`/
+    /// `BroadcastNoReady` above).
+    BroadcastSkipVote(View),
     /// §5's `Fixed` transition outcome for `view` (`true` = well-formed proposal now
     /// fixed, `false` = malformed/Reject) -- not itself a spec-named wire effect, but a
     /// necessary, minimal channel from `AgbEngine::on_propose` to `Frontier::record_fixed`

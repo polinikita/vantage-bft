@@ -58,6 +58,7 @@ impl DeclaredSender for Inbound {
             Inbound::ControlTimeoutVote(s, _) => Some(*s),
             Inbound::ControlTimeoutAccept(s, _) => Some(*s),
             Inbound::ControlFetch(_, _, s) => Some(*s),
+            Inbound::SkipVote(_, s) => Some(*s),
             Inbound::Serve(_)
             | Inbound::AckAvailability(_)
             | Inbound::Propose(_)

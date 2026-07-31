@@ -151,6 +151,12 @@ fn mac_candidate_sender(message: &PrimaryMessage) -> Option<PublicKey> {
         // Vantage's own `ControlServe` (see `vantage::node::mac_candidate_sender`'s
         // identical arm).
         PrimaryMessage::SimpleItCutServe(_) => None,
+        // A real, per-destination-verifiable sender field, mirroring `vantage::node::
+        // mac_candidate_sender`'s own arm for the same variant -- kept here too even
+        // though (like every other vantage-AGB-only variant below) it never
+        // legitimately reaches Simple-IT's port, matching this specific variant's
+        // treatment on the Vantage side exactly.
+        PrimaryMessage::VantageSkipVote(_, s) => Some(*s),
         // Autobahn-only and Vantage-AGB-only variants never legitimately reach the
         // Simple-IT assembly's port (`dispatch`'s own catch-all ignores them below);
         // no candidate needed.
@@ -811,7 +817,7 @@ impl SimpleItCore {
     /// against real I/O -- mirrors `VantageCore::execute`'s identical `VecDeque`-based
     /// loop, restricted to the six `Effect` variants `lm`/`rep` can actually produce.
     ///
-    /// The remaining 25 `Effect` variants (every AGB/pacemaker/control-log/anchor/
+    /// The remaining 26 `Effect` variants (every AGB/pacemaker/control-log/anchor/
     /// cursor-output variant `LaneManager`/`Repairer` never construct -- confirmed by
     /// inspection of both types' source: their only `Effect::` construction sites are
     /// `BroadcastPublish`, `BroadcastAck`, `SyncBatches`, `RequestTo`, `ServeTo`,
@@ -819,6 +825,9 @@ impl SimpleItCore {
     /// or `unreachable!()`: they are genuinely unproducible on this path, but a panic
     /// in a validator is worse than an observable drop, so a debug build gets a loud
     /// `debug_assert!` while a release build just counts and drops.
+    /// `Effect::BroadcastSkipVote` joins this list -- `AgbEngine::
+    /// recheck_skip_vote_trigger`'s only caller-visible effect, equally unproducible
+    /// on this data-plane-only path.
     async fn execute(&mut self, initial: Vec<Effect>) {
         let mut queue: VecDeque<Effect> = initial.into();
         while let Some(effect) = queue.pop_front() {
@@ -895,6 +904,7 @@ impl SimpleItCore {
                 | Effect::BroadcastEchoSkip(_)
                 | Effect::BroadcastReady(_)
                 | Effect::BroadcastNoReady(_)
+                | Effect::BroadcastSkipVote(_)
                 | Effect::Fixed(_, _)
                 | Effect::Completed(_, _, _)
                 | Effect::Sealed(_, _)

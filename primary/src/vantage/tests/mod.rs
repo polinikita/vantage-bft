@@ -38,5 +38,8 @@ mod control_tests;
 // PHASE6-SPEC.md §8
 mod byzantine_tests;
 
-// PHASE7 (`Parameters::batched_anchors`, "Batched resolution entries")
+// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph)
 mod batched_anchors_tests;
+
+// signature-free.tex 704fb29 -- "Grounded post-ready skip" (par:skip-seal)
+mod skip_vote_tests;

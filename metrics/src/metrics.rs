@@ -193,10 +193,20 @@ pub struct Metrics {
     /// wins is the route -- later compatible submissions for the same view never
     /// count again). Routes: `fast_full` (all-n unanimous fast seal), `direct_full`
     /// (grade-1 ready quorum), `direct_core` (grade-0 ready quorum), `anchor_full`,
-    /// `anchor_core`, `anchor_skip` (the apply-anchor adapter's three outcomes).
-    /// Different nodes can legitimately show different route distributions for the
-    /// same view (e.g. one node fast-seals while another only reaches the anchor).
+    /// `anchor_core`, `anchor_skip` (the apply-anchor adapter's three outcomes),
+    /// `vote_skip` (the grounded post-ready skip-vote quorum, signature-free.tex's
+    /// par:skip-seal). Different nodes can legitimately show different route
+    /// distributions for the same view (e.g. one node fast-seals while another only
+    /// reaches the anchor).
     pub vantage_seals: IntCounterVec,
+
+    // --- signature-free.tex's "Grounded post-ready skip" (par:skip-seal).
+    /// `SKIP-VOTE(u)` statements this node broadcast (one per target it voted on --
+    /// at most once per target, ever).
+    pub vantage_skip_votes_sent: IntCounter,
+    /// `SKIP-VOTE(u)` statements this node counted first-hand from a peer (self-votes
+    /// are not counted here -- see `vantage_skip_votes_sent`).
+    pub vantage_skip_votes_received: IntCounter,
 
     // --- Phase 7 prep (PHASE7-PREP-NOTES.md, Finding A diagnosis): always-on progress
     // gauges, one flat value each (no labels), sampled once/sec by `VantageCore` itself
@@ -602,8 +612,20 @@ impl Metrics {
             .unwrap(),
             vantage_seals: register_int_counter_vec_with_registry!(
                 "vantage_seals",
-                "Vantage views sealed, by route (fast_full/direct_full/direct_core/anchor_full/anchor_core/anchor_skip)",
+                "Vantage views sealed, by route (fast_full/direct_full/direct_core/anchor_full/anchor_core/anchor_skip/vote_skip)",
                 &["route"],
+                registry,
+            )
+            .unwrap(),
+            vantage_skip_votes_sent: register_int_counter_with_registry!(
+                "vantage_skip_votes_sent",
+                "Grounded SKIP-VOTE(u) statements this node broadcast",
+                registry,
+            )
+            .unwrap(),
+            vantage_skip_votes_received: register_int_counter_with_registry!(
+                "vantage_skip_votes_received",
+                "Grounded SKIP-VOTE(u) statements this node counted first-hand from a peer",
                 registry,
             )
             .unwrap(),

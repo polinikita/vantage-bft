@@ -79,12 +79,6 @@ pub struct Node {
     /// `avail_tick` itself to substitute the periodic watermark broadcast a real
     /// `VantageCore::run` would schedule.
     pub ack_watermarks: bool,
-    /// Mirrors `VantageCore::batched_anchors` exactly: `false` (the default, via
-    /// `Node::new`) takes `Resolver::decide`'s exact pre-existing path (0/1
-    /// entries, `ViewProposal` only); `true` (opt in via `with_batched_anchors`)
-    /// takes `Resolver::decide_prefix`'s path (0..=f entries, possibly a
-    /// `BatchViewProposal`).
-    pub batched_anchors: bool,
 }
 
 impl Node {
@@ -92,12 +86,11 @@ impl Node {
         Self::new_with_committee(name, path, max_views, test_committee())
     }
 
-    /// PHASE7 (`Parameters::batched_anchors`): `Node::new`'s generalization over an
-    /// arbitrary committee -- the fixed `test_committee()` (n=4, f=1) never allows a
-    /// genuine `k >= 2` batch (`agb::batch_cap` floors at `f`, which is 1 there), so
-    /// batching-specific end-to-end tests need a bigger one. `Node::new` itself is
-    /// unchanged (still `test_committee()`, byte/behavior-identical to before this
-    /// method existed) -- it just delegates here now.
+    /// PHASE7: `Node::new`'s generalization over an arbitrary committee -- the fixed
+    /// `test_committee()` (n=4, f=1) never allows a genuine `k >= 2` batch
+    /// (`agb::batch_cap` floors at `f`, which is 1 there), so batching-specific
+    /// end-to-end tests need a bigger one. `Node::new` itself is unchanged (still
+    /// `test_committee()`) -- it just delegates here now.
     pub fn new_with_committee(name: PublicKey, path: &str, max_views: View, committee: Committee) -> Self {
         let (lm, _store) = new_lane_manager_with_committee(name, path, committee.clone());
         let rep = new_repairer_with_committee(name, &lm, committee.clone());
@@ -146,7 +139,6 @@ impl Node {
             held_wishes: Vec::new(),
             metrics,
             ack_watermarks: false,
-            batched_anchors: false,
         }
     }
 
@@ -155,14 +147,6 @@ impl Node {
     /// (`vantage::node::VantageCore::build`) reads the flag from `Parameters` instead.
     pub fn with_ack_watermarks(mut self, on: bool) -> Self {
         self.ack_watermarks = on;
-        self
-    }
-
-    /// Opt this node into batched resolution entries (`Parameters::batched_anchors`)
-    /// -- see the field's own doc comment. Test-only builder; production wiring
-    /// (`vantage::node::VantageCore::build`) reads the flag from `Parameters` instead.
-    pub fn with_batched_anchors(mut self, on: bool) -> Self {
-        self.batched_anchors = on;
         self
     }
 
@@ -180,11 +164,7 @@ impl Node {
                 let agb = &self.agb;
                 let control = &self.control;
                 let resolved = |u: View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-                if self.batched_anchors {
-                    self.resolver.decide_prefix(agb, view, now, resolved)
-                } else {
-                    self.resolver.decide(agb, view, now, resolved).into_iter().collect()
-                }
+                self.resolver.decide_prefix(agb, view, now, resolved)
             } else {
                 Vec::new()
             };
@@ -355,6 +335,8 @@ impl Node {
                 self.control.on_control_fetch(requester, view, digest)
             }
             Inbound::ControlServe(view, proposal) => self.control.on_control_serve(view, proposal),
+            // Mirrors `vantage::node::VantageCore::dispatch_inbound`'s own arm.
+            Inbound::SkipVote(view, sender) => self.agb.on_skip_vote(view, sender),
         }
     }
 
@@ -537,6 +519,15 @@ pub fn drain_local(
                 for j in 0..n {
                     if j != idx && nodes[j].alive {
                         outbox.push_back((j, Inbound::NoReady(view, sender, wish)));
+                    }
+                }
+            }
+            // No wish piggyback, unlike `BroadcastEchoSkip`/`BroadcastNoReady` above.
+            Effect::BroadcastSkipVote(view) => {
+                let sender = nodes[idx].name;
+                for j in 0..n {
+                    if j != idx && nodes[j].alive {
+                        outbox.push_back((j, Inbound::SkipVote(view, sender)));
                     }
                 }
             }

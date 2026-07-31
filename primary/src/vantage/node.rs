@@ -68,8 +68,8 @@ pub enum Inbound {
     Avail(Vec<AvailEntry>, PublicKey),
     /// `VantagePropose`/`VantageProposeBatch` carry no sender field on the wire (§2)
     /// -- see `VantageCore::dispatch_inbound` for how the trusted sender is derived.
-    /// PHASE7 (`Parameters::batched_anchors`): `ProposalOut` -- `Single` normalizes
-    /// `VantagePropose`, `Batch` normalizes `VantageProposeBatch`.
+    /// PHASE7: `ProposalOut` -- `Single` normalizes `VantagePropose`, `Batch`
+    /// normalizes `VantageProposeBatch`.
     Propose(ProposalOut),
     /// PHASE7: `EchoOut` -- `Single` normalizes `VantageEcho`, `Batch` normalizes
     /// `VantageEchoBatch`.
@@ -99,6 +99,11 @@ pub enum Inbound {
     /// PHASE7: `ProposalOut` -- `Single` normalizes `ControlServe`, `Batch`
     /// normalizes `ControlServeBatch`.
     ControlServe(View, ProposalOut),
+    /// signature-free.tex's "Grounded post-ready skip" (par:skip-seal): a
+    /// `VantageSkipVote`. Carries no wish watermark (unlike `EchoSkip`/`NoReady`
+    /// above) -- the paper never requires one, and this is a rare, one-shot-per-target
+    /// crash-fallback statement, not a frequent response worth piggybacking on.
+    SkipVote(View, PublicKey),
 }
 
 /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
@@ -142,8 +147,8 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
         PrimaryMessage::ControlTimeoutAccept(_, s) => Some(*s),
         PrimaryMessage::ControlFetch(_, _, s) => Some(*s),
         PrimaryMessage::ControlServe(_, _) => None,
-        // PHASE7 (`Parameters::batched_anchors`): the vector-`M` counterparts, same
-        // D4/declared-sender classification as their singular siblings above.
+        // PHASE7: the vector-`M` counterparts, same D4/declared-sender
+        // classification as their singular siblings above.
         PrimaryMessage::VantageProposeBatch(p) => {
             Some(crate::vantage::agb::proposer(committee, p.view))
         }
@@ -153,6 +158,9 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
             Some(crate::vantage::control::control_leader(committee, p.round))
         }
         PrimaryMessage::ControlServeBatch(_, _) => None,
+        // A real, per-destination-verifiable sender field, same class as
+        // `VantageEchoSkip`/`VantageNoReady` above.
+        PrimaryMessage::VantageSkipVote(_, s) => Some(*s),
         // Autobahn-only variants never legitimately reach the Vantage assembly's port
         // (`dispatch`'s own catch-all ignores them below); no candidate needed.
         _ => None,
@@ -294,10 +302,10 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::ControlTimeoutAccept(r, s) => Inbound::ControlTimeoutAccept(s, r),
             PrimaryMessage::ControlFetch(v, d, s) => Inbound::ControlFetch(v, d, s),
             PrimaryMessage::ControlServe(v, p) => Inbound::ControlServe(v, ProposalOut::Single(p)),
-            // PHASE7 (`Parameters::batched_anchors`): the vector-`M` counterparts --
-            // normalized into the SAME `Inbound` variants above via `ProposalOut`/
-            // `EchoOut`/`ReadyOut`'s `Batch` case, so `dispatch_inbound` needs no new
-            // arms, only a shape dispatch at each existing one.
+            // PHASE7: the vector-`M` counterparts -- normalized into the SAME
+            // `Inbound` variants above via `ProposalOut`/`EchoOut`/`ReadyOut`'s
+            // `Batch` case, so `dispatch_inbound` needs no new arms, only a shape
+            // dispatch at each existing one.
             PrimaryMessage::VantageProposeBatch(p) => Inbound::Propose(ProposalOut::Batch(p)),
             PrimaryMessage::VantageEchoBatch(e) => Inbound::Echo(EchoOut::Batch(e)),
             PrimaryMessage::VantageReadyBatch(r) => Inbound::Ready(ReadyOut::Batch(r)),
@@ -307,6 +315,7 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::ControlServeBatch(v, p) => {
                 Inbound::ControlServe(v, ProposalOut::Batch(p))
             }
+            PrimaryMessage::VantageSkipVote(v, s) => Inbound::SkipVote(v, s),
             // Autobahn-only variants never reach the Vantage assembly's port; ignore
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
@@ -366,12 +375,6 @@ pub struct VantageCore {
     /// off (`run` never even constructs the periodic tick in that case).
     ack_watermark_period_ms: u64,
 
-    /// `Parameters::batched_anchors` (PHASE7, "Batched resolution entries"): when
-    /// `true`, `try_propose_effects` consults `Resolver::decide_prefix` instead of
-    /// `decide`, and may build/broadcast a `BatchViewProposal` instead of a
-    /// `ViewProposal`. `false` (the default) takes the exact same `decide`/
-    /// `ViewProposal` path as before this flag existed -- byte-identical.
-    batched_anchors: bool,
 
     /// §10 timer queue: (deadline, view, kind), drained by the run loop's `sleep_until`
     /// branch (message channels are checked first every iteration -- §5's tie-break
@@ -612,7 +615,6 @@ impl VantageCore {
             payload_size: 0,
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
-            batched_anchors: parameters.batched_anchors,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
             payload: PayloadIo {
@@ -988,18 +990,15 @@ impl VantageCore {
                 view += 1;
                 continue;
             }
-            // PHASE7 (`Parameters::batched_anchors`): off takes `decide`'s exact
-            // pre-existing path (0/1 entries); on takes `decide_prefix`'s prefix scan
-            // (0..=f entries) -- see `Resolver::decide_prefix`'s own doc comment.
+            // signature-free.tex's "Batched resolution entries" paragraph (narrowed by
+            // 704fb29, par:batched-anchors): the recovery-turn scan always uses
+            // `decide_prefix`'s prefix logic (0..=f entries), unconditional protocol
+            // behavior -- see its own doc comment.
             let entries: Vec<crate::vantage::ResolutionEntry> = {
                 let agb = &self.agb;
                 let control = &self.control;
                 let resolved = |u: View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-                if self.batched_anchors {
-                    self.resolver.decide_prefix(agb, view, now, resolved)
-                } else {
-                    self.resolver.decide(agb, view, now, resolved).into_iter().collect()
-                }
+                self.resolver.decide_prefix(agb, view, now, resolved)
             };
             let proposal = match entries.len() {
                 0 => self
@@ -1258,6 +1257,16 @@ impl VantageCore {
                 self.control.on_control_fetch(requester, view, digest)
             }
             Inbound::ControlServe(view, proposal) => self.control.on_control_serve(view, proposal),
+
+            // --- signature-free.tex's "Grounded post-ready skip" (par:skip-seal) ---
+            Inbound::SkipVote(view, sender) => {
+                // No `recheck_all`/`try_propose_effects` afterward: counting a vote
+                // only ever ADDS a new exclusion reason (a known terminal skip) to
+                // `TryMetaOK`'s conjunction for OTHER carrying views -- it can never
+                // newly SATISFY a pending one, unlike a lock-release-affecting
+                // `EchoSkip`/`NoReady`, so there is nothing here for either to unblock.
+                self.agb.on_skip_vote(view, sender)
+            }
         }
     }
 
@@ -1326,10 +1335,9 @@ impl VantageCore {
                     queue.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                     queue.extend(self.cursor.retry());
                 }
-                // PHASE7 (`Parameters::batched_anchors`): `Single` is byte-identical
-                // to the pre-PHASE7 path (same `VantagePropose` message); `Batch`
-                // (only ever constructed when the flag is on) rides the separate,
-                // flag-gated `VantageProposeBatch` message.
+                // PHASE7: `Single` rides the pre-PHASE7 `VantagePropose` message
+                // (0/1-entry `M`); `Batch` (`decide_prefix` produced `>= 2` entries)
+                // rides the separate `VantageProposeBatch` message.
                 Effect::BroadcastPropose(p) => match p {
                     ProposalOut::Single(p) => {
                         self.wire
@@ -1387,6 +1395,13 @@ impl VantageCore {
                     let wish = self.pacemaker.own_watermark();
                     self.wire
                         .broadcast_message(PrimaryMessage::VantageNoReady(view, self.name, wish))
+                        .await;
+                }
+                // No wish piggyback, unlike `BroadcastEchoSkip`/`BroadcastNoReady`
+                // above (see `Inbound::SkipVote`'s doc comment).
+                Effect::BroadcastSkipVote(view) => {
+                    self.wire
+                        .broadcast_message(PrimaryMessage::VantageSkipVote(view, self.name))
                         .await;
                 }
                 Effect::Fixed(view, well_formed) => {

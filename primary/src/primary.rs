@@ -157,6 +157,13 @@ pub enum PrimaryMessage {
         Option<crate::vantage::BatchViewProposal>,
     ),
     ControlServeBatch(View, crate::vantage::BatchViewProposal),
+    // Vantage only, signature-free.tex's "Grounded post-ready skip" (par:skip-seal).
+    // Unconditional protocol behavior (no flag, unlike the variants above): the
+    // one-shot statement `<skip-vote, u>`, sent by a correct party after its own
+    // durably-emitted no-ready, a first-hand 2f+1 echo-skip census, and a free
+    // resolution stance. Appended last -- same bincode wire-compat rule as every
+    // other protocol-specific variant above.
+    VantageSkipVote(View, /* sender */ PublicKey),
 }
 
 impl PrimaryMessage {
@@ -207,6 +214,7 @@ impl PrimaryMessage {
             PrimaryMessage::VantageReadyBatch(..) => "VantageReadyBatch",
             PrimaryMessage::ControlInitBatch(..) => "ControlInitBatch",
             PrimaryMessage::ControlServeBatch(..) => "ControlServeBatch",
+            PrimaryMessage::VantageSkipVote(..) => "VantageSkipVote",
         }
     }
 }
