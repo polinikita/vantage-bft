@@ -187,6 +187,30 @@ impl BlockCache {
         }
     }
 
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): this author's own
+    /// cached block at exactly `height`, if any. An author's own lane carries at
+    /// most one digest per height absent a Byzantine fork (`upsert`'s own doc
+    /// comment on fork representability); the first indexed digest is taken. Every
+    /// call site (`LaneManager::author_block_at`, reached only from
+    /// `VantageCore`/`SimpleItCore`'s `Inbound::LaneResume` handling after already
+    /// checking `author == self.name`) only ever asks about ITS OWN lane, which this
+    /// protocol never lets fork at the party serving it.
+    pub fn author_block_at(&self, author: &PublicKey, height: Height) -> Option<&Header> {
+        let digest = self.by_author.get(author)?.get(&height)?.iter().next()?;
+        self.by_digest.get(digest).map(|e| &e.block)
+    }
+
+    /// Mechanism A: the smallest height this party holds ANY cached block for
+    /// `author` at. Currently always `Some(1)` once `author` has published anything
+    /// -- N8 retention never discards (`BlockEntry::retained`'s doc comment: "must be
+    /// held + served forever once set") -- and `None` before that; kept as a real
+    /// query over `by_author`'s own index (not a hardcoded `1`) so the resume-serve
+    /// clamp this feeds (`LaneManager::earliest_authored_height`) stays correct if
+    /// height-based eviction is ever added to this cache.
+    pub fn earliest_height(&self, author: &PublicKey) -> Option<Height> {
+        self.by_author.get(author)?.keys().next().copied()
+    }
+
     pub fn author_refs(&self, author: &PublicKey) -> Vec<BlockRef> {
         self.by_author
             .get(author)
@@ -688,6 +712,20 @@ pub struct LaneManager {
     /// cached. Bounded by O(n^2), same as `credited_floor`, no GC needed.
     pending_avail: HashMap<(PublicKey, PublicKey), AvailEntry>,
 
+    /// Mechanism A (sender-side lane resume, `vantage::resume`) requester-side
+    /// trigger input: per-author max height that has reached at least an
+    /// (f+1)-availability mark (`AckThreshold::Validity`), maintained in
+    /// `process_ack_availability` -- the SAME mark-consumption site
+    /// `ack_availability`/`quorum_direct_refs` are already updated from, just also
+    /// tracking the plain running max height per author. Deliberately NOT
+    /// necessarily a contiguous prefix (an ack-availability mark is per EXACT tuple,
+    /// so a higher height can cross the threshold before a lower one does under
+    /// network asynchrony) -- this is exactly `avail(a)` in the design doc, "the
+    /// highest height with an (f+1)-availability mark for lane a", compared against
+    /// `own_avail_watermark`'s own CONTIGUOUS frontier below to detect a gap.
+    /// Bounded by committee size, same as `own_avail_watermark`, no GC needed.
+    avail_watermark_high: HashMap<PublicKey, Height>,
+
     /// §6.4 counters; `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
 }
@@ -737,6 +775,7 @@ impl LaneManager {
             avail_dirty: false,
             credited_floor: HashMap::new(),
             pending_avail: HashMap::new(),
+            avail_watermark_high: HashMap::new(),
             metrics: None,
         }
     }
@@ -1005,6 +1044,16 @@ impl LaneManager {
             return Vec::new();
         }
         self.ack_availability.insert(r.clone(), threshold);
+        // Mechanism A (`vantage::resume`): every mark reaching this point is, by
+        // construction, at least `Validity` (f+1) -- `AckAggregator::record_ack`
+        // never emits anything weaker -- so this is unconditional, not gated on
+        // `threshold`. A running max, not an insert-if-absent: marks for the same
+        // author can arrive out of height order (this is a per-EXACT-tuple fact, not
+        // a prefix), so only a genuinely higher height may advance it.
+        let high = self.avail_watermark_high.entry(r.0).or_insert(0);
+        if r.1 > *high {
+            *high = r.1;
+        }
         if threshold >= AckThreshold::Quorum
             && self.direct_pub_refs.contains(&r)
             && self.quorum_direct_refs.insert(r.clone())
@@ -1150,6 +1199,68 @@ impl LaneManager {
                 })
                 .collect(),
         )
+    }
+
+    /// Mechanism A (`vantage::resume`) requester-side trigger input: `frontier(a)` in
+    /// the design doc -- this party's own held CONTIGUOUS direct-verified prefix
+    /// height for lane `author`. Reuses `own_avail_watermark` -- the ack-watermark
+    /// front-end's identical per-author bookkeeping, unconditional regardless of
+    /// `Parameters::ack_watermarks` (see that field's own doc comment) -- rather than
+    /// duplicating a second frontier tracker. `0` (genesis) if nothing of `author`'s
+    /// has ever confirmed DirectPub at this party.
+    pub fn own_direct_frontier(&self, author: &PublicKey) -> Height {
+        self.own_avail_watermark
+            .get(author)
+            .map(|(h, _)| *h)
+            .unwrap_or(0)
+    }
+
+    /// Mechanism A requester-side trigger input: `avail(a)` in the design doc -- see
+    /// `avail_watermark_high`'s own doc comment. `0` if no (f+1) mark has ever been
+    /// recorded for `author`.
+    pub fn avail_high(&self, author: &PublicKey) -> Height {
+        self.avail_watermark_high.get(author).copied().unwrap_or(0)
+    }
+
+    /// Mechanism A serve-side upper bound: this party's own current lane tip height
+    /// (`own_frontier`'s pre-existing role for `publish_own`). Only meaningful as
+    /// "the requested lane's own tip" when `self.name` IS that lane's author --
+    /// `VantageCore`/`SimpleItCore`'s `Inbound::LaneResume` handling only ever calls
+    /// this after already checking exactly that.
+    pub fn own_tip_height(&self) -> Height {
+        self.own_frontier.0
+    }
+
+    /// Mechanism A serve-side clamp floor, delegating to `BlockCache::
+    /// earliest_height`; `1` (the lowest real block height -- height 0 is the
+    /// implicit, never-transmitted genesis) when nothing has been cached for
+    /// `author` yet, so a request naming `from <= 1` (or `0`) clamps up to the
+    /// earliest block that could ever legitimately be served.
+    pub fn earliest_authored_height(&self, author: &PublicKey) -> Height {
+        self.blocks
+            .lock()
+            .unwrap()
+            .earliest_height(author)
+            .unwrap_or(1)
+    }
+
+    /// Mechanism A serve-side lookup, delegating to `BlockCache::author_block_at`.
+    pub fn author_block_at(&self, author: &PublicKey, height: Height) -> Option<Header> {
+        self.blocks
+            .lock()
+            .unwrap()
+            .author_block_at(author, height)
+            .cloned()
+    }
+
+    /// Mechanism A receipt-continuation: the cached author of `digest`'s block, if
+    /// held. `on_payload_ready`'s delayed DirectPub transition (a header whose bytes
+    /// already arrived but whose payload was still syncing) is keyed by header
+    /// digest alone, unlike `Inbound::Publish`'s direct access to `header.author` --
+    /// this is the one extra lookup that lets the SAME "did frontier(author) just
+    /// advance" continuation check run at that call site too.
+    pub fn author_of(&self, digest: &Digest) -> Option<PublicKey> {
+        self.blocks.lock().unwrap().get(digest).map(|e| e.block.author)
     }
 
     /// Resolves a peer's ack-watermark vector into the exact `BlockRef`s this party's

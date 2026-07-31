@@ -219,6 +219,20 @@ pub struct Metrics {
     /// `VantageBodyFetch` with its own held, fixed `ViewProposal`.
     pub vantage_bodies_served: IntCounter,
 
+    // --- Mechanism A (sender-side lane resume, ack-census-gap-triggered -- see
+    // `vantage::resume`'s own module doc comment). Shared by both Vantage and
+    // Simple-IT (same `LaneManager`/`Wire` data plane). Always registered; expected
+    // to stay at/near zero on a fault-free run (a persistent gap never forms) and to
+    // recover dissemination after a windowed `--withhold` fault closes.
+    /// `VantageLaneResume` requests this node sent (one per (lane author, gap
+    /// height) the requester-side trigger actually fired for, after its two-tick
+    /// persistence check and backoff -- not one per tick).
+    pub vantage_lane_resume_requests_sent: IntCounter,
+    /// Own blocks this node served, as unicast `Header(_, false)`, answering a
+    /// peer's `VantageLaneResume` -- counted per block actually served, not per
+    /// request received.
+    pub vantage_lane_resume_blocks_served: IntCounter,
+
     // --- Phase 7 prep (PHASE7-PREP-NOTES.md, Finding A diagnosis): always-on progress
     // gauges, one flat value each (no labels), sampled once/sec by `VantageCore` itself
     // (metrics-only addition -- no protocol-semantic effect, same "always registered,
@@ -649,6 +663,18 @@ impl Metrics {
             vantage_bodies_served: register_int_counter_with_registry!(
                 "vantage_bodies_served",
                 "Digest-named AGB statements (signature-free.tex sec.8.3): VantageBodyServe messages this node sent",
+                registry,
+            )
+            .unwrap(),
+            vantage_lane_resume_requests_sent: register_int_counter_with_registry!(
+                "vantage_lane_resume_requests_sent",
+                "Mechanism A (sender-side lane resume): VantageLaneResume requests this node sent",
+                registry,
+            )
+            .unwrap(),
+            vantage_lane_resume_blocks_served: register_int_counter_with_registry!(
+                "vantage_lane_resume_blocks_served",
+                "Mechanism A (sender-side lane resume): own blocks this node served answering a VantageLaneResume request",
                 registry,
             )
             .unwrap(),

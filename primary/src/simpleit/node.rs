@@ -24,6 +24,7 @@ use crate::vantage::lanes::{
 };
 use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
+use crate::vantage::resume::{self, ResumeServe, ResumeTrigger};
 use crate::vantage::wire::{self, DeclaredSender, Wire};
 use crate::vantage::{BlockRef, Effect};
 use async_trait::async_trait;
@@ -39,7 +40,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -110,6 +111,10 @@ pub enum Inbound {
     /// The five wire-received cut-consensus messages, forwarded to `CutEngine::handle`
     /// verbatim.
     Cut(engine::Inbound),
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): a peer's
+    /// `VantageLaneResume(author, from, requester)` -- mirrors `vantage::node::
+    /// Inbound::LaneResume` exactly (same wire message, same data plane).
+    LaneResume(PublicKey, Height, PublicKey),
 }
 
 impl DeclaredSender for Inbound {
@@ -120,6 +125,8 @@ impl DeclaredSender for Inbound {
             Inbound::Serve(_) | Inbound::AckAvailability(_) => None,
             Inbound::Avail(_, s) => Some(*s),
             Inbound::Cut(cut_inbound) => cut_inbound.declared_sender(),
+            // Mechanism A: mirrors `vantage::node::Inbound`'s own identical arm.
+            Inbound::LaneResume(_, _, requester) => Some(*requester),
         }
     }
 }
@@ -163,6 +170,10 @@ fn mac_candidate_sender(message: &PrimaryMessage) -> Option<PublicKey> {
         // legitimately reaches Simple-IT's port, matching this specific variant's
         // treatment on the Vantage side exactly.
         PrimaryMessage::VantageSkipVote(_, s) => Some(*s),
+        // Mechanism A (`vantage::resume`): a real, per-destination-verifiable
+        // declared requester, mirroring `vantage::node::mac_candidate_sender`'s own
+        // identical arm for this variant.
+        PrimaryMessage::VantageLaneResume(_, _, requester) => Some(*requester),
         // Autobahn-only and Vantage-AGB-only variants never legitimately reach the
         // Simple-IT assembly's port (`dispatch`'s own catch-all ignores them below);
         // no candidate needed.
@@ -266,6 +277,10 @@ impl MessageHandler for SimpleItReceiverHandler {
                 Inbound::Cut(engine::Inbound::CutFetch(round, digest, requester))
             }
             PrimaryMessage::SimpleItCutServe(p) => Inbound::Cut(engine::Inbound::CutServe(p)),
+            // Mechanism A (`vantage::resume`).
+            PrimaryMessage::VantageLaneResume(author, from, requester) => {
+                Inbound::LaneResume(author, from, requester)
+            }
             // Autobahn-only and Vantage-AGB-only variants never reach the Simple-IT
             // assembly's port; ignore rather than panic (defense in depth against a
             // misrouted message).
@@ -362,6 +377,21 @@ pub struct SimpleItCore {
     /// The ack-watermark broadcast period, ms -- irrelevant when `ack_watermarks` is
     /// off.
     ack_watermark_period_ms: u64,
+
+    /// Mechanism A (sender-side lane resume, `vantage::resume`) -- mirrors
+    /// `vantage::node::VantageCore`'s identical fields exactly (own separate
+    /// instances, same reasoning as every other data-plane field on this struct).
+    /// Unconditional protocol behavior (no flag) -- every party always runs this
+    /// check.
+    resume_trigger: ResumeTrigger,
+    resume_serve: ResumeServe,
+    /// `Parameters::resume_check_period_ms` -- the `run` loop's `resume_tick` period.
+    resume_check_period_ms: u64,
+    /// `Parameters::resume_backoff_ms` -- shared by both `resume_trigger` and
+    /// `resume_serve`.
+    resume_backoff_ms: u64,
+    /// `Parameters::resume_batch` -- the maximum own blocks served per resume batch.
+    resume_batch: u64,
 
     /// Session id / genesis digest, computed once at `build` time (mirrors
     /// `VantageCore::build`'s identical locals) -- kept as fields because
@@ -609,6 +639,11 @@ impl SimpleItCore {
             payload_size: 0,
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
+            resume_trigger: ResumeTrigger::new(),
+            resume_serve: ResumeServe::new(),
+            resume_check_period_ms: parameters.resume_check_period_ms,
+            resume_backoff_ms: parameters.resume_backoff_ms,
+            resume_batch: parameters.resume_batch,
             sid,
             genesis,
             max_block_payload: parameters.max_block_payload,
@@ -676,6 +711,13 @@ impl SimpleItCore {
             None
         };
 
+        // Mechanism A (sender-side lane resume, `vantage::resume`): mirrors
+        // `VantageCore::run`'s identical construction -- unconditional (no flag),
+        // its own dedicated tick so `Parameters::resume_check_period_ms` is
+        // genuinely honored.
+        let mut resume_tick = tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
+        resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             self.wire.maybe_prune_cancel_handlers();
 
@@ -734,6 +776,21 @@ impl SimpleItCore {
                     }
                 }
 
+                // Mechanism A (design doc step 2): mirrors `VantageCore::run`'s
+                // identical `resume_tick` branch -- the EPISODE DETECTOR/retry
+                // driver; ongoing drain of an established episode instead runs at
+                // receipt pace via `try_resume_request`'s other call sites
+                // (`Inbound::Publish`/`on_payload_ready` in `dispatch_inbound`/
+                // `on_payload_ready` below).
+                _ = resume_tick.tick() => {
+                    let now = Instant::now();
+                    let authors: Vec<PublicKey> =
+                        self.wire.other_primaries.iter().map(|(pk, _)| *pk).collect();
+                    for author in authors {
+                        self.try_resume_request(author, now).await;
+                    }
+                }
+
                 _ = prune_tick.tick() => {
                     self.wire.prune_cancel_handlers();
                     self.collect_internal_garbage();
@@ -779,8 +836,16 @@ impl SimpleItCore {
         }
         match inbound {
             Inbound::Publish(sender, header) => {
+                // Mechanism A receipt-continuation (design doc step 3, mirrors
+                // `VantageCore::dispatch_inbound`'s identical hook): this publish
+                // may have just advanced `frontier(author)`.
+                let author = header.author;
+                let before = self.lm.own_direct_frontier(&author);
                 let effects = self.lm.process_publish(sender, header).await;
                 self.execute(effects).await;
+                if self.lm.own_direct_frontier(&author) > before {
+                    self.try_resume_request(author, Instant::now()).await;
+                }
             }
             Inbound::Serve(header) => {
                 let effects = self.rep.on_serve(header);
@@ -815,6 +880,36 @@ impl SimpleItCore {
                     self.cut.handle(cut_inbound, &tips, &oracle)
                 };
                 self.execute_cut(effects).await;
+            }
+            // Mechanism A (`vantage::resume`): mirrors `vantage::node::VantageCore::
+            // dispatch_inbound`'s own `Inbound::LaneResume` arm exactly (same clamp,
+            // dedup, and batch-cap decisions -- see that arm's own comments).
+            Inbound::LaneResume(author, from, requester) => {
+                if author != self.name {
+                    return;
+                }
+                let floor = self.lm.earliest_authored_height(&author);
+                let from = from.max(floor);
+                let tip = self.lm.own_tip_height();
+                if from > tip {
+                    return;
+                }
+                let now = Instant::now();
+                let backoff = Duration::from_millis(self.resume_backoff_ms);
+                if !self.resume_serve.should_serve(requester, from, now, backoff) {
+                    return;
+                }
+                let to = (from + self.resume_batch - 1).min(tip);
+                let mut effects = Vec::with_capacity((to - from + 1) as usize);
+                for height in from..=to {
+                    if let Some(header) = self.lm.author_block_at(&author, height) {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_lane_resume_blocks_served.inc();
+                        }
+                        effects.push(Effect::ResumeServeTo(requester, header));
+                    }
+                }
+                self.execute(effects).await;
             }
         }
     }
@@ -878,6 +973,11 @@ impl SimpleItCore {
     /// or `unreachable!()`: they are genuinely unproducible on this path, but a panic
     /// in a validator is worse than an observable drop, so a debug build gets a loud
     /// `debug_assert!` while a release build just counts and drops.
+    ///
+    /// `Effect::ResumeServeTo` (Mechanism A, `vantage::resume`) is NOT in that list
+    /// below, unlike every other AGB-family variant: it IS genuinely producible on
+    /// this path, constructed directly by `dispatch_inbound`'s own `Inbound::
+    /// LaneResume` arm (not by `lm`/`rep`), so it gets a real arm just below.
     /// `Effect::BroadcastSkipVote` joins this list -- `AgbEngine::
     /// recheck_skip_vote_trigger`'s only caller-visible effect, equally unproducible
     /// on this data-plane-only path.
@@ -956,6 +1056,18 @@ impl SimpleItCore {
                     // `CutEngine` exposes none for this specific case (unlike
                     // `retry_pending_cut_proposals`, which the engine already invokes
                     // internally for the unrelated SAFE-PARENT-blocked case).
+                }
+
+                // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+                Effect::ResumeServeTo(requester, header) => {
+                    // `resume::SEND_TIMEOUT`'s own doc comment: bounds a single slow
+                    // requester's cost to this one batch entry, never this whole
+                    // effect-drain loop.
+                    let _ = tokio::time::timeout(
+                        resume::SEND_TIMEOUT,
+                        self.wire.send_resume_header(requester, header),
+                    )
+                    .await;
                 }
                 other @ (Effect::BroadcastPropose(_)
                 | Effect::BroadcastEcho(_)
@@ -1223,7 +1335,8 @@ impl SimpleItCore {
         self.execute(effects).await;
     }
 
-    /// D1 payload-sync bookkeeping -- mirrors `VantageCore::on_payload_ready` exactly.
+    /// D1 payload-sync bookkeeping -- mirrors `VantageCore::on_payload_ready` exactly,
+    /// including its Mechanism A receipt-continuation hook.
     async fn on_payload_ready(&mut self, header_digest: Digest, digest: Digest, worker_id: WorkerId) {
         let mut resolved = false;
         if let Some(set) = self.payload.pending_payload.get_mut(&header_digest) {
@@ -1232,6 +1345,13 @@ impl SimpleItCore {
         }
         if resolved {
             self.payload.pending_payload.remove(&header_digest);
+            // Mechanism A receipt-continuation (design doc step 3, mirrors
+            // `VantageCore::on_payload_ready`'s identical hook): the DELAYED half
+            // of "a resume-served header advances frontier(author)" -- taken
+            // BEFORE `set_payload_ready`, which is the call that may actually
+            // advance `own_direct_frontier` for it.
+            let author = self.lm.author_of(&header_digest);
+            let before = author.map(|a| self.lm.own_direct_frontier(&a));
             let effects = self.lm.set_payload_ready(&header_digest);
             self.execute(effects).await;
             // Defensive trigger, mirroring `Effect::BlockCached`'s identical one:
@@ -1241,6 +1361,39 @@ impl SimpleItCore {
             // re-attempting here costs little and keeps this call site aligned with
             // the other trigger point in case that independence ever changes.
             self.drain_commit_queue().await;
+            if let (Some(author), Some(before)) = (author, before) {
+                if self.lm.own_direct_frontier(&author) > before {
+                    self.try_resume_request(author, Instant::now()).await;
+                }
+            }
+        }
+    }
+
+    /// Mechanism A (sender-side lane resume, `vantage::resume`) -- mirrors
+    /// `VantageCore::try_resume_request` exactly. Shared by the periodic
+    /// `resume_tick` and both receipt-continuation call sites
+    /// (`dispatch_inbound`'s `Inbound::Publish` arm, `on_payload_ready` above).
+    async fn try_resume_request(&mut self, author: PublicKey, now: Instant) {
+        let frontier = self.lm.own_direct_frontier(&author);
+        let avail = self.lm.avail_high(&author);
+        let backoff = Duration::from_millis(self.resume_backoff_ms);
+        if let Some(from) = self
+            .resume_trigger
+            .check(author, frontier, avail, now, backoff, self.resume_batch)
+        {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_lane_resume_requests_sent.inc();
+            }
+            // `resume::SEND_TIMEOUT`'s own doc comment: a single backed-up
+            // destination must cost this one send, never this whole run loop.
+            let _ = tokio::time::timeout(
+                resume::SEND_TIMEOUT,
+                self.wire.send_message(
+                    author,
+                    PrimaryMessage::VantageLaneResume(author, from, self.name),
+                ),
+            )
+            .await;
         }
     }
 }

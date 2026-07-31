@@ -183,6 +183,26 @@ pub enum PrimaryMessage {
     // `simpleit::engine::CutEngine::broadcast_cut_ready`). Appended last -- same
     // bincode wire-compat rule as every other protocol-specific variant above.
     SimpleItCutReady(crate::simpleit::CutReady),
+    // Mechanism A (sender-side lane resume, modeled on Starfish's subscription
+    // resume but ack-census-gap-triggered rather than reconnection-triggered --
+    // motivated by the windowed `--withhold` experiment). A requester asks the named
+    // lane AUTHOR to re-publish its own lane from `from` (inclusive) upward --
+    // unicast to the author only, never broadcast. Shared by both Vantage and
+    // Simple-IT (same `LaneManager`/`Wire` data plane); see `vantage::resume`'s own
+    // module doc comment for the full trigger/serve design. No separate reply
+    // variant: the author answers with ordinary `Header(_, false)` messages,
+    // unicast (`vantage::wire::Wire::send_resume_header`) -- receipt is therefore
+    // DirectPub/ack-eligible through the existing publish path, exactly as a
+    // broadcast publish would be, and still subject to the `--withhold` filter
+    // during an active window (required for experiment fidelity: a withholding
+    // sender must not resume-serve its own blocked half mid-window either).
+    // Appended last -- same bincode wire-compat rule as every other
+    // protocol-specific variant above.
+    VantageLaneResume(
+        /* lane author */ PublicKey,
+        /* from height, inclusive */ Height,
+        /* requester */ PublicKey,
+    ),
 }
 
 impl PrimaryMessage {
@@ -239,6 +259,7 @@ impl PrimaryMessage {
             PrimaryMessage::VantageBodyFetch(..) => "VantageBodyFetch",
             PrimaryMessage::VantageBodyServe(..) => "VantageBodyServe",
             PrimaryMessage::SimpleItCutReady(..) => "SimpleItCutReady",
+            PrimaryMessage::VantageLaneResume(..) => "VantageLaneResume",
         }
     }
 }

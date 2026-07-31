@@ -7,6 +7,7 @@
 // `VantageCore`, aside from the `self.` -> `self.wire.`-style re-pointing the split
 // forces at `VantageCore`'s own call sites (see `node.rs` itself for those).
 
+use crate::messages::Header;
 use crate::primary::PrimaryMessage;
 use crate::vantage::node::{message_needs_placeholder_tag, Inbound};
 use bytes::Bytes;
@@ -67,6 +68,11 @@ impl DeclaredSender for Inbound {
             Inbound::EchoDigest(d) => Some(d.sender),
             Inbound::ReadyDigest(d) => Some(d.sender),
             Inbound::BodyFetch(_, _, s) => Some(*s),
+            // Mechanism A (`vantage::resume`): a real declared requester, same class
+            // as `HeadersRequest`/`BodyFetch` above -- checked against membership
+            // before `dispatch_inbound` ever inspects the (untrusted-until-then)
+            // `author` field.
+            Inbound::LaneResume(_, _, requester) => Some(*requester),
             Inbound::Serve(_)
             | Inbound::AckAvailability(_)
             | Inbound::Propose(_)
@@ -415,6 +421,38 @@ impl Wire {
             }
         };
         self.worker_network.send_typed(addr, data, msg_type).await;
+    }
+
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): unicasts our own
+    /// original-dissemination header to `peer` as one entry of a resume batch. Same
+    /// wire encoding as a fresh publish (`Header(_, false)`, MAC-bound to
+    /// `h.author` -- `mac_candidate_sender`'s existing arm for this variant already
+    /// covers it unchanged, since this is only ever called by the block's own author
+    /// answering a `VantageLaneResume` for its OWN lane, i.e. `h.author ==
+    /// self.name`), just unicast instead of broadcast -- so receipt is DirectPub/
+    /// ack-eligible through the existing publish path exactly as a broadcast publish
+    /// would be. Deliberately routed through `send_message` (genuine per-destination
+    /// MAC tag), never through the placeholder-tag path.
+    ///
+    /// Consults the SAME withholding predicate `broadcast_message`'s `Header(_,
+    /// false)` arm does (`withheld_header_dests` + `config::withhold_active`): a
+    /// withholding sender mid-window must not resume-serve its own blocked half
+    /// either -- `--withhold` models a sender that never gets this data to that half
+    /// AT ALL during the window, and a resume batch is still that same data, merely
+    /// addressed differently on the wire. `withheld_header_dests`'s second component
+    /// (`full`, this node's ALLOWED, i.e. non-blocked, destinations) is what's
+    /// consulted -- `peer` not appearing in it means `peer` is in this node's
+    /// blocked half.
+    pub(crate) async fn send_resume_header(&mut self, peer: PublicKey, header: Header) {
+        if let Some((_, allowed)) = &self.withheld_header_dests {
+            let peer_allowed = allowed.iter().any(|(pk, _)| *pk == peer);
+            if !peer_allowed && config::withhold_active(self.withhold_window.as_deref(), Instant::now())
+            {
+                return;
+            }
+        }
+        self.send_message(peer, PrimaryMessage::Header(header, false))
+            .await;
     }
 
     /// Small accessor for `VantageCore::sync_batches`/`notify_committed` (which stay on

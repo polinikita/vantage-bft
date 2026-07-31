@@ -388,6 +388,33 @@ impl Node {
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects
             }
+            // Mechanism A (`vantage::resume`): mirrors `vantage::node::VantageCore::
+            // dispatch_inbound`'s own `Inbound::LaneResume` arm's clamp + serve
+            // decision. Deliberately simpler than production in two PACING-only
+            // respects that no existing test in this suite depends on: no
+            // `resume_batch` cap (serves through our own tip in one go) and no
+            // `ResumeServe` dedup memo (this harness has no analogue of `VantageCore::
+            // resume_serve`, and nothing here drives the requester-side trigger tick
+            // that would call this repeatedly) -- the CORRECTNESS-bearing part
+            // (foreign-lane rejection, floor clamp) is unchanged from production.
+            Inbound::LaneResume(author, from, requester) => {
+                if author != self.name {
+                    return Vec::new();
+                }
+                let floor = self.lm.earliest_authored_height(&author);
+                let from = from.max(floor);
+                let tip = self.lm.own_tip_height();
+                if from > tip {
+                    return Vec::new();
+                }
+                let mut effects = Vec::new();
+                for height in from..=tip {
+                    if let Some(header) = self.lm.author_block_at(&author, height) {
+                        effects.push(Effect::ResumeServeTo(requester, header));
+                    }
+                }
+                effects
+            }
         }
     }
 
@@ -750,6 +777,20 @@ pub fn drain_local(
                 if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
                     if nodes[j].alive {
                         outbox.push_back((j, Inbound::BodyServe(view, proposal)));
+                    }
+                }
+            }
+
+            // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+            // Same wire encoding as `Effect::BroadcastPublish` (`Header(_, false)`,
+            // which always maps to `Inbound::Publish` regardless of unicast vs.
+            // broadcast delivery -- see `vantage::wire::Wire::send_resume_header`'s
+            // own doc comment), just routed to exactly one target instead of every
+            // live node.
+            Effect::ResumeServeTo(requester, header) => {
+                if let Some(j) = nodes.iter().position(|nd| nd.name == requester) {
+                    if nodes[j].alive {
+                        outbox.push_back((j, Inbound::Publish(header.author, header.clone())));
                     }
                 }
             }

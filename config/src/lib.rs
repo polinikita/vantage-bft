@@ -517,6 +517,56 @@ pub struct Parameters {
     /// `blip_node_index`.
     #[serde(skip)]
     pub blip_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
+
+    /// Mechanism A (sender-side lane resume, modeled on Starfish's subscription
+    /// resume but ack-census-gap-triggered instead of reconnection-triggered --
+    /// motivated by the windowed `--withhold` experiment, where a fire-and-forget
+    /// broadcast publish never gets replayed for whatever half of the committee
+    /// missed it during the window). The periodic tick period at which
+    /// `VantageCore`/`SimpleItCore` check each OTHER lane author for a persistent gap
+    /// between this party's own held contiguous direct-verified prefix
+    /// (`vantage::lanes::LaneManager::own_direct_frontier`) and the highest
+    /// (f+1)-attested height for that author's lane
+    /// (`vantage::lanes::LaneManager::avail_high`) -- see `vantage::resume`'s own
+    /// module doc comment for the trigger/serve design. Shared by both Vantage and
+    /// Simple-IT (same `LaneManager`/`Wire` data plane). `#[serde(default)]`
+    /// (1000 ms) keeps every pre-existing parameter file valid.
+    #[serde(default = "default_resume_check_period_ms")]
+    pub resume_check_period_ms: u64,
+    /// Mechanism A: the minimum spacing between two `VantageLaneResume` requests this
+    /// party sends for the SAME (lane author, gap height), and independently the
+    /// minimum spacing between two resume batches a lane author serves for the SAME
+    /// (requester, gap height) -- a resend/re-serve rate limit, not an absolute
+    /// one-shot (a request/serve for a DIFFERENT height is never held back by this).
+    /// `#[serde(default)]` (4000 ms) keeps every pre-existing parameter file valid.
+    #[serde(default = "default_resume_backoff_ms")]
+    pub resume_backoff_ms: u64,
+    /// Mechanism A: the maximum number of own blocks a lane author serves in a
+    /// single resume batch. Requester-paced rather than a server-side cursor
+    /// looping to the author's own tip in one shot: the requester's own frontier
+    /// advances on receipt of a batch, and its NEXT REQUEST follows immediately
+    /// (`VantageCore::try_resume_request`'s receipt-continuation call sites,
+    /// `Inbound::Publish`/`on_payload_ready` -- not just the periodic
+    /// `resume_check_period_ms` tick) -- this deliberately simplifies Starfish's
+    /// server-side park-on-notify serving loop (no per-requester cursor state to
+    /// clean up) while still draining at receipt pace, not tick pace.
+    ///
+    /// NOT a direct copy of Starfish's own `batch_own_block_size` default (8,
+    /// crates/starfish-core/src/dag_state.rs) despite the shared name and role:
+    /// Starfish's 8 is sized per iteration of a server-side loop that keeps
+    /// streaming batch after batch with no round trip in between (bounded only by
+    /// the transport's own flow control); ours is sized per REQUEST-RESPONSE ROUND
+    /// TRIP (one batch, then wait for the next ask). At Starfish's cadence 8/
+    /// iteration over a tight loop is already fast; at ours, 8/RTT over a
+    /// (bursty, contended-WAN-mimicked) round trip is not -- 64/RTT
+    /// (~150-300 ms under this repo's own AWS-RTT latency mimic) is roughly
+    /// 200-400 blocks/s/lane, enough to clear a several-hundred-block gap (this
+    /// repo's own `max_header_delay` default publishes roughly one block every
+    /// tens of ms per author, so even a short fault window backs up a lane by
+    /// hundreds of blocks) in low single-digit seconds instead of tens of seconds.
+    /// `#[serde(default)]` (64) keeps every pre-existing parameter file valid.
+    #[serde(default = "default_resume_batch")]
+    pub resume_batch: u64,
 }
 
 fn default_batch_max_bytes() -> usize {
@@ -562,6 +612,21 @@ fn default_blip_for_ms() -> u64 {
 /// CLI default.
 fn default_withhold_for_ms() -> u64 {
     30_000
+}
+
+/// `Parameters::resume_check_period_ms`'s own doc comment.
+fn default_resume_check_period_ms() -> u64 {
+    1_000
+}
+
+/// `Parameters::resume_backoff_ms`'s own doc comment.
+fn default_resume_backoff_ms() -> u64 {
+    4_000
+}
+
+/// `Parameters::resume_batch`'s own doc comment.
+fn default_resume_batch() -> u64 {
+    64
 }
 
 /// AWS region names for the 10-region RTT matrix below. Ported VERBATIM from
@@ -791,6 +856,9 @@ impl Default for Parameters {
             blip_at_ms: 0,
             blip_for_ms: default_blip_for_ms(),
             blip_window: None,
+            resume_check_period_ms: default_resume_check_period_ms(),
+            resume_backoff_ms: default_resume_backoff_ms(),
+            resume_batch: default_resume_batch(),
         }
     }
 }
@@ -894,6 +962,11 @@ impl Parameters {
             "Digest-named AGB statements (ECHO/READY name their proposal by hash \
              instead of by value) enabled? {}",
             self.digest_statements
+        );
+        info!(
+            "Lane-resume (Mechanism A: sender-side resume triggered by an ack-census \
+             gap) check period {} ms, backoff {} ms, batch {} blocks",
+            self.resume_check_period_ms, self.resume_backoff_ms, self.resume_batch
         );
         if self.withhold_senders > 0 {
             match self.withhold_at_ms {

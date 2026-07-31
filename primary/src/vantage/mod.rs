@@ -17,6 +17,7 @@ pub mod pacemaker;
 pub mod payload;
 pub mod repair;
 pub mod resolve;
+pub mod resume;
 pub mod threshold;
 pub mod wire;
 
@@ -213,6 +214,19 @@ pub enum Effect {
     /// `BatchViewProposal` -- digest-named statements are the `ViewProposal`
     /// (Single)-only encoding (see `EchoDigest`'s own doc comment).
     BodyServeTo(PublicKey, View, ViewProposal),
+
+    // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+    /// Unicast our own original-dissemination header to `requester`, one entry of a
+    /// resume batch answering its `VantageLaneResume` (design doc step 3). Deliberately
+    /// NOT `Effect::ServeTo`: that effect always sends `Header(_, true)` ("Serve"),
+    /// which carries no sender claim to MAC-bind and is never subject to the
+    /// `--withhold` filter or the receive path's DirectPub/ack accounting the way an
+    /// ORIGINAL-dissemination `Header(_, false)` publish is -- see this variant's own
+    /// construction site (`vantage::node::VantageCore::dispatch_inbound`'s
+    /// `Inbound::LaneResume` arm) for why the resumed republish must use the OTHER
+    /// encoding. Executed via `Wire::send_resume_header`, not `Wire::send_message`
+    /// directly, so the withholding fault injector still governs it mid-window.
+    ResumeServeTo(PublicKey /* requester */, Header),
 }
 
 pub mod control;

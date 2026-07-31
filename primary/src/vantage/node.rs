@@ -5,7 +5,7 @@
 // the one piece of genuinely shared state (§3.3's cross-notification hook).
 
 use crate::messages::{Ack, Header};
-use crate::primary::{PrimaryMessage, View, CHANNEL_CAPACITY};
+use crate::primary::{Height, PrimaryMessage, View, CHANNEL_CAPACITY};
 use crate::vantage::agb::{
     AgbEngine, DigestStatements, EchoDigest, EchoOut, ProposalOut, ReadyDigest, ReadyOut,
     TimerKind, ViewProposal,
@@ -22,6 +22,7 @@ use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
+use crate::vantage::resume::{self, ResumeServe, ResumeTrigger};
 use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
 use async_trait::async_trait;
@@ -119,6 +120,13 @@ pub enum Inbound {
     BodyFetch(View, Digest, PublicKey),
     /// A peer's `VantageBodyServe(view, proposal)` answer.
     BodyServe(View, ViewProposal),
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): a peer's
+    /// `VantageLaneResume(author, from, requester)` -- `author` is the LANE this
+    /// message is about (checked against `self.name` in `dispatch_inbound`, not
+    /// trusted merely because it decoded), `from` is the requested resume-from
+    /// height, and `requester` is who's asking (a real, declared, MAC/membership-
+    /// checked sender -- same D4 class as `HeadersRequest`'s own `requestor` field).
+    LaneResume(PublicKey, Height, PublicKey),
 }
 
 /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
@@ -186,6 +194,12 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
         PrimaryMessage::VantageReadyDigest(d) => Some(d.sender),
         PrimaryMessage::VantageBodyFetch(_, _, s) => Some(*s),
         PrimaryMessage::VantageBodyServe(_, _) => None,
+        // Mechanism A (`vantage::resume`): a real, per-destination-verifiable
+        // declared requester, same class as `VantageBodyFetch`/`ControlFetch`
+        // above -- the message asserts "I, requester, am asking author to resume its
+        // lane", requester's own claim, MAC-bound to requester regardless of who the
+        // (separately, protocol-level-checked) named lane author is.
+        PrimaryMessage::VantageLaneResume(_, _, requester) => Some(*requester),
         // Autobahn-only variants never legitimately reach the Vantage assembly's port
         // (`dispatch`'s own catch-all ignores them below); no candidate needed.
         _ => None,
@@ -354,6 +368,10 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageReadyDigest(d) => Inbound::ReadyDigest(d),
             PrimaryMessage::VantageBodyFetch(v, d, r) => Inbound::BodyFetch(v, d, r),
             PrimaryMessage::VantageBodyServe(v, p) => Inbound::BodyServe(v, p),
+            // Mechanism A (`vantage::resume`).
+            PrimaryMessage::VantageLaneResume(author, from, requester) => {
+                Inbound::LaneResume(author, from, requester)
+            }
             // Autobahn-only variants never reach the Vantage assembly's port; ignore
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
@@ -426,6 +444,21 @@ pub struct VantageCore {
     /// doc comment) -- reception of either wire encoding is NEVER gated by this
     /// flag, on this or any other party.
     digest_statements: bool,
+
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): the requester-side
+    /// per-lane trigger memo (two-consecutive-ticks persistence + request backoff).
+    /// Unconditional protocol behavior (no flag, unlike `ack_watermarks`/
+    /// `digest_statements` above) -- every party always runs this check.
+    resume_trigger: ResumeTrigger,
+    /// Mechanism A: the author-side per-requester serve dedup memo.
+    resume_serve: ResumeServe,
+    /// `Parameters::resume_check_period_ms` -- the `run` loop's `resume_tick` period.
+    resume_check_period_ms: u64,
+    /// `Parameters::resume_backoff_ms` -- shared by both `resume_trigger` (request
+    /// rate limit) and `resume_serve` (serve rate limit).
+    resume_backoff_ms: u64,
+    /// `Parameters::resume_batch` -- the maximum own blocks served per resume batch.
+    resume_batch: u64,
 
     /// §10 timer queue: (deadline, view, kind), drained by the run loop's `sleep_until`
     /// branch (message channels are checked first every iteration -- §5's tie-break
@@ -701,6 +734,11 @@ impl VantageCore {
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
             digest_statements: parameters.digest_statements,
+            resume_trigger: ResumeTrigger::new(),
+            resume_serve: ResumeServe::new(),
+            resume_check_period_ms: parameters.resume_check_period_ms,
+            resume_backoff_ms: parameters.resume_backoff_ms,
+            resume_batch: parameters.resume_batch,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
             payload: PayloadIo {
@@ -765,6 +803,14 @@ impl VantageCore {
         } else {
             None
         };
+
+        // Mechanism A (sender-side lane resume, `vantage::resume`): unconditional
+        // (no flag -- every party always runs this check, unlike `avail_tick`
+        // above), its own dedicated tick so `Parameters::resume_check_period_ms` is
+        // genuinely honored rather than piggybacking on `metrics_tick`'s fixed 1s
+        // period.
+        let mut resume_tick = tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
+        resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             // P4-3, amended by Fable perf audit item 4: bound `cancel_handlers`'
@@ -858,6 +904,31 @@ impl VantageCore {
                     }
                 }
 
+                // Mechanism A (design doc step 2): every author besides ourselves,
+                // checked against the SAME persistent-gap trigger regardless of
+                // whether it's currently gap-free (the common case) or stuck --
+                // `ResumeTrigger::check` is the one place that decides, per author,
+                // whether this tick actually sends anything. This tick is the
+                // EPISODE DETECTOR (the two-consecutive-ticks persistence bar) and
+                // the retry/backoff driver for a request that hasn't been answered
+                // yet; ONGOING drain of an already-established episode instead runs
+                // at receipt pace via `try_resume_request`'s other two call sites
+                // (`Inbound::Publish`, `on_payload_ready`), not here.
+                _ = resume_tick.tick() => {
+                    let now = Instant::now();
+                    // Cloned out (a plain `Vec<PublicKey>`, already excluding
+                    // `self.name` -- `Wire::other_primaries` is "OTHER primaries",
+                    // precomputed once and fixed for this node's lifetime, see that
+                    // field's own doc comment) so the loop body below is free to
+                    // borrow `self` one call at a time across `.await` points,
+                    // rather than holding a live borrow of `self` for the whole loop.
+                    let authors: Vec<PublicKey> =
+                        self.wire.other_primaries.iter().map(|(pk, _)| *pk).collect();
+                    for author in authors {
+                        self.try_resume_request(author, now).await;
+                    }
+                }
+
                 _ = metrics_tick.tick() => {
                     // Fable perf audit item 4: force an unconditional prune once/sec
                     // regardless of `maybe_prune_cancel_handlers`'s doubling
@@ -917,12 +988,68 @@ impl VantageCore {
         }
         if resolved {
             self.payload.pending_payload.remove(&header_digest);
+            // Mechanism A receipt-continuation (design doc step 3): the DELAYED
+            // half of "a resume-served header advances frontier(author)" -- a
+            // header whose bytes already arrived (direct=true) but whose payload
+            // was still syncing, per `LaneManager::process_publish_inner`'s own
+            // `direct && !payload_ok` arm. `author_of`/the "before" snapshot are
+            // taken BEFORE `set_payload_ready`, which is the call that may
+            // actually advance `own_direct_frontier` for it (synchronously, inside
+            // `refresh_author` -- see that method's own doc comment).
+            let author = self.lm.author_of(&header_digest);
+            let before = author.map(|a| self.lm.own_direct_frontier(&a));
             // P4-4: payload arriving can be the event that flips
             // `direct_pub`/`author_ok` for a C/T entry the positive gate is
             // waiting on -- re-poll it, same reasoning as the `Ack` arm.
             let mut effects = self.lm.set_payload_ready(&header_digest);
             effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
             self.execute(effects, now).await;
+            if let (Some(author), Some(before)) = (author, before) {
+                if self.lm.own_direct_frontier(&author) > before {
+                    self.try_resume_request(author, now).await;
+                }
+            }
+        }
+    }
+
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): `ResumeTrigger::
+    /// check` for a single author, immediately sending (subject to `resume::
+    /// SEND_TIMEOUT`) if it fires. Shared by three call sites: the periodic
+    /// `resume_tick` (episode detector + retry/backoff driver), and receipt-
+    /// triggered continuation from `Inbound::Publish`/`on_payload_ready` (design
+    /// doc step 3: "the requester's frontier advances on receipt, its next request
+    /// follows" -- drains an ESTABLISHED episode at RECEIPT pace instead of
+    /// waiting for the next tick, matching Starfish's own continuous per-peer
+    /// stream rather than a 1 Hz ping-pong). All three call sites hand this the
+    /// SAME `ResumeTrigger` instance, so its two-consecutive-ticks/backoff state
+    /// is coherent regardless of which one actually fires a given request -- a
+    /// tick's retry racing a receipt's continuation for the identical (author,
+    /// from) is exactly the case `ResumeTrigger::check`'s own backoff key
+    /// (author, from) already serializes to at most one send per
+    /// `resume_backoff_ms`, whichever call reaches it first.
+    async fn try_resume_request(&mut self, author: PublicKey, now: Instant) {
+        let frontier = self.lm.own_direct_frontier(&author);
+        let avail = self.lm.avail_high(&author);
+        let backoff = Duration::from_millis(self.resume_backoff_ms);
+        if let Some(from) = self
+            .resume_trigger
+            .check(author, frontier, avail, now, backoff, self.resume_batch)
+        {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_lane_resume_requests_sent.inc();
+            }
+            // `resume::SEND_TIMEOUT`'s own doc comment: a single backed-up
+            // destination must cost this one send, never this whole run loop --
+            // the request is simply retried a later tick (or the next receipt) if
+            // it doesn't land.
+            let _ = tokio::time::timeout(
+                resume::SEND_TIMEOUT,
+                self.wire.send_message(
+                    author,
+                    PrimaryMessage::VantageLaneResume(author, from, self.name),
+                ),
+            )
+            .await;
         }
     }
 
@@ -1230,7 +1357,25 @@ impl VantageCore {
             return Vec::new();
         }
         match inbound {
-            Inbound::Publish(sender, header) => self.lm.process_publish(sender, header).await,
+            Inbound::Publish(sender, header) => {
+                let author = header.author;
+                let before = self.lm.own_direct_frontier(&author);
+                let effects = self.lm.process_publish(sender, header).await;
+                // Mechanism A receipt-continuation (design doc step 3): this
+                // publish -- a resume-served header, or an ordinary broadcast
+                // landing on a previously-gapped lane -- may have just advanced
+                // `frontier(author)` (synchronously, inside `process_publish`'s own
+                // `refresh_author` call). If `author`'s episode is already
+                // ESTABLISHED and a gap still remains, ask for the next span now,
+                // rather than waiting for the next `resume_tick`. A no-op call
+                // (`ResumeTrigger::check` returns `None`) for the overwhelming
+                // majority of publishes, which never had an established episode to
+                // begin with.
+                if self.lm.own_direct_frontier(&author) > before {
+                    self.try_resume_request(author, now).await;
+                }
+                effects
+            }
             Inbound::Serve(header) => self.rep.on_serve(header),
             Inbound::HeadersRequest(digests, requestor) => {
                 let mut effects = Vec::new();
@@ -1395,6 +1540,46 @@ impl VantageCore {
                         .on_body_serve(view, proposal, &mut self.agb, &mut self.rep);
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
+                effects
+            }
+
+            // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+            // Design doc step 3 (author side): `author` names a lane, `requester` is
+            // who's asking (already known to be a committee member -- the gate at
+            // the top of this function ran before this arm is ever reached).
+            Inbound::LaneResume(author, from, requester) => {
+                // "author ignores resume requests for lanes it doesn't own": `author`
+                // is UNTRUSTED input (merely a wire field, not itself a declared-
+                // sender claim -- see `Inbound::LaneResume`'s own doc comment) until
+                // checked against our own identity.
+                if author != self.name {
+                    return Vec::new();
+                }
+                // "author clamps below-floor requests": `from` is the requester's own
+                // claim about where ITS OWN prefix ends -- clamp up to whatever this
+                // party can actually still serve before doing anything else.
+                let floor = self.lm.earliest_authored_height(&author);
+                let from = from.max(floor);
+                let tip = self.lm.own_tip_height();
+                if from > tip {
+                    return Vec::new(); // nothing new to serve (fully caught up, or
+                                        // a request racing ahead of our own tip)
+                }
+                let backoff = Duration::from_millis(self.resume_backoff_ms);
+                if !self.resume_serve.should_serve(requester, from, now, backoff) {
+                    return Vec::new(); // one-shot dedup: already served this exact
+                                        // (requester, from) within resume_backoff_ms
+                }
+                let to = (from + self.resume_batch - 1).min(tip);
+                let mut effects = Vec::with_capacity((to - from + 1) as usize);
+                for height in from..=to {
+                    if let Some(header) = self.lm.author_block_at(&author, height) {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_lane_resume_blocks_served.inc();
+                        }
+                        effects.push(Effect::ResumeServeTo(requester, header));
+                    }
+                }
                 effects
             }
         }
@@ -1717,6 +1902,19 @@ impl VantageCore {
                         .send_message(peer, PrimaryMessage::VantageBodyServe(view, proposal))
                         .await;
                 }
+
+                // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+                Effect::ResumeServeTo(requester, header) => {
+                    // `resume::SEND_TIMEOUT`'s own doc comment: bounds a single slow
+                    // requester's cost to this one batch entry, never this whole
+                    // effect-drain loop (which a burst of `Inbound::LaneResume`
+                    // arrivals can otherwise queue many of, back to back).
+                    let _ = tokio::time::timeout(
+                        resume::SEND_TIMEOUT,
+                        self.wire.send_resume_header(requester, header),
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1972,6 +2170,16 @@ mod tests {
             ),
             None
         );
+
+        // Mechanism A (`vantage::resume`): MAC-bound to the declared REQUESTER,
+        // regardless of the (separately, protocol-level-checked) named lane author.
+        assert_eq!(
+            mac_candidate_sender(
+                &PrimaryMessage::VantageLaneResume(author, 5, sender),
+                &committee
+            ),
+            Some(sender)
+        );
     }
 
     #[test]
@@ -2012,6 +2220,15 @@ mod tests {
         )));
         assert!(!message_needs_placeholder_tag(
             &PrimaryMessage::VantageBodyFetch(1, Digest::default(), crate::common::keys()[0].0)
+        ));
+        // Mechanism A: carries a real declared requester (see `mac_candidate_sender`'s
+        // own arm for this variant) -- not in the no-claim class.
+        assert!(!message_needs_placeholder_tag(
+            &PrimaryMessage::VantageLaneResume(
+                crate::common::keys()[0].0,
+                5,
+                crate::common::keys()[1].0
+            )
         ));
     }
 
@@ -2128,6 +2345,250 @@ mod tests {
         assert!(
             matches!(delivered, Ok(Some(Inbound::AckAvailability(_)))),
             "a genuinely MAC'd ACK from the real declared sender must be delivered when it advances availability"
+        );
+    }
+
+    // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+    //
+    // `ResumeTrigger`/`ResumeServe`'s own pure trigger/backoff/dedup logic is covered
+    // in `vantage::resume`'s own test module; these tests cover the AUTHOR-side
+    // serve path's protocol-level checks (foreign-lane rejection, floor clamp,
+    // one-batch-not-tip pacing), which need a real `VantageCore` (`LaneManager`'s
+    // block cache) to exercise meaningfully.
+
+    /// "author ignores resume requests for lanes it doesn't own": a `LaneResume`
+    /// naming some OTHER committee member's lane must produce no effects at all,
+    /// regardless of how well-formed the rest of the message is.
+    #[tokio::test]
+    async fn dispatch_lane_resume_ignores_foreign_lane() {
+        let mut core = test_core(0, "lane_resume_foreign");
+        let (other_author, _) = crate::common::keys()[1];
+        let (requester, _) = crate::common::keys()[2];
+        assert_ne!(other_author, core.name);
+
+        let effects = core
+            .dispatch_inbound(
+                Inbound::LaneResume(other_author, 1, requester),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            effects.is_empty(),
+            "a LaneResume naming a lane this party doesn't own must be ignored"
+        );
+    }
+
+    /// "author clamps below-floor requests": `from = 0` is below the earliest real
+    /// block height (1 -- height 0 is the implicit, never-transmitted genesis).
+    /// Serving must clamp up to 1, not attempt (and fail) to serve height 0.
+    #[tokio::test]
+    async fn dispatch_lane_resume_clamps_below_floor() {
+        let mut core = test_core(0, "lane_resume_clamp");
+        let (requester, _) = crate::common::keys()[1];
+        let author = core.name;
+
+        for _ in 0..3 {
+            core.lm.publish_own(std::collections::BTreeMap::new()).await;
+        }
+        assert_eq!(core.lm.own_tip_height(), 3);
+
+        let effects = core
+            .dispatch_inbound(Inbound::LaneResume(author, 0, requester), Instant::now())
+            .await;
+
+        let served: Vec<(PublicKey, u64)> = effects
+            .iter()
+            .map(|e| match e {
+                Effect::ResumeServeTo(r, h) => (*r, h.height),
+                other => panic!("expected ResumeServeTo, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            served,
+            vec![(requester, 1), (requester, 2), (requester, 3)],
+            "from=0 must clamp up to height 1, then serve through our own tip (3)"
+        );
+    }
+
+    /// The design doc's "one batch per request" pacing: even when this party's own
+    /// tip is far beyond `resume_batch` blocks past `from`, a single `LaneResume`
+    /// serves at most `resume_batch` blocks -- it does not loop to tip. (`test_core`
+    /// uses `Parameters::default()`, whose `resume_batch` default is 8.)
+    #[tokio::test]
+    async fn dispatch_lane_resume_serves_one_batch_not_the_whole_tip() {
+        let mut core = test_core(0, "lane_resume_batch");
+        let (requester, _) = crate::common::keys()[1];
+        let author = core.name;
+        assert_eq!(core.resume_batch, 64);
+
+        for _ in 0..100 {
+            core.lm.publish_own(std::collections::BTreeMap::new()).await;
+        }
+        assert_eq!(core.lm.own_tip_height(), 100);
+
+        let effects = core
+            .dispatch_inbound(Inbound::LaneResume(author, 1, requester), Instant::now())
+            .await;
+
+        let served_heights: Vec<u64> = effects
+            .iter()
+            .map(|e| match e {
+                Effect::ResumeServeTo(_, h) => h.height,
+                other => panic!("expected ResumeServeTo, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            served_heights,
+            (1..=64).collect::<Vec<u64>>(),
+            "must serve exactly one resume_batch-sized span (1..=64), not loop through height 100"
+        );
+    }
+
+    /// A request whose (already-clamped) `from` is beyond this party's own tip --
+    /// e.g. a requester racing ahead, or asking again right after having already
+    /// caught up -- must produce no effects (nothing to serve), not panic on an
+    /// inverted range.
+    #[tokio::test]
+    async fn dispatch_lane_resume_from_beyond_tip_serves_nothing() {
+        let mut core = test_core(0, "lane_resume_beyond_tip");
+        let (requester, _) = crate::common::keys()[1];
+        let author = core.name;
+
+        core.lm.publish_own(std::collections::BTreeMap::new()).await;
+        assert_eq!(core.lm.own_tip_height(), 1);
+
+        let effects = core
+            .dispatch_inbound(Inbound::LaneResume(author, 5, requester), Instant::now())
+            .await;
+
+        assert!(effects.is_empty());
+    }
+
+    /// Rate-limit / dedup: two IDENTICAL, back-to-back `LaneResume(author, from,
+    /// requester)` requests (the requester retrying before the first batch's effect
+    /// on its own frontier could possibly have landed) must not double-serve --
+    /// `ResumeServe::should_serve`'s one-shot-per-`resume_backoff_ms` dedup, exercised
+    /// end-to-end through `dispatch_inbound`.
+    #[tokio::test]
+    async fn dispatch_lane_resume_dedups_identical_repeat_request() {
+        let mut core = test_core(0, "lane_resume_dedup");
+        let (requester, _) = crate::common::keys()[1];
+        let author = core.name;
+
+        core.lm.publish_own(std::collections::BTreeMap::new()).await;
+        let now = Instant::now();
+
+        let first = core
+            .dispatch_inbound(Inbound::LaneResume(author, 1, requester), now)
+            .await;
+        assert_eq!(first.len(), 1, "first request must be served");
+
+        let second = core
+            .dispatch_inbound(Inbound::LaneResume(author, 1, requester), now)
+            .await;
+        assert!(
+            second.is_empty(),
+            "an identical repeat within resume_backoff_ms must be suppressed"
+        );
+    }
+
+    /// Pacing fix, design doc step 3: once a gap-episode is ESTABLISHED, receipt of
+    /// a publish that advances `frontier(author)` must trigger the next
+    /// `VantageLaneResume` immediately, through `Inbound::Publish`'s own
+    /// receipt-continuation hook -- NOT only on the next `resume_tick`. Exercised
+    /// end to end: two direct `try_resume_request` calls establish the episode
+    /// (mirroring two ticks with the gap still open), then a single
+    /// `Inbound::Publish` for `author`'s own next height is dispatched with NO
+    /// third tick in between, and the resume-request counter must still have
+    /// advanced by exactly one -- because the mark is set well AHEAD of that one
+    /// height (avail=5, not 1), so a gap genuinely remains after frontier reaches
+    /// 1, exactly the "far-ahead gap, one small step closer" shape a real
+    /// multi-round-trip catch-up has at any given step.
+    ///
+    /// `resume_batch` is overridden to 1 here: this test's own concern is the
+    /// WIRING (does `Inbound::Publish` actually call `try_resume_request`), not
+    /// the in-flight span-sizing `ResumeTrigger::check`'s own unit tests already
+    /// cover directly (`established_episode_waits_for_the_whole_in_flight_batch_
+    /// before_continuing`) -- with the real default (64) a single-height publish
+    /// would correctly NOT fully land an in-flight span and this test would need
+    /// to simulate the whole batch instead of just one header.
+    #[tokio::test]
+    async fn dispatch_publish_continues_established_episode_without_a_third_tick() {
+        let mut core = test_core(0, "lane_resume_receipt_continuation");
+        core.resume_batch = 1;
+        let (author, _) = crate::common::keys()[1];
+        let (other_sender, _) = crate::common::keys()[2];
+
+        // Manufacture an (f+1)-availability mark at height 5 for `author`'s lane,
+        // via the same shared `AckAggregator` two real acks would use -- crosses
+        // `validity_threshold` (2 for this n=4 test committee) without a live
+        // network. `avail_high` is a pure ack-census fact, independent of what
+        // this party has itself cached -- see that field's own doc comment.
+        let reference = (author, 5u64, Digest::default());
+        let first_ack = {
+            let mut agg = core.ack_aggregator.lock().unwrap();
+            agg.record_ack(author, reference.clone())
+        };
+        assert!(first_ack.availability.is_none());
+        let second_ack = {
+            let mut agg = core.ack_aggregator.lock().unwrap();
+            agg.record_ack(other_sender, reference.clone())
+        };
+        let availability = second_ack
+            .availability
+            .expect("second distinct acker crosses validity (f+1=2)");
+        let now = Instant::now();
+        core.on_ack_availability(availability, now);
+        assert_eq!(core.lm.avail_high(&author), 5);
+        assert_eq!(core.lm.own_direct_frontier(&author), 0);
+
+        // Two ticks -- the gap (frontier=0, avail=1, from=1) is unchanged across
+        // both, exactly as `resume_tick`'s own loop would present it.
+        core.try_resume_request(author, now).await;
+        assert_eq!(
+            core.metrics.as_ref().unwrap().vantage_lane_resume_requests_sent.get(),
+            0,
+            "first observation must not fire"
+        );
+        let t1 = now + Duration::from_millis(core.resume_check_period_ms);
+        core.try_resume_request(author, t1).await;
+        let sent_after_establish = core
+            .metrics
+            .as_ref()
+            .unwrap()
+            .vantage_lane_resume_requests_sent
+            .get();
+        assert_eq!(
+            sent_after_establish, 1,
+            "second consecutive tick establishes the episode and fires the first request"
+        );
+
+        // The batch lands: `author`'s own height-1 header arrives as an ordinary
+        // publish (this is exactly what a resumed `Header(_, false)` looks like on
+        // arrival -- see `Wire::send_resume_header`'s own doc comment). `t2` is
+        // well within ONE tick period of `t1` -- no third tick ever runs.
+        let header = Header::new_vantage(
+            author,
+            1,
+            std::collections::BTreeMap::new(),
+            core.lm.genesis().clone(),
+            core.lm.sid().clone(),
+        );
+        let t2 = t1 + Duration::from_millis(50);
+        core.dispatch_inbound(Inbound::Publish(author, header), t2)
+            .await;
+
+        assert_eq!(
+            core.lm.own_direct_frontier(&author),
+            1,
+            "the publish must have advanced frontier(author) to 1"
+        );
+        assert_eq!(
+            core.metrics.as_ref().unwrap().vantage_lane_resume_requests_sent.get(),
+            sent_after_establish + 1,
+            "receipt of the publish must fire the NEXT request immediately -- no \
+             third tick was ever run in this test"
         );
     }
 }

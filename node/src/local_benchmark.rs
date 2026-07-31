@@ -767,8 +767,15 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             // because it shares the `Header` wire variant with the publish path --
             // `VantageBodyFetch`/`VantageBodyServe` have no such sharing accident, so
             // both ends of this pair land in "repair" cleanly).
+            // Mechanism A (sender-side lane resume, `vantage::resume`): same "repair"
+            // category as the fetch/serve pairs above -- it recovers already-
+            // identified missing data (a peer's own ack-census gap) given only a
+            // height, same role as `HeadersRequest`/`VantageBodyFetch` for their own
+            // gap classes. The served answer rides the ordinary `Header` wire
+            // variant (already categorized "dissemination" above), same accepted
+            // miscategorization noted for `HeadersRequest`'s own answer.
             "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageBodyFetch"
-            | "VantageBodyServe" => "repair",
+            | "VantageBodyServe" | "VantageLaneResume" => "repair",
             "CompReport"
             | "ControlInit"
             | "ControlEcho"
@@ -794,7 +801,9 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
         Protocol::SimpleIt => match msg_type {
             "Header" | "Batch" => "dissemination",
             "VantageAck" | "VantageAvail" => "acks",
-            "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
+            // Mechanism A: same data plane as `Protocol::Vantage`'s own identical
+            // addition above (`SimpleItCore` reuses `LaneManager`/`Wire` verbatim).
+            "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageLaneResume" => "repair",
             "SimpleItCutProposal"
             | "SimpleItCutVote"
             | "SimpleItDecide"
@@ -812,7 +821,10 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
         Protocol::SimpleItBracha => match msg_type {
             "Header" | "Batch" => "dissemination",
             "VantageAck" | "VantageAvail" => "acks",
-            "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
+            // Mechanism A: same data plane as `Protocol::SimpleIt`'s own identical
+            // addition above (`SimpleItCore` serves both variants -- see
+            // `SimpleItCore::build`'s own `Variant::{Opt,Bracha}` selection).
+            "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageLaneResume" => "repair",
             "SimpleItCutProposal"
             | "SimpleItCutVote"
             | "SimpleItDecide"
