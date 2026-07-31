@@ -701,6 +701,12 @@ impl Primary {
                         .as_deref()
                         .map(|table| committee.latency_map(&name, table))
                         .unwrap_or_default(),
+                    // Data-plane withholding fault injector (`--withhold`): resolved
+                    // once here (`None` == current behavior, byte-identical, unless
+                    // `--withhold` selects this node as a withholding sender) -- same
+                    // "doesn't otherwise take a `Parameters`" reasoning as
+                    // `latency_map` just above.
+                    config::withheld_destinations(&committee, &name, parameters.withhold_senders),
                     metrics.clone(),
                     parameters.compress_network,
                     batch,

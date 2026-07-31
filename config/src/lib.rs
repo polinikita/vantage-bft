@@ -3,7 +3,7 @@ use crypto::{generate_production_keypair, MacSecret, PublicKey, SecretKey};
 use log::{info, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::io::Write as _;
@@ -419,6 +419,19 @@ pub struct Parameters {
     /// parameter file (which never mentions this field) valid.
     #[serde(default)]
     pub mac_secret: Option<MacSecret>,
+
+    /// Data-plane withholding fault injector (`node local-benchmark --withhold`): the
+    /// first `withhold_senders` committee indices (0-based, sorted order -- the same
+    /// convention `--crash`/`--load-nodes` already use) withhold their payload-
+    /// dissemination broadcasts (worker `Batch`, primary `Header`/lane-block publish)
+    /// from a staggered half of the committee -- see `withheld_destinations`. Every
+    /// other message (consensus, acks, and every repair/request-response path) is
+    /// unaffected. `0` (default) means no node withholds anything -- `#[serde(default)]`
+    /// keeps every pre-existing parameter file valid, and `withheld_destinations`
+    /// returns `None` for every node when this is `0`, so the filter never allocates or
+    /// perturbs a send path in that case.
+    #[serde(default)]
+    pub withhold_senders: usize,
 }
 
 fn default_batch_max_bytes() -> usize {
@@ -673,6 +686,7 @@ impl Default for Parameters {
             batch_max_delay_ms: default_batch_max_delay_ms(),
             authenticate_channels: false,
             mac_secret: None,
+            withhold_senders: 0,
         }
     }
 }
@@ -777,6 +791,13 @@ impl Parameters {
              instead of by value) enabled? {}",
             self.digest_statements
         );
+        if self.withhold_senders > 0 {
+            info!(
+                "Data-plane withholding: first {} node(s) withhold payload dissemination \
+                 from a staggered half of the committee",
+                self.withhold_senders
+            );
+        }
     }
 }
 
@@ -1160,6 +1181,42 @@ impl Committee {
     }
 }
 
+/// Data-plane withholding fault injector (`node local-benchmark --withhold`,
+/// `Parameters::withhold_senders`). Every node derives this PURELY locally, from data
+/// it already has (its own identity, `committee`'s own sorted order, and the
+/// configured sender count) -- never sent over the wire, and meant to be called once
+/// at node startup and cached, not per send.
+///
+/// The first `withhold_senders` committee indices (0-based, `Committee::index_of`
+/// order -- the same convention `--crash` (trailing) and `--load-nodes` (leading)
+/// already use) are withholding senders. A withholding sender at index `i` withholds
+/// its payload-dissemination broadcasts from exactly the staggered half `{(i+1),
+/// (i+2), ..., (i + n/2)} mod n` (integer division, so an odd `n` rounds down) --
+/// every other node, INCLUDING `i` itself, still receives normally.
+///
+/// Returns `None` when `self_pk` is not withholding: always the case when
+/// `withhold_senders` is 0 (the default -- every node gets `None`, so the caller's
+/// filter is skipped entirely and the send path is byte-identical to before this
+/// feature existed), when `self_pk`'s own committee index is `>= withhold_senders`, or
+/// when `self_pk` is not a committee member at all.
+pub fn withheld_destinations(
+    committee: &Committee,
+    self_pk: &PublicKey,
+    withhold_senders: usize,
+) -> Option<HashSet<PublicKey>> {
+    let n = committee.size();
+    if withhold_senders == 0 || n == 0 {
+        return None;
+    }
+    let i = committee.index_of(self_pk)?;
+    if i >= withhold_senders {
+        return None;
+    }
+    let order: Vec<PublicKey> = committee.authorities.keys().copied().collect();
+    let half = n / 2;
+    Some((1..=half).map(|offset| order[(i + offset) % n]).collect())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct KeyPair {
     /// The node's public key (and identifier).
@@ -1250,5 +1307,58 @@ mod tests {
         assert_eq!(table.one_way(0, 0), Duration::ZERO); // diagonal
         assert_eq!(table.one_way(0, 1), Duration::from_millis(50)); // 100ms RTT / 2
         assert_eq!(table.one_way(19, 3), Duration::from_millis(50));
+    }
+
+    /// `withheld_destinations`: the exact stagger + wraparound example the feature's
+    /// own spec walks through -- n=20, sender index 15 blocks {16..19, 0..5}, exactly
+    /// 10 (= floor(20/2)) destinations.
+    #[test]
+    fn withheld_destinations_stagger_wraps_around() {
+        let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
+        let blocked = withheld_destinations(&committee, &keypairs[15].name, 16)
+            .expect("index 15 is one of the first 16 withholding senders");
+        let expected: HashSet<PublicKey> = [16, 17, 18, 19, 0, 1, 2, 3, 4, 5]
+            .into_iter()
+            .map(|idx| keypairs[idx].name)
+            .collect();
+        assert_eq!(blocked, expected);
+    }
+
+    /// `--withhold 0` (the default): every node gets `None`, regardless of committee
+    /// size or its own position.
+    #[test]
+    fn withheld_destinations_zero_is_none_for_everyone() {
+        let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
+        for keypair in &keypairs {
+            assert!(withheld_destinations(&committee, &keypair.name, 0).is_none());
+        }
+    }
+
+    /// `--withhold <nodes>`: every single node is a withholding sender.
+    #[test]
+    fn withheld_destinations_k_equals_n_every_sender_withholds() {
+        let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
+        for keypair in &keypairs {
+            assert!(withheld_destinations(&committee, &keypair.name, 20).is_some());
+        }
+    }
+
+    /// Odd `n` uses `floor(n/2)`, not a rounded-up half: n=7 blocks exactly 3.
+    #[test]
+    fn withheld_destinations_odd_committee_floors() {
+        let (committee, keypairs) = Committee::local_benchmark(7, 1, 9000);
+        let blocked = withheld_destinations(&committee, &keypairs[0].name, 1)
+            .expect("index 0 is the sole withholding sender");
+        let expected: HashSet<PublicKey> = [1, 2, 3].into_iter().map(|idx| keypairs[idx].name).collect();
+        assert_eq!(blocked, expected);
+    }
+
+    /// A node past the first `withhold_senders` indices does not withhold at all, even
+    /// though other nodes do.
+    #[test]
+    fn withheld_destinations_non_sender_index_is_none() {
+        let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
+        assert!(withheld_destinations(&committee, &keypairs[2].name, 3).is_some());
+        assert!(withheld_destinations(&committee, &keypairs[3].name, 3).is_none());
     }
 }

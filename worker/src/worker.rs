@@ -14,7 +14,7 @@ use network::{BatchConfig, MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,6 +69,15 @@ pub struct Worker {
     /// (`BatchMaker`, `Synchronizer`, `Helper`), which previously ran at zero
     /// injected delay even under a WAN-shaped run.
     latency_map: HashMap<SocketAddr, Duration>,
+    /// Data-plane withholding fault injector (`Parameters::withhold_senders`),
+    /// resolved once at spawn time (same convention as `latency_map` above) via
+    /// `config::withheld_destinations`. `None` -- the default, and always the case
+    /// when `--withhold` is 0 -- means this authority is not a withholding sender:
+    /// `handle_clients_transactions`'s `workers_addresses` list is built exactly as
+    /// before. `Some(blocked)` excludes every peer in `blocked` from that list, once,
+    /// at the same point it's otherwise constructed -- `BatchMaker` itself never sees
+    /// this field, and its own broadcast in `seal` is completely unchanged either way.
+    withheld_destinations: Option<HashSet<PublicKey>>,
     /// Transport-level batching config, resolved once at spawn time from
     /// `parameters.batch_{messages,max_bytes,max_delay_ms}` (mirrors `latency_map`'s
     /// own resolve-once-at-spawn convention). Threaded into every worker-to-worker/
@@ -121,6 +130,11 @@ impl Worker {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
+        // Data-plane withholding fault injector: resolved once, same convention as
+        // `latency_map` above.
+        let withheld_destinations =
+            config::withheld_destinations(&committee, &name, parameters.withhold_senders);
+
         // Resolved once, same convention as `latency_map` above.
         let batch = BatchConfig {
             enabled: parameters.batch_messages,
@@ -151,6 +165,7 @@ impl Worker {
             store,
             metrics: metrics.clone(),
             latency_map,
+            withheld_destinations,
             batch,
             channel_auth,
         };
@@ -299,9 +314,18 @@ impl Worker {
             /* tx_batch */
             tx_processor, //sender channel to connect to processor
             /* workers_addresses */
+            // Data-plane withholding fault injector: `withheld_destinations` is `None`
+            // unless THIS authority is a withholding sender (`--withhold`), so the
+            // `is_none_or` below is a single cheap branch -- no allocation, no
+            // perturbation -- on the default path.
             self.committee
                 .others_workers(&self.name, &self.id)
                 .iter()
+                .filter(|(name, _)| {
+                    self.withheld_destinations
+                        .as_ref()
+                        .is_none_or(|blocked| !blocked.contains(name))
+                })
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
             self.latency_map.clone(),

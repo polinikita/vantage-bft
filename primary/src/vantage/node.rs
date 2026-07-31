@@ -594,6 +594,23 @@ impl VantageCore {
         // comment.
         let other_primary_addrs: Vec<SocketAddr> =
             other_primaries.iter().map(|(_, a)| *a).collect();
+
+        // Data-plane withholding fault injector (`--withhold`): resolved once here,
+        // same convention as `latency_map` just below -- `None` (the default, and
+        // always the case when `--withhold` is 0) means this node's header broadcasts
+        // are untouched (see `Wire::withheld_header_dests`'s own doc comment).
+        let withheld_header_dests: wire::WithheldHeaderDests =
+            config::withheld_destinations(&committee, &name, parameters.withhold_senders).map(
+                |blocked| {
+                    let full: Vec<(PublicKey, SocketAddr)> = other_primaries
+                        .iter()
+                        .filter(|(pk, _)| !blocked.contains(pk))
+                        .copied()
+                        .collect();
+                    let addrs: Vec<SocketAddr> = full.iter().map(|(_, a)| *a).collect();
+                    (addrs, full)
+                });
+
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
             .our_workers_by_id(&name)
             .expect("Our public key is not in the committee")
@@ -661,6 +678,7 @@ impl VantageCore {
                 other_primaries,
                 other_primary_addrs,
                 worker_addresses,
+                withheld_header_dests,
                 metrics: core_metrics.clone(),
             },
             header_size: parameters.header_size,

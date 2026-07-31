@@ -103,6 +103,23 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         load_nodes,
         live_nodes
     );
+    // Data-plane withholding fault injector: indexed over the FULL committee (0-based,
+    // sorted order), the same universe `--crash`/`--load-nodes` share -- not clamped to
+    // `live_nodes`, since a withholding sender index that happens to fall in the
+    // crashed (trailing) range is simply never spawned at all, a harmless no-op rather
+    // than an error (see `withheld_destinations`'s own doc comment for the derivation
+    // every node performs locally).
+    let withhold: usize = matches
+        .get_one::<String>("withhold")
+        .unwrap()
+        .parse()
+        .context("--withhold must be a non-negative integer")?;
+    anyhow::ensure!(
+        withhold <= nodes,
+        "--withhold ({}) must be at most --nodes ({})",
+        withhold,
+        nodes
+    );
     let delta_ms: u64 = matches
         .get_one::<String>("delta-ms")
         .unwrap()
@@ -251,6 +268,17 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             load_nodes, live_nodes
         );
     }
+    if withhold > 0 {
+        // Stable, grep-parseable: the "only X of N nodes" count is the staggered
+        // unblocked half INCLUDING the withholding sender itself (n - floor(n/2)),
+        // matching `withheld_destinations`'s own derivation exactly.
+        let reachable = nodes - nodes / 2;
+        println!(
+            "Withhold: first {} node(s) disseminate payload to only {} of {} nodes \
+             (staggered halves; repair paths unaffected)",
+            withhold, reachable, nodes
+        );
+    }
     println!("======================================\n");
 
     // Wipe and recreate the data dir (starfish's own local-benchmark does the same).
@@ -309,6 +337,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         ack_watermarks: matches.get_flag("ack-watermarks"),
         ack_watermark_period_ms,
         digest_statements: matches.get_flag("digest-statements"),
+        withhold_senders: withhold,
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which

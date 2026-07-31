@@ -93,6 +93,14 @@ pub fn sender_is_member<M: DeclaredSender>(m: &M, members: &HashSet<PublicKey>) 
     }
 }
 
+/// clippy::type_complexity: named alias for `Wire::withheld_header_dests`'s own type
+/// (also used identically by `VantageCore::build`/`SimpleItCore::build`, which compute
+/// the value this field holds) -- a caller-filtered pair of `Wire::
+/// other_primary_addrs`/`Wire::other_primaries` (addresses-only, and full
+/// `(PublicKey, SocketAddr)` pairs for the per-destination MAC-tag path), or `None`
+/// when this node is not a withholding sender.
+pub(crate) type WithheldHeaderDests = Option<(Vec<SocketAddr>, Vec<(PublicKey, SocketAddr)>)>;
+
 /// Network/wire-transport state `VantageCore` owns: the two typed senders, MAC-auth
 /// keying, in-flight cancel-handle bookkeeping, and the committee's/our own workers'
 /// resolved addresses. Per-field security/perf rationale below is carried over
@@ -130,6 +138,19 @@ pub struct Wire {
     /// every single broadcast for no reason.
     pub(crate) other_primary_addrs: Vec<SocketAddr>,
     pub(crate) worker_addresses: HashMap<WorkerId, SocketAddr>,
+
+    /// Data-plane withholding fault injector (`Parameters::withhold_senders`):
+    /// `other_primaries`/`other_primary_addrs` above, with this node's own blocked
+    /// half already removed -- precomputed ONCE at construction (`VantageCore::build`/
+    /// `SimpleItCore::build`, via `config::withheld_destinations`), never per send.
+    /// `None` -- the default, and always the case when `--withhold` is 0 -- means this
+    /// node is not a withholding sender: `broadcast_message`'s `Header(_, false)` arm
+    /// then falls straight through to the untouched `broadcast` below, so the default
+    /// header-dissemination path allocates and branches exactly as it did before this
+    /// field existed. `Some((addrs, full))` is used ONLY for that one arm -- every
+    /// other broadcast (VantageEcho/Ready/ControlInit/etc.) always uses
+    /// `other_primaries`/`other_primary_addrs` unfiltered, regardless of this field.
+    pub(crate) withheld_header_dests: WithheldHeaderDests,
 
     /// Cloned from `VantageCore::metrics` at construction time (kept there too, for
     /// `sample_metrics`'s progress gauges) -- `broadcast_message` is the only wire
@@ -192,6 +213,17 @@ impl Wire {
                     .proposed_header_size_bytes
                     .observe(header_bytes.len());
             }
+            // Data-plane withholding fault injector (`--withhold`): this is the ONLY
+            // original-dissemination publish of a header (`ServeTo`'s `Header(_,
+            // true)` reply unicasts via `send_message`/`send_to`, never through here) --
+            // `.clone()` on a `None` `Option` is a no-op, so a non-withholding node
+            // (every node when `--withhold` is 0) falls straight through to the
+            // untouched `broadcast` call below with no extra allocation.
+            if let Some((addrs, full)) = self.withheld_header_dests.clone() {
+                self.broadcast_to(bytes, msg_type, placeholder, addrs, full)
+                    .await;
+                return;
+            }
         }
         self.broadcast(bytes, msg_type, placeholder).await;
     }
@@ -247,6 +279,54 @@ impl Wire {
             let tag = auth
                 .tag_for(&peer, &payload)
                 .expect("every `other_primaries` entry is a committee member");
+            let mut tagged = payload.clone();
+            tagged.extend_from_slice(&tag);
+            let handler = self
+                .network
+                .send_typed(addr, Bytes::from(tagged), msg_type)
+                .await;
+            self.cancel_handlers.push(handler);
+        }
+    }
+
+    /// Data-plane withholding fault injector (`--withhold`): same wire-level contract
+    /// as `broadcast` (identical MAC-tag-append logic), but against a caller-supplied
+    /// destination list instead of `self.other_primaries`/`self.other_primary_addrs`
+    /// -- `addrs`/`full` are those two fields with this node's own blocked half
+    /// already removed (`withheld_header_dests`). `broadcast` itself is left
+    /// completely untouched (not even refactored to delegate here) so the default,
+    /// non-withholding path -- including every non-Header broadcast, which never
+    /// reaches this method at all -- keeps its exact original allocation/branch shape.
+    async fn broadcast_to(
+        &mut self,
+        payload: Vec<u8>,
+        msg_type: &'static str,
+        placeholder: bool,
+        addrs: Vec<SocketAddr>,
+        full: Vec<(PublicKey, SocketAddr)>,
+    ) {
+        let Some(auth) = self.channel_auth.clone() else {
+            let handlers = self
+                .network
+                .broadcast_typed(addrs, Bytes::from(payload), msg_type)
+                .await;
+            self.cancel_handlers.extend(handlers);
+            return;
+        };
+        if placeholder {
+            let mut tagged = payload;
+            tagged.extend_from_slice(&auth.tag_unverified(&tagged));
+            let handlers = self
+                .network
+                .broadcast_typed(addrs, Bytes::from(tagged), msg_type)
+                .await;
+            self.cancel_handlers.extend(handlers);
+            return;
+        }
+        for (peer, addr) in full {
+            let tag = auth
+                .tag_for(&peer, &payload)
+                .expect("every withheld-header destination is a committee member");
             let mut tagged = payload.clone();
             tagged.extend_from_slice(&tag);
             let handler = self

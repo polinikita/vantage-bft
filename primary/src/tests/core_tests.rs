@@ -103,6 +103,9 @@ async fn process_header() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -203,6 +206,9 @@ async fn process_header_missing_parent() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -304,6 +310,9 @@ async fn process_header_invalid_height() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -398,6 +407,9 @@ async fn process_header_missing_payload() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -490,6 +502,9 @@ async fn process_votes() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -604,6 +619,9 @@ async fn process_certificates() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -721,6 +739,9 @@ async fn process_prepare() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -870,6 +891,9 @@ async fn generate_confirm() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -1032,6 +1056,9 @@ async fn generate_commit() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -1246,6 +1273,9 @@ async fn generate_pipelined_prepare() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -1425,6 +1455,9 @@ async fn local_timeout_view() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,
@@ -1522,6 +1555,9 @@ async fn sync_missing_proposals() {
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): empty = current behavior
         // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
+        // Data-plane withholding fault injector: `None` matches every other existing
+        // test's expectations (byte-identical to no withholding).
+        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         false,

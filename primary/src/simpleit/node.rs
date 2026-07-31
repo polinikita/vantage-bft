@@ -510,6 +510,23 @@ impl SimpleItCore {
             .collect();
         let other_primary_addrs: Vec<SocketAddr> =
             other_primaries.iter().map(|(_, a)| *a).collect();
+
+        // Data-plane withholding fault injector (`--withhold`): mirrors
+        // `VantageCore::build`'s identical resolve-once-here treatment (same shared
+        // `Wire`, same field) -- see `Wire::withheld_header_dests`'s own doc comment.
+        let withheld_header_dests: wire::WithheldHeaderDests =
+            config::withheld_destinations(&committee, &name, parameters.withhold_senders).map(
+                |blocked| {
+                    let full: Vec<(PublicKey, SocketAddr)> = other_primaries
+                        .iter()
+                        .filter(|(pk, _)| !blocked.contains(pk))
+                        .copied()
+                        .collect();
+                    let addrs: Vec<SocketAddr> = full.iter().map(|(_, a)| *a).collect();
+                    (addrs, full)
+                },
+            );
+
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
             .our_workers_by_id(&name)
             .expect("Our public key is not in the committee")
@@ -564,6 +581,7 @@ impl SimpleItCore {
                 other_primaries,
                 other_primary_addrs,
                 worker_addresses,
+                withheld_header_dests,
                 metrics: core_metrics.clone(),
             },
             payload: PayloadIo {

@@ -214,6 +214,25 @@ async fn main() -> Result<()> {
                         ),
                 )
                 .arg(
+                    Arg::new("withhold")
+                        .long("withhold")
+                        .value_name("INT")
+                        .default_value("0")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Data-plane withholding fault injector: number of the \
+                        first committee indices (0-based, sorted order -- same convention as \
+                        --crash/--load-nodes) that withhold their payload-dissemination \
+                        broadcasts (worker Batch, primary Header/lane-block publish) from a \
+                        staggered half of the committee -- everyone else, including the sender \
+                        itself, still receives normally. Every other message (consensus, acks, \
+                        every repair/request-response path) is unaffected -- the blocked half \
+                        must recover the payload through the existing repair paths. Must be \
+                        between 0 and --nodes inclusive. Default: 0 (disabled, byte-identical \
+                        to no withholding).",
+                        ),
+                )
+                .arg(
                     Arg::new("delta-ms")
                         .long("delta-ms")
                         .value_name("INT")

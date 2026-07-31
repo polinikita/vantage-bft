@@ -88,6 +88,15 @@ pub struct Core {
     votes_aggregator: VotesAggregator,
 
     network: ReliableSender,
+    /// Data-plane withholding fault injector (`Parameters::withhold_senders`),
+    /// resolved once by the caller (`Primary::spawn`, via `config::
+    /// withheld_destinations`) -- same "doesn't otherwise take a `Parameters`"
+    /// reasoning as `network`'s own `latency_map` argument at `spawn`. `None` (the
+    /// default, and always the case when `--withhold` is 0) means this node's header
+    /// broadcasts are untouched: `process_own_header`'s address list is built exactly
+    /// as before. `Some(blocked)` means this node IS a withholding sender -- its own
+    /// header-broadcast address list excludes every peer in `blocked`.
+    withheld_header_dests: Option<HashSet<PublicKey>>,
     /// METRICS-DASHBOARD-SPEC.md §3 addendum: this node's own metrics handle, kept
     /// (not just handed to `network`'s `with_metrics` below) so `process_own_header`
     /// can observe `proposed_header_size_bytes` at the same publish point Vantage's
@@ -223,6 +232,13 @@ impl Core {
         // passed. Resolved by the caller rather than here since `Core::spawn` (unlike
         // `vantage::node::VantageCore::spawn`) doesn't otherwise take a `Parameters`.
         latency_map: HashMap<SocketAddr, Duration>,
+        // Data-plane withholding fault injector: resolved once by the caller
+        // (`Primary::spawn`, via `config::withheld_destinations`) -- same
+        // resolved-by-caller convention as `latency_map` just above, and for the
+        // identical reason (this fn doesn't otherwise take a `Parameters`/`Committee`
+        // pair post-move). Appended immediately after `latency_map` to keep every
+        // resolved-once-at-spawn value grouped together.
+        withheld_header_dests: Option<HashSet<PublicKey>>,
         // METRICS-DASHBOARD-SPEC.md §1: wire-metrics handle, appended last (same
         // convention as `latency_map` above) -- attached to `network` so every
         // `PrimaryMessage` this task sends/broadcasts is counted.
@@ -263,6 +279,7 @@ impl Core {
                     .with_metrics(metrics)
                     .with_compression(compress_network)
                     .with_batching(batch),
+                withheld_header_dests,
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 already_proposed_slots: HashSet::new(),
@@ -385,11 +402,19 @@ impl Core {
             //self.consensus_instances.insert(dig.clone(), consensus.clone());
         }
 
-        // Broadcast the new header in a reliable manner.
+        // Broadcast the new header in a reliable manner. Data-plane withholding fault
+        // injector: `withheld_header_dests` is `None` unless THIS node is a
+        // withholding sender (`--withhold`), so the `is_none_or` below is a single
+        // cheap branch -- no allocation, no perturbation -- on the default path.
         let addresses = self
             .committee
             .others_primaries(&self.name)
             .iter()
+            .filter(|(pk, _)| {
+                self.withheld_header_dests
+                    .as_ref()
+                    .is_none_or(|blocked| !blocked.contains(pk))
+            })
             .map(|(_, x)| x.primary_to_primary)
             .collect();
         let bytes = bincode::serialize(&PrimaryMessage::Header(header.clone(), false))
