@@ -232,6 +232,16 @@ pub struct Metrics {
     /// peer's `VantageLaneResume` -- counted per block actually served, not per
     /// request received.
     pub vantage_lane_resume_blocks_served: IntCounter,
+    /// Fable perf audit (loop-starvation fix): resume traffic (`VantageLaneResume`
+    /// requests, and `Header(_, false)` resume-batch entries) `Wire::enqueue_resume`
+    /// failed to `try_send` onto the dedicated resume-sender task's channel --
+    /// either it was full (the task fell behind draining a backed-up destination)
+    /// or closed (the task panicked). Expected to stay at/near zero: Mechanism A's
+    /// own end-to-end retry (`vantage::resume::ResumeTrigger`'s backoff,
+    /// `vantage::resume::ResumeServe`'s dedup) recovers every drop this counts, so a
+    /// nonzero rate here is a liveness signal (the channel is genuinely saturated),
+    /// never a correctness bug on its own.
+    pub vantage_lane_resume_send_drops: IntCounter,
 
     // --- Phase 7 prep (PHASE7-PREP-NOTES.md, Finding A diagnosis): always-on progress
     // gauges, one flat value each (no labels), sampled once/sec by `VantageCore` itself
@@ -675,6 +685,12 @@ impl Metrics {
             vantage_lane_resume_blocks_served: register_int_counter_with_registry!(
                 "vantage_lane_resume_blocks_served",
                 "Mechanism A (sender-side lane resume): own blocks this node served answering a VantageLaneResume request",
+                registry,
+            )
+            .unwrap(),
+            vantage_lane_resume_send_drops: register_int_counter_with_registry!(
+                "vantage_lane_resume_send_drops",
+                "Mechanism A (sender-side lane resume): resume messages dropped because the dedicated resume-sender task's channel was full or closed",
                 registry,
             )
             .unwrap(),

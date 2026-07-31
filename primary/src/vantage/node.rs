@@ -22,7 +22,7 @@ use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
-use crate::vantage::resume::{self, ResumeServe, ResumeTrigger};
+use crate::vantage::resume::{ResumeServe, ResumeTrigger};
 use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
 use async_trait::async_trait;
@@ -680,6 +680,23 @@ impl VantageCore {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        // Mechanism A (sender-side lane resume, `vantage::resume`): this node's own
+        // dedicated off-run-loop sender -- see `wire::spawn_resume_sender`'s doc
+        // comment for the full design/rationale (fixes the diagnosed loop-starvation
+        // defect: Mechanism A's own network sends used to run inline, synchronously,
+        // on THIS run loop). Built from the SAME `latency_map`/`blip_gate`/`batch`/
+        // `core_metrics` locals as `network`/`worker_network` just below (identical
+        // configuration convention) -- cloned here (rather than moved) since both of
+        // those still need their own copies afterward.
+        let resume_tx = wire::spawn_resume_sender(
+            latency_map.clone(),
+            blip_gate.clone(),
+            parameters.compress_network,
+            batch,
+            core_metrics.clone(),
+            channel_auth.clone(),
+        );
+
         let core = Self {
             name,
             members,
@@ -717,6 +734,7 @@ impl VantageCore {
                     }
                     s
                 },
+                resume_tx,
                 channel_auth,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
@@ -925,7 +943,7 @@ impl VantageCore {
                     let authors: Vec<PublicKey> =
                         self.wire.other_primaries.iter().map(|(pk, _)| *pk).collect();
                     for author in authors {
-                        self.try_resume_request(author, now).await;
+                        self.try_resume_request(author, now);
                     }
                 }
 
@@ -1006,28 +1024,35 @@ impl VantageCore {
             self.execute(effects, now).await;
             if let (Some(author), Some(before)) = (author, before) {
                 if self.lm.own_direct_frontier(&author) > before {
-                    self.try_resume_request(author, now).await;
+                    self.try_resume_request(author, now);
                 }
             }
         }
     }
 
     /// Mechanism A (sender-side lane resume, `vantage::resume`): `ResumeTrigger::
-    /// check` for a single author, immediately sending (subject to `resume::
-    /// SEND_TIMEOUT`) if it fires. Shared by three call sites: the periodic
-    /// `resume_tick` (episode detector + retry/backoff driver), and receipt-
-    /// triggered continuation from `Inbound::Publish`/`on_payload_ready` (design
-    /// doc step 3: "the requester's frontier advances on receipt, its next request
-    /// follows" -- drains an ESTABLISHED episode at RECEIPT pace instead of
-    /// waiting for the next tick, matching Starfish's own continuous per-peer
-    /// stream rather than a 1 Hz ping-pong). All three call sites hand this the
-    /// SAME `ResumeTrigger` instance, so its two-consecutive-ticks/backoff state
-    /// is coherent regardless of which one actually fires a given request -- a
-    /// tick's retry racing a receipt's continuation for the identical (author,
-    /// from) is exactly the case `ResumeTrigger::check`'s own backoff key
-    /// (author, from) already serializes to at most one send per
-    /// `resume_backoff_ms`, whichever call reaches it first.
-    async fn try_resume_request(&mut self, author: PublicKey, now: Instant) {
+    /// check` for a single author, immediately enqueueing the resulting
+    /// `VantageLaneResume` (a non-blocking `Wire::enqueue_resume` hand-off onto the
+    /// dedicated resume-sender task -- see that method's doc comment) if it fires.
+    /// Shared by three call sites: the periodic `resume_tick` (episode detector +
+    /// retry/backoff driver), and receipt-triggered continuation from
+    /// `Inbound::Publish`/`on_payload_ready` (design doc step 3: "the requester's
+    /// frontier advances on receipt, its next request follows" -- drains an
+    /// ESTABLISHED episode at RECEIPT pace instead of waiting for the next tick,
+    /// matching Starfish's own continuous per-peer stream rather than a 1 Hz
+    /// ping-pong). All three call sites hand this the SAME `ResumeTrigger`
+    /// instance, so its two-consecutive-ticks/backoff state is coherent regardless
+    /// of which one actually fires a given request -- a tick's retry racing a
+    /// receipt's continuation for the identical (author, from) is exactly the case
+    /// `ResumeTrigger::check`'s own backoff key (author, from) already serializes
+    /// to at most one send per `resume_backoff_ms`, whichever call reaches it
+    /// first.
+    ///
+    /// Synchronous (not `async`): once the send itself became a non-blocking
+    /// `try_send`, nothing left in this function's body ever awaits -- keeping it
+    /// `async fn` anyway would misdescribe it, and every call site below drops the
+    /// now-pointless `.await` accordingly.
+    fn try_resume_request(&mut self, author: PublicKey, now: Instant) {
         let frontier = self.lm.own_direct_frontier(&author);
         let avail = self.lm.avail_high(&author);
         let backoff = Duration::from_millis(self.resume_backoff_ms);
@@ -1038,18 +1063,10 @@ impl VantageCore {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_lane_resume_requests_sent.inc();
             }
-            // `resume::SEND_TIMEOUT`'s own doc comment: a single backed-up
-            // destination must cost this one send, never this whole run loop --
-            // the request is simply retried a later tick (or the next receipt) if
-            // it doesn't land.
-            let _ = tokio::time::timeout(
-                resume::SEND_TIMEOUT,
-                self.wire.send_message(
-                    author,
-                    PrimaryMessage::VantageLaneResume(author, from, self.name),
-                ),
-            )
-            .await;
+            self.wire.enqueue_resume(
+                author,
+                PrimaryMessage::VantageLaneResume(author, from, self.name),
+            );
         }
     }
 
@@ -1372,7 +1389,7 @@ impl VantageCore {
                 // majority of publishes, which never had an established episode to
                 // begin with.
                 if self.lm.own_direct_frontier(&author) > before {
-                    self.try_resume_request(author, now).await;
+                    self.try_resume_request(author, now);
                 }
                 effects
             }
@@ -1905,15 +1922,13 @@ impl VantageCore {
 
                 // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
                 Effect::ResumeServeTo(requester, header) => {
-                    // `resume::SEND_TIMEOUT`'s own doc comment: bounds a single slow
-                    // requester's cost to this one batch entry, never this whole
-                    // effect-drain loop (which a burst of `Inbound::LaneResume`
-                    // arrivals can otherwise queue many of, back to back).
-                    let _ = tokio::time::timeout(
-                        resume::SEND_TIMEOUT,
-                        self.wire.send_resume_header(requester, header),
-                    )
-                    .await;
+                    // Non-blocking hand-off onto the dedicated resume-sender task
+                    // (`Wire::enqueue_resume_header` -> `enqueue_resume`) -- never
+                    // `.await`ed, so a burst of `Inbound::LaneResume` arrivals
+                    // queuing many of these back to back (exactly what a
+                    // windowed-withhold recovery produces) costs this effect-drain
+                    // loop nothing beyond the enqueue itself.
+                    self.wire.enqueue_resume_header(requester, header);
                 }
             }
         }
@@ -2545,14 +2560,14 @@ mod tests {
 
         // Two ticks -- the gap (frontier=0, avail=1, from=1) is unchanged across
         // both, exactly as `resume_tick`'s own loop would present it.
-        core.try_resume_request(author, now).await;
+        core.try_resume_request(author, now);
         assert_eq!(
             core.metrics.as_ref().unwrap().vantage_lane_resume_requests_sent.get(),
             0,
             "first observation must not fire"
         );
         let t1 = now + Duration::from_millis(core.resume_check_period_ms);
-        core.try_resume_request(author, t1).await;
+        core.try_resume_request(author, t1);
         let sent_after_establish = core
             .metrics
             .as_ref()
@@ -2566,7 +2581,7 @@ mod tests {
 
         // The batch lands: `author`'s own height-1 header arrives as an ordinary
         // publish (this is exactly what a resumed `Header(_, false)` looks like on
-        // arrival -- see `Wire::send_resume_header`'s own doc comment). `t2` is
+        // arrival -- see `Wire::enqueue_resume_header`'s own doc comment). `t2` is
         // well within ONE tick period of `t1` -- no third tick ever runs.
         let header = Header::new_vantage(
             author,

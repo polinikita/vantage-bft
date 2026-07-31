@@ -224,8 +224,10 @@ pub enum Effect {
     /// ORIGINAL-dissemination `Header(_, false)` publish is -- see this variant's own
     /// construction site (`vantage::node::VantageCore::dispatch_inbound`'s
     /// `Inbound::LaneResume` arm) for why the resumed republish must use the OTHER
-    /// encoding. Executed via `Wire::send_resume_header`, not `Wire::send_message`
-    /// directly, so the withholding fault injector still governs it mid-window.
+    /// encoding. Executed via `Wire::enqueue_resume_header` -- a non-blocking
+    /// hand-off onto the dedicated resume-sender task (`Wire::spawn_resume_sender`),
+    /// never `Wire::send_message` directly -- so the withholding fault injector
+    /// still governs it mid-window (checked at enqueue time, before hand-off).
     ResumeServeTo(PublicKey /* requester */, Header),
 }
 

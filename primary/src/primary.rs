@@ -191,7 +191,8 @@ pub enum PrimaryMessage {
     // Simple-IT (same `LaneManager`/`Wire` data plane); see `vantage::resume`'s own
     // module doc comment for the full trigger/serve design. No separate reply
     // variant: the author answers with ordinary `Header(_, false)` messages,
-    // unicast (`vantage::wire::Wire::send_resume_header`) -- receipt is therefore
+    // unicast (`vantage::wire::Wire::enqueue_resume_header`, a non-blocking
+    // hand-off onto a dedicated resume-sender task) -- receipt is therefore
     // DirectPub/ack-eligible through the existing publish path, exactly as a
     // broadcast publish would be, and still subject to the `--withhold` filter
     // during an active window (required for experiment fidelity: a withholding

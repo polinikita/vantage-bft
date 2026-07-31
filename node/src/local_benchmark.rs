@@ -1199,6 +1199,29 @@ async fn print_results(
             );
         }
     }
+
+    // Mechanism A (sender-side lane resume, `vantage::resume`) diagnostic: read
+    // straight from each primary's own registry -- not derived from the wire-type
+    // counters above (which only ever see what actually reached the wire).
+    // `vantage_lane_resume_send_drops` in particular never appears on the wire at
+    // all by construction (a dropped enqueue never becomes a send), so this is the
+    // only way to observe it post-run.
+    let resume_requests_sent: u64 = primary_metrics
+        .iter()
+        .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_requests_sent"))
+        .sum();
+    let resume_blocks_served: u64 = primary_metrics
+        .iter()
+        .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_blocks_served"))
+        .sum();
+    let resume_send_drops: u64 = primary_metrics
+        .iter()
+        .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_send_drops"))
+        .sum();
+    println!(
+        " Mechanism A (lane resume): {} requests sent, {} blocks served, {} sends dropped (channel full/closed)",
+        resume_requests_sent, resume_blocks_served, resume_send_drops
+    );
     println!();
 
     // PHASE6-SPEC.md §9 gate amendment: per-node seal-route breakdown (near-idle/absent

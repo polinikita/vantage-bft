@@ -37,58 +37,22 @@
 // frontier/availability facts it consults are read (never duplicated) from
 // `vantage::lanes::LaneManager::own_direct_frontier`/`avail_high`; the actual block
 // lookup/clamp is `vantage::lanes::LaneManager::author_block_at`/
-// `earliest_authored_height`/`own_tip_height`; the actual wire send is
-// `vantage::wire::Wire::send_resume_header`. All of that orchestration lives in the
-// caller (`vantage::node`/`simpleit::node`), which already owns those three types --
-// this module stays a small, independently unit-testable piece of pure logic with no
-// network/lane-cache/metrics dependency of its own.
+// `earliest_authored_height`/`own_tip_height`; the actual wire hand-off is
+// `vantage::wire::Wire::enqueue_resume`/`enqueue_resume_header`, a non-blocking
+// `try_send` onto a dedicated off-run-loop sender task (`wire::spawn_resume_sender`)
+// -- see that function's doc comment for why a per-send timeout (this module's
+// previous `SEND_TIMEOUT`, deleted -- see git history) is no longer needed at all:
+// the run loop never performs the network send itself anymore, so there is nothing
+// left on ITS side for a slow destination to block. All of that orchestration lives
+// in the caller (`vantage::node`/`simpleit::node`), which already owns those three
+// types -- this module stays a small, independently unit-testable piece of pure
+// logic with no network/lane-cache/metrics dependency of its own.
 
 use crypto::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::primary::Height;
-
-/// Per-send safety bound for Mechanism A's own two network call sites (the
-/// requester's outgoing `VantageLaneResume`, and the author's outgoing resumed
-/// `Header(_, false)` batch) -- empirically load-bearing, not a stylistic nicety.
-///
-/// `Wire::send_message`'s `.await` only resolves once the message is handed to its
-/// destination's `ReliableSender::Connection` task via a BOUNDED (1000-capacity)
-/// in-process channel -- it returns as soon as that handoff succeeds, well before any
-/// actual byte reaches the network. Under ordinary load this is near-instant. But
-/// `VantageCore::run`/`SimpleItCore::run` is a single sequential task: while ANY one
-/// `.await` inside a `select!` branch is pending, that task processes NOTHING else --
-/// no inbound messages, no timers, no other authors' resume traffic -- for as long as
-/// that `.await` takes. If a destination's own connection task falls behind (e.g. its
-/// OWN outbound queue is backed up because ITS peer is slow to read, propagating TCP
-/// backpressure back through the queue), the handoff channel fills and this send
-/// blocks until the destination recovers.
-///
-/// A single stuck destination among up to ~20 possible authors would therefore be
-/// enough to freeze this party's ENTIRE event loop -- not just its resume traffic --
-/// for as long as that destination stays backed up, which is observably possible
-/// under exactly the bursty, all-to-all catch-up traffic Mechanism A itself creates
-/// once a withheld window closes and many peers simultaneously resume many lanes.
-/// Wrapping Mechanism A's own sends in `tokio::time::timeout` bounds the damage: a
-/// slow destination costs this one send attempt, not this party's whole run loop --
-/// the request/serve will simply be retried on a later tick (or a later, hopefully
-/// unstuck, incoming request), never silently dropped forever. Scoped to Mechanism
-/// A's own two call sites only, not applied to any pre-existing effect: broadening it
-/// would change behavior/guarantees for code this task does not own.
-///
-/// Deliberately much shorter than `resume_check_period_ms`'s own tick period, not
-/// just "short": the requester's tick handler can attempt this many times in a row
-/// (once per OTHER committee member with an established gap, up to ~n-1), and the
-/// author's per-request handler can attempt it up to `resume_batch` times in a row --
-/// a per-send bound anywhere near the tick period would let ONE tick's worth of
-/// resume processing eat MULTIPLE tick periods end-to-end in the worst case (every
-/// attempt individually timing out), starving this party's own inbound-message
-/// processing (the same single sequential run loop) for that whole stretch. The
-/// handoff this bounds is a purely LOCAL, in-process bounded-channel send (see
-/// above) -- under any healthy connection it resolves in low-single-digit
-/// microseconds, so this still leaves three orders of magnitude of margin.
-pub const SEND_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// Requester-side trigger state (design doc step 2). One instance per
 /// `VantageCore`/`SimpleItCore`, covering every OTHER committee member's lane (the

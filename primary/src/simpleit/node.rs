@@ -24,7 +24,7 @@ use crate::vantage::lanes::{
 };
 use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
-use crate::vantage::resume::{self, ResumeServe, ResumeTrigger};
+use crate::vantage::resume::{ResumeServe, ResumeTrigger};
 use crate::vantage::wire::{self, DeclaredSender, Wire};
 use crate::vantage::{BlockRef, Effect};
 use async_trait::async_trait;
@@ -584,6 +584,22 @@ impl SimpleItCore {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        // Mechanism A (sender-side lane resume, `vantage::resume`): this node's own
+        // dedicated off-run-loop sender -- mirrors `VantageCore::build`'s identical
+        // construction exactly (see `wire::spawn_resume_sender`'s doc comment for
+        // the full design/rationale). Built from the SAME `latency_map`/
+        // `blip_gate`/`batch`/`core_metrics` locals as `network`/`worker_network`
+        // just below -- cloned here (rather than moved) since both of those still
+        // need their own copies afterward.
+        let resume_tx = wire::spawn_resume_sender(
+            latency_map.clone(),
+            blip_gate.clone(),
+            parameters.compress_network,
+            batch,
+            core_metrics.clone(),
+            channel_auth.clone(),
+        );
+
         let core = Self {
             name,
             members,
@@ -615,6 +631,7 @@ impl SimpleItCore {
                     }
                     s
                 },
+                resume_tx,
                 channel_auth,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
@@ -787,7 +804,7 @@ impl SimpleItCore {
                     let authors: Vec<PublicKey> =
                         self.wire.other_primaries.iter().map(|(pk, _)| *pk).collect();
                     for author in authors {
-                        self.try_resume_request(author, now).await;
+                        self.try_resume_request(author, now);
                     }
                 }
 
@@ -844,7 +861,7 @@ impl SimpleItCore {
                 let effects = self.lm.process_publish(sender, header).await;
                 self.execute(effects).await;
                 if self.lm.own_direct_frontier(&author) > before {
-                    self.try_resume_request(author, Instant::now()).await;
+                    self.try_resume_request(author, Instant::now());
                 }
             }
             Inbound::Serve(header) => {
@@ -1060,14 +1077,11 @@ impl SimpleItCore {
 
                 // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
                 Effect::ResumeServeTo(requester, header) => {
-                    // `resume::SEND_TIMEOUT`'s own doc comment: bounds a single slow
-                    // requester's cost to this one batch entry, never this whole
-                    // effect-drain loop.
-                    let _ = tokio::time::timeout(
-                        resume::SEND_TIMEOUT,
-                        self.wire.send_resume_header(requester, header),
-                    )
-                    .await;
+                    // Non-blocking hand-off onto the dedicated resume-sender task
+                    // (`Wire::enqueue_resume_header` -> `enqueue_resume`) -- never
+                    // `.await`ed, so this costs the effect-drain loop nothing
+                    // beyond the enqueue itself.
+                    self.wire.enqueue_resume_header(requester, header);
                 }
                 other @ (Effect::BroadcastPropose(_)
                 | Effect::BroadcastEcho(_)
@@ -1363,17 +1377,20 @@ impl SimpleItCore {
             self.drain_commit_queue().await;
             if let (Some(author), Some(before)) = (author, before) {
                 if self.lm.own_direct_frontier(&author) > before {
-                    self.try_resume_request(author, Instant::now()).await;
+                    self.try_resume_request(author, Instant::now());
                 }
             }
         }
     }
 
     /// Mechanism A (sender-side lane resume, `vantage::resume`) -- mirrors
-    /// `VantageCore::try_resume_request` exactly. Shared by the periodic
-    /// `resume_tick` and both receipt-continuation call sites
-    /// (`dispatch_inbound`'s `Inbound::Publish` arm, `on_payload_ready` above).
-    async fn try_resume_request(&mut self, author: PublicKey, now: Instant) {
+    /// `VantageCore::try_resume_request` exactly, including its non-`async`
+    /// signature (see that function's own doc comment for why: once the send
+    /// itself became a non-blocking `try_send`, nothing in this body ever
+    /// awaits). Shared by the periodic `resume_tick` and both receipt-continuation
+    /// call sites (`dispatch_inbound`'s `Inbound::Publish` arm, `on_payload_ready`
+    /// above).
+    fn try_resume_request(&mut self, author: PublicKey, now: Instant) {
         let frontier = self.lm.own_direct_frontier(&author);
         let avail = self.lm.avail_high(&author);
         let backoff = Duration::from_millis(self.resume_backoff_ms);
@@ -1384,16 +1401,10 @@ impl SimpleItCore {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_lane_resume_requests_sent.inc();
             }
-            // `resume::SEND_TIMEOUT`'s own doc comment: a single backed-up
-            // destination must cost this one send, never this whole run loop.
-            let _ = tokio::time::timeout(
-                resume::SEND_TIMEOUT,
-                self.wire.send_message(
-                    author,
-                    PrimaryMessage::VantageLaneResume(author, from, self.name),
-                ),
-            )
-            .await;
+            self.wire.enqueue_resume(
+                author,
+                PrimaryMessage::VantageLaneResume(author, from, self.name),
+            );
         }
     }
 }

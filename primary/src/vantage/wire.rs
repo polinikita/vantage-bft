@@ -14,11 +14,12 @@ use bytes::Bytes;
 use config::WorkerId;
 use crypto::{PairwiseKeys, PublicKey};
 use metrics::Metrics;
-use network::{CancelHandler, ReliableSender, SimpleSender};
+use network::{BatchConfig, BlipGate, CancelHandler, ReliableSender, SimpleSender};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::sync::oneshot::error::TryRecvError;
 
 /// SECURITY (Fable audit): a message's wire-declared (or positionally-attributed)
@@ -120,6 +121,19 @@ pub struct Wire {
 
     pub(crate) network: ReliableSender,
     pub(crate) worker_network: SimpleSender,
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): the channel end
+    /// this node's run loop `try_send`s onto (`enqueue_resume`/`enqueue_resume_
+    /// header` below) -- NEVER `.await`ed, so a backed-up destination costs
+    /// nothing on this side. The receiving half is owned entirely by the
+    /// dedicated task `spawn_resume_sender` spawns at construction time, which
+    /// owns its OWN `SimpleSender` (a separate connection pool from `network`/
+    /// `worker_network` above) and its own `channel_auth` clone -- see that
+    /// function's doc comment for the full design. This field, plus those two
+    /// enqueue methods, is the ENTIRE fix for the loop-starvation defect this
+    /// crate's previous per-send `resume::SEND_TIMEOUT` (deleted) only ever
+    /// bounded the damage from: a backed-up destination now costs the sender
+    /// task's own progress, never `VantageCore`/`SimpleItCore`'s run loop's.
+    pub(crate) resume_tx: mpsc::Sender<(PublicKey, SocketAddr, PrimaryMessage)>,
     /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
     /// (`Parameters::authenticate_channels`). `None` (the default) is byte-identical
     /// to pre-MAC behavior: `broadcast_message`/`send_message` hand `network`/
@@ -423,36 +437,76 @@ impl Wire {
         self.worker_network.send_typed(addr, data, msg_type).await;
     }
 
-    /// Mechanism A (sender-side lane resume, `vantage::resume`): unicasts our own
-    /// original-dissemination header to `peer` as one entry of a resume batch. Same
-    /// wire encoding as a fresh publish (`Header(_, false)`, MAC-bound to
+    /// Mechanism A (sender-side lane resume, `vantage::resume`): the run loop's
+    /// non-blocking hand-off of `message` (addressed to `peer`) onto the dedicated
+    /// resume-sender task's channel (`spawn_resume_sender`) -- the ONLY interaction
+    /// `VantageCore`/`SimpleItCore`'s run loop has with Mechanism A's own network
+    /// sends, replacing the previous `send_message`-based `send_resume_header`/
+    /// `resume::SEND_TIMEOUT` combo entirely (both deleted). `try_send`, NEVER
+    /// `.await`ed: fire-and-forget is CORRECT here because resume traffic is
+    /// end-to-end retried above this layer already (the requester's own backoff
+    /// re-asks an unanswered gap; the author's own `resume::ResumeServe` dedup
+    /// absorbs a duplicate re-serve) -- a dropped enqueue costs one attempt, never
+    /// this run loop's own progress on anything else.
+    ///
+    /// `peer` must resolve in `other_primaries` -- mirrors `send_to`'s identical
+    /// resolve-or-no-op contract exactly (a `peer` that isn't a known other primary,
+    /// e.g. `self.name`, which `other_primaries` never contains by construction, is
+    /// silently skipped, same as `send_to` already does).
+    pub(crate) fn enqueue_resume(&self, peer: PublicKey, message: PrimaryMessage) {
+        let Some(addr) = self
+            .other_primaries
+            .iter()
+            .find(|(pk, _)| *pk == peer)
+            .map(|(_, a)| *a)
+        else {
+            return;
+        };
+        if self.resume_tx.try_send((peer, addr, message)).is_err() {
+            // `Full` (the sender task fell behind draining a backed-up
+            // destination) or `Closed` (the task itself is gone -- in practice
+            // only reachable if it panicked; the channel's one live `Sender`
+            // lives on this `Wire`, tied to this node's own lifetime). Either
+            // way, this one resume message did not go out on this attempt --
+            // Mechanism A's own end-to-end retry (`resume::ResumeTrigger`'s
+            // backoff, `resume::ResumeServe`'s dedup) is what recovers it, not
+            // a second attempt from here.
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_lane_resume_send_drops.inc();
+            }
+        }
+    }
+
+    /// Mechanism A: the author-side counterpart -- same withholding-fidelity gate
+    /// `broadcast_message`'s `Header(_, false)` arm consults (`withheld_header_dests`
+    /// together with `config::withhold_active`), applied HERE, at enqueue time in
+    /// the run loop (where `withheld_header_dests`/`withhold_window` live -- the
+    /// sender task `enqueue_resume` hands off to carries neither field, and must
+    /// not): a withholding sender mid-window must not resume-serve its own blocked
+    /// half either -- `--withhold` models a sender that never gets this data to
+    /// that half AT ALL during the window, and a resume batch is still that same
+    /// data, merely addressed differently on the wire. `withheld_header_dests`'s
+    /// second component (`full`, this node's ALLOWED, i.e. non-blocked,
+    /// destinations) is what's consulted -- `peer` not appearing in it means
+    /// `peer` is in this node's blocked half.
+    ///
+    /// Same wire encoding as a fresh publish (`Header(_, false)`, MAC-bound to
     /// `h.author` -- `mac_candidate_sender`'s existing arm for this variant already
     /// covers it unchanged, since this is only ever called by the block's own author
     /// answering a `VantageLaneResume` for its OWN lane, i.e. `h.author ==
     /// self.name`), just unicast instead of broadcast -- so receipt is DirectPub/
     /// ack-eligible through the existing publish path exactly as a broadcast publish
-    /// would be. Deliberately routed through `send_message` (genuine per-destination
-    /// MAC tag), never through the placeholder-tag path.
-    ///
-    /// Consults the SAME withholding predicate `broadcast_message`'s `Header(_,
-    /// false)` arm does (`withheld_header_dests` + `config::withhold_active`): a
-    /// withholding sender mid-window must not resume-serve its own blocked half
-    /// either -- `--withhold` models a sender that never gets this data to that half
-    /// AT ALL during the window, and a resume batch is still that same data, merely
-    /// addressed differently on the wire. `withheld_header_dests`'s second component
-    /// (`full`, this node's ALLOWED, i.e. non-blocked, destinations) is what's
-    /// consulted -- `peer` not appearing in it means `peer` is in this node's
-    /// blocked half.
-    pub(crate) async fn send_resume_header(&mut self, peer: PublicKey, header: Header) {
+    /// would be.
+    pub(crate) fn enqueue_resume_header(&self, peer: PublicKey, header: Header) {
         if let Some((_, allowed)) = &self.withheld_header_dests {
             let peer_allowed = allowed.iter().any(|(pk, _)| *pk == peer);
-            if !peer_allowed && config::withhold_active(self.withhold_window.as_deref(), Instant::now())
+            if !peer_allowed
+                && config::withhold_active(self.withhold_window.as_deref(), Instant::now())
             {
                 return;
             }
         }
-        self.send_message(peer, PrimaryMessage::Header(header, false))
-            .await;
+        self.enqueue_resume(peer, PrimaryMessage::Header(header, false));
     }
 
     /// Small accessor for `VantageCore::sync_batches`/`notify_committed` (which stay on
@@ -461,5 +515,100 @@ impl Wire {
     /// address now that `worker_addresses` lives here.
     pub(crate) fn worker_addr(&self, worker_id: WorkerId) -> Option<SocketAddr> {
         self.worker_addresses.get(&worker_id).copied()
+    }
+}
+
+/// Mechanism A (sender-side lane resume, `vantage::resume`): capacity of
+/// `spawn_resume_sender`'s own channel. Sized to absorb a full windowed-withhold
+/// recovery burst without forcing every enqueue onto `Wire::enqueue_resume`'s drop
+/// path: the measured loop-starvation defect this whole task exists to fix served
+/// ~600-header backlogs to ~10 requesters per author (~6.4k unicasts committee-wide)
+/// entirely synchronously on the run loop; 4096 comfortably covers one node's own
+/// share of that burst (never the whole committee's traffic through one instance's
+/// one channel -- every node has its own `Wire`, hence its own channel) while
+/// staying a small, fixed amount of memory. A full channel is never a correctness
+/// bug, only a liveness hiccup: `enqueue_resume`'s `try_send` failing drops one
+/// message, which Mechanism A's own end-to-end retry (`resume::ResumeTrigger`'s
+/// backoff-driven resend, `resume::ResumeServe`'s dedup covering a redundant
+/// re-serve) recovers on a later attempt.
+const RESUME_SEND_CHANNEL_CAPACITY: usize = 4096;
+
+/// Mechanism A (sender-side lane resume, `vantage::resume`): builds this node's ONE
+/// dedicated resume-sender task and returns the `mpsc::Sender` end `Wire::
+/// enqueue_resume`/`enqueue_resume_header` `try_send` onto. Called once, at
+/// `VantageCore::build`/`SimpleItCore::build` time, with the SAME `latency_map`/
+/// `blip_gate`/`compress_network`/`batch`/`metrics` values those constructors hand
+/// `network`/`worker_network` (identical configuration convention) -- but this is a
+/// DELIBERATELY SEPARATE `SimpleSender` instance (its own connection pool) and a
+/// separate clone of `channel_auth`, so a resume destination's connection state, and
+/// this task's own MAC-tagging, never touch `network`'s (primary<->primary AGB/
+/// consensus traffic) or `worker_network`'s (primary<->worker) state, or
+/// `VantageCore`/`SimpleItCore`'s run loop, ever again once spawned.
+///
+/// Fire-and-forget (`SimpleSender`, not `ReliableSender`) is CORRECT for resume
+/// traffic specifically, unlike most of this node's other unicast traffic: it is
+/// end-to-end retried ABOVE this layer already (the requester's own backoff
+/// re-requests an unanswered gap; the author's own `resume::ResumeServe` dedup
+/// absorbs a duplicate re-serve), so `ReliableSender`'s retry-until-ack machinery
+/// would only add redundant bookkeeping for a guarantee this mechanism does not need.
+///
+/// The task this spawns (`run_resume_sender`) is free to block/await on every single
+/// send -- that IS its entire reason to exist: letting one slow destination cost
+/// only this task's own progress, never the run loop that used to make this exact
+/// send inline (the loop-starvation defect `resume::SEND_TIMEOUT`, now deleted, used
+/// to merely bound the damage from, rather than eliminate).
+pub(crate) fn spawn_resume_sender(
+    latency_map: HashMap<SocketAddr, Duration>,
+    blip_gate: Option<Arc<BlipGate>>,
+    compress_network: bool,
+    batch: BatchConfig,
+    metrics: Option<Arc<Metrics>>,
+    channel_auth: Option<Arc<PairwiseKeys>>,
+) -> mpsc::Sender<(PublicKey, SocketAddr, PrimaryMessage)> {
+    let (tx, rx) = mpsc::channel(RESUME_SEND_CHANNEL_CAPACITY);
+    let mut sender = SimpleSender::new()
+        .with_latency(latency_map)
+        .with_blip(blip_gate)
+        .with_compression(compress_network)
+        .with_batching(batch);
+    if let Some(m) = metrics {
+        sender = sender.with_metrics(m);
+    }
+    tokio::spawn(run_resume_sender(rx, sender, channel_auth));
+    tx
+}
+
+/// Mechanism A: the dedicated off-run-loop task itself, fed by `spawn_resume_
+/// sender`'s channel. One iteration: recv -> serialize -> MAC-tag (per destination,
+/// mirroring `Wire::send_to`'s tag-append contract exactly -- neither of Mechanism
+/// A's two message shapes (`VantageLaneResume`, the requester's own outgoing ask;
+/// `Header(_, false)`, the author's resumed republish) is D4-class (no sender claim
+/// to bind), so this never takes the placeholder-tag path `broadcast`/`broadcast_to`
+/// use for `Header(_, true)`/`ControlServe`/etc.) -> `SimpleSender::send_typed`.
+/// Every step here may block/await freely -- see `spawn_resume_sender`'s doc comment
+/// for why that is this task's entire job rather than a bug. Ends the moment `tx`'s
+/// one live clone (held by `Wire`) drops -- `rx.recv()` then returns `None` and this
+/// loop, and the task with it, ends; nothing joins it explicitly, mirroring every
+/// other detached `tokio::spawn` in this codebase (e.g. `network::Connection::spawn`).
+async fn run_resume_sender(
+    mut rx: mpsc::Receiver<(PublicKey, SocketAddr, PrimaryMessage)>,
+    mut sender: SimpleSender,
+    channel_auth: Option<Arc<PairwiseKeys>>,
+) {
+    while let Some((peer, addr, message)) = rx.recv().await {
+        let msg_type = message.type_name();
+        let bytes = bincode::serialize(&message).expect("serializes");
+        let data = match &channel_auth {
+            None => Bytes::from(bytes),
+            Some(auth) => {
+                let tag = auth
+                    .tag_for(&peer, &bytes)
+                    .expect("peer is a committee member");
+                let mut tagged = bytes;
+                tagged.extend_from_slice(&tag);
+                Bytes::from(tagged)
+            }
+        };
+        sender.send_typed(addr, data, msg_type).await;
     }
 }

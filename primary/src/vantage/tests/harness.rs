@@ -784,7 +784,7 @@ pub fn drain_local(
             // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
             // Same wire encoding as `Effect::BroadcastPublish` (`Header(_, false)`,
             // which always maps to `Inbound::Publish` regardless of unicast vs.
-            // broadcast delivery -- see `vantage::wire::Wire::send_resume_header`'s
+            // broadcast delivery -- see `vantage::wire::Wire::enqueue_resume_header`'s
             // own doc comment), just routed to exactly one target instead of every
             // live node.
             Effect::ResumeServeTo(requester, header) => {
