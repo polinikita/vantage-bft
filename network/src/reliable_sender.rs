@@ -136,7 +136,7 @@ impl ReliableSender {
 
     /// Helper function to spawn a new connection.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
-        let (tx, rx) = channel(1_000);
+        let (tx, rx) = channel(100_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
         // Resolved ONCE here (mirrors `extra_latency` just above), not per-message:
         // `None` unless a blip gate is attached AND `address` is one of its held

@@ -99,7 +99,7 @@ impl SimpleSender {
 
     /// Helper function to spawn a new connection.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
-        let (tx, rx) = channel(1_000);
+        let (tx, rx) = channel(100_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
         // Resolved ONCE here (mirrors `extra_latency` just above), not per-message --
         // see `ReliableSender::spawn_connection`'s identical comment.
