@@ -81,6 +81,28 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         nodes
     );
     let live_nodes = nodes - crash;
+    // Load-skew: which of the LIVE nodes spawn client tasks. Absent, defaults to every
+    // live node (today's behavior, byte-identical). The loaded set is always "the
+    // first `load_nodes` live indices" -- since crashed nodes are already excluded by
+    // being the trailing `crash` indices (R2, just above), this selection can never
+    // overlap the crashed set without any extra bookkeeping here.
+    let load_nodes: usize = match matches.get_one::<String>("load-nodes") {
+        Some(s) => s
+            .parse()
+            .context("--load-nodes must be a positive integer")?,
+        None => live_nodes,
+    };
+    anyhow::ensure!(
+        load_nodes >= 1,
+        "--load-nodes ({}) must be at least 1 (a run with zero clients measures nothing)",
+        load_nodes
+    );
+    anyhow::ensure!(
+        load_nodes <= live_nodes,
+        "--load-nodes ({}) must be at most the number of live nodes ({})",
+        load_nodes,
+        live_nodes
+    );
     let delta_ms: u64 = matches
         .get_one::<String>("delta-ms")
         .unwrap()
@@ -223,6 +245,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             crash, nodes, live_nodes
         );
     }
+    if load_nodes < live_nodes {
+        println!(
+            "Load: {} of {} live node(s) receive client transactions (aggregate rate unchanged)",
+            load_nodes, live_nodes
+        );
+    }
     println!("======================================\n");
 
     // Wipe and recreate the data dir (starfish's own local-benchmark does the same).
@@ -318,10 +346,13 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             authority.workers.values().map(|w| w.transactions)
         })
         .collect();
-    // Offered rate scaled to the live clients only (R2): the same aggregate --rate is
-    // now divided among fewer senders, so each live client's own per-client rate rises
-    // to compensate -- the aggregate offered load is unchanged by which nodes crashed.
-    let rate_share = rate.div_ceil((live_nodes * workers).max(1) as u64);
+    // Offered rate scaled to the LOADED clients only (R2 + load-skew): the same
+    // aggregate --rate is divided among however many senders actually exist --
+    // `load_nodes` of them, not `live_nodes` -- so each loaded client's own
+    // per-client rate rises to compensate; the aggregate offered load is unchanged by
+    // which nodes crashed OR by how many live nodes are unloaded. `load_nodes ==
+    // live_nodes` (the default) recovers the original divisor exactly.
+    let rate_share = rate.div_ceil((load_nodes * workers).max(1) as u64);
 
     // Spawn every primary and every worker natively, in this one process -- only for
     // the live nodes (R2).
@@ -351,6 +382,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         primary_metrics.push((i, primary_registry, primary_reporter));
         metrics_targets.push(primary_target);
 
+        // Load-skew: `i` ranges over live node indices only (`.take(live_nodes)`
+        // below), so "first `load_nodes` of these" is exactly the loaded set --
+        // already disjoint from the crashed (trailing) indices by construction; see
+        // the `load_nodes` validation above for the same interplay spelled out.
+        let client_rate_share = (i < load_nodes).then_some(rate_share);
         let (workers_spawned, workers_client_handles) = spawn_node_workers(
             i,
             name,
@@ -359,7 +395,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             &committee,
             &parameters,
             tx_size,
-            rate_share,
+            client_rate_share,
             mode,
             &all_worker_addresses,
         )?;
@@ -653,13 +689,15 @@ fn spawn_node_primary(
 }
 
 /// Spawns one live node's `workers` workers in-process -- the exact same
-/// `Worker::spawn` wiring `node run ... worker` uses standalone -- plus one
-/// client task per worker, waiting for every live node's worker addresses
-/// before sending (mirrors `benchmark_client --nodes`). Returns each worker's
-/// metrics registry/reporter alongside its own metrics-scrape target for
-/// `prometheus.yaml` (in worker-id order), plus that client task's own
+/// `Worker::spawn` wiring `node run ... worker` uses standalone -- plus, when
+/// `rate_share` is `Some` (this node is in the `--load-nodes` loaded set), one
+/// client task per worker, waiting for every live node's worker addresses before
+/// sending (mirrors `benchmark_client --nodes`); when `None`, this node's workers
+/// still spawn and still listen, they just get no client task. Returns each
+/// worker's metrics registry/reporter alongside its own metrics-scrape target for
+/// `prometheus.yaml` (in worker-id order), plus every spawned client task's own
 /// `JoinHandle` (Fable audit item 5: so the caller can stop it before a final,
-/// drained re-read -- see `run`).
+/// drained re-read -- see `run`; empty when `rate_share` is `None`).
 // clippy::too_many_arguments: see primary/src/committer.rs's identical justification
 // (this local helper mirrors Worker::spawn's own wiring one-for-one).
 #[allow(clippy::too_many_arguments)]
@@ -671,7 +709,7 @@ fn spawn_node_workers(
     committee: &Committee,
     parameters: &Parameters,
     tx_size: usize,
-    rate_share: u64,
+    rate_share: Option<u64>,
     mode: TransactionMode,
     all_worker_addresses: &[SocketAddr],
 ) -> Result<(Vec<NodeMetricsHandle>, Vec<tokio::task::JoinHandle<()>>)> {
@@ -703,20 +741,27 @@ fn spawn_node_workers(
         );
         spawned.push((registry, reporter, target));
 
-        let target_addr = committee.worker(&name, &worker_id).unwrap().transactions;
-        let client = Client {
-            target: target_addr,
-            size: tx_size,
-            rate: rate_share,
-            nodes: all_worker_addresses.to_vec(),
-            mode,
-        };
-        client_handles.push(tokio::spawn(async move {
-            client.wait().await;
-            if let Err(e) = client.send().await {
-                log::warn!("Client for node {} worker {} exited: {}", i, j, e);
-            }
-        }));
+        // --load-nodes: unloaded live nodes (`rate_share == None`) already ran
+        // `Worker::spawn` above and already listen on their transactions port --
+        // still included in every client's `all_worker_addresses` wait-list -- they
+        // just never get a client task of their own below, so their lane carries no
+        // payload.
+        if let Some(rate_share) = rate_share {
+            let target_addr = committee.worker(&name, &worker_id).unwrap().transactions;
+            let client = Client {
+                target: target_addr,
+                size: tx_size,
+                rate: rate_share,
+                nodes: all_worker_addresses.to_vec(),
+                mode,
+            };
+            client_handles.push(tokio::spawn(async move {
+                client.wait().await;
+                if let Err(e) = client.send().await {
+                    log::warn!("Client for node {} worker {} exited: {}", i, j, e);
+                }
+            }));
+        }
     }
     Ok((spawned, client_handles))
 }

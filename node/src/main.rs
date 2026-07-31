@@ -200,6 +200,20 @@ async fn main() -> Result<()> {
                         ),
                 )
                 .arg(
+                    Arg::new("load-nodes")
+                        .long("load-nodes")
+                        .value_name("INT")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Load-skew: number of the first live nodes whose clients \
+                        submit transactions; remaining live nodes still run their \
+                        primary/worker tasks and still listen for transactions, they just \
+                        receive none. Aggregate offered --rate is unchanged -- it is \
+                        redivided among these clients only. Must be between 1 and the \
+                        number of live nodes inclusive. Default: all live nodes.",
+                        ),
+                )
+                .arg(
                     Arg::new("delta-ms")
                         .long("delta-ms")
                         .value_name("INT")
