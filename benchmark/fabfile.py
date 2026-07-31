@@ -110,7 +110,7 @@ def install(ctx, source_build=False):
 
 @task
 def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False, all_to_all=False,
-           batch_messages=False, batch_max_bytes=65536, batch_max_delay_ms=5,
+           batch_messages=True, batch_max_bytes=65536, batch_max_delay_ms=5,
            mimic_latency_ms=0, source_build=False):
     ''' Run benchmarks on AWS.
 

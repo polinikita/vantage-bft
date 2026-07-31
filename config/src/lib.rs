@@ -382,7 +382,7 @@ pub struct Parameters {
     /// EXCEPT the client-facing transaction port (clients never batch, same carve-out
     /// as `compress_network`). Committee-wide consistent by construction, same
     /// reasoning as `compress_network`.
-    #[serde(default)]
+    #[serde(default = "default_batch_messages")]
     pub batch_messages: bool,
     /// Hybrid flush size cap in bytes (see `network::BatchConfig::max_bytes`).
     /// Irrelevant when `batch_messages` is off. `#[serde(default)]` (65536) keeps
@@ -567,6 +567,10 @@ pub struct Parameters {
     /// `#[serde(default)]` (64) keeps every pre-existing parameter file valid.
     #[serde(default = "default_resume_batch")]
     pub resume_batch: u64,
+}
+
+fn default_batch_messages() -> bool {
+    true
 }
 
 fn default_batch_max_bytes() -> usize {
@@ -843,7 +847,7 @@ impl Default for Parameters {
             latency_table: None,
             mimic_latency_ms: None,
             compress_network: false,
-            batch_messages: false,
+            batch_messages: true,
             batch_max_bytes: default_batch_max_bytes(),
             batch_max_delay_ms: default_batch_max_delay_ms(),
             authenticate_channels: false,
@@ -1560,7 +1564,9 @@ mod tests {
         assert_eq!(params.mimic_latency_ms, Some(100));
         // Fields absent from the JSON fall back to their serde defaults.
         assert!(!params.authenticate_channels);
-        assert!(!params.batch_messages);
+        // Transport batching is ON by default (5 ms / 64 KB per-destination
+        // coalescing) -- a parameters file that omits the key gets it enabled.
+        assert!(params.batch_messages);
         assert!(!params.compress_network);
         // `vantage_gc_window_views` is absent from this (pre-existing shape) file and
         // must default to the same 50 the Vantage GC previously took from `gc_depth`,

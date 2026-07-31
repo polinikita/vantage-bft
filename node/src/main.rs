@@ -346,15 +346,15 @@ async fn main() -> Result<()> {
                         ),
                 )
                 .arg(
-                    Arg::new("batch-messages")
-                        .long("batch-messages")
+                    Arg::new("no-batch-messages")
+                        .long("no-batch-messages")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "Transport-level per-peer outbound message batching \
-                        (coalescing), applied uniformly by the network crate to every \
-                        sender/receiver (all protocols identically) except the \
-                        client-facing transaction port. Off by default -- byte-identical \
-                        wire/behavior when off.",
+                            "Disable transport-level per-peer outbound message batching \
+                        (coalescing; 5 ms / 64 KB hybrid flush, applied uniformly by the \
+                        network crate to every sender/receiver, all protocols \
+                        identically, except the client-facing transaction port). ON by \
+                        default; this flag restores unbatched per-message framing.",
                         ),
                 )
                 .arg(

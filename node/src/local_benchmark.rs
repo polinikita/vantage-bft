@@ -421,8 +421,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         max_header_delay: max_header_delay_ms,
         // METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when off.
         compress_network: matches.get_flag("compress-network"),
-        // Transport-level batching: off by default, byte-identical wire/behavior when off.
-        batch_messages: matches.get_flag("batch-messages"),
+        // Transport-level batching: ON by default (5 ms / 64 KB per-destination
+        // coalescing); --no-batch-messages restores unbatched framing.
+        batch_messages: !matches.get_flag("no-batch-messages"),
         batch_max_bytes,
         batch_max_delay_ms,
         // Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
@@ -619,7 +620,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // reads below, just every second instead of once at the end. Diagnostic only;
         // does not touch the client/committer/execute path in any way.
         println!(
-            " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume"
+            " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume   wish   target   omega_q"
         );
         let mut elapsed: u64 = 0;
         // Committed-throughput series (grep-parseable `TIMELINE:` lines): matches
@@ -642,9 +643,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                     for (i, registry, _reporter) in &primary_metrics {
                         if let Some(p) = read_vantage_progress(registry) {
                             println!(
-                                " [timeline] T+{:<4} node-{:<3} entered={:<7} a_i={:<5} cursor={:<7} round={:<6} delivered={:<9} consume={}",
+                                " [timeline] T+{:<4} node-{:<3} entered={:<7} a_i={:<5} cursor={:<7} round={:<6} delivered={:<9} consume={:<6} wish={:<6} target={:<6} omega_q={}",
                                 elapsed, i, p.entered_view, p.frontier_a_i, p.cursor_next_view, p.control_round,
-                                p.control_delivered_len, p.control_consume_pos
+                                p.control_delivered_len, p.control_consume_pos,
+                                p.own_watermark, p.entry_target, p.omega_q
                             );
                         }
                     }

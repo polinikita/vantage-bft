@@ -12,6 +12,11 @@ async fn handle_clients_transactions() {
     let committee = committee_with_base_port(11_000);
     let parameters = Parameters {
         batch_size: 200, // Two transactions.
+        // This test pins the UNBATCHED wire shape end to end (the worker-to-primary
+        // listener asserts exact frame bytes); transport batching -- on by default --
+        // would wrap the same bytes in bundle framing, which is covered by the
+        // network crate's own batch tests, not this one's subject.
+        batch_messages: false,
         ..Parameters::default()
     };
 
