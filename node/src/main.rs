@@ -370,6 +370,20 @@ async fn main() -> Result<()> {
                             "Ack-watermark broadcast period, ms -- irrelevant unless \
                         --ack-watermarks is set",
                         ),
+                )
+                .arg(
+                    Arg::new("digest-statements")
+                        .long("digest-statements")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "signature-free.tex sec.8.3 'Digest-named AGB statements': every \
+                        Vantage ECHO/READY names its proposal by hash instead of carrying it \
+                        by value (the proposal itself still travels by value only in the \
+                        propose message); a receiver fetches the body on demand from a \
+                        buffered statement's own author if it doesn't already hold it. \
+                        Emission-only: reception handles both encodings unconditionally \
+                        either way. Off by default -- byte-identical wire/behavior when off.",
+                        ),
                 ),
         )
         .subcommand_required(true)

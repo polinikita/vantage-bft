@@ -43,3 +43,6 @@ mod batched_anchors_tests;
 
 // signature-free.tex 704fb29 -- "Grounded post-ready skip" (par:skip-seal)
 mod skip_vote_tests;
+
+// signature-free.tex sec.8.3 -- "Digest-named AGB statements"
+mod digest_stmt_tests;

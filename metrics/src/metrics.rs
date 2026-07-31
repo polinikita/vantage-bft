@@ -208,6 +208,17 @@ pub struct Metrics {
     /// are not counted here -- see `vantage_skip_votes_sent`).
     pub vantage_skip_votes_received: IntCounter,
 
+    // --- signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
+    // digest_statements`). Always zero when the flag is off (no `VantageEchoDigest`/
+    // `VantageReadyDigest` is ever sent, so no digest statement is ever buffered, so
+    // no fetch is ever issued; nothing this counts is reachable without the flag).
+    /// `VantageBodyFetch` messages this node sent (one per target statement author,
+    /// per outstanding (view, digest) pair, per retry attempt).
+    pub vantage_body_fetches_sent: IntCounter,
+    /// `VantageBodyServe` messages this node sent, answering a peer's
+    /// `VantageBodyFetch` with its own held, fixed `ViewProposal`.
+    pub vantage_bodies_served: IntCounter,
+
     // --- Phase 7 prep (PHASE7-PREP-NOTES.md, Finding A diagnosis): always-on progress
     // gauges, one flat value each (no labels), sampled once/sec by `VantageCore` itself
     // (metrics-only addition -- no protocol-semantic effect, same "always registered,
@@ -626,6 +637,18 @@ impl Metrics {
             vantage_skip_votes_received: register_int_counter_with_registry!(
                 "vantage_skip_votes_received",
                 "Grounded SKIP-VOTE(u) statements this node counted first-hand from a peer",
+                registry,
+            )
+            .unwrap(),
+            vantage_body_fetches_sent: register_int_counter_with_registry!(
+                "vantage_body_fetches_sent",
+                "Digest-named AGB statements (signature-free.tex sec.8.3): VantageBodyFetch messages this node sent",
+                registry,
+            )
+            .unwrap(),
+            vantage_bodies_served: register_int_counter_with_registry!(
+                "vantage_bodies_served",
+                "Digest-named AGB statements (signature-free.tex sec.8.3): VantageBodyServe messages this node sent",
                 registry,
             )
             .unwrap(),

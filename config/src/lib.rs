@@ -271,6 +271,23 @@ pub struct Parameters {
     #[serde(default = "default_ack_watermark_period_ms")]
     pub ack_watermark_period_ms: u64,
 
+    /// Vantage only, optional, flag-gated (signature-free.tex §8.3's "Digest-named
+    /// AGB statements"): every ECHO/READY (the `Single`, non-batch shape) names its
+    /// proposal by `hash(B_v)` instead of carrying it by value -- the proposal
+    /// itself still travels by value only in `VantagePropose`. Reception handles
+    /// both encodings unconditionally regardless of this flag, on every party
+    /// (`vantage::agb::DigestStatements`); the flag gates EMISSION only.
+    /// `#[serde(default)]` = `false` -- byte-identical wire/behavior when off: no
+    /// `VantageEchoDigest`/`VantageReadyDigest`/`VantageBodyFetch`/
+    /// `VantageBodyServe` message is ever constructed or sent, and
+    /// `VantageCore`/`SimpleItCore` (irrelevant to the latter, which has no AGB
+    /// engine) never touch `DigestStatements`'s buffering/fetch bookkeeping in any
+    /// observable way. Committee-wide consistent by construction, same reasoning as
+    /// `ack_watermarks`/`compress_network`: every node's `Parameters` comes from the
+    /// same generated config.
+    #[serde(default)]
+    pub digest_statements: bool,
+
     /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
     /// per-authority-pair one-way latency table, applied to THIS node's own
     /// primary-to-primary connections at spawn time via `Committee::latency_map`
@@ -610,6 +627,7 @@ impl Default for Parameters {
             simpleit_gc_window_rounds: default_simpleit_gc_window_rounds(),
             ack_watermarks: false,
             ack_watermark_period_ms: default_ack_watermark_period_ms(),
+            digest_statements: false,
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,
@@ -739,6 +757,11 @@ impl Parameters {
             "Ack watermarks (periodic per-lane availability broadcast, replaces \
              per-block acks) enabled? {}. Period: {} ms",
             self.ack_watermarks, self.ack_watermark_period_ms
+        );
+        info!(
+            "Digest-named AGB statements (ECHO/READY name their proposal by hash \
+             instead of by value) enabled? {}",
+            self.digest_statements
         );
     }
 }

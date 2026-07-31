@@ -164,6 +164,18 @@ pub enum PrimaryMessage {
     // resolution stance. Appended last -- same bincode wire-compat rule as every
     // other protocol-specific variant above.
     VantageSkipVote(View, /* sender */ PublicKey),
+    // Vantage only, flag-gated (`Parameters::digest_statements`, signature-free.tex
+    // §8.3's "Digest-named AGB statements"): the digest-named counterparts of
+    // `VantageEcho`/`VantageReady` (naming the proposal by `hash(B_v)` instead of
+    // carrying it), plus fetch/serve for the `ViewProposal` body itself. Constructed
+    // only when the flag is on; a run with the flag off never sends any of these
+    // four -- reception handles them unconditionally either way (see
+    // `vantage::agb::DigestStatements`'s own module doc comment). Appended last --
+    // same bincode wire-compat rule as every other protocol-specific variant above.
+    VantageEchoDigest(crate::vantage::EchoDigest),
+    VantageReadyDigest(crate::vantage::ReadyDigest),
+    VantageBodyFetch(View, Digest, /* requester */ PublicKey),
+    VantageBodyServe(View, ViewProposal),
 }
 
 impl PrimaryMessage {
@@ -215,6 +227,10 @@ impl PrimaryMessage {
             PrimaryMessage::ControlInitBatch(..) => "ControlInitBatch",
             PrimaryMessage::ControlServeBatch(..) => "ControlServeBatch",
             PrimaryMessage::VantageSkipVote(..) => "VantageSkipVote",
+            PrimaryMessage::VantageEchoDigest(..) => "VantageEchoDigest",
+            PrimaryMessage::VantageReadyDigest(..) => "VantageReadyDigest",
+            PrimaryMessage::VantageBodyFetch(..) => "VantageBodyFetch",
+            PrimaryMessage::VantageBodyServe(..) => "VantageBodyServe",
         }
     }
 }

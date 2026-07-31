@@ -174,6 +174,46 @@ pub struct Echo {
     pub origin: Option<u8>,
 }
 
+/// signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
+/// digest_statements`): the digest-named counterpart of `Echo` -- the wire tuple
+/// `(view, hash(B_v), grade, origin bit, sender)` the paragraph specifies, minus the
+/// by-value proposal itself. Carried on its own wire message, `VantageEchoDigest`,
+/// constructed only via `Echo::to_digest` at the emission boundary
+/// (`VantageCore::execute`) -- `AgbEngine` itself never builds or reads one; see
+/// `DigestStatements`'s own module doc comment for the reception-side translation
+/// layer this type feeds.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct EchoDigest {
+    pub view: View,
+    pub digest: Digest,
+    pub grade: u8,
+    pub sender: PublicKey,
+    pub wish: View,
+    pub origin: Option<u8>,
+}
+
+impl Echo {
+    /// The compact, digest-named encoding of this exact statement -- `Parameters::
+    /// digest_statements`'s emission-side translation, applied ONLY at the wire-
+    /// serialization boundary, never inside `AgbEngine`: the engine keeps
+    /// constructing a full by-value `Echo` exactly as before (`build_echo_out`), and
+    /// this is purely an alternate wire ENCODING of that same, unchanged value.
+    /// `sid` is the same session id `AgbEngine` derives every proposal digest
+    /// against (`AgbEngine::sid`), so `self.proposal.digest(sid)` here is byte-
+    /// identical to whatever digest a receiver -- by-value or digest-named -- would
+    /// independently compute for the same content.
+    pub fn to_digest(&self, sid: &Digest) -> EchoDigest {
+        EchoDigest {
+            view: self.proposal.view,
+            digest: self.proposal.digest(sid),
+            grade: self.grade,
+            sender: self.sender,
+            wish: self.wish,
+            origin: self.origin,
+        }
+    }
+}
+
 /// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): `EchoBatch`, the batch-proposal echo.
 /// PHASE8 (signature-free.tex 704fb29, par:batched-anchors): carries no `Ann`/origin
 /// field at all -- `formed_batch` now requires every `proposal.m` entry to be `Skip`,
@@ -283,6 +323,31 @@ pub struct Ready {
     pub sender: PublicKey,
     /// See `Echo::wish`'s doc comment -- same piggyback convention (W4/D5-3).
     pub wish: View,
+}
+
+/// signature-free.tex §8.3 "Digest-named AGB statements": the digest-named
+/// counterpart of `Ready`, mirroring `EchoDigest` exactly (see its own doc comment) --
+/// no origin bit (the paragraph's "origin bit, for an ECHO" is echo-only).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ReadyDigest {
+    pub view: View,
+    pub digest: Digest,
+    pub grade: ReadyGrade,
+    pub sender: PublicKey,
+    pub wish: View,
+}
+
+impl Ready {
+    /// `Echo::to_digest`'s counterpart for `Ready` -- see that method's doc comment.
+    pub fn to_digest(&self, sid: &Digest) -> ReadyDigest {
+        ReadyDigest {
+            view: self.proposal.view,
+            digest: self.proposal.digest(sid),
+            grade: self.grade,
+            sender: self.sender,
+            wish: self.wish,
+        }
+    }
 }
 
 /// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): `Ready`'s counterpart for a
@@ -974,6 +1039,47 @@ impl AgbEngine {
     /// `echo_sent` above.
     pub fn ready_sent(&self, view: View) -> bool {
         self.is_pruned(view) || self.views.get(&view).is_some_and(|s| s.ready_sent)
+    }
+
+    /// signature-free.tex §8.3 "Digest-named AGB statements": read-only accessor for
+    /// the session id every proposal digest is computed against -- lets the
+    /// wire-serialization boundary (`VantageCore::execute`'s emission-side
+    /// translation) and `DigestStatements` (reception-side body verification) derive
+    /// the SAME digest this engine itself would, without duplicating `sid`
+    /// elsewhere. Read-only: exposes existing state, changes no rule/threshold/
+    /// one-shot, same class as `is_sealed`/`echo_sent`/`ready_sent` above.
+    pub fn sid(&self) -> &Digest {
+        &self.sid
+    }
+
+    /// Read-only accessor mirroring `sid()` -- the committee `DigestStatements` needs
+    /// for `formed`'s well-formedness check on a served body.
+    pub fn committee(&self) -> &Committee {
+        &self.committee
+    }
+
+    /// signature-free.tex §8.3 "Digest-named AGB statements": read-only query of
+    /// this view's fixed proposal (received BY VALUE, via the ordinary propose path
+    /// -- `on_propose_any`'s sticky `Fixed::Proposal` write) and its digest, or
+    /// `None` for `Unset`/`Reject`/a pruned view. Lets `DigestStatements` recognize
+    /// when a locally fixed proposal already matches a digest a remote digest-named
+    /// statement just named, without duplicating any of `on_propose_any`'s own
+    /// sticky-fixing/validation logic, and lets it answer a peer's body-fetch from
+    /// this same state. Read-only: exposes existing state exactly like `is_sealed`/
+    /// `echo_sent`/`ready_sent` do; changes no rule, threshold, or one-shot.
+    /// CRITICAL for the paragraph's provenance guarantee: this is the ONLY signal
+    /// `DigestStatements` ever treats as "directly received from the proposer" --
+    /// nothing in that type ever calls `on_propose`/`on_propose_batch` itself (a
+    /// served body is verified and drained without ever touching `Fixed`), so a
+    /// served body can never cause THIS accessor to start returning `Some` for it.
+    pub fn fixed_proposal(&self, view: View) -> Option<(Arc<ProposalOut>, Digest)> {
+        if self.is_pruned(view) {
+            return None;
+        }
+        match self.views.get(&view).map(|s| &s.fixed) {
+            Some(Fixed::Proposal(p, d)) => Some((Arc::clone(p), d.clone())),
+            _ => None,
+        }
     }
 
     /// PHASE6-SPEC.md §6: submit an anchor-derived outcome `X_u` to the SAME try-seal
@@ -2317,5 +2423,542 @@ impl AgbEngine {
             self.try_seal(view, outcome, "fast_full", &mut effects);
         }
         effects
+    }
+}
+
+// =====================================================================================
+// signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
+// digest_statements`) -- the reception-side translation layer. `AgbEngine` above is
+// UNCHANGED by this section: no by-value rule, threshold, or one-shot in it was
+// touched to add this (the only edits to `AgbEngine` itself are the three read-only
+// accessors just above -- `sid`/`committee`/`fixed_proposal` -- which expose existing
+// state and mutate nothing). `DigestStatements` is a thin adapter that sits strictly
+// BETWEEN the wire and the engine: it never maintains a parallel counted census, and
+// it is the only place a digest-named statement is ever constructed or consumed.
+//
+// CROSS-ENCODING ONE-SHOT (the module's central correctness property): a sender's
+// digest-named and by-value statement for the same (view, statement kind) occupy the
+// SAME one-shot slot because this type never counts anything itself -- the moment a
+// body is verified, a buffered statement is drained by resynthesizing the exact
+// by-value `Echo`/`Ready` value and calling `AgbEngine::on_echo`/`on_ready` UNCHANGED.
+// Those methods' own `count_echo_statement`/`count_ready_statement` (first received
+// wins, keyed by (view, sender) only -- never by encoding) is the SAME dedup a real
+// by-value statement goes through; a digest-named statement that resolves immediately
+// (body already held) is fed through the identical call, with no buffering at all.
+// So whichever encoding from a given sender reaches that call FIRST wins the slot,
+// and the second is a guaranteed no-op there -- exactly the by-value protocol's
+// existing single-slot guarantee, now shared across two wire encodings instead of one.
+//
+// THRESHOLD DISCIPLINE (no READY/completion/seal before the body is held): automatic
+// by construction, not by a separate check -- a buffered statement is kept ENTIRELY
+// in `buffered_echo`/`buffered_ready` below, never touching `AgbEngine::on_echo`/
+// `on_ready` (and therefore never touching any census, tally, or threshold check
+// inside them) until `drain` resynthesizes and feeds it, which happens only once a
+// verified body is in hand. Nothing in this type counts toward anything on its own.
+//
+// BOUND (`<= n digests per view`): `buffered_echo`/`buffered_ready` are keyed
+// (View -> PublicKey -> ..), one entry per (view, sender) -- first-hand dedup,
+// mirroring `AgbEngine`'s own one-shot rule exactly (`Entry::or_insert` on an
+// already-populated sender is a no-op). There are only `n` possible senders, so each
+// map holds at most `n` entries per view regardless of how many DISTINCT
+// (Byzantine-fabricated) digests are named across them -- and since `known_bodies`/
+// `pending_fetch` are keyed by exactly the digests those <= n statements name, both
+// hold at most `n` entries per view too (in the worst case every sender names its own
+// distinct digest; in the honest-majority case there is exactly one).
+// =====================================================================================
+
+/// clippy::type_complexity: named factor-outs for `DigestStatements`'s two buffered-
+/// statement maps -- the payload a sender's one-shot buffered ECHO/READY digest
+/// statement carries (the digest it named, plus its own grade/origin), keyed
+/// `View -> PublicKey -> ..` in the struct itself.
+type BufferedEcho = (Digest, u8, Option<u8>);
+type BufferedReady = (Digest, ReadyGrade);
+
+/// The translation layer's per-view/per-(view,digest) state -- see the module
+/// doc comment above for the correctness argument. All new per-view state lives in
+/// `BTreeMap`/`BTreeSet`s keyed by `View` (or a `(View, ..)` tuple), covered by the
+/// standing `split_off`-based GC (`gc_below`) -- no `retain`, same discipline as
+/// `AgbEngine`/`control::ControlLog`'s own GC.
+pub struct DigestStatements {
+    /// Per view, per sender: this sender's one-shot buffered ECHO digest statement --
+    /// the digest it named, its grade, and its origin bit -- not yet drained because
+    /// no verified body matching that digest was held at arrival time.
+    buffered_echo: BTreeMap<View, BTreeMap<PublicKey, BufferedEcho>>,
+    /// Per view, per sender: this sender's one-shot buffered READY digest statement.
+    buffered_ready: BTreeMap<View, BTreeMap<PublicKey, BufferedReady>>,
+    /// Verified `(view, digest)` bodies -- populated once, from EITHER a matching
+    /// `AgbEngine::fixed_proposal` (received by value, via the ordinary propose path)
+    /// or an accepted `VantageBodyServe` -- so a LATER digest statement naming an
+    /// already-verified pair is fed immediately, with no repeated fetch/verify.
+    known_bodies: BTreeMap<(View, Digest), Arc<ViewProposal>>,
+    /// Outstanding fetches this party has issued, mapped to the `Instant` of the last
+    /// fan-out. Mirrors `control::ControlLog::pending_fetch`'s identical role, with
+    /// an `Instant` clock standing in for that type's `Round` one -- an AGB view has
+    /// no per-view round counter of its own to retry against.
+    pending_fetch: BTreeMap<(View, Digest), Instant>,
+    /// Per-requester serve dedup on the answering side: at most one `VantageBodyServe`
+    /// per (view, digest, requester), ever. Mirrors `control::ControlLog::
+    /// fetch_answered` exactly.
+    fetch_answered: BTreeSet<(View, Digest, PublicKey)>,
+    min_live_view: View,
+    /// Re-fan an unanswered fetch after this long. Mirrors `control::ControlLog::
+    /// FETCH_RETRY_ROUNDS` / `simpleit::engine::CutEngine::FETCH_RETRY_ROUNDS` (both
+    /// "8" of their own retry clock's units) -- stated directly as a `Duration` (8
+    /// base delay units, Δ) since AGB views carry no round counter of their own.
+    fetch_retry_interval: Duration,
+    /// `None` in most unit tests, which don't assert on metrics -- mirrors `AgbEngine`/
+    /// `Repairer`'s own optional-handle convention.
+    metrics: Option<Arc<Metrics>>,
+}
+
+impl DigestStatements {
+    pub fn new(delta_ms: u64) -> Self {
+        Self {
+            buffered_echo: BTreeMap::new(),
+            buffered_ready: BTreeMap::new(),
+            known_bodies: BTreeMap::new(),
+            pending_fetch: BTreeMap::new(),
+            fetch_answered: BTreeSet::new(),
+            min_live_view: 1,
+            fetch_retry_interval: Duration::from_millis(delta_ms) * 8,
+            metrics: None,
+        }
+    }
+
+    /// Attach counters (production wiring only -- most unit tests skip this).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn is_pruned(&self, view: View) -> bool {
+        view < self.min_live_view
+    }
+
+    /// GC: prune every per-view/per-(view,digest) map below `floor`. Mirrors
+    /// `AgbEngine::gc_below`/`control::ControlLog::gc_below`'s identical `split_off`
+    /// shape -- `Digest::default()`/`PublicKey::default()` are the same "smallest
+    /// possible key at this view" sentinels `ControlLog::gc_below` already uses to
+    /// `split_off` a `BTreeMap`/`BTreeSet` keyed by a `(View, ..)` tuple.
+    pub fn gc_below(&mut self, floor: View) {
+        if floor <= self.min_live_view {
+            return;
+        }
+        self.buffered_echo = self.buffered_echo.split_off(&floor);
+        self.buffered_ready = self.buffered_ready.split_off(&floor);
+        self.known_bodies = self.known_bodies.split_off(&(floor, Digest::default()));
+        self.pending_fetch = self.pending_fetch.split_off(&(floor, Digest::default()));
+        self.fetch_answered = self
+            .fetch_answered
+            .split_off(&(floor, Digest::default(), PublicKey::default()));
+        self.min_live_view = floor;
+    }
+
+    // ---------------------------------------------------------- resolving a body
+
+    /// A verified body for `(view, digest)`, if this party holds one -- either
+    /// already memoized in `known_bodies` (from an earlier verification, by value or
+    /// via serve) or newly recognized against `AgbEngine::fixed_proposal` (received
+    /// by value, via the ordinary propose path), in which case it is memoized into
+    /// `known_bodies` here too, so a LATER `VantageBodyFetch` for the same pair
+    /// answers from this same lookup without re-deriving anything (see
+    /// `on_body_fetch`, which calls this same accessor).
+    ///
+    /// Only `ProposalOut::Single` can ever match: a `Batch` fixed proposal's digest
+    /// lives in a disjoint, domain-separated hash space (`ProposalOut::digest`), so a
+    /// `Single`-shaped `EchoDigest`/`ReadyDigest` can never legitimately name it --
+    /// digest-named statements are a `ViewProposal` (Single)-only encoding by
+    /// construction (see this module's own doc comment; PHASE7's batched `M` is an
+    /// orthogonal optimization, out of scope here).
+    fn resolve_body(
+        &mut self,
+        view: View,
+        digest: &Digest,
+        agb: &AgbEngine,
+    ) -> Option<Arc<ViewProposal>> {
+        let key = (view, digest.clone());
+        if let Some(p) = self.known_bodies.get(&key) {
+            return Some(Arc::clone(p));
+        }
+        let (fixed, fixed_digest) = agb.fixed_proposal(view)?;
+        if fixed_digest != *digest {
+            return None;
+        }
+        let ProposalOut::Single(vp) = fixed.as_ref() else {
+            return None;
+        };
+        let arc = Arc::new(vp.clone());
+        self.known_bodies.insert(key, Arc::clone(&arc));
+        Some(arc)
+    }
+
+    // ---------------------------------------------------------------------- draining
+
+    /// Body for `(view, digest)` just became verified-held -- drain every statement
+    /// buffered under EXACTLY this pair through the UNCHANGED by-value `on_echo`/
+    /// `on_ready` (the cross-encoding one-shot property -- see this module's own doc
+    /// comment). Buffered entries naming a DIFFERENT digest for the same view are
+    /// left untouched (still pending their own body). Clears the matching
+    /// `pending_fetch` entry, if any.
+    fn drain(
+        &mut self,
+        view: View,
+        digest: &Digest,
+        body: &Arc<ViewProposal>,
+        agb: &mut AgbEngine,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.pending_fetch.remove(&(view, digest.clone()));
+
+        let mut echo_bucket_empty = false;
+        if let Some(senders) = self.buffered_echo.get_mut(&view) {
+            let due: Vec<(PublicKey, u8, Option<u8>)> = senders
+                .iter()
+                .filter(|(_, (d, _, _))| d == digest)
+                .map(|(s, (_, g, o))| (*s, *g, *o))
+                .collect();
+            for (sender, grade, origin) in due {
+                senders.remove(&sender);
+                // `wish` is irrelevant here: it was already absorbed at reception
+                // time (`VantageCore::dispatch_inbound`'s `Inbound::EchoDigest` arm
+                // calls `Pacemaker::on_wish` unconditionally, whether or not this
+                // statement ends up buffered), and `AgbEngine::on_echo`/`on_ready`
+                // never read the field anyway (see `on_echo_any`'s own body).
+                let echo = Echo {
+                    proposal: (**body).clone(),
+                    grade,
+                    sender,
+                    wish: 0,
+                    origin,
+                };
+                effects.extend(agb.on_echo(echo, rep));
+            }
+            echo_bucket_empty = senders.is_empty();
+        }
+        if echo_bucket_empty {
+            self.buffered_echo.remove(&view);
+        }
+
+        let mut ready_bucket_empty = false;
+        if let Some(senders) = self.buffered_ready.get_mut(&view) {
+            let due: Vec<(PublicKey, ReadyGrade)> = senders
+                .iter()
+                .filter(|(_, (d, _))| d == digest)
+                .map(|(s, (_, g))| (*s, *g))
+                .collect();
+            for (sender, grade) in due {
+                senders.remove(&sender);
+                let ready = Ready {
+                    proposal: (**body).clone(),
+                    grade,
+                    sender,
+                    wish: 0,
+                };
+                effects.extend(agb.on_ready(ready, rep));
+            }
+            ready_bucket_empty = senders.is_empty();
+        }
+        if ready_bucket_empty {
+            self.buffered_ready.remove(&view);
+        }
+        effects
+    }
+
+    // ------------------------------------------------------------------- buffering
+
+    /// Records `sender`'s first-hand digest-named ECHO for `view` (one-shot: mirrors
+    /// `AgbEngine::count_echo_statement`'s own per-(view,sender) dedup exactly --
+    /// `Entry::or_insert` never overwrites an already-present sender), then ensures a
+    /// fetch is outstanding for `(view, digest)`.
+    fn buffer_echo(
+        &mut self,
+        view: View,
+        digest: Digest,
+        sender: PublicKey,
+        grade: u8,
+        origin: Option<u8>,
+        now: Instant,
+    ) -> Vec<Effect> {
+        self.buffered_echo
+            .entry(view)
+            .or_default()
+            .entry(sender)
+            .or_insert_with(|| (digest.clone(), grade, origin));
+        self.ensure_fetch(view, digest, now)
+    }
+
+    fn buffer_ready(
+        &mut self,
+        view: View,
+        digest: Digest,
+        sender: PublicKey,
+        grade: ReadyGrade,
+        now: Instant,
+    ) -> Vec<Effect> {
+        self.buffered_ready
+            .entry(view)
+            .or_default()
+            .entry(sender)
+            .or_insert_with(|| (digest.clone(), grade));
+        self.ensure_fetch(view, digest, now)
+    }
+
+    // ---------------------------------------------------------------- fetch/serve
+
+    /// The union of senders currently buffered under `(view, digest)` in EITHER
+    /// census -- "the statement authors buffered for that (view, digest)" (the
+    /// paragraph's own retention guarantee: a correct author of a matching ECHO or
+    /// READY necessarily holds the exact body it named, having validated it before
+    /// ever naming it).
+    fn fetch_targets(&self, view: View, digest: &Digest) -> Vec<PublicKey> {
+        let mut targets: BTreeSet<PublicKey> = BTreeSet::new();
+        if let Some(senders) = self.buffered_echo.get(&view) {
+            targets.extend(
+                senders
+                    .iter()
+                    .filter(|(_, (d, _, _))| d == digest)
+                    .map(|(s, _)| *s),
+            );
+        }
+        if let Some(senders) = self.buffered_ready.get(&view) {
+            targets.extend(
+                senders
+                    .iter()
+                    .filter(|(_, (d, _))| d == digest)
+                    .map(|(s, _)| *s),
+            );
+        }
+        targets.into_iter().collect()
+    }
+
+    /// Fan a `VantageBodyFetch` out to every currently-buffered author of `(view,
+    /// digest)`, at most once per `fetch_retry_interval` for that exact pair. Mirrors
+    /// `control::ControlLog::ensure_fetch` exactly: the backoff is a latch on the
+    /// PAIR, not on the target set, so a sender that buffers AFTER the first attempt
+    /// is still asked once the next retry re-derives the (by-then-larger) target set
+    /// fresh.
+    fn ensure_fetch(&mut self, view: View, digest: Digest, now: Instant) -> Vec<Effect> {
+        if self.is_pruned(view) {
+            return Vec::new();
+        }
+        let key = (view, digest.clone());
+        match self.pending_fetch.get(&key) {
+            Some(&last) if now.saturating_duration_since(last) < self.fetch_retry_interval => {
+                return Vec::new();
+            }
+            _ => {}
+        }
+        self.pending_fetch.insert(key, now);
+        let targets = self.fetch_targets(view, &digest);
+        if let Some(metrics) = &self.metrics {
+            for _ in &targets {
+                metrics.vantage_body_fetches_sent.inc();
+            }
+        }
+        targets
+            .into_iter()
+            .map(|peer| Effect::BodyFetchTo(peer, view, digest.clone()))
+            .collect()
+    }
+
+    /// An inbound digest-named ECHO (`VantageEchoDigest`) -- handled unconditionally
+    /// regardless of this party's OWN `digest_statements` setting (reception always
+    /// handles both encodings; see the module doc comment). N9 hygiene mirrors
+    /// `AgbEngine::on_echo`'s own: a malformed grade byte (not 0/1) is dropped
+    /// outright, never buffered or counted.
+    ///
+    /// If the named body is already held+verified, synthesizes the by-value `Echo`
+    /// and feeds it straight into the UNCHANGED `AgbEngine::on_echo` -- occupying the
+    /// SAME one-shot slot a by-value `VantageEcho` from this sender would. Otherwise
+    /// buffers it and ensures a fetch is outstanding. Nothing here ever touches
+    /// `AgbEngine`'s own census before the body is verified.
+    pub fn on_echo_digest(
+        &mut self,
+        msg: EchoDigest,
+        now: Instant,
+        agb: &mut AgbEngine,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        if self.is_pruned(msg.view) || msg.grade > 1 {
+            return Vec::new();
+        }
+        if let Some(body) = self.resolve_body(msg.view, &msg.digest, agb) {
+            let echo = Echo {
+                proposal: (*body).clone(),
+                grade: msg.grade,
+                sender: msg.sender,
+                wish: msg.wish,
+                origin: msg.origin,
+            };
+            return agb.on_echo(echo, rep);
+        }
+        self.buffer_echo(msg.view, msg.digest, msg.sender, msg.grade, msg.origin, now)
+    }
+
+    /// An inbound digest-named READY (`VantageReadyDigest`) -- `on_echo_digest`'s
+    /// counterpart, same discipline.
+    pub fn on_ready_digest(
+        &mut self,
+        msg: ReadyDigest,
+        now: Instant,
+        agb: &mut AgbEngine,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        if self.is_pruned(msg.view) {
+            return Vec::new();
+        }
+        if let Some(body) = self.resolve_body(msg.view, &msg.digest, agb) {
+            let ready = Ready {
+                proposal: (*body).clone(),
+                grade: msg.grade,
+                sender: msg.sender,
+                wish: msg.wish,
+            };
+            return agb.on_ready(ready, rep);
+        }
+        self.buffer_ready(msg.view, msg.digest, msg.sender, msg.grade, now)
+    }
+
+    /// `Effect::Fixed(view, true)`'s hook: a proposal was just fixed BY VALUE (the
+    /// ordinary propose path) -- drain any digest statements already buffered for
+    /// its digest. A no-op if nothing was ever buffered for this view, or if
+    /// `view`'s fixed proposal is `Reject`/absent/`Batch`-shaped (`resolve_body`'s
+    /// own scope).
+    pub fn on_local_fixed(
+        &mut self,
+        view: View,
+        agb: &mut AgbEngine,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        let Some((_, digest)) = agb.fixed_proposal(view) else {
+            return Vec::new();
+        };
+        let Some(body) = self.resolve_body(view, &digest, agb) else {
+            return Vec::new();
+        };
+        self.drain(view, &digest, &body, agb, rep)
+    }
+
+    /// A peer's `VantageBodyFetch(view, digest, requester)` -- answer with our own
+    /// held, fixed `ViewProposal` if it matches exactly this digest and we haven't
+    /// already answered this requester for this pair. Mirrors `control::ControlLog::
+    /// on_control_fetch` (per-requester dedup; the held, verified body is the only
+    /// real gate). Serves ONLY from `AgbEngine::fixed_proposal` (a body received by
+    /// value) -- never from `known_bodies` (a body this party itself only ever
+    /// fetched): the paragraph's retention guarantee is stated over ECHO/READY
+    /// AUTHORS, and a party that never itself echoes/readies a view (which a served,
+    /// non-`Fixed` body can never cause -- see `fixed_proposal`'s own doc comment)
+    /// can never legitimately be selected as anyone's fetch TARGET either
+    /// (`fetch_targets` draws only from buffered STATEMENT senders), so this
+    /// narrower serve source answers every fetch that could ever legitimately reach
+    /// this party.
+    pub fn on_body_fetch(
+        &mut self,
+        requester: PublicKey,
+        view: View,
+        digest: Digest,
+        agb: &AgbEngine,
+    ) -> Vec<Effect> {
+        if self.is_pruned(view) {
+            return Vec::new();
+        }
+        let key = (view, digest.clone(), requester);
+        if self.fetch_answered.contains(&key) {
+            return Vec::new();
+        }
+        let Some((fixed, fixed_digest)) = agb.fixed_proposal(view) else {
+            return Vec::new();
+        };
+        if fixed_digest != digest {
+            return Vec::new();
+        }
+        let ProposalOut::Single(vp) = fixed.as_ref() else {
+            return Vec::new();
+        };
+        self.fetch_answered.insert(key);
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_bodies_served.inc();
+        }
+        vec![Effect::BodyServeTo(requester, view, vp.clone())]
+    }
+
+    /// A peer's `VantageBodyServe(view, proposal)` response -- accept only a body
+    /// matching an outstanding fetch of OUR OWN for exactly `(view, digest(proposal))`
+    /// (the same "hash-matching a REQUESTED pair, not merely well-formed" discipline
+    /// `control::ControlLog::on_control_serve`'s P6-2 fix applies -- an unsolicited or
+    /// wrong-digest serve changes no state) AND well-formed (`formed`). On
+    /// acceptance: memoizes it into `known_bodies` and drains every statement
+    /// buffered for this exact pair through the by-value path -- WITHOUT ever calling
+    /// `AgbEngine::on_propose`, so a served body creates no proposal provenance (the
+    /// paragraph's own "served bytes recover the body but create neither proposal
+    /// provenance nor an ECHO or READY" -- no `rho_i`/direct-receipt state is ever
+    /// set; `AgbEngine::fixed_proposal` stays `None` for this view unless a genuine
+    /// by-value propose independently arrives). A mismatched or malformed serve is
+    /// simply dropped; the outstanding `pending_fetch` entry is left untouched, so
+    /// the next periodic retry re-asks (a different holder, or the same one again).
+    pub fn on_body_serve(
+        &mut self,
+        view: View,
+        proposal: ViewProposal,
+        agb: &mut AgbEngine,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        if self.is_pruned(view) || proposal.view != view {
+            return Vec::new();
+        }
+        let digest = proposal.digest(agb.sid());
+        if !self.pending_fetch.contains_key(&(view, digest.clone())) {
+            return Vec::new(); // unsolicited, or answers a pair we never asked for
+        }
+        if !formed(agb.committee(), proposal.view, &proposal.c, &proposal.t, &proposal.m) {
+            return Vec::new();
+        }
+        let body = Arc::new(proposal);
+        self.known_bodies
+            .insert((view, digest.clone()), Arc::clone(&body));
+        self.drain(view, &digest, &body, agb, rep)
+    }
+
+    /// Periodic retry -- mirrors `VantageCore::run`'s 1s `metrics_tick`, which
+    /// already drives `collect_internal_garbage`/`sample_metrics` off the same
+    /// cadence: re-fan every outstanding fetch whose backoff has elapsed.
+    pub fn retry_fetches(&mut self, now: Instant) -> Vec<Effect> {
+        let due: Vec<(View, Digest)> = self
+            .pending_fetch
+            .iter()
+            .filter(|(_, &last)| now.saturating_duration_since(last) >= self.fetch_retry_interval)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut effects = Vec::new();
+        for (view, digest) in due {
+            effects.extend(self.ensure_fetch(view, digest, now));
+        }
+        effects
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_echo_count_for_test(&self, view: View) -> usize {
+        self.buffered_echo.get(&view).map_or(0, |m| m.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_ready_count_for_test(&self, view: View) -> usize {
+        self.buffered_ready.get(&view).map_or(0, |m| m.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_fetch_count_for_test(&self) -> usize {
+        self.pending_fetch.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fetch_answered_count_for_test(&self) -> usize {
+        self.fetch_answered.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_body_for_test(&self, view: View, digest: &Digest) -> bool {
+        self.known_bodies.contains_key(&(view, digest.clone()))
     }
 }

@@ -828,6 +828,11 @@ impl SimpleItCore {
     /// `Effect::BroadcastSkipVote` joins this list -- `AgbEngine::
     /// recheck_skip_vote_trigger`'s only caller-visible effect, equally unproducible
     /// on this data-plane-only path.
+    /// `Effect::BodyFetchTo`/`Effect::BodyServeTo` (signature-free.tex §8.3
+    /// "Digest-named AGB statements") join the list too -- `vantage::agb::
+    /// DigestStatements`'s own two caller-visible effects, equally unproducible here
+    /// (Simple-IT has no AGB engine, and `Parameters::digest_statements` is
+    /// Vantage-only).
     async fn execute(&mut self, initial: Vec<Effect>) {
         let mut queue: VecDeque<Effect> = initial.into();
         while let Some(effect) = queue.pop_front() {
@@ -924,7 +929,9 @@ impl SimpleItCore {
                 | Effect::ControlFetchTo(_, _, _)
                 | Effect::ControlServeTo(_, _, _)
                 | Effect::ArmControlTimer(_, _)
-                | Effect::ApplyAnchor(_, _, _)) => {
+                | Effect::ApplyAnchor(_, _, _)
+                | Effect::BodyFetchTo(_, _, _)
+                | Effect::BodyServeTo(_, _, _)) => {
                     debug_assert!(
                         false,
                         "SimpleItCore's data-plane effect loop received a Vantage-\

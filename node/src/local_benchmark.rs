@@ -210,6 +210,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             ack_watermark_period_ms
         );
     }
+    if matches.get_flag("digest-statements") {
+        println!(
+            "Digest-named AGB statements: ON (Vantage ECHO/READY name their proposal by hash instead of by value)"
+        );
+    }
     if crash > 0 {
         println!(
             "Crash fault: {} of {} nodes never spawned (committee unchanged; live = {})",
@@ -268,6 +273,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             .then(MacSecret::generate),
         ack_watermarks: matches.get_flag("ack-watermarks"),
         ack_watermark_period_ms,
+        digest_statements: matches.get_flag("digest-statements"),
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
@@ -494,9 +500,21 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             "Header" | "Batch" => "dissemination",
             "VantageAck" | "VantageAvail" => "acks",
             "VantagePropose" | "VantageEcho" | "VantageEchoSkip" | "VantageReady"
-            | "VantageNoReady" | "VantageSkipVote" => "agb",
+            | "VantageNoReady" | "VantageSkipVote"
+            // signature-free.tex sec.8.3 "Digest-named AGB statements": the same
+            // logical ECHO/READY statements, just a compact encoding -- same
+            // category as their by-value counterparts above.
+            | "VantageEchoDigest" | "VantageReadyDigest" => "agb",
             "VantageWish" => "pacemaker",
-            "HeadersRequest" | "Synchronize" | "BatchRequest" => "repair",
+            // "repair": recovers already-identified missing data given only a
+            // reference/digest -- `HeadersRequest`/`Synchronize`/`BatchRequest`'s own
+            // role (see this function's "known simplification" doc comment: the
+            // ANSWER side of that pair is miscategorized as "dissemination" purely
+            // because it shares the `Header` wire variant with the publish path --
+            // `VantageBodyFetch`/`VantageBodyServe` have no such sharing accident, so
+            // both ends of this pair land in "repair" cleanly).
+            "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageBodyFetch"
+            | "VantageBodyServe" => "repair",
             "CompReport"
             | "ControlInit"
             | "ControlEcho"

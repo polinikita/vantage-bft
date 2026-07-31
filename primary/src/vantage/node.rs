@@ -6,7 +6,10 @@
 
 use crate::messages::{Ack, Header};
 use crate::primary::{PrimaryMessage, View, CHANNEL_CAPACITY};
-use crate::vantage::agb::{AgbEngine, EchoOut, ProposalOut, ReadyOut, TimerKind};
+use crate::vantage::agb::{
+    AgbEngine, DigestStatements, EchoDigest, EchoOut, ProposalOut, ReadyDigest, ReadyOut,
+    TimerKind, ViewProposal,
+};
 use crate::vantage::block::{self, BlockRef};
 use crate::vantage::control::{ControlLog, ControlProposal, Round};
 use crate::vantage::cursor::Cursor;
@@ -104,6 +107,18 @@ pub enum Inbound {
     /// above) -- the paper never requires one, and this is a rare, one-shot-per-target
     /// crash-fallback statement, not a frequent response worth piggybacking on.
     SkipVote(View, PublicKey),
+    /// signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
+    /// digest_statements`) -- reception is unconditional regardless of this party's
+    /// OWN flag setting (see `vantage::agb::DigestStatements`'s own module doc
+    /// comment). `VantageEchoDigest`/`VantageReadyDigest` carry their own `sender`/
+    /// `wish` fields directly (mirroring `Echo`/`Ready` themselves), unlike
+    /// `Propose`/`ControlInit` above.
+    EchoDigest(EchoDigest),
+    ReadyDigest(ReadyDigest),
+    /// A peer's `VantageBodyFetch(view, digest, requester)`.
+    BodyFetch(View, Digest, PublicKey),
+    /// A peer's `VantageBodyServe(view, proposal)` answer.
+    BodyServe(View, ViewProposal),
 }
 
 /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
@@ -161,6 +176,16 @@ fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Opti
         // A real, per-destination-verifiable sender field, same class as
         // `VantageEchoSkip`/`VantageNoReady` above.
         PrimaryMessage::VantageSkipVote(_, s) => Some(*s),
+        // signature-free.tex §8.3 "Digest-named AGB statements": `EchoDigest`/
+        // `ReadyDigest` carry a real declared sender field directly, same class as
+        // `VantageEcho`/`VantageReady` above. `VantageBodyFetch` carries a real
+        // declared requester, same class as `ControlFetch`. `VantageBodyServe`
+        // carries no sender claim at all (content is verified by hash against an
+        // outstanding `pending_fetch` entry, same D4 class as `ControlServe`).
+        PrimaryMessage::VantageEchoDigest(d) => Some(d.sender),
+        PrimaryMessage::VantageReadyDigest(d) => Some(d.sender),
+        PrimaryMessage::VantageBodyFetch(_, _, s) => Some(*s),
+        PrimaryMessage::VantageBodyServe(_, _) => None,
         // Autobahn-only variants never legitimately reach the Vantage assembly's port
         // (`dispatch`'s own catch-all ignores them below); no candidate needed.
         _ => None,
@@ -184,6 +209,11 @@ pub(super) fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
             | PrimaryMessage::ControlServe(_, _)
             | PrimaryMessage::ControlServeBatch(_, _)
             | PrimaryMessage::SimpleItCutServe(_)
+            // signature-free.tex §8.3: `VantageBodyServe` is D4-class, same "no
+            // sender claim to bind" reasoning as `ControlServe`/`SimpleItCutServe`
+            // above -- content is verified by hash against the requester's own
+            // outstanding `pending_fetch` entry, not by sender.
+            | PrimaryMessage::VantageBodyServe(_, _)
     )
 }
 
@@ -316,6 +346,14 @@ impl MessageHandler for VantageReceiverHandler {
                 Inbound::ControlServe(v, ProposalOut::Batch(p))
             }
             PrimaryMessage::VantageSkipVote(v, s) => Inbound::SkipVote(v, s),
+            // signature-free.tex §8.3 "Digest-named AGB statements": routed
+            // unconditionally regardless of this party's OWN `digest_statements`
+            // setting -- see `vantage::agb::DigestStatements`'s own module doc
+            // comment for why reception is never flag-gated.
+            PrimaryMessage::VantageEchoDigest(d) => Inbound::EchoDigest(d),
+            PrimaryMessage::VantageReadyDigest(d) => Inbound::ReadyDigest(d),
+            PrimaryMessage::VantageBodyFetch(v, d, r) => Inbound::BodyFetch(v, d, r),
+            PrimaryMessage::VantageBodyServe(v, p) => Inbound::BodyServe(v, p),
             // Autobahn-only variants never reach the Vantage assembly's port; ignore
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
@@ -351,6 +389,11 @@ pub struct VantageCore {
     pacemaker: Pacemaker,
     resolver: Resolver,
     control: ControlLog,
+    /// signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
+    /// digest_statements`) -- the reception-side translation layer sitting between
+    /// the wire and `agb`. See `vantage::agb::DigestStatements`'s own module doc
+    /// comment for the architecture/correctness rationale.
+    digest_stmts: DigestStatements,
 
     /// Network/wire-transport state (typed senders, MAC-auth keying, cancel-handler
     /// bookkeeping, resolved addresses) -- factored out into `Wire` (`vantage::wire`)
@@ -375,6 +418,14 @@ pub struct VantageCore {
     /// off (`run` never even constructs the periodic tick in that case).
     ack_watermark_period_ms: u64,
 
+    /// `Parameters::digest_statements`: when `true`, `execute`'s `Effect::
+    /// BroadcastEcho`/`Effect::BroadcastReady` arms (the `Single`, non-batch case)
+    /// send the compact `VantageEchoDigest`/`VantageReadyDigest` wire message
+    /// instead of the full by-value one. Emission-only gate: `false` (the default)
+    /// is byte-identical to today (see `vantage::agb::DigestStatements`'s own module
+    /// doc comment) -- reception of either wire encoding is NEVER gated by this
+    /// flag, on this or any other party.
+    digest_statements: bool,
 
     /// §10 timer queue: (deadline, view, kind), drained by the run loop's `sleep_until`
     /// branch (message channels are checked first every iteration -- §5's tie-break
@@ -514,11 +565,13 @@ impl VantageCore {
             blocks.clone(),
         );
         let mut agb = AgbEngine::new(name, committee.clone(), sid.clone(), parameters.delta_ms);
+        let mut digest_stmts = DigestStatements::new(parameters.delta_ms);
         let core_metrics = metrics.clone();
         if let Some(m) = metrics {
             lm = lm.with_metrics(m.clone());
             rep = rep.with_metrics(m.clone());
-            agb = agb.with_metrics(m);
+            agb = agb.with_metrics(m.clone());
+            digest_stmts = digest_stmts.with_metrics(m);
         }
         let frontier = Frontier::new(name, committee.clone());
         let cursor = Cursor::new(
@@ -579,6 +632,7 @@ impl VantageCore {
             pacemaker,
             resolver,
             control,
+            digest_stmts,
             wire: Wire {
                 name,
                 network: {
@@ -615,6 +669,7 @@ impl VantageCore {
             payload_size: 0,
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
+            digest_statements: parameters.digest_statements,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
             payload: PayloadIo {
@@ -778,6 +833,13 @@ impl VantageCore {
                     // condition, bounding worst-case staleness to ~1s.
                     self.wire.prune_cancel_handlers();
                     self.collect_internal_garbage();
+                    // signature-free.tex §8.3: periodic retry for outstanding body
+                    // fetches whose backoff has elapsed -- reuses this existing 1s
+                    // tick rather than a dedicated timer queue (mirrors `control::
+                    // ControlLog`'s own coarse, round-based retry cadence).
+                    let retry_now = Instant::now();
+                    let retry_effects = self.digest_stmts.retry_fetches(retry_now);
+                    self.execute(retry_effects, retry_now).await;
                     self.sample_metrics();
                     // METRICS-DASHBOARD-SPEC.md §3: `core_queue_length` -- `rx_vantage`'s
                     // current depth (cheap, `Receiver::len()` is O(1)); `0` (never set)
@@ -940,6 +1002,7 @@ impl VantageCore {
             )
             .max(1);
         self.agb.gc_below(floor);
+        self.digest_stmts.gc_below(floor);
         self.frontier.gc_below(floor);
         // NOTE: `Cursor` deliberately has no `gc_below`. Every key in its `pending`/
         // `core_emitted` maps is `>= next_view` by construction (both insertion sites
@@ -1267,6 +1330,42 @@ impl VantageCore {
                 // `EchoSkip`/`NoReady`, so there is nothing here for either to unblock.
                 self.agb.on_skip_vote(view, sender)
             }
+
+            // --- signature-free.tex §8.3 "Digest-named AGB statements" ---
+            // Reception is unconditional regardless of `self.digest_statements` --
+            // see `vantage::agb::DigestStatements`'s own module doc comment.
+            Inbound::EchoDigest(msg) => {
+                let mut effects = self.pacemaker.on_wish(msg.sender, msg.wish);
+                effects.extend(
+                    self.digest_stmts
+                        .on_echo_digest(msg, now, &mut self.agb, &mut self.rep),
+                );
+                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
+                effects
+            }
+            Inbound::ReadyDigest(msg) => {
+                let mut effects = self.pacemaker.on_wish(msg.sender, msg.wish);
+                effects.extend(
+                    self.digest_stmts
+                        .on_ready_digest(msg, now, &mut self.agb, &mut self.rep),
+                );
+                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
+                effects
+            }
+            Inbound::BodyFetch(view, digest, requester) => {
+                self.digest_stmts
+                    .on_body_fetch(requester, view, digest, &self.agb)
+            }
+            Inbound::BodyServe(view, proposal) => {
+                let mut effects =
+                    self.digest_stmts
+                        .on_body_serve(view, proposal, &mut self.agb, &mut self.rep);
+                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
+                effects
+            }
         }
     }
 
@@ -1358,6 +1457,23 @@ impl VantageCore {
                 Effect::BroadcastEcho(mut e) => {
                     e.set_wish(self.pacemaker.own_watermark());
                     match e {
+                        // signature-free.tex §8.3 "Digest-named AGB statements"
+                        // (`Parameters::digest_statements`): the flag's ENTIRE
+                        // emission-side effect -- when on, send the compact
+                        // `VantageEchoDigest` instead of the full by-value one.
+                        // `AgbEngine` still constructed the identical by-value
+                        // `Echo` above (`build_echo_out`, untouched); this is
+                        // purely an alternate wire encoding of that same value,
+                        // decided here, not inside the engine. Never applies to
+                        // `Batch` (out of scope -- see `EchoDigest`'s own doc
+                        // comment), so a batched-anchors run is unaffected either
+                        // way.
+                        EchoOut::Single(e) if self.digest_statements => {
+                            let msg = e.to_digest(self.agb.sid());
+                            self.wire
+                                .broadcast_message(PrimaryMessage::VantageEchoDigest(msg))
+                                .await
+                        }
                         EchoOut::Single(e) => {
                             self.wire
                                 .broadcast_message(PrimaryMessage::VantageEcho(e))
@@ -1379,6 +1495,14 @@ impl VantageCore {
                 Effect::BroadcastReady(mut r) => {
                     r.set_wish(self.pacemaker.own_watermark());
                     match r {
+                        // signature-free.tex §8.3: mirrors `Effect::BroadcastEcho`'s
+                        // identical translation immediately above.
+                        ReadyOut::Single(r) if self.digest_statements => {
+                            let msg = r.to_digest(self.agb.sid());
+                            self.wire
+                                .broadcast_message(PrimaryMessage::VantageReadyDigest(msg))
+                                .await
+                        }
                         ReadyOut::Single(r) => {
                             self.wire
                                 .broadcast_message(PrimaryMessage::VantageReady(r))
@@ -1410,6 +1534,15 @@ impl VantageCore {
                         queue.extend(self.agb.activate(v, now, &mut self.lm, &mut self.rep));
                     }
                     queue.extend(self.try_propose_effects(now));
+                    // signature-free.tex §8.3: a proposal just fixed BY VALUE may
+                    // already match digest statements buffered before it arrived --
+                    // drain them now. A no-op if nothing was ever buffered for this
+                    // view, or if `well_formed` is false (`on_local_fixed`'s own
+                    // `fixed_proposal` query returns `None` for `Reject`).
+                    queue.extend(
+                        self.digest_stmts
+                            .on_local_fixed(view, &mut self.agb, &mut self.rep),
+                    );
                 }
                 Effect::Completed(view, c, t) => {
                     queue.extend(self.cursor.on_completed(view, c, t));
@@ -1537,6 +1670,21 @@ impl VantageCore {
                         queue.extend(self.rep.authorize(r));
                     }
                     queue.extend(self.agb.submit_anchor(view, outcome));
+                }
+
+                // --- signature-free.tex §8.3 "Digest-named AGB statements" ---
+                Effect::BodyFetchTo(peer, view, digest) => {
+                    self.wire
+                        .send_message(
+                            peer,
+                            PrimaryMessage::VantageBodyFetch(view, digest, self.name),
+                        )
+                        .await;
+                }
+                Effect::BodyServeTo(peer, view, proposal) => {
+                    self.wire
+                        .send_message(peer, PrimaryMessage::VantageBodyServe(view, proposal))
+                        .await;
                 }
             }
         }
@@ -1821,6 +1969,18 @@ mod tests {
         // this no-claim class.
         assert!(!message_needs_placeholder_tag(
             &PrimaryMessage::SimpleItCutFetch(1, Digest::default(), crate::common::keys()[0].0)
+        ));
+        // signature-free.tex §8.3 "Digest-named AGB statements": `VantageBodyServe`
+        // is D4-class too, same "no sender claim to bind" reasoning as
+        // `ControlServe`/`SimpleItCutServe` above; its fetch counterpart
+        // `VantageBodyFetch` carries a real declared requester, same class as
+        // `ControlFetch`/`SimpleItCutFetch` above -- not in this no-claim class.
+        assert!(message_needs_placeholder_tag(&PrimaryMessage::VantageBodyServe(
+            1,
+            dummy_proposal()
+        )));
+        assert!(!message_needs_placeholder_tag(
+            &PrimaryMessage::VantageBodyFetch(1, Digest::default(), crate::common::keys()[0].0)
         ));
     }
 

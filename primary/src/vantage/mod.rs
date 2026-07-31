@@ -21,8 +21,9 @@ pub mod threshold;
 pub mod wire;
 
 pub use agb::{
-    AgbEngine, BatchViewProposal, Echo, EchoBatch, EchoOut, Manifest, Outcome, ProposalOut, Ready,
-    ReadyBatch, ReadyGrade, ReadyOut, ResolutionEntry, TimerKind, ViewProposal,
+    AgbEngine, BatchViewProposal, DigestStatements, Echo, EchoBatch, EchoDigest, EchoOut, Manifest,
+    Outcome, ProposalOut, Ready, ReadyBatch, ReadyDigest, ReadyGrade, ReadyOut, ResolutionEntry,
+    TimerKind, ViewProposal,
 };
 pub use block::BlockRef;
 pub use cursor::Cursor;
@@ -199,6 +200,19 @@ pub enum Effect {
     /// executor, `VantageCore`, owns both `Repairer::authorize` and
     /// `AgbEngine::submit_anchor` -- `control::ControlLog` itself touches neither).
     ApplyAnchor(View, Outcome, Vec<BlockRef>),
+
+    // --- signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
+    // digest_statements`) ---
+    /// Fan-out request for a still-missing AGB proposal body, one `Effect` per
+    /// target peer (mirrors `ControlFetchTo`'s identical role for control-log
+    /// carrier bodies, one level down at the AGB ECHO/READY layer instead of the
+    /// resolution/control layer).
+    BodyFetchTo(PublicKey, View, Digest),
+    /// Answer a peer's `VantageBodyFetch` with our own held, fixed `ViewProposal`
+    /// (mirrors `ControlServeTo`). Always a `ViewProposal`, never a
+    /// `BatchViewProposal` -- digest-named statements are the `ViewProposal`
+    /// (Single)-only encoding (see `EchoDigest`'s own doc comment).
+    BodyServeTo(PublicKey, View, ViewProposal),
 }
 
 pub mod control;

@@ -59,11 +59,21 @@ impl DeclaredSender for Inbound {
             Inbound::ControlTimeoutAccept(s, _) => Some(*s),
             Inbound::ControlFetch(_, _, s) => Some(*s),
             Inbound::SkipVote(_, s) => Some(*s),
+            // signature-free.tex §8.3 "Digest-named AGB statements": `EchoDigest`/
+            // `ReadyDigest` carry a real declared sender directly, same class as
+            // `Echo`/`Ready` above; `BodyFetch` carries a real declared requester,
+            // same class as `ControlFetch` above.
+            Inbound::EchoDigest(d) => Some(d.sender),
+            Inbound::ReadyDigest(d) => Some(d.sender),
+            Inbound::BodyFetch(_, _, s) => Some(*s),
             Inbound::Serve(_)
             | Inbound::AckAvailability(_)
             | Inbound::Propose(_)
             | Inbound::ControlInit(_, _)
-            | Inbound::ControlServe(_, _) => None,
+            | Inbound::ControlServe(_, _)
+            // `BodyServe`'s content is self-authenticating by hash against an
+            // outstanding `pending_fetch` entry, same D4 class as `ControlServe`.
+            | Inbound::BodyServe(_, _) => None,
         }
     }
 }

@@ -162,3 +162,74 @@ async fn four_party_happy_path_identical_output_with_ack_watermarks() {
         );
     }
 }
+
+/// Digest-named AGB statements (optional, flag-gated -- `Parameters::
+/// digest_statements`, signature-free.tex §8.3): the identical four-party happy path,
+/// but with every ECHO/READY travelling digest-named instead of by value. Committed
+/// output must still be byte-identical to the by-value run, AND -- the paragraph's own
+/// favorable-path claim ("when the proposer is correct, every party already has the
+/// body, so this encoding adds no reconstruction delay") -- zero body fetches/serves
+/// should ever be needed, since every party directly receives `VantagePropose` before
+/// any ECHO/READY for that view can possibly arrive.
+#[tokio::test]
+async fn four_party_happy_path_identical_output_with_digest_statements() {
+    let all = authors();
+    let mut nodes: Vec<Node> = all
+        .iter()
+        .enumerate()
+        .map(|(i, (pk, _))| {
+            Node::new(
+                *pk,
+                &format!(".db_test_integration_node_digest_{}", i),
+                MAX_VIEWS,
+            )
+            .with_digest_statements(true)
+        })
+        .collect();
+    let now = Instant::now();
+    let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
+
+    for i in 0..nodes.len() {
+        let (_, effects) = nodes[i].lm.publish_own(BTreeMap::new()).await;
+        drain_local(&mut nodes, i, effects, now, &mut outbox);
+    }
+    run_to_quiescence(&mut nodes, &mut outbox, now).await;
+
+    boot(&mut nodes, now, &mut outbox).await;
+
+    for (i, node) in nodes.iter().enumerate() {
+        assert!(
+            node.cursor.next_view() >= 4,
+            "node {} only reached view {}",
+            i,
+            node.cursor.next_view()
+        );
+    }
+
+    let reference = nodes[0].cursor.output_log().to_vec();
+    for (i, node) in nodes.iter().enumerate().skip(1) {
+        assert_eq!(
+            node.cursor.output_log(),
+            reference.as_slice(),
+            "node {} output log diverged from node 0 under digest statements",
+            i
+        );
+    }
+    assert!(!reference.is_empty());
+
+    // Favorable path: nobody should ever have needed to fetch or serve a body.
+    for (i, node) in nodes.iter().enumerate() {
+        assert_eq!(
+            node.metrics.vantage_body_fetches_sent.get(),
+            0,
+            "node {} issued a body fetch in the all-correct favorable path",
+            i
+        );
+        assert_eq!(
+            node.metrics.vantage_bodies_served.get(),
+            0,
+            "node {} served a body in the all-correct favorable path",
+            i
+        );
+    }
+}

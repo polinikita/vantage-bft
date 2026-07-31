@@ -16,7 +16,7 @@
 
 use super::common::*;
 use crate::primary::View;
-use crate::vantage::agb::{AgbEngine, EchoOut, ProposalOut, ReadyOut, TimerKind};
+use crate::vantage::agb::{AgbEngine, DigestStatements, EchoOut, ProposalOut, ReadyOut, TimerKind};
 use crate::vantage::control::ControlLog;
 use crate::vantage::frontier::Frontier;
 use crate::vantage::lanes::{AckAggregator, AckAvailability, LaneManager, SharedAckAggregator};
@@ -43,6 +43,14 @@ pub struct Node {
     pub pacemaker: Pacemaker,
     pub resolver: Resolver,
     pub control: ControlLog,
+    /// signature-free.tex §8.3 "Digest-named AGB statements" -- mirrors
+    /// `VantageCore::digest_stmts` exactly.
+    pub digest_stmts: DigestStatements,
+    /// Mirrors `VantageCore::digest_statements` exactly: `false` (the default, via
+    /// `Node::new`) leaves `drain_local`'s `Effect::BroadcastEcho`/`BroadcastReady`
+    /// fan-out byte-identical to before this field existed. `true` (opt in via
+    /// `with_digest_statements`) sends the compact digest-named encoding instead.
+    pub digest_statements: bool,
     /// A test-only cap on `try_propose_effects` (mirroring `integration_tests.rs`'s
     /// original `MAX_VIEWS`): this harness never seeds new lane content after the
     /// initial round, so every view would otherwise propose over identical
@@ -97,6 +105,7 @@ impl Node {
         let registry = prometheus::Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         let agb = new_agb_engine_with_committee(name, committee.clone()).with_metrics(metrics.clone());
+        let digest_stmts = DigestStatements::new(TEST_DELTA_MS).with_metrics(metrics.clone());
         let frontier = Frontier::new(name, committee.clone());
         let cursor = Cursor::new(
             committee.clone(),
@@ -131,6 +140,8 @@ impl Node {
             pacemaker,
             resolver,
             control,
+            digest_stmts,
+            digest_statements: false,
             max_views,
             alive: true,
             timers: Vec::new(),
@@ -147,6 +158,15 @@ impl Node {
     /// (`vantage::node::VantageCore::build`) reads the flag from `Parameters` instead.
     pub fn with_ack_watermarks(mut self, on: bool) -> Self {
         self.ack_watermarks = on;
+        self
+    }
+
+    /// Opt this node into digest-named AGB statements (`Parameters::
+    /// digest_statements`) -- see the field's own doc comment. Test-only builder;
+    /// production wiring (`vantage::node::VantageCore::build`) reads the flag from
+    /// `Parameters` instead.
+    pub fn with_digest_statements(mut self, on: bool) -> Self {
+        self.digest_statements = on;
         self
     }
 
@@ -337,6 +357,37 @@ impl Node {
             Inbound::ControlServe(view, proposal) => self.control.on_control_serve(view, proposal),
             // Mirrors `vantage::node::VantageCore::dispatch_inbound`'s own arm.
             Inbound::SkipVote(view, sender) => self.agb.on_skip_vote(view, sender),
+            // signature-free.tex §8.3 "Digest-named AGB statements" -- mirrors
+            // `vantage::node::VantageCore::dispatch_inbound`'s own four arms.
+            Inbound::EchoDigest(msg) => {
+                let mut effects = self.absorb_wish(msg.sender, msg.wish);
+                effects.extend(
+                    self.digest_stmts
+                        .on_echo_digest(msg, now, &mut self.agb, &mut self.rep),
+                );
+                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects
+            }
+            Inbound::ReadyDigest(msg) => {
+                let mut effects = self.absorb_wish(msg.sender, msg.wish);
+                effects.extend(
+                    self.digest_stmts
+                        .on_ready_digest(msg, now, &mut self.agb, &mut self.rep),
+                );
+                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects
+            }
+            Inbound::BodyFetch(view, digest, requester) => {
+                self.digest_stmts
+                    .on_body_fetch(requester, view, digest, &self.agb)
+            }
+            Inbound::BodyServe(view, proposal) => {
+                let mut effects =
+                    self.digest_stmts
+                        .on_body_serve(view, proposal, &mut self.agb, &mut self.rep);
+                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects
+            }
         }
     }
 
@@ -490,9 +541,25 @@ pub fn drain_local(
             }
             Effect::BroadcastEcho(mut e) => {
                 e.set_wish(nodes[idx].pacemaker.own_watermark());
+                // signature-free.tex §8.3 "Digest-named AGB statements": mirrors
+                // `VantageCore::execute`'s identical emission-side translation --
+                // computed once (not per-destination), never applied to `Batch`.
+                let translated = if nodes[idx].digest_statements {
+                    match &e {
+                        EchoOut::Single(single) => Some(single.to_digest(nodes[idx].agb.sid())),
+                        EchoOut::Batch(_) => None,
+                    }
+                } else {
+                    None
+                };
                 for j in 0..n {
                     if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::Echo(e.clone())));
+                        match &translated {
+                            Some(digest_msg) => {
+                                outbox.push_back((j, Inbound::EchoDigest(digest_msg.clone())))
+                            }
+                            None => outbox.push_back((j, Inbound::Echo(e.clone()))),
+                        }
                     }
                 }
             }
@@ -507,9 +574,24 @@ pub fn drain_local(
             }
             Effect::BroadcastReady(mut r) => {
                 r.set_wish(nodes[idx].pacemaker.own_watermark());
+                // signature-free.tex §8.3: mirrors `Effect::BroadcastEcho`'s
+                // identical translation immediately above.
+                let translated = if nodes[idx].digest_statements {
+                    match &r {
+                        ReadyOut::Single(single) => Some(single.to_digest(nodes[idx].agb.sid())),
+                        ReadyOut::Batch(_) => None,
+                    }
+                } else {
+                    None
+                };
                 for j in 0..n {
                     if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::Ready(r.clone())));
+                        match &translated {
+                            Some(digest_msg) => {
+                                outbox.push_back((j, Inbound::ReadyDigest(digest_msg.clone())))
+                            }
+                            None => outbox.push_back((j, Inbound::Ready(r.clone()))),
+                        }
                     }
                 }
             }
@@ -546,6 +628,12 @@ pub fn drain_local(
                     queue.extend(node.agb.activate(v, now, &mut node.lm, &mut node.rep));
                 }
                 queue.extend(node.try_propose_effects(now));
+                // signature-free.tex §8.3: mirrors `VantageCore::execute`'s
+                // identical `Effect::Fixed` addendum.
+                queue.extend(
+                    node.digest_stmts
+                        .on_local_fixed(view, &mut node.agb, &mut node.rep),
+                );
             }
             Effect::Completed(view, c, t) => {
                 queue.extend(nodes[idx].cursor.on_completed(view, c, t));
@@ -648,6 +736,22 @@ pub fn drain_local(
                     queue.extend(node.rep.authorize(r));
                 }
                 queue.extend(node.agb.submit_anchor(view, outcome));
+            }
+
+            // --- signature-free.tex §8.3 "Digest-named AGB statements" ---
+            Effect::BodyFetchTo(peer, view, digest) => {
+                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                    if nodes[j].alive {
+                        outbox.push_back((j, Inbound::BodyFetch(view, digest, nodes[idx].name)));
+                    }
+                }
+            }
+            Effect::BodyServeTo(peer, view, proposal) => {
+                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                    if nodes[j].alive {
+                        outbox.push_back((j, Inbound::BodyServe(view, proposal)));
+                    }
+                }
             }
         }
     }
