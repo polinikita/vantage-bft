@@ -92,8 +92,15 @@ impl Pacemaker {
         self.largest_entered_view
     }
 
-    #[cfg(test)]
-    pub(crate) fn omega_of_for_test(&self, author: PublicKey) -> View {
+    /// reconnect-replay plan §2.6: OUR OWN tracked wish for `author` -- the
+    /// requester-side "hint floor" a `VantageResumeHello` we send TO `author`
+    /// carries (§2.4: "The requester's `omega_of(j)` floor survives only as a
+    /// hint" -- v3's authoritative floor is the AUTHOR's own `pending_low`, never
+    /// this). Promoted from a `#[cfg(test)]`-only accessor (`omega_of_for_test`) to
+    /// a production one -- every other read-only accessor on this type (`own_
+    /// watermark`/`entry_target`/`omega_plus`/`omega_q`/`entered_view`) is already
+    /// `pub fn`, so this matches the type's own established visibility convention.
+    pub fn omega_of(&self, author: PublicKey) -> View {
         self.omega[self.index_of[&author]]
     }
 

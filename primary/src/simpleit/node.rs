@@ -233,7 +233,8 @@ struct TipOracleAdapter<'a> {
 impl TipOracle for TipOracleAdapter<'_> {
     fn available_at_validity(&self, author: &PublicKey, tip: &Proposal) -> bool {
         let r: BlockRef = (*author, tip.height, tip.header_digest.clone());
-        self.lm.is_q_available(&r, self.committee.validity_threshold())
+        self.lm
+            .is_q_available(&r, self.committee.validity_threshold())
     }
 }
 
@@ -494,7 +495,25 @@ impl SimpleItCore {
         // `core_metrics` locals as `network`/`worker_network` just below -- cloned
         // here (rather than moved) since both of those still need their own copies
         // afterward.
-        let resume_tx = wire::spawn_resume_sender(latency_map.clone(), batch, core_metrics.clone());
+        //
+        // reconnect-replay plan §7 (mechanical adaptation ONLY -- SimpleIt never
+        // constructs `Effect::Broadcast*`'s outbox-recorded path, never opens a
+        // replay episode, and never attaches `with_reconnect_events`/`with_drop_map`
+        // to `network` below -- "no volatile, no events, no episodes"): `in_flight`
+        // is a freshly constructed, permanently-unfed map (nothing here ever
+        // inserts into it, since `Wire::enqueue_replay` is never called on this
+        // assembly) and the chunk-pacing parameters are inert for the same reason --
+        // still threaded through because `spawn_resume_sender`/`Wire` are the SAME
+        // shared types Vantage uses.
+        let in_flight: wire::InFlightMap = Arc::new(Mutex::new(HashMap::new()));
+        let resume_tx = wire::spawn_resume_sender(
+            latency_map.clone(),
+            batch,
+            core_metrics.clone(),
+            in_flight.clone(),
+            parameters.replay_chunk_bytes,
+            parameters.replay_chunk_interval_ms,
+        );
 
         let core = Self {
             name,
@@ -525,12 +544,18 @@ impl SimpleItCore {
                 resume_tx,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
-                other_primaries,
+                other_primaries: other_primaries.clone(),
                 other_primary_addrs,
                 worker_addresses,
                 withheld_header_dests,
                 withhold_window: parameters.withhold_window.clone(),
                 metrics: core_metrics.clone(),
+                addr_to_peer: other_primaries
+                    .iter()
+                    .map(|(pk, addr)| (*addr, *pk))
+                    .collect(),
+                dirty_map: Arc::new(Mutex::new(HashMap::new())),
+                in_flight,
             },
             payload: PayloadIo {
                 pending_payload: HashMap::new(),
@@ -622,7 +647,8 @@ impl SimpleItCore {
         // `VantageCore::run`'s identical construction -- unconditional (no flag),
         // its own dedicated tick so `Parameters::resume_check_period_ms` is
         // genuinely honored.
-        let mut resume_tick = tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
+        let mut resume_tick =
+            tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
         resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -803,7 +829,10 @@ impl SimpleItCore {
                 }
                 let now = Instant::now();
                 let backoff = Duration::from_millis(self.resume_backoff_ms);
-                if !self.resume_serve.should_serve(requester, from, now, backoff) {
+                if !self
+                    .resume_serve
+                    .should_serve(requester, from, now, backoff)
+                {
                     return;
                 }
                 let to = (from + self.resume_batch - 1).min(tip);
@@ -1181,7 +1210,12 @@ impl SimpleItCore {
                 &stop_digest,
                 &proposal.header_digest,
             )?;
-            resolved.push((*author, proposal.height, proposal.header_digest.clone(), suffix));
+            resolved.push((
+                *author,
+                proposal.height,
+                proposal.header_digest.clone(),
+                suffix,
+            ));
         }
 
         // Pass 2: every author resolved -- apply.
@@ -1207,7 +1241,8 @@ impl SimpleItCore {
             // walk can hit its own stop condition). `tip_digest` is used directly
             // rather than re-deriving it from `suffix.last()`, so there is no
             // `Option`/index to ever panic on here.
-            self.committed_watermark.insert(author, (height, tip_digest));
+            self.committed_watermark
+                .insert(author, (height, tip_digest));
         }
         Some((by_worker.into_iter().collect(), headers))
     }
@@ -1241,7 +1276,12 @@ impl SimpleItCore {
 
     /// D1 payload-sync bookkeeping -- mirrors `VantageCore::on_payload_ready` exactly,
     /// including its Mechanism A receipt-continuation hook.
-    async fn on_payload_ready(&mut self, header_digest: Digest, digest: Digest, worker_id: WorkerId) {
+    async fn on_payload_ready(
+        &mut self,
+        header_digest: Digest,
+        digest: Digest,
+        worker_id: WorkerId,
+    ) {
         let mut resolved = false;
         if let Some(set) = self.payload.pending_payload.get_mut(&header_digest) {
             set.remove(&(digest, worker_id));
@@ -1284,9 +1324,9 @@ impl SimpleItCore {
         let frontier = self.lm.own_direct_frontier(&author);
         let avail = self.lm.avail_high(&author);
         let backoff = Duration::from_millis(self.resume_backoff_ms);
-        if let Some(from) = self
-            .resume_trigger
-            .check(author, frontier, avail, now, backoff, self.resume_batch)
+        if let Some(from) =
+            self.resume_trigger
+                .check(author, frontier, avail, now, backoff, self.resume_batch)
         {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_lane_resume_requests_sent.inc();
@@ -1571,7 +1611,11 @@ mod tests {
             rx_y.try_recv().is_err(),
             "round 1 blocking must suppress round 3 too, even though B is fully available"
         );
-        assert_eq!(node_y.commit_queue.len(), 3, "all three rounds must still be queued");
+        assert_eq!(
+            node_y.commit_queue.len(),
+            3,
+            "all three rounds must still be queued"
+        );
 
         insert(&node_y, &chain_a[0]);
         insert(&node_y, &chain_a[1]);
@@ -1580,8 +1624,10 @@ mod tests {
         assert!(node_x.commit_queue.is_empty());
         assert!(node_y.commit_queue.is_empty());
 
-        let seq_x: Vec<Digest> = std::iter::from_fn(|| rx_x.try_recv().ok().map(|h| h.id)).collect();
-        let seq_y: Vec<Digest> = std::iter::from_fn(|| rx_y.try_recv().ok().map(|h| h.id)).collect();
+        let seq_x: Vec<Digest> =
+            std::iter::from_fn(|| rx_x.try_recv().ok().map(|h| h.id)).collect();
+        let seq_y: Vec<Digest> =
+            std::iter::from_fn(|| rx_y.try_recv().ok().map(|h| h.id)).collect();
         let expected = vec![
             chain_a[0].id.clone(),
             chain_a[1].id.clone(),

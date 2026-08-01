@@ -18,11 +18,15 @@ use crate::vantage::lanes::{
     AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager, SharedAckAggregator,
     SharedBlocks,
 };
+use crate::vantage::outbox::Outbox;
 use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
-use crate::vantage::resume::{ResumeServe, ResumeTrigger};
+use crate::vantage::resume::{
+    in_flight_state, InFlightState, NudgeMemo, ReplayEpisodes, ResumeServe, ResumeTrigger,
+    ServeBudget,
+};
 use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
 use async_trait::async_trait;
@@ -30,7 +34,7 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
-use network::{BatchConfig, MessageHandler, ReliableSender, SimpleSender, Writer};
+use network::{BatchConfig, DirtyMap, MessageHandler, ReliableSender, SimpleSender, Writer};
 use prometheus::IntCounter;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -127,6 +131,13 @@ pub enum Inbound {
     /// height, and `requester` is who's asking (a real, declared, MAC/membership-
     /// checked sender -- same D4 class as `HeadersRequest`'s own `requestor` field).
     LaneResume(PublicKey, Height, PublicKey),
+    /// reconnect-replay plan §7: a peer's `VantageResumeHello(floor hint, sender)`
+    /// -- a SEPARATE mechanism from `LaneResume` above (see `vantage::resume`'s own
+    /// module doc comment); `sender` is a real, declared, membership-checked
+    /// sender, same D4 class as `LaneResume`'s own `requester` field.
+    ResumeHello(View, PublicKey),
+    /// A peer's `VantageReplayDone(end_key, complete, clamped, sender)`.
+    ReplayDone(View, bool, bool, PublicKey),
 }
 
 /// Network receiver handler for the Vantage assembly's `primary_to_primary` port.
@@ -228,6 +239,14 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageLaneResume(author, from, requester) => {
                 Inbound::LaneResume(author, from, requester)
             }
+            // reconnect-replay plan §7 (a separate mechanism from `VantageLaneResume`
+            // above -- see `vantage::resume`'s own module doc comment).
+            PrimaryMessage::VantageResumeHello(floor, sender) => {
+                Inbound::ResumeHello(floor, sender)
+            }
+            PrimaryMessage::VantageReplayDone(end_key, complete, clamped, sender) => {
+                Inbound::ReplayDone(end_key, complete, clamped, sender)
+            }
             // Autobahn-only variants never reach the Vantage assembly's port; ignore
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
@@ -316,6 +335,40 @@ pub struct VantageCore {
     /// `Parameters::resume_batch` -- the maximum own blocks served per resume batch.
     resume_batch: u64,
 
+    /// reconnect-replay plan §5 (server-authoritative floor, v3) -- a SEPARATE
+    /// mechanism from Mechanism A above (see `vantage::resume`'s own module doc
+    /// comment): every one-shot broadcast this node has sent volatile
+    /// (`broadcast_recorded`), retained for possible replay. `Parameters::
+    /// outbox_max_bytes`-capped.
+    outbox: Outbox,
+    /// §2.4: per peer X, the lowest filing key X may be missing -- the
+    /// authoritative serve floor (absent entry = `None`, "no known gap"). Updated
+    /// ONLY by the dirty-map sweep (`sweep_dirty_map`, min-merge) and by a
+    /// successfully-enqueued replay's own end (`on_resume_hello`, §14 A2/A4) --
+    /// NEVER by an ordinary broadcast, keeping steady-state cost at zero. `HashMap`,
+    /// not `BTreeMap`: committee-bounded (one entry per peer), not view-keyed.
+    pending_low: HashMap<PublicKey, View>,
+    /// §2.6: requester-side "do we have an open ask toward peer X" episode state.
+    replay_episodes: ReplayEpisodes,
+    /// §6: author-side per-peer served-bytes rolling-window budget.
+    serve_budget: ServeBudget,
+    /// §2.6/§14 A3: author-side "when did we last serve-or-nudge peer X" cooldown.
+    nudge_memo: NudgeMemo,
+    /// `Parameters::replay_history_views` -- the outbox's own age-based retention
+    /// window (views behind `own_watermark`), consulted by `collect_internal_
+    /// garbage`. Clamped to >= 1 at `build` time, mirroring `gc_window`'s identical
+    /// clamp for the identical reason (a window of 0 would prune the view a
+    /// broadcast was just filed under, in the same tick it was filed).
+    replay_history_views: View,
+    /// `Parameters::replay_serve_max_bytes` -- the author-side per-peer served-bytes
+    /// budget per rolling `resume_backoff_ms` window (§6).
+    replay_serve_max_bytes: usize,
+    /// `Parameters::replay_episode_max_ms` -- the requester-side episode expiry
+    /// valve AND (audit-3 A6) the author-side in-flight-replay-stream TTL; see
+    /// `Parameters::replay_episode_max_ms`'s own doc comment for why the two share
+    /// one constant.
+    replay_episode_max_ms: u64,
+
     /// §10 timer queue: (deadline, view, kind), drained by the run loop's `sleep_until`
     /// branch (message channels are checked first every iteration -- §5's tie-break
     /// rule: "drain message queues before taking a timer branch"). D7-4 (PHASE7-PREP-
@@ -370,12 +423,16 @@ pub struct VantageCore {
 /// `VantageCore::build`'s return shape: the constructed core, channel ends `spawn`
 /// still needs to wire up (or a test needs to drive directly), and the shared
 /// ACK accumulator used by both local ACK feedback and the network handler.
+/// reconnect-replay plan §2.1/§7 (audit F8): also carries `reconnect_rx`, the
+/// receiving half of the MAIN pool's reconnect-event channel -- `run` selects on it
+/// directly (§2.6 trigger (i)).
 type BuildOutput = (
     VantageCore,
     Receiver<Inbound>,
     Receiver<(Digest, Digest, WorkerId)>,
     Sender<Inbound>,
     SharedAckAggregator,
+    Receiver<SocketAddr>,
 );
 
 impl VantageCore {
@@ -390,9 +447,9 @@ impl VantageCore {
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
     ) -> (Sender<Inbound>, SharedAckAggregator) {
-        let (core, rx_vantage, rx_payload_ready, tx_vantage, ack_aggregator) =
+        let (core, rx_vantage, rx_payload_ready, tx_vantage, ack_aggregator, reconnect_rx) =
             Self::build(name, committee, parameters, store, metrics, tx_output);
-        tokio::spawn(core.run(rx_vantage, rx_our_digests, rx_payload_ready));
+        tokio::spawn(core.run(rx_vantage, rx_our_digests, rx_payload_ready, reconnect_rx));
         (tx_vantage, ack_aggregator)
     }
 
@@ -468,6 +525,22 @@ impl VantageCore {
         // comment.
         let other_primary_addrs: Vec<SocketAddr> =
             other_primaries.iter().map(|(_, a)| *a).collect();
+        // reconnect-replay plan §2.3/§7: the exact reverse of `other_primaries`,
+        // precomputed once (mirrors `other_primary_addrs`'s own reasoning).
+        let addr_to_peer: HashMap<SocketAddr, PublicKey> = other_primaries
+            .iter()
+            .map(|(pk, addr)| (*addr, *pk))
+            .collect();
+        // reconnect-replay plan §2.3/§6/§7: the two shared maps the MAIN pool's
+        // `ReliableSender` (drop map) and the resume-sender task (in-flight map)
+        // feed/consume from a different task than this one -- see `Wire::dirty_map`/
+        // `Wire::in_flight`'s own doc comments.
+        let dirty_map: DirtyMap = Arc::new(Mutex::new(HashMap::new()));
+        let in_flight: wire::InFlightMap = Arc::new(Mutex::new(HashMap::new()));
+        // reconnect-replay plan §2.1/§7: capacity >= committee size (design doc §7)
+        // -- a prompt-Hello latency optimization only, never load-bearing (a
+        // dropped/full-channel event is simply recovered by the next `resume_tick`).
+        let (reconnect_tx, reconnect_rx) = channel(committee.size().max(1));
 
         // Data-plane withholding fault injector (`--withhold`): resolved once here,
         // same convention as `latency_map` just below -- `None` (the default, and
@@ -483,7 +556,8 @@ impl VantageCore {
                         .collect();
                     let addrs: Vec<SocketAddr> = full.iter().map(|(_, a)| *a).collect();
                     (addrs, full)
-                });
+                },
+            );
 
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
             .our_workers_by_id(&name)
@@ -518,8 +592,17 @@ impl VantageCore {
         // on THIS run loop). Built from the SAME `latency_map`/`batch`/`core_metrics`
         // locals as `network`/`worker_network` just below (identical configuration
         // convention) -- cloned here (rather than moved) since both of those still
-        // need their own copies afterward.
-        let resume_tx = wire::spawn_resume_sender(latency_map.clone(), batch, core_metrics.clone());
+        // need their own copies afterward. reconnect-replay plan §5/§6/§7: also
+        // hands the task its own clone of `in_flight` (the remove-after-`Done` side)
+        // and the chunk-pacing parameters (§9).
+        let resume_tx = wire::spawn_resume_sender(
+            latency_map.clone(),
+            batch,
+            core_metrics.clone(),
+            in_flight.clone(),
+            parameters.replay_chunk_bytes,
+            parameters.replay_chunk_interval_ms,
+        );
 
         let core = Self {
             name,
@@ -538,7 +621,10 @@ impl VantageCore {
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
-                        .with_batching(batch);
+                        .with_batching(batch)
+                        // reconnect-replay plan §14 A7: the MAIN pool only.
+                        .with_reconnect_events(reconnect_tx)
+                        .with_drop_map(dirty_map.clone());
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
                     }
@@ -562,6 +648,9 @@ impl VantageCore {
                 withheld_header_dests,
                 withhold_window: parameters.withhold_window.clone(),
                 metrics: core_metrics.clone(),
+                addr_to_peer,
+                dirty_map,
+                in_flight,
             },
             header_size: parameters.header_size,
             max_header_delay: parameters.max_header_delay,
@@ -575,6 +664,17 @@ impl VantageCore {
             resume_check_period_ms: parameters.resume_check_period_ms,
             resume_backoff_ms: parameters.resume_backoff_ms,
             resume_batch: parameters.resume_batch,
+            outbox: Outbox::new(parameters.outbox_max_bytes),
+            pending_low: HashMap::new(),
+            replay_episodes: ReplayEpisodes::new(),
+            serve_budget: ServeBudget::new(),
+            nudge_memo: NudgeMemo::new(),
+            // Clamped to >= 1: mirrors `gc_window`'s identical clamp (a window of 0
+            // would prune the view a broadcast was just filed under, in the same
+            // tick it was filed).
+            replay_history_views: parameters.replay_history_views.max(1),
+            replay_serve_max_bytes: parameters.replay_serve_max_bytes,
+            replay_episode_max_ms: parameters.replay_episode_max_ms,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
             payload: PayloadIo {
@@ -599,6 +699,7 @@ impl VantageCore {
             rx_payload_ready,
             tx_vantage,
             ack_aggregator,
+            reconnect_rx,
         )
     }
 
@@ -607,6 +708,7 @@ impl VantageCore {
         mut rx_vantage: Receiver<Inbound>,
         mut rx_our_digests: Receiver<(Digest, WorkerId)>,
         mut rx_payload_ready: Receiver<(Digest, Digest, WorkerId)>,
+        mut reconnect_rx: Receiver<SocketAddr>,
     ) {
         let boot = Instant::now();
         // Genesis bootstrap (§4/PHASE5-SPEC.md W1): every party enters view 1 at boot,
@@ -645,7 +747,8 @@ impl VantageCore {
         // above), its own dedicated tick so `Parameters::resume_check_period_ms` is
         // genuinely honored rather than piggybacking on `metrics_tick`'s fixed 1s
         // period.
-        let mut resume_tick = tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
+        let mut resume_tick =
+            tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
         resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -750,8 +853,17 @@ impl VantageCore {
                 // yet; ONGOING drain of an already-established episode instead runs
                 // at receipt pace via `try_resume_request`'s other two call sites
                 // (`Inbound::Publish`, `on_payload_ready`), not here.
+                //
+                // reconnect-replay plan §2.4/§2.6/§14 A3: this SAME tick also (a)
+                // sweeps the dirty map (spec: "swept on resume_tick and before
+                // serving any Hello") -- FIRST, so the episode/nudge checks below
+                // see a fresh `pending_low`; (b) re-Hellos any open replay episode
+                // past backoff (or closes it past the expiry valve); (c) runs the
+                // server-side nudge loop. A separate, unrelated mechanism from
+                // Mechanism A above -- see `vantage::resume`'s own module doc.
                 _ = resume_tick.tick() => {
                     let now = Instant::now();
+                    self.sweep_dirty_map();
                     // Cloned out (a plain `Vec<PublicKey>`, already excluding
                     // `self.name` -- `Wire::other_primaries` is "OTHER primaries",
                     // precomputed once and fixed for this node's lifetime, see that
@@ -760,8 +872,28 @@ impl VantageCore {
                     // rather than holding a live borrow of `self` for the whole loop.
                     let authors: Vec<PublicKey> =
                         self.wire.other_primaries.iter().map(|(pk, _)| *pk).collect();
+                    let episode_backoff = Duration::from_millis(self.resume_backoff_ms);
+                    let episode_max_age = Duration::from_millis(self.replay_episode_max_ms);
                     for author in authors {
                         self.try_resume_request(author, now);
+                        if self.replay_episodes.tick(author, now, episode_backoff, episode_max_age) {
+                            self.send_resume_hello(author).await;
+                        }
+                        self.maybe_nudge(author, now, episode_backoff).await;
+                    }
+                }
+
+                // reconnect-replay plan §2.1/§2.6/§7 trigger (i): our own reconnect
+                // to `addr`, fired by the MAIN pool's `Connection` on re-establishment
+                // after a failure (never the first-ever clean connect) -- a prompt,
+                // best-effort latency optimization; a lost/dropped event costs
+                // nothing beyond waiting for the next `resume_tick`'s own re-Hello.
+                Some(addr) = reconnect_rx.recv() => {
+                    let now = Instant::now();
+                    if let Some(&peer) = self.wire.addr_to_peer.get(&addr) {
+                        self.replay_episodes.open(peer, now);
+                        self.send_resume_hello(peer).await;
+                        self.try_resume_request(peer, now);
                     }
                 }
 
@@ -874,9 +1006,9 @@ impl VantageCore {
         let frontier = self.lm.own_direct_frontier(&author);
         let avail = self.lm.avail_high(&author);
         let backoff = Duration::from_millis(self.resume_backoff_ms);
-        if let Some(from) = self
-            .resume_trigger
-            .check(author, frontier, avail, now, backoff, self.resume_batch)
+        if let Some(from) =
+            self.resume_trigger
+                .check(author, frontier, avail, now, backoff, self.resume_batch)
         {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_lane_resume_requests_sent.inc();
@@ -885,6 +1017,234 @@ impl VantageCore {
                 author,
                 PrimaryMessage::VantageLaneResume(author, from, self.name),
             );
+        }
+    }
+
+    // --- reconnect-replay plan (server-authoritative floor, v3): a SEPARATE
+    // mechanism from Mechanism A above (see `vantage::resume`'s own module doc
+    // comment) -- resumes one-shot AGB/consensus broadcasts lost to a volatile
+    // session death, rather than lane content.
+
+    /// §2.2/§4: the outbox+volatile-send half of every `execute` broadcast arm
+    /// EXCEPT `Header(_, false)` (durable lane data; Mechanism A + `--withhold`
+    /// gate untouched) and `VantageAvail` (periodic self-superseding, stays durable
+    /// and unrecorded -- see the `avail_tick` arm in `run`). Serializes once,
+    /// records it in the outbox under the CURRENT `own_watermark` (the filing key
+    /// every later Hello/`pending_low`/replay computation keys off -- audit V1:
+    /// monotone since `own_watermark` itself never decreases), then sends it
+    /// volatile.
+    async fn broadcast_recorded(&mut self, message: PrimaryMessage) {
+        let msg_type = message.type_name();
+        let bytes = Bytes::from(bincode::serialize(&message).expect("serializes"));
+        let key = self.pacemaker.own_watermark();
+        self.outbox.record(key, bytes.clone());
+        self.wire.broadcast_volatile(bytes, msg_type, key).await;
+    }
+
+    /// §2.3/§7/§14 A8: drains the shared dirty map (never merely reads it -- A8)
+    /// then min-merges each `(addr, key)` entry into `pending_low`, translating
+    /// `SocketAddr -> PublicKey` via `Wire::addr_to_peer`. Called on `resume_tick`
+    /// and before serving any Hello (§2.4).
+    fn sweep_dirty_map(&mut self) {
+        let drained: HashMap<SocketAddr, u64> = {
+            let mut guard = self.wire.dirty_map.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for (addr, key) in drained {
+            let Some(&peer) = self.wire.addr_to_peer.get(&addr) else {
+                continue;
+            };
+            self.pending_low
+                .entry(peer)
+                .and_modify(|existing| *existing = (*existing).min(key))
+                .or_insert(key);
+        }
+    }
+
+    /// §6/§14 A6: is a replay stream to `peer` currently in flight? Evicts (and
+    /// counts) a stale entry if found -- see `resume::InFlightState`'s own doc
+    /// comment for the TTL rationale. Shared by the Hello-serving path (a genuine
+    /// `InFlight` blocks a fresh serve outright) and the nudge loop (§14 A3's own
+    /// "X not in-flight" conjunct).
+    fn check_in_flight(&mut self, peer: PublicKey, now: Instant) -> bool {
+        let ttl = Duration::from_millis(self.replay_episode_max_ms);
+        let state = {
+            let guard = self.wire.in_flight.lock().unwrap();
+            in_flight_state(&guard, &peer, now, ttl)
+        };
+        match state {
+            InFlightState::InFlight => true,
+            InFlightState::Absent => false,
+            InFlightState::Expired => {
+                self.wire.in_flight.lock().unwrap().remove(&peer);
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_replay_inflight_ttl_expired_total.inc();
+                }
+                false
+            }
+        }
+    }
+
+    /// §2.6 triggers (i)/(ii)/(iii): sends a `VantageResumeHello` to `peer` DURABLY
+    /// (the ordinary `send_message` unicast path). Contrast `send_nudge_hello`
+    /// (trigger (iv), the ONE Hello sent volatile instead -- §14 A7): each of these
+    /// three is either a one-shot event or bounded by the requester's own
+    /// `replay_episode_max_ms` expiry valve, so durable delivery is safe (never
+    /// unboundedly retried/buffered against a permanently-dead peer) and valuable
+    /// (A5's belt-and-braces tail actually needs the prompt Hello to land).
+    async fn send_resume_hello(&mut self, peer: PublicKey) {
+        let floor_hint = self.pacemaker.omega_of(peer);
+        self.wire
+            .send_message(
+                peer,
+                PrimaryMessage::VantageResumeHello(floor_hint, self.name),
+            )
+            .await;
+    }
+
+    /// §2.6 trigger (iv)/§14 A3/A7: the server-side nudge loop's own Hello send,
+    /// VOLATILE (self-superseding: a later nudge always supersedes an undelivered
+    /// earlier one; a lost nudge is simply re-nudged on the next `resume_tick`) --
+    /// unlike the other three triggers, a nudge has no natural bound of its own
+    /// (`pending_low[X]` can stay set indefinitely against a peer that never
+    /// reconnects), so sending it durably would let one new retried buffer entry
+    /// accumulate per backoff period, forever, against a dead peer.
+    async fn send_nudge_hello(&mut self, peer: PublicKey) {
+        let floor_hint = self.pacemaker.omega_of(peer);
+        let key = self.pacemaker.own_watermark();
+        self.wire
+            .send_volatile(
+                peer,
+                PrimaryMessage::VantageResumeHello(floor_hint, self.name),
+                key,
+            )
+            .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_replay_pending_low_nudges_total.inc();
+        }
+    }
+
+    /// §2.6's server-side nudge loop, audit-3 A3's exact condition: `pending_low
+    /// [peer].is_some() && peer not in-flight && backoff elapsed since the last
+    /// serve-or-nudge to peer` -- deliberately keyed to "since the last serve-OR-
+    /// nudge" (not "since `pending_low` was set"), which is the audited fix: the
+    /// weaker form would silence this backstop after a single partial serve, even
+    /// though `pending_low` can (and, under budget truncation, routinely does)
+    /// stay set across many serves.
+    async fn maybe_nudge(&mut self, peer: PublicKey, now: Instant, backoff: Duration) {
+        if !self.pending_low.contains_key(&peer) {
+            return;
+        }
+        if self.check_in_flight(peer, now) {
+            return;
+        }
+        if !self.nudge_memo.due(peer, now, backoff) {
+            return;
+        }
+        self.send_nudge_hello(peer).await;
+        self.nudge_memo.record(peer, now);
+    }
+
+    /// §2/§6/§14 A1/A2/A4/A5: the Hello-serving decision. `hello_floor` is the
+    /// sender's own hint (`omega_of` at THEIR end, §2.4/A5's "belt-and-braces
+    /// tail"); the AUTHORITATIVE floor is `pending_low[sender]` (fed exclusively by
+    /// this node's own exact drop reports, never by anything `sender` claims -- D4
+    /// caveat (i)/(ii) in `vantage::resume`'s own module doc). Reciprocation (§2.6
+    /// trigger (iii)) and the dirty-map sweep (§2.4: "swept ... before serving any
+    /// Hello") both run BEFORE the floor read; everything from the floor read
+    /// through the enqueue is await-free (audit V4: single-threaded atomicity --
+    /// nothing else on this task's `&mut self` can observe a torn intermediate
+    /// state, since there is no `.await` point for the runtime to preempt at).
+    async fn on_resume_hello(&mut self, hello_floor: View, sender: PublicKey, now: Instant) {
+        // (iii): reciprocation, memo-deduped -- independent of everything below.
+        if self.replay_episodes.on_hello_received(sender, now) {
+            self.send_resume_hello(sender).await;
+        }
+
+        self.sweep_dirty_map();
+
+        if self.check_in_flight(sender, now) {
+            // §6: "the in-flight stream already serves >= pending_low, a superset
+            // of any concurrent ask" -- ignored entirely, no Done either.
+            return;
+        }
+
+        // --- await-free from here through the enqueue (audit V4) ---
+        let pending = self.pending_low.get(&sender).copied();
+        let raw_from = match pending {
+            Some(p) => hello_floor.min(p),
+            None => hello_floor,
+        };
+        let outbox_floor = self.outbox.floor();
+        let served_from = raw_from.max(outbox_floor);
+        let clamped = served_from > raw_from;
+
+        let window = Duration::from_millis(self.resume_backoff_ms);
+        let remaining =
+            self.serve_budget
+                .remaining(sender, now, window, self.replay_serve_max_bytes);
+        let has_backlog = self.outbox.slice_from(served_from).next().is_some();
+        if remaining == 0 && has_backlog {
+            // §6: "over-budget Hellos are deferred to the next window (the episode
+            // tick re-asks)" -- nothing sent at all this time.
+            return;
+        }
+
+        let (msgs, end_key, complete) = self.outbox.take_budgeted_slice(served_from, remaining);
+        let served_bytes: usize = msgs.iter().map(Bytes::len).sum();
+        self.serve_budget.record(sender, served_bytes, now, window);
+
+        let done = PrimaryMessage::VantageReplayDone(end_key, complete, clamped, self.name);
+        let enqueued = self.wire.enqueue_replay(sender, msgs, done);
+        // --- end await-free section ---
+
+        if !enqueued {
+            // audit-3 A2: `Wire::enqueue_replay` already counted the drop metric;
+            // `pending_low` stays untouched -- the next nudge/tick re-asks.
+            return;
+        }
+        self.wire.in_flight.lock().unwrap().insert(sender, now);
+        if complete {
+            self.pending_low.remove(&sender);
+        } else {
+            // A4's monotone guard: raise, never lower (a `None`/absent prior value
+            // is treated as unconstrained -- `end_key` always wins).
+            self.pending_low
+                .entry(sender)
+                .and_modify(|existing| *existing = (*existing).max(end_key))
+                .or_insert(end_key);
+        }
+        self.nudge_memo.record(sender, now);
+        if clamped {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_replay_done_clamped_total.inc();
+            }
+        }
+    }
+
+    /// §2.6's `VantageReplayDone` arm: episode continuation (send the next Hello
+    /// immediately) on `complete = false`; close the episode on `complete = true`.
+    /// `end_key` carries no requester-side state update in v3: correctness lives
+    /// entirely in the AUTHOR's own `pending_low` (§2.4) -- the requester's floor
+    /// is a hint only (D4 caveat (iii)), so there is nothing here to advance.
+    async fn on_replay_done(
+        &mut self,
+        _end_key: View,
+        complete: bool,
+        clamped: bool,
+        sender: PublicKey,
+        now: Instant,
+    ) {
+        if clamped {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_replay_done_clamped_total.inc();
+            }
+        }
+        if complete {
+            self.replay_episodes.close(&sender);
+        } else {
+            self.replay_episodes.open(sender, now);
+            self.send_resume_hello(sender).await;
         }
     }
 
@@ -988,6 +1348,30 @@ impl VantageCore {
     }
 
     fn collect_internal_garbage(&mut self) {
+        // reconnect-replay plan §5: the outbox's own retention window tracks
+        // `own_watermark` (this party's own wish high-watermark) -- a different,
+        // generally FASTER-advancing counter than the resolver's own `resolved_
+        // watermark` the rest of this method's floor (below) is keyed to. Pruned
+        // UNCONDITIONALLY, every tick, rather than gated behind the resolver-floor
+        // early return below -- gating it there would silently stall outbox GC
+        // whenever resolution itself stalls, even while `own_watermark` (and the
+        // outbox) keep growing.
+        let outbox_floor = self
+            .pacemaker
+            .own_watermark()
+            .saturating_sub(self.replay_history_views)
+            .max(1);
+        self.outbox.prune_below(outbox_floor);
+        // Audit-3 (Q3 recommendation): any `pending_low[X]` below the just-advanced
+        // outbox floor can never be served from again regardless -- raise it now
+        // rather than waiting for a future Hello to discover the gap only after
+        // already trying (and getting `Done(clamped=true)`).
+        for pending in self.pending_low.values_mut() {
+            if *pending < outbox_floor {
+                *pending = outbox_floor;
+            }
+        }
+
         let floor = self.resolver.gc_floor(self.gc_window);
         if floor <= self.last_gc_floor {
             return;
@@ -1081,15 +1465,13 @@ impl VantageCore {
                 effects.push(Effect::BroadcastPropose(proposal.clone()));
                 effects.extend(match proposal {
                     ProposalOut::Single(p) => {
-                        self.agb.on_propose(self.name, p, now, &mut self.lm, &mut self.rep)
+                        self.agb
+                            .on_propose(self.name, p, now, &mut self.lm, &mut self.rep)
                     }
-                    ProposalOut::Batch(p) => self.agb.on_propose_batch(
-                        self.name,
-                        p,
-                        now,
-                        &mut self.lm,
-                        &mut self.rep,
-                    ),
+                    ProposalOut::Batch(p) => {
+                        self.agb
+                            .on_propose_batch(self.name, p, now, &mut self.lm, &mut self.rep)
+                    }
                 });
             }
             view += 1;
@@ -1247,7 +1629,8 @@ impl VantageCore {
                 let claimed_sender = self.agb.proposer(proposal.view());
                 match proposal {
                     ProposalOut::Single(p) => {
-                        self.agb.on_propose(claimed_sender, p, now, &mut self.lm, &mut self.rep)
+                        self.agb
+                            .on_propose(claimed_sender, p, now, &mut self.lm, &mut self.rep)
                     }
                     ProposalOut::Batch(p) => self.agb.on_propose_batch(
                         claimed_sender,
@@ -1354,28 +1737,31 @@ impl VantageCore {
             // see `vantage::agb::DigestStatements`'s own module doc comment.
             Inbound::EchoDigest(msg) => {
                 let mut effects = self.pacemaker.on_wish(msg.sender, msg.wish);
-                effects.extend(
-                    self.digest_stmts
-                        .on_echo_digest(msg, now, &mut self.agb, &mut self.rep),
-                );
+                effects.extend(self.digest_stmts.on_echo_digest(
+                    msg,
+                    now,
+                    &mut self.agb,
+                    &mut self.rep,
+                ));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::ReadyDigest(msg) => {
                 let mut effects = self.pacemaker.on_wish(msg.sender, msg.wish);
-                effects.extend(
-                    self.digest_stmts
-                        .on_ready_digest(msg, now, &mut self.agb, &mut self.rep),
-                );
+                effects.extend(self.digest_stmts.on_ready_digest(
+                    msg,
+                    now,
+                    &mut self.agb,
+                    &mut self.rep,
+                ));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
-            Inbound::BodyFetch(view, digest, requester) => {
-                self.digest_stmts
-                    .on_body_fetch(requester, view, digest, &self.agb)
-            }
+            Inbound::BodyFetch(view, digest, requester) => self
+                .digest_stmts
+                .on_body_fetch(requester, view, digest, &self.agb),
             Inbound::BodyServe(view, proposal) => {
                 let mut effects =
                     self.digest_stmts
@@ -1405,12 +1791,15 @@ impl VantageCore {
                 let tip = self.lm.own_tip_height();
                 if from > tip {
                     return Vec::new(); // nothing new to serve (fully caught up, or
-                                        // a request racing ahead of our own tip)
+                                       // a request racing ahead of our own tip)
                 }
                 let backoff = Duration::from_millis(self.resume_backoff_ms);
-                if !self.resume_serve.should_serve(requester, from, now, backoff) {
+                if !self
+                    .resume_serve
+                    .should_serve(requester, from, now, backoff)
+                {
                     return Vec::new(); // one-shot dedup: already served this exact
-                                        // (requester, from) within resume_backoff_ms
+                                       // (requester, from) within resume_backoff_ms
                 }
                 let to = (from + self.resume_batch - 1).min(tip);
                 let mut effects = Vec::with_capacity((to - from + 1) as usize);
@@ -1423,6 +1812,25 @@ impl VantageCore {
                     }
                 }
                 effects
+            }
+
+            // --- reconnect-replay plan (server-authoritative floor, v3) -- a
+            // SEPARATE mechanism from `LaneResume` above (see `vantage::resume`'s
+            // own module doc comment). Both arms perform their own I/O directly
+            // (dirty-map sweep, `pending_low`, the shared in-flight map, and the
+            // resume-sender task hand-off all need synchronous, single-threaded
+            // atomicity between a floor read and the resulting enqueue -- audit
+            // V4 -- which does not decompose into a `Vec<Effect>` the way the
+            // rest of this protocol's pure state machines do) rather than
+            // returning effects for `execute` to drain.
+            Inbound::ResumeHello(floor, sender) => {
+                self.on_resume_hello(floor, sender, now).await;
+                Vec::new()
+            }
+            Inbound::ReplayDone(end_key, complete, clamped, sender) => {
+                self.on_replay_done(end_key, complete, clamped, sender, now)
+                    .await;
+                Vec::new()
             }
         }
     }
@@ -1458,8 +1866,9 @@ impl VantageCore {
                     // emitting this effect exactly as before.
                     queue.extend(self.record_local_ack(&ack, now));
                     if !self.ack_watermarks {
-                        self.wire
-                            .broadcast_message(PrimaryMessage::VantageAck(ack))
+                        // reconnect-replay plan §2.2/§4: a one-shot broadcast, not
+                        // durable lane data -- outbox-recorded, sent volatile.
+                        self.broadcast_recorded(PrimaryMessage::VantageAck(ack))
                             .await
                     }
                 }
@@ -1495,15 +1904,14 @@ impl VantageCore {
                 // PHASE7: `Single` rides the pre-PHASE7 `VantagePropose` message
                 // (0/1-entry `M`); `Batch` (`decide_prefix` produced `>= 2` entries)
                 // rides the separate `VantageProposeBatch` message.
+                // reconnect-replay plan §2.2/§4: outbox-recorded, sent volatile.
                 Effect::BroadcastPropose(p) => match p {
                     ProposalOut::Single(p) => {
-                        self.wire
-                            .broadcast_message(PrimaryMessage::VantagePropose(p))
+                        self.broadcast_recorded(PrimaryMessage::VantagePropose(p))
                             .await
                     }
                     ProposalOut::Batch(p) => {
-                        self.wire
-                            .broadcast_message(PrimaryMessage::VantageProposeBatch(p))
+                        self.broadcast_recorded(PrimaryMessage::VantageProposeBatch(p))
                             .await
                     }
                 },
@@ -1528,26 +1936,22 @@ impl VantageCore {
                         // way.
                         EchoOut::Single(e) if self.digest_statements => {
                             let msg = e.to_digest(self.agb.sid());
-                            self.wire
-                                .broadcast_message(PrimaryMessage::VantageEchoDigest(msg))
+                            self.broadcast_recorded(PrimaryMessage::VantageEchoDigest(msg))
                                 .await
                         }
                         EchoOut::Single(e) => {
-                            self.wire
-                                .broadcast_message(PrimaryMessage::VantageEcho(e))
+                            self.broadcast_recorded(PrimaryMessage::VantageEcho(e))
                                 .await
                         }
                         EchoOut::Batch(e) => {
-                            self.wire
-                                .broadcast_message(PrimaryMessage::VantageEchoBatch(e))
+                            self.broadcast_recorded(PrimaryMessage::VantageEchoBatch(e))
                                 .await
                         }
                     }
                 }
                 Effect::BroadcastEchoSkip(view) => {
                     let wish = self.pacemaker.own_watermark();
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageEchoSkip(view, self.name, wish))
+                    self.broadcast_recorded(PrimaryMessage::VantageEchoSkip(view, self.name, wish))
                         .await;
                 }
                 Effect::BroadcastReady(mut r) => {
@@ -1557,33 +1961,28 @@ impl VantageCore {
                         // identical translation immediately above.
                         ReadyOut::Single(r) if self.digest_statements => {
                             let msg = r.to_digest(self.agb.sid());
-                            self.wire
-                                .broadcast_message(PrimaryMessage::VantageReadyDigest(msg))
+                            self.broadcast_recorded(PrimaryMessage::VantageReadyDigest(msg))
                                 .await
                         }
                         ReadyOut::Single(r) => {
-                            self.wire
-                                .broadcast_message(PrimaryMessage::VantageReady(r))
+                            self.broadcast_recorded(PrimaryMessage::VantageReady(r))
                                 .await
                         }
                         ReadyOut::Batch(r) => {
-                            self.wire
-                                .broadcast_message(PrimaryMessage::VantageReadyBatch(r))
+                            self.broadcast_recorded(PrimaryMessage::VantageReadyBatch(r))
                                 .await
                         }
                     }
                 }
                 Effect::BroadcastNoReady(view) => {
                     let wish = self.pacemaker.own_watermark();
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageNoReady(view, self.name, wish))
+                    self.broadcast_recorded(PrimaryMessage::VantageNoReady(view, self.name, wish))
                         .await;
                 }
                 // No wish piggyback, unlike `BroadcastEchoSkip`/`BroadcastNoReady`
                 // above (see `Inbound::SkipVote`'s doc comment).
                 Effect::BroadcastSkipVote(view) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageSkipVote(view, self.name))
+                    self.broadcast_recorded(PrimaryMessage::VantageSkipVote(view, self.name))
                         .await;
                 }
                 Effect::Fixed(view, well_formed) => {
@@ -1597,10 +1996,11 @@ impl VantageCore {
                     // drain them now. A no-op if nothing was ever buffered for this
                     // view, or if `well_formed` is false (`on_local_fixed`'s own
                     // `fixed_proposal` query returns `None` for `Reject`).
-                    queue.extend(
-                        self.digest_stmts
-                            .on_local_fixed(view, &mut self.agb, &mut self.rep),
-                    );
+                    queue.extend(self.digest_stmts.on_local_fixed(
+                        view,
+                        &mut self.agb,
+                        &mut self.rep,
+                    ));
                 }
                 Effect::Completed(view, c, t) => {
                     queue.extend(self.cursor.on_completed(view, c, t));
@@ -1617,8 +2017,7 @@ impl VantageCore {
                         .await;
                 }
                 Effect::BroadcastWish(view) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::VantageWish(view, self.name))
+                    self.broadcast_recorded(PrimaryMessage::VantageWish(view, self.name))
                         .await
                 }
                 Effect::Enter(view) => {
@@ -1645,9 +2044,12 @@ impl VantageCore {
                     }
                     queue.extend(self.control.on_completion_reportable(view, proposal));
                 }
+                // reconnect-replay plan §2.2/§4: the wish-free one-shots
+                // (CompReport, Control*) below are ALSO outbox-recorded/volatile --
+                // every broadcast in `execute` except `BroadcastPublish`/
+                // `VantageAvail`'s own `avail_tick` arm is.
                 Effect::BroadcastCompReport(view, digest) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::CompReport(view, digest, self.name))
+                    self.broadcast_recorded(PrimaryMessage::CompReport(view, digest, self.name))
                         .await;
                 }
                 // PHASE7: `Single`/`None` are byte-identical to the pre-PHASE7 path
@@ -1655,47 +2057,36 @@ impl VantageCore {
                 // flag-gated `ControlInitBatch` message.
                 Effect::BroadcastControlInit(proposal, b_w) => match b_w {
                     None => {
-                        self.wire
-                            .broadcast_message(PrimaryMessage::ControlInit(proposal, None))
+                        self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, None))
                             .await
                     }
                     Some(ProposalOut::Single(p)) => {
-                        self.wire
-                            .broadcast_message(PrimaryMessage::ControlInit(proposal, Some(p)))
+                        self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, Some(p)))
                             .await
                     }
                     Some(ProposalOut::Batch(p)) => {
-                        self.wire
-                            .broadcast_message(PrimaryMessage::ControlInitBatch(
-                                proposal,
-                                Some(p),
-                            ))
+                        self.broadcast_recorded(PrimaryMessage::ControlInitBatch(proposal, Some(p)))
                             .await
                     }
                 },
                 Effect::BroadcastControlEcho(proposal) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::ControlEcho(proposal, self.name))
+                    self.broadcast_recorded(PrimaryMessage::ControlEcho(proposal, self.name))
                         .await;
                 }
                 Effect::BroadcastControlReady(proposal) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::ControlReady(proposal, self.name))
+                    self.broadcast_recorded(PrimaryMessage::ControlReady(proposal, self.name))
                         .await;
                 }
                 Effect::BroadcastControlCommit(round) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::ControlCommit(round, self.name))
+                    self.broadcast_recorded(PrimaryMessage::ControlCommit(round, self.name))
                         .await;
                 }
                 Effect::BroadcastControlTimeoutVote(round) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::ControlTimeoutVote(round, self.name))
+                    self.broadcast_recorded(PrimaryMessage::ControlTimeoutVote(round, self.name))
                         .await;
                 }
                 Effect::BroadcastControlTimeoutAccept(round) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::ControlTimeoutAccept(round, self.name))
+                    self.broadcast_recorded(PrimaryMessage::ControlTimeoutAccept(round, self.name))
                         .await;
                 }
                 Effect::ControlFetchTo(peer, view, digest) => {
@@ -1777,7 +2168,6 @@ impl VantageCore {
             .clone();
         Some(UtilizationTimer::from_counter(counter))
     }
-
 }
 
 #[cfg(test)]
@@ -1815,7 +2205,7 @@ mod tests {
         let registry = prometheus::Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         let (tx_output, _rx_output) = channel(1);
-        let (core, _rx_vantage, _rx_payload_ready, _tx_vantage, _ack_aggregator) =
+        let (core, _rx_vantage, _rx_payload_ready, _tx_vantage, _ack_aggregator, _reconnect_rx) =
             VantageCore::build(
                 name,
                 committee,
@@ -2189,7 +2579,11 @@ mod tests {
         // both, exactly as `resume_tick`'s own loop would present it.
         core.try_resume_request(author, now);
         assert_eq!(
-            core.metrics.as_ref().unwrap().vantage_lane_resume_requests_sent.get(),
+            core.metrics
+                .as_ref()
+                .unwrap()
+                .vantage_lane_resume_requests_sent
+                .get(),
             0,
             "first observation must not fire"
         );
@@ -2227,10 +2621,469 @@ mod tests {
             "the publish must have advanced frontier(author) to 1"
         );
         assert_eq!(
-            core.metrics.as_ref().unwrap().vantage_lane_resume_requests_sent.get(),
+            core.metrics
+                .as_ref()
+                .unwrap()
+                .vantage_lane_resume_requests_sent
+                .get(),
             sent_after_establish + 1,
             "receipt of the publish must fire the NEXT request immediately -- no \
              third tick was ever run in this test"
+        );
+    }
+
+    // --- reconnect-replay plan (server-authoritative floor, v3): a SEPARATE
+    // mechanism from Mechanism A above (see `vantage::resume`'s own module doc
+    // comment). Lives here, not in `vantage::tests::`, for the SAME reason the
+    // LaneResume tests above do: `pending_low`/`outbox`/`wire` and `dispatch_
+    // inbound`/`build` are private to this module, and the synchronous
+    // `vantage::tests::harness` has no transport-level concept at all (no
+    // sessions, no volatile sends, no dirty/in-flight maps) to model this
+    // mechanism's own tests against -- see `harness.rs`'s own `Inbound::
+    // ResumeHello`/`ReplayDone` arm for that boundary. `network::reliable_sender_
+    // tests` separately covers the TRANSPORT half (A1's handler-less-entry
+    // survival, the four session-death drop-accounting paths, reconnect events,
+    // the backoff cap).
+
+    /// `peer`'s real primary address in `core`'s own (fixed, `crate::common::
+    /// committee()`-derived) address book.
+    fn addr_of(core: &VantageCore, peer: PublicKey) -> SocketAddr {
+        core.wire
+            .other_primaries
+            .iter()
+            .find(|(pk, _)| *pk == peer)
+            .map(|(_, a)| *a)
+            .expect("peer must be an other-primary of this test committee")
+    }
+
+    /// Swaps `core.wire.resume_tx` for a fresh, test-owned channel, returning the
+    /// receiving end so a test can inspect exactly what the Hello-serving/nudge
+    /// code enqueues. `build()` (via `test_core`) already spawned a real
+    /// resume-sender task fed by the ORIGINAL channel -- swapping the `Sender`
+    /// simply orphans that task (it idles forever on an empty channel no one
+    /// sends to anymore), harmless for a test that then exits and tears down its
+    /// whole `#[tokio::test]` runtime, tasks included.
+    fn intercept_resume_channel(core: &mut VantageCore) -> Receiver<wire::ResumeSend> {
+        let (tx, rx) = channel(64);
+        core.wire.resume_tx = tx;
+        rx
+    }
+
+    /// Forces every subsequent `Wire::enqueue_replay`/`enqueue_resume` `try_send`
+    /// to fail with `Closed` -- audit-3 A2's own Err arm.
+    fn break_resume_channel(core: &mut VantageCore) {
+        let (tx, rx) = channel::<wire::ResumeSend>(1);
+        drop(rx);
+        core.wire.resume_tx = tx;
+    }
+
+    fn enqueue_drops(core: &VantageCore) -> u64 {
+        core.metrics
+            .as_ref()
+            .unwrap()
+            .vantage_replay_enqueue_drops_total
+            .get()
+    }
+
+    fn done_clamped(core: &VantageCore) -> u64 {
+        core.metrics
+            .as_ref()
+            .unwrap()
+            .vantage_replay_done_clamped_total
+            .get()
+    }
+
+    fn nudges_sent(core: &VantageCore) -> u64 {
+        core.metrics
+            .as_ref()
+            .unwrap()
+            .vantage_replay_pending_low_nudges_total
+            .get()
+    }
+
+    fn ttl_expired(core: &VantageCore) -> u64 {
+        core.metrics
+            .as_ref()
+            .unwrap()
+            .vantage_replay_inflight_ttl_expired_total
+            .get()
+    }
+
+    /// **The B1 killer test** (design doc §11, first bullet -- "the single most
+    /// important test in this change"): audit-2's B1 race was a session-2
+    /// piggyback landing FIRST and inflating the REQUESTER's own claimed Hello
+    /// floor, which a requester-latched-floor design (v1/v2) would have trusted,
+    /// permanently skipping the genuinely-dropped earlier suffix. v3 closes this
+    /// by construction: the serve floor is `min(hello.floor, pending_low[requester])`,
+    /// and `pending_low` is fed EXCLUSIVELY by this node's own exact drop reports,
+    /// never by anything the requester claims. Here: `peer` genuinely dropped
+    /// everything from view 5 onward (simulated via a direct dirty-map insert --
+    /// exactly the report `network::Connection::report_dropped` computes for real
+    /// at session death); `peer`'s Hello nonetheless claims a floor of 100 (as it
+    /// would if its own tracking had already jumped ahead from a later, out-of-
+    /// order session-2 arrival). The served suffix must start at 5 regardless.
+    #[tokio::test]
+    async fn resume_hello_serves_from_pending_low_regardless_of_inflated_hello_floor() {
+        let mut core = test_core(0, "reconnect_b1");
+        let (peer, _) = crate::common::keys()[1];
+
+        core.outbox.record(5, Bytes::from_static(b"five"));
+        core.outbox.record(10, Bytes::from_static(b"ten"));
+        core.outbox.record(100, Bytes::from_static(b"hundred"));
+
+        let peer_addr = addr_of(&core, peer);
+        core.wire.dirty_map.lock().unwrap().insert(peer_addr, 5);
+
+        let mut rx = intercept_resume_channel(&mut core);
+
+        let inflated_floor: View = 100;
+        core.dispatch_inbound(Inbound::ResumeHello(inflated_floor, peer), Instant::now())
+            .await;
+
+        let sent = rx.try_recv().expect("a Replay must have been enqueued");
+        let wire::ResumeSend::Replay {
+            peer: p,
+            msgs,
+            done,
+            ..
+        } = sent
+        else {
+            panic!("expected a Replay, got {:?}", sent);
+        };
+        assert_eq!(p, peer);
+        assert_eq!(
+            msgs,
+            vec![
+                Bytes::from_static(b"five"),
+                Bytes::from_static(b"ten"),
+                Bytes::from_static(b"hundred"),
+            ],
+            "the dropped suffix from view 5 must be served in full, regardless of \
+             the inflated Hello floor"
+        );
+        match done {
+            PrimaryMessage::VantageReplayDone(end_key, complete, clamped, sender) => {
+                assert_eq!(end_key, 101);
+                assert!(complete);
+                assert!(!clamped);
+                assert_eq!(sender, core.name);
+            }
+            other => panic!("expected VantageReplayDone, got {:?}", other),
+        }
+        assert!(
+            !core.pending_low.contains_key(&peer),
+            "a complete serve must clear pending_low"
+        );
+    }
+
+    /// A healthy, caught-up peer's Hello (`pending_low = None`, floor at or past
+    /// the outbox's own tip) serves an EMPTY slice -- `Done(complete=true)` only,
+    /// zero duplicate volume in steady state (§2.4).
+    #[tokio::test]
+    async fn resume_hello_from_a_caught_up_peer_serves_nothing_and_reports_complete() {
+        let mut core = test_core(0, "reconnect_caught_up");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+
+        let mut rx = intercept_resume_channel(&mut core);
+        // floor=6: "I need key 6 onward" -- the peer already has key 5 (the
+        // outbox's only entry), so this genuinely is the caught-up case.
+        core.dispatch_inbound(Inbound::ResumeHello(6, peer), Instant::now())
+            .await;
+
+        let wire::ResumeSend::Replay { msgs, done, .. } = rx
+            .try_recv()
+            .expect("a Done-only Replay must still be enqueued")
+        else {
+            panic!("expected a Replay");
+        };
+        assert!(msgs.is_empty());
+        match done {
+            PrimaryMessage::VantageReplayDone(end_key, complete, clamped, _) => {
+                assert_eq!(end_key, 6);
+                assert!(complete);
+                assert!(!clamped);
+            }
+            other => panic!("expected VantageReplayDone, got {:?}", other),
+        }
+    }
+
+    /// GC interaction (§5/§6): once the outbox has pruned below what a peer
+    /// actually needs, the serve is clamped up to `outbox_floor` and `Done`
+    /// reports it -- the "recovered-with-gap" case.
+    #[tokio::test]
+    async fn resume_hello_clamps_to_outbox_floor_and_reports_clamped() {
+        let mut core = test_core(0, "reconnect_clamped");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+        core.outbox.record(50, Bytes::from_static(b"fifty"));
+        core.outbox.prune_below(20); // views 5..20 are now irrevocably gone
+
+        let mut rx = intercept_resume_channel(&mut core);
+        let clamped_metric_before = done_clamped(&core);
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), Instant::now())
+            .await;
+
+        let wire::ResumeSend::Replay { msgs, done, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a Replay");
+        };
+        assert_eq!(msgs, vec![Bytes::from_static(b"fifty")]);
+        match done {
+            PrimaryMessage::VantageReplayDone(end_key, complete, clamped, _) => {
+                assert_eq!(end_key, 51);
+                assert!(complete);
+                assert!(
+                    clamped,
+                    "the requested floor (5) was below outbox_floor (20)"
+                );
+            }
+            other => panic!("expected VantageReplayDone, got {:?}", other),
+        }
+        assert_eq!(clamped_metric_before + 1, done_clamped(&core));
+    }
+
+    /// §6: "A Hello from X while X is in-flight ... is ignored -- the in-flight
+    /// stream already serves >= pending_low, a superset of any concurrent ask."
+    #[tokio::test]
+    async fn resume_hello_while_in_flight_is_ignored() {
+        let mut core = test_core(0, "reconnect_in_flight");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+
+        let mut rx = intercept_resume_channel(&mut core);
+        let now = Instant::now();
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), now)
+            .await;
+        assert!(rx.try_recv().is_ok(), "the first Hello must be served");
+        assert!(core.wire.in_flight.lock().unwrap().contains_key(&peer));
+
+        // A second Hello while that stream is still marked in-flight (nothing
+        // drained/removed it -- see `intercept_resume_channel`'s own doc comment).
+        core.dispatch_inbound(
+            Inbound::ResumeHello(5, peer),
+            now + Duration::from_millis(10),
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a concurrent Hello while a superset stream is in flight must be ignored, not re-served"
+        );
+    }
+
+    /// Audit-3 A6: an in-flight entry older than `replay_episode_max_ms` is stale,
+    /// not genuinely in flight -- it is evicted (bumping the TTL-expiry metric) and
+    /// the Hello is served normally.
+    #[tokio::test]
+    async fn resume_hello_served_again_after_in_flight_ttl_expires() {
+        let mut core = test_core(0, "reconnect_ttl_expiry");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+        assert_eq!(core.replay_episode_max_ms, 60_000);
+
+        let mut rx = intercept_resume_channel(&mut core);
+        let now = Instant::now();
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), now)
+            .await;
+        assert!(rx.try_recv().is_ok());
+
+        let before = ttl_expired(&core);
+        let later = now + Duration::from_millis(60_001);
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), later)
+            .await;
+        assert_eq!(
+            before + 1,
+            ttl_expired(&core),
+            "the stale entry must be counted once"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "past the TTL, the entry is stale (not genuinely in flight) -- the Hello must be served"
+        );
+    }
+
+    /// Audit-3 A2: a `try_send` failure onto the resume-sender task's channel
+    /// leaves `pending_low` untouched (never raised, never cleared) and counts the
+    /// drop metric instead -- the next ask (once the channel has room again)
+    /// re-serves normally.
+    #[tokio::test]
+    async fn try_send_failure_leaves_pending_low_unchanged_and_next_ask_recovers() {
+        let mut core = test_core(0, "reconnect_a2");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+        let peer_addr = addr_of(&core, peer);
+        core.wire.dirty_map.lock().unwrap().insert(peer_addr, 5);
+
+        break_resume_channel(&mut core);
+        let drops_before = enqueue_drops(&core);
+        let now = Instant::now();
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), now)
+            .await;
+
+        assert_eq!(drops_before + 1, enqueue_drops(&core));
+        assert_eq!(
+            core.pending_low.get(&peer).copied(),
+            Some(5),
+            "a failed enqueue must leave pending_low exactly as the dirty-map sweep set it"
+        );
+        assert!(
+            !core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            "a failed enqueue must not mark the stream in-flight either"
+        );
+
+        // The channel recovers (e.g. the task caught up) -- the next ask succeeds.
+        let mut rx = intercept_resume_channel(&mut core);
+        core.dispatch_inbound(
+            Inbound::ResumeHello(5, peer),
+            now + Duration::from_millis(10),
+        )
+        .await;
+        let wire::ResumeSend::Replay { done, .. } =
+            rx.try_recv().expect("the retried ask must be served")
+        else {
+            panic!("expected a Replay");
+        };
+        assert!(matches!(
+            done,
+            PrimaryMessage::VantageReplayDone(_, true, false, _)
+        ));
+        assert!(!core.pending_low.contains_key(&peer));
+    }
+
+    /// §2.6: `Done(complete=false)` is a continuation -- the episode toward the
+    /// author re-opens (or stays open) and the NEXT Hello is sent immediately, not
+    /// backoff-gated (unlike the periodic tick's own re-Hello).
+    #[tokio::test]
+    async fn replay_done_incomplete_reopens_episode_and_sends_hello_immediately() {
+        let mut core = test_core(0, "reconnect_done_continuation");
+        let (author, _) = crate::common::keys()[1];
+        assert!(!core.replay_episodes.is_open(&author));
+
+        core.dispatch_inbound(
+            Inbound::ReplayDone(42, false, false, author),
+            Instant::now(),
+        )
+        .await;
+
+        assert!(
+            core.replay_episodes.is_open(&author),
+            "an incomplete Done must (re)open our own episode toward the author"
+        );
+    }
+
+    /// `Done(complete=true)` closes the episode.
+    #[tokio::test]
+    async fn replay_done_complete_closes_the_episode() {
+        let mut core = test_core(0, "reconnect_done_complete");
+        let (author, _) = crate::common::keys()[1];
+        core.replay_episodes.open(author, Instant::now());
+        assert!(core.replay_episodes.is_open(&author));
+
+        core.dispatch_inbound(Inbound::ReplayDone(42, true, false, author), Instant::now())
+            .await;
+
+        assert!(!core.replay_episodes.is_open(&author));
+    }
+
+    /// `clamped = true` bumps the metric regardless of `complete`.
+    #[tokio::test]
+    async fn replay_done_clamped_bumps_the_metric() {
+        let mut core = test_core(0, "reconnect_done_clamped_metric");
+        let (author, _) = crate::common::keys()[1];
+        let before = done_clamped(&core);
+
+        core.dispatch_inbound(Inbound::ReplayDone(42, true, true, author), Instant::now())
+            .await;
+
+        assert_eq!(before + 1, done_clamped(&core));
+    }
+
+    /// **Audit-3 A3's own regression**: the nudge condition is keyed to "backoff
+    /// elapsed since the last SERVE-OR-NUDGE", not "since `pending_low` was set" --
+    /// the weaker (rejected) form would silence the backstop after exactly one
+    /// partial serve, even though `pending_low` legitimately stays set across many
+    /// serves under budget truncation. A forged `Done(complete=true)` (dispatched
+    /// as if `peer` had somehow answered on its own behalf) is interleaved to
+    /// demonstrate D4 caveat (iii): it can only ever close OUR OWN requester-side
+    /// episode toward `peer` (irrelevant here -- we are the AUTHOR in this test,
+    /// not a requester toward `peer`) and has NO effect on `pending_low`/the nudge
+    /// condition, both of which are exclusively OUR OWN server-side facts.
+    #[tokio::test]
+    async fn nudge_fires_after_partial_serve_despite_a_forged_complete_done() {
+        let mut core = test_core(0, "reconnect_a3_nudge");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+        core.outbox.record(10, Bytes::from_static(b"ten"));
+
+        let mut rx = intercept_resume_channel(&mut core);
+        let now = Instant::now();
+
+        // A PARTIAL serve (budget=1 byte forces truncation at the first key) --
+        // `pending_low` is raised (not cleared), and the serve itself refreshes
+        // `nudge_memo` (a serve counts as "activity" toward the shared cooldown).
+        core.replay_serve_max_bytes = 1;
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), now)
+            .await;
+        let wire::ResumeSend::Replay { done, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a Replay");
+        };
+        assert!(matches!(
+            done,
+            PrimaryMessage::VantageReplayDone(6, false, false, _)
+        ));
+        assert_eq!(core.pending_low.get(&peer).copied(), Some(6));
+
+        // The forged Done: no effect on `pending_low` or the nudge condition.
+        core.dispatch_inbound(Inbound::ReplayDone(999, true, false, peer), now)
+            .await;
+        assert_eq!(core.pending_low.get(&peer).copied(), Some(6));
+
+        // Immediately after the serve, the nudge must NOT fire (nudge_memo was
+        // just refreshed by the serve itself, and the in-flight entry the serve
+        // itself set is also still fresh).
+        let nudges_before = nudges_sent(&core);
+        core.maybe_nudge(
+            peer,
+            now + Duration::from_millis(10),
+            Duration::from_millis(4_000),
+        )
+        .await;
+        assert_eq!(
+            nudges_before,
+            nudges_sent(&core),
+            "too soon since the serve itself"
+        );
+
+        // Past both the in-flight TTL and the serve-or-nudge backoff, with
+        // `pending_low` STILL set (the serve was partial): the nudge must fire.
+        let later = now + Duration::from_millis(65_000);
+        core.maybe_nudge(peer, later, Duration::from_millis(4_000))
+            .await;
+        assert_eq!(
+            nudges_before + 1,
+            nudges_sent(&core),
+            "A3: backoff since the last serve-or-nudge has elapsed, and pending_low \
+             is still set -- the nudge must fire regardless of the earlier serve \
+             or the forged Done"
+        );
+    }
+
+    /// The nudge loop's own Hello send rides the VOLATILE class (§14 A7) -- a
+    /// smoke check that it does not panic/hang and does bump the metric exactly
+    /// once per fired nudge (the send itself is covered end-to-end by
+    /// `network::reliable_sender_tests`).
+    #[tokio::test]
+    async fn maybe_nudge_is_a_no_op_when_pending_low_is_unset() {
+        let mut core = test_core(0, "reconnect_nudge_noop");
+        let (peer, _) = crate::common::keys()[1];
+        let before = nudges_sent(&core);
+
+        core.maybe_nudge(peer, Instant::now(), Duration::from_millis(4_000))
+            .await;
+
+        assert_eq!(
+            before,
+            nudges_sent(&core),
+            "no pending_low entry -- nothing to nudge"
         );
     }
 }

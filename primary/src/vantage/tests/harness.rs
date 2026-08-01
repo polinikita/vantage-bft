@@ -99,12 +99,18 @@ impl Node {
     /// (`agb::batch_cap` floors at `f`, which is 1 there), so batching-specific
     /// end-to-end tests need a bigger one. `Node::new` itself is unchanged (still
     /// `test_committee()`) -- it just delegates here now.
-    pub fn new_with_committee(name: PublicKey, path: &str, max_views: View, committee: Committee) -> Self {
+    pub fn new_with_committee(
+        name: PublicKey,
+        path: &str,
+        max_views: View,
+        committee: Committee,
+    ) -> Self {
         let (lm, _store) = new_lane_manager_with_committee(name, path, committee.clone());
         let rep = new_repairer_with_committee(name, &lm, committee.clone());
         let registry = prometheus::Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
-        let agb = new_agb_engine_with_committee(name, committee.clone()).with_metrics(metrics.clone());
+        let agb =
+            new_agb_engine_with_committee(name, committee.clone()).with_metrics(metrics.clone());
         let digest_stmts = DigestStatements::new(TEST_DELTA_MS).with_metrics(metrics.clone());
         let frontier = Frontier::new(name, committee.clone());
         let cursor = Cursor::new(
@@ -189,7 +195,10 @@ impl Node {
                 Vec::new()
             };
         let proposal = match entries.len() {
-            0 => self.frontier.try_propose(&self.lm, None).map(ProposalOut::Single),
+            0 => self
+                .frontier
+                .try_propose(&self.lm, None)
+                .map(ProposalOut::Single),
             1 => self
                 .frontier
                 .try_propose(&self.lm, entries.into_iter().next())
@@ -203,15 +212,13 @@ impl Node {
             effects.push(Effect::BroadcastPropose(proposal.clone()));
             effects.extend(match proposal {
                 ProposalOut::Single(p) => {
-                    self.agb.on_propose(self.name, p, now, &mut self.lm, &mut self.rep)
+                    self.agb
+                        .on_propose(self.name, p, now, &mut self.lm, &mut self.rep)
                 }
-                ProposalOut::Batch(p) => self.agb.on_propose_batch(
-                    self.name,
-                    p,
-                    now,
-                    &mut self.lm,
-                    &mut self.rep,
-                ),
+                ProposalOut::Batch(p) => {
+                    self.agb
+                        .on_propose_batch(self.name, p, now, &mut self.lm, &mut self.rep)
+                }
             });
         }
         effects
@@ -293,10 +300,12 @@ impl Node {
                 let sender = self.agb.proposer(proposal.view());
                 match proposal {
                     ProposalOut::Single(p) => {
-                        self.agb.on_propose(sender, p, now, &mut self.lm, &mut self.rep)
+                        self.agb
+                            .on_propose(sender, p, now, &mut self.lm, &mut self.rep)
                     }
                     ProposalOut::Batch(p) => {
-                        self.agb.on_propose_batch(sender, p, now, &mut self.lm, &mut self.rep)
+                        self.agb
+                            .on_propose_batch(sender, p, now, &mut self.lm, &mut self.rep)
                     }
                 }
             }
@@ -361,26 +370,29 @@ impl Node {
             // `vantage::node::VantageCore::dispatch_inbound`'s own four arms.
             Inbound::EchoDigest(msg) => {
                 let mut effects = self.absorb_wish(msg.sender, msg.wish);
-                effects.extend(
-                    self.digest_stmts
-                        .on_echo_digest(msg, now, &mut self.agb, &mut self.rep),
-                );
+                effects.extend(self.digest_stmts.on_echo_digest(
+                    msg,
+                    now,
+                    &mut self.agb,
+                    &mut self.rep,
+                ));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects
             }
             Inbound::ReadyDigest(msg) => {
                 let mut effects = self.absorb_wish(msg.sender, msg.wish);
-                effects.extend(
-                    self.digest_stmts
-                        .on_ready_digest(msg, now, &mut self.agb, &mut self.rep),
-                );
+                effects.extend(self.digest_stmts.on_ready_digest(
+                    msg,
+                    now,
+                    &mut self.agb,
+                    &mut self.rep,
+                ));
                 effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
                 effects
             }
-            Inbound::BodyFetch(view, digest, requester) => {
-                self.digest_stmts
-                    .on_body_fetch(requester, view, digest, &self.agb)
-            }
+            Inbound::BodyFetch(view, digest, requester) => self
+                .digest_stmts
+                .on_body_fetch(requester, view, digest, &self.agb),
             Inbound::BodyServe(view, proposal) => {
                 let mut effects =
                     self.digest_stmts
@@ -415,6 +427,17 @@ impl Node {
                 }
                 effects
             }
+            // reconnect-replay plan (server-authoritative floor, v3): a SEPARATE,
+            // transport-level mechanism (volatile sends, session-death drop
+            // accounting, the shared dirty/in-flight maps) this synchronous,
+            // no-real-network harness has no analogue of at all -- unlike
+            // Mechanism A's `LaneResume` above, which this harness models a
+            // simplified version of. Covered instead by `VantageCore`'s own
+            // `#[cfg(test)] mod tests` (in `node.rs`), which drives a REAL `Wire`
+            // (dirty map, in-flight map, outbox) directly -- see that module's own
+            // doc comment for why (private fields/constructors). Never constructed
+            // by this harness's own test suites.
+            Inbound::ResumeHello(..) | Inbound::ReplayDone(..) => Vec::new(),
         }
     }
 

@@ -204,6 +204,31 @@ pub enum PrimaryMessage {
         /* from height, inclusive */ Height,
         /* requester */ PublicKey,
     ),
+    // reconnect-replay plan §7 (server-authoritative floor, v3): a SEPARATE
+    // mechanism from `VantageLaneResume` above (see `vantage::resume`'s own module
+    // doc comment) -- resumes ONE-SHOT AGB/consensus broadcasts lost to a volatile
+    // session death, rather than lane content. `VantageResumeHello(floor hint,
+    // sender)` is sent unicast (i) on this node's own reconnect event, (ii) by the
+    // tick for any open episode past `resume_backoff_ms`, (iii) reciprocally on
+    // Hello receipt, and (iv) by the server-side nudge loop when `pending_low` is
+    // set and no serve has been enqueued since (§14 A3) -- (iv) rides the VOLATILE
+    // send class (§14 A7); (i)-(iii) ride the ordinary durable unicast path. Both
+    // variants appended last -- same bincode wire-compat rule as every other
+    // protocol-specific variant above.
+    VantageResumeHello(View, /* sender */ PublicKey),
+    // Sent by the resume task after a replay stream's last chunk (`end_key`, always
+    // durable -- rides the SAME `ResumeSend::Replay` frame sequence as the chunks it
+    // terminates). `complete` is `false` iff the per-peer serve budget truncated the
+    // span before the requester's known need was fully covered (a continuation
+    // Hello follows immediately); `clamped` is `true` iff `outbox_floor` truncated
+    // the requested span below what was actually asked for (a recovered-with-gap
+    // signal, `vantage_replay_done_clamped_total`).
+    VantageReplayDone(
+        View,      /* end_key: last fully served key + 1 */
+        bool,      /* complete */
+        bool,      /* clamped */
+        PublicKey, /* sender */
+    ),
 }
 
 impl PrimaryMessage {
@@ -261,6 +286,12 @@ impl PrimaryMessage {
             PrimaryMessage::VantageBodyServe(..) => "VantageBodyServe",
             PrimaryMessage::SimpleItCutReady(..) => "SimpleItCutReady",
             PrimaryMessage::VantageLaneResume(..) => "VantageLaneResume",
+            PrimaryMessage::VantageResumeHello(..) => "VantageResumeHello",
+            // reconnect-replay plan §7: labeled by its own variant name, distinct
+            // from the "Replay" label the wire-frame chunks it terminates use (see
+            // `vantage::wire`'s resume task) -- `Done` is a `PrimaryMessage` in its
+            // own right, never a raw `Bytes` chunk.
+            PrimaryMessage::VantageReplayDone(..) => "VantageReplayDone",
         }
     }
 }

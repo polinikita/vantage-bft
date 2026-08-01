@@ -162,7 +162,7 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
         now,
     )
     .await;
-    assert_eq!(node.pacemaker.omega_of_for_test(sender), 3);
+    assert_eq!(node.pacemaker.omega_of(sender), 3);
 
     node.dispatch(
         Inbound::Echo(EchoOut::Single(Echo {
@@ -176,7 +176,7 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
     )
     .await;
     assert_eq!(
-        node.pacemaker.omega_of_for_test(sender),
+        node.pacemaker.omega_of(sender),
         7,
         "the duplicate's wish must still be absorbed"
     );
@@ -277,10 +277,10 @@ async fn w4_piggyback_rides_on_all_four_response_types() {
         now,
     )
     .await;
-    assert_eq!(node.pacemaker.omega_of_for_test(s1), 9);
+    assert_eq!(node.pacemaker.omega_of(s1), 9);
 
     node.dispatch(Inbound::EchoSkip(1, s2, 10), now).await;
-    assert_eq!(node.pacemaker.omega_of_for_test(s2), 10);
+    assert_eq!(node.pacemaker.omega_of(s2), 10);
 
     node.dispatch(
         Inbound::Ready(ReadyOut::Single(Ready {
@@ -292,8 +292,8 @@ async fn w4_piggyback_rides_on_all_four_response_types() {
         now,
     )
     .await;
-    assert_eq!(node.pacemaker.omega_of_for_test(s3), 11);
+    assert_eq!(node.pacemaker.omega_of(s3), 11);
 
     node.dispatch(Inbound::NoReady(1, s4, 12), now).await;
-    assert_eq!(node.pacemaker.omega_of_for_test(s4), 12);
+    assert_eq!(node.pacemaker.omega_of(s4), 12);
 }

@@ -13,6 +13,7 @@ pub mod cursor;
 pub mod frontier;
 pub mod lanes;
 pub mod node;
+pub mod outbox;
 pub mod pacemaker;
 pub mod payload;
 pub mod repair;

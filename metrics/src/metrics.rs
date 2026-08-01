@@ -243,6 +243,35 @@ pub struct Metrics {
     /// never a correctness bug on its own.
     pub vantage_lane_resume_send_drops: IntCounter,
 
+    // --- reconnect-replay plan §10 (server-authoritative floor, v3): a SEPARATE
+    // mechanism from Mechanism A above (see `vantage::resume`'s own module doc
+    // comment) -- resumes one-shot AGB/consensus broadcasts lost to a volatile
+    // session death, rather than lane content. `network_messages_sent_total`/
+    // `network_bytes_sent_total`/`network_frames_sent_total` (labeled `"Replay"`/
+    // `"VantageResumeHello"`/`"VantageReplayDone"`) already cover raw send volume
+    // generically -- these four cover what those generic counters structurally
+    // cannot: WHY a send happened, or that one was dropped before ever reaching the
+    // wire. Always registered; expected to stay at/near zero on a fault-free run.
+    /// `Wire::enqueue_replay`'s `try_send` onto the resume-sender task's channel
+    /// failed (full or closed) -- audit-3 A2's own Err arm: `pending_low` is left
+    /// untouched on this path, recovered by the next nudge/tick re-ask.
+    pub vantage_replay_enqueue_drops_total: IntCounter,
+    /// `VantageReplayDone` sends where `outbox_floor` truncated the requested span
+    /// below what was actually asked for -- a recovered-with-gap signal (the
+    /// requester's episode still closes/continues correctly; this just means some
+    /// of what it asked for is permanently gone).
+    pub vantage_replay_done_clamped_total: IntCounter,
+    /// Server-side nudge Hellos sent (`pending_low[X]` set, `X` not in-flight,
+    /// backoff elapsed since the last serve-or-nudge toward `X` -- audit-3 A3). The
+    /// backstop for a lost Hello/Done/reconnect-event: closes the asymmetric case
+    /// where the peer that's missing data never itself asks for it.
+    pub vantage_replay_pending_low_nudges_total: IntCounter,
+    /// In-flight-replay-stream entries found stale (older than `replay_episode_max_
+    /// ms`, audit-3 A6) and evicted -- expected near-zero; a sustained nonzero rate
+    /// means the resume task is falling behind draining what it already enqueued
+    /// (strict `Message`-priority scheduling does not guarantee replay throughput).
+    pub vantage_replay_inflight_ttl_expired_total: IntCounter,
+
     // --- Phase 7 prep (PHASE7-PREP-NOTES.md, Finding A diagnosis): always-on progress
     // gauges, one flat value each (no labels), sampled once/sec by `VantageCore` itself
     // (metrics-only addition -- no protocol-semantic effect, same "always registered,
@@ -683,6 +712,30 @@ impl Metrics {
             vantage_lane_resume_send_drops: register_int_counter_with_registry!(
                 "vantage_lane_resume_send_drops",
                 "Mechanism A (sender-side lane resume): resume messages dropped because the dedicated resume-sender task's channel was full or closed",
+                registry,
+            )
+            .unwrap(),
+            vantage_replay_enqueue_drops_total: register_int_counter_with_registry!(
+                "vantage_replay_enqueue_drops_total",
+                "Reconnect replay: enqueue_replay try_send drops (Full/Closed) onto the resume-sender task",
+                registry,
+            )
+            .unwrap(),
+            vantage_replay_done_clamped_total: register_int_counter_with_registry!(
+                "vantage_replay_done_clamped_total",
+                "Reconnect replay: VantageReplayDone sends truncated below the requested span by outbox_floor",
+                registry,
+            )
+            .unwrap(),
+            vantage_replay_pending_low_nudges_total: register_int_counter_with_registry!(
+                "vantage_replay_pending_low_nudges_total",
+                "Reconnect replay: server-side nudge Hellos sent for a set pending_low with no recent serve",
+                registry,
+            )
+            .unwrap(),
+            vantage_replay_inflight_ttl_expired_total: register_int_counter_with_registry!(
+                "vantage_replay_inflight_ttl_expired_total",
+                "Reconnect replay: stale in-flight-replay-stream entries evicted past replay_episode_max_ms",
                 registry,
             )
             .unwrap(),

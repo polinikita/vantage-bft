@@ -31,7 +31,7 @@ fn w1_omega_initializes_to_zero_for_every_author() {
     let (name, _) = authors()[0];
     let pm = Pacemaker::new(name, &test_committee());
     for (author, _) in authors() {
-        assert_eq!(pm.omega_of_for_test(author), 0);
+        assert_eq!(pm.omega_of(author), 0);
     }
     assert_eq!(pm.own_watermark(), 0);
     assert_eq!(pm.entry_target(), 0);
@@ -52,7 +52,7 @@ fn w1_genesis_sets_own_wish_to_2_and_broadcasts_with_self_delivery() {
     // "Self-delivery immediate": the own slot is updated synchronously, right here --
     // no separate self-addressed message round-trip is needed to observe it.
     assert_eq!(pm.own_watermark(), 2);
-    assert_eq!(pm.omega_of_for_test(name), 2);
+    assert_eq!(pm.omega_of(name), 2);
     // View 1's entry already happened (the existing boot behavior, outside this
     // struct) -- genesis must record that so it is never re-scheduled.
     assert_eq!(pm.largest_entered_view_for_test(), 1);
@@ -91,7 +91,7 @@ fn w2_omega_plus_boundary_exactly_f_plus_1_senders() {
         5,
         "amplification must update the own slot/watermark"
     );
-    assert_eq!(pm.omega_of_for_test(name), 5);
+    assert_eq!(pm.omega_of(name), 5);
 }
 
 #[test]
@@ -200,12 +200,12 @@ fn w2_stale_wish_causes_no_transition() {
     let (p1, _) = all[0];
     let mut pm = Pacemaker::new(name, &test_committee());
     let _ = pm.on_wish(p1, 5);
-    assert_eq!(pm.omega_of_for_test(p1), 5);
+    assert_eq!(pm.omega_of(p1), 5);
 
     let effects = pm.on_wish(p1, 3); // stale: 3 <= the sender's already-recorded 5
     assert!(effects.is_empty());
     assert_eq!(
-        pm.omega_of_for_test(p1),
+        pm.omega_of(p1),
         5,
         "a stale wish must never lower the sender's slot"
     );

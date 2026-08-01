@@ -484,6 +484,59 @@ pub struct Parameters {
     /// `#[serde(default)]` (64) keeps every pre-existing parameter file valid.
     #[serde(default = "default_resume_batch")]
     pub resume_batch: u64,
+
+    /// reconnect-replay plan §5/§9: how many VIEWS of one-shot-message history
+    /// `vantage::outbox::Outbox` retains behind the current `own_watermark` before
+    /// `prune_below` evicts a whole view's worth (a ceiling; `outbox_max_bytes`
+    /// below is the byte cap that actually binds in practice at typical Δ). Kept
+    /// SEPARATE from `vantage_gc_window_views` for the identical reason that field's
+    /// own doc comment gives for being separate from `gc_depth`: the outbox is keyed
+    /// by `Pacemaker::own_watermark` (this party's own wish), a different, generally
+    /// faster-advancing counter than the resolver's `resolved_watermark`
+    /// `vantage_gc_window_views` is sized against -- reusing either existing window
+    /// would silently mis-size this one. `#[serde(default)]` keeps every
+    /// pre-existing parameter file valid.
+    #[serde(default = "default_replay_history_views")]
+    pub replay_history_views: u64,
+    /// reconnect-replay plan §5/§9: the resume task's per-chunk send size, in bytes
+    /// of pre-bundle-header replay payload -- one `ResumeSend::Replay` chunk per
+    /// stream per round-robin rotation. `#[serde(default)]` keeps every pre-existing
+    /// parameter file valid.
+    #[serde(default = "default_replay_chunk_bytes")]
+    pub replay_chunk_bytes: usize,
+    /// reconnect-replay plan §5/§9: the resume task's pacing delay between
+    /// round-robin rotations -- together with `replay_chunk_bytes` this bounds the
+    /// GLOBAL replay ceiling to `replay_chunk_bytes / replay_chunk_interval_ms`
+    /// bytes/s by construction (one task, one bucket, shared by every concurrent
+    /// replay stream). `#[serde(default)]` keeps every pre-existing parameter file
+    /// valid.
+    #[serde(default = "default_replay_chunk_interval_ms")]
+    pub replay_chunk_interval_ms: u64,
+    /// reconnect-replay plan §6/§9: the per-peer served-bytes budget per rolling
+    /// `resume_backoff_ms` window -- bounds per-peer extraction to roughly
+    /// `replay_serve_max_bytes / resume_backoff_ms` bytes/s; an over-budget Hello is
+    /// deferred to the next window rather than served partially past the cap (a
+    /// single key larger than the whole budget is still served whole -- see
+    /// `vantage::outbox`'s module doc). `#[serde(default)]` keeps every pre-existing
+    /// parameter file valid.
+    #[serde(default = "default_replay_serve_max_bytes")]
+    pub replay_serve_max_bytes: usize,
+    /// reconnect-replay plan §5/§9: the outbox's total byte cap, evicting whole
+    /// oldest views (never the newest key) once crossed -- the bound that actually
+    /// binds in practice at typical Δ (`replay_history_views` above is a ceiling on
+    /// top of it). `#[serde(default)]` keeps every pre-existing parameter file valid.
+    #[serde(default = "default_outbox_max_bytes")]
+    pub outbox_max_bytes: usize,
+    /// reconnect-replay plan §6/§9/§14 A6: the requester-side replay episode's
+    /// expiry valve (re-opened by the next reconnect/Hello/nudge event), AND (A6)
+    /// the author-side in-flight-replay-stream TTL -- the two are deliberately the
+    /// SAME constant: A6's own rationale is that strict `Message`-priority
+    /// scheduling means replay throughput is not guaranteed, so a shorter in-flight
+    /// TTL could expire mid-drain and cause a duplicate re-serve; sizing it to the
+    /// requester's own episode lifetime avoids that by construction. `#[serde(default)]`
+    /// keeps every pre-existing parameter file valid.
+    #[serde(default = "default_replay_episode_max_ms")]
+    pub replay_episode_max_ms: u64,
 }
 
 fn default_batch_messages() -> bool {
@@ -542,6 +595,36 @@ fn default_resume_backoff_ms() -> u64 {
 /// `Parameters::resume_batch`'s own doc comment.
 fn default_resume_batch() -> u64 {
     64
+}
+
+/// `Parameters::replay_history_views`'s own doc comment.
+fn default_replay_history_views() -> u64 {
+    512
+}
+
+/// `Parameters::replay_chunk_bytes`'s own doc comment.
+fn default_replay_chunk_bytes() -> usize {
+    65_536
+}
+
+/// `Parameters::replay_chunk_interval_ms`'s own doc comment.
+fn default_replay_chunk_interval_ms() -> u64 {
+    5
+}
+
+/// `Parameters::replay_serve_max_bytes`'s own doc comment.
+fn default_replay_serve_max_bytes() -> usize {
+    8 << 20
+}
+
+/// `Parameters::outbox_max_bytes`'s own doc comment.
+fn default_outbox_max_bytes() -> usize {
+    64 << 20
+}
+
+/// `Parameters::replay_episode_max_ms`'s own doc comment.
+fn default_replay_episode_max_ms() -> u64 {
+    60_000
 }
 
 /// AWS region names for the 10-region RTT matrix below. Ported VERBATIM from
@@ -767,6 +850,12 @@ impl Default for Parameters {
             resume_check_period_ms: default_resume_check_period_ms(),
             resume_backoff_ms: default_resume_backoff_ms(),
             resume_batch: default_resume_batch(),
+            replay_history_views: default_replay_history_views(),
+            replay_chunk_bytes: default_replay_chunk_bytes(),
+            replay_chunk_interval_ms: default_replay_chunk_interval_ms(),
+            replay_serve_max_bytes: default_replay_serve_max_bytes(),
+            outbox_max_bytes: default_outbox_max_bytes(),
+            replay_episode_max_ms: default_replay_episode_max_ms(),
         }
     }
 }
@@ -870,6 +959,16 @@ impl Parameters {
             "Lane-resume (Mechanism A: sender-side resume triggered by an ack-census \
              gap) check period {} ms, backoff {} ms, batch {} blocks",
             self.resume_check_period_ms, self.resume_backoff_ms, self.resume_batch
+        );
+        info!(
+            "Reconnect replay (server-floored volatile one-shot replay): outbox {} views / {} B, \
+             replay chunk {} B / {} ms, per-peer serve budget {} B, episode/in-flight TTL {} ms",
+            self.replay_history_views,
+            self.outbox_max_bytes,
+            self.replay_chunk_bytes,
+            self.replay_chunk_interval_ms,
+            self.replay_serve_max_bytes,
+            self.replay_episode_max_ms
         );
         if self.withhold_senders > 0 {
             match self.withhold_at_ms {
@@ -1459,7 +1558,10 @@ mod tests {
         let (committee, keypairs) = Committee::local_benchmark(7, 1, 9000);
         let blocked = withheld_destinations(&committee, &keypairs[0].name, 1)
             .expect("index 0 is the sole withholding sender");
-        let expected: HashSet<PublicKey> = [1, 2, 3].into_iter().map(|idx| keypairs[idx].name).collect();
+        let expected: HashSet<PublicKey> = [1, 2, 3]
+            .into_iter()
+            .map(|idx| keypairs[idx].name)
+            .collect();
         assert_eq!(blocked, expected);
     }
 

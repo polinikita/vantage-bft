@@ -48,6 +48,41 @@
 // types -- this module stays a small, independently unit-testable piece of pure
 // logic with no network/lane-cache/metrics dependency of its own.
 
+// reconnect-replay plan §2.6/§3/§6/§14 (v3, server-authoritative floor): a SECOND,
+// unrelated mechanism sharing this module purely by the orchestrator's own file
+// layout choice -- Mechanism A above resumes LANE CONTENT (own blocks); this part
+// resumes ONE-SHOT AGB/consensus messages (`VantageCore::broadcast_recorded`'s
+// outbox) lost to a volatile session death. `pending_low` (the authoritative floor
+// this mechanism serves from) lives on `VantageCore` itself, not here -- everything
+// below is the pure, unit-testable bookkeeping AROUND it: the requester-side "do we
+// have an open ask toward peer X, and is it time to (re-)Hello" state machine
+// (`ReplayEpisodes`), the author-side "is a replay to X already in flight"
+// query (`InFlightState`/`in_flight_state`) and per-peer served-bytes budget
+// (`ServeBudget`), and the author-side "when did we last serve-or-nudge X"
+// cooldown (`NudgeMemo`). None of these touch the network, the outbox, or
+// `pending_low` directly -- see `vantage::node::VantageCore`'s own wiring (the Hello/
+// Done dispatch arms, `resume_tick`) for how they compose.
+//
+// D4 caveats (Byzantine-forgery boundary, unchanged in spirit from v1/v2, restated
+// for v3's authority inversion -- module doc, per the design doc's own instruction):
+// (i) a Byzantine `j` inflating its own wish (the Hello floor HINT) only ever
+// under-asks for `j`'s OWN messages -- and under v3 even that is moot: the serve
+// floor is `min(hello.floor, pending_low[j])`, and honest authors' `pending_low`
+// never consults `j`'s claims at all (it is fed exclusively by the transport's own
+// exact drop reports). (ii) A forged `Hello(sender=j, floor=0)` -- claiming a
+// non-member's or the wrong party's identity is already rejected upstream by
+// `dispatch_inbound`'s membership gate, so this is `j` forging ITS OWN floor low --
+// only HELPS `j`: the serve goes to `j`'s own committee address, from `min(0,
+// pending_low[j])`, a SUPERSET of whatever `j` actually needs; it wastes at most the
+// per-peer serve budget (`ServeBudget`) -- no suppression lever exists (the old v1/v2
+// latched-floor authority that a low forged floor could exploit is gone by
+// construction). (iii) A forged `Done(sender=j, complete=true)` closes OUR episode
+// toward `j` early -- but if `j` genuinely dropped something of ours, `j`'s OWN
+// `pending_low[us]` (fed by `j`'s transport, not by anything `j` can forge) drives
+// `j`'s own server-side nudge loop, which reopens the exchange from `j`'s side
+// regardless of what our episode thinks: a forged early close costs a DELAY (until
+// the next nudge/tick), never a permanent loss.
+
 use crypto::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -209,7 +244,13 @@ impl ResumeServe {
     /// Recording happens unconditionally on a `true` result -- callers must not
     /// invoke this speculatively and then decide not to serve after all, or a later
     /// genuine repeat within the backoff window would wrongly be let through.
-    pub fn should_serve(&mut self, requester: PublicKey, from: Height, now: Instant, backoff: Duration) -> bool {
+    pub fn should_serve(
+        &mut self,
+        requester: PublicKey,
+        from: Height,
+        now: Instant,
+        backoff: Duration,
+    ) -> bool {
         if let Some((last_from, at)) = self.last_served.get(&requester) {
             if *last_from == from && now.duration_since(*at) < backoff {
                 return false;
@@ -217,6 +258,233 @@ impl ResumeServe {
         }
         self.last_served.insert(requester, (from, now));
         true
+    }
+}
+
+/// reconnect-replay plan §2.6: requester-side episode bookkeeping -- per peer we
+/// might be behind (a `VantageResumeHello` we've sent, or intend to keep sending,
+/// asking THEM to replay toward US), whether an episode is currently open and when we
+/// last sent a Hello as part of it. An episode opens on (i) our own reconnect event,
+/// (ii)/re-Hello: the periodic tick for an already-open episode past
+/// `resume_backoff_ms`, or (iii) receipt of a Hello FROM that peer (reciprocation);
+/// it closes on `VantageReplayDone(complete=true)`, or auto-closes past
+/// `replay_episode_max_ms` (the expiry valve) -- reopened by the next (i)/(iii)
+/// event, or by a `Done(complete=false)` continuation (§14 A3: silencing outright
+/// after a partial serve is exactly the bug that amendment fixes elsewhere; this
+/// type's own `open` has no such silencing -- see `VantageCore`'s `ReplayDone` arm).
+#[derive(Default)]
+pub struct ReplayEpisodes {
+    open: HashMap<PublicKey, Episode>,
+}
+
+struct Episode {
+    /// When this episode was (last) opened -- the expiry valve's own reference
+    /// instant. Continuation (`open`, called again for an already-open episode)
+    /// resets this, treating "the answer to our last Hello just arrived, and there
+    /// is more to come" as equivalent to a fresh event for valve purposes.
+    opened_at: Instant,
+    /// When we last sent a Hello as part of this episode -- the backoff gate
+    /// `tick`'s re-Hello (and nothing else: `open`'s own immediate send is never
+    /// backoff-gated) checks against.
+    last_hello_at: Instant,
+}
+
+impl ReplayEpisodes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_open(&self, peer: &PublicKey) -> bool {
+        self.open.contains_key(peer)
+    }
+
+    /// (i)/continuation: unconditionally (re)opens the episode toward `peer`,
+    /// resetting both the expiry valve and the backoff gate to `now`. The caller
+    /// ALWAYS sends a Hello immediately after calling this -- it is never itself
+    /// backoff-gated (a one-shot event, or a continuation the server itself is
+    /// actively answering, both warrant an immediate ask).
+    pub fn open(&mut self, peer: PublicKey, now: Instant) {
+        self.open.insert(
+            peer,
+            Episode {
+                opened_at: now,
+                last_hello_at: now,
+            },
+        );
+    }
+
+    /// (iii): reciprocation on receiving a Hello FROM `peer`. "Memo-deduped" (design
+    /// doc §2.6): if we already have an episode open toward `peer`, this leaves it
+    /// untouched and returns `false` -- our own tick (`tick`, below) is already
+    /// re-asking on its own backoff-gated schedule, and sending a SECOND, immediate
+    /// reciprocal Hello on every further incoming Hello would let two peers that
+    /// keep Hello-ing each other amplify without bound. Only a genuinely NEW episode
+    /// (nothing open yet toward `peer`) opens and returns `true` -- the caller sends
+    /// a Hello only then.
+    pub fn on_hello_received(&mut self, peer: PublicKey, now: Instant) -> bool {
+        if self.is_open(&peer) {
+            return false;
+        }
+        self.open(peer, now);
+        true
+    }
+
+    /// (ii) + the expiry valve: called once per `resume_tick` for every peer with an
+    /// episode open. Closes (removes) the episode instead, returning `false`, once
+    /// `max_age` has elapsed since it was (last) opened -- "reopened by the next
+    /// event/nudge" (design doc §2.6), never by this method. Otherwise returns
+    /// `true` (and records a fresh `last_hello_at`) iff `backoff` has elapsed since
+    /// the last Hello sent for this episode; `false` (no-op) if the backoff hasn't
+    /// elapsed yet. A peer with no open episode is not tracked at all -- `false`.
+    pub fn tick(
+        &mut self,
+        peer: PublicKey,
+        now: Instant,
+        backoff: Duration,
+        max_age: Duration,
+    ) -> bool {
+        let Some(episode) = self.open.get_mut(&peer) else {
+            return false;
+        };
+        if now.duration_since(episode.opened_at) >= max_age {
+            self.open.remove(&peer);
+            return false;
+        }
+        if now.duration_since(episode.last_hello_at) >= backoff {
+            episode.last_hello_at = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `VantageReplayDone(complete=true)`: this episode is answered, close it.
+    pub fn close(&mut self, peer: &PublicKey) {
+        self.open.remove(peer);
+    }
+}
+
+/// reconnect-replay plan §6: author-side in-flight-replay-stream query, over a
+/// caller-owned map (`VantageCore`/the resume task's shared `Arc<Mutex<HashMap<
+/// PublicKey, Instant>>>` -- see `vantage::wire::InFlightMap`) this module never
+/// allocates or holds itself, keeping this a pure, lock-free, unit-testable
+/// decision: `InFlight` blocks a fresh Hello outright (the running stream already
+/// serves `>= pending_low`, a superset of any concurrent ask -- §6); `Expired`
+/// additionally reports that a STALE entry was found, distinct from `Absent` (the
+/// common case for an honest, caught-up peer) so the caller can bump a metric and
+/// evict the stale entry once, rather than treating every subsequent Hello as if it
+/// still needed a fresh discovery.
+///
+/// TTL = `Parameters::replay_episode_max_ms` (audit-3 A6), NOT a shorter value:
+/// strict `Message`-priority scheduling (§5) means replay throughput is not
+/// guaranteed, so a shorter TTL could expire mid-drain and cause a duplicate
+/// re-serve; sizing it to the requester's own episode lifetime avoids that by
+/// construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InFlightState {
+    Absent,
+    InFlight,
+    Expired,
+}
+
+/// See `InFlightState`'s own doc comment.
+pub fn in_flight_state(
+    map: &HashMap<PublicKey, Instant>,
+    peer: &PublicKey,
+    now: Instant,
+    ttl: Duration,
+) -> InFlightState {
+    match map.get(peer) {
+        None => InFlightState::Absent,
+        Some(&started) if now.duration_since(started) < ttl => InFlightState::InFlight,
+        Some(_) => InFlightState::Expired,
+    }
+}
+
+/// reconnect-replay plan §6: author-side per-peer served-bytes budget, a rolling
+/// `resume_backoff_ms` window capped at `Parameters::replay_serve_max_bytes` --
+/// bounds per-peer extraction to roughly `replay_serve_max_bytes / resume_backoff_ms`
+/// bytes/s. "Rolling" here means a fixed window anchored the first time a peer is
+/// served after its previous window (if any) has fully elapsed -- not a sliding
+/// average -- mirroring `ResumeServe`'s own backoff-window semantics above rather
+/// than introducing a second windowing convention into this one file.
+#[derive(Default)]
+pub struct ServeBudget {
+    windows: HashMap<PublicKey, (Instant, usize)>,
+}
+
+impl ServeBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes still available to serve `peer` in its CURRENT window -- `max_bytes`
+    /// (a fresh window) if none is open yet, or the previous one has fully elapsed;
+    /// `max_bytes` minus whatever has already been `record`ed in the still-open
+    /// window otherwise. Never mutates -- pair with `record` after the caller
+    /// decides how many bytes it actually served (which may be zero, e.g. a
+    /// deferred-to-next-window Hello).
+    pub fn remaining(
+        &self,
+        peer: PublicKey,
+        now: Instant,
+        window: Duration,
+        max_bytes: usize,
+    ) -> usize {
+        match self.windows.get(&peer) {
+            Some(&(start, served)) if now.duration_since(start) < window => {
+                max_bytes.saturating_sub(served)
+            }
+            _ => max_bytes,
+        }
+    }
+
+    /// Record `bytes` just served to `peer` -- opens a fresh window (dated `now`)
+    /// if none is open, or the previous one has fully elapsed; otherwise accumulates
+    /// into the still-open one. A `bytes = 0` call still opens a window if none
+    /// exists, matching `remaining`'s own "is there an open window" check.
+    pub fn record(&mut self, peer: PublicKey, bytes: usize, now: Instant, window: Duration) {
+        match self.windows.get_mut(&peer) {
+            Some((start, served)) if now.duration_since(*start) < window => {
+                *served += bytes;
+            }
+            _ => {
+                self.windows.insert(peer, (now, bytes));
+            }
+        }
+    }
+}
+
+/// reconnect-replay plan §2.6/§14 A3: author-side "when did we last serve-or-nudge
+/// peer X" cooldown -- the single timestamp both A3's nudge condition ("backoff
+/// elapsed since last serve-or-nudge to X") and its own refresh (on either a serve OR
+/// a nudge) touch, so a serve and a nudge share one cooldown instead of two
+/// independently-ticking timers that could otherwise both fire back to back for the
+/// same peer.
+#[derive(Default)]
+pub struct NudgeMemo {
+    last: HashMap<PublicKey, Instant>,
+}
+
+impl NudgeMemo {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A3's own backoff-timing third of its nudge condition -- the caller is
+    /// responsible for the other two (`pending_low[peer].is_some()` and `peer` not
+    /// in-flight; this type never touches either, keeping it a pure, no-network,
+    /// no-shared-map decision). `true` iff `backoff` has elapsed since the last
+    /// recorded serve-or-nudge toward `peer`, or none was ever recorded.
+    pub fn due(&self, peer: PublicKey, now: Instant, backoff: Duration) -> bool {
+        self.last
+            .get(&peer)
+            .is_none_or(|&at| now.duration_since(at) >= backoff)
+    }
+
+    /// Record that a serve or a nudge just happened toward `peer`.
+    pub fn record(&mut self, peer: PublicKey, now: Instant) {
+        self.last.insert(peer, now);
     }
 }
 
@@ -263,7 +531,14 @@ mod tests {
             "first observation must not fire"
         );
         assert_eq!(
-            trigger.check(author, 10, 12, now + Duration::from_millis(1_000), backoff, 1),
+            trigger.check(
+                author,
+                10,
+                12,
+                now + Duration::from_millis(1_000),
+                backoff,
+                1
+            ),
             Some(11),
             "second consecutive observation of the SAME gap must fire"
         );
@@ -281,17 +556,38 @@ mod tests {
         assert_eq!(trigger.check(author, 10, 12, now, backoff, 1), None);
         // Gap closes for one tick (e.g. avail dipped, or was a stale read).
         assert_eq!(
-            trigger.check(author, 10, 10, now + Duration::from_millis(1_000), backoff, 1),
+            trigger.check(
+                author,
+                10,
+                10,
+                now + Duration::from_millis(1_000),
+                backoff,
+                1
+            ),
             None
         );
         // Gap reappears -- this must count as observation #1 again, not #3.
         assert_eq!(
-            trigger.check(author, 10, 12, now + Duration::from_millis(2_000), backoff, 1),
+            trigger.check(
+                author,
+                10,
+                12,
+                now + Duration::from_millis(2_000),
+                backoff,
+                1
+            ),
             None,
             "the memo was cleared by the gap-free tick; this is a fresh first observation"
         );
         assert_eq!(
-            trigger.check(author, 10, 12, now + Duration::from_millis(3_000), backoff, 1),
+            trigger.check(
+                author,
+                10,
+                12,
+                now + Duration::from_millis(3_000),
+                backoff,
+                1
+            ),
             Some(11)
         );
     }
@@ -389,7 +685,10 @@ mod tests {
         let resume_batch = 8;
 
         // avail is far ahead (100) so the gap never closes across this whole test.
-        assert_eq!(trigger.check(author, 10, 100, now, backoff, resume_batch), None);
+        assert_eq!(
+            trigger.check(author, 10, 100, now, backoff, resume_batch),
+            None
+        );
         let t1 = now + Duration::from_millis(1_000);
         assert_eq!(
             trigger.check(author, 10, 100, t1, backoff, resume_batch),
@@ -582,5 +881,202 @@ mod tests {
             "once backoff has elapsed since the ORIGINAL grant (not since a suppressed retry) \
              the same (requester, from) may be served again"
         );
+    }
+
+    // --- reconnect-replay plan §2.6/§6/§14 (v3): `ReplayEpisodes`, `InFlightState`/
+    // `in_flight_state`, `ServeBudget`, `NudgeMemo`. Unrelated to Mechanism A above
+    // (see this module's own doc comment) -- these tests never touch `ResumeTrigger`/
+    // `ResumeServe`.
+
+    #[test]
+    fn episode_opens_and_reports_open() {
+        let mut episodes = ReplayEpisodes::new();
+        let peer = key(1);
+        let now = Instant::now();
+
+        assert!(!episodes.is_open(&peer));
+        episodes.open(peer, now);
+        assert!(episodes.is_open(&peer));
+    }
+
+    /// (iii) "memo-deduped": the FIRST Hello from a peer we have no open episode
+    /// toward opens one and asks for a reciprocal send; a SECOND Hello while that
+    /// episode is still open must not re-trigger a send (the tick's own backoff-
+    /// gated schedule is already covering it).
+    #[test]
+    fn on_hello_received_is_memo_deduped() {
+        let mut episodes = ReplayEpisodes::new();
+        let peer = key(1);
+        let now = Instant::now();
+
+        assert!(
+            episodes.on_hello_received(peer, now),
+            "the first Hello from a peer with no open episode must trigger a reciprocal send"
+        );
+        assert!(episodes.is_open(&peer));
+        assert!(
+            !episodes.on_hello_received(peer, now + Duration::from_millis(10)),
+            "a second Hello while the episode is already open must not re-trigger a send"
+        );
+    }
+
+    /// (ii): a fresh episode's very first tick, immediately after `open`, must not
+    /// re-Hello again (backoff hasn't elapsed since `open`'s own implicit send);
+    /// once `backoff` elapses, the next tick fires and refreshes the gate.
+    #[test]
+    fn tick_re_hellos_only_after_backoff_elapses() {
+        let mut episodes = ReplayEpisodes::new();
+        let peer = key(1);
+        let now = Instant::now();
+        let backoff = Duration::from_millis(4_000);
+        let max_age = Duration::from_millis(60_000);
+
+        episodes.open(peer, now);
+        assert!(
+            !episodes.tick(peer, now + Duration::from_millis(100), backoff, max_age),
+            "backoff has not elapsed since `open`'s own immediate send"
+        );
+        assert!(episodes.tick(peer, now + Duration::from_millis(4_001), backoff, max_age));
+        // The gate just refreshed -- an immediately-following tick must not fire again.
+        assert!(!episodes.tick(peer, now + Duration::from_millis(4_100), backoff, max_age));
+    }
+
+    /// The expiry valve: an episode past `max_age` auto-closes on the next tick,
+    /// regardless of backoff -- "reopened by the next event/nudge", never by `tick`
+    /// itself.
+    #[test]
+    fn tick_closes_the_episode_past_max_age() {
+        let mut episodes = ReplayEpisodes::new();
+        let peer = key(1);
+        let now = Instant::now();
+        let backoff = Duration::from_millis(4_000);
+        let max_age = Duration::from_millis(60_000);
+
+        episodes.open(peer, now);
+        assert!(!episodes.tick(peer, now + Duration::from_millis(60_001), backoff, max_age));
+        assert!(
+            !episodes.is_open(&peer),
+            "the episode must auto-close past max_age"
+        );
+    }
+
+    /// `tick` on a peer with no open episode at all is a harmless no-op (the common
+    /// case: `resume_tick` sweeps every OTHER primary every period, most of which
+    /// never have an episode open).
+    #[test]
+    fn tick_on_a_peer_with_no_open_episode_is_a_no_op() {
+        let mut episodes = ReplayEpisodes::new();
+        let peer = key(1);
+        let now = Instant::now();
+        assert!(!episodes.tick(
+            peer,
+            now,
+            Duration::from_millis(4_000),
+            Duration::from_millis(60_000)
+        ));
+    }
+
+    #[test]
+    fn close_removes_the_episode() {
+        let mut episodes = ReplayEpisodes::new();
+        let peer = key(1);
+        let now = Instant::now();
+        episodes.open(peer, now);
+        episodes.close(&peer);
+        assert!(!episodes.is_open(&peer));
+    }
+
+    #[test]
+    fn in_flight_state_absent_when_never_inserted() {
+        let map: HashMap<PublicKey, Instant> = HashMap::new();
+        let peer = key(1);
+        assert_eq!(
+            in_flight_state(&map, &peer, Instant::now(), Duration::from_millis(60_000)),
+            InFlightState::Absent
+        );
+    }
+
+    #[test]
+    fn in_flight_state_distinguishes_in_flight_from_expired() {
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        let peer = key(1);
+        map.insert(peer, now);
+        let ttl = Duration::from_millis(60_000);
+
+        assert_eq!(
+            in_flight_state(&map, &peer, now + Duration::from_millis(100), ttl),
+            InFlightState::InFlight
+        );
+        assert_eq!(
+            in_flight_state(&map, &peer, now + Duration::from_millis(60_001), ttl),
+            InFlightState::Expired,
+            "audit-3 A6: TTL = replay_episode_max_ms, distinguishable from a genuinely absent entry"
+        );
+    }
+
+    #[test]
+    fn serve_budget_starts_full_and_depletes_within_a_window() {
+        let mut budget = ServeBudget::new();
+        let peer = key(1);
+        let now = Instant::now();
+        let window = Duration::from_millis(4_000);
+        let max_bytes = 1_000;
+
+        assert_eq!(budget.remaining(peer, now, window, max_bytes), max_bytes);
+        budget.record(peer, 400, now, window);
+        assert_eq!(budget.remaining(peer, now, window, max_bytes), 600);
+        budget.record(peer, 600, now + Duration::from_millis(10), window);
+        assert_eq!(budget.remaining(peer, now, window, max_bytes), 0);
+    }
+
+    #[test]
+    fn serve_budget_resets_once_the_window_elapses() {
+        let mut budget = ServeBudget::new();
+        let peer = key(1);
+        let now = Instant::now();
+        let window = Duration::from_millis(4_000);
+        let max_bytes = 1_000;
+
+        budget.record(peer, 1_000, now, window);
+        assert_eq!(budget.remaining(peer, now, window, max_bytes), 0);
+
+        let later = now + Duration::from_millis(4_001);
+        assert_eq!(
+            budget.remaining(peer, later, window, max_bytes),
+            max_bytes,
+            "a fully-elapsed window must not carry over any of the previous one's usage"
+        );
+    }
+
+    #[test]
+    fn nudge_memo_due_when_never_recorded_and_after_backoff() {
+        let mut memo = NudgeMemo::new();
+        let peer = key(1);
+        let now = Instant::now();
+        let backoff = Duration::from_millis(4_000);
+
+        assert!(
+            memo.due(peer, now, backoff),
+            "never recorded -- due immediately"
+        );
+        memo.record(peer, now);
+        assert!(!memo.due(peer, now + Duration::from_millis(100), backoff));
+        assert!(memo.due(peer, now + Duration::from_millis(4_001), backoff));
+    }
+
+    /// A3's own rationale for sharing one timestamp: recording a SERVE must suppress
+    /// a subsequent NUDGE just as a recorded nudge would (they are the same
+    /// cooldown), so a server that just served `X` does not also immediately nudge
+    /// it.
+    #[test]
+    fn nudge_memo_serve_and_nudge_share_one_cooldown() {
+        let mut memo = NudgeMemo::new();
+        let peer = key(1);
+        let now = Instant::now();
+        let backoff = Duration::from_millis(4_000);
+
+        memo.record(peer, now); // stands in for "a serve was just enqueued"
+        assert!(!memo.due(peer, now + Duration::from_millis(1_000), backoff));
     }
 }

@@ -6,6 +6,19 @@
 // unchanged from its previous home on `VantageCore`, aside from the `self.` ->
 // `self.wire.`-style re-pointing the split forces at `VantageCore`'s own call sites
 // (see `node.rs` itself for those).
+//
+// reconnect-replay plan (server-authoritative floor, v3): this module also carries
+// the wire-level half of the reconnect-triggered replay mechanism -- `broadcast_
+// volatile`/`send_volatile` (the outbox's own send path), the `addr_to_peer`/`dirty_
+// map`/`in_flight` handles, and the resume-sender task's `ResumeSend::Replay`
+// scheduling (see that enum and `spawn_resume_sender`'s own doc comments for the
+// full design). Audit-3 A9, stated once here for the whole subsystem: unlike
+// Mechanism A's own `Message` traffic (retried end-to-end ABOVE this layer, so a
+// crashed sender task only stalls it), a panic in the resume-sender task is a
+// PERMANENT-LOSS event for every `pending_low` span already raised on the strength
+// of an enqueue that looked successful -- the same acceptance class as any other
+// detached `tokio::spawn` task in this codebase, just with a distinct, user-visible
+// symptom (`vantage_replay_pending_low_nudges_total` climbing without bound).
 
 use crate::messages::Header;
 use crate::primary::PrimaryMessage;
@@ -14,13 +27,23 @@ use bytes::Bytes;
 use config::WorkerId;
 use crypto::PublicKey;
 use metrics::Metrics;
-use network::{BatchConfig, CancelHandler, ReliableSender, SimpleSender};
-use std::collections::{HashMap, HashSet};
+use network::{BatchConfig, CancelHandler, DirtyMap, ReliableSender, SimpleSender};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot::error::TryRecvError;
+
+/// reconnect-replay plan §6/§14 A8 (clippy::type_complexity): shared in-flight-
+/// replay-stream marker -- `VantageCore`'s own insert-on-(successful-)enqueue side
+/// lives on `Wire::in_flight`; the resume task's own remove-after-`Done` side is
+/// handed the same `Arc` at spawn time (`spawn_resume_sender`). See
+/// `resume::InFlightState`'s own doc comment for the pure decision logic layered
+/// over a borrowed snapshot of this map -- this alias exists only so the two owners
+/// (a struct field and a spawned task's argument) never have to spell out the full
+/// nested type.
+pub(crate) type InFlightMap = Arc<Mutex<HashMap<PublicKey, Instant>>>;
 
 /// SECURITY (Fable audit): a message's wire-declared (or positionally-attributed)
 /// sender claim, for `sender_is_member`'s generic non-member gate to check. One `impl`
@@ -74,6 +97,10 @@ impl DeclaredSender for Inbound {
             // before `dispatch_inbound` ever inspects the (untrusted-until-then)
             // `author` field.
             Inbound::LaneResume(_, _, requester) => Some(*requester),
+            // reconnect-replay plan §7: real, declared senders, same D4 class as
+            // `LaneResume`'s own `requester` field above.
+            Inbound::ResumeHello(_, sender) => Some(*sender),
+            Inbound::ReplayDone(_, _, _, sender) => Some(*sender),
             Inbound::Serve(_)
             | Inbound::AckAvailability(_)
             | Inbound::Propose(_)
@@ -128,8 +155,11 @@ pub struct Wire {
     /// the loop-starvation defect this crate's previous per-send `resume::
     /// SEND_TIMEOUT` (deleted) only ever bounded the damage from: a backed-up
     /// destination now costs the sender task's own progress, never
-    /// `VantageCore`/`SimpleItCore`'s run loop's.
-    pub(crate) resume_tx: mpsc::Sender<(SocketAddr, PrimaryMessage)>,
+    /// `VantageCore`/`SimpleItCore`'s run loop's. reconnect-replay plan §5/§7: now
+    /// carries `ResumeSend` (Mechanism A's own `Message` shape, plus v3's own
+    /// `Replay` stream shape) rather than a bare `(SocketAddr, PrimaryMessage)`
+    /// tuple -- see `ResumeSend`'s own doc comment.
+    pub(crate) resume_tx: mpsc::Sender<ResumeSend>,
     pub(crate) cancel_handlers: Vec<CancelHandler>,
     /// Fable perf audit item 4: `cancel_handlers.len()` at the last actual
     /// `prune_cancel_handlers` scan -- `maybe_prune_cancel_handlers` only re-scans
@@ -173,6 +203,26 @@ pub struct Wire {
     /// `sample_metrics`'s progress gauges) -- `broadcast_message` is the only wire
     /// method that observes a metric (`proposed_block_size_bytes`).
     pub(crate) metrics: Option<Arc<Metrics>>,
+
+    /// reconnect-replay plan §2.3/§7: the exact reverse of `other_primaries`,
+    /// precomputed once (mirrors `other_primary_addrs`'s own "fixed for this node's
+    /// lifetime" reasoning) -- the dirty-map sweep's ONLY use for it: translating a
+    /// `Connection`'s own `SocketAddr` key into the `PublicKey` whose `pending_low`
+    /// entry (owned by `VantageCore`, not this struct) should be min-merged. Also
+    /// used to resolve `reconnect_rx`'s own `SocketAddr` events the same way.
+    pub(crate) addr_to_peer: HashMap<SocketAddr, PublicKey>,
+    /// reconnect-replay plan §2.3/§7/§14 A8: the shared dirty map `self.network`
+    /// (the MAIN pool only -- A7) min-merges every session-death volatile-drop
+    /// report into. `VantageCore`'s own `resume_tick`/Hello handling DRAINS this
+    /// (never merely reads it -- A8) then min-merges each entry into `pending_low`.
+    /// A fresh, empty, permanently-unfed map on `SimpleItCore` (which never attaches
+    /// it to a `ReliableSender` via `with_drop_map` -- "no events" per this crate's
+    /// own wiring notes): harmless, since nothing ever writes into it there.
+    pub(crate) dirty_map: DirtyMap,
+    /// reconnect-replay plan §6/§14 A8: the shared in-flight-replay-stream map --
+    /// see `InFlightMap`'s own doc comment. A fresh, empty, permanently-unfed map on
+    /// `SimpleItCore` for the identical reason `dirty_map` is.
+    pub(crate) in_flight: InFlightMap,
 }
 
 impl Wire {
@@ -182,6 +232,14 @@ impl Wire {
     /// semantics are unaffected (`Connection::keep_alive` treats a dropped receiver's
     /// closed sender as cancellation, per `network::reliable_sender`, so we must never
     /// drop one that's genuinely still pending).
+    ///
+    /// reconnect-replay plan §2.2/§7/§14 A2/m8 (updated contract): a VOLATILE send
+    /// (`broadcast_recorded`/`broadcast_volatile`, this crate's dominant broadcast
+    /// traffic class post-v3) never allocates a cancel handler at all -- there is
+    /// nothing here to prune for it. `self.cancel_handlers` therefore now only ever
+    /// grows from the traffic that stays durable (`Header(_, false)`, `VantageAvail`,
+    /// and every unicast) -- this method's own O(n) cost is unchanged, but the SIZE
+    /// of `n` it scans no longer tracks total broadcast volume the way it used to.
     pub(crate) fn prune_cancel_handlers(&mut self) {
         self.cancel_handlers
             .retain_mut(|handler| matches!(handler.try_recv(), Err(TryRecvError::Empty)));
@@ -255,6 +313,61 @@ impl Wire {
         self.send_to(peer, bytes, msg_type).await;
     }
 
+    /// reconnect-replay plan §2.2/§7: `VantageCore::broadcast_recorded`'s wire half
+    /// -- records nothing itself (the outbox lives on `VantageCore`;
+    /// `broadcast_recorded` calls `outbox::Outbox::record` then this). `payload` is
+    /// already serialized (the Bytes path -- no handler bookkeeping at all, unlike
+    /// `broadcast`/`broadcast_to`, which extend `self.cancel_handlers`); `key` is
+    /// `Pacemaker::own_watermark()` at send time, the outbox's own filing key -- see
+    /// `network::ReliableSender::broadcast_volatile`'s doc comment for how a
+    /// coalesced bundle reduces several constituents' keys to one (min).
+    pub(crate) async fn broadcast_volatile(
+        &mut self,
+        payload: Bytes,
+        msg_type: &'static str,
+        key: u64,
+    ) {
+        self.network
+            .broadcast_volatile_typed(self.other_primary_addrs.clone(), payload, key, msg_type)
+            .await;
+    }
+
+    /// reconnect-replay plan §14 A7: the unicast counterpart of `broadcast_volatile`,
+    /// used ONLY by the server-side nudge loop's own Hello send -- nudges are sent
+    /// VOLATILE (self-superseding: a later nudge always supersedes an undelivered
+    /// earlier one; a lost nudge is simply re-nudged on the next `resume_tick`) so
+    /// that a peer stuck cycling through repeated failed reconnects never
+    /// accumulates one durably-retried nudge per backoff period forever (contrast
+    /// with the OTHER three Hello triggers -- reconnect-prompt, tick re-Hello, and
+    /// reciprocal-on-receipt -- which stay on the ordinary durable `send_message`
+    /// path via `VantageCore::send_resume_hello`: each of those is either a one-shot
+    /// event or bounded by the requester's own `replay_episode_max_ms` expiry valve,
+    /// so durable delivery is both safe and valuable there -- see D4 caveat (ii) in
+    /// `resume`'s own module doc for why a forged low floor on any of these can only
+    /// ever help, never suppress, the recipient). `key` is `Pacemaker::own_watermark()`
+    /// at send time -- see this method's own call site for why an approximate key is
+    /// safe here (a nudge is not itself outbox content).
+    pub(crate) async fn send_volatile(
+        &mut self,
+        peer: PublicKey,
+        message: PrimaryMessage,
+        key: u64,
+    ) {
+        let Some(addr) = self
+            .other_primaries
+            .iter()
+            .find(|(pk, _)| *pk == peer)
+            .map(|(_, a)| *a)
+        else {
+            return;
+        };
+        let msg_type = message.type_name();
+        let bytes = Bytes::from(bincode::serialize(&message).expect("serializes"));
+        self.network
+            .send_volatile_typed(addr, bytes, key, msg_type)
+            .await;
+    }
+
     /// Broadcasts `payload` verbatim to every other primary. Fable perf audit item 5a:
     /// `other_primary_addrs` is precomputed once (see its own doc comment) -- this
     /// `.clone()` is a straight contiguous `Vec<SocketAddr>` memcpy.
@@ -278,7 +391,12 @@ impl Wire {
     /// default, non-withholding path -- including every non-Header broadcast, which
     /// never reaches this method at all -- keeps its exact original allocation/branch
     /// shape.
-    async fn broadcast_to(&mut self, payload: Vec<u8>, msg_type: &'static str, addrs: Vec<SocketAddr>) {
+    async fn broadcast_to(
+        &mut self,
+        payload: Vec<u8>,
+        msg_type: &'static str,
+        addrs: Vec<SocketAddr>,
+    ) {
         let handlers = self
             .network
             .broadcast_typed(addrs, Bytes::from(payload), msg_type)
@@ -340,7 +458,11 @@ impl Wire {
         else {
             return;
         };
-        if self.resume_tx.try_send((addr, message)).is_err() {
+        if self
+            .resume_tx
+            .try_send(ResumeSend::Message(addr, message))
+            .is_err()
+        {
             // `Full` (the sender task fell behind draining a backed-up
             // destination) or `Closed` (the task itself is gone -- in practice
             // only reachable if it panicked; the channel's one live `Sender`
@@ -353,6 +475,46 @@ impl Wire {
                 metrics.vantage_lane_resume_send_drops.inc();
             }
         }
+    }
+
+    /// reconnect-replay plan §5/§6/§14 A2: non-blocking hand-off of a replay stream
+    /// (`msgs` -- possibly empty, see `VantageCore`'s `Inbound::ResumeHello` handling
+    /// for when that's legitimate -- plus the terminating `done`) onto the
+    /// resume-sender task's channel; mirrors `enqueue_resume`'s identical
+    /// fire-and-forget `try_send` contract, this time for v3's own durable replay
+    /// shape rather than Mechanism A's `Message` shape. Returns whether the enqueue
+    /// succeeded: audit-3 A2 makes this the caller's (`VantageCore`'s) gate for
+    /// whether `pending_low`/the in-flight map may be updated at all -- "iff the
+    /// `try_send` ... returned Ok; on Err, ... leave `pending_low` untouched".
+    pub(crate) fn enqueue_replay(
+        &self,
+        peer: PublicKey,
+        msgs: Vec<Bytes>,
+        done: PrimaryMessage,
+    ) -> bool {
+        let Some(addr) = self
+            .other_primaries
+            .iter()
+            .find(|(pk, _)| *pk == peer)
+            .map(|(_, a)| *a)
+        else {
+            return false;
+        };
+        let ok = self
+            .resume_tx
+            .try_send(ResumeSend::Replay {
+                to: addr,
+                peer,
+                msgs,
+                done,
+            })
+            .is_ok();
+        if !ok {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_replay_enqueue_drops_total.inc();
+            }
+        }
+        ok
     }
 
     /// Mechanism A: the author-side counterpart -- same withholding-fidelity gate
@@ -392,6 +554,37 @@ impl Wire {
     }
 }
 
+/// reconnect-replay plan §5/§7: what the resume-sender task actually transmits.
+/// `Message` is Mechanism A's pre-existing shape (a single `PrimaryMessage`, sent
+/// fire-and-forget via the task's own `SimpleSender` -- unchanged semantics, unchanged
+/// wire encoding). `Replay` is v3's own durable replay-stream shape: `msgs` (already-
+/// serialized outbox entries, possibly empty -- see `VantageCore`'s
+/// `Inbound::ResumeHello` handling for when an empty slice is legitimate) chunked and
+/// sent via the task's OWN `ReliableSender` (durable-only -- audit-3 A2: "never sends
+/// volatile"), `done` following as the stream's terminating frame once every chunk
+/// has gone out; `peer` is who to remove from the shared in-flight map at that point.
+#[derive(Debug)]
+pub(crate) enum ResumeSend {
+    Message(SocketAddr, PrimaryMessage),
+    Replay {
+        to: SocketAddr,
+        peer: PublicKey,
+        msgs: Vec<Bytes>,
+        done: PrimaryMessage,
+    },
+}
+
+/// reconnect-replay plan §5: one active replay stream's remaining, not-yet-sent
+/// chunks -- the resume task's own round-robin queue entry. `msgs` shrinks from the
+/// front as `run_resume_sender`'s ticker sends chunks; the stream is done (its
+/// `done` frame sent, `peer` removed from the in-flight map) once it's empty.
+struct ReplayStream {
+    to: SocketAddr,
+    peer: PublicKey,
+    msgs: VecDeque<Bytes>,
+    done: PrimaryMessage,
+}
+
 /// Mechanism A (sender-side lane resume, `vantage::resume`): capacity of
 /// `spawn_resume_sender`'s own channel. Sized to absorb a full windowed-withhold
 /// recovery burst without forcing every enqueue onto `Wire::enqueue_resume`'s drop
@@ -404,62 +597,171 @@ impl Wire {
 /// bug, only a liveness hiccup: `enqueue_resume`'s `try_send` failing drops one
 /// message, which Mechanism A's own end-to-end retry (`resume::ResumeTrigger`'s
 /// backoff-driven resend, `resume::ResumeServe`'s dedup covering a redundant
-/// re-serve) recovers on a later attempt.
+/// re-serve) recovers on a later attempt; `enqueue_replay`'s own `try_send` failing
+/// is audit-3 A2's own Err arm (leaves `pending_low` untouched, recovered by the
+/// next nudge/tick).
 const RESUME_SEND_CHANNEL_CAPACITY: usize = 4096;
 
-/// Mechanism A (sender-side lane resume, `vantage::resume`): builds this node's ONE
-/// dedicated resume-sender task and returns the `mpsc::Sender` end `Wire::
-/// enqueue_resume`/`enqueue_resume_header` `try_send` onto. Called once, at
-/// `VantageCore::build`/`SimpleItCore::build` time, with the SAME `latency_map`/
-/// `batch`/`metrics` values those constructors hand `network`/`worker_network`
-/// (identical configuration convention) -- but this is a DELIBERATELY SEPARATE
-/// `SimpleSender` instance (its own connection pool), so a resume destination's
-/// connection state never touches `network`'s (primary<->primary AGB/consensus
-/// traffic) or `worker_network`'s (primary<->worker) state, or
-/// `VantageCore`/`SimpleItCore`'s run loop, ever again once spawned.
+/// Builds this node's ONE dedicated resume-sender task and returns the `mpsc::Sender`
+/// end `Wire::enqueue_resume`/`enqueue_resume_header`/`enqueue_replay` `try_send`
+/// onto. Called once, at `VantageCore::build`/`SimpleItCore::build` time, with the
+/// SAME `latency_map`/`batch`/`metrics` values those constructors hand `network`/
+/// `worker_network` (identical configuration convention) -- but these are
+/// DELIBERATELY SEPARATE sender instances (their own connection pools), so a resume
+/// destination's connection state never touches `network`'s (primary<->primary AGB/
+/// consensus traffic) or `worker_network`'s (primary<->worker) state, or
+/// `VantageCore`/`SimpleItCore`'s run loop, ever again once spawned. `in_flight` is
+/// `Wire::in_flight`'s own `Arc` clone -- this is the task's remove-after-`Done` side
+/// of it (see `InFlightMap`'s own doc comment).
 ///
-/// Fire-and-forget (`SimpleSender`, not `ReliableSender`) is CORRECT for resume
-/// traffic specifically, unlike most of this node's other unicast traffic: it is
-/// end-to-end retried ABOVE this layer already (the requester's own backoff
-/// re-requests an unanswered gap; the author's own `resume::ResumeServe` dedup
-/// absorbs a duplicate re-serve), so `ReliableSender`'s retry-until-ack machinery
-/// would only add redundant bookkeeping for a guarantee this mechanism does not need.
+/// TWO senders now, not one (reconnect-replay plan §5/§7): `messages` (`SimpleSender`,
+/// unchanged -- fire-and-forget is CORRECT for Mechanism A traffic specifically, since
+/// it is end-to-end retried ABOVE this layer already: the requester's own backoff
+/// re-requests an unanswered gap, the author's own `resume::ResumeServe` dedup absorbs
+/// a duplicate re-serve) and `replay` (a NEW, durable-only `ReliableSender` -- v3's own
+/// replay/Done frames must survive a session death mid-stream, which is exactly what
+/// makes raising `pending_low` at enqueue time sound; audit-3 A2 forbids it from ever
+/// sending volatile). Neither attaches `with_reconnect_events`/`with_drop_map` (A7:
+/// "apply to the MAIN pool only -- the replay pool feeds neither").
 ///
 /// The task this spawns (`run_resume_sender`) is free to block/await on every single
 /// send -- that IS its entire reason to exist: letting one slow destination cost
 /// only this task's own progress, never the run loop that used to make this exact
 /// send inline (the loop-starvation defect `resume::SEND_TIMEOUT`, now deleted, used
 /// to merely bound the damage from, rather than eliminate).
+///
+/// reconnect-replay plan §14 A9: a panic in this task is a PERMANENT-LOSS event for
+/// every `pending_low` span it had already raised on the strength of an enqueue that
+/// (from `VantageCore`'s side) looked successful -- unlike Mechanism A's own
+/// `Message` traffic (v1's design: end-to-end retried above this layer, so a crashed
+/// sender task merely stalls it until Mechanism A's own backoff notices and re-asks),
+/// a `Replay` stream this task never gets to finish sending has no other path to
+/// delivery. This is the SAME acceptance class as every other detached `tokio::spawn`
+/// task in this codebase already carries (a panic here is as fatal as one in
+/// `network::Connection::run`), just with a different, now user-visible symptom:
+/// `vantage_replay_pending_low_nudges_total` climbing without bound as the nudge loop
+/// keeps re-asking a `pending_low` that nothing is left alive to ever answer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_resume_sender(
     latency_map: HashMap<SocketAddr, Duration>,
     batch: BatchConfig,
     metrics: Option<Arc<Metrics>>,
-) -> mpsc::Sender<(SocketAddr, PrimaryMessage)> {
+    in_flight: InFlightMap,
+    chunk_bytes: usize,
+    chunk_interval_ms: u64,
+) -> mpsc::Sender<ResumeSend> {
     let (tx, rx) = mpsc::channel(RESUME_SEND_CHANNEL_CAPACITY);
-    let mut sender = SimpleSender::new()
+    let mut messages = SimpleSender::new()
+        .with_latency(latency_map.clone())
+        .with_batching(batch);
+    let mut replay = ReliableSender::new()
         .with_latency(latency_map)
         .with_batching(batch);
     if let Some(m) = metrics {
-        sender = sender.with_metrics(m);
+        messages = messages.with_metrics(m.clone());
+        replay = replay.with_metrics(m);
     }
-    tokio::spawn(run_resume_sender(rx, sender));
+    let chunk_interval = Duration::from_millis(chunk_interval_ms.max(1));
+    tokio::spawn(run_resume_sender(
+        rx,
+        messages,
+        replay,
+        in_flight,
+        chunk_bytes.max(1),
+        chunk_interval,
+    ));
     tx
 }
 
-/// Mechanism A: the dedicated off-run-loop task itself, fed by `spawn_resume_
-/// sender`'s channel. One iteration: recv -> serialize -> `SimpleSender::send_typed`.
-/// Every step here may block/await freely -- see `spawn_resume_sender`'s doc comment
-/// for why that is this task's entire job rather than a bug. Ends the moment `tx`'s
-/// one live clone (held by `Wire`) drops -- `rx.recv()` then returns `None` and this
-/// loop, and the task with it, ends; nothing joins it explicitly, mirroring every
-/// other detached `tokio::spawn` in this codebase (e.g. `network::Connection::spawn`).
+/// Sends one `ResumeSend::Message` immediately via `messages` -- shared by
+/// `run_resume_sender`'s blocking-recv and drain-the-rest arms.
+async fn send_message_item(messages: &mut SimpleSender, to: SocketAddr, message: PrimaryMessage) {
+    let msg_type = message.type_name();
+    let bytes = bincode::serialize(&message).expect("serializes");
+    messages.send_typed(to, Bytes::from(bytes), msg_type).await;
+}
+
+/// The dedicated off-run-loop task itself, fed by `spawn_resume_sender`'s channel.
+///
+/// Mechanism A's `Message` items are sent IMMEDIATELY, unchanged (see `spawn_resume_
+/// sender`'s doc comment). reconnect-replay plan §5: `Replay` items instead join
+/// `streams` (a `VecDeque`, round-robin by construction -- a stream that isn't yet
+/// fully drained is rotated to the BACK after each chunk, so no single stream can
+/// monopolize the task); a `chunk_interval`-paced ticker sends exactly one
+/// `chunk_bytes` chunk from the FRONT stream per rotation (a single constituent
+/// message larger than the whole chunk cap is still sent whole -- the same
+/// documented, bounded overshoot `outbox::Outbox`'s own byte-cap eviction and
+/// `resume::ServeBudget`'s own per-key truncation already accept, never split
+/// mid-message).
+///
+/// `select!`'s `biased` `rx.recv()` branch (with a `try_recv` drain loop right behind
+/// it) gives `Message` items STRICT priority over the next chunk tick -- module doc,
+/// design doc §5: "draining ALL queued v1 Message items between chunks". Two bounds
+/// keep either side from starving the other, both worth stating explicitly since
+/// neither is enforced by a hard cap in this loop itself: v1 traffic (Mechanism A's
+/// own `Message` items) is inherently rate-bounded by ITS OWN in-flight-1/round-trip
+/// protocol (`resume::ResumeTrigger`'s in-flight cap of 1 per author), so the priority
+/// drain this task gives it is itself rate-bounded, never an unbounded flood; replay
+/// throughput is bounded from the other side by `chunk_interval`/`chunk_bytes`
+/// (`replay_chunk_bytes / replay_chunk_interval_ms` bytes/s, one task, one bucket, by
+/// construction -- design doc §5's "global replay ceiling").
+///
+/// Ends the moment `tx`'s one live clone (held by `Wire`) drops -- `rx.recv()` then
+/// returns `None` and this loop, and the task with it, ends; nothing joins it
+/// explicitly, mirroring every other detached `tokio::spawn` in this codebase. See
+/// `spawn_resume_sender`'s own doc comment (audit-3 A9) for what a PANIC here means.
 async fn run_resume_sender(
-    mut rx: mpsc::Receiver<(SocketAddr, PrimaryMessage)>,
-    mut sender: SimpleSender,
+    mut rx: mpsc::Receiver<ResumeSend>,
+    mut messages: SimpleSender,
+    mut replay: ReliableSender,
+    in_flight: InFlightMap,
+    chunk_bytes: usize,
+    chunk_interval: Duration,
 ) {
-    while let Some((addr, message)) = rx.recv().await {
-        let msg_type = message.type_name();
-        let bytes = bincode::serialize(&message).expect("serializes");
-        sender.send_typed(addr, Bytes::from(bytes), msg_type).await;
+    let mut streams: VecDeque<ReplayStream> = VecDeque::new();
+    let mut ticker = tokio::time::interval(chunk_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+
+            maybe = rx.recv() => {
+                let Some(item) = maybe else { return };
+                match item {
+                    ResumeSend::Message(to, message) => send_message_item(&mut messages, to, message).await,
+                    ResumeSend::Replay { to, peer, msgs, done } => {
+                        streams.push_back(ReplayStream { to, peer, msgs: msgs.into(), done });
+                    }
+                }
+                // Strict priority (module doc): absorb everything ELSE already
+                // waiting before this task ever considers the next chunk tick.
+                while let Ok(item) = rx.try_recv() {
+                    match item {
+                        ResumeSend::Message(to, message) => send_message_item(&mut messages, to, message).await,
+                        ResumeSend::Replay { to, peer, msgs, done } => {
+                            streams.push_back(ReplayStream { to, peer, msgs: msgs.into(), done });
+                        }
+                    }
+                }
+            }
+
+            _ = ticker.tick(), if !streams.is_empty() => {
+                let Some(mut stream) = streams.pop_front() else { continue };
+                let mut sent = 0usize;
+                while sent < chunk_bytes {
+                    let Some(bytes) = stream.msgs.pop_front() else { break };
+                    sent += bytes.len();
+                    replay.send_typed(stream.to, bytes, "Replay").await;
+                }
+                if stream.msgs.is_empty() {
+                    let msg_type = stream.done.type_name();
+                    let done_bytes = bincode::serialize(&stream.done).expect("serializes");
+                    replay.send_typed(stream.to, Bytes::from(done_bytes), msg_type).await;
+                    in_flight.lock().unwrap().remove(&stream.peer);
+                } else {
+                    streams.push_back(stream);
+                }
+            }
+        }
     }
 }
