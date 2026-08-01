@@ -86,7 +86,11 @@ iptables_rule() {
     if [ "$MODE" = drop ]; then
         dexec iptables "$1" "$2" "$3" "$4" -j DROP
     else
-        dexec iptables "$1" "$2" "$3" "$4" -j REJECT --reject-with tcp-reset
+        # `--reject-with tcp-reset` is only valid on a rule that matches TCP
+        # (`-p tcp`) -- without it, nf_tables iptables refuses the insert with
+        # "RULE_INSERT failed (Invalid argument)". All inter-node protocol
+        # traffic is TCP, so matching `-p tcp` loses nothing.
+        dexec iptables "$1" "$2" "$3" "$4" -p tcp -j REJECT --reject-with tcp-reset
     fi
 }
 
