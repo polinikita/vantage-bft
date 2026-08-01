@@ -113,6 +113,9 @@ async fn process_header() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Send a header to the core.
@@ -219,6 +222,9 @@ async fn process_header_missing_parent() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     let header_one = header();
@@ -326,6 +332,9 @@ async fn process_header_invalid_height() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Send a header to the core.
@@ -426,6 +435,9 @@ async fn process_header_missing_payload() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Send a header to the core.
@@ -524,6 +536,9 @@ async fn process_votes() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Receive geneis parent cert from the proposer
@@ -644,6 +659,9 @@ async fn process_certificates() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Send enough certificates to the core.
@@ -767,6 +785,9 @@ async fn process_prepare() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Send headers to the core, so they won't request sync
@@ -922,6 +943,9 @@ async fn generate_confirm() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Receive the first prepare message from proposer
@@ -1090,6 +1114,9 @@ async fn generate_commit() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Receive the first prepare message from proposer
@@ -1310,6 +1337,9 @@ async fn generate_pipelined_prepare() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Receive the first prepare message from proposer
@@ -1495,6 +1525,9 @@ async fn local_timeout_view() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     /*let message = handle.await.unwrap();
@@ -1598,6 +1631,9 @@ async fn sync_missing_proposals() {
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
         BatchConfig::default(),
+        // KNOB 2 (measurement ablation): appended last, same convention as
+        // `Core::spawn`'s own doc comment for this param.
+        parameters.retry_backoff_max_ms,
     );
 
     // Receive the first prepare message from proposer

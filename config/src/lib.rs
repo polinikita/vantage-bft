@@ -485,6 +485,55 @@ pub struct Parameters {
     #[serde(default = "default_resume_batch")]
     pub resume_batch: u64,
 
+    /// KNOB 1 (measurement ablation): master on/off switch for the newer,
+    /// server-floored volatile one-shot replay mechanism (`vantage::outbox::Outbox`
+    /// plus the Hello/Done exchange -- `replay_history_views`/`replay_chunk_bytes`/
+    /// `replay_chunk_interval_ms`/`replay_serve_max_bytes`/`outbox_max_bytes`/
+    /// `replay_episode_max_ms` below). Vantage only.
+    ///
+    /// Motivation: this mechanism and `retry_backoff_max_ms`'s cap change (60s ->
+    /// 2s) landed in the same commits, and an adversarial review of a before/after
+    /// benchmark figure found the cap alone explains most of the measured
+    /// improvement -- with no build able to disable the replay mechanism
+    /// independently, it could not be attributed any effect at all. This flag,
+    /// together with `retry_backoff_max_ms`, creates three cleanly separable
+    /// measurement arms: (A) "true before" (`reconnect_replay=false`,
+    /// `retry_backoff_max_ms=60000`), (B) "cap only" (`false`, `2000`), (C) "full"
+    /// (`true`, `2000`) -- A->B isolates the backoff cap, B->C isolates the replay.
+    ///
+    /// `#[serde(default = "default_reconnect_replay")]` (`true`) keeps every
+    /// pre-existing parameter file's behavior unchanged. When `false`,
+    /// `VantageCore::broadcast_recorded` (the single choke point every one-shot
+    /// AGB/consensus broadcast passes through) records nothing into the outbox and
+    /// sends via the ordinary DURABLE path instead of the volatile one, no Hello is
+    /// ever sent or reciprocated (the reconnect-event arm, the tick re-ask, and the
+    /// `pending_low` nudge are all inert), and an incoming `ResumeHello`/
+    /// `ReplayDone` is ignored -- i.e. the node behaves exactly as it did before
+    /// this mechanism existed. Mechanism A (the PRE-EXISTING sender-side lane
+    /// resume, `vantage::resume`'s `ResumeTrigger`/`ResumeServe`/
+    /// `Inbound::LaneResume`) is a SEPARATE mechanism and is never gated by this
+    /// flag -- see that module's own doc comment.
+    #[serde(default = "default_reconnect_replay")]
+    pub reconnect_replay: bool,
+
+    /// KNOB 2 (measurement ablation, paired with `reconnect_replay` above): the
+    /// reconnect-waiter's exponential-backoff CEILING, in ms
+    /// (`network::reliable_sender::Connection::run`'s `delay = min(2*delay,
+    /// retry_backoff_max_ms)`). Transport-level, so unlike every other field in
+    /// this group it is NOT Vantage-specific -- it applies uniformly to every
+    /// `ReliableSender` this workspace's three protocols (Autobahn, Vantage,
+    /// Simple-IT) construct for primary-to-primary traffic, including the
+    /// reconnect-replay pool's own task-owned sender (`vantage::wire::
+    /// spawn_resume_sender`). The initial per-connection retry delay (200ms) and
+    /// the doubling between attempts are unaffected by this knob -- only the
+    /// ceiling the doubling saturates at.
+    ///
+    /// `#[serde(default = "default_retry_backoff_max_ms")]` (`2000`) matches the
+    /// value this cap was hardcoded to before this field existed, so every
+    /// pre-existing parameter file's behavior is unchanged.
+    #[serde(default = "default_retry_backoff_max_ms")]
+    pub retry_backoff_max_ms: u64,
+
     /// reconnect-replay plan §5/§9: how many VIEWS of one-shot-message history
     /// `vantage::outbox::Outbox` retains behind the current `own_watermark` before
     /// `prune_below` evicts a whole view's worth (a ceiling; `outbox_max_bytes`
@@ -595,6 +644,17 @@ fn default_resume_backoff_ms() -> u64 {
 /// `Parameters::resume_batch`'s own doc comment.
 fn default_resume_batch() -> u64 {
     64
+}
+
+/// `Parameters::reconnect_replay`'s own doc comment.
+fn default_reconnect_replay() -> bool {
+    true
+}
+
+/// `Parameters::retry_backoff_max_ms`'s own doc comment -- matches
+/// `network::reliable_sender`'s own previously-hardcoded cap exactly.
+fn default_retry_backoff_max_ms() -> u64 {
+    2_000
 }
 
 /// `Parameters::replay_history_views`'s own doc comment.
@@ -850,6 +910,8 @@ impl Default for Parameters {
             resume_check_period_ms: default_resume_check_period_ms(),
             resume_backoff_ms: default_resume_backoff_ms(),
             resume_batch: default_resume_batch(),
+            reconnect_replay: default_reconnect_replay(),
+            retry_backoff_max_ms: default_retry_backoff_max_ms(),
             replay_history_views: default_replay_history_views(),
             replay_chunk_bytes: default_replay_chunk_bytes(),
             replay_chunk_interval_ms: default_replay_chunk_interval_ms(),
@@ -961,14 +1023,25 @@ impl Parameters {
             self.resume_check_period_ms, self.resume_backoff_ms, self.resume_batch
         );
         info!(
-            "Reconnect replay (server-floored volatile one-shot replay): outbox {} views / {} B, \
-             replay chunk {} B / {} ms, per-peer serve budget {} B, episode/in-flight TTL {} ms",
+            "Reconnect replay (server-floored volatile one-shot replay) {}: outbox {} views / \
+             {} B, replay chunk {} B / {} ms, per-peer serve budget {} B, episode/in-flight TTL \
+             {} ms, retry backoff cap {} ms",
+            // KNOB 1/2 (measurement ablation): every run's log must self-document
+            // which of the three arms it is -- see `reconnect_replay`'s own doc
+            // comment for the arm definitions. The two flags are otherwise
+            // indistinguishable from the rest of a run's log.
+            if self.reconnect_replay {
+                "ENABLED"
+            } else {
+                "DISABLED"
+            },
             self.replay_history_views,
             self.outbox_max_bytes,
             self.replay_chunk_bytes,
             self.replay_chunk_interval_ms,
             self.replay_serve_max_bytes,
-            self.replay_episode_max_ms
+            self.replay_episode_max_ms,
+            self.retry_backoff_max_ms
         );
         if self.withhold_senders > 0 {
             match self.withhold_at_ms {
@@ -1508,6 +1581,13 @@ mod tests {
         // `None` after deserialization -- `node run` builds it from
         // `mimic_latency_ms` at spawn.
         assert!(params.latency_table.is_none());
+        // KNOB 1/2 (measurement ablation): absent from this (pre-existing shape)
+        // file -- must default to today's behavior exactly (replay enabled, 2s
+        // backoff cap), same "splitting a knob apart changes nothing for an
+        // existing parameter file" guarantee `vantage_gc_window_views` is pinned
+        // against just above.
+        assert!(params.reconnect_replay);
+        assert_eq!(params.retry_backoff_max_ms, 2000);
 
         // Prove the spawn-time expansion `node run` performs yields a well-formed
         // uniform NxN table with the RTT/2 one-way convention.
@@ -1611,5 +1691,15 @@ mod tests {
             Some(&cell),
             base + Duration::from_secs(25)
         )); // after
+    }
+
+    /// KNOB 1/2 (measurement ablation): `Parameters::default()` reproduces today's
+    /// existing behavior exactly -- the reconnect-replay mechanism enabled and the
+    /// 2s retry-backoff cap, both previously hardcoded/unconditional.
+    #[test]
+    fn reconnect_replay_and_retry_backoff_default_to_todays_behavior() {
+        let params = Parameters::default();
+        assert!(params.reconnect_replay);
+        assert_eq!(params.retry_backoff_max_ms, 2000);
     }
 }

@@ -62,6 +62,15 @@ type VolatileKey = Option<u64>;
 /// (empty for a volatile entry/bundle), and its own filing key (`None` for durable).
 type BufferedEntry = (Bytes, ReplyTargets, VolatileKey);
 
+/// KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`): the
+/// reconnect-waiter's default exponential-backoff ceiling -- reproduces the value
+/// this cap was hardcoded to before `with_retry_backoff_max_ms` existed, so a
+/// `ReliableSender` that never calls it is byte-identical to today. See
+/// `Connection::run`'s own doc comment (the `delay = min(2*delay, ..)` call site)
+/// for where this is consulted, and `config::Parameters::retry_backoff_max_ms`'s
+/// own doc comment for the measurement rationale.
+const DEFAULT_RETRY_BACKOFF_MAX_MS: u64 = 2_000;
+
 /// We keep alive one TCP connection per peer, each connection is handled by a separate task (called `Connection`).
 /// We communicate with our 'connections' through a dedicated channel kept by the HashMap called `connections`.
 /// This sender is 'reliable' in the sense that it keeps trying to re-transmit messages for which it didn't
@@ -95,6 +104,14 @@ pub struct ReliableSender {
     /// min-merges its own session-death volatile-drop report into. `None` by
     /// default, same convention as `latency`/`metrics`.
     drop_map: Option<DirtyMap>,
+    /// KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`):
+    /// the reconnect-waiter's exponential-backoff ceiling, in ms -- see
+    /// `Connection::run`'s own doc comment for where this is consulted. Defaults to
+    /// `DEFAULT_RETRY_BACKOFF_MAX_MS` (reproducing today's previously-hardcoded cap
+    /// exactly); `with_retry_backoff_max_ms` overrides it, same
+    /// attach-before-any-connection-spawns convention as `with_latency`/
+    /// `with_metrics`/`with_batching`/`with_reconnect_events`/`with_drop_map`.
+    retry_backoff_max_ms: u64,
 }
 
 impl std::default::Default for ReliableSender {
@@ -113,6 +130,7 @@ impl ReliableSender {
             batch: BatchConfig::default(),
             reconnect_events: None,
             drop_map: None,
+            retry_backoff_max_ms: DEFAULT_RETRY_BACKOFF_MAX_MS,
         }
     }
 
@@ -163,6 +181,21 @@ impl ReliableSender {
         self
     }
 
+    /// KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`):
+    /// override the reconnect-waiter's exponential-backoff ceiling (default
+    /// `DEFAULT_RETRY_BACKOFF_MAX_MS` = 2000ms, reproducing today's
+    /// previously-hardcoded cap exactly) -- same attach-before-any-connection-
+    /// spawns convention as `with_latency`/`with_metrics`/`with_batching`/
+    /// `with_reconnect_events`/`with_drop_map`. See `Connection::run`'s own doc
+    /// comment for where this is consulted, and `config::Parameters::
+    /// retry_backoff_max_ms`'s own doc comment for the measurement rationale
+    /// (isolating this cap's own effect from the reconnect-replay mechanism that
+    /// landed alongside it, across three benchmark arms).
+    pub fn with_retry_backoff_max_ms(mut self, ms: u64) -> Self {
+        self.retry_backoff_max_ms = ms;
+        self
+    }
+
     /// Helper function to spawn a new connection.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(100_000);
@@ -175,6 +208,7 @@ impl ReliableSender {
             self.batch,
             self.reconnect_events.clone(),
             self.drop_map.clone(),
+            self.retry_backoff_max_ms,
         );
         tx
     }
@@ -491,6 +525,11 @@ struct Connection {
     /// `extra_latency`). Min-merged into (`address` -> min dropped key) at every
     /// session death that actually discarded at least one volatile entry.
     drop_map: Option<DirtyMap>,
+    /// KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`):
+    /// resolved once at spawn time (mirrors `extra_latency`) -- the reconnect-
+    /// waiter's exponential-backoff ceiling. See `run`'s own doc comment at the
+    /// `delay = min(2*delay, ..)` call site for the measurement rationale.
+    retry_backoff_max_ms: u64,
     /// reconnect-replay plan §2.1/§7: has this connection EVER failed before (a
     /// failed connect attempt, or an established session that later died)? Set in
     /// the connect-`Err` arm and right after `keep_alive` returns; checked (never
@@ -515,6 +554,7 @@ impl Connection {
         batch: BatchConfig,
         reconnect_events: Option<Sender<SocketAddr>>,
         drop_map: Option<DirtyMap>,
+        retry_backoff_max_ms: u64,
     ) {
         tokio::spawn(async move {
             Self {
@@ -527,6 +567,7 @@ impl Connection {
                 batch,
                 reconnect_events,
                 drop_map,
+                retry_backoff_max_ms,
                 had_failure: false,
             }
             .run()
@@ -616,7 +657,20 @@ impl Connection {
                                 // this cap (backoff at 12.8s at the old 60s cap); a
                                 // 2s ceiling bounds the worst-case pre-Hello silent
                                 // gap without materially increasing reconnect churn.
-                                delay = min(2*delay, 2_000);
+                                //
+                                // KNOB 2 (measurement ablation, `config::Parameters::
+                                // retry_backoff_max_ms`, `ReliableSender::
+                                // with_retry_backoff_max_ms`): this cap change landed
+                                // in the same commits as the reconnect-replay
+                                // mechanism above, and an adversarial review of a
+                                // before/after benchmark figure found the cap alone
+                                // explains most of the measured improvement --
+                                // `self.retry_backoff_max_ms` makes it independently
+                                // selectable (default `DEFAULT_RETRY_BACKOFF_MAX_MS` =
+                                // 2_000, reproducing the hardcoded value this replaced
+                                // exactly) so the two changes can be attributed
+                                // separately across benchmark arms.
+                                delay = min(2*delay, self.retry_backoff_max_ms);
                                 retry +=1;
                                 break 'waiter;
                             },

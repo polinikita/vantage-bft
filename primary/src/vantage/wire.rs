@@ -636,6 +636,14 @@ const RESUME_SEND_CHANNEL_CAPACITY: usize = 4096;
 /// sending volatile). Neither attaches `with_reconnect_events`/`with_drop_map` (A7:
 /// "apply to the MAIN pool only -- the replay pool feeds neither").
 ///
+/// KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`):
+/// UNLIKE `with_reconnect_events`/`with_drop_map` above, the reconnect-waiter
+/// backoff cap is NOT MAIN-pool-only -- `replay` gets it too (see this fn's own
+/// `retry_backoff_max_ms` parameter), since the cap is a plain transport
+/// property, orthogonal to KNOB 1's reconnect-replay mechanism (which stays
+/// MAIN-pool-only): every `ReliableSender` this node spawns should reconnect
+/// under the SAME cap for the ablation to be uniform.
+///
 /// The task this spawns (`run_resume_sender`) is free to block/await on every single
 /// send -- that IS its entire reason to exist: letting one slow destination cost
 /// only this task's own progress, never the run loop that used to make this exact
@@ -661,6 +669,12 @@ pub(crate) fn spawn_resume_sender(
     in_flight: InFlightMap,
     chunk_bytes: usize,
     chunk_interval_ms: u64,
+    // KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`):
+    // this pool's own `replay` `ReliableSender` below is a SEPARATE connection pool
+    // from the main one (`VantageCore`/`SimpleItCore`'s own `Wire::network`) --
+    // threaded through here too so the cap applies uniformly to every
+    // `ReliableSender` this node spawns, not just the main pool.
+    retry_backoff_max_ms: u64,
 ) -> mpsc::Sender<ResumeSend> {
     let (tx, rx) = mpsc::channel(RESUME_SEND_CHANNEL_CAPACITY);
     let mut messages = SimpleSender::new()
@@ -668,7 +682,8 @@ pub(crate) fn spawn_resume_sender(
         .with_batching(batch);
     let mut replay = ReliableSender::new()
         .with_latency(latency_map)
-        .with_batching(batch);
+        .with_batching(batch)
+        .with_retry_backoff_max_ms(retry_backoff_max_ms);
     if let Some(m) = metrics {
         messages = messages.with_metrics(m.clone());
         replay = replay.with_metrics(m);

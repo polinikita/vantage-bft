@@ -335,11 +335,25 @@ pub struct VantageCore {
     /// `Parameters::resume_batch` -- the maximum own blocks served per resume batch.
     resume_batch: u64,
 
+    /// KNOB 1 (measurement ablation): `Parameters::reconnect_replay`'s own copy --
+    /// see that field's doc comment for the full rationale (isolating this
+    /// mechanism's own effect from the `retry_backoff_max_ms` cap change that
+    /// landed alongside it). `true` (the default) is today's existing behavior,
+    /// byte-identical. Consulted by `broadcast_recorded` (the single choke point
+    /// every one-shot AGB/consensus broadcast passes through),
+    /// `resume_tick_replay_effects`/the `run` loop's `reconnect_rx` arm, and
+    /// `dispatch_inbound`'s `ResumeHello`/`ReplayDone` arms. Mechanism A
+    /// (`vantage::resume`'s `ResumeTrigger`/`ResumeServe`, `try_resume_request`) is
+    /// NEVER gated by this flag -- it is a separate mechanism, not part of this
+    /// ablation.
+    reconnect_replay: bool,
     /// reconnect-replay plan §5 (server-authoritative floor, v3) -- a SEPARATE
     /// mechanism from Mechanism A above (see `vantage::resume`'s own module doc
     /// comment): every one-shot broadcast this node has sent volatile
     /// (`broadcast_recorded`), retained for possible replay. `Parameters::
-    /// outbox_max_bytes`-capped.
+    /// outbox_max_bytes`-capped. Always constructed (even when `reconnect_replay`
+    /// is `false`) but then stays permanently empty, since `broadcast_recorded`
+    /// never records into it while disabled.
     outbox: Outbox,
     /// §2.4: per peer X, the lowest filing key X may be missing -- the
     /// authoritative serve floor (absent entry = `None`, "no known gap"). Updated
@@ -602,6 +616,9 @@ impl VantageCore {
             in_flight.clone(),
             parameters.replay_chunk_bytes,
             parameters.replay_chunk_interval_ms,
+            // KNOB 2 (measurement ablation): applies to this pool too -- see
+            // `spawn_resume_sender`'s own doc comment.
+            parameters.retry_backoff_max_ms,
         );
 
         let core = Self {
@@ -622,9 +639,27 @@ impl VantageCore {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
                         .with_batching(batch)
-                        // reconnect-replay plan §14 A7: the MAIN pool only.
-                        .with_reconnect_events(reconnect_tx)
-                        .with_drop_map(dirty_map.clone());
+                        // KNOB 2 (measurement ablation): transport-level, attached
+                        // regardless of `reconnect_replay` -- see that field's own
+                        // doc comment.
+                        .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms);
+                    // KNOB 1 (measurement ablation): reconnect-replay plan §14 A7's
+                    // "the MAIN pool only" convention is now itself conditional on
+                    // the mechanism being enabled -- when disabled, neither the
+                    // reconnect-event channel nor the drop map is ever attached, so
+                    // this pool's transport-level behavior is byte-identical to
+                    // before the mechanism existed (`Parameters::reconnect_replay`'s
+                    // own doc comment: "preferably do not even attach" -- the
+                    // option this build chooses). `reconnect_tx`/`dirty_map` are
+                    // simply dropped/unfed in that case; `reconnect_rx`/`Wire::
+                    // dirty_map` stay typed the same either way (see their own
+                    // fields' doc comments), so nothing downstream needs an
+                    // `Option`.
+                    if parameters.reconnect_replay {
+                        s = s
+                            .with_reconnect_events(reconnect_tx)
+                            .with_drop_map(dirty_map.clone());
+                    }
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
                     }
@@ -664,6 +699,7 @@ impl VantageCore {
             resume_check_period_ms: parameters.resume_check_period_ms,
             resume_backoff_ms: parameters.resume_backoff_ms,
             resume_batch: parameters.resume_batch,
+            reconnect_replay: parameters.reconnect_replay,
             outbox: Outbox::new(parameters.outbox_max_bytes),
             pending_low: HashMap::new(),
             replay_episodes: ReplayEpisodes::new(),
@@ -863,7 +899,16 @@ impl VantageCore {
                 // Mechanism A above -- see `vantage::resume`'s own module doc.
                 _ = resume_tick.tick() => {
                     let now = Instant::now();
-                    self.sweep_dirty_map();
+                    // KNOB 1 (measurement ablation): the dirty-map sweep feeds
+                    // `pending_low`, v3's own bookkeeping -- inert while disabled
+                    // (see `Parameters::reconnect_replay`'s own doc comment). In
+                    // practice `self.wire.dirty_map` is never fed at all while
+                    // disabled either (`build` never attaches `with_drop_map` to
+                    // the MAIN pool in that case), so this is already a no-op; the
+                    // guard just makes that explicit instead of relying on it.
+                    if self.reconnect_replay {
+                        self.sweep_dirty_map();
+                    }
                     // Cloned out (a plain `Vec<PublicKey>`, already excluding
                     // `self.name` -- `Wire::other_primaries` is "OTHER primaries",
                     // precomputed once and fixed for this node's lifetime, see that
@@ -875,11 +920,11 @@ impl VantageCore {
                     let episode_backoff = Duration::from_millis(self.resume_backoff_ms);
                     let episode_max_age = Duration::from_millis(self.replay_episode_max_ms);
                     for author in authors {
+                        // Mechanism A -- NOT part of this ablation, always runs
+                        // regardless of `reconnect_replay`.
                         self.try_resume_request(author, now);
-                        if self.replay_episodes.tick(author, now, episode_backoff, episode_max_age) {
-                            self.send_resume_hello(author, now, "tick").await;
-                        }
-                        self.maybe_nudge(author, now, episode_backoff).await;
+                        // KNOB 1: v3's own episode re-ask + nudge, self-gated.
+                        self.resume_tick_replay_effects(author, now, episode_backoff, episode_max_age).await;
                     }
                 }
 
@@ -900,8 +945,21 @@ impl VantageCore {
                         peer_index.map_or_else(|| "unmapped".to_string(), |i| i.to_string())
                     );
                     if let Some(peer) = resolved {
-                        self.replay_episodes.open(peer, now);
-                        self.send_resume_hello(peer, now, "event").await;
+                        // KNOB 1 (measurement ablation): the Hello/episode-opening
+                        // half of this trigger is inert while disabled -- see
+                        // `Parameters::reconnect_replay`'s own doc comment.
+                        // `try_resume_request` below (Mechanism A) is NOT part of
+                        // this ablation and always runs regardless, mirroring the
+                        // `resume_tick` arm's identical treatment just above. In
+                        // practice this whole arm is unreachable while disabled
+                        // anyway (`build` never attaches `with_reconnect_events` to
+                        // the MAIN pool in that case, so `reconnect_rx` stays
+                        // permanently closed) -- this guard only matters for a
+                        // hypothetical mixed configuration.
+                        if self.reconnect_replay {
+                            self.replay_episodes.open(peer, now);
+                            self.send_resume_hello(peer, now, "event").await;
+                        }
                         self.try_resume_request(peer, now);
                     }
                 }
@@ -1029,6 +1087,30 @@ impl VantageCore {
         }
     }
 
+    /// KNOB 1 (measurement ablation): the `resume_tick` arm's own v3 body (episode
+    /// re-ask + nudge) for a single author -- self-gated on `reconnect_replay` so
+    /// it is directly testable without spawning the whole `run` loop (a real tick
+    /// would need either a live task plus real timing -- the class of test this
+    /// codebase's own network-crate tests deliberately avoid -- or reaching inside
+    /// `resume_tick`, which isn't a standalone method). Extracted out of `run`'s
+    /// per-author loop, which still calls `try_resume_request` (Mechanism A, NOT
+    /// part of this ablation) unconditionally right before this.
+    async fn resume_tick_replay_effects(
+        &mut self,
+        author: PublicKey,
+        now: Instant,
+        backoff: Duration,
+        max_age: Duration,
+    ) {
+        if !self.reconnect_replay {
+            return;
+        }
+        if self.replay_episodes.tick(author, now, backoff, max_age) {
+            self.send_resume_hello(author, now, "tick").await;
+        }
+        self.maybe_nudge(author, now, backoff).await;
+    }
+
     // --- reconnect-replay plan (server-authoritative floor, v3): a SEPARATE
     // mechanism from Mechanism A above (see `vantage::resume`'s own module doc
     // comment) -- resumes one-shot AGB/consensus broadcasts lost to a volatile
@@ -1042,7 +1124,24 @@ impl VantageCore {
     /// every later Hello/`pending_low`/replay computation keys off -- audit V1:
     /// monotone since `own_watermark` itself never decreases), then sends it
     /// volatile.
+    ///
+    /// KNOB 1 (measurement ablation, `Parameters::reconnect_replay`): this is the
+    /// mechanism's SINGLE choke point -- every one-shot broadcast arm in `execute`
+    /// calls this, never `Wire::broadcast_volatile` directly -- so the ablation
+    /// branches HERE rather than duplicating a flag check at every call site. When
+    /// disabled, this reverts to exactly the behavior that predates the
+    /// reconnect-replay mechanism: nothing is recorded (there is no replay left to
+    /// serve it from later, so filing history for one would be pure waste), and the
+    /// message goes out on the ordinary DURABLE path instead of the volatile one --
+    /// this is the load-bearing half of disabling the mechanism: a one-shot
+    /// AGB/consensus statement merely dropped on a session death (volatile's whole
+    /// point) would otherwise be lost forever, with no replay mechanism left to
+    /// recover it.
     async fn broadcast_recorded(&mut self, message: PrimaryMessage) {
+        if !self.reconnect_replay {
+            self.wire.broadcast_message(message).await;
+            return;
+        }
         let msg_type = message.type_name();
         let bytes = Bytes::from(bincode::serialize(&message).expect("serializes"));
         let key = self.pacemaker.own_watermark();
@@ -1932,12 +2031,34 @@ impl VantageCore {
             // rest of this protocol's pure state machines do) rather than
             // returning effects for `execute` to drain.
             Inbound::ResumeHello(floor, sender) => {
-                self.on_resume_hello(floor, sender, now).await;
+                // KNOB 1 (measurement ablation): ignored while disabled -- no
+                // Replay enqueue, no `pending_low`/in-flight change. A uniform run
+                // (every node sharing the same `Parameters`) never sends one of
+                // these while disabled (see `broadcast_recorded`/`run`'s gated
+                // arms), so this branch matters only for a MIXED run, which must
+                // not misbehave either -- logged once per receipt since that is
+                // otherwise a silent, easy-to-miss divergence between arms.
+                if self.reconnect_replay {
+                    self.on_resume_hello(floor, sender, now).await;
+                } else {
+                    log::debug!(
+                        "vantage node: resume hello ignored: reconnect replay disabled, sender={}",
+                        sender
+                    );
+                }
                 Vec::new()
             }
             Inbound::ReplayDone(end_key, complete, clamped, sender) => {
-                self.on_replay_done(end_key, complete, clamped, sender, now)
-                    .await;
+                // KNOB 1: same reasoning as `ResumeHello` above.
+                if self.reconnect_replay {
+                    self.on_replay_done(end_key, complete, clamped, sender, now)
+                        .await;
+                } else {
+                    log::debug!(
+                        "vantage node: replay done ignored: reconnect replay disabled, sender={}",
+                        sender
+                    );
+                }
                 Vec::new()
             }
         }
@@ -3255,6 +3376,126 @@ mod tests {
             before,
             nudges_sent(&core),
             "no pending_low entry -- nothing to nudge"
+        );
+    }
+
+    // --- KNOB 1 (measurement ablation, `Parameters::reconnect_replay`): with the
+    // mechanism disabled, `VantageCore` must behave exactly as it did before it
+    // existed -- see that field's own doc comment for the full rationale. `Parameters
+    // ::default()` (what `test_core` builds with) has `reconnect_replay: true`, so
+    // these tests flip the field directly on the constructed core, the same
+    // established idiom `dispatch_publish_continues_established_episode_without_a_
+    // third_tick` above already uses for `resume_batch`.
+
+    /// `broadcast_recorded` -- the single choke point every one-shot AGB/consensus
+    /// broadcast passes through -- must leave the outbox empty and send DURABLE
+    /// (`Wire::broadcast_message`) rather than volatile when disabled. Observed via
+    /// `Wire::cancel_handlers`, the same seam `Wire::prune_cancel_handlers`'s own doc
+    /// comment already documents as the durable/volatile discriminator: "a VOLATILE
+    /// send never allocates a cancel handler at all ... `cancel_handlers` therefore
+    /// only ever grows from the traffic that stays durable".
+    #[tokio::test]
+    async fn broadcast_recorded_with_replay_disabled_skips_outbox_and_goes_durable() {
+        let mut core = test_core(0, "knob1_broadcast_recorded_disabled");
+        core.reconnect_replay = false;
+        assert!(core.wire.cancel_handlers.is_empty());
+        let other_primaries = core.wire.other_primaries.len();
+        assert!(
+            other_primaries > 0,
+            "test committee must have other primaries"
+        );
+
+        core.broadcast_recorded(PrimaryMessage::VantageWish(7, core.name))
+            .await;
+
+        assert!(
+            core.outbox.slice_from(0).next().is_none(),
+            "the outbox must stay empty when the mechanism is disabled"
+        );
+        assert_eq!(
+            core.wire.cancel_handlers.len(),
+            other_primaries,
+            "a durable broadcast allocates one cancel handler per other primary -- \
+             a volatile send would allocate none at all"
+        );
+    }
+
+    /// An incoming `ResumeHello` while disabled must produce no `Replay` enqueue and
+    /// no `pending_low`/in-flight state change -- fully inert, not merely served
+    /// less aggressively. Content already sitting in the outbox (e.g. left over
+    /// from before the flag was flipped) must not be served from either.
+    #[tokio::test]
+    async fn resume_hello_is_a_no_op_when_replay_is_disabled() {
+        let mut core = test_core(0, "knob1_resume_hello_disabled");
+        core.reconnect_replay = false;
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+
+        let mut rx = intercept_resume_channel(&mut core);
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), Instant::now())
+            .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no Replay must ever be enqueued while the mechanism is disabled"
+        );
+        assert!(
+            !core.pending_low.contains_key(&peer),
+            "pending_low must not change"
+        );
+        assert!(
+            !core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            "the in-flight map must not change"
+        );
+    }
+
+    /// `ReplayDone` while disabled is equally inert -- no episode ever opens.
+    #[tokio::test]
+    async fn replay_done_is_a_no_op_when_replay_is_disabled() {
+        let mut core = test_core(0, "knob1_replay_done_disabled");
+        core.reconnect_replay = false;
+        let (author, _) = crate::common::keys()[1];
+
+        core.dispatch_inbound(
+            Inbound::ReplayDone(42, false, false, author),
+            Instant::now(),
+        )
+        .await;
+
+        assert!(
+            !core.replay_episodes.is_open(&author),
+            "an incomplete Done must not open an episode while disabled"
+        );
+    }
+
+    /// The `resume_tick` arm's own v3 body (episode re-ask + nudge,
+    /// `resume_tick_replay_effects`) is inert when disabled -- no Hello sent (no
+    /// episode opens) and no nudge counted, even with `pending_low` set (e.g. stale
+    /// state from before the flag was flipped). Mechanism A's own `try_resume_request`
+    /// is a separate call in `run`'s loop, not part of this method -- see that
+    /// method's own doc comment.
+    #[tokio::test]
+    async fn resume_tick_replay_effects_are_inert_when_disabled() {
+        let mut core = test_core(0, "knob1_resume_tick_disabled");
+        core.reconnect_replay = false;
+        let (author, _) = crate::common::keys()[1];
+        core.pending_low.insert(author, 5);
+        let now = Instant::now();
+        let backoff = Duration::from_millis(core.resume_backoff_ms);
+        let max_age = Duration::from_millis(core.replay_episode_max_ms);
+        let nudges_before = nudges_sent(&core);
+
+        core.resume_tick_replay_effects(author, now, backoff, max_age)
+            .await;
+
+        assert!(
+            !core.replay_episodes.is_open(&author),
+            "no episode must open while disabled"
+        );
+        assert_eq!(
+            nudges_before,
+            nudges_sent(&core),
+            "no nudge must fire while disabled"
         );
     }
 }

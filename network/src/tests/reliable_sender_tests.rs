@@ -516,6 +516,35 @@ async fn detached_entry_survives_the_waiter_and_is_delivered_on_reconnect() {
     assert!(handle.await.is_ok());
 }
 
+// --- KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`).
+//
+// The reconnect-waiter's exponential backoff caps out after several real
+// reconnect attempts (200ms doubling to the ceiling) -- exercising that end-to-end
+// would need either real wall-clock waits (flaky, and this crate's own tests
+// elsewhere deliberately avoid that class of test) or paused-virtual-time
+// machinery this codebase doesn't otherwise use. Pinning the plumbed field
+// directly is the appropriate level of test here instead: it proves
+// `with_retry_backoff_max_ms` is honored on the sender (overriding the documented
+// default), which is the one thing `spawn_connection` forwards, unmodified, into
+// every `Connection` it spawns (`Connection::run`'s own `delay = min(2*delay,
+// self.retry_backoff_max_ms)` is the sole consumer).
+
+/// `ReliableSender::new()` defaults to `DEFAULT_RETRY_BACKOFF_MAX_MS` (2000ms,
+/// reproducing the cap this field replaced exactly), and `with_retry_backoff_max_ms`
+/// overrides it.
+#[test]
+fn with_retry_backoff_max_ms_overrides_the_default() {
+    let default_sender = ReliableSender::new();
+    assert_eq!(
+        default_sender.retry_backoff_max_ms,
+        DEFAULT_RETRY_BACKOFF_MAX_MS
+    );
+    assert_eq!(DEFAULT_RETRY_BACKOFF_MAX_MS, 2_000);
+
+    let overridden = ReliableSender::new().with_retry_backoff_max_ms(250);
+    assert_eq!(overridden.retry_backoff_max_ms, 250);
+}
+
 /// (d): a detached-durable entry still awaiting an ack when the session dies is
 /// requeued (never discarded, unlike a volatile entry) -- the SAME `key = None`
 /// session-death treatment an ordinary durable entry gets -- and delivered once

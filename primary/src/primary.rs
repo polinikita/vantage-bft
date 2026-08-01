@@ -735,6 +735,10 @@ impl Primary {
                     parameters.withhold_window.clone(),
                     metrics.clone(),
                     batch,
+                    // KNOB 2 (measurement ablation): applies to Autobahn's own
+                    // primary-to-primary pool too -- see `Parameters::
+                    // retry_backoff_max_ms`'s own doc comment.
+                    parameters.retry_backoff_max_ms,
                 );
 
                 Committer::spawn(

@@ -265,6 +265,11 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "resume_check_period_ms": 1000,
         "resume_backoff_ms": 4000,
         "resume_batch": 64,
+        # Measurement ablation (KNOB 1/2): see --no-reconnect-replay/
+        # --retry-backoff-max-ms's own help text -- these two flags create three
+        # cleanly separable benchmark arms (true-before / cap-only / full).
+        "reconnect_replay": not args.no_reconnect_replay,
+        "retry_backoff_max_ms": args.retry_backoff_max_ms,
     }
 
 
@@ -440,6 +445,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--ack-watermarks", action="store_true")
     p.add_argument("--ack-watermark-period-ms", type=int, default=50)
     p.add_argument("--digest-statements", action="store_true")
+    p.add_argument("--no-reconnect-replay", action="store_true",
+                   help="Measurement ablation KNOB 1: disable the server-floored "
+                        "volatile one-shot replay mechanism (outbox + Hello/Done "
+                        "exchange). ON by default; this flag restores pre-mechanism "
+                        "behavior -- one-shot AGB/consensus broadcasts go out durable, "
+                        "unrecorded. Vantage only (no effect on autobahn-*/simple-it*). "
+                        "Pair with --retry-backoff-max-ms to isolate this mechanism's "
+                        "own effect from the reconnect backoff cap that changed "
+                        "alongside it.")
+    p.add_argument("--retry-backoff-max-ms", type=int, default=2000,
+                   help="Measurement ablation KNOB 2: the reconnect-waiter's "
+                        "exponential-backoff ceiling, ms. Transport-level -- applies "
+                        "uniformly to every protocol's primary-to-primary connections. "
+                        "Default 2000 (today's cap); pass 60000 to reproduce the "
+                        "pre-cap-change baseline.")
     p.add_argument("--withhold", type=int, default=0)
     p.add_argument("--withhold-at", type=int, default=None)
     p.add_argument("--withhold-for", type=int, default=30)

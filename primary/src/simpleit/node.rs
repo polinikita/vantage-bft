@@ -513,6 +513,11 @@ impl SimpleItCore {
             in_flight.clone(),
             parameters.replay_chunk_bytes,
             parameters.replay_chunk_interval_ms,
+            // KNOB 2 (measurement ablation, `config::Parameters::
+            // retry_backoff_max_ms`): transport-level, applies to Simple-IT's
+            // resume-sender pool too -- see `spawn_resume_sender`'s own doc
+            // comment.
+            parameters.retry_backoff_max_ms,
         );
 
         let core = Self {
@@ -526,7 +531,16 @@ impl SimpleItCore {
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
-                        .with_batching(batch);
+                        .with_batching(batch)
+                        // KNOB 2 (measurement ablation, `config::Parameters::
+                        // retry_backoff_max_ms`): transport-level, applies to
+                        // Simple-IT's main pool too -- see that field's own doc
+                        // comment. Unlike Vantage, Simple-IT never attaches
+                        // `with_reconnect_events`/`with_drop_map` here at all
+                        // (KNOB 1's reconnect-replay mechanism is Vantage-only --
+                        // see the comment above `resume_tx`'s own construction),
+                        // so this is the only new knob this pool needs.
+                        .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms);
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
                     }

@@ -257,6 +257,13 @@ impl Core {
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
+        // KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`):
+        // resolved once by the caller (`Primary::spawn`, a plain
+        // `parameters.retry_backoff_max_ms` copy) -- appended last, same
+        // resolved-once-at-spawn convention as `batch` immediately above. See that
+        // field's own doc comment: transport-level, applies to every protocol's
+        // primary-to-primary `ReliableSender` uniformly, not just Vantage's.
+        retry_backoff_max_ms: u64,
     ) {
         tokio::spawn(async move {
             Self {
@@ -287,7 +294,11 @@ impl Core {
                 network: ReliableSender::new()
                     .with_latency(latency_map)
                     .with_metrics(metrics)
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    // KNOB 2 (measurement ablation): applies to Autobahn's own
+                    // primary-to-primary pool too -- see `retry_backoff_max_ms`'s
+                    // own doc comment on this fn's signature.
+                    .with_retry_backoff_max_ms(retry_backoff_max_ms),
                 withheld_header_dests,
                 withhold_window,
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
