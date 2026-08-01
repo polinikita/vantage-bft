@@ -1247,12 +1247,40 @@ impl VantageCore {
         self.serve_budget.record(sender, served_bytes, now, backoff);
 
         let done = PrimaryMessage::VantageReplayDone(end_key, complete, clamped, self.name);
+        // Adversarial-audit FINDING 1 (MAJOR, the observed 60s serve stalls):
+        // insert into the shared in-flight map BEFORE `enqueue_replay`'s
+        // `try_send`, never after. `try_send` makes the stream visible to
+        // `run_resume_sender` immediately; on a quiet system that task's own
+        // ticker is starved (`if !streams.is_empty()` guards `tokio::time::
+        // interval::tick()`, so the interval is never polled while idle), and
+        // with `MissedTickBehavior::Delay` its first poll after a stream finally
+        // arrives fires IMMEDIATELY -- the task can pop the stream, drain a
+        // small slice in one chunk pass, send `Done`, and run `in_flight.
+        // remove(&peer)` as a no-op, ALL before this core's own insert below
+        // ever ran -- plain thread parallelism between two tokio tasks, present
+        // whether or not the `log::debug!` calls around this code are compiled
+        // in. Inserting first closes the window: the task's `remove` always
+        // finds the entry that was placed here, never races one that hasn't
+        // happened yet. On `!enqueued` (the stream never actually reached the
+        // task), the entry is removed again immediately below -- restoring
+        // today's `pending_low`-untouched contract exactly. Do NOT instead move
+        // the insert into the task itself: the window between THIS core's
+        // enqueue and the task's own dequeue would then read the map as
+        // `Absent`, letting a backoff-driven retry Hello enqueue a SECOND,
+        // duplicate stream whose own in-flight marker and this one's would then
+        // cross-clear each other.
+        self.wire.in_flight.lock().unwrap().insert(sender, now);
         let enqueued = self.wire.enqueue_replay(sender, msgs, done);
         // --- end await-free section ---
 
         if !enqueued {
             // audit-3 A2: `Wire::enqueue_replay` already counted the drop metric;
-            // `pending_low` stays untouched -- the next nudge/tick re-asks.
+            // `pending_low` stays untouched -- the next nudge/tick re-asks. The
+            // in-flight entry inserted above never corresponded to a real
+            // stream (nothing was ever handed to the task) -- remove it now, or
+            // it would spuriously block a later, successful ask for `sender`
+            // until the unrelated 60s TTL expiry eventually sweeps it.
+            self.wire.in_flight.lock().unwrap().remove(&sender);
             log::debug!(
                 "vantage node: resume serve suppressed: sender={} served_from={} gate=enqueue-failed",
                 sender,
@@ -1269,7 +1297,6 @@ impl VantageCore {
             complete,
             clamped
         );
-        self.wire.in_flight.lock().unwrap().insert(sender, now);
         if complete {
             self.pending_low.remove(&sender);
         } else {
@@ -1294,6 +1321,14 @@ impl VantageCore {
     /// entirely in the AUTHOR's own `pending_low` (§2.4) -- the requester's floor
     /// is a hint only (D4 caveat (iii)), so there is nothing here to advance --
     /// logged (diagnostics only) below, never otherwise consulted.
+    ///
+    /// D4 addendum (audit note; no code change): a forged `Done(complete=false,
+    /// sender=j)` (`j` need not have any real stream toward us at all) buys `j`
+    /// exactly one extra durable Hello from us, via the continuation branch below
+    /// -- linear in the number of forged Dones sent, no amplification, and bounded
+    /// by the same ordinary durable-send accounting `send_resume_hello` always
+    /// costs. Not a suppression lever either way: it can only ever cause an EXTRA
+    /// ask toward `j`, never fewer.
     async fn on_replay_done(
         &mut self,
         end_key: View,
@@ -3020,6 +3055,69 @@ mod tests {
             PrimaryMessage::VantageReplayDone(_, true, false, _)
         ));
         assert!(!core.pending_low.contains_key(&peer));
+    }
+
+    /// **Adversarial-audit FINDING 1** (MAJOR, the observed 60s serve stalls):
+    /// insert-after-enqueue race. `enqueue_replay`'s `try_send` makes the stream
+    /// visible to `run_resume_sender` immediately; that task's own ticker is
+    /// starved on a quiet system (`if !streams.is_empty()` never polls it while
+    /// idle), so with `MissedTickBehavior::Delay` its first poll after a stream
+    /// arrives fires IMMEDIATELY -- the task can pop/send/`remove` before the
+    /// core's own insert runs, if the insert happens AFTER the enqueue (plain
+    /// thread parallelism between two tokio tasks, not reproducible
+    /// deterministically in a single-threaded unit test -- what IS deterministic,
+    /// and what this test pins, is the STATE INVARIANT the fix establishes:
+    /// inserting before enqueueing means the marker is always present by the
+    /// time the enqueue's own effects could possibly become visible to a
+    /// consumer, so a "task-side remove" -- simulated directly here, standing in
+    /// for `run_resume_sender`'s own tail -- always finds it).
+    #[tokio::test]
+    async fn resume_hello_in_flight_marker_is_present_for_a_task_side_remove_to_find() {
+        let mut core = test_core(0, "reconnect_finding1_success");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+
+        let mut rx = intercept_resume_channel(&mut core);
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), Instant::now())
+            .await;
+
+        assert!(rx.try_recv().is_ok(), "the ask must have been enqueued");
+        assert!(
+            core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            "the in-flight marker must be present once a Replay has been enqueued"
+        );
+        // Simulate the task-side remove (`run_resume_sender`'s own tail, run
+        // after it sends that stream's `Done`) -- it must always find the entry
+        // the core placed, never race one that hasn't happened yet.
+        assert!(
+            core.wire.in_flight.lock().unwrap().remove(&peer).is_some(),
+            "a task-side remove must always find the entry -- insert-before-\
+             enqueue closes the window where it could race an insert that \
+             hasn't happened yet"
+        );
+    }
+
+    /// FINDING 1's complementary path: a forced `try_send` failure means no
+    /// stream ever reached the task -- the in-flight entry inserted just before
+    /// the attempt must be removed again immediately, never left stranded until
+    /// the unrelated 60s TTL expiry sweeps it. (Also covered incidentally by
+    /// `try_send_failure_leaves_pending_low_unchanged_and_next_ask_recovers`
+    /// above; kept as its own focused test for direct traceability to this
+    /// finding.)
+    #[tokio::test]
+    async fn resume_hello_enqueue_failure_leaves_no_stranded_in_flight_entry() {
+        let mut core = test_core(0, "reconnect_finding1_failure");
+        let (peer, _) = crate::common::keys()[1];
+        core.outbox.record(5, Bytes::from_static(b"five"));
+
+        break_resume_channel(&mut core);
+        core.dispatch_inbound(Inbound::ResumeHello(5, peer), Instant::now())
+            .await;
+
+        assert!(
+            !core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            "a failed enqueue must never strand an in-flight entry"
+        );
     }
 
     /// §2.6: `Done(complete=false)` is a continuation -- the episode toward the

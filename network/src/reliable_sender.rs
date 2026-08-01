@@ -323,6 +323,42 @@ impl ReliableSender {
                 .await;
         }
     }
+
+    /// Adversarial-audit FINDING 2: a durable send with NO cancel handler at all --
+    /// see `SendClass::DurableDetached`'s own doc comment for why this is NOT the
+    /// same thing as calling `send` and dropping the returned `CancelHandler`
+    /// early (that leaves a now-cancellable entry; this never allocates one to
+    /// begin with, so there is nothing for a checkpoint to find "all closed").
+    /// Retried-until-ack and requeued across reconnects exactly like `send`.
+    /// For a caller that genuinely never needs the handle -- e.g. `vantage::wire`'s
+    /// resume-sender task, whose `Replay`/`Done` frames must stay durable without
+    /// the task itself tracking their individual completion.
+    pub async fn send_detached(&mut self, address: SocketAddr, data: Bytes) {
+        if !self.connections.contains_key(&address) {
+            let tx = self.spawn_connection(address);
+            self.connections.insert(address, tx);
+        }
+        self.connections
+            .get(&address)
+            .unwrap()
+            .send(InnerMessage {
+                data,
+                class: SendClass::DurableDetached,
+            })
+            .await
+            .expect("Failed to send internal message");
+    }
+
+    /// Typed variant of `send_detached` (see `send_typed`).
+    pub async fn send_detached_typed(
+        &mut self,
+        address: SocketAddr,
+        data: Bytes,
+        msg_type: &'static str,
+    ) {
+        record_typed_sent(&self.metrics, msg_type, data.len());
+        self.send_detached(address, data).await;
+    }
 }
 
 /// Shared by `ReliableSender`/`SimpleSender`'s `*_typed` methods: increments the two
@@ -344,14 +380,39 @@ pub(crate) fn record_typed_sent(
     }
 }
 
-/// reconnect-replay plan §7: a message's send class -- exactly one of a durable reply
+/// reconnect-replay plan §7: a message's send class. `Durable` carries a live reply
 /// target (today's cancel-handler semantics, retried-until-ack, requeued forever
-/// across reconnects) or a volatile filing key (no reply target at all -- audit m8).
-/// An enum (rather than two parallel `Option`s that could both be `Some`/`None`)
-/// makes "exactly one of the two" a type-level invariant instead of a runtime one.
+/// across reconnects). `Volatile` carries a filing key instead (no reply target at
+/// all -- audit m8) and is discarded, never requeued, at session death.
+///
+/// `DurableDetached` (adversarial-audit FINDING 2): durable requeue/retry semantics
+/// identical to `Durable`, but with NO reply target at all -- for a caller that
+/// truly never wants to track completion, not merely one that forgot to. This is
+/// NOT the same as a caller dropping `Durable`'s `CancelHandler` early: doing that
+/// leaves a non-empty `ReplyTargets` whose one (or, coalesced, several) entries are
+/// all already closed, which `all_closed` correctly reports `true` for -- the A1
+/// guard exempts only an EMPTY vec, so a bundle with a dropped-but-once-present
+/// handler is (correctly) cancellable, and every pre-transmission checkpoint
+/// (pre-send skip, delayed-pop skip, waiter retain) is then free to silently drop it
+/// before it ever reaches the socket. `run_resume_sender`'s `Replay`/`Done` frames
+/// were hitting exactly this: `send_typed`'s returned `CancelHandler` was discarded
+/// at the end of the send statement, `is_closed()` flips true the instant that
+/// `oneshot::Receiver` drops, and the frame could vanish pre-transmission -- durable
+/// in name only, and the exact silent one-shot loss (the B1 class) v3 exists to
+/// exclude, compounded by `pending_low` having already been raised/cleared on the
+/// core's side for a span that might never actually transmit. `DurableDetached`
+/// never allocates a `oneshot::channel` in the first place, so `ReplyTargets` for
+/// such an entry is empty by construction (like `Volatile`'s), which the A1 guard
+/// DOES correctly treat as never-closed -- and unlike `Volatile`, its filing key
+/// slot is `None`, so the EXISTING buffer/pending_replies/session-death-tail code
+/// (which already branches on `key: Option<u64>` -- `None` = durable-requeue,
+/// `Some` = volatile-discard) requeues it across reconnects with zero changes to
+/// that logic. An enum (rather than parallel `Option`s) makes "exactly one of the
+/// three" a type-level invariant instead of a runtime one.
 #[derive(Debug)]
 enum SendClass {
     Durable(oneshot::Sender<Bytes>),
+    DurableDetached,
     Volatile(u64),
 }
 
@@ -572,6 +633,12 @@ impl Connection {
                             // - Durable: buffered exactly as before (FIX 1a below);
                             //   The caller is responsible to clean up the buffer
                             //   through the cancel handlers.
+                            // - DurableDetached (adversarial-audit FINDING 2): same
+                            //   buffering as Durable, minus the handler -- there is
+                            //   none to retain-scan for (there never was one), so
+                            //   `all_closed` on its empty `ReplyTargets` is always
+                            //   `false` (A1) and it survives exactly like Durable
+                            //   does, across as many reconnects as it takes.
                             // - Volatile: NEVER buffered -- counted (min-merged into
                             //   the drop map, exactly like the three `keep_alive_*`
                             //   session-death discard sites) and dropped immediately.
@@ -633,6 +700,15 @@ impl Connection {
                                         self.buffer.push_back((data, vec![h], None));
                                         self.buffer.retain(|(_, handlers, _)| !all_closed(handlers));
                                     }
+                                    SendClass::DurableDetached => {
+                                        // Same FIX 1a bundle-framing requirement as
+                                        // `Durable` above -- the wire format cares
+                                        // whether batching is on, not whether a
+                                        // handler happens to exist.
+                                        let data = if self.batch.enabled { encode_bundle(&[data]) } else { data };
+                                        self.buffer.push_back((data, Vec::new(), None));
+                                        self.buffer.retain(|(_, handlers, _)| !all_closed(handlers));
+                                    }
                                     SendClass::Volatile(k) => self.report_dropped(Some(k)),
                                 }
                             }
@@ -669,6 +745,15 @@ impl Connection {
     /// switch" -- this is the one call site that split would otherwise have
     /// complicated); a volatile bundle's own key is reduced (min) only once, at
     /// flush time (see the two `flush_*` helpers below), never accumulated here.
+    ///
+    /// Adversarial-audit FINDING 2: `SendClass::DurableDetached` bypasses BOTH
+    /// coalescers entirely, always a singleton buffer entry (still bundle-wrapped
+    /// when batching is on -- the same wire-format requirement `Durable`'s own
+    /// entries have) -- there is no `oneshot::Sender` to fold into `durable_
+    /// coalescer`'s own generic slot, and this class's volume is bounded by
+    /// construction (`vantage::wire`'s own module doc: at most one budgeted replay
+    /// stream + its `Done` per peer at a time), so skipping coalescing costs
+    /// nothing worth adding a THIRD coalescer for.
     #[allow(clippy::too_many_arguments)]
     fn on_arrival(
         &mut self,
@@ -679,15 +764,21 @@ impl Connection {
         volatile_coalescer: &mut Coalescer<u64>,
         volatile_deadline: &mut Option<Instant>,
     ) {
-        if !self.batch.enabled {
-            let entry: BufferedEntry = match class {
-                SendClass::Durable(h) => (data, vec![h], None),
-                SendClass::Volatile(k) => (data, Vec::new(), Some(k)),
-            };
-            self.buffer.push_back(entry);
-            return;
-        }
         match class {
+            SendClass::DurableDetached => {
+                let data = if self.batch.enabled {
+                    encode_bundle(&[data])
+                } else {
+                    data
+                };
+                self.buffer.push_back((data, Vec::new(), None));
+            }
+            SendClass::Durable(h) if !self.batch.enabled => {
+                self.buffer.push_back((data, vec![h], None));
+            }
+            SendClass::Volatile(k) if !self.batch.enabled => {
+                self.buffer.push_back((data, Vec::new(), Some(k)));
+            }
             SendClass::Durable(h) => {
                 if durable_coalescer.push(data, h) {
                     *durable_deadline = Some(Instant::now() + self.batch.max_delay());

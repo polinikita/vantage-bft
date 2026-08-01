@@ -19,6 +19,18 @@
 // of an enqueue that looked successful -- the same acceptance class as any other
 // detached `tokio::spawn` task in this codebase, just with a distinct, user-visible
 // symptom (`vantage_replay_pending_low_nudges_total` climbing without bound).
+//
+// Adversarial-audit FINDING 2: `Replay`/`Done` frames ride `network::ReliableSender::
+// send_detached_typed` (detached-durable -- see `run_resume_sender`'s own doc comment
+// for why they must never carry a `CancelHandler` this task would just drop). Durable
+// means requeued forever against a peer that never reconnects, but this never grows
+// unbounded the way a naive "durable, no backpressure" send might: detached-durable
+// frames toward a single dead peer accumulate bounded by exactly one in-flight,
+// budget-capped replay stream (`replay_serve_max_bytes`, <= 8MB) plus that stream's
+// own terminating `Done`, because every serve is Hello-GATED (`Inbound::ResumeHello`
+// is what starts a stream at all -- see `VantageCore::on_resume_hello`'s own in-flight
+// check) -- nothing re-serves the SAME peer again while its one stream is still
+// marked in-flight, regardless of how long that peer stays unreachable.
 
 use crate::messages::Header;
 use crate::primary::PrimaryMessage;
@@ -710,6 +722,24 @@ async fn send_message_item(messages: &mut SimpleSender, to: SocketAddr, message:
 /// returns `None` and this loop, and the task with it, ends; nothing joins it
 /// explicitly, mirroring every other detached `tokio::spawn` in this codebase. See
 /// `spawn_resume_sender`'s own doc comment (audit-3 A9) for what a PANIC here means.
+///
+/// Adversarial-audit FINDING 2 (BLOCKER): both sends in the chunk-tick arm below use
+/// `ReliableSender::send_detached_typed`, NEVER `send_typed`. `send_typed` returns a
+/// `CancelHandler` (`oneshot::Receiver<Bytes>`); this task has never bound it to
+/// anything, so it used to drop at the end of that one statement -- and dropping a
+/// `Receiver` flips its paired `Sender::is_closed()` true IMMEDIATELY, which made
+/// `all_closed` (network's own A1-guarded predicate) report `true` for that entry at
+/// EVERY pre-transmission checkpoint (`network::Connection`'s pre-send skip,
+/// delayed-pop skip, waiter retain) between the moment `send_typed` returned and the
+/// moment the frame actually left the socket -- a window batching alone widens to up
+/// to 5ms. A `Replay` chunk or `Done` frame could therefore vanish AFTER `pending_
+/// low` was already raised (or cleared, for `Done`) on the strength of it having
+/// been "sent": silent, permanent, one-shot loss -- the exact B1 class v3 exists to
+/// exclude. `send_detached_typed` never allocates that `oneshot::channel` at all, so
+/// there is nothing to drop and nothing for `all_closed` to see as closed (its
+/// `ReplyTargets` is empty, which the A1 guard already treats as never-cancellable);
+/// it is durable-requeued across reconnects exactly like an ordinary `send_typed`
+/// call whose handler the caller correctly kept alive.
 async fn run_resume_sender(
     mut rx: mpsc::Receiver<ResumeSend>,
     mut messages: SimpleSender,
@@ -751,12 +781,18 @@ async fn run_resume_sender(
                 while sent < chunk_bytes {
                     let Some(bytes) = stream.msgs.pop_front() else { break };
                     sent += bytes.len();
-                    replay.send_typed(stream.to, bytes, "Replay").await;
+                    // Adversarial-audit FINDING 2 (BLOCKER): `send_detached_typed`,
+                    // never `send_typed` -- see this fn's own doc comment for why a
+                    // discarded `CancelHandler` here was silently losing frames
+                    // pre-transmission.
+                    replay.send_detached_typed(stream.to, bytes, "Replay").await;
                 }
                 if stream.msgs.is_empty() {
                     let msg_type = stream.done.type_name();
                     let done_bytes = bincode::serialize(&stream.done).expect("serializes");
-                    replay.send_typed(stream.to, Bytes::from(done_bytes), msg_type).await;
+                    replay
+                        .send_detached_typed(stream.to, Bytes::from(done_bytes), msg_type)
+                        .await;
                     in_flight.lock().unwrap().remove(&stream.peer);
                 } else {
                     streams.push_back(stream);

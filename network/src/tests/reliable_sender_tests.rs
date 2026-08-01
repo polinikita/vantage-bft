@@ -431,3 +431,123 @@ async fn interleaved_arrivals_while_disconnected_only_durable_survives() {
     assert!(cancel_handler.await.is_ok());
     assert!(handle.await.is_ok());
 }
+
+// --- Adversarial-audit FINDING 2 (BLOCKER): `SendClass::DurableDetached` /
+// `send_detached`/`send_detached_typed`. The suite above never caught the
+// underlying bug (every existing durable-send test holds its `CancelHandler` for
+// the test's own duration, which is exactly what made `all_closed` see it as
+// still-open) -- these tests specifically exercise the shape that DID break:
+// nothing at all retaining a handler between the send call and the frame
+// actually reaching the wire.
+
+/// (a): `send_detached` never allocates a `CancelHandler` in the first place --
+/// unlike `send`, there is nothing for the caller to (accidentally) drop early.
+/// A frame sent this way must still reach the wire.
+#[tokio::test]
+async fn send_detached_has_no_handler_to_drop_and_still_transmits() {
+    let address = "127.0.0.1:5311".parse::<SocketAddr>().unwrap();
+    let message = "detached-durable";
+    let handle = listener(address, message.to_string());
+
+    let mut sender = ReliableSender::new();
+    sender.send_detached(address, Bytes::from(message)).await;
+
+    assert!(handle.await.is_ok());
+}
+
+/// (b): end-to-end, a `Done`-shaped frame sent via `send_detached_typed` -- the
+/// exact call `run_resume_sender` makes -- is received even after the sender-side
+/// call's own scope has fully ended. With `send`/`send_typed`, the returned
+/// `CancelHandler` would drop at the closing brace below; `send_detached_typed`
+/// never creates one, so there is nothing whose lifetime could matter.
+#[tokio::test]
+async fn send_detached_typed_done_frame_survives_past_the_send_call_scope() {
+    let address = "127.0.0.1:5312".parse::<SocketAddr>().unwrap();
+    let message = "VantageReplayDone-shaped";
+    let handle = listener(address, message.to_string());
+
+    let mut sender = ReliableSender::new();
+    {
+        sender
+            .send_detached_typed(address, Bytes::from(message), "VantageReplayDone")
+            .await;
+        // The send call's own scope ends here.
+    }
+
+    assert!(
+        handle.await.is_ok(),
+        "the frame must still be received after the send call's scope ended"
+    );
+}
+
+/// (c) (mirrors the A1 regression `handler_less_volatile_entry_survives_pre_
+/// send_skip_on_a_live_session`): a detached-durable entry queued on a LIVE
+/// session survives the pre-send skip -- `all_closed` on its empty, never-
+/// populated `ReplyTargets` is always `false`, exactly like a volatile entry's.
+#[tokio::test]
+async fn detached_entry_survives_pre_send_skip_on_a_live_session() {
+    let address = "127.0.0.1:5313".parse::<SocketAddr>().unwrap();
+    let message = "detached-pre-send";
+    let handle = listener(address, message.to_string());
+
+    let mut sender = ReliableSender::new();
+    sender.send_detached(address, Bytes::from(message)).await;
+
+    assert!(handle.await.is_ok());
+}
+
+/// (c) (mirrors the A1 regression for the reconnect-waiter arm,
+/// `durable_arrival_while_disconnected_is_buffered_and_delivered_on_reconnect`):
+/// a detached-durable entry queued while DISCONNECTED survives the waiter's own
+/// retain sweep and is delivered once the connection re-establishes -- like an
+/// ordinary durable entry, never discarded like a volatile one.
+#[tokio::test]
+async fn detached_entry_survives_the_waiter_and_is_delivered_on_reconnect() {
+    let address = "127.0.0.1:5314".parse::<SocketAddr>().unwrap();
+    let message = "detached-waiter";
+
+    // No listener yet -- queued via the reconnect-waiter loop.
+    let mut sender = ReliableSender::new();
+    sender.send_detached(address, Bytes::from(message)).await;
+
+    sleep(Duration::from_millis(50)).await;
+    let handle = listener(address, message.to_string());
+
+    assert!(handle.await.is_ok());
+}
+
+/// (d): a detached-durable entry still awaiting an ack when the session dies is
+/// requeued (never discarded, unlike a volatile entry) -- the SAME `key = None`
+/// session-death treatment an ordinary durable entry gets -- and delivered once
+/// the connection re-establishes, unmodified.
+#[tokio::test]
+async fn detached_entry_is_requeued_across_a_session_death_like_any_durable_entry() {
+    let address = "127.0.0.1:5315".parse::<SocketAddr>().unwrap();
+    let message = "detached-requeued";
+    let expected_frame = Bytes::from(message);
+
+    let handle = tokio::spawn(async move {
+        let listener = TcpListener::bind(&address).await.unwrap();
+        let (first, _) = listener.accept().await.unwrap();
+        // Long enough for the detached send to actually reach the wire (moving
+        // it into `pending_replies`, awaiting an ack that never comes) before
+        // the peer disappears.
+        sleep(Duration::from_millis(100)).await;
+        drop(first);
+
+        let (second, _) = listener.accept().await.unwrap();
+        let (mut writer, mut reader) = Framed::new(second, LengthDelimitedCodec::new()).split();
+        match reader.next().await {
+            Some(Ok(received)) => {
+                assert_eq!(received.freeze(), expected_frame);
+                writer.send(Bytes::from("Ack")).await.unwrap();
+            }
+            _ => panic!("the detached entry was not requeued across the session death"),
+        }
+    });
+
+    let mut sender = ReliableSender::new();
+    sender.send_detached(address, Bytes::from(message)).await;
+
+    assert!(handle.await.is_ok());
+}
