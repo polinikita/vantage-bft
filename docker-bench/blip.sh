@@ -82,6 +82,19 @@ fi
 # `iptables_rule <-I|-D> <INPUT|OUTPUT> <-s|-d> <ip>`: branches on $MODE directly
 # rather than building a shared "extra args" array, so no call site needs to expand a
 # possibly-empty array under `set -u` (same bash-3.2 concern as above).
+#
+# CUT-MODE ASYMMETRY FIX (found by a debug-logged validation run): the INPUT
+# REJECT generates an RST toward the peer, but that RST is a locally-generated
+# packet and traverses THIS node's OUTPUT chain -- where the plain OUTPUT REJECT
+# ate it. Peers therefore never learned their connections died: from their side
+# the "cut" silently degraded to `drop` (pause) semantics -- TCP retransmitted
+# into the void and the SAME socket resumed after restore, so only this node's
+# own outbound sockets ever saw a reset (local RSTs from the OUTPUT REJECT).
+# The `--tcp-flags RST RST -j ACCEPT` rule, inserted ABOVE the OUTPUT REJECT,
+# lets outbound RSTs (and only RSTs -- a bare RST carries no payload, so this
+# leaks no data) through, making the cut symmetric: both sides' established
+# connections reset promptly, both sides' reconnect SYNs are refused fast, and
+# both sides exercise the reconnect path the `cut` mode exists to test.
 iptables_rule() {
     if [ "$MODE" = drop ]; then
         dexec iptables "$1" "$2" "$3" "$4" -j DROP
@@ -94,17 +107,30 @@ iptables_rule() {
     fi
 }
 
+# The RST-passthrough exception for cut mode (see the block comment above). Only
+# ever installed/removed on OUTPUT, above the REJECT rule (`-I OUTPUT` after the
+# REJECT was inserted puts this at position 1, in front of it).
+rst_passthrough() {
+    dexec iptables "$1" OUTPUT -d "$2" -p tcp --tcp-flags RST RST -j ACCEPT
+}
+
 dexec() { docker exec "$CONTAINER" "$@"; }
 
 apply() {
     for ip in "${PEER_IPS[@]}"; do
         iptables_rule -I INPUT  -s "$ip"
         iptables_rule -I OUTPUT -d "$ip"
+        if [ "$MODE" = cut ]; then
+            rst_passthrough -I "$ip"
+        fi
     done
 }
 
 remove() {
     for ip in "${PEER_IPS[@]}"; do
+        if [ "$MODE" = cut ]; then
+            rst_passthrough -D "$ip" 2>/dev/null || true
+        fi
         iptables_rule -D INPUT  -s "$ip" 2>/dev/null || true
         iptables_rule -D OUTPUT -d "$ip" 2>/dev/null || true
     done
