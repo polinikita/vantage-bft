@@ -11,7 +11,7 @@ pub mod common;
 
 pub use crate::batch::BatchConfig;
 pub use crate::receiver::{MessageHandler, Receiver, Writer};
-pub use crate::reliable_sender::{CancelHandler, ReliableSender};
+pub use crate::reliable_sender::{CancelHandler, DirtyMap, ReliableSender};
 pub use crate::simple_sender::SimpleSender;
 
 // PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item): per-destination
