@@ -59,10 +59,11 @@ label, which comes from each scrape target's static `labels:` block, not from th
 app):
 
 - **Overview**: a prominent protocol/mode stat panel (`protocol_info`/
-  `transaction_mode_info`, METRICS-DASHBOARD-SPEC.md §8), committed TPS (per-node
-  timeseries + total stat), committed bytes rate, real-transaction-latency
-  p50/p90/p99/max, seal-route rate (total + a fallback-route stat as a degradation
-  signal), latency misses.
+  `transaction_mode_info`, METRICS-DASHBOARD-SPEC.md §8), committed TPS (one
+  worker-0 series per validator + total stat), committed bytes rate, per-validator
+  ordering and materialized p50 transaction latency (both visually capped at one
+  second), seal-route rate (total + a fallback-route stat as a degradation signal),
+  and latency misses.
 - **Consensus** (Vantage-only -- empty/no-data on the two Autobahn paths, which never
   observe into these): view entry/seal/anchor rates, cursor lag (`entered_view -
   cursor_next_view`), control round, frontier `a_i`, control delivered-log

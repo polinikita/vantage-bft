@@ -142,12 +142,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s])))",
+          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
           "legendFormat": "total TPS",
           "refId": "A"
         }
       ],
-      "description": "committed_transactions is a per-worker-process counter and every node counts the same replicated commit sequence, so this sums within each host first, then takes the max across hosts (a flat sum would inflate by committee size).",
+      "description": "Every validator's worker-0 observes the replicated commit sequence, so the total is the maximum worker-0 rate rather than a committee-wide sum, which would inflate TPS by committee size.",
       "title": "Committed TPS (total)",
       "type": "stat"
     },
@@ -201,12 +201,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(sum by (host) (rate(committed_bytes{node=~\"$node\"}[10s])))",
+          "expr": "max(rate(committed_bytes{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
           "legendFormat": "total BPS",
           "refId": "A"
         }
       ],
-      "description": "committed_bytes is a per-worker-process counter and every node counts the same replicated commit sequence, so this sums within each host first, then takes the max across hosts (a flat sum would inflate by committee size).",
+      "description": "Every validator's worker-0 observes the replicated commit sequence, so the total is the maximum worker-0 byte rate rather than a committee-wide sum.",
       "title": "Committed bytes rate (total)",
       "type": "stat"
     },
@@ -339,7 +339,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 5
       },
@@ -364,13 +364,13 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s]))",
-          "legendFormat": "{{host}}",
+          "expr": "rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s])",
+          "legendFormat": "{{node}}",
           "refId": "A"
         }
       ],
-      "description": "committed_transactions is a per-worker-process counter and every node counts the same replicated commit sequence, so this breaks down by host (one physical machine, collapsing collocated primary+worker) rather than by per-process node -- summing per-process values here would double count a collocated primary+worker pair.",
-      "title": "Committed TPS per host",
+      "description": "One line per validator's worker-0 metrics endpoint. The node label names that validator and worker directly; no committee-wide sum is applied.",
+      "title": "Committed TPS per node",
       "type": "timeseries"
     },
     {
@@ -380,14 +380,16 @@
       },
       "fieldConfig": {
         "defaults": {
+          "max": 1000,
+          "min": 0,
           "unit": "ms"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 5
       },
       "id": 8,
@@ -411,39 +413,62 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg(transaction_committed_latency{node=~\"$node\",v=\"p50\"}) / 1000",
-          "legendFormat": "p50",
+          "expr": "clamp_max(transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000, 1000)",
+          "legendFormat": "{{node}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "avg(transaction_committed_latency{node=~\"$node\",v=\"p90\"}) / 1000",
-          "legendFormat": "p90",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "avg(transaction_committed_latency{node=~\"$node\",v=\"p99\"}) / 1000",
-          "legendFormat": "p99",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "max(transaction_committed_latency{node=~\"$node\",v=\"max\"}) / 1000",
-          "legendFormat": "max",
-          "refId": "D"
         }
       ],
-      "title": "Real transaction latency (p50/p90/p99/max, ms)",
+      "description": "Submission-to-ordering cumulative p50 for each validator's worker-0 endpoint. clamp_max bounds the plot at 1,000 ms; a line on the ceiling may represent a larger raw value.",
+      "title": "Ordering latency p50 per node (1 s cap)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "max": 1000,
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 5
+      },
+      "id": 33,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "clamp_max(transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000, 1000)",
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Submission-to-ordering-and-local-payload cumulative p50 for each validator's worker-0 endpoint. clamp_max bounds the plot at 1,000 ms; a line on the ceiling may represent a larger raw value.",
+      "title": "Materialized latency p50 per node (1 s cap)",
       "type": "timeseries"
     },
     {
@@ -1074,12 +1099,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(bytes_sent_total{node=~\"$node\"}) / max(sum by (host) (committed_bytes{node=~\"$node\"}))",
+          "expr": "sum(bytes_sent_total{node=~\"$node\"}) / max(committed_bytes{node=~\"$node\",node=~\".*-worker-0$\"})",
           "legendFormat": "overhead ratio",
           "refId": "A"
         }
       ],
-      "description": "bytes_sent_total is genuinely additive across processes (real network egress) so it stays a flat sum; committed_bytes is a replicated-counter, so its denominator sums within each host first, then takes the max across hosts.",
+      "description": "bytes_sent_total is genuinely additive across processes; committed_bytes is replicated, so the denominator uses the maximum validator worker-0 counter rather than summing the committee.",
       "title": "Overhead bytes per sequenced byte",
       "type": "stat"
     },
@@ -1133,12 +1158,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(bytes_sent_total{node=~\"$node\"}[10s])) / max(sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s]))) / 512",
+          "expr": "sum(rate(bytes_sent_total{node=~\"$node\"}[10s])) / max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s])) / 512",
           "legendFormat": "efficiency",
           "refId": "A"
         }
       ],
-      "description": "bytes_sent_total is genuinely additive across processes (real network egress) so it stays a flat sum; committed_transactions is a replicated-counter, so its denominator sums within each host first, then takes the max across hosts.",
+      "description": "bytes_sent_total is genuinely additive across processes; committed_transactions is replicated, so the denominator uses the maximum validator worker-0 rate rather than summing the committee.",
       "title": "Bandwidth efficiency (512B-normalized)",
       "type": "stat"
     },
@@ -1475,12 +1500,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(sum by (host) (rate(committed_transactions{node=~\"$node\"}[10s])))",
+          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
           "legendFormat": "committed/s",
           "refId": "B"
         }
       ],
-      "description": "submitted_transactions is emitted client-side, each client submitting a distinct slice of the load, so it stays a flat sum; committed_transactions is a per-worker-process counter and every node counts the same replicated commit sequence, so it sums within each host first, then takes the max across hosts.",
+      "description": "submitted_transactions is client-side and additive; committed_transactions is replicated, so committed/s uses the maximum validator worker-0 rate rather than summing the committee.",
       "title": "Submitted vs. sequenced (committed) transactions/s",
       "type": "timeseries"
     },
@@ -1759,6 +1784,6 @@
   "timezone": "browser",
   "title": "Vantage - local-benchmark / remote",
   "uid": "vantage-local-benchmark",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }
