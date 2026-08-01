@@ -223,7 +223,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
     # `reconcile_protocol`'s harmless-but-noisy mismatch warning on every node's log.
     use_optimistic_tips = args.protocol != "autobahn-seamless"
     return {
-        "timeout_delay": 1000,
+        "timeout_delay": args.timeout_delay_ms,
         "header_size": 1000,
         "max_header_delay": args.max_header_delay_ms,
         "gc_depth": 50,
@@ -436,6 +436,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     "with another docker-compose project already on this host")
     # Parameters passthrough (mirrors `node local-benchmark`'s own flag names).
     p.add_argument("--delta-ms", type=int, default=1000)
+    p.add_argument("--timeout-delay-ms", type=int, default=1000,
+                   help="protocol round timeout in milliseconds (default 1000; "
+                        "Simple-IT with Opt-RBC requires 8 * --delta-ms)")
     p.add_argument("--max-batch-delay-ms", type=int, default=20)
     p.add_argument("--max-header-delay-ms", type=int, default=50)
     p.add_argument("--no-batch-messages", action="store_true")
