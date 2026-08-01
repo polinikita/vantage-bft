@@ -78,9 +78,12 @@ app):
   requested/served (all Vantage-only), batches/s (both protocols), submitted vs.
   sequenced (committed) transactions/s, proposed block size (p50/p90/p99/max bytes,
   Vantage only).
-- **Node health**: Prometheus's own `up` (scrape status) by node, `VantageCore`
-  utilization by section (§3's four `utilization_timer{proc}` labels, as % busy),
-  `VantageCore` inbound-queue depth (`core_queue_length`).
+- **Node health**: Prometheus's own `up` (scrape status) by node; per-validator CPU
+  and resident memory summed across that validator's standalone primary and worker
+  processes; `VantageCore` utilization by section (§3's four
+  `utilization_timer{proc}` labels, as % busy); and `VantageCore` inbound-queue
+  depth (`core_queue_length`).  CPU is percent of one logical core and may exceed
+  100%; the client load generator is deliberately excluded.
 
 Panels for metrics a given protocol never observes into (e.g. every Vantage-only
 panel, when an Autobahn run is live) simply show no data -- by design ("panels show
@@ -100,3 +103,10 @@ repository root, same convention `fab` itself uses relative to `benchmark/`).
 (no recording rules; category grouping is done panel-side via label regexes instead,
 see "Dashboard" above) -- if `--data-dir` is overridden, either symlink it to
 `.local-bench` or set `PROMETHEUS_CONFIG` to match.
+
+Because native `local-benchmark` runs every validator as tasks inside one PID, the
+operating system cannot attribute CPU or resident memory to an individual validator.
+The per-node CPU/memory panels therefore intentionally show no data in that mode.
+They populate for Linux standalone-process deployments such as Docker/Colima and
+remote runs, where each primary and worker has its own process collector; the panel
+groups those process series back into one validator line.

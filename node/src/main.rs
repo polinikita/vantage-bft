@@ -545,7 +545,7 @@ async fn run(matches: &ArgMatches) -> Result<()> {
             let (_tx_pushdown_cert, rx_pushdown_cert) = channel(CHANNEL_CAPACITY);
             let (_tx_request_header_sync, rx_request_header_sync) = channel(CHANNEL_CAPACITY);
 
-            Primary::spawn(
+            let (_, _, registry) = Primary::spawn(
                 name,
                 committee.clone(),
                 parameters.clone(),
@@ -561,6 +561,8 @@ async fn run(matches: &ArgMatches) -> Result<()> {
                 rx_request_header_sync,
                 tx_output,
             );
+            metrics::register_process_collector(&registry)
+                .context("Failed to register primary process metrics")?;
             /*Consensus::spawn(
                 name,
                 committee,
@@ -586,7 +588,9 @@ async fn run(matches: &ArgMatches) -> Result<()> {
                 .unwrap()
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
-            Worker::spawn(keypair.name, id, committee, parameters, store);
+            let (_, _, registry) = Worker::spawn(keypair.name, id, committee, parameters, store);
+            metrics::register_process_collector(&registry)
+                .context("Failed to register worker process metrics")?;
         }
         _ => unreachable!(),
     }

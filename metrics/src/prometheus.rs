@@ -14,6 +14,30 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 pub const METRICS_ROUTE: &str = "/metrics";
 
+/// Registers CPU-time and resident-memory metrics for this OS process.
+///
+/// Standalone primary/worker binaries call this after constructing their registry,
+/// giving Prometheus one `process_*` series per independently running process.  The
+/// in-process benchmark deliberately does not call it: all validators there share a
+/// PID, so attaching the same process collector to every per-validator registry would
+/// falsely duplicate whole-process resource usage.  The upstream collector is Linux-
+/// only; other platforms keep the endpoint operational but expose no `process_*`
+/// series.
+pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        registry.register(Box::new(
+            prometheus::process_collector::ProcessCollector::for_self(),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = registry;
+        Ok(())
+    }
+}
+
 /// Always-on Prometheus text-exposition endpoint (starfish parity: it also serves
 /// Phase-3+ protocol metrics once those land on the same registry).
 pub fn start_prometheus_server(
@@ -39,5 +63,26 @@ async fn metrics(registry: Extension<Registry>) -> (StatusCode, String) {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Unable to encode metrics: {error}"),
         ),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_collector_exports_cpu_and_resident_memory() {
+        let registry = Registry::new();
+        register_process_collector(&registry).unwrap();
+
+        let names: Vec<_> = registry
+            .gather()
+            .into_iter()
+            .map(|family| family.get_name().to_owned())
+            .collect();
+        assert!(names.iter().any(|name| name == "process_cpu_seconds_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "process_resident_memory_bytes"));
     }
 }

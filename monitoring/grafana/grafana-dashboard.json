@@ -1612,7 +1612,7 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 8,
+        "w": 6,
         "x": 0,
         "y": 79
       },
@@ -1652,15 +1652,111 @@
       },
       "fieldConfig": {
         "defaults": {
+          "min": 0,
           "unit": "percent"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 7,
-        "w": 10,
-        "x": 8,
+        "w": 9,
+        "x": 6,
         "y": 79
+      },
+      "id": 34,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "100 * sum by (validator) (label_replace(rate(process_cpu_seconds_total{node=~\"$node\"}[10s]), \"validator\", \"$1\", \"node\", \"(.*)-(primary|worker-[0-9]+)\"))",
+          "legendFormat": "{{validator}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Per-validator CPU used by its standalone primary and worker processes, expressed as percent of one logical core and excluding the client load generator. Values may exceed 100% when a validator uses multiple cores. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
+      "title": "CPU usage per node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 9,
+        "x": 15,
+        "y": 79
+      },
+      "id": 35,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (validator) (label_replace(process_resident_memory_bytes{node=~\"$node\"}, \"validator\", \"$1\", \"node\", \"(.*)-(primary|worker-[0-9]+)\"))",
+          "legendFormat": "{{validator}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Per-validator resident memory summed across its standalone primary and worker processes, excluding the client load generator. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
+      "title": "Resident memory per node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 16,
+        "x": 0,
+        "y": 86
       },
       "id": 31,
       "options": {
@@ -1704,9 +1800,9 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 6,
-        "x": 18,
-        "y": 79
+        "w": 8,
+        "x": 16,
+        "y": 86
       },
       "id": 32,
       "options": {
@@ -1784,6 +1880,6 @@
   "timezone": "browser",
   "title": "Vantage - local-benchmark / remote",
   "uid": "vantage-local-benchmark",
-  "version": 3,
+  "version": 4,
   "weekStart": ""
 }

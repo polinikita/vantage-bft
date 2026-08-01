@@ -13,7 +13,7 @@ pub use crate::metrics::{
     AsPrometheusMetric, HistogramReporter, MetricReporter, Metrics, UtilizationTimer,
     UtilizationTimerVecExt,
 };
-pub use crate::prometheus::start_prometheus_server;
+pub use crate::prometheus::{register_process_collector, start_prometheus_server};
 pub use crate::snapshot::{
     aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot,
     read_materialised_latency_snapshot, read_seal_route_counts, read_vantage_progress,
