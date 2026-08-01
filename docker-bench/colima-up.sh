@@ -13,110 +13,66 @@
 # protocol comparison. This script provisions a VM sized for the real workload.
 #
 # Modeled on dev-tools/iota-private-network/experiments/colima-up.sh in the iota
-# repo (same author, same host): native aarch64, vz + virtiofs, repo cloned onto
-# the VM's own large data disk rather than driven over a read-only host mount.
+# repo (same author, same host): native aarch64, vz + virtiofs.
 #
-# Usage:   ./colima-up.sh            (idempotent; reuses a running VM)
-#          ./colima-up.sh --sync     (only re-sync the repo into the VM)
+# UNLIKE that script, nothing is cloned into the VM and no experiment runs inside
+# it. Colima mounts $HOME read-WRITE under virtiofs (verified), and `colima start`
+# points the host docker CLI at this VM's daemon -- so `docker-bench/run.sh` is
+# driven from macOS exactly as before and only the daemon moves. That matters
+# because gen.py shells out to a native `cargo`/`node` binary for key generation,
+# which exists on the Mac and not in the VM. Everything the experiment needs on
+# Linux (tc netem, iptables) runs INSIDE the containers, which already ship
+# iproute2/iptables and hold NET_ADMIN, so the VM itself needs no provisioning.
+# Per-node RocksDB bind mounts land on the Mac filesystem over virtiofs; fine at
+# these rates, revisit if an I/O-heavy configuration says otherwise.
+#
+# Usage:   ./colima-up.sh      (idempotent; reuses a running VM)
+# Verify:  docker context ls   -> colima-<profile> should be CURRENT
+# Restore: docker context use desktop-linux; colima stop --profile <profile>
 set -euo pipefail
 
 PROFILE="${VANTAGE_COLIMA_PROFILE:-vantage}"
 CPU="${VANTAGE_COLIMA_CPU:-12}"
 MEMORY="${VANTAGE_COLIMA_MEM:-32}"   # GB
 DISK="${VANTAGE_COLIMA_DISK:-120}"   # GB
-VM_REPO_DIR="vantage"
-
-REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
-BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
 command -v colima >/dev/null 2>&1 || { echo "colima not installed: brew install colima docker" >&2; exit 1; }
 
-if [ "${1:-}" != "--sync" ]; then
-    if colima status --profile "$PROFILE" >/dev/null 2>&1; then
-        say "Colima '$PROFILE' already running -- reusing (CPU/memory changes need a manual stop/start)"
-    else
-        say "Starting Colima '$PROFILE' (${CPU} CPU / ${MEMORY} GB / ${DISK} GB, vz+virtiofs)"
-        colima start --profile "$PROFILE" \
-            --cpu "$CPU" --memory "$MEMORY" --disk "$DISK" \
-            --vm-type vz --mount-type virtiofs
-    fi
-
-    say "Provisioning VM packages (git, python3, curl, iptables, iproute2)"
-    colima ssh --profile "$PROFILE" -- bash -lc '
-        set -euo pipefail
-        sudo apt-get update -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            git python3 curl iptables iproute2 rsync >/dev/null
-        echo "  python3: $(python3 --version)"
-        echo "  iptables: $(command -v iptables)"
-    '
+if colima status --profile "$PROFILE" >/dev/null 2>&1; then
+    say "Colima '$PROFILE' already running -- reusing (CPU/memory changes need a manual stop/start)"
+else
+    say "Starting Colima '$PROFILE' (${CPU} CPU / ${MEMORY} GB / ${DISK} GB, vz+virtiofs)"
+    colima start --profile "$PROFILE" \
+        --cpu "$CPU" --memory "$MEMORY" --disk "$DISK" \
+        --vm-type vz --mount-type virtiofs
 fi
 
-# The repo lives on the VM's large data disk (vdb): docker-bench bind-mounts
-# per-node RocksDB stores and logs under docker-bench/data/, which must be
-# writable -- the macOS-side virtiofs mount is not a safe place for that, and
-# the root disk is too small. ~/vantage inside the VM is a symlink to it.
-say "Syncing branch '$BRANCH' into the VM (~/$VM_REPO_DIR on the data disk)"
-colima ssh --profile "$PROFILE" -- bash -lc "
-    set -euo pipefail
-    SRC='$REPO_ROOT'
-    LINK=\"\$HOME/$VM_REPO_DIR\"
-    BIG_PARENT=/mnt/lima-colima-$PROFILE
-    big_total=\$(df -BG --output=size \"\$BIG_PARENT\" 2>/dev/null | tail -1 | tr -dc 0-9 || echo 0)
-    if [ \"\${big_total:-0}\" -ge 50 ]; then
-        sudo mkdir -p \"\$BIG_PARENT\"; sudo chown \"\$(id -u):\$(id -g)\" \"\$BIG_PARENT\"
-        DST=\"\$BIG_PARENT/$VM_REPO_DIR\"
-        if [ -d \"\$LINK\" ] && [ ! -L \"\$LINK\" ]; then
-            [ -e \"\$DST\" ] || { sudo mv \"\$LINK\" \"\$DST\"; sudo chown -R \"\$(id -u):\$(id -g)\" \"\$DST\"; }
-            rm -rf \"\$LINK\"
-        fi
-        ln -sfn \"\$DST\" \"\$LINK\"
-    else
-        echo \"  WARNING: \$BIG_PARENT only \${big_total}G -- keeping repo on the root disk\"
-        DST=\"\$LINK\"
-    fi
+# `colima start` already switches the active docker context; make it explicit so a
+# re-run against an already-running VM also leaves the CLI pointed at it.
+docker context use "colima-$PROFILE" >/dev/null
 
-    if [ -d \"\$DST/.git\" ]; then
-        git -C \"\$DST\" fetch origin --prune 2>/dev/null || git -C \"\$DST\" fetch \"\$SRC\" --prune
-    else
-        git clone \"\$SRC\" \"\$DST\"
-    fi
-    git -C \"\$DST\" checkout -B '$BRANCH' 2>/dev/null || git -C \"\$DST\" checkout '$BRANCH'
-    git -C \"\$DST\" fetch \"\$SRC\" '$BRANCH'
-    git -C \"\$DST\" reset --hard FETCH_HEAD
-
-    # Overlay uncommitted working-tree state (modified + untracked, .gitignore
-    # respected), then apply deletions -- same contract as the iota script, so
-    # an experiment can run without committing first.
-    DIRTY=\$(git -C \"\$SRC\" ls-files -mo --exclude-standard)
-    if [ -n \"\$DIRTY\" ]; then
-        echo \"  overlaying \$(echo \"\$DIRTY\" | wc -l | tr -d ' ') uncommitted file(s)\"
-        printf '%s\n' \"\$DIRTY\" | rsync -a --files-from=- \"\$SRC/\" \"\$DST/\"
-    fi
-    git -C \"\$SRC\" ls-files -d | while IFS= read -r f; do
-        [ -n \"\$f\" ] && rm -f \"\$DST/\$f\"
-    done
-
-    git -C \"\$DST\" log --oneline -1
-    echo \"  repo on \$DST (\$(df -h --output=avail \"\$DST\" 2>/dev/null | tail -1 | tr -d ' ') free)\"
-"
+say "Active docker daemon"
+docker info --format '  CPUs={{.NCPU}}  Mem={{.MemTotal}}  Server={{.ServerVersion}}'
 
 cat <<EOF
 
 $(say "Ready")
-Run benchmarks FROM INSIDE the VM (the host's docker context is left untouched):
+Run benchmarks from macOS exactly as before -- the docker CLI now targets this VM:
 
-    colima ssh --profile $PROFILE
-    cd ~/$VM_REPO_DIR/docker-bench
+    cd docker-bench
     ./run.sh --nodes 4 --rate 200 --duration 120 --protocol vantage
+    ./blip.sh 0 all 15 cut          # from a second shell, mid-run
 
-Faults, from a second shell in the same VM:
-    cd ~/$VM_REPO_DIR/docker-bench && ./blip.sh 0 all 15 cut
+Metrics ports are published to the VM and forwarded to the Mac's loopback by
+Colima, so the existing 127.0.0.1:<port>/metrics scrapes keep working.
 
-Metrics are published on the VM's own loopback; from the Mac use
-'colima ssh --profile $PROFILE -- curl -s localhost:PORT/metrics', or add a
-port forward. Re-run this script to push new local commits/edits.
-Tear down: colima stop --profile $PROFILE
+Confirm the WAN emulation is live inside a running cluster (it is applied by
+each container's own generated tc-setup.sh, not by this script):
+    docker logs vantage-node-0 2>&1 | grep tc-setup
+    docker exec vantage-node-0 tc qdisc show dev eth0
+
+When finished, put the CLI back on Docker Desktop and stop the VM:
+    docker context use desktop-linux && colima stop --profile $PROFILE
 EOF
