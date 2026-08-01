@@ -272,9 +272,34 @@ impl ResumeServe {
 /// event, or by a `Done(complete=false)` continuation (§14 A3: silencing outright
 /// after a partial serve is exactly the bug that amendment fixes elsewhere; this
 /// type's own `open` has no such silencing -- see `VantageCore`'s `ReplayDone` arm).
+///
+/// Docker-validation regression (mutual-Hello-loop oscillator): reciprocation
+/// (`on_hello_received`, below) is gated by `last_hello_sent`, a SENT-memo that
+/// SURVIVES episode close -- per plan §7's exact sentence: "both sides memo
+/// `last_hello_at` at send; an incoming Hello reciprocates only if own `last_hello_
+/// at` for that peer is stale". Episode-PRESENCE gating (`is_open()` alone, this
+/// type's own earlier, defective form) is NOT equivalent: `Done(complete=true)`
+/// rides the task-owned replay pool's `ReliableSender` (its own TCP connection);
+/// the reciprocal Hello we're gating rides the MAIN pool's `send_message` (a
+/// DIFFERENT TCP connection, additionally delayed by that pool's own 5ms batching
+/// coalescer) -- two independent connections have no relative ordering guarantee
+/// AT ALL. Whenever a `Done(complete=true)` outraces the peer's own reciprocal
+/// Hello, presence-gating finds the episode ALREADY closed, reciprocates with a
+/// FRESH Hello, and the peer -- symmetrically racing the exact same way -- does
+/// the same back: the pair phase-locks into a mutual Hello/serve loop at the
+/// backoff period, forever (confirmed in docker: ~14 replay frames/s + ~0.6
+/// Hello/s steady chatter between two nodes, from boot, never quiescing). The
+/// sent-memo is immune BECAUSE closing an episode does not erase "I sent this
+/// peer a Hello moments ago" -- `last_hello_sent` is peer-scoped, not
+/// episode-scoped, and is updated at the actual send (`VantageCore::send_resume_
+/// hello`/`send_nudge_hello`), never touched by `close`.
 #[derive(Default)]
 pub struct ReplayEpisodes {
     open: HashMap<PublicKey, Episode>,
+    /// The sent-memo above -- committee-bounded (one entry per peer), so a plain
+    /// `HashMap` (never pruned, matching `resume::NudgeMemo::last`/`ServeBudget::
+    /// windows`'s identical convention elsewhere in this module).
+    last_hello_sent: HashMap<PublicKey, Instant>,
 }
 
 struct Episode {
@@ -304,6 +329,14 @@ impl ReplayEpisodes {
     /// backoff-gated (a one-shot event, or a continuation the server itself is
     /// actively answering, both warrant an immediate ask).
     pub fn open(&mut self, peer: PublicKey, now: Instant) {
+        // Diagnostics only (module doc: item 4f) -- distinguishes a genuinely NEW
+        // episode from a continuation's re-open; never consulted for correctness.
+        let cause = if self.open.contains_key(&peer) {
+            "reopened"
+        } else {
+            "opened"
+        };
+        log::debug!("vantage resume: episode {cause}: peer={peer}");
         self.open.insert(
             peer,
             Episode {
@@ -313,20 +346,37 @@ impl ReplayEpisodes {
         );
     }
 
-    /// (iii): reciprocation on receiving a Hello FROM `peer`. "Memo-deduped" (design
-    /// doc §2.6): if we already have an episode open toward `peer`, this leaves it
-    /// untouched and returns `false` -- our own tick (`tick`, below) is already
-    /// re-asking on its own backoff-gated schedule, and sending a SECOND, immediate
-    /// reciprocal Hello on every further incoming Hello would let two peers that
-    /// keep Hello-ing each other amplify without bound. Only a genuinely NEW episode
-    /// (nothing open yet toward `peer`) opens and returns `true` -- the caller sends
-    /// a Hello only then.
-    pub fn on_hello_received(&mut self, peer: PublicKey, now: Instant) -> bool {
+    /// (iii): reciprocation on receiving a Hello FROM `peer`. Gated by the SENT-
+    /// memo (`last_hello_sent`), per plan §7's exact sentence -- see this type's
+    /// own doc comment for why episode-presence gating alone is NOT equivalent
+    /// (the Done-vs-Hello cross-pool race). Reciprocates (opens a fresh episode,
+    /// returns `true`) iff NO episode is currently open toward `peer` AND EITHER
+    /// we have never sent `peer` a Hello, or `backoff` has elapsed since the last
+    /// one we sent -- otherwise a no-op, returning `false` (our own tick, or the
+    /// in-flight send this Hello likely raced, is already covering it).
+    pub fn on_hello_received(&mut self, peer: PublicKey, now: Instant, backoff: Duration) -> bool {
         if self.is_open(&peer) {
+            return false;
+        }
+        let sent_recently = self
+            .last_hello_sent
+            .get(&peer)
+            .is_some_and(|&at| now.duration_since(at) < backoff);
+        if sent_recently {
             return false;
         }
         self.open(peer, now);
         true
+    }
+
+    /// Records that a Hello was just sent to `peer` (ANY trigger -- event,
+    /// tick re-Hello, reciprocal, or nudge; `VantageCore::send_resume_hello`/
+    /// `send_nudge_hello` are this map's only two writers, so every actual send is
+    /// covered regardless of which of the four call sites triggered it). Deliberately
+    /// NOT touched by `close`/the expiry valve -- surviving episode close is the
+    /// entire point (this type's own doc comment).
+    pub fn record_hello_sent(&mut self, peer: PublicKey, now: Instant) {
+        self.last_hello_sent.insert(peer, now);
     }
 
     /// (ii) + the expiry valve: called once per `resume_tick` for every peer with an
@@ -347,6 +397,7 @@ impl ReplayEpisodes {
             return false;
         };
         if now.duration_since(episode.opened_at) >= max_age {
+            log::debug!("vantage resume: episode expired: peer={peer}");
             self.open.remove(&peer);
             return false;
         }
@@ -360,7 +411,9 @@ impl ReplayEpisodes {
 
     /// `VantageReplayDone(complete=true)`: this episode is answered, close it.
     pub fn close(&mut self, peer: &PublicKey) {
-        self.open.remove(peer);
+        if self.open.remove(peer).is_some() {
+            log::debug!("vantage resume: episode closed: peer={peer}");
+        }
     }
 }
 
@@ -900,24 +953,78 @@ mod tests {
     }
 
     /// (iii) "memo-deduped": the FIRST Hello from a peer we have no open episode
-    /// toward opens one and asks for a reciprocal send; a SECOND Hello while that
-    /// episode is still open must not re-trigger a send (the tick's own backoff-
-    /// gated schedule is already covering it).
+    /// toward (and have never sent) opens one and asks for a reciprocal send; a
+    /// SECOND Hello while that episode is still open must not re-trigger a send
+    /// (the tick's own backoff-gated schedule is already covering it).
     #[test]
     fn on_hello_received_is_memo_deduped() {
         let mut episodes = ReplayEpisodes::new();
         let peer = key(1);
         let now = Instant::now();
+        let backoff = Duration::from_millis(4_000);
 
         assert!(
-            episodes.on_hello_received(peer, now),
-            "the first Hello from a peer with no open episode must trigger a reciprocal send"
+            episodes.on_hello_received(peer, now, backoff),
+            "the first Hello from a peer with no open episode and no recent send \
+             must trigger a reciprocal send"
         );
         assert!(episodes.is_open(&peer));
         assert!(
-            !episodes.on_hello_received(peer, now + Duration::from_millis(10)),
+            !episodes.on_hello_received(peer, now + Duration::from_millis(10), backoff),
             "a second Hello while the episode is already open must not re-trigger a send"
         );
+    }
+
+    /// **Docker-validation regression**: the mutual-Hello-loop oscillator. `A` has
+    /// an open episode toward `B` (having just sent it a Hello); `B`'s answering
+    /// `Done(complete=true)` closes `A`'s episode BEFORE `B`'s own reciprocal
+    /// Hello -- sent over a DIFFERENT connection (the Done rides the task-owned
+    /// replay pool's `ReliableSender`; the reciprocal Hello rides the main pool's
+    /// `send_message`, plus that pool's own 5ms batching-coalescer delay) -- ever
+    /// lands at `A`; the two frames have no relative ordering guarantee at all.
+    /// Episode-PRESENCE gating alone (this type's earlier, defective form) would
+    /// see no episode open at that point and reciprocate with a FRESH Hello --
+    /// which `B`, racing the identical way, would do right back: the pair
+    /// phase-locks into a mutual Hello/serve loop at the backoff period, forever
+    /// (confirmed in docker: ~14 replay frames/s + ~0.6 Hello/s steady chatter
+    /// between two nodes, from boot, never quiescing). The sent-memo must
+    /// suppress this: closing an episode does not erase "I sent this peer a Hello
+    /// moments ago".
+    #[test]
+    fn on_hello_received_is_immune_to_the_done_vs_hello_cross_pool_race() {
+        let mut episodes = ReplayEpisodes::new();
+        let b = key(2);
+        let now = Instant::now();
+        let backoff = Duration::from_millis(4_000);
+
+        // A has an open episode toward B and just sent it a Hello.
+        episodes.open(b, now);
+        episodes.record_hello_sent(b, now);
+
+        // B's Done(complete=true) arrives first and closes A's episode -- exactly
+        // `VantageCore::on_replay_done`'s own `complete` branch.
+        episodes.close(&b);
+        assert!(!episodes.is_open(&b));
+
+        // B's reciprocal Hello arrives at A next (the race this regression is
+        // about), still well within backoff of A's own send above -- must NOT
+        // reciprocate (no new episode), even though the episode is closed.
+        let t1 = now + Duration::from_millis(500);
+        assert!(
+            !episodes.on_hello_received(b, t1, backoff),
+            "the sent-memo must suppress reciprocation even though the episode \
+             was already closed by the racing Done"
+        );
+        assert!(!episodes.is_open(&b), "no new episode must have opened");
+
+        // Past backoff, a genuinely new Hello from B must still reciprocate
+        // normally -- the legitimate case is unaffected.
+        let t2 = now + Duration::from_millis(4_001);
+        assert!(
+            episodes.on_hello_received(b, t2, backoff),
+            "past backoff, reciprocation must still work"
+        );
+        assert!(episodes.is_open(&b));
     }
 
     /// (ii): a fresh episode's very first tick, immediately after `open`, must not

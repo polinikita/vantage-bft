@@ -877,7 +877,7 @@ impl VantageCore {
                     for author in authors {
                         self.try_resume_request(author, now);
                         if self.replay_episodes.tick(author, now, episode_backoff, episode_max_age) {
-                            self.send_resume_hello(author).await;
+                            self.send_resume_hello(author, now, "tick").await;
                         }
                         self.maybe_nudge(author, now, episode_backoff).await;
                     }
@@ -890,9 +890,18 @@ impl VantageCore {
                 // nothing beyond waiting for the next `resume_tick`'s own re-Hello.
                 Some(addr) = reconnect_rx.recv() => {
                     let now = Instant::now();
-                    if let Some(&peer) = self.wire.addr_to_peer.get(&addr) {
+                    let resolved = self.wire.addr_to_peer.get(&addr).copied();
+                    let peer_index = resolved.and_then(|peer| {
+                        self.wire.other_primaries.iter().position(|(pk, _)| *pk == peer)
+                    });
+                    log::debug!(
+                        "vantage node: reconnect event received: addr={} peer_index={}",
+                        addr,
+                        peer_index.map_or_else(|| "unmapped".to_string(), |i| i.to_string())
+                    );
+                    if let Some(peer) = resolved {
                         self.replay_episodes.open(peer, now);
-                        self.send_resume_hello(peer).await;
+                        self.send_resume_hello(peer, now, "event").await;
                         self.try_resume_request(peer, now);
                     }
                 }
@@ -1092,14 +1101,29 @@ impl VantageCore {
     /// `replay_episode_max_ms` expiry valve, so durable delivery is safe (never
     /// unboundedly retried/buffered against a permanently-dead peer) and valuable
     /// (A5's belt-and-braces tail actually needs the prompt Hello to land).
-    async fn send_resume_hello(&mut self, peer: PublicKey) {
+    ///
+    /// `trigger` is diagnostics-only (one of `"event"` -- the reconnect prompt AND
+    /// a `Done(complete=false)` continuation, both one-shot triggers by an event
+    /// -- `"tick"`, or `"reciprocal"`; `send_nudge_hello` logs its own fixed
+    /// `"nudge"` separately). Every actual send -- from ANY of the four triggers
+    /// -- records `last_hello_sent` here, the ONE place that memo is ever written
+    /// (`ReplayEpisodes::on_hello_received`'s own doc comment: this is what makes
+    /// it immune to the Done-vs-Hello cross-pool race).
+    async fn send_resume_hello(&mut self, peer: PublicKey, now: Instant, trigger: &'static str) {
         let floor_hint = self.pacemaker.omega_of(peer);
+        log::debug!(
+            "vantage node: resume hello sent: peer={} floor_hint={} trigger={}",
+            peer,
+            floor_hint,
+            trigger
+        );
         self.wire
             .send_message(
                 peer,
                 PrimaryMessage::VantageResumeHello(floor_hint, self.name),
             )
             .await;
+        self.replay_episodes.record_hello_sent(peer, now);
     }
 
     /// §2.6 trigger (iv)/§14 A3/A7: the server-side nudge loop's own Hello send,
@@ -1108,10 +1132,18 @@ impl VantageCore {
     /// unlike the other three triggers, a nudge has no natural bound of its own
     /// (`pending_low[X]` can stay set indefinitely against a peer that never
     /// reconnects), so sending it durably would let one new retried buffer entry
-    /// accumulate per backoff period, forever, against a dead peer.
-    async fn send_nudge_hello(&mut self, peer: PublicKey) {
+    /// accumulate per backoff period, forever, against a dead peer. A nudge carries
+    /// a real floor hint and is served like any other ask, so it counts as our own
+    /// ask toward `peer` exactly like `send_resume_hello`'s three triggers --
+    /// `last_hello_sent` is recorded here too.
+    async fn send_nudge_hello(&mut self, peer: PublicKey, now: Instant) {
         let floor_hint = self.pacemaker.omega_of(peer);
         let key = self.pacemaker.own_watermark();
+        log::debug!(
+            "vantage node: resume hello sent: peer={} floor_hint={} trigger=nudge",
+            peer,
+            floor_hint
+        );
         self.wire
             .send_volatile(
                 peer,
@@ -1119,6 +1151,7 @@ impl VantageCore {
                 key,
             )
             .await;
+        self.replay_episodes.record_hello_sent(peer, now);
         if let Some(metrics) = &self.metrics {
             metrics.vantage_replay_pending_low_nudges_total.inc();
         }
@@ -1141,7 +1174,7 @@ impl VantageCore {
         if !self.nudge_memo.due(peer, now, backoff) {
             return;
         }
-        self.send_nudge_hello(peer).await;
+        self.send_nudge_hello(peer, now).await;
         self.nudge_memo.record(peer, now);
     }
 
@@ -1156,9 +1189,19 @@ impl VantageCore {
     /// nothing else on this task's `&mut self` can observe a torn intermediate
     /// state, since there is no `.await` point for the runtime to preempt at).
     async fn on_resume_hello(&mut self, hello_floor: View, sender: PublicKey, now: Instant) {
-        // (iii): reciprocation, memo-deduped -- independent of everything below.
-        if self.replay_episodes.on_hello_received(sender, now) {
-            self.send_resume_hello(sender).await;
+        log::debug!(
+            "vantage node: resume hello received: sender={} floor={}",
+            sender,
+            hello_floor
+        );
+        let backoff = Duration::from_millis(self.resume_backoff_ms);
+
+        // (iii): reciprocation, gated by the sent-memo (not episode presence --
+        // see `ReplayEpisodes::on_hello_received`'s own doc comment for the
+        // Done-vs-Hello cross-pool race this avoids) -- independent of everything
+        // below.
+        if self.replay_episodes.on_hello_received(sender, now, backoff) {
+            self.send_resume_hello(sender, now, "reciprocal").await;
         }
 
         self.sweep_dirty_map();
@@ -1166,6 +1209,10 @@ impl VantageCore {
         if self.check_in_flight(sender, now) {
             // §6: "the in-flight stream already serves >= pending_low, a superset
             // of any concurrent ask" -- ignored entirely, no Done either.
+            log::debug!(
+                "vantage node: resume serve suppressed: sender={} gate=in-flight",
+                sender
+            );
             return;
         }
 
@@ -1179,20 +1226,25 @@ impl VantageCore {
         let served_from = raw_from.max(outbox_floor);
         let clamped = served_from > raw_from;
 
-        let window = Duration::from_millis(self.resume_backoff_ms);
         let remaining =
             self.serve_budget
-                .remaining(sender, now, window, self.replay_serve_max_bytes);
+                .remaining(sender, now, backoff, self.replay_serve_max_bytes);
         let has_backlog = self.outbox.slice_from(served_from).next().is_some();
         if remaining == 0 && has_backlog {
             // §6: "over-budget Hellos are deferred to the next window (the episode
             // tick re-asks)" -- nothing sent at all this time.
+            log::debug!(
+                "vantage node: resume serve suppressed: sender={} served_from={} gate=budget",
+                sender,
+                served_from
+            );
             return;
         }
 
         let (msgs, end_key, complete) = self.outbox.take_budgeted_slice(served_from, remaining);
+        let msg_count = msgs.len();
         let served_bytes: usize = msgs.iter().map(Bytes::len).sum();
-        self.serve_budget.record(sender, served_bytes, now, window);
+        self.serve_budget.record(sender, served_bytes, now, backoff);
 
         let done = PrimaryMessage::VantageReplayDone(end_key, complete, clamped, self.name);
         let enqueued = self.wire.enqueue_replay(sender, msgs, done);
@@ -1201,8 +1253,22 @@ impl VantageCore {
         if !enqueued {
             // audit-3 A2: `Wire::enqueue_replay` already counted the drop metric;
             // `pending_low` stays untouched -- the next nudge/tick re-asks.
+            log::debug!(
+                "vantage node: resume serve suppressed: sender={} served_from={} gate=enqueue-failed",
+                sender,
+                served_from
+            );
             return;
         }
+        log::debug!(
+            "vantage node: resume serve decision: sender={} served_from={} msgs={} end_key={} complete={} clamped={}",
+            sender,
+            served_from,
+            msg_count,
+            end_key,
+            complete,
+            clamped
+        );
         self.wire.in_flight.lock().unwrap().insert(sender, now);
         if complete {
             self.pending_low.remove(&sender);
@@ -1226,15 +1292,22 @@ impl VantageCore {
     /// immediately) on `complete = false`; close the episode on `complete = true`.
     /// `end_key` carries no requester-side state update in v3: correctness lives
     /// entirely in the AUTHOR's own `pending_low` (§2.4) -- the requester's floor
-    /// is a hint only (D4 caveat (iii)), so there is nothing here to advance.
+    /// is a hint only (D4 caveat (iii)), so there is nothing here to advance --
+    /// logged (diagnostics only) below, never otherwise consulted.
     async fn on_replay_done(
         &mut self,
-        _end_key: View,
+        end_key: View,
         complete: bool,
         clamped: bool,
         sender: PublicKey,
         now: Instant,
     ) {
+        log::debug!(
+            "vantage node: resume done received: sender={} end_key={} complete={}",
+            sender,
+            end_key,
+            complete
+        );
         if clamped {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_replay_done_clamped_total.inc();
@@ -1244,7 +1317,7 @@ impl VantageCore {
             self.replay_episodes.close(&sender);
         } else {
             self.replay_episodes.open(sender, now);
-            self.send_resume_hello(sender).await;
+            self.send_resume_hello(sender, now, "event").await;
         }
     }
 
