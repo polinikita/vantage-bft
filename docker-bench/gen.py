@@ -365,6 +365,10 @@ def render_compose(n: int, args: argparse.Namespace) -> str:
             f"      TX_SIZE: \"{args.tx_size}\"",
             f"      TX_MODE: \"{args.mode}\"",
             f"      PROTOCOL: \"{args.protocol}\"",
+            # RUST_LOG overrides the -vv default filter (env_logger::from_env in
+            # node/src/main.rs), letting a diagnostic run scope debug logging to
+            # exact modules without drowning primary.log in whole-crate debug output.
+            *([f"      RUST_LOG: \"{args.rust_log}\""] if args.rust_log else []),
             "    volumes:",
             "      - ./data/committee.json:/shared/committee.json:ro",
             "      - ./data/parameters.json:/shared/parameters.json:ro",
@@ -439,6 +443,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--withhold", type=int, default=0)
     p.add_argument("--withhold-at", type=int, default=None)
     p.add_argument("--withhold-for", type=int, default=30)
+    p.add_argument("--rust-log", default=None, metavar="FILTER",
+                   help="RUST_LOG filter for every container's node processes, e.g. "
+                        "'info,primary::vantage::resume=debug' -- overrides the -vv "
+                        "default; omit for the normal info-level logs")
     args = p.parse_args(argv)
 
     if not (1 <= args.nodes <= MAX_NODES):
