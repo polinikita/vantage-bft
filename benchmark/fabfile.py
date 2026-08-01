@@ -109,7 +109,7 @@ def install(ctx, source_build=False):
 
 
 @task
-def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=False, all_to_all=False,
+def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
            batch_messages=True, batch_max_bytes=65536, batch_max_delay_ms=5,
            mimic_latency_ms=0, source_build=False):
     ''' Run benchmarks on AWS.
@@ -169,9 +169,6 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', compress_network=Fal
         # latency_table at spawn -- the only way to inject WAN-shaped latency on the
         # distributed path (Parameters.latency_table is #[serde(skip)]).
         'mimic_latency_ms': int(mimic_latency_ms),
-        # METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when
-        # off; `fab remote --compress-network` (or edit this literal) to enable.
-        'compress_network': compress_network,
         # Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
         # behavior when off; `fab remote --all-to-all` (or edit this literal) to enable.
         'all_to_all': all_to_all,

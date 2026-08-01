@@ -38,7 +38,7 @@ COMPOSE_FILE = REPO_ROOT / "monitoring" / "docker-compose.yml"
 REQUIRED_KEYS = [
     "protocol", "nodes", "workers", "rate", "tx_size", "mode", "duration",
     "delta_ms", "max_batch_delay_ms", "max_header_delay_ms", "crash",
-    "latency_table", "compress_network", "data_dir",
+    "latency_table", "data_dir",
 ]
 
 
@@ -172,11 +172,8 @@ def build_local_benchmark_args(cfg: dict, binary: Path) -> list:
         # inject that AWS matrix instead of the pure-loopback mode this config value
         # documents, so the zero must be explicit.
         args += ["--mimic-latency-ms", "0"]
-    if cfg.get("compress_network"):
-        args.append("--compress-network")
     # Transport-level batching: optional (not in REQUIRED_KEYS), off by default --
-    # byte-identical wire/behavior when omitted, mirroring `compress_network`'s own
-    # optional-flag handling just above.
+    # byte-identical wire/behavior when omitted.
     if cfg.get("batch_messages"):
         args.append("--batch-messages")
         if cfg.get("batch_max_bytes") is not None:

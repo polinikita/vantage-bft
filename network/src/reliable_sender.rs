@@ -1,6 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch::{encode_bundle, sleep_until_or_pending, BatchConfig, Coalescer};
-use crate::blip::BlipGate;
 use crate::error::NetworkError;
 use bytes::Bytes;
 use futures::sink::SinkExt as _;
@@ -49,22 +48,12 @@ pub struct ReliableSender {
     /// latency, empty by default (current behavior, byte-identical). See
     /// `network/src/lib.rs`'s module doc for the injection point/semantics.
     latency: HashMap<SocketAddr, Duration>,
-    /// Transient network-level "blip" fault injector (`node local-benchmark
-    /// --blip-at`), attached via `with_blip` the same way `latency` is attached via
-    /// `with_latency`. `None` by default -- every connection this sender spawns then
-    /// skips the blip-clamp check entirely (see `Connection::keep_alive`'s branch
-    /// condition), zero added cost on the untouched path.
-    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: optional wire-metrics handle, attached the same
     /// way as `latency` (`with_metrics`, called once right after construction).
     /// `None` by default -- every connection this sender spawns then skips the
     /// `bytes_sent_total` accounting entirely (zero added cost on the untouched
     /// path, mirroring `extra_latency`'s own zero-cost default).
     metrics: Option<Arc<Metrics>>,
-    /// METRICS-DASHBOARD-SPEC.md §8: lz4 compression, off by default -- the default
-    /// (`false`) path never calls `lz4_flex::compress_prepend_size` at all, so it's
-    /// byte-identical to pre-compression behavior.
-    compress: bool,
     /// Transport-level per-peer outbound batching (coalescing), off by default -- see
     /// `network::batch`'s module doc. Byte-identical wire/behavior when disabled.
     batch: BatchConfig,
@@ -82,9 +71,7 @@ impl ReliableSender {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
             latency: HashMap::new(),
-            blip: None,
             metrics: None,
-            compress: false,
             batch: BatchConfig::default(),
         }
     }
@@ -100,26 +87,10 @@ impl ReliableSender {
         self
     }
 
-    /// Attach a blip gate (same contract as `with_latency`: call before any
-    /// connection is spawned). `None` -- the default, and always the case when
-    /// `--blip-at` isn't given -- is a no-op.
-    pub fn with_blip(mut self, gate: Option<Arc<BlipGate>>) -> Self {
-        self.blip = gate;
-        self
-    }
-
-    /// METRICS-DASHBOARD-SPEC.md §8: enable lz4 compression for every connection this
-    /// sender spawns afterwards. Call before any connection is spawned (same contract
-    /// as `with_latency`/`with_metrics`).
-    pub fn with_compression(mut self, enabled: bool) -> Self {
-        self.compress = enabled;
-        self
-    }
-
     /// Enable per-connection outbound batching (coalescing) for every connection this
-    /// sender spawns afterwards. Same contract as `with_compression`/`with_latency`:
-    /// call before any connection is spawned. `BatchConfig::default()` (`enabled:
-    /// false`) is a no-op -- byte-identical to never calling this at all.
+    /// sender spawns afterwards. Same contract as `with_latency`: call before any
+    /// connection is spawned. `BatchConfig::default()` (`enabled: false`) is a no-op
+    /// -- byte-identical to never calling this at all.
     pub fn with_batching(mut self, config: BatchConfig) -> Self {
         self.batch = config;
         self
@@ -138,19 +109,7 @@ impl ReliableSender {
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(100_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        // Resolved ONCE here (mirrors `extra_latency` just above), not per-message:
-        // `None` unless a blip gate is attached AND `address` is one of its held
-        // destinations (see `BlipGate::targets`'s doc comment).
-        let blip = self.blip.clone().filter(|gate| gate.targets(&address));
-        Connection::spawn(
-            address,
-            rx,
-            extra_latency,
-            blip,
-            self.metrics.clone(),
-            self.compress,
-            self.batch,
-        );
+        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.batch);
         tx
     }
 
@@ -306,33 +265,21 @@ struct Connection {
     /// resolved once at spawn time and applied before every real send for this
     /// connection's whole life -- see `keep_alive`.
     extra_latency: Duration,
-    /// Transient network-level "blip" fault injector: resolved once at spawn time
-    /// (mirrors `extra_latency`) via `ReliableSender::spawn_connection`'s own
-    /// `BlipGate::targets` check -- `None` unless a blip gate is attached to the
-    /// owning `ReliableSender` AND `address` is one of its held destinations. See
-    /// `keep_alive`'s branch condition and `scheduled_release`.
-    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: resolved once at spawn time (mirrors
     /// `extra_latency`); `bytes_sent_total` is incremented at every successful
     /// physical write, length prefix included, whether the first attempt or a retry.
     metrics: Option<Arc<Metrics>>,
-    /// METRICS-DASHBOARD-SPEC.md §8: resolved once at spawn time; `false` (the
-    /// default) never calls `lz4_flex::compress_prepend_size`.
-    compress: bool,
-    /// Resolved once at spawn time (mirrors `compress`); `BatchConfig::default()`
+    /// Resolved once at spawn time (mirrors `extra_latency`); `BatchConfig::default()`
     /// (`enabled: false`) never consults a `Coalescer` at all.
     batch: BatchConfig,
 }
 
 impl Connection {
-    #[allow(clippy::too_many_arguments)]
     fn spawn(
         address: SocketAddr,
         receiver: Receiver<InnerMessage>,
         extra_latency: Duration,
-        blip: Option<Arc<BlipGate>>,
         metrics: Option<Arc<Metrics>>,
-        compress: bool,
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
@@ -342,9 +289,7 @@ impl Connection {
                 retry_delay: 200,
                 buffer: VecDeque::new(),
                 extra_latency,
-                blip,
                 metrics,
-                compress,
                 batch,
             }
             .run()
@@ -355,25 +300,6 @@ impl Connection {
     /// Length-delimited-codec frame prefix: 4 bytes, fixed (`LengthDelimitedCodec::
     /// new()`'s default `length_field_length`).
     const FRAME_PREFIX_LEN: u64 = 4;
-
-    /// METRICS-DASHBOARD-SPEC.md §8: the actual bytes to hand to `writer.send` --
-    /// lz4-compressed (`bytes_uncompressed_sent_total` credited with the pre-
-    /// compression size) when `compress` is on, `data` verbatim otherwise (the
-    /// default, zero-cost path: no compression call is made at all). When batching is
-    /// also on, `data` here is already the WHOLE bundle frame -- compression wraps the
-    /// bundle, not its individual constituent messages (order: coalesce -> compress ->
-    /// outer length-prefix framing).
-    fn wire_bytes(&self, data: &Bytes) -> Bytes {
-        if !self.compress {
-            return data.clone();
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics
-                .bytes_uncompressed_sent_total
-                .inc_by(data.len() as u64);
-        }
-        Bytes::from(lz4_flex::compress_prepend_size(data))
-    }
 
     fn record_bytes_sent(&self, len: usize) {
         if let Some(metrics) = &self.metrics {
@@ -431,10 +357,10 @@ impl Connection {
                             // `self.batch.enabled`, EVERY entry that ever enters
                             // `self.buffer` must already be bundle-framed
                             // (`encode_bundle` output) -- `keep_alive_*` writes
-                            // `buffer` entries to the wire verbatim (past `wire_bytes`/
-                            // compression only), and the receiver's `decode_bundle`
-                            // assumes every frame it reads while batching is on IS a
-                            // bundle. This arm runs while the TCP connect itself is
+                            // `buffer` entries to the wire verbatim, and the receiver's
+                            // `decode_bundle` assumes every frame it reads while
+                            // batching is on IS a bundle. This arm runs while the TCP
+                            // connect itself is
                             // failing, i.e. BEFORE any `Connection`-owned coalescer
                             // exists to do that wrapping -- so it must wrap the raw
                             // message itself, as a singleton bundle, or a raw
@@ -456,16 +382,11 @@ impl Connection {
     }
 
     /// Transmit messages once we have established a connection. D7-3 (PHASE7-PREP-
-    /// NOTES.md): the default (`extra_latency.is_zero()` AND no blip gate attached)
-    /// path is BYTE-IDENTICAL to the pre-existing code (no scheduling overhead at
-    /// all, not even one extra `Instant::now()` call) -- the WAN-shaped-run/blip path
-    /// is a separate method. `self.blip.is_none()` is one cheap extra `Option` check
-    /// on this branch (mirrors `extra_latency.is_zero()` itself), added because a
-    /// blip-gated connection needs the SAME dynamic per-message scheduling
-    /// `keep_alive_delayed` already provides even when `extra_latency` itself is
-    /// zero (see `scheduled_release`).
+    /// NOTES.md): the default (`extra_latency.is_zero()`) path is BYTE-IDENTICAL to
+    /// the pre-existing code (no scheduling overhead at all, not even one extra
+    /// `Instant::now()` call) -- the WAN-shaped-run path is a separate method.
     async fn keep_alive(&mut self, stream: TcpStream) -> NetworkError {
-        if self.extra_latency.is_zero() && self.blip.is_none() {
+        if self.extra_latency.is_zero() {
             self.keep_alive_immediate(stream).await
         } else {
             self.keep_alive_delayed(stream).await
@@ -473,17 +394,9 @@ impl Connection {
     }
 
     /// The release instant for a message being scheduled right now: `now() +
-    /// extra_latency`, further clamped forward to the blip window's end if this
-    /// connection is gated and that natural release would otherwise land inside the
-    /// window (see `BlipGate::clamp`'s doc comment for the ordering-preservation
-    /// argument -- this is the ONLY point `keep_alive_delayed` computes a release
-    /// instant, so that argument covers this whole connection).
+    /// extra_latency`.
     fn scheduled_release(&self) -> Instant {
-        let natural_release = Instant::now() + self.extra_latency;
-        match &self.blip {
-            Some(gate) => gate.clamp(natural_release),
-            None => natural_release,
-        }
+        Instant::now() + self.extra_latency
     }
 
     /// The original, unmodified transmit loop -- used whenever no artificial latency
@@ -510,12 +423,11 @@ impl Connection {
                 }
 
                 // Try to send the message.
-                let wire = self.wire_bytes(&data);
-                match writer.send(wire.clone()).await {
+                match writer.send(data.clone()).await {
                     Ok(()) => {
                         // The message has been sent, we remove it from the buffer and add it to
                         // `pending_replies` while we wait for an ACK.
-                        self.record_bytes_sent(wire.len());
+                        self.record_bytes_sent(data.len());
                         self.record_frame_sent();
                         pending_replies.push_back((data, handlers));
                     }
@@ -658,10 +570,9 @@ impl Connection {
                     if all_closed(&handlers) {
                         continue;
                     }
-                    let wire = self.wire_bytes(&data);
-                    match writer.send(wire.clone()).await {
+                    match writer.send(data.clone()).await {
                         Ok(()) => {
-                            self.record_bytes_sent(wire.len());
+                            self.record_bytes_sent(data.len());
                             self.record_frame_sent();
                             pending_replies.push_back((data, handlers));
                         }

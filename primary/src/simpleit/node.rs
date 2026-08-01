@@ -30,7 +30,7 @@ use crate::vantage::{BlockRef, Effect};
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, Protocol, WorkerId};
-use crypto::{Digest, PairwiseKeys, PublicKey};
+use crypto::{Digest, PublicKey};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::Metrics;
 use network::{BatchConfig, MessageHandler, ReliableSender, SimpleSender, Writer};
@@ -131,62 +131,11 @@ impl DeclaredSender for Inbound {
     }
 }
 
-/// SECURITY (Fable audit): Simple-IT's own mirror of `vantage::node::
-/// mac_candidate_sender` -- MAC-candidate classification for every `PrimaryMessage`
-/// variant THIS handler ever routes. Can't reuse Vantage's directly (module-private to
-/// `vantage::node`); duplicated rather than shared, matching how `mac_candidate_sender`/
-/// `DeclaredSender` are ALREADY two independently-maintained mappings within
-/// `vantage::node` itself (one keyed on the wire `PrimaryMessage` pre-routing, one on
-/// the routed `Inbound` post-routing) -- this mirrors `impl DeclaredSender for
-/// engine::Inbound` above variant-for-variant. No positionally-attributed (D4-class)
-/// variant exists in Simple-IT's own message family: `CutProposal` carries its
-/// `proposer` directly on the wire (unlike Vantage's `ViewProposal`), so every
-/// claimed-sender variant below is a real, per-destination-verifiable field read, never
-/// a `committee`-derived leader-schedule lookup.
-fn mac_candidate_sender(message: &PrimaryMessage) -> Option<PublicKey> {
-    match message {
-        PrimaryMessage::Header(h, false) => Some(h.author),
-        PrimaryMessage::Header(_, true) => None,
-        PrimaryMessage::HeadersRequest(_, requestor) => Some(*requestor),
-        PrimaryMessage::VantageAck(a) => Some(a.sender),
-        PrimaryMessage::VantageAvail(_, sender) => Some(*sender),
-        PrimaryMessage::SimpleItCutProposal(p) => Some(p.proposer),
-        PrimaryMessage::SimpleItCutVote(v) => Some(v.author),
-        PrimaryMessage::SimpleItDecide(d) => Some(d.author),
-        PrimaryMessage::SimpleItTimeout(t) => Some(t.author),
-        PrimaryMessage::SimpleItTimeoutAccept(a) => Some(a.author),
-        // BRACHA VARIANT ADDITION: a real, per-destination-verifiable sender field,
-        // same class as `SimpleItCutVote`/`SimpleItDecide` above.
-        PrimaryMessage::SimpleItCutReady(r) => Some(r.author),
-        PrimaryMessage::SimpleItCutFetch(_, _, requester) => Some(*requester),
-        // `CutProposal::proposer` inside names the ORIGINAL round leader, not the
-        // relaying/serving party -- no sender claim to bind here, exactly like
-        // Vantage's own `ControlServe` (see `vantage::node::mac_candidate_sender`'s
-        // identical arm).
-        PrimaryMessage::SimpleItCutServe(_) => None,
-        // A real, per-destination-verifiable sender field, mirroring `vantage::node::
-        // mac_candidate_sender`'s own arm for the same variant -- kept here too even
-        // though (like every other vantage-AGB-only variant below) it never
-        // legitimately reaches Simple-IT's port, matching this specific variant's
-        // treatment on the Vantage side exactly.
-        PrimaryMessage::VantageSkipVote(_, s) => Some(*s),
-        // Mechanism A (`vantage::resume`): a real, per-destination-verifiable
-        // declared requester, mirroring `vantage::node::mac_candidate_sender`'s own
-        // identical arm for this variant.
-        PrimaryMessage::VantageLaneResume(_, _, requester) => Some(*requester),
-        // Autobahn-only and Vantage-AGB-only variants never legitimately reach the
-        // Simple-IT assembly's port (`dispatch`'s own catch-all ignores them below);
-        // no candidate needed.
-        _ => None,
-    }
-}
-
 /// Network receiver handler for the Simple-IT assembly's `primary_to_primary` port.
 /// Deliberately a distinct type from `VantageReceiverHandler` (which stays untouched)
 /// -- the two assemblies never share a handler -- but mirrors it closely: same
-/// ack-aggregator behaviour, same MAC verification shape, same frame acking (moved
-/// into `network::Receiver` itself, once per received frame -- see
-/// `VantageReceiverHandler`'s own doc comment for why).
+/// ack-aggregator behaviour, same frame acking (moved into `network::Receiver` itself,
+/// once per received frame -- see `VantageReceiverHandler`'s own doc comment for why).
 #[derive(Clone)]
 pub struct SimpleItReceiverHandler {
     pub tx: Sender<Inbound>,
@@ -194,15 +143,6 @@ pub struct SimpleItReceiverHandler {
     /// `None` only in tests that construct this handler directly without wiring
     /// metrics; production (`Primary::spawn`) always passes `Some`.
     pub metrics: Option<Arc<Metrics>>,
-    /// `Some` iff `Parameters::authenticate_channels` is on -- see
-    /// `mac_candidate_sender`'s doc comment for the verification model.
-    pub channel_auth: Option<Arc<PairwiseKeys>>,
-    // Deliberately NO `committee` field, unlike `VantageReceiverHandler`: that field
-    // exists there only to resolve `VantagePropose`/`ControlInit`'s positionally-
-    // attributed sender (`agb::proposer`/`control::control_leader`, both pure
-    // functions of `committee`). No Simple-IT message is positionally attributed --
-    // `CutProposal` carries `proposer` directly on the wire -- so `mac_candidate_sender`
-    // below never needs one, and carrying an unread field would be dead state.
 }
 
 #[async_trait]
@@ -212,30 +152,10 @@ impl MessageHandler for SimpleItReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        let (payload, tag): (&[u8], Option<[u8; crypto::mac::TAG_LEN]>) = match &self.channel_auth
-        {
-            Some(_) => match crypto::mac::split_tag(&serialized) {
-                Some((payload, tag)) => (payload, Some(tag)),
-                None => return Ok(()),
-            },
-            None => (&serialized[..], None),
-        };
-
-        let message: PrimaryMessage = bincode::deserialize(payload)?;
-
-        if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
-            if let Some(sender) = mac_candidate_sender(&message) {
-                if !auth.verify(&sender, payload, &tag) {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.authenticated_channel_rejected_total.inc();
-                    }
-                    return Ok(());
-                }
-            }
-        }
+        let message: PrimaryMessage = bincode::deserialize(&serialized)?;
 
         if let Some(metrics) = &self.metrics {
-            crate::primary::record_typed_received(metrics, message.type_name(), payload.len());
+            crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
         }
 
         let inbound = match message {
@@ -476,15 +396,6 @@ impl SimpleItCore {
         // comment.
         let members: HashSet<PublicKey> = committee.authorities.keys().cloned().collect();
 
-        let channel_auth: Option<Arc<PairwiseKeys>> = if parameters.authenticate_channels {
-            let secret = parameters
-                .mac_secret
-                .expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
-            Some(Arc::new(committee.pairwise_keys(&name, &secret)))
-        } else {
-            None
-        };
-
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
         let blocks: SharedBlocks = Arc::new(Mutex::new(BlockCache::new()));
@@ -570,14 +481,6 @@ impl SimpleItCore {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
-        // Transient network-level "blip" fault injector (`--blip-at`): resolved once,
-        // same convention as `latency_map` just above -- see `vantage::node::
-        // VantageCore::build`'s identical treatment for the exact reasoning.
-        let blip_gate = parameters.blip_window.clone().and_then(|window| {
-            config::blip_targets(&committee, &name, parameters.blip_node_index)
-                .map(|targets| Arc::new(network::BlipGate::new(targets, window)))
-        });
-
         let batch = BatchConfig {
             enabled: parameters.batch_messages,
             max_bytes: parameters.batch_max_bytes,
@@ -587,18 +490,11 @@ impl SimpleItCore {
         // Mechanism A (sender-side lane resume, `vantage::resume`): this node's own
         // dedicated off-run-loop sender -- mirrors `VantageCore::build`'s identical
         // construction exactly (see `wire::spawn_resume_sender`'s doc comment for
-        // the full design/rationale). Built from the SAME `latency_map`/
-        // `blip_gate`/`batch`/`core_metrics` locals as `network`/`worker_network`
-        // just below -- cloned here (rather than moved) since both of those still
-        // need their own copies afterward.
-        let resume_tx = wire::spawn_resume_sender(
-            latency_map.clone(),
-            blip_gate.clone(),
-            parameters.compress_network,
-            batch,
-            core_metrics.clone(),
-            channel_auth.clone(),
-        );
+        // the full design/rationale). Built from the SAME `latency_map`/`batch`/
+        // `core_metrics` locals as `network`/`worker_network` just below -- cloned
+        // here (rather than moved) since both of those still need their own copies
+        // afterward.
+        let resume_tx = wire::spawn_resume_sender(latency_map.clone(), batch, core_metrics.clone());
 
         let core = Self {
             name,
@@ -608,12 +504,9 @@ impl SimpleItCore {
             ack_aggregator: ack_aggregator.clone(),
             rep,
             wire: Wire {
-                name,
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
-                        .with_blip(blip_gate.clone())
-                        .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
@@ -623,8 +516,6 @@ impl SimpleItCore {
                 worker_network: {
                     let mut s = SimpleSender::new()
                         .with_latency(latency_map)
-                        .with_blip(blip_gate)
-                        .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
@@ -632,7 +523,6 @@ impl SimpleItCore {
                     s
                 },
                 resume_tx,
-                channel_auth,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
                 other_primaries,

@@ -42,15 +42,6 @@ pub struct Receiver<Handler: MessageHandler> {
     /// `bytes_received_total` is incremented once per received frame, length prefix
     /// included, before the frame is handed to `handler.dispatch`.
     metrics: Option<Arc<Metrics>>,
-    /// METRICS-DASHBOARD-SPEC.md §8: `false` (the default) never calls
-    /// `lz4_flex::decompress_size_prepended` -- byte-identical to pre-compression
-    /// behavior. Committee-wide consistent by construction (see `Parameters::
-    /// compress_network`'s doc): every sender this receiver's peers use shares the
-    /// same setting, so "compressed frame arrives while this flag is off" is a
-    /// misconfiguration, not a case this code needs to tolerate gracefully -- a
-    /// decode failure in that case is `warn!`-logged and the connection dropped, the
-    /// same way any other malformed frame is already handled.
-    compress: bool,
     /// Whether THIS handler's peers ack every received frame -- matches, per
     /// call-site, whatever the corresponding `MessageHandler::dispatch` impl used to
     /// do itself (`writer.send(Bytes::from("Ack"))` as its first action) before the
@@ -72,7 +63,7 @@ pub struct Receiver<Handler: MessageHandler> {
 impl<Handler: MessageHandler> Receiver<Handler> {
     /// Spawn a new network receiver handling connections from any incoming peer.
     pub fn spawn(address: SocketAddr, handler: Handler) {
-        Self::spawn_full(address, handler, None, false, false, false);
+        Self::spawn_full(address, handler, None, false, false);
     }
 
     /// Same as `spawn`, plus a `bytes_received_total` observation for every frame this
@@ -82,20 +73,17 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         handler: Handler,
         metrics: Option<Arc<Metrics>>,
     ) {
-        Self::spawn_full(address, handler, metrics, false, false, false);
+        Self::spawn_full(address, handler, metrics, false, false);
     }
 
-    /// Full form: metrics handle + lz4 compression flag (§8) + ack/batch flags. See
-    /// `acks`/`batch`'s own doc comments for their exact contracts. `compress` must
-    /// match what every peer's own sender is configured with (see `Parameters::
-    /// compress_network`'s doc on committee-wide consistency) -- same requirement
-    /// applies to `batch` vs. `Parameters::batch_messages`.
-    #[allow(clippy::too_many_arguments)]
+    /// Full form: metrics handle + ack/batch flags. See `acks`/`batch`'s own doc
+    /// comments for their exact contracts. `batch` must match what every peer's own
+    /// sender is configured with (see `Parameters::batch_messages`'s doc on
+    /// committee-wide consistency).
     pub fn spawn_full(
         address: SocketAddr,
         handler: Handler,
         metrics: Option<Arc<Metrics>>,
-        compress: bool,
         acks: bool,
         batch: bool,
     ) {
@@ -104,7 +92,6 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 address,
                 handler,
                 metrics,
-                compress,
                 acks,
                 batch,
             }
@@ -135,7 +122,6 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 peer,
                 self.handler.clone(),
                 self.metrics.clone(),
-                self.compress,
                 self.acks,
                 self.batch,
             )
@@ -145,13 +131,11 @@ impl<Handler: MessageHandler> Receiver<Handler> {
 
     /// Spawn a new runner to handle a specific TCP connection. It receives messages and process them
     /// using the provided handler.
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_runner(
         socket: TcpStream,
         peer: SocketAddr,
         handler: Handler,
         metrics: Option<Arc<Metrics>>,
-        compress: bool,
         acks: bool,
         batch: bool,
     ) {
@@ -166,20 +150,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                                 .bytes_received_total
                                 .inc_by(message.len() as u64 + 4);
                         }
-                        // METRICS-DASHBOARD-SPEC.md §8: decompress AFTER length-prefix
-                        // framing (the frame itself is already delimited by the codec
-                        // above) -- mirrors the send side compressing BEFORE framing.
-                        let payload = if compress {
-                            match lz4_flex::decompress_size_prepended(&message) {
-                                Ok(decompressed) => Bytes::from(decompressed),
-                                Err(e) => {
-                                    warn!("Failed to lz4-decompress frame from {}: {}", peer, e);
-                                    return;
-                                }
-                            }
-                        } else {
-                            message.freeze()
-                        };
+                        let payload = message.freeze();
 
                         // Exactly one ack per received FRAME (see `Receiver::acks`'s
                         // doc comment), sent before dispatch -- identical relative

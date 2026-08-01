@@ -72,8 +72,7 @@ app):
   queries -- one legend line per category; whichever protocol is actually running
   populates its own lines, the other protocol's lines are simply flat at zero, not
   wrong), overhead-bytes-per-sequenced-byte, bandwidth efficiency (starfish's
-  512B-normalized formula), compression ratio (§8 -- only meaningful when
-  `--compress-network` is on; 0/absent otherwise, not a misleading number).
+  512B-normalized formula).
 - **Data plane**: blocks published/received, acks sent/received, repairs
   requested/served (all Vantage-only), batches/s (both protocols), submitted vs.
   sequenced (committed) transactions/s, proposed block size (p50/p90/p99/max bytes,

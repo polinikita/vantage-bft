@@ -8,9 +8,9 @@ python3 local-dryrun/dryrun.py
 ```
 
 edits go in `config.yml` (protocol, node/worker count, rate, tx size, mode, duration,
-Δ, batch/header delays, crash count, latency table, compression, data dir -- every
-run parameter in one place, commented defaults = the n=10 / 1000 tx/s WAN-shaped
-latency experiment).
+Δ, batch/header delays, crash count, latency table, data dir -- every run parameter
+in one place, commented defaults = the n=10 / 1000 tx/s WAN-shaped latency
+experiment).
 
 ## What it does
 

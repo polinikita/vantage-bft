@@ -19,7 +19,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn};
 use metrics::Metrics;
-use network::{BatchConfig, BlipGate, CancelHandler, ReliableSender};
+use network::{BatchConfig, CancelHandler, ReliableSender};
 //use tokio::time::error::Elapsed;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -251,19 +251,10 @@ impl Core {
         // withhold_window`) -- appended immediately after `withheld_header_dests`,
         // same "keep every resolved-once-at-spawn value grouped together" reasoning.
         withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
-        // Transient network-level "blip" fault injector (`--blip-at`): resolved once
-        // by the caller (`Primary::spawn`, via `config::blip_targets` +
-        // `Parameters::blip_window`) -- same resolved-by-caller convention as
-        // `latency_map`/`withheld_header_dests` just above, for the identical reason.
-        // `None` (the default, and always the case when `--blip-at` isn't given)
-        // means this node's `network` sender never even checks the blip window.
-        blip_gate: Option<Arc<BlipGate>>,
         // METRICS-DASHBOARD-SPEC.md §1: wire-metrics handle, appended last (same
         // convention as `latency_map` above) -- attached to `network` so every
         // `PrimaryMessage` this task sends/broadcasts is counted.
         metrics: Arc<Metrics>,
-        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
-        compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
@@ -295,9 +286,7 @@ impl Core {
                 metrics: metrics.clone(),
                 network: ReliableSender::new()
                     .with_latency(latency_map)
-                    .with_blip(blip_gate)
                     .with_metrics(metrics)
-                    .with_compression(compress_network)
                     .with_batching(batch),
                 withheld_header_dests,
                 withhold_window,

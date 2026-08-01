@@ -33,8 +33,6 @@ impl Helper {
         rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         metrics: Arc<Metrics>,
-        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
-        compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
@@ -46,7 +44,6 @@ impl Helper {
                 rx_primaries_headers,
                 network: SimpleSender::new()
                     .with_metrics(metrics)
-                    .with_compression(compress_network)
                     .with_batching(batch),
             }
             .run()

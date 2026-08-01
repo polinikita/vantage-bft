@@ -275,35 +275,6 @@ pub trait TipOracle {
     fn available_at_validity(&self, author: &PublicKey, tip: &Proposal) -> bool;
 }
 
-/// Fault-injection scaffolding for benchmark/simulation runs -- NOT protocol. Upstream
-/// (`Core`) always carried these five fields (`crash_author`, `crash_on_proposal`,
-/// `crash_duration`, `cut_proposal_count`, `crash_triggered`), using
-/// `crash_on_proposal == 0` as an always-present "disabled" sentinel. Here they exist
-/// at all only when a benchmark opts in via `CutEngine::with_crash_sim` -- production
-/// (`CutEngine::crash_sim: None`, the default) carries none of this bookkeeping,
-/// including the proposal counter, which has no protocol meaning of its own (its only
-/// reader is `CutEngine::maybe_skip_cut_proposal`).
-#[derive(Clone, Debug)]
-pub struct CrashSim {
-    author: PublicKey,
-    on_proposal: u64,
-    duration_ms: u64,
-    proposal_count: u64,
-    triggered: bool,
-}
-
-impl CrashSim {
-    pub fn new(author: PublicKey, on_proposal: u64, duration_ms: u64) -> Self {
-        Self {
-            author,
-            on_proposal,
-            duration_ms,
-            proposal_count: 0,
-            triggered: false,
-        }
-    }
-}
-
 /// BRACHA VARIANT ADDITION -- see the module doc comment's "BRACHA VARIANT" paragraph
 /// for the full mechanism. Selects which cut-consensus census/echo shape
 /// `CutEngine::process_cut_vote` (and, for `Bracha`, `process_cut_ready`) runs;
@@ -337,9 +308,6 @@ pub struct CutEngine {
     /// `true` (the paper-faithful default). `false` reproduces upstream exactly (votes
     /// without ever inspecting `proposal.tips`).
     gate_tips: bool,
-    /// Deviation from upstream's always-present crash fields -- see `CrashSim`'s doc
-    /// comment.
-    crash_sim: Option<CrashSim>,
     /// BRACHA VARIANT ADDITION -- see `Variant`'s own doc comment. `CutEngine::new`'s
     /// default (`Variant::Opt`) is byte-for-byte the engine as it existed before this
     /// field was added.
@@ -506,7 +474,6 @@ impl CutEngine {
             committee,
             timeout_delay,
             gate_tips: true,
-            crash_sim: None,
             variant: Variant::default(),
             cut_round: 1,
             highest_safe_cut: Digest::default(),
@@ -540,12 +507,6 @@ impl CutEngine {
     /// reproduce upstream's blind-vote behavior.
     pub fn with_gate_tips(mut self, gate_tips: bool) -> Self {
         self.gate_tips = gate_tips;
-        self
-    }
-
-    /// Opt into the fault-injection scaffolding -- see `CrashSim`'s doc comment.
-    pub fn with_crash_sim(mut self, crash_sim: CrashSim) -> Self {
-        self.crash_sim = Some(crash_sim);
         self
     }
 
@@ -1193,43 +1154,12 @@ impl CutEngine {
         if !self.proposed_cut_rounds.insert(round) {
             return Vec::new();
         }
-        if let Some(sim) = self.crash_sim.as_mut() {
-            sim.proposal_count += 1;
-        }
-        if self.maybe_skip_cut_proposal(round, "cut") {
-            return Vec::new();
-        }
 
         let parent_cut = self.highest_safe_cut.clone();
         let proposal = self.make_cut_proposal(round, parent_cut, tips);
         let mut effects = vec![CutEffect::Broadcast(CutOut::CutProposal(proposal.clone()))];
         effects.extend(self.process_cut_proposal(proposal, tips, oracle));
         effects
-    }
-
-    /// Upstream primary/src/core.rs:790-806.
-    fn maybe_skip_cut_proposal(&mut self, round: CutRound, source: &'static str) -> bool {
-        let Some(sim) = self.crash_sim.as_mut() else {
-            return false;
-        };
-        if sim.triggered
-            || sim.on_proposal == 0
-            || sim.author != self.name
-            || sim.proposal_count != sim.on_proposal
-        {
-            return false;
-        }
-
-        sim.triggered = true;
-        log::info!(
-            "BENCH event=proposal_skip node={:?} round={} proposal_index={} duration_ms={} source={} one_shot=true",
-            self.name,
-            round,
-            sim.proposal_count,
-            sim.duration_ms,
-            source
-        );
-        true
     }
 
     /// Upstream primary/src/core.rs:808-822. `ArmTimer`'s deadline is computed here

@@ -7,10 +7,10 @@ use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
-use crypto::{Digest, PairwiseKeys, PublicKey};
+use crypto::{Digest, PublicKey};
 use log::{error, info, warn};
 use metrics::{start_prometheus_server, MetricReporter, Metrics};
-use network::{BatchConfig, BlipGate, MessageHandler, Receiver, Writer};
+use network::{BatchConfig, MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
@@ -69,14 +69,6 @@ pub struct Worker {
     /// (`BatchMaker`, `Synchronizer`, `Helper`), which previously ran at zero
     /// injected delay even under a WAN-shaped run.
     latency_map: HashMap<SocketAddr, Duration>,
-    /// Transient network-level "blip" fault injector (`Parameters::blip_node_index`),
-    /// resolved once at spawn time (same convention as `latency_map` above) via
-    /// `config::blip_targets` + `Parameters::blip_window`. `None` -- the default, and
-    /// always the case when `--blip-at` isn't given -- means every worker-to-worker/
-    /// worker-to-primary-reply sender this worker spawns never checks the blip
-    /// window. Threaded into every `SimpleSender` this worker spawns (`BatchMaker`,
-    /// `Synchronizer`, `Helper`), same convention as `latency_map`.
-    blip_gate: Option<Arc<BlipGate>>,
     /// Data-plane withholding fault injector (`Parameters::withhold_senders`),
     /// resolved once at spawn time (same convention as `latency_map` above) via
     /// `config::withheld_destinations`. `None` -- the default, and always the case
@@ -88,10 +80,9 @@ pub struct Worker {
     withheld_destinations: Option<HashSet<PublicKey>>,
     /// Data-plane withholding fault injector, TIME-WINDOWED variant
     /// (`Parameters::withhold_window`): the shared, in-process "has the window opened
-    /// yet" cell, cloned straight from `parameters` (same convention as `blip_gate`'s
-    /// own `parameters.blip_window.clone()` above -- no `config::` resolution needed
-    /// here, unlike `withheld_destinations`, since this cell doesn't depend on OUR OWN
-    /// committee position at all). Threaded through to `BatchMaker::spawn`, which
+    /// yet" cell, cloned straight from `parameters` -- no `config::` resolution
+    /// needed here, unlike `withheld_destinations`, since this cell doesn't depend on
+    /// OUR OWN committee position at all. Threaded through to `BatchMaker::spawn`, which
     /// consults it (via `config::withhold_active`) once per seal to decide whether
     /// `withheld_destinations`' filter is currently active -- see `handle_clients_
     /// transactions`'s own comment at that call site. `None` whenever `--withhold-at`
@@ -105,14 +96,6 @@ pub struct Worker {
     /// matching `network::Receiver`s -- EXCEPT the client transaction port, which
     /// never batches (see `handle_clients_transactions`).
     batch: BatchConfig,
-    /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
-    /// (`Parameters::authenticate_channels`), resolved once at spawn time (same
-    /// convention as `latency_map`/`batch`). `None` (the default) is byte-identical
-    /// to pre-MAC behavior. Threaded into every worker-to-worker/worker-to-primary
-    /// sender and receiver this worker spawns -- EXCEPT the client transaction port
-    /// (clients aren't committee members and hold no key, same carve-out as
-    /// `compress_network`/`batch_messages`).
-    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 impl Worker {
@@ -160,32 +143,11 @@ impl Worker {
         // doc comment on `Worker`).
         let withhold_window = parameters.withhold_window.clone();
 
-        // Transient network-level "blip" fault injector: resolved once, same
-        // convention as `latency_map` above.
-        let blip_gate = parameters.blip_window.clone().and_then(|window| {
-            config::blip_targets(&committee, &name, parameters.blip_node_index)
-                .map(|targets| Arc::new(BlipGate::new(targets, window)))
-        });
-
         // Resolved once, same convention as `latency_map` above.
         let batch = BatchConfig {
             enabled: parameters.batch_messages,
             max_bytes: parameters.batch_max_bytes,
             max_delay_ms: parameters.batch_max_delay_ms,
-        };
-
-        // SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels,
-        // resolved once, same convention as `latency_map`/`batch` above.
-        // `authenticate_channels` on with no `mac_secret` set is a misconfiguration
-        // (would otherwise silently run unauthenticated) -- panic loudly rather than
-        // let it pass.
-        let channel_auth: Option<Arc<PairwiseKeys>> = if parameters.authenticate_channels {
-            let secret = parameters
-                .mac_secret
-                .expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
-            Some(Arc::new(committee.pairwise_keys(&name, &secret)))
-        } else {
-            None
         };
 
         // Define a worker instance.
@@ -197,11 +159,9 @@ impl Worker {
             store,
             metrics: metrics.clone(),
             latency_map,
-            blip_gate,
             withheld_destinations,
             withhold_window,
             batch,
-            channel_auth,
         };
 
         // Spawn all worker tasks.
@@ -212,7 +172,6 @@ impl Worker {
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
-            worker.name,
             worker
                 .committee
                 .primary(&worker.name)
@@ -220,9 +179,7 @@ impl Worker {
                 .worker_to_primary, //filter primary associated with current worker based on the committee config.
             rx_primary, //receiver channel to connect to primary channel (i.e. how other listener functions can invoke to PrimaryConnector)
             worker.metrics.clone(),
-            worker.parameters.compress_network,
             worker.batch,
-            worker.channel_auth.clone(),
         );
 
         // NOTE: This log entry is used to compute performance.
@@ -259,11 +216,8 @@ impl Worker {
             PrimaryReceiverHandler {
                 tx_synchronizer,
                 metrics: self.metrics.clone(),
-                name: self.name,
-                channel_auth: self.channel_auth.clone(),
             }, //handler for received Primary messages, forwards them to synchronizer
             Some(self.metrics.clone()),
-            self.parameters.compress_network,
             // This handler never acked (see its `dispatch`'s doc comment).
             /* acks */
             false,
@@ -282,11 +236,8 @@ impl Worker {
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
             self.latency_map.clone(),
-            self.blip_gate.clone(),
             self.metrics.clone(),
-            self.parameters.compress_network,
             self.batch,
-            self.channel_auth.clone(),
         );
 
         info!(
@@ -317,22 +268,13 @@ impl Worker {
                 yield_counter: Arc::new(AtomicU64::new(0)),
             }, //handler for received Client messages, forwards them to batch maker
             Some(self.metrics.clone()),
-            // METRICS-DASHBOARD-SPEC.md §8: client traffic is NEVER compressed --
-            // `node::client::Client` builds its own raw `Framed`/`TcpStream` directly
-            // (bypasses `network::SimpleSender` entirely, see `node/src/client.rs`),
-            // so it never compresses regardless of this committee's own
-            // `compress_network` setting. Always `false` here, independent of
-            // `self.parameters.compress_network` (which only governs primary<->worker/
-            // primary<->primary/worker<->worker traffic, all of which DOES go through
-            // `network::{Simple,Reliable}Sender`).
-            false,
             // This handler never acked either (see its `dispatch`).
             /* acks */
             false,
             // Client traffic is NEVER batched -- `node::client::Client` sends raw,
-            // unbundled frames (same bypass-of-`network::{Simple,Reliable}Sender`
-            // reasoning as the `compress` argument just above). Always `false` here,
-            // independent of `self.parameters.batch_messages`.
+            // unbundled frames (bypasses `network::{Simple,Reliable}Sender` entirely,
+            // see `node/src/client.rs`). Always `false` here, independent of
+            // `self.parameters.batch_messages`.
             /* batch */
             false,
         );
@@ -376,11 +318,8 @@ impl Worker {
             /* withheld_workers_addresses */ withheld_workers_addresses,
             /* withhold_window */ self.withhold_window.clone(),
             self.latency_map.clone(),
-            self.blip_gate.clone(),
             self.metrics.clone(),
-            self.parameters.compress_network,
             self.batch,
-            self.channel_auth.clone(),
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -428,10 +367,8 @@ impl Worker {
                 tx_helper,    //sender channel to connect to helper
                 tx_processor, //sender channel to connect to processor
                 metrics: self.metrics.clone(),
-                channel_auth: self.channel_auth.clone(),
             },
             Some(self.metrics.clone()),
-            self.parameters.compress_network,
             // This handler acks every received frame (moved out of `dispatch` -- see
             // its doc comment).
             /* acks */
@@ -447,9 +384,7 @@ impl Worker {
             /* rx_request */
             rx_helper, //receiver channel to connect to WorkerReceiverHandler
             self.latency_map.clone(),
-            self.blip_gate.clone(),
             self.metrics.clone(),
-            self.parameters.compress_network,
             self.batch,
         );
 
@@ -523,19 +458,6 @@ struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>, //sender channel to connect to helper
     tx_processor: Sender<SerializedBatchMessage>, //sender channel to connect to processor
     metrics: Arc<Metrics>,
-    /// SECURITY (Fable audit): `Parameters::authenticate_channels`. `None` is
-    /// byte-identical to pre-MAC behavior. `WorkerMessage::Batch` carries no sender
-    /// claim at all (own-batch broadcasts and `Helper`'s cross-authority relays are
-    /// indistinguishable on the wire -- the same D4-class gap as `Header(_, true)`/
-    /// `ControlServe` on the primary side) -- its bytes (tag included, if the flag is
-    /// on) are forwarded to `Processor` completely untouched: `Processor` content-
-    /// addresses a batch by hashing EXACTLY the bytes it's handed, so every copy of
-    /// "the same" batch floating around the network (the original seal, and every
-    /// relayed/gossiped copy) must stay byte-identical for `store.read(digest)`
-    /// lookups to ever hit -- this handler must never strip or alter a `Batch`'s
-    /// bytes. `WorkerMessage::BatchRequest` DOES carry a genuine sender claim
-    /// (`origin`) and IS verified normally, once we know that's the variant we have.
-    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 #[async_trait]
@@ -551,12 +473,6 @@ impl MessageHandler for WorkerReceiverHandler {
         // for batching (several logical messages can share one frame, and only one
         // ack may be sent per frame). See `Receiver::acks`'s doc comment.
 
-        // SECURITY (Fable audit): deserialize the FULL received bytes first -- bincode
-        // tolerates (ignores) any trailing bytes beyond what a value actually needs,
-        // so this succeeds identically whether or not a MAC tag is appended, without
-        // this handler needing to guess up front how many trailing bytes (if any) to
-        // strip. See `channel_auth`'s doc comment for why `Batch`'s bytes are then
-        // never touched, while `BatchRequest`'s tag IS split off and verified.
         match bincode::deserialize(&serialized) {
             Ok(WorkerMessage::Batch(..)) => {
                 //If receive batch message from another worker. Store the batch, and process.
@@ -580,15 +496,6 @@ impl MessageHandler for WorkerReceiverHandler {
             }
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => {
                 //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
-                if let Some(auth) = &self.channel_auth {
-                    let Some((payload, tag)) = crypto::mac::split_tag(&serialized) else {
-                        return Ok(());
-                    };
-                    if !auth.verify(&requestor, payload, &tag) {
-                        self.metrics.authenticated_channel_rejected_total.inc();
-                        return Ok(());
-                    }
-                }
                 self.metrics
                     .network_messages_received_total
                     .with_label_values(&["BatchRequest"])
@@ -614,15 +521,6 @@ impl MessageHandler for WorkerReceiverHandler {
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>, //sender channel to connect to synchronizer.
     metrics: Arc<Metrics>,
-    /// SECURITY (Fable audit): this worker's own public key -- the worker<->primary
-    /// channel is intra-authority (our own primary shares our own public key), so the
-    /// MAC candidate sender for every message on this port is always `name` itself
-    /// (`k_{name,name}`, the degenerate self-pair key). Unused when `channel_auth` is
-    /// `None`.
-    name: PublicKey,
-    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
-    /// behavior.
-    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 #[async_trait]
@@ -632,27 +530,10 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        // SECURITY (Fable audit): strip and verify the trailing MAC tag before
-        // deserializing -- same contract as `crate::vantage::node::
-        // VantageReceiverHandler::dispatch`.
-        let (payload, tag): (&[u8], Option<[u8; crypto::mac::TAG_LEN]>) = match &self.channel_auth {
-            Some(_) => match crypto::mac::split_tag(&serialized) {
-                Some((payload, tag)) => (payload, Some(tag)),
-                None => return Ok(()),
-            },
-            None => (&serialized[..], None),
-        };
-
         // Deserialize the message and send it to the synchronizer.
-        match bincode::deserialize::<PrimaryWorkerMessage>(payload) {
+        match bincode::deserialize::<PrimaryWorkerMessage>(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
             Ok(message) => {
-                if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
-                    if !auth.verify(&self.name, payload, &tag) {
-                        self.metrics.authenticated_channel_rejected_total.inc();
-                        return Ok(());
-                    }
-                }
                 self.metrics
                     .network_messages_received_total
                     .with_label_values(&[message.type_name()])
@@ -660,7 +541,7 @@ impl MessageHandler for PrimaryReceiverHandler {
                 self.metrics
                     .network_bytes_received_total
                     .with_label_values(&[message.type_name()])
-                    .inc_by(payload.len() as u64);
+                    .inc_by(serialized.len() as u64);
                 self.tx_synchronizer
                     .send(message)
                     .await

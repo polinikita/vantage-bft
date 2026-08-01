@@ -393,29 +393,13 @@ impl Primary {
         // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
         let consensus_round = Arc::new(AtomicU64::new(0));
 
-        // Transport-level batching, resolved once here (mirrors `compress_network`'s
-        // own plumbing -- a single `Parameters`-derived value threaded into every
-        // `Reliable`/`SimpleSender` and `network::Receiver` this primary spawns,
-        // both protocols identically).
+        // Transport-level batching, resolved once here -- a single `Parameters`-
+        // derived value threaded into every `Reliable`/`SimpleSender` and
+        // `network::Receiver` this primary spawns, both protocols identically.
         let batch = network::BatchConfig {
             enabled: parameters.batch_messages,
             max_bytes: parameters.batch_max_bytes,
             max_delay_ms: parameters.batch_max_delay_ms,
-        };
-
-        // SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
-        // (`Parameters::authenticate_channels`), resolved once here -- shared by
-        // every handler/sender below, both protocol branches, exactly like `batch`
-        // above. `authenticate_channels` on with no `mac_secret` is a misconfiguration
-        // (would otherwise silently run unauthenticated); panic loudly rather than
-        // let it pass.
-        let channel_auth: Option<Arc<crypto::PairwiseKeys>> = if parameters.authenticate_channels {
-            let secret = parameters
-                .mac_secret
-                .expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
-            Some(Arc::new(committee.pairwise_keys(&name, &secret)))
-        } else {
-            None
         };
 
         match parameters.protocol {
@@ -448,11 +432,8 @@ impl Primary {
                         tx: tx_vantage,
                         ack_aggregator,
                         metrics: Some(metrics.clone()),
-                        channel_auth: channel_auth.clone(),
-                        committee: committee.clone(),
                     },
                     Some(metrics.clone()),
-                    parameters.compress_network,
                     // Acks every received frame (moved out of `dispatch` -- see
                     // `VantageReceiverHandler`'s doc comment).
                     /* acks */
@@ -480,11 +461,8 @@ impl Primary {
                         tx_our_digests,
                         tx_others_digests,
                         metrics: metrics.clone(),
-                        name,
-                        channel_auth: channel_auth.clone(),
                     },
                     Some(metrics.clone()),
-                    parameters.compress_network,
                     // This handler never acked (see its `dispatch`).
                     /* acks */
                     false,
@@ -512,7 +490,7 @@ impl Primary {
             Protocol::SimpleIt | Protocol::SimpleItBracha => {
                 // Simple-IT cut-consensus: a single `SimpleItCore` task, mirroring
                 // `Protocol::Vantage`'s assembly exactly (same address setup, same
-                // `acks: true`, same compress/batch parameters) -- it drives
+                // `acks: true`, same batch parameters) -- it drives
                 // `simpleit::CutEngine` over the identical data plane (`LaneManager`/
                 // `Repairer`/`Wire`/`PayloadIo`) Vantage uses, as its own separate
                 // instances (deliberately not shared mutable state -- see
@@ -545,10 +523,8 @@ impl Primary {
                         tx: tx_simpleit,
                         ack_aggregator,
                         metrics: Some(metrics.clone()),
-                        channel_auth: channel_auth.clone(),
                     },
                     Some(metrics.clone()),
-                    parameters.compress_network,
                     // Acks every received frame (moved out of `dispatch` -- see
                     // `SimpleItReceiverHandler`'s doc comment).
                     /* acks */
@@ -576,11 +552,8 @@ impl Primary {
                         tx_our_digests,
                         tx_others_digests,
                         metrics: metrics.clone(),
-                        name,
-                        channel_auth: channel_auth.clone(),
                     },
                     Some(metrics.clone()),
-                    parameters.compress_network,
                     // This handler never acked (see its `dispatch`).
                     /* acks */
                     false,
@@ -623,7 +596,6 @@ impl Primary {
                         metrics: metrics.clone(),
                     },
                     Some(metrics.clone()),
-                    parameters.compress_network,
                     // Acks every received frame (moved out of `dispatch` -- see
                     // `PrimaryReceiverHandler`'s doc comment).
                     /* acks */
@@ -648,11 +620,8 @@ impl Primary {
                         tx_our_digests,
                         tx_others_digests,
                         metrics: metrics.clone(),
-                        name,
-                        channel_auth: channel_auth.clone(),
                     },
                     Some(metrics.clone()),
-                    parameters.compress_network,
                     // This handler never acked (see its `dispatch`).
                     /* acks */
                     false,
@@ -733,19 +702,7 @@ impl Primary {
                     // resolved once here, a plain clone of the shared cell (`None`
                     // whenever `--withhold-at` isn't given).
                     parameters.withhold_window.clone(),
-                    // Transient network-level "blip" fault injector (`--blip-at`):
-                    // resolved once here, same convention as `latency_map`/
-                    // `withheld_destinations` just above -- `None` (the default, and
-                    // always the case when `--blip-at` isn't given, or when this
-                    // node's own `Parameters::blip_window` was never armed -- e.g. the
-                    // distributed `node run` path, which exposes no CLI flag for this)
-                    // means this node's primary-to-primary traffic is untouched.
-                    parameters.blip_window.clone().and_then(|window| {
-                        config::blip_targets(&committee, &name, parameters.blip_node_index)
-                            .map(|targets| Arc::new(network::BlipGate::new(targets, window)))
-                    }),
                     metrics.clone(),
-                    parameters.compress_network,
                     batch,
                 );
 
@@ -760,9 +717,7 @@ impl Primary {
                     tx_output,
                     synchronizer,
                     metrics.clone(),
-                    parameters.compress_network,
                     batch,
-                    channel_auth.clone(),
                 );
 
                 // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
@@ -774,9 +729,7 @@ impl Primary {
                     rx_consensus,
                     tx_certificates_loopback.clone(),
                     metrics.clone(),
-                    parameters.compress_network,
                     batch,
-                    channel_auth.clone(),
                 );
 
                 // Receives batch digests from other workers. They are only used to validate headers.
@@ -797,9 +750,7 @@ impl Primary {
                     /* tx_core */ tx_headers_loopback,
                     tx_header_waiter_instances,
                     metrics.clone(),
-                    parameters.compress_network,
                     batch,
-                    channel_auth.clone(),
                 );
 
                 // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
@@ -831,7 +782,6 @@ impl Primary {
                     rx_cert_requests,
                     rx_header_requests,
                     metrics.clone(),
-                    parameters.compress_network,
                     batch,
                 );
 
@@ -906,16 +856,6 @@ struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
     metrics: Arc<Metrics>,
-    /// SECURITY (Fable audit): this authority's own public key -- the worker<->primary
-    /// channel is intra-authority (our own worker shares our own public key), so the
-    /// MAC candidate sender for every message on this port is always `name` itself
-    /// (`k_{name,name}`, the degenerate self-pair key -- see `PairwiseKeys::build`'s
-    /// doc comment). Unused when `channel_auth` is `None`.
-    name: PublicKey,
-    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
-    /// behavior -- every received frame is deserialized and routed exactly as
-    /// received, no trailing bytes stripped or checked.
-    channel_auth: Option<Arc<crypto::PairwiseKeys>>,
 }
 
 #[async_trait]
@@ -925,38 +865,20 @@ impl MessageHandler for WorkerReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        // SECURITY (Fable audit): strip and verify the trailing MAC tag before
-        // deserializing -- see `crate::vantage::node::VantageReceiverHandler::
-        // dispatch`'s identical contract/doc comment.
-        let (payload, tag): (&[u8], Option<[u8; crypto::mac::TAG_LEN]>) = match &self.channel_auth {
-            Some(_) => match crypto::mac::split_tag(&serialized) {
-                Some((payload, tag)) => (payload, Some(tag)),
-                None => return Ok(()),
-            },
-            None => (&serialized[..], None),
-        };
-
         // Deserialize and parse the message.
         let message: WorkerPrimaryMessage =
-            bincode::deserialize(payload).map_err(DagError::SerializationError)?;
-
-        if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
-            if !auth.verify(&self.name, payload, &tag) {
-                self.metrics.authenticated_channel_rejected_total.inc();
-                return Ok(());
-            }
-        }
+            bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
 
         match message {
             WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
-                record_typed_received(&self.metrics, "OurBatch", payload.len());
+                record_typed_received(&self.metrics, "OurBatch", serialized.len());
                 self.tx_our_digests //sender channel to Proposer
                     .send((digest, worker_id))
                     .await
                     .expect("Failed to send workers' digests")
             }
             WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
-                record_typed_received(&self.metrics, "OthersBatch", payload.len());
+                record_typed_received(&self.metrics, "OthersBatch", serialized.len());
                 self.tx_others_digests //sender channel to PayloadReceiver
                     .send((digest, worker_id))
                     .await

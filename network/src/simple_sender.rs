@@ -1,6 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch::{sleep_until_or_pending, BatchConfig, Coalescer};
-use crate::blip::BlipGate;
 use crate::error::NetworkError;
 use crate::reliable_sender::record_typed_sent;
 use bytes::Bytes;
@@ -34,13 +33,8 @@ pub struct SimpleSender {
     /// latency, empty by default (current behavior, byte-identical). See
     /// `network/src/lib.rs`'s module doc for the injection point/semantics.
     latency: HashMap<SocketAddr, Duration>,
-    /// Transient network-level "blip" fault injector, same contract as
-    /// `ReliableSender::blip` -- attached via `with_blip`, `None` by default.
-    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::metrics`.
     metrics: Option<Arc<Metrics>>,
-    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::compress`.
-    compress: bool,
     /// Same contract as `ReliableSender::batch` (see `network::batch`'s module doc).
     batch: BatchConfig,
 }
@@ -57,9 +51,7 @@ impl SimpleSender {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
             latency: HashMap::new(),
-            blip: None,
             metrics: None,
-            compress: false,
             batch: BatchConfig::default(),
         }
     }
@@ -72,22 +64,10 @@ impl SimpleSender {
         self
     }
 
-    /// Attach a blip gate (same contract as `ReliableSender::with_blip`).
-    pub fn with_blip(mut self, gate: Option<Arc<BlipGate>>) -> Self {
-        self.blip = gate;
-        self
-    }
-
     /// METRICS-DASHBOARD-SPEC.md §1: attach a wire-metrics handle (same contract as
     /// `ReliableSender::with_metrics`).
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
-        self
-    }
-
-    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::with_compression`.
-    pub fn with_compression(mut self, enabled: bool) -> Self {
-        self.compress = enabled;
         self
     }
 
@@ -101,18 +81,7 @@ impl SimpleSender {
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(100_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        // Resolved ONCE here (mirrors `extra_latency` just above), not per-message --
-        // see `ReliableSender::spawn_connection`'s identical comment.
-        let blip = self.blip.clone().filter(|gate| gate.targets(&address));
-        Connection::spawn(
-            address,
-            rx,
-            extra_latency,
-            blip,
-            self.metrics.clone(),
-            self.compress,
-            self.batch,
-        );
+        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.batch);
         tx
     }
 
@@ -195,14 +164,8 @@ struct Connection {
     /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): this connection's own fixed
     /// artificial one-way delay to `address` (`Duration::ZERO` = off, the default).
     extra_latency: Duration,
-    /// Transient network-level "blip" fault injector: same contract as
-    /// `ReliableSender::Connection::blip` -- resolved once at spawn time via
-    /// `SimpleSender::spawn_connection`'s own `BlipGate::targets` check.
-    blip: Option<Arc<BlipGate>>,
     /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::Connection::metrics`.
     metrics: Option<Arc<Metrics>>,
-    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::Connection::compress`.
-    compress: bool,
     /// Same contract as `ReliableSender::Connection::batch`.
     batch: BatchConfig,
 }
@@ -212,9 +175,7 @@ impl Connection {
         address: SocketAddr,
         receiver: Receiver<Bytes>,
         extra_latency: Duration,
-        blip: Option<Arc<BlipGate>>,
         metrics: Option<Arc<Metrics>>,
-        compress: bool,
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
@@ -222,29 +183,12 @@ impl Connection {
                 address,
                 receiver,
                 extra_latency,
-                blip,
                 metrics,
-                compress,
                 batch,
             }
             .run()
             .await;
         });
-    }
-
-    /// METRICS-DASHBOARD-SPEC.md §8: same contract as `ReliableSender::wire_bytes`.
-    /// When batching is also on, `data` here is already the whole bundle frame (same
-    /// composition order as `ReliableSender`: coalesce -> compress -> outer frame).
-    fn wire_bytes(&self, data: &Bytes) -> Bytes {
-        if !self.compress {
-            return data.clone();
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics
-                .bytes_uncompressed_sent_total
-                .inc_by(data.len() as u64);
-        }
-        Bytes::from(lz4_flex::compress_prepend_size(data))
     }
 
     fn record_frame_sent(&self) {
@@ -257,10 +201,9 @@ impl Connection {
     /// audit item 6: dispatches to one of two loops depending on whether a
     /// per-destination latency is actually configured -- mirrors `ReliableSender::
     /// keep_alive`'s existing `extra_latency.is_zero()` split (`keep_alive_immediate`
-    /// vs. `keep_alive_delayed`). `self.blip.is_none()` extends that split the same
-    /// way `ReliableSender::keep_alive`'s does -- see its doc comment.
+    /// vs. `keep_alive_delayed`).
     async fn run(&mut self) {
-        if self.extra_latency.is_zero() && self.blip.is_none() {
+        if self.extra_latency.is_zero() {
             self.run_immediate().await
         } else {
             self.run_delayed().await
@@ -268,21 +211,15 @@ impl Connection {
     }
 
     /// The release instant for a message being scheduled right now -- same contract
-    /// as `ReliableSender::Connection::scheduled_release` (see its doc comment for
-    /// the ordering-preservation argument, which applies identically here: every
-    /// call site below runs inside this same connection's single sequential task).
+    /// as `ReliableSender::Connection::scheduled_release`.
     fn scheduled_release(&self) -> tokio::time::Instant {
-        let natural_release = tokio::time::Instant::now() + self.extra_latency;
-        match &self.blip {
-            Some(gate) => gate.clamp(natural_release),
-            None => natural_release,
-        }
+        tokio::time::Instant::now() + self.extra_latency
     }
 
     /// Fable perf audit item 6: the zero-latency fast path -- byte-identical to the
     /// pre-D7-3 loop (no delay queue, no `Instant::now()`/`sleep_until` bookkeeping at
     /// all), used whenever no artificial per-destination latency is configured (the
-    /// default). Every message still goes through `wire_bytes`/metrics exactly as
+    /// default). Every message still goes through the same metrics accounting as
     /// `run_delayed` does, so the bytes actually written to the wire are identical
     /// either way -- only the zero-cost scheduling differs.
     ///
@@ -315,9 +252,8 @@ impl Connection {
                 () = coalesce_due, if self.batch.enabled && !coalescer.is_empty() => {
                     let (bundle, _) = coalescer.flush();
                     coalesce_deadline = None;
-                    let wire = self.wire_bytes(&bundle);
-                    let len = wire.len();
-                    if let Err(e) = writer.send(wire).await {
+                    let len = bundle.len();
+                    if let Err(e) = writer.send(bundle).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                         return;
                     }
@@ -334,9 +270,8 @@ impl Connection {
                         if coalescer.over_cap(self.batch.max_bytes) {
                             let (bundle, _) = coalescer.flush();
                             coalesce_deadline = None;
-                            let wire = self.wire_bytes(&bundle);
-                            let len = wire.len();
-                            if let Err(e) = writer.send(wire).await {
+                            let len = bundle.len();
+                            if let Err(e) = writer.send(bundle).await {
                                 warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                                 return;
                             }
@@ -346,9 +281,8 @@ impl Connection {
                             self.record_frame_sent();
                         }
                     } else {
-                        let wire = self.wire_bytes(&data);
-                        let len = wire.len();
-                        if let Err(e) = writer.send(wire).await {
+                        let len = data.len();
+                        if let Err(e) = writer.send(data).await {
                             warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                             return;
                         }
@@ -416,9 +350,8 @@ impl Connection {
             tokio::select! {
                 () = due, if !delay_queue.is_empty() => {
                     let (_, data) = delay_queue.pop_front().unwrap();
-                    let wire = self.wire_bytes(&data);
-                    let len = wire.len();
-                    if let Err(e) = writer.send(wire).await {
+                    let len = data.len();
+                    if let Err(e) = writer.send(data).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                         return;
                     }

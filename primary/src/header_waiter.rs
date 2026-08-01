@@ -4,7 +4,7 @@ use crate::messages::{proposal_digest, ConsensusMessage, Header, Proposal};
 use crate::primary::{Height, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
-use crypto::{Digest, PairwiseKeys, PublicKey};
+use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
@@ -77,18 +77,6 @@ pub struct HeaderWaiter {
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
     pending: HashMap<Digest, (Height, Sender<()>)>,
-
-    /// SECURITY (Fable audit, P2-1 fix): this authority's own public key -- the
-    /// worker<->primary `Synchronize` send below is intra-authority (our own worker
-    /// shares our own public key), so its tag is always keyed `k_{name,name}` (same
-    /// convention as `garbage_collector.rs`'s `Cleanup`/`committer.rs`'s `Committed`).
-    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
-    /// behavior. Only the primary<->worker `Synchronize` send is tagged here --
-    /// `HeaderWaiter`'s other sends (`HeadersRequest`/`CertificatesRequest`/
-    /// `ProposalHeadersRequest`) are Autobahn primary<->primary traffic, already
-    /// authenticated by that channel's existing ed25519 signatures; deliberately left
-    /// untouched (see the MAC feature's own top-level scope note).
-    channel_auth: Option<Arc<PairwiseKeys>>,
 }
 
 impl HeaderWaiter {
@@ -107,13 +95,8 @@ impl HeaderWaiter {
         tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         metrics: Arc<Metrics>,
-        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
-        compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
-        // SECURITY (Fable audit, P2-1 fix): appended last, same convention as every
-        // other MAC-consuming `::spawn`.
-        channel_auth: Option<Arc<PairwiseKeys>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -129,35 +112,15 @@ impl HeaderWaiter {
                 tx_consensus_loopback,
                 network: SimpleSender::new()
                     .with_metrics(metrics)
-                    .with_compression(compress_network)
                     .with_batching(batch),
                 parent_requests: HashMap::new(),
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
                 pending: HashMap::new(),
-                channel_auth,
             }
             .run()
             .await;
         });
-    }
-
-    /// SECURITY (Fable audit, P2-1 fix): appends a tag keyed `k_{name,name}` (the
-    /// worker<->primary channel is intra-authority -- byte-identical, unappended,
-    /// when `channel_auth` is off) before sending a `Synchronize` request to one of
-    /// our own workers.
-    fn tag(&self, payload: Vec<u8>) -> Bytes {
-        match &self.channel_auth {
-            None => Bytes::from(payload),
-            Some(auth) => {
-                let tag = auth
-                    .tag_for(&self.name, &payload)
-                    .expect("self is a committee member");
-                let mut tagged = payload;
-                tagged.extend_from_slice(&tag);
-                Bytes::from(tagged)
-            }
-        }
     }
 
     /// Helper function. It waits for particular data to become available in the storage
@@ -251,8 +214,7 @@ impl HeaderWaiter {
                                     let message = PrimaryWorkerMessage::Synchronize(digests, author);
                                     let bytes = bincode::serialize(&message)
                                         .expect("Failed to serialize batch sync request");
-                                    let tagged = self.tag(bytes);
-                                    self.network.send_typed(address, tagged, "Synchronize").await;
+                                    self.network.send_typed(address, Bytes::from(bytes), "Synchronize").await;
                                 }
                             }
                         }

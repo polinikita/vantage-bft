@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crypto::{generate_production_keypair, MacSecret, PublicKey, SecretKey};
+use crypto::{generate_production_keypair, PublicKey, SecretKey};
 use log::{info, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -297,7 +297,7 @@ pub struct Parameters {
     /// `VantageCore`/`SimpleItCore` (irrelevant to the latter, which has no AGB
     /// engine) never touch `DigestStatements`'s buffering/fetch bookkeeping in any
     /// observable way. Committee-wide consistent by construction, same reasoning as
-    /// `ack_watermarks`/`compress_network`: every node's `Parameters` comes from the
+    /// `ack_watermarks`: every node's `Parameters` comes from the
     /// same generated config.
     #[serde(default)]
     pub digest_statements: bool,
@@ -364,24 +364,13 @@ pub struct Parameters {
     #[serde(default)]
     pub mimic_latency_ms: Option<u64>,
 
-    /// METRICS-DASHBOARD-SPEC.md §8: network-level lz4 compression, off by default
-    /// (`#[serde(default)]` = `false`) -- byte-identical framing when off (no
-    /// compress/decompress call is even made, see `network` crate). Applied uniformly
-    /// by the `network` crate to every sender/receiver, all three protocols
-    /// identically. Committee-wide consistent by construction: every node's
-    /// `Parameters` comes from the same generated config, so a mixed on/off committee
-    /// isn't a supported configuration (a node expecting compressed frames would fail
-    /// to decode an uncompressed peer's traffic, and vice versa).
-    #[serde(default)]
-    pub compress_network: bool,
-
     /// Transport-level per-peer outbound message batching (coalescing), off by
     /// default (`#[serde(default)]` = `false`) -- byte-identical wire/behavior when
     /// off (see `network` crate's `batch` module doc). Protocol-transparent: applied
     /// uniformly by the `network` crate to every sender/receiver this node spawns
-    /// EXCEPT the client-facing transaction port (clients never batch, same carve-out
-    /// as `compress_network`). Committee-wide consistent by construction, same
-    /// reasoning as `compress_network`.
+    /// EXCEPT the client-facing transaction port (clients never batch). Committee-wide
+    /// consistent by construction: every node's `Parameters` comes from the same
+    /// generated config.
     #[serde(default = "default_batch_messages")]
     pub batch_messages: bool,
     /// Hybrid flush size cap in bytes (see `network::BatchConfig::max_bytes`).
@@ -398,27 +387,6 @@ pub struct Parameters {
     /// cap still short-circuits this window the moment a burst fills it.
     #[serde(default = "default_batch_max_delay_ms")]
     pub batch_max_delay_ms: u64,
-
-    /// Symmetric pairwise-MAC authenticated channels (signature-free, quantum-safe):
-    /// off by default (`#[serde(default)]` = `false`) -- byte-identical wire when off,
-    /// no MAC is computed, appended, or verified anywhere. Committee-wide consistent
-    /// by construction, same reasoning as `compress_network`/`batch_messages`: every
-    /// node's `Parameters` comes from the same generated config, and every peer must
-    /// agree on whether the trailing tag is present. Closes wire-level sender
-    /// impersonation (a Byzantine node forging a message under an honest peer's
-    /// declared sender field) for every inter-validator channel this crate's `network`
-    /// senders/receivers carry, using only `mac_secret` -- no signatures, no PKI, no
-    /// handshake.
-    #[serde(default)]
-    pub authenticate_channels: bool,
-    /// The committee-wide symmetric master secret `authenticate_channels` derives
-    /// every pairwise key from (see `crypto::mac`). `None` unless
-    /// `authenticate_channels` is set; spawning with the flag on and no secret is a
-    /// misconfiguration (every `*::spawn` that reads this panics loudly rather than
-    /// silently running unauthenticated). `#[serde(default)]` keeps every pre-existing
-    /// parameter file (which never mentions this field) valid.
-    #[serde(default)]
-    pub mac_secret: Option<MacSecret>,
 
     /// Data-plane withholding fault injector (`node local-benchmark --withhold`): the
     /// first `withhold_senders` committee indices (0-based, sorted order -- the same
@@ -441,9 +409,8 @@ pub struct Parameters {
     /// sender's whole lifetime, reproducing c35fc4a's original (pre-window) behavior
     /// exactly. `#[serde(default)]` keeps every pre-existing parameter file valid.
     ///
-    /// Only ever populated by `node local-benchmark`'s CLI entry handler -- mirrors
-    /// `blip_at_ms`'s own doc comment (same "library code/`node run` never sets this"
-    /// scoping, for the identical reason).
+    /// Only ever populated by `node local-benchmark`'s CLI entry handler -- library
+    /// code/`node run` never sets this.
     #[serde(default)]
     pub withhold_at_ms: Option<u64>,
     /// Withholding window duration (ms). Only consulted when `withhold_at_ms` is
@@ -455,13 +422,11 @@ pub struct Parameters {
     /// The shared, in-process "has the window opened yet" cell every withholding
     /// sender's own filter site (`worker::BatchMaker::seal`, `primary::Core::
     /// process_own_header`, `primary::vantage::wire::Wire::broadcast_message`)
-    /// consults via `withhold_active` (this crate) -- same `Arc`-shared-cell/
-    /// arm-once-at-measurement-start convention as `blip_window` below (see its own
-    /// doc comment); `node local-benchmark::run` arms both cells at the identical
-    /// point, right after `run_start` is captured. Stores `std::time::Instant` for
-    /// the identical "this crate never needs a `tokio` dependency" reason
-    /// `blip_window`'s own doc comment gives. `#[serde(skip)]` -- always `None`
-    /// immediately after `Parameters::default()`/`Parameters::import(..)`.
+    /// consults via `withhold_active` (this crate). `node local-benchmark::run` arms
+    /// this cell right after `run_start` is captured. Stores `std::time::Instant`
+    /// so this crate never needs a `tokio` dependency just for this one
+    /// skip-serialized field. `#[serde(skip)]` -- always `None` immediately after
+    /// `Parameters::default()`/`Parameters::import(..)`.
     ///
     /// `None` here makes `withhold_active` treat withholding as WHOLE-RUN (see that
     /// fn's own doc comment) -- it does NOT disable withholding; disabling
@@ -469,54 +434,6 @@ pub struct Parameters {
     /// knob this field never touches.
     #[serde(skip)]
     pub withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
-
-    /// Transient network-level "blip" fault injector (`node local-benchmark --blip-at/
-    /// --blip-for/--blip-node`): reproduces the Autobahn paper's (Giridharan et al.,
-    /// SOSP'24, Figs. 1/7/8) blip experiment -- "we ... trigger a three second blip by
-    /// simulating a single leader failure". The committee index (0-based, sorted
-    /// order -- same convention `--crash`/`--load-nodes`/`--withhold` already use) of
-    /// the node that blips. `None` (default) = no blip configured -- `blip_targets`
-    /// (this crate) then returns `None` for every node, so no `network::BlipGate` is
-    /// ever constructed at any spawn site and the send path is byte-identical to
-    /// before this feature existed. `#[serde(default)]` keeps every pre-existing
-    /// parameter file valid.
-    ///
-    /// Only ever populated by `node local-benchmark`'s CLI entry handler
-    /// (`node/src/local_benchmark.rs::run`) -- like `latency_table`, never by library
-    /// code. `node run`'s distributed path exposes no CLI flag for this: an imported
-    /// `parameters.json` that happened to set this field would still resolve a gate's
-    /// TARGET set, but `blip_window` below (`#[serde(skip)]`, so always `None` after
-    /// import) would never arm, making the gate permanently inert -- see that field's
-    /// own doc comment.
-    #[serde(default)]
-    pub blip_node_index: Option<usize>,
-    /// Offset from measurement start (ms) when the blip window begins. Only consulted
-    /// when `blip_node_index` is `Some`. `#[serde(default)]` keeps every pre-existing
-    /// parameter file valid.
-    #[serde(default)]
-    pub blip_at_ms: u64,
-    /// Blip window duration (ms). Only consulted when `blip_node_index` is `Some`.
-    /// `#[serde(default)]` (3000 ms, the Autobahn paper's own blip duration) keeps
-    /// every pre-existing parameter file valid.
-    #[serde(default = "default_blip_for_ms")]
-    pub blip_for_ms: u64,
-    /// The shared, in-process "has the window opened yet" cell every node's own
-    /// `network::BlipGate` clones (same `Arc`, so `node local-benchmark::run`'s single
-    /// `.set(..)` call -- made once measurement start is known, see
-    /// `local_benchmark.rs` -- is instantly visible to every already-spawned node's
-    /// connections, even ones mid-`keep_alive_delayed`/`run_delayed`). Stores
-    /// `std::time::Instant` rather than `tokio::time::Instant` so this crate never
-    /// needs a `tokio` dependency just for this one skip-serialized field;
-    /// `network::BlipGate::clamp` (which DOES depend on tokio already) converts via
-    /// `tokio::time::Instant::from_std` at the point of use. `#[serde(skip)]` (never
-    /// round-trips through `parameters.json`, exactly like `latency_table`) -- always
-    /// `None` immediately after `Parameters::default()`/`Parameters::import(..)`.
-    /// `None` here makes every gate permanently inert regardless of
-    /// `blip_node_index` (see that field's own doc comment): `node local-benchmark`
-    /// is the only populator, and always sets this whenever it sets
-    /// `blip_node_index`.
-    #[serde(skip)]
-    pub blip_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 
     /// Mechanism A (sender-side lane resume, modeled on Starfish's subscription
     /// resume but ack-census-gap-triggered instead of reconnection-triggered --
@@ -604,12 +521,6 @@ fn default_simpleit_gc_window_rounds() -> u64 {
 /// `ack_watermarks`'s own doc comment.
 fn default_ack_watermark_period_ms() -> u64 {
     50
-}
-
-/// `Parameters::blip_for_ms`'s own doc comment -- matches the Autobahn paper's own
-/// three-second blip.
-fn default_blip_for_ms() -> u64 {
-    3_000
 }
 
 /// `Parameters::withhold_for_ms`'s own doc comment -- matches `--withhold-for`'s own
@@ -846,20 +757,13 @@ impl Default for Parameters {
             delta_ms: default_delta_ms(),
             latency_table: None,
             mimic_latency_ms: None,
-            compress_network: false,
             batch_messages: true,
             batch_max_bytes: default_batch_max_bytes(),
             batch_max_delay_ms: default_batch_max_delay_ms(),
-            authenticate_channels: false,
-            mac_secret: None,
             withhold_senders: 0,
             withhold_at_ms: None,
             withhold_for_ms: default_withhold_for_ms(),
             withhold_window: None,
-            blip_node_index: None,
-            blip_at_ms: 0,
-            blip_for_ms: default_blip_for_ms(),
-            blip_window: None,
             resume_check_period_ms: default_resume_check_period_ms(),
             resume_backoff_ms: default_resume_backoff_ms(),
             resume_batch: default_resume_batch(),
@@ -948,14 +852,9 @@ impl Parameters {
             }
             None => {}
         }
-        info!("Network compression enabled? {}", self.compress_network);
         info!(
             "Network batching enabled? {}. Max bytes: {}. Max delay: {} ms",
             self.batch_messages, self.batch_max_bytes, self.batch_max_delay_ms
-        );
-        info!(
-            "Authenticated channels (symmetric pairwise MAC) enabled? {}",
-            self.authenticate_channels
         );
         info!(
             "Ack watermarks (periodic per-lane availability broadcast, replaces \
@@ -987,13 +886,6 @@ impl Parameters {
                     self.withhold_senders
                 ),
             }
-        }
-        if let Some(idx) = self.blip_node_index {
-            info!(
-                "Blip fault injector (Autobahn SOSP'24 Figs. 1/7/8 repro): node index {} \
-                 network-paused for {} ms starting at T+{} ms",
-                idx, self.blip_for_ms, self.blip_at_ms
-            );
         }
     }
 }
@@ -1359,16 +1251,6 @@ impl Committee {
             .map(|x| x.consensus.consensus_to_consensus)
     }
 
-    /// Symmetric pairwise-MAC authenticated channels: builds `myself`'s own
-    /// `PairwiseKeys` handle, one derived key per committee member (including
-    /// `myself` -- see `PairwiseKeys::build`'s doc comment). Every process belonging
-    /// to the same authority (a primary and each of its workers, which all share
-    /// `myself`'s public key) independently derives the IDENTICAL keys from the same
-    /// `secret` + `self`, with no handshake and no cross-process plumbing needed.
-    pub fn pairwise_keys(&self, myself: &PublicKey, secret: &MacSecret) -> crypto::PairwiseKeys {
-        crypto::PairwiseKeys::build(secret, *myself, self.authorities.keys().cloned())
-    }
-
     pub fn broadcast_addresses(&self, myself: &PublicKey) -> Vec<(PublicKey, SocketAddr)> {
         self.authorities
             .iter()
@@ -1420,7 +1302,7 @@ pub fn withheld_destinations(
 /// withholding sender's own `withheld_destinations` filter should actually be applied
 /// right now. `window` is `Parameters::withhold_window.as_deref()` -- the SAME shared,
 /// in-process "has the window opened yet" cell every withholding node's own filter
-/// site consults (mirrors `network::BlipGate::clamp`'s own `self.window.get()` check).
+/// site consults.
 ///
 ///   - `window` is `None` (`--withhold-at` was never given): WHOLE-RUN withholding,
 ///     exactly c35fc4a's original behavior -- ALWAYS active. This is the only case
@@ -1430,66 +1312,19 @@ pub fn withheld_destinations(
 ///   - `window` is `Some(cell)` and UNARMED (`cell.get()` is `None`, i.e. `node
 ///     local-benchmark::run` hasn't yet reached measurement start): NOT active -- the
 ///     window's start-to-be is necessarily still in the future, so there is nothing to
-///     withhold from yet (same reasoning `network::BlipGate`'s own unarmed-cell case
-///     relies on for its no-op -- see that type's doc comment).
+///     withhold from yet.
 ///   - `window` is `Some(cell)` and ARMED (`Some((start, end))`): active iff `now` is
-///     in the half-open interval `[start, end)` -- same inclusive-start/exclusive-end
-///     boundary convention as `network::BlipGate::clamp`'s own window.
+///     in the half-open interval `[start, end)`.
 ///
-/// Callers consult this ONCE per send (never cached), the same convention `network::
-/// BlipGate::clamp` uses for its own per-message window check -- time-windowed
-/// withholding can turn on/off mid-run, unlike the spatial `withheld_destinations`
-/// filter (which is fixed for a node's whole lifetime and IS resolved once at spawn).
+/// Callers consult this ONCE per send (never cached) -- time-windowed withholding can
+/// turn on/off mid-run, unlike the spatial `withheld_destinations` filter (which is
+/// fixed for a node's whole lifetime and IS resolved once at spawn).
 pub fn withhold_active(window: Option<&OnceLock<(Instant, Instant)>>, now: Instant) -> bool {
     match window {
         None => true,
         Some(cell) => cell
             .get()
             .is_some_and(|&(start, end)| now >= start && now < end),
-    }
-}
-
-/// Transient network-level "blip" fault injector (`node local-benchmark --blip-at/
-/// --blip-for/--blip-node`, `Parameters::blip_node_index`): reproduces the Autobahn
-/// paper's (Giridharan et al., SOSP'24, Figs. 1/7/8) blip experiment -- a transient
-/// single-node stall in which every byte to/from one node is HELD (not dropped) for a
-/// fixed window, then released. Every node derives this PURELY locally (its own
-/// identity, `committee`'s own sorted order, and the configured index) -- the same
-/// resolve-once-at-spawn convention `withheld_destinations`/`Committee::latency_map`
-/// already use.
-///
-/// Returns the set of socket addresses THIS node's own `ReliableSender`/`SimpleSender`
-/// connections should hold traffic to during the blip window (fed straight into
-/// `network::BlipGate::new`, the same way `Committee::latency_map`'s return value
-/// feeds `with_latency`):
-///   - if `self_pk` IS the blipped node: every OTHER authority's addresses -- this
-///     node's own outbound is held regardless of destination, since a genuinely
-///     stalled node cannot selectively single out which peer it happens to be
-///     talking to.
-///   - otherwise: only the blipped node's own addresses -- every other destination is
-///     unaffected.
-///
-/// `None` when `blip_node_index` is `None` (the default -- no blip configured) or
-/// doesn't resolve to a committee member (defensive; `node local-benchmark` validates
-/// the index eagerly against the live range and should never pass an out-of-range one
-/// here).
-pub fn blip_targets(
-    committee: &Committee,
-    self_pk: &PublicKey,
-    blip_node_index: Option<usize>,
-) -> Option<HashSet<SocketAddr>> {
-    let blip_pk = *committee.authorities.keys().nth(blip_node_index?)?;
-    if *self_pk == blip_pk {
-        Some(
-            committee
-                .authorities
-                .keys()
-                .filter(|&&k| k != blip_pk)
-                .flat_map(|k| committee.addresses_of(k))
-                .collect(),
-        )
-    } else {
-        Some(committee.addresses_of(&blip_pk).into_iter().collect())
     }
 }
 
@@ -1562,12 +1397,9 @@ mod tests {
         assert_eq!(params.protocol, Protocol::Vantage);
         assert_eq!(params.delta_ms, 150);
         assert_eq!(params.mimic_latency_ms, Some(100));
-        // Fields absent from the JSON fall back to their serde defaults.
-        assert!(!params.authenticate_channels);
         // Transport batching is ON by default (5 ms / 64 KB per-destination
         // coalescing) -- a parameters file that omits the key gets it enabled.
         assert!(params.batch_messages);
-        assert!(!params.compress_network);
         // `vantage_gc_window_views` is absent from this (pre-existing shape) file and
         // must default to the same 50 the Vantage GC previously took from `gc_depth`,
         // so splitting the two knobs apart changes nothing for existing parameter files.
@@ -1660,8 +1492,7 @@ mod tests {
     }
 
     /// An ARMED window is active strictly inside `[start, end)`, and inactive
-    /// everywhere else (before `start`, at/after `end`) -- the same half-open
-    /// boundary convention `network::BlipGate::clamp` uses for its own window.
+    /// everywhere else (before `start`, at/after `end`).
     #[test]
     fn withhold_active_armed_inside_and_outside_window() {
         let cell: OnceLock<(Instant, Instant)> = OnceLock::new();
@@ -1678,53 +1509,5 @@ mod tests {
             Some(&cell),
             base + Duration::from_secs(25)
         )); // after
-    }
-
-    /// `blip_targets`: the blipped node itself holds every OTHER authority's
-    /// addresses (regardless of destination), and never any of its own.
-    #[test]
-    fn blip_targets_self_is_blip_node_targets_everyone_else() {
-        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9500);
-        let targets =
-            blip_targets(&committee, &keypairs[2].name, Some(2)).expect("index 2 is the blip node");
-        let expected: HashSet<SocketAddr> = keypairs
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != 2)
-            .flat_map(|(_, k)| committee.addresses_of(&k.name))
-            .collect();
-        assert_eq!(targets, expected);
-        for addr in committee.addresses_of(&keypairs[2].name) {
-            assert!(!targets.contains(&addr));
-        }
-    }
-
-    /// A non-blip node only holds connections addressed to the blip node itself.
-    #[test]
-    fn blip_targets_peer_targets_only_blip_node() {
-        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9600);
-        let targets = blip_targets(&committee, &keypairs[0].name, Some(2))
-            .expect("index 0 is a peer, not the blip node");
-        let expected: HashSet<SocketAddr> =
-            committee.addresses_of(&keypairs[2].name).into_iter().collect();
-        assert_eq!(targets, expected);
-    }
-
-    /// `blip_node_index: None` (the default): every node gets `None`, regardless of
-    /// committee size or its own position.
-    #[test]
-    fn blip_targets_disabled_is_none_for_everyone() {
-        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9700);
-        for keypair in &keypairs {
-            assert!(blip_targets(&committee, &keypair.name, None).is_none());
-        }
-    }
-
-    /// An out-of-range index resolves to `None` defensively -- the CLI is expected to
-    /// validate this eagerly and never actually pass one through.
-    #[test]
-    fn blip_targets_out_of_range_index_is_none() {
-        let (committee, keypairs) = Committee::local_benchmark(5, 1, 9800);
-        assert!(blip_targets(&committee, &keypairs[0].name, Some(99)).is_none());
     }
 }

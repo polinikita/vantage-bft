@@ -19,11 +19,8 @@ async fn make_batch() {
         /* withheld_workers_addresses */ None,
         /* withhold_window */ None,
         /* latency_map */ std::collections::HashMap::new(),
-        /* blip_gate */ None,
         Metrics::new(&prometheus::Registry::new()).0,
-        false,
         BatchConfig::default(),
-        /* channel_auth */ None,
     );
 
     // Send enough transactions to seal a batch.
@@ -55,11 +52,8 @@ async fn batch_timeout() {
         /* withheld_workers_addresses */ None,
         /* withhold_window */ None,
         /* latency_map */ std::collections::HashMap::new(),
-        /* blip_gate */ None,
         Metrics::new(&prometheus::Registry::new()).0,
-        false,
         BatchConfig::default(),
-        /* channel_auth */ None,
     );
 
     // Do not send enough transactions to seal a batch..

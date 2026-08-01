@@ -31,11 +31,8 @@ async fn synchronize() {
         /* sync_retry_nodes */ 3, // Not used in this test.
         rx_message,
         /* latency_map */ std::collections::HashMap::new(),
-        /* blip_gate */ None,
         metrics,
-        false,
         BatchConfig::default(),
-        /* channel_auth */ None,
     );
 
     // Spawn a listener to receive our batch requests.
@@ -93,8 +90,6 @@ mod benchmark_metrics_tests {
             observed_commits: HashSet::new(),
             observed_commits_order: BTreeSet::new(),
             pending_misses: BTreeMap::new(),
-            channel_auth: None,
-            rng: SmallRng::from_entropy(),
         }
     }
 

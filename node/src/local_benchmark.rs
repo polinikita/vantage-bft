@@ -12,7 +12,7 @@ use crate::CHANNEL_CAPACITY;
 use anyhow::{Context, Result};
 use clap::ArgMatches;
 use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol, WorkerId};
-use crypto::{MacSecret, PublicKey, SignatureService};
+use crypto::{PublicKey, SignatureService};
 use metrics::{
     aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot,
     read_materialised_latency_snapshot, read_vantage_progress, LatencySnapshot, MetricReporter,
@@ -120,12 +120,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold,
         nodes
     );
-    // Time-windows the data-plane withholding fault injector above (mirrors
-    // --blip-at's own arming pattern -- see `blip_at_secs` just below): absent (the
+    // Time-windows the data-plane withholding fault injector above: absent (the
     // default) means WHOLE-RUN withholding, byte-identical to --withhold's original
     // (unwindowed) behavior. `--withhold-at 0` (withholding starts immediately at
-    // measurement start) is just an ordinary value, same "no explicit-0-vs-absent
-    // ambiguity" reasoning as `--blip-at`'s own doc comment.
+    // measurement start) is just an ordinary value -- there is no "explicit 0 vs.
+    // absent" ambiguity to resolve here.
     let withhold_at_secs: Option<u64> = matches
         .get_one::<String>("withhold-at")
         .map(|s| {
@@ -142,40 +141,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold_at_secs.is_none() || withhold > 0,
         "--withhold-at requires --withhold > 0"
     );
-    // Transient network-level "blip" fault injector (Autobahn SOSP'24 Figs. 1/7/8
-    // repro): `--blip-at`'s presence is the sole enable switch -- absent (the
-    // default) means no blip, byte-identical behavior. Unlike `--mimic-latency-ms`,
-    // there is no "explicit 0 vs. absent" ambiguity to resolve here: `--blip-at 0`
-    // (blip starts immediately at measurement start) is just an ordinary value.
-    let blip_at_secs: Option<u64> = matches
-        .get_one::<String>("blip-at")
-        .map(|s| s.parse().context("--blip-at must be a non-negative integer"))
-        .transpose()?;
-    let blip_for_secs: u64 = matches
-        .get_one::<String>("blip-for")
-        .unwrap()
-        .parse()
-        .context("--blip-for must be a non-negative integer")?;
-    let blip_node: usize = matches
-        .get_one::<String>("blip-node")
-        .unwrap()
-        .parse()
-        .context("--blip-node must be a non-negative integer")?;
-    if blip_at_secs.is_some() {
-        // Must be a LIVE node -- a blip targeting a crashed (trailing) index would be
-        // indistinguishable from no blip at all (nothing is spawned there to pause),
-        // which is almost certainly not what was intended.
-        anyhow::ensure!(
-            blip_node < live_nodes,
-            "--blip-node ({}) must be a live node index (< {} live node(s); indices \
-             {}..{} are crashed via --crash {})",
-            blip_node,
-            live_nodes,
-            live_nodes,
-            nodes,
-            crash
-        );
-    }
     let delta_ms: u64 = matches
         .get_one::<String>("delta-ms")
         .unwrap()
@@ -207,12 +172,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .parse()
         .context("--ack-watermark-period-ms must be a non-negative integer")?;
     // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default. Auto-enabled
-    // whenever a blip OR a withholding window is configured (`--blip-at`/
-    // `--withhold-at`), since either one's whole point is to make the
-    // committed-throughput dip/recovery shape visible (see the `TIMELINE:` series
-    // below) -- same consistency reasoning for both flags.
-    let timeline: bool =
-        matches.get_flag("timeline") || blip_at_secs.is_some() || withhold_at_secs.is_some();
+    // whenever a withholding window is configured (`--withhold-at`), since its whole
+    // point is to make the committed-throughput dip/recovery shape visible (see the
+    // `TIMELINE:` series below).
+    let timeline: bool = matches.get_flag("timeline") || withhold_at_secs.is_some();
     // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `--latency-table <csv>` (an n x n
     // RTT-ms matrix, node index = committee order) takes precedence over
     // `--mimic-latency-ms <u64>` (the uniform EXPLICIT OVERRIDE shorthand -- defined
@@ -301,11 +264,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         delta_ms, max_batch_delay_ms, max_header_delay_ms
     );
     println!("Data dir: {}", data_dir.display());
-    if matches.get_flag("authenticate-channels") {
-        println!(
-            "Authenticated channels: ON (symmetric pairwise MAC, fresh in-process master secret)"
-        );
-    }
     if matches.get_flag("ack-watermarks") {
         println!(
             "Ack watermarks: ON (periodic per-lane availability broadcast every {} ms, replaces per-block acks)",
@@ -354,13 +312,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             ),
         }
     }
-    if let Some(at) = blip_at_secs {
-        println!(
-            "Blip: node {} network-paused (all traffic held, not dropped) for {}s \
-             starting at T+{}s (Autobahn SOSP'24 Figs. 1/7/8 repro)",
-            blip_node, blip_for_secs, at
-        );
-    }
     println!("======================================\n");
 
     // Wipe and recreate the data dir (starfish's own local-benchmark does the same).
@@ -375,24 +326,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .export(data_dir.join("committee.json").to_str().unwrap())
         .context("Failed to write committee.json")?;
 
-    // Transient network-level "blip" fault injector: the shared, in-process "has the
-    // window opened yet" cell (see `Parameters::blip_window`'s own doc comment) --
-    // created empty here, BEFORE any node spawns, and cloned into every node's own
-    // `Parameters` below; armed (via `.set(..)`) once `run_start` is known, further
-    // down, at which point every already-spawned node's connections see it instantly
-    // (same `Arc`). `None` whenever `--blip-at` isn't given, so no cell is even
-    // allocated on the default path.
-    let blip_window_cell: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>> =
-        blip_at_secs.map(|_| Arc::new(OnceLock::new()));
-
-    // Data-plane withholding fault injector, time-windowed variant: the identical
-    // shared, in-process "has the window opened yet" cell pattern as
-    // `blip_window_cell` just above (see `Parameters::withhold_window`'s own doc
-    // comment) -- created empty here, BEFORE any node spawns, and cloned into every
-    // node's own `Parameters` below; armed (via `.set(..)`) once `run_start` is
-    // known, further down, alongside the blip cell. `None` whenever `--withhold-at`
-    // isn't given, so no cell is even allocated on the default (unwindowed or
-    // disabled) path.
+    // Data-plane withholding fault injector, time-windowed variant: the shared,
+    // in-process "has the window opened yet" cell (see `Parameters::withhold_window`'s
+    // own doc comment) -- created empty here, BEFORE any node spawns, and cloned into
+    // every node's own `Parameters` below; armed (via `.set(..)`) once `run_start` is
+    // known, further down. `None` whenever `--withhold-at` isn't given, so no cell is
+    // even allocated on the default (unwindowed or disabled) path.
     let withhold_window_cell: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>> =
         withhold_at_secs.map(|_| Arc::new(OnceLock::new()));
 
@@ -419,8 +358,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         },
         max_batch_delay: max_batch_delay_ms,
         max_header_delay: max_header_delay_ms,
-        // METRICS-DASHBOARD-SPEC.md §8: off by default, byte-identical framing when off.
-        compress_network: matches.get_flag("compress-network"),
         // Transport-level batching: ON by default (5 ms / 64 KB per-destination
         // coalescing); --no-batch-messages restores unbatched framing.
         batch_messages: !matches.get_flag("no-batch-messages"),
@@ -429,15 +366,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
         // behavior when off.
         all_to_all: matches.get_flag("all-to-all"),
-        // Symmetric pairwise-MAC authenticated channels: off by default, byte-identical
-        // wire/behavior when off. A fresh master secret is generated here, once, and
-        // shared (via this single in-process `Parameters` value, cloned into every
-        // node this run spawns) across every node -- exactly the in-process-shared-
-        // secret contract `authenticate_channels`'s own doc comment describes.
-        authenticate_channels: matches.get_flag("authenticate-channels"),
-        mac_secret: matches
-            .get_flag("authenticate-channels")
-            .then(MacSecret::generate),
         ack_watermarks: matches.get_flag("ack-watermarks"),
         ack_watermark_period_ms,
         digest_statements: matches.get_flag("digest-statements"),
@@ -447,19 +375,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // `withhold_at_secs` is absent (whole-run withholding -- see
         // `config::withhold_active`'s own doc comment). `withhold_window` is the
         // shared cell created just above -- `#[serde(skip)]`, same
-        // never-round-trips-through-JSON treatment as `blip_window` below.
+        // never-round-trips-through-JSON treatment as `latency_table` below.
         withhold_at_ms: withhold_at_secs.map(|secs| secs * 1000),
         withhold_for_ms: withhold_for_secs * 1000,
         withhold_window: withhold_window_cell.clone(),
-        // Transient network-level "blip" fault injector: `blip_node_index` is the
-        // sole enable switch (mirrors `blip_at_secs.is_some()` above); `blip_at_ms`/
-        // `blip_for_ms` are meaningless/unused whenever it's `None`. `blip_window` is
-        // the shared cell created just above -- `#[serde(skip)]`, same
-        // never-round-trips-through-JSON treatment as `latency_table` below.
-        blip_node_index: blip_at_secs.map(|_| blip_node),
-        blip_at_ms: blip_at_secs.unwrap_or(0) * 1000,
-        blip_for_ms: blip_for_secs * 1000,
-        blip_window: blip_window_cell.clone(),
         // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
         // means it never round-trips through the `parameters.json` export just below --
         // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
@@ -580,28 +499,13 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         println!("Running benchmark ({} sec)...", duration);
     }
     let run_start = tokio::time::Instant::now();
-    // Transient network-level "blip" fault injector: the window is anchored to THIS
-    // benchmark's own measurement start (`run_start`, just captured) rather than to
-    // process-spawn time (which happened earlier, in the loop above) -- `--blip-at`
-    // is defined as an offset from measurement start, and every node's own
-    // `Parameters::blip_window` clone (set at spawn time, before this point) observes
-    // this `.set(..)` the instant it happens, since they all share the same `Arc`.
-    if let (Some(cell), Some(at)) = (&blip_window_cell, blip_at_secs) {
-        let start = run_start.into_std() + std::time::Duration::from_secs(at);
-        let end = start + std::time::Duration::from_secs(blip_for_secs);
-        cell.set((start, end))
-            .expect("blip window is set exactly once, right after run_start");
-        println!(
-            "TIMELINE-BLIP: start={} end={} node={}",
-            at,
-            at + blip_for_secs,
-            blip_node
-        );
-    }
-    // Data-plane withholding fault injector, time-windowed variant: identical
-    // anchor-to-measurement-start reasoning as the blip window just above -- same
-    // emission point, same "every already-spawned node's `Parameters::
-    // withhold_window` clone sees this `.set(..)` instantly (same `Arc`)" argument.
+    // Data-plane withholding fault injector, time-windowed variant: the window is
+    // anchored to THIS benchmark's own measurement start (`run_start`, just captured)
+    // rather than to process-spawn time (which happened earlier, in the loop above) --
+    // `--withhold-at` is defined as an offset from measurement start, and every node's
+    // own `Parameters::withhold_window` clone (set at spawn time, before this point)
+    // observes this `.set(..)` the instant it happens, since they all share the same
+    // `Arc`.
     if let (Some(cell), Some(at)) = (&withhold_window_cell, withhold_at_secs) {
         let start = run_start.into_std() + std::time::Duration::from_secs(at);
         let end = start + std::time::Duration::from_secs(withhold_for_secs);

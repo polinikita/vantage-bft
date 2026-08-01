@@ -50,7 +50,7 @@ pub use aggregators::{
     TimeoutAggregator,
 };
 pub use effects::{CutEffect, CutOut};
-pub use engine::{CrashSim, CutEngine, Inbound, TipOracle, Variant};
+pub use engine::{CutEngine, Inbound, TipOracle, Variant};
 pub use messages::{
     Cut, CutProposal, CutReady, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
 };

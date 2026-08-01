@@ -28,7 +28,7 @@ use crate::vantage::Effect;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
-use crypto::{Digest, PairwiseKeys, PublicKey};
+use crypto::{Digest, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
 use network::{BatchConfig, MessageHandler, ReliableSender, SimpleSender, Writer};
 use prometheus::IntCounter;
@@ -129,108 +129,6 @@ pub enum Inbound {
     LaneResume(PublicKey, Height, PublicKey),
 }
 
-/// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
-/// (`Parameters::authenticate_channels`) -- the candidate sender a MAC tag must verify
-/// against, for every `PrimaryMessage` variant this handler ever routes. Mirrors
-/// `DeclaredSender::declared_sender`'s classification exactly (declared wire sender
-/// field where one exists), PLUS the two D4-class positionally-attributed variants
-/// (`VantagePropose`/`ControlInit`), which carry no wire sender field at all but ARE
-/// still cryptographically bindable here: `agb::proposer`/`control::control_leader`
-/// are pure functions of `committee` alone, so this network-layer boundary can derive
-/// the identical trusted sender `VantageCore::dispatch_inbound` derives, without
-/// needing a live `VantageCore` (or its mutable AGB/control-log state) to ask.
-/// `None` for `Header(_, true)` ("Serve") and `ControlServe`: neither carries any
-/// sender claim (wire or positional) to bind -- the same pre-existing D4 gap
-/// `declared_sender` already carves out (content is self-authenticating by digest /
-/// gated downstream by `pending_fetch`, respectively). A MAC tag is still present on the wire
-/// for these two (uniform framing -- every message carries exactly one trailing tag
-/// when the flag is on), it is simply never checked, since there is nothing to check
-/// it against.
-fn mac_candidate_sender(message: &PrimaryMessage, committee: &Committee) -> Option<PublicKey> {
-    match message {
-        PrimaryMessage::Header(h, false) => Some(h.author),
-        PrimaryMessage::Header(_, true) => None,
-        PrimaryMessage::HeadersRequest(_, requestor) => Some(*requestor),
-        PrimaryMessage::VantageAck(a) => Some(a.sender),
-        PrimaryMessage::VantageAvail(_, sender) => Some(*sender),
-        PrimaryMessage::VantagePropose(p) => Some(crate::vantage::agb::proposer(committee, p.view)),
-        PrimaryMessage::VantageEcho(e) => Some(e.sender),
-        PrimaryMessage::VantageEchoSkip(_, s, _) => Some(*s),
-        PrimaryMessage::VantageReady(r) => Some(r.sender),
-        PrimaryMessage::VantageNoReady(_, s, _) => Some(*s),
-        PrimaryMessage::VantageWish(_, s) => Some(*s),
-        PrimaryMessage::CompReport(_, _, s) => Some(*s),
-        PrimaryMessage::ControlInit(p, _) => {
-            Some(crate::vantage::control::control_leader(committee, p.round))
-        }
-        PrimaryMessage::ControlEcho(_, s) => Some(*s),
-        PrimaryMessage::ControlReady(_, s) => Some(*s),
-        PrimaryMessage::ControlCommit(_, s) => Some(*s),
-        PrimaryMessage::ControlTimeoutVote(_, s) => Some(*s),
-        PrimaryMessage::ControlTimeoutAccept(_, s) => Some(*s),
-        PrimaryMessage::ControlFetch(_, _, s) => Some(*s),
-        PrimaryMessage::ControlServe(_, _) => None,
-        // PHASE7: the vector-`M` counterparts, same D4/declared-sender
-        // classification as their singular siblings above.
-        PrimaryMessage::VantageProposeBatch(p) => {
-            Some(crate::vantage::agb::proposer(committee, p.view))
-        }
-        PrimaryMessage::VantageEchoBatch(e) => Some(e.sender),
-        PrimaryMessage::VantageReadyBatch(r) => Some(r.sender),
-        PrimaryMessage::ControlInitBatch(p, _) => {
-            Some(crate::vantage::control::control_leader(committee, p.round))
-        }
-        PrimaryMessage::ControlServeBatch(_, _) => None,
-        // A real, per-destination-verifiable sender field, same class as
-        // `VantageEchoSkip`/`VantageNoReady` above.
-        PrimaryMessage::VantageSkipVote(_, s) => Some(*s),
-        // signature-free.tex §8.3 "Digest-named AGB statements": `EchoDigest`/
-        // `ReadyDigest` carry a real declared sender field directly, same class as
-        // `VantageEcho`/`VantageReady` above. `VantageBodyFetch` carries a real
-        // declared requester, same class as `ControlFetch`. `VantageBodyServe`
-        // carries no sender claim at all (content is verified by hash against an
-        // outstanding `pending_fetch` entry, same D4 class as `ControlServe`).
-        PrimaryMessage::VantageEchoDigest(d) => Some(d.sender),
-        PrimaryMessage::VantageReadyDigest(d) => Some(d.sender),
-        PrimaryMessage::VantageBodyFetch(_, _, s) => Some(*s),
-        PrimaryMessage::VantageBodyServe(_, _) => None,
-        // Mechanism A (`vantage::resume`): a real, per-destination-verifiable
-        // declared requester, same class as `VantageBodyFetch`/`ControlFetch`
-        // above -- the message asserts "I, requester, am asking author to resume its
-        // lane", requester's own claim, MAC-bound to requester regardless of who the
-        // (separately, protocol-level-checked) named lane author is.
-        PrimaryMessage::VantageLaneResume(_, _, requester) => Some(*requester),
-        // Autobahn-only variants never legitimately reach the Vantage assembly's port
-        // (`dispatch`'s own catch-all ignores them below); no candidate needed.
-        _ => None,
-    }
-}
-
-/// SECURITY (Fable audit): the OUTBOUND-side mirror of `mac_candidate_sender`'s `None`
-/// arms -- true for the three D4-class variants with no sender claim at all (wire or
-/// positional) to bind: `Header(_, true)`/`ControlServe` (Vantage's own carrier-body
-/// repair) and `SimpleItCutServe` (Simple-IT's sibling cut-proposal repair -- see
-/// `simpleit::node::mac_candidate_sender`'s identical `None` arm for that variant:
-/// its `CutProposal::proposer` field names the ORIGINAL round leader, never the
-/// relaying/serving party, so there is no sender claim here to bind either). This
-/// node always sends its OWN messages, so on the outbound side the candidate (when
-/// one exists) is trivially `self.name` -- only whether a candidate exists at all
-/// matters here, not its value, hence the plain `bool`.
-pub(super) fn message_needs_placeholder_tag(message: &PrimaryMessage) -> bool {
-    matches!(
-        message,
-        PrimaryMessage::Header(_, true)
-            | PrimaryMessage::ControlServe(_, _)
-            | PrimaryMessage::ControlServeBatch(_, _)
-            | PrimaryMessage::SimpleItCutServe(_)
-            // signature-free.tex §8.3: `VantageBodyServe` is D4-class, same "no
-            // sender claim to bind" reasoning as `ControlServe`/`SimpleItCutServe`
-            // above -- content is verified by hash against the requester's own
-            // outstanding `pending_fetch` entry, not by sender.
-            | PrimaryMessage::VantageBodyServe(_, _)
-    )
-}
-
 /// Network receiver handler for the Vantage assembly's `primary_to_primary` port.
 /// Deliberately a distinct type from Autobahn's `PrimaryReceiverHandler` (which stays
 /// byte-identical, untouched) -- the two assemblies never share a handler.
@@ -242,16 +140,6 @@ pub struct VantageReceiverHandler {
     /// directly without wiring metrics (matches `VantageCore`'s own optional-handle
     /// convention) -- production (`Primary::spawn`) always passes `Some`.
     pub metrics: Option<Arc<Metrics>>,
-    /// SECURITY (Fable audit): `Some` iff `Parameters::authenticate_channels` is on --
-    /// see `mac_candidate_sender`'s doc comment for the verification model. `None`
-    /// (the default) is byte-identical to pre-MAC behavior: every received frame is
-    /// deserialized and routed exactly as received, no trailing bytes stripped.
-    pub channel_auth: Option<Arc<PairwiseKeys>>,
-    /// Needed only to derive `VantagePropose`/`ControlInit`'s positionally-attributed
-    /// sender (see `mac_candidate_sender`) -- a small, immutable, once-built clone
-    /// (mirrors `VantageCore`'s own `committee.clone()` at `build` time). Unused when
-    /// `channel_auth` is `None`.
-    pub committee: Committee,
 }
 
 #[async_trait]
@@ -266,42 +154,10 @@ impl MessageHandler for VantageReceiverHandler {
         // logical messages can share one frame, and only one ack may be sent per
         // frame). See `Receiver::acks`'s doc comment.
 
-        // SECURITY (Fable audit): when authenticated channels are on, the trailing
-        // `crypto::mac::TAG_LEN` bytes of every frame are the MAC tag -- strip them
-        // BEFORE deserializing (a frame too short to even carry a tag is malformed/
-        // adversarial; drop it, same "drop, don't propagate/tear down" treatment as a
-        // deserialize failure below). `None` (flag off) is byte-identical to before:
-        // `payload` is `serialized` verbatim, no tag ever stripped or checked.
-        let (payload, tag): (&[u8], Option<[u8; crypto::mac::TAG_LEN]>) = match &self.channel_auth {
-            Some(_) => match crypto::mac::split_tag(&serialized) {
-                Some((payload, tag)) => (payload, Some(tag)),
-                None => return Ok(()),
-            },
-            None => (&serialized[..], None),
-        };
-
-        let message: PrimaryMessage = bincode::deserialize(payload)?;
-
-        // SECURITY (Fable audit): verify the MAC tag against the message's own
-        // declared/positionally-derived sender BEFORE this message is ever forwarded
-        // to `VantageCore` -- a mismatch is dropped here, never reaching the
-        // membership gate or any protocol logic. A `None` candidate (the D4-class
-        // `Header(_, true)`/`ControlServe` carve-out, see `mac_candidate_sender`) has
-        // no claim to check, so it passes through exactly as it did before this flag
-        // existed.
-        if let (Some(auth), Some(tag)) = (&self.channel_auth, tag) {
-            if let Some(sender) = mac_candidate_sender(&message, &self.committee) {
-                if !auth.verify(&sender, payload, &tag) {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.authenticated_channel_rejected_total.inc();
-                    }
-                    return Ok(());
-                }
-            }
-        }
+        let message: PrimaryMessage = bincode::deserialize(&serialized)?;
 
         if let Some(metrics) = &self.metrics {
-            crate::primary::record_typed_received(metrics, message.type_name(), payload.len());
+            crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
         }
         let inbound = match message {
             PrimaryMessage::Header(h, false) => Inbound::Publish(h.author, h),
@@ -561,21 +417,6 @@ impl VantageCore {
         // wire-declared sender against.
         let members: HashSet<PublicKey> = committee.authorities.keys().cloned().collect();
 
-        // SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels.
-        // `parameters.authenticate_channels` on with no `mac_secret` set is a
-        // misconfiguration (it would otherwise silently run unauthenticated) --
-        // panic loudly rather than let it pass, the same "fail fast on
-        // misconfiguration" posture already used for `expect`s elsewhere in this
-        // constructor (e.g. "Our public key is not in the committee").
-        let channel_auth: Option<Arc<PairwiseKeys>> = if parameters.authenticate_channels {
-            let secret = parameters
-                .mac_secret
-                .expect("authenticate_channels is set but mac_secret is None (misconfiguration)");
-            Some(Arc::new(committee.pairwise_keys(&name, &secret)))
-        } else {
-            None
-        };
-
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
         let blocks: SharedBlocks = Arc::new(Mutex::new(BlockCache::new()));
@@ -662,18 +503,8 @@ impl VantageCore {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
-        // Transient network-level "blip" fault injector (`--blip-at`): resolved once,
-        // same convention as `latency_map` just above -- `None` (the default, and
-        // always the case when `--blip-at` isn't given, or `Parameters::blip_window`
-        // was never armed -- e.g. the distributed `node run` path) means both senders
-        // below never even check the blip window.
-        let blip_gate = parameters.blip_window.clone().and_then(|window| {
-            config::blip_targets(&committee, &name, parameters.blip_node_index)
-                .map(|targets| Arc::new(network::BlipGate::new(targets, window)))
-        });
-
-        // Transport-level batching, resolved once (mirrors `latency_map`/
-        // `compress_network`'s own resolve-once-at-spawn convention).
+        // Transport-level batching, resolved once (mirrors `latency_map`'s own
+        // resolve-once-at-spawn convention).
         let batch = BatchConfig {
             enabled: parameters.batch_messages,
             max_bytes: parameters.batch_max_bytes,
@@ -684,18 +515,11 @@ impl VantageCore {
         // dedicated off-run-loop sender -- see `wire::spawn_resume_sender`'s doc
         // comment for the full design/rationale (fixes the diagnosed loop-starvation
         // defect: Mechanism A's own network sends used to run inline, synchronously,
-        // on THIS run loop). Built from the SAME `latency_map`/`blip_gate`/`batch`/
-        // `core_metrics` locals as `network`/`worker_network` just below (identical
-        // configuration convention) -- cloned here (rather than moved) since both of
-        // those still need their own copies afterward.
-        let resume_tx = wire::spawn_resume_sender(
-            latency_map.clone(),
-            blip_gate.clone(),
-            parameters.compress_network,
-            batch,
-            core_metrics.clone(),
-            channel_auth.clone(),
-        );
+        // on THIS run loop). Built from the SAME `latency_map`/`batch`/`core_metrics`
+        // locals as `network`/`worker_network` just below (identical configuration
+        // convention) -- cloned here (rather than moved) since both of those still
+        // need their own copies afterward.
+        let resume_tx = wire::spawn_resume_sender(latency_map.clone(), batch, core_metrics.clone());
 
         let core = Self {
             name,
@@ -711,12 +535,9 @@ impl VantageCore {
             control,
             digest_stmts,
             wire: Wire {
-                name,
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
-                        .with_blip(blip_gate.clone())
-                        .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
@@ -726,8 +547,6 @@ impl VantageCore {
                 worker_network: {
                     let mut s = SimpleSender::new()
                         .with_latency(latency_map)
-                        .with_blip(blip_gate)
-                        .with_compression(parameters.compress_network)
                         .with_batching(batch);
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
@@ -735,7 +554,6 @@ impl VantageCore {
                     s
                 },
                 resume_tx,
-                channel_auth,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
                 other_primaries,
@@ -2130,136 +1948,11 @@ mod tests {
         let _ = effects;
     }
 
-    // --- SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels ---
-
-    /// `mac_candidate_sender`'s pure classification, exercised directly (no network):
-    /// declared-sender variants return that field; the two positionally-attributed
-    /// D4-class variants (`VantagePropose`/`ControlInit`) return the committee's own
-    /// `agb::proposer`/`control::control_leader` derivation; the two no-claim variants
-    /// (`Header(_, true)`/`ControlServe`) return `None`.
-    #[test]
-    fn mac_candidate_sender_classification() {
-        let committee = crate::common::committee();
-        let (author, _) = crate::common::keys()[0];
-        let (sender, _) = crate::common::keys()[1];
-
-        let header = Header {
-            author,
-            ..Header::default()
-        };
-        assert_eq!(
-            mac_candidate_sender(&PrimaryMessage::Header(header.clone(), false), &committee),
-            Some(author)
-        );
-        assert_eq!(
-            mac_candidate_sender(&PrimaryMessage::Header(header, true), &committee),
-            None
-        );
-
-        let ack = Ack::new(author, 1, Digest::default(), sender);
-        assert_eq!(
-            mac_candidate_sender(&PrimaryMessage::VantageAck(ack), &committee),
-            Some(sender)
-        );
-
-        let proposal = ViewProposal {
-            view: 3,
-            c: Vec::new(),
-            t: Vec::new(),
-            m: None,
-        };
-        assert_eq!(
-            mac_candidate_sender(&PrimaryMessage::VantagePropose(proposal), &committee),
-            Some(crate::vantage::agb::proposer(&committee, 3))
-        );
-
-        let control_proposal = ControlProposal {
-            round: 2,
-            parent: 0,
-            value: None,
-        };
-        assert_eq!(
-            mac_candidate_sender(
-                &PrimaryMessage::ControlInit(control_proposal.clone(), None),
-                &committee
-            ),
-            Some(crate::vantage::control::control_leader(&committee, 2))
-        );
-        assert_eq!(
-            mac_candidate_sender(
-                &PrimaryMessage::ControlServe(3, dummy_proposal()),
-                &committee
-            ),
-            None
-        );
-
-        // Mechanism A (`vantage::resume`): MAC-bound to the declared REQUESTER,
-        // regardless of the (separately, protocol-level-checked) named lane author.
-        assert_eq!(
-            mac_candidate_sender(
-                &PrimaryMessage::VantageLaneResume(author, 5, sender),
-                &committee
-            ),
-            Some(sender)
-        );
-    }
-
-    #[test]
-    fn message_needs_placeholder_tag_classification() {
-        let header = Header::default();
-        assert!(message_needs_placeholder_tag(&PrimaryMessage::Header(
-            header.clone(),
-            true
-        )));
-        assert!(!message_needs_placeholder_tag(&PrimaryMessage::Header(
-            header, false
-        )));
-        assert!(message_needs_placeholder_tag(
-            &PrimaryMessage::ControlServe(1, dummy_proposal())
-        ));
-        assert!(!message_needs_placeholder_tag(
-            &PrimaryMessage::VantageWish(1, crate::common::keys()[0].0)
-        ));
-        // Simple-IT's sibling repair-serve: same "no sender claim to bind" class as
-        // `ControlServe` above -- see this function's own doc comment.
-        assert!(message_needs_placeholder_tag(
-            &PrimaryMessage::SimpleItCutServe(crate::simpleit::CutProposal::default())
-        ));
-        // Its fetch counterpart, by contrast, carries a real declared requester (see
-        // `simpleit::node::mac_candidate_sender`'s `SimpleItCutFetch` arm) -- not in
-        // this no-claim class.
-        assert!(!message_needs_placeholder_tag(
-            &PrimaryMessage::SimpleItCutFetch(1, Digest::default(), crate::common::keys()[0].0)
-        ));
-        // signature-free.tex §8.3 "Digest-named AGB statements": `VantageBodyServe`
-        // is D4-class too, same "no sender claim to bind" reasoning as
-        // `ControlServe`/`SimpleItCutServe` above; its fetch counterpart
-        // `VantageBodyFetch` carries a real declared requester, same class as
-        // `ControlFetch`/`SimpleItCutFetch` above -- not in this no-claim class.
-        assert!(message_needs_placeholder_tag(&PrimaryMessage::VantageBodyServe(
-            1,
-            dummy_proposal()
-        )));
-        assert!(!message_needs_placeholder_tag(
-            &PrimaryMessage::VantageBodyFetch(1, Digest::default(), crate::common::keys()[0].0)
-        ));
-        // Mechanism A: carries a real declared requester (see `mac_candidate_sender`'s
-        // own arm for this variant) -- not in the no-claim class.
-        assert!(!message_needs_placeholder_tag(
-            &PrimaryMessage::VantageLaneResume(
-                crate::common::keys()[0].0,
-                5,
-                crate::common::keys()[1].0
-            )
-        ));
-    }
-
     /// End-to-end over a real TCP loopback (mirrors `network::receiver_tests::receive`):
-    /// flag off (`channel_auth: None`) is byte-identical to pre-MAC behavior -- a plain,
-    /// untagged ACK still deserializes and reaches `VantageCore` once it advances
+    /// a plain ACK still deserializes and reaches `VantageCore` once it advances
     /// aggregate availability.
     #[tokio::test]
-    async fn dispatch_flag_off_delivers_untagged_ack_threshold() {
+    async fn dispatch_delivers_ack_over_tcp_once_threshold_reached() {
         use futures::SinkExt as _;
         use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -2277,8 +1970,6 @@ mod tests {
             tx: tx_vantage,
             ack_aggregator,
             metrics: None,
-            channel_auth: None,
-            committee,
         };
 
         let address: SocketAddr = "127.0.0.1:14510".parse().unwrap();
@@ -2295,78 +1986,7 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_millis(500), rx_vantage.recv()).await;
         assert!(
             matches!(received, Ok(Some(Inbound::AckAvailability(_)))),
-            "flag off must deliver a plain untagged ACK once it advances availability"
-        );
-    }
-
-    /// The core impersonation-closure property: a message tagged with the WRONG
-    /// sender's key (i.e. someone claiming to be `sender` who doesn't hold `k_{sender,
-    /// self}`) is dropped, never reaching `VantageCore`; the SAME message, correctly
-    /// tagged by the real `sender`, IS delivered.
-    #[tokio::test]
-    async fn dispatch_authenticated_rejects_forged_sender_accepts_genuine() {
-        use futures::SinkExt as _;
-        use tokio_util::codec::{Framed, LengthDelimitedCodec};
-
-        let committee = crate::common::committee();
-        let (name, _) = crate::common::keys()[0]; // this node ("self" / the receiver)
-        let (sender, _) = crate::common::keys()[1]; // the genuine, honest sender
-        let (impostor, _) = crate::common::keys()[2]; // a distinct committee member with no claim to `sender`'s key
-        let secret = crypto::MacSecret::generate();
-
-        let receiver_auth = Arc::new(committee.pairwise_keys(&name, &secret));
-        let sender_auth = committee.pairwise_keys(&sender, &secret);
-        let impostor_auth = committee.pairwise_keys(&impostor, &secret);
-
-        let ack_aggregator = Arc::new(Mutex::new(AckAggregator::new(committee.clone())));
-        let (pre_sender, _) = crate::common::keys()[3];
-        let reference = (sender, 9, Digest::default());
-        ack_aggregator
-            .lock()
-            .unwrap()
-            .record_ack(pre_sender, reference.clone());
-        let (tx_vantage, mut rx_vantage) = channel(4);
-        let handler = VantageReceiverHandler {
-            tx: tx_vantage,
-            ack_aggregator,
-            metrics: None,
-            channel_auth: Some(receiver_auth),
-            committee: committee.clone(),
-        };
-
-        let address: SocketAddr = "127.0.0.1:14511".parse().unwrap();
-        network::Receiver::spawn(address, handler);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // A wire `Ack` whose DECLARED sender field is `sender` -- but physically
-        // produced (MAC'd) by `impostor`, who does not hold `k_{sender,name}`.
-        let ack = Ack::new(reference.0, reference.1, reference.2.clone(), sender);
-        let payload = bincode::serialize(&PrimaryMessage::VantageAck(ack.clone())).unwrap();
-        let forged_tag = impostor_auth
-            .tag_for(&name, &payload)
-            .expect("impostor is a committee member");
-        let mut forged = payload.clone();
-        forged.extend_from_slice(&forged_tag);
-
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
-        transport.send(Bytes::from(forged)).await.unwrap();
-
-        let rejected = tokio::time::timeout(Duration::from_millis(300), rx_vantage.recv()).await;
-        assert!(rejected.is_err(), "a forged sender claim (wrong holder of the claimed sender's key) must be dropped, not delivered");
-
-        // The identical logical message, genuinely tagged by `sender` itself.
-        let genuine_tag = sender_auth
-            .tag_for(&name, &payload)
-            .expect("sender is a committee member");
-        let mut genuine = payload;
-        genuine.extend_from_slice(&genuine_tag);
-        transport.send(Bytes::from(genuine)).await.unwrap();
-
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx_vantage.recv()).await;
-        assert!(
-            matches!(delivered, Ok(Some(Inbound::AckAvailability(_)))),
-            "a genuinely MAC'd ACK from the real declared sender must be delivered when it advances availability"
+            "must deliver the ACK once it advances availability"
         );
     }
 

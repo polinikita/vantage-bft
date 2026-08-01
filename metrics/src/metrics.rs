@@ -310,15 +310,6 @@ pub struct Metrics {
     /// frame, so `network_messages_sent_total` (sum) / `network_frames_sent_total`
     /// reads directly as the coalescing ratio.
     pub network_frames_sent_total: IntCounter,
-    /// Symmetric pairwise-MAC authenticated channels (`Parameters::
-    /// authenticate_channels`): inbound frames dropped because the trailing MAC tag
-    /// didn't verify against the message's declared/positionally-derived sender (a
-    /// forged/tampered/replayed-under-a-different-key frame), across every handler
-    /// (Vantage primary, Autobahn worker-facing primary, worker<->worker,
-    /// worker<->primary) this node runs. Always zero on the honest-only path and
-    /// whenever the flag is off; a nonzero value means a Byzantine node attempted
-    /// message impersonation on an authenticated channel.
-    pub authenticated_channel_rejected_total: IntCounter,
 
     // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
     /// Transactions the worker's `BatchMaker` received from a client, before batching
@@ -378,11 +369,6 @@ pub struct Metrics {
     /// Write-once (where known -- see `set_transaction_mode_info`'s doc): which
     /// client transaction-payload mode this run uses.
     pub transaction_mode_info: IntGaugeVec,
-    /// Starfish's own counter, reinstated (§1 had omitted it as N/A without
-    /// compression): sum of pre-compression serialized sizes, incremented only when
-    /// `compress_network` is on (mirrors starfish's own conditional exactly -- when
-    /// compression is off this would just duplicate `bytes_sent_total`).
-    pub bytes_uncompressed_sent_total: IntCounter,
 
     // --- Perf-audit addendum: metrics-active window (starfish parity,
     // `metrics.rs`'s own `metrics_active`/`transactions_generator.rs`'s early
@@ -801,13 +787,6 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
-            authenticated_channel_rejected_total: register_int_counter_with_registry!(
-                "authenticated_channel_rejected_total",
-                "Inbound frames dropped for failing symmetric-pairwise-MAC verification \
-                 (authenticate_channels)",
-                registry,
-            )
-            .unwrap(),
             submitted_transactions: register_int_counter_with_registry!(
                 "submitted_transactions",
                 "Total transactions received by the worker's BatchMaker from a client",
@@ -847,12 +826,6 @@ impl Metrics {
                 "transaction_mode_info",
                 "Write-once: which client transaction-payload mode this run uses (value always 1)",
                 &["mode"],
-                registry,
-            )
-            .unwrap(),
-            bytes_uncompressed_sent_total: register_int_counter_with_registry!(
-                "bytes_uncompressed_sent_total",
-                "Sum of pre-compression serialized sizes (only incremented when compress_network is on)",
                 registry,
             )
             .unwrap(),

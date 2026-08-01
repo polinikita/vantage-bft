@@ -110,12 +110,8 @@ async fn process_header() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -220,12 +216,8 @@ async fn process_header_missing_parent() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -331,12 +323,8 @@ async fn process_header_invalid_height() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -435,12 +423,8 @@ async fn process_header_missing_payload() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -537,12 +521,8 @@ async fn process_votes() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -661,12 +641,8 @@ async fn process_certificates() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -788,12 +764,8 @@ async fn process_prepare() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -947,12 +919,8 @@ async fn generate_confirm() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -1119,12 +1087,8 @@ async fn generate_commit() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -1343,12 +1307,8 @@ async fn generate_pipelined_prepare() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -1532,12 +1492,8 @@ async fn local_timeout_view() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -1639,12 +1595,8 @@ async fn sync_missing_proposals() {
         // matches every other existing test's expectations (whole-run mode
         // whenever the (disabled, here) withholding filter above is `Some`).
         None,
-        // Transient network-level "blip" fault injector: `None` matches every other
-        // existing test's expectations (byte-identical to no blip).
-        None,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         test_metrics(),
-        false,
         BatchConfig::default(),
     );
 
@@ -1664,9 +1616,7 @@ async fn sync_missing_proposals() {
         tx_headers_loopback,
         tx_header_waiter_instances,
         test_metrics(),
-        false,
         BatchConfig::default(),
-        /* channel_auth */ None,
     );
 
     // Send headers to the core, so they won't request sync

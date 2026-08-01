@@ -16,9 +16,6 @@ use tokio::sync::oneshot;
 #[path = "tests/crypto_tests.rs"]
 pub mod crypto_tests;
 
-pub mod mac;
-pub use mac::{MacSecret, PairwiseKeys};
-
 pub type CryptoError = ed25519::Error;
 
 /// The hasher used for all content digests (Starfish parity). blake3 produces a

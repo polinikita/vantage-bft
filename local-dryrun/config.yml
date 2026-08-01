@@ -51,9 +51,5 @@ crash: 0
 latency_table: wan-testbed-latency-10node.csv
 # latency_table: none
 
-# METRICS-DASHBOARD-SPEC.md §8: lz4 network compression, off by default (byte-
-# identical framing when off).
-compress_network: false
-
 # Where `node local-benchmark` writes its per-node stores + prometheus.yaml.
 data_dir: local-dryrun/data

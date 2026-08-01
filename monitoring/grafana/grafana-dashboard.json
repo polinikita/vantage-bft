@@ -1149,64 +1149,6 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 6,
-        "x": 12,
-        "y": 48
-      },
-      "id": 20,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum(bytes_uncompressed_sent_total{node=~\"$node\"}) / sum(bytes_sent_total{node=~\"$node\"})",
-          "legendFormat": "ratio",
-          "refId": "A"
-        }
-      ],
-      "title": "Compression ratio (uncompressed/wire, when --compress-network on)",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
           "unit": "Bps",
           "color": {
             "mode": "thresholds"

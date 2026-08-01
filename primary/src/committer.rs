@@ -67,16 +67,6 @@ pub struct Committer {
     worker_addresses: HashMap<WorkerId, SocketAddr>,
     #[cfg(feature = "benchmark")]
     network: SimpleSender,
-    /// SECURITY (Fable audit): this authority's own public key -- the worker<->primary
-    /// `Committed` notification is intra-authority, so its tag is always keyed
-    /// `k_{name,name}` (see `PairwiseKeys::build`'s doc comment). Only read on the
-    /// benchmark path (the only one that ever sends `Committed` to a worker).
-    #[cfg(feature = "benchmark")]
-    name: PublicKey,
-    /// `Parameters::authenticate_channels`; `None` is byte-identical to pre-MAC
-    /// behavior.
-    #[cfg(feature = "benchmark")]
-    channel_auth: Option<Arc<crypto::PairwiseKeys>>,
 }
 
 impl Committer {
@@ -86,11 +76,11 @@ impl Committer {
     // same argument list one level of indirection away and churn every call site
     // (same call as `Core::spawn`/`VantageCore::spawn`'s existing allows).
     #[allow(clippy::too_many_arguments)]
-    // `name`/`metrics`/`compress_network` are only read under `#[cfg(feature =
-    // "benchmark")]` below (worker-notification wiring), so they're unused on the
-    // default build; `store`/`gc_depth`/`rx_commit` are genuinely unused in every
-    // build (kept, not removed, to avoid touching the one call site in primary.rs
-    // for parameters with no correctness weight either way -- same reasoning as
+    // `name`/`metrics` are only read under `#[cfg(feature = "benchmark")]` below
+    // (worker-notification wiring), so they're unused on the default build;
+    // `store`/`gc_depth`/`rx_commit` are genuinely unused in every build (kept, not
+    // removed, to avoid touching the one call site in primary.rs for parameters with
+    // no correctness weight either way -- same reasoning as
     // `Synchronizer::tx_certificate_waiter`).
     #[allow(unused_variables)]
     pub fn spawn(
@@ -105,15 +95,8 @@ impl Committer {
         synchronizer: Synchronizer,
         // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
         metrics: Arc<Metrics>,
-        // METRICS-DASHBOARD-SPEC.md §8: appended last, same convention.
-        compress_network: bool,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
-        // SECURITY (Fable audit): appended last, same convention as every other
-        // MAC-consuming `::spawn`. Only meaningfully read on the benchmark path (the
-        // existing whole-fn `#[allow(unused_variables)]` above already covers it being
-        // unused on the default build).
-        channel_auth: Option<Arc<crypto::PairwiseKeys>>,
     ) {
         let (_tx_deliver, rx_deliver) = channel(CHANNEL_CAPACITY);
 
@@ -144,35 +127,11 @@ impl Committer {
                 #[cfg(feature = "benchmark")]
                 network: SimpleSender::new()
                     .with_metrics(metrics)
-                    .with_compression(compress_network)
                     .with_batching(batch),
-                #[cfg(feature = "benchmark")]
-                name,
-                #[cfg(feature = "benchmark")]
-                channel_auth,
             }
             .run()
             .await;
         });
-    }
-
-    /// SECURITY (Fable audit): appends a tag keyed `k_{name,name}` (the worker<->
-    /// primary channel is intra-authority -- byte-identical, unappended, when
-    /// `channel_auth` is off) before sending a `Committed` notification to one of our
-    /// own workers.
-    #[cfg(feature = "benchmark")]
-    fn tag(&self, payload: Vec<u8>) -> Bytes {
-        match &self.channel_auth {
-            None => Bytes::from(payload),
-            Some(auth) => {
-                let tag = auth
-                    .tag_for(&self.name, &payload)
-                    .expect("self is a committee member");
-                let mut tagged = payload;
-                tagged.extend_from_slice(&tag);
-                Bytes::from(tagged)
-            }
-        }
     }
 
     async fn process_commit_message(
@@ -274,9 +233,8 @@ impl Committer {
                                                 digests,
                                             ))
                                             .expect("Failed to serialize committed message");
-                                        let tagged = self.tag(bytes);
                                         self.network
-                                            .send_typed(*address, tagged, "Committed")
+                                            .send_typed(*address, Bytes::from(bytes), "Committed")
                                             .await;
                                     }
                                 }

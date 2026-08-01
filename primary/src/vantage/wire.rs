@@ -1,20 +1,20 @@
 // Network/wire-transport helpers for `VantageCore`, split out of `vantage::node` so a
 // second consensus protocol can reuse the same primary<->primary/primary<->worker wire
-// machinery (symmetric pairwise-MAC framing, cancel-handler bookkeeping, broadcast/
-// unicast dispatch) without depending on Vantage's own protocol state (`agb`,
-// `frontier`, `cursor`, `pacemaker`, `resolver`, `control`). Pure code motion out of
-// `node.rs`: every field and method below is unchanged from its previous home on
-// `VantageCore`, aside from the `self.` -> `self.wire.`-style re-pointing the split
-// forces at `VantageCore`'s own call sites (see `node.rs` itself for those).
+// machinery (cancel-handler bookkeeping, broadcast/unicast dispatch) without depending
+// on Vantage's own protocol state (`agb`, `frontier`, `cursor`, `pacemaker`, `resolver`,
+// `control`). Pure code motion out of `node.rs`: every field and method below is
+// unchanged from its previous home on `VantageCore`, aside from the `self.` ->
+// `self.wire.`-style re-pointing the split forces at `VantageCore`'s own call sites
+// (see `node.rs` itself for those).
 
 use crate::messages::Header;
 use crate::primary::PrimaryMessage;
-use crate::vantage::node::{message_needs_placeholder_tag, Inbound};
+use crate::vantage::node::Inbound;
 use bytes::Bytes;
 use config::WorkerId;
-use crypto::{PairwiseKeys, PublicKey};
+use crypto::PublicKey;
 use metrics::Metrics;
-use network::{BatchConfig, BlipGate, CancelHandler, ReliableSender, SimpleSender};
+use network::{BatchConfig, CancelHandler, ReliableSender, SimpleSender};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -104,21 +104,17 @@ pub fn sender_is_member<M: DeclaredSender>(m: &M, members: &HashSet<PublicKey>) 
 /// clippy::type_complexity: named alias for `Wire::withheld_header_dests`'s own type
 /// (also used identically by `VantageCore::build`/`SimpleItCore::build`, which compute
 /// the value this field holds) -- a caller-filtered pair of `Wire::
-/// other_primary_addrs`/`Wire::other_primaries` (addresses-only, and full
-/// `(PublicKey, SocketAddr)` pairs for the per-destination MAC-tag path), or `None`
-/// when this node is not a withholding sender.
+/// other_primary_addrs`/`Wire::other_primaries` (addresses-only, and the full
+/// `(PublicKey, SocketAddr)` pairs `enqueue_resume_header` needs to check whether a
+/// given peer is in this node's own allowed, i.e. non-blocked, half), or `None` when
+/// this node is not a withholding sender.
 pub(crate) type WithheldHeaderDests = Option<(Vec<SocketAddr>, Vec<(PublicKey, SocketAddr)>)>;
 
-/// Network/wire-transport state `VantageCore` owns: the two typed senders, MAC-auth
-/// keying, in-flight cancel-handle bookkeeping, and the committee's/our own workers'
-/// resolved addresses. Per-field security/perf rationale below is carried over
-/// verbatim from `VantageCore`'s previous copy of each field.
+/// Network/wire-transport state `VantageCore` owns: the two typed senders, in-flight
+/// cancel-handle bookkeeping, and the committee's/our own workers' resolved addresses.
+/// Per-field security/perf rationale below is carried over verbatim from
+/// `VantageCore`'s previous copy of each field.
 pub struct Wire {
-    /// This node's own public key -- cloned from `VantageCore::name` (kept there too,
-    /// for the rest of `VantageCore`'s own use) since `send_to_worker` needs it to key
-    /// the intra-authority `k_{self, self}` MAC tag.
-    pub(crate) name: PublicKey,
-
     pub(crate) network: ReliableSender,
     pub(crate) worker_network: SimpleSender,
     /// Mechanism A (sender-side lane resume, `vantage::resume`): the channel end
@@ -127,24 +123,13 @@ pub struct Wire {
     /// nothing on this side. The receiving half is owned entirely by the
     /// dedicated task `spawn_resume_sender` spawns at construction time, which
     /// owns its OWN `SimpleSender` (a separate connection pool from `network`/
-    /// `worker_network` above) and its own `channel_auth` clone -- see that
-    /// function's doc comment for the full design. This field, plus those two
-    /// enqueue methods, is the ENTIRE fix for the loop-starvation defect this
-    /// crate's previous per-send `resume::SEND_TIMEOUT` (deleted) only ever
-    /// bounded the damage from: a backed-up destination now costs the sender
-    /// task's own progress, never `VantageCore`/`SimpleItCore`'s run loop's.
-    pub(crate) resume_tx: mpsc::Sender<(PublicKey, SocketAddr, PrimaryMessage)>,
-    /// SECURITY (Fable audit): symmetric pairwise-MAC authenticated channels
-    /// (`Parameters::authenticate_channels`). `None` (the default) is byte-identical
-    /// to pre-MAC behavior: `broadcast_message`/`send_message` hand `network`/
-    /// `worker_network` the bare serialized message, nothing appended. `Some` when the
-    /// flag is on: every outbound message gets a trailing tag over its own serialized
-    /// bytes, keyed `k_{self, dest}` (or `k_{self, self}` for the two D4-class
-    /// variants with no sender claim to bind -- see `PairwiseKeys::tag_unverified`'s
-    /// doc comment) -- computed once and shared across a broadcast's destinations
-    /// when the tag itself is destination-independent (the unverified-variant case),
-    /// per-destination when it isn't.
-    pub(crate) channel_auth: Option<Arc<PairwiseKeys>>,
+    /// `worker_network` above) -- see that function's doc comment for the full
+    /// design. This field, plus those two enqueue methods, is the ENTIRE fix for
+    /// the loop-starvation defect this crate's previous per-send `resume::
+    /// SEND_TIMEOUT` (deleted) only ever bounded the damage from: a backed-up
+    /// destination now costs the sender task's own progress, never
+    /// `VantageCore`/`SimpleItCore`'s run loop's.
+    pub(crate) resume_tx: mpsc::Sender<(SocketAddr, PrimaryMessage)>,
     pub(crate) cancel_handlers: Vec<CancelHandler>,
     /// Fable perf audit item 4: `cancel_handlers.len()` at the last actual
     /// `prune_cancel_handlers` scan -- `maybe_prune_cancel_handlers` only re-scans
@@ -176,9 +161,9 @@ pub struct Wire {
     /// Data-plane withholding fault injector, TIME-WINDOWED variant
     /// (`Parameters::withhold_window`): the shared, in-process "has the window opened
     /// yet" cell, cloned straight from `parameters` at construction (`VantageCore::
-    /// build`/`SimpleItCore::build`) -- same `Arc`-clone convention as `network`'s own
-    /// `blip_gate`. Consulted (via `config::withhold_active`) in `broadcast_message`'s
-    /// `Header(_, false)` arm, ONLY when `withheld_header_dests` is `Some` -- see that
+    /// build`/`SimpleItCore::build`). Consulted (via `config::withhold_active`) in
+    /// `broadcast_message`'s `Header(_, false)` arm, ONLY when `withheld_header_dests`
+    /// is `Some` -- see that
     /// method's own comment. `None` whenever `--withhold-at` isn't given (including
     /// whenever `withheld_header_dests` itself is already `None`), in which case it's
     /// never even looked at.
@@ -223,12 +208,6 @@ impl Wire {
     /// is computed before serializing, so it labels the exact variant sent.
     pub(crate) async fn broadcast_message(&mut self, message: PrimaryMessage) {
         let msg_type = message.type_name();
-        // SECURITY (Fable audit): `Header(_, true)` ("Serve") never legitimately
-        // reaches `broadcast_message` (`ServeTo` always unicasts via `send_message`
-        // below), so the only D4-class placeholder-tag variant this method ever sees
-        // in practice is `ControlServe` -- kept as a real `match`, not an assert, so
-        // this stays correct even if a future effect ever does broadcast one of them.
-        let placeholder = message_needs_placeholder_tag(&message);
         let bytes = bincode::serialize(&message).expect("serializes");
         // METRICS-DASHBOARD-SPEC.md §3 (+ addendum): `proposed_block_size_bytes` (the
         // full wire envelope) and `proposed_header_size_bytes` (the header serialized
@@ -258,135 +237,57 @@ impl Wire {
             // `None` case, which is always active -- see that fn's own doc comment):
             // fall through to the untouched `broadcast` below, exactly as if this
             // node were not withholding at all right now.
-            if let Some((addrs, full)) = self.withheld_header_dests.clone() {
+            if let Some((addrs, _)) = self.withheld_header_dests.clone() {
                 if config::withhold_active(self.withhold_window.as_deref(), Instant::now()) {
-                    self.broadcast_to(bytes, msg_type, placeholder, addrs, full)
-                        .await;
+                    self.broadcast_to(bytes, msg_type, addrs).await;
                     return;
                 }
             }
         }
-        self.broadcast(bytes, msg_type, placeholder).await;
+        self.broadcast(bytes, msg_type).await;
     }
 
     /// Shared shape behind every `execute` arm that just serializes a `PrimaryMessage`
     /// and unicasts it verbatim to one peer.
     pub(crate) async fn send_message(&mut self, peer: PublicKey, message: PrimaryMessage) {
         let msg_type = message.type_name();
-        let placeholder = message_needs_placeholder_tag(&message);
         let bytes = bincode::serialize(&message).expect("serializes");
-        self.send_to(peer, bytes, msg_type, placeholder).await;
+        self.send_to(peer, bytes, msg_type).await;
     }
 
-    /// SECURITY (Fable audit): appends this message's MAC tag (when `channel_auth` is
-    /// on) before broadcasting to every other primary. `placeholder` (see
-    /// `message_needs_placeholder_tag`): the two D4-class variants with no sender
-    /// claim to bind get one destination-independent tag (`PairwiseKeys::
-    /// tag_unverified`), computed once and shared across every destination -- exactly
-    /// like the flag-off path's own `.clone()`-shared `Bytes` -- rather than N
-    /// per-destination tags nobody will ever check. Every other variant gets a
-    /// genuine per-destination tag (`k_{self, dest}`), since `dest` varies.
-    async fn broadcast(&mut self, payload: Vec<u8>, msg_type: &'static str, placeholder: bool) {
-        let Some(auth) = self.channel_auth.clone() else {
-            // Flag off: byte-identical to pre-MAC behavior. Fable perf audit item 5a:
-            // `other_primary_addrs` is precomputed once (see its own doc comment) --
-            // this `.clone()` is a straight contiguous `Vec<SocketAddr>` memcpy.
-            let handlers = self
-                .network
-                .broadcast_typed(
-                    self.other_primary_addrs.clone(),
-                    Bytes::from(payload),
-                    msg_type,
-                )
-                .await;
-            self.cancel_handlers.extend(handlers);
-            return;
-        };
-        if placeholder {
-            let mut tagged = payload;
-            tagged.extend_from_slice(&auth.tag_unverified(&tagged));
-            let handlers = self
-                .network
-                .broadcast_typed(
-                    self.other_primary_addrs.clone(),
-                    Bytes::from(tagged),
-                    msg_type,
-                )
-                .await;
-            self.cancel_handlers.extend(handlers);
-            return;
-        }
-        for (peer, addr) in self.other_primaries.clone() {
-            let tag = auth
-                .tag_for(&peer, &payload)
-                .expect("every `other_primaries` entry is a committee member");
-            let mut tagged = payload.clone();
-            tagged.extend_from_slice(&tag);
-            let handler = self
-                .network
-                .send_typed(addr, Bytes::from(tagged), msg_type)
-                .await;
-            self.cancel_handlers.push(handler);
-        }
+    /// Broadcasts `payload` verbatim to every other primary. Fable perf audit item 5a:
+    /// `other_primary_addrs` is precomputed once (see its own doc comment) -- this
+    /// `.clone()` is a straight contiguous `Vec<SocketAddr>` memcpy.
+    async fn broadcast(&mut self, payload: Vec<u8>, msg_type: &'static str) {
+        let handlers = self
+            .network
+            .broadcast_typed(
+                self.other_primary_addrs.clone(),
+                Bytes::from(payload),
+                msg_type,
+            )
+            .await;
+        self.cancel_handlers.extend(handlers);
     }
 
     /// Data-plane withholding fault injector (`--withhold`): same wire-level contract
-    /// as `broadcast` (identical MAC-tag-append logic), but against a caller-supplied
-    /// destination list instead of `self.other_primaries`/`self.other_primary_addrs`
-    /// -- `addrs`/`full` are those two fields with this node's own blocked half
-    /// already removed (`withheld_header_dests`). `broadcast` itself is left
-    /// completely untouched (not even refactored to delegate here) so the default,
-    /// non-withholding path -- including every non-Header broadcast, which never
-    /// reaches this method at all -- keeps its exact original allocation/branch shape.
-    async fn broadcast_to(
-        &mut self,
-        payload: Vec<u8>,
-        msg_type: &'static str,
-        placeholder: bool,
-        addrs: Vec<SocketAddr>,
-        full: Vec<(PublicKey, SocketAddr)>,
-    ) {
-        let Some(auth) = self.channel_auth.clone() else {
-            let handlers = self
-                .network
-                .broadcast_typed(addrs, Bytes::from(payload), msg_type)
-                .await;
-            self.cancel_handlers.extend(handlers);
-            return;
-        };
-        if placeholder {
-            let mut tagged = payload;
-            tagged.extend_from_slice(&auth.tag_unverified(&tagged));
-            let handlers = self
-                .network
-                .broadcast_typed(addrs, Bytes::from(tagged), msg_type)
-                .await;
-            self.cancel_handlers.extend(handlers);
-            return;
-        }
-        for (peer, addr) in full {
-            let tag = auth
-                .tag_for(&peer, &payload)
-                .expect("every withheld-header destination is a committee member");
-            let mut tagged = payload.clone();
-            tagged.extend_from_slice(&tag);
-            let handler = self
-                .network
-                .send_typed(addr, Bytes::from(tagged), msg_type)
-                .await;
-            self.cancel_handlers.push(handler);
-        }
+    /// as `broadcast`, but against a caller-supplied destination list instead of
+    /// `self.other_primary_addrs` -- `addrs` is that field with this node's own
+    /// blocked half already removed (`withheld_header_dests`). `broadcast` itself is
+    /// left completely untouched (not even refactored to delegate here) so the
+    /// default, non-withholding path -- including every non-Header broadcast, which
+    /// never reaches this method at all -- keeps its exact original allocation/branch
+    /// shape.
+    async fn broadcast_to(&mut self, payload: Vec<u8>, msg_type: &'static str, addrs: Vec<SocketAddr>) {
+        let handlers = self
+            .network
+            .broadcast_typed(addrs, Bytes::from(payload), msg_type)
+            .await;
+        self.cancel_handlers.extend(handlers);
     }
 
-    /// SECURITY (Fable audit): same tag-append contract as `broadcast`, for a single
-    /// destination.
-    async fn send_to(
-        &mut self,
-        peer: PublicKey,
-        payload: Vec<u8>,
-        msg_type: &'static str,
-        placeholder: bool,
-    ) {
+    /// Unicasts `payload` verbatim to a single peer.
+    async fn send_to(&mut self, peer: PublicKey, payload: Vec<u8>, msg_type: &'static str) {
         let Some(addr) = self
             .other_primaries
             .iter()
@@ -395,46 +296,23 @@ impl Wire {
         else {
             return;
         };
-        let data = match &self.channel_auth {
-            None => Bytes::from(payload),
-            Some(auth) => {
-                let tag = if placeholder {
-                    auth.tag_unverified(&payload)
-                } else {
-                    auth.tag_for(&peer, &payload)
-                        .expect("peer is a committee member")
-                };
-                let mut tagged = payload;
-                tagged.extend_from_slice(&tag);
-                Bytes::from(tagged)
-            }
-        };
-        let handler = self.network.send_typed(addr, data, msg_type).await;
+        let handler = self
+            .network
+            .send_typed(addr, Bytes::from(payload), msg_type)
+            .await;
         self.cancel_handlers.push(handler);
     }
 
-    /// SECURITY (Fable audit): appends a tag keyed `k_{self, self}` (the worker<->
-    /// primary channel is intra-authority: our own worker's public key IS `self.name`)
-    /// before sending to one of our own workers. A no-op (byte-identical) when
-    /// `channel_auth` is off.
+    /// Sends to one of our own workers.
     pub(crate) async fn send_to_worker(
         &mut self,
         addr: SocketAddr,
         payload: Vec<u8>,
         msg_type: &'static str,
     ) {
-        let data = match &self.channel_auth {
-            None => Bytes::from(payload),
-            Some(auth) => {
-                let tag = auth
-                    .tag_for(&self.name, &payload)
-                    .expect("self is a committee member");
-                let mut tagged = payload;
-                tagged.extend_from_slice(&tag);
-                Bytes::from(tagged)
-            }
-        };
-        self.worker_network.send_typed(addr, data, msg_type).await;
+        self.worker_network
+            .send_typed(addr, Bytes::from(payload), msg_type)
+            .await;
     }
 
     /// Mechanism A (sender-side lane resume, `vantage::resume`): the run loop's
@@ -462,7 +340,7 @@ impl Wire {
         else {
             return;
         };
-        if self.resume_tx.try_send((peer, addr, message)).is_err() {
+        if self.resume_tx.try_send((addr, message)).is_err() {
             // `Full` (the sender task fell behind draining a backed-up
             // destination) or `Closed` (the task itself is gone -- in practice
             // only reachable if it panicked; the channel's one live `Sender`
@@ -490,13 +368,9 @@ impl Wire {
     /// destinations) is what's consulted -- `peer` not appearing in it means
     /// `peer` is in this node's blocked half.
     ///
-    /// Same wire encoding as a fresh publish (`Header(_, false)`, MAC-bound to
-    /// `h.author` -- `mac_candidate_sender`'s existing arm for this variant already
-    /// covers it unchanged, since this is only ever called by the block's own author
-    /// answering a `VantageLaneResume` for its OWN lane, i.e. `h.author ==
-    /// self.name`), just unicast instead of broadcast -- so receipt is DirectPub/
-    /// ack-eligible through the existing publish path exactly as a broadcast publish
-    /// would be.
+    /// Same wire encoding as a fresh publish (`Header(_, false)`), just unicast
+    /// instead of broadcast -- so receipt is DirectPub/ack-eligible through the
+    /// existing publish path exactly as a broadcast publish would be.
     pub(crate) fn enqueue_resume_header(&self, peer: PublicKey, header: Header) {
         if let Some((_, allowed)) = &self.withheld_header_dests {
             let peer_allowed = allowed.iter().any(|(pk, _)| *pk == peer);
@@ -537,12 +411,11 @@ const RESUME_SEND_CHANNEL_CAPACITY: usize = 4096;
 /// dedicated resume-sender task and returns the `mpsc::Sender` end `Wire::
 /// enqueue_resume`/`enqueue_resume_header` `try_send` onto. Called once, at
 /// `VantageCore::build`/`SimpleItCore::build` time, with the SAME `latency_map`/
-/// `blip_gate`/`compress_network`/`batch`/`metrics` values those constructors hand
-/// `network`/`worker_network` (identical configuration convention) -- but this is a
-/// DELIBERATELY SEPARATE `SimpleSender` instance (its own connection pool) and a
-/// separate clone of `channel_auth`, so a resume destination's connection state, and
-/// this task's own MAC-tagging, never touch `network`'s (primary<->primary AGB/
-/// consensus traffic) or `worker_network`'s (primary<->worker) state, or
+/// `batch`/`metrics` values those constructors hand `network`/`worker_network`
+/// (identical configuration convention) -- but this is a DELIBERATELY SEPARATE
+/// `SimpleSender` instance (its own connection pool), so a resume destination's
+/// connection state never touches `network`'s (primary<->primary AGB/consensus
+/// traffic) or `worker_network`'s (primary<->worker) state, or
 /// `VantageCore`/`SimpleItCore`'s run loop, ever again once spawned.
 ///
 /// Fire-and-forget (`SimpleSender`, not `ReliableSender`) is CORRECT for resume
@@ -559,56 +432,34 @@ const RESUME_SEND_CHANNEL_CAPACITY: usize = 4096;
 /// to merely bound the damage from, rather than eliminate).
 pub(crate) fn spawn_resume_sender(
     latency_map: HashMap<SocketAddr, Duration>,
-    blip_gate: Option<Arc<BlipGate>>,
-    compress_network: bool,
     batch: BatchConfig,
     metrics: Option<Arc<Metrics>>,
-    channel_auth: Option<Arc<PairwiseKeys>>,
-) -> mpsc::Sender<(PublicKey, SocketAddr, PrimaryMessage)> {
+) -> mpsc::Sender<(SocketAddr, PrimaryMessage)> {
     let (tx, rx) = mpsc::channel(RESUME_SEND_CHANNEL_CAPACITY);
     let mut sender = SimpleSender::new()
         .with_latency(latency_map)
-        .with_blip(blip_gate)
-        .with_compression(compress_network)
         .with_batching(batch);
     if let Some(m) = metrics {
         sender = sender.with_metrics(m);
     }
-    tokio::spawn(run_resume_sender(rx, sender, channel_auth));
+    tokio::spawn(run_resume_sender(rx, sender));
     tx
 }
 
 /// Mechanism A: the dedicated off-run-loop task itself, fed by `spawn_resume_
-/// sender`'s channel. One iteration: recv -> serialize -> MAC-tag (per destination,
-/// mirroring `Wire::send_to`'s tag-append contract exactly -- neither of Mechanism
-/// A's two message shapes (`VantageLaneResume`, the requester's own outgoing ask;
-/// `Header(_, false)`, the author's resumed republish) is D4-class (no sender claim
-/// to bind), so this never takes the placeholder-tag path `broadcast`/`broadcast_to`
-/// use for `Header(_, true)`/`ControlServe`/etc.) -> `SimpleSender::send_typed`.
+/// sender`'s channel. One iteration: recv -> serialize -> `SimpleSender::send_typed`.
 /// Every step here may block/await freely -- see `spawn_resume_sender`'s doc comment
 /// for why that is this task's entire job rather than a bug. Ends the moment `tx`'s
 /// one live clone (held by `Wire`) drops -- `rx.recv()` then returns `None` and this
 /// loop, and the task with it, ends; nothing joins it explicitly, mirroring every
 /// other detached `tokio::spawn` in this codebase (e.g. `network::Connection::spawn`).
 async fn run_resume_sender(
-    mut rx: mpsc::Receiver<(PublicKey, SocketAddr, PrimaryMessage)>,
+    mut rx: mpsc::Receiver<(SocketAddr, PrimaryMessage)>,
     mut sender: SimpleSender,
-    channel_auth: Option<Arc<PairwiseKeys>>,
 ) {
-    while let Some((peer, addr, message)) = rx.recv().await {
+    while let Some((addr, message)) = rx.recv().await {
         let msg_type = message.type_name();
         let bytes = bincode::serialize(&message).expect("serializes");
-        let data = match &channel_auth {
-            None => Bytes::from(bytes),
-            Some(auth) => {
-                let tag = auth
-                    .tag_for(&peer, &bytes)
-                    .expect("peer is a committee member");
-                let mut tagged = bytes;
-                tagged.extend_from_slice(&tag);
-                Bytes::from(tagged)
-            }
-        };
-        sender.send_typed(addr, data, msg_type).await;
+        sender.send_typed(addr, Bytes::from(bytes), msg_type).await;
     }
 }

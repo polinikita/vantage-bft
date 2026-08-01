@@ -14,12 +14,10 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
 use tokio::time::{Duration, Instant};
 
-/// Mirrors `Parameters::compress_network`'s plumbing contract: a small `Copy` config
-/// threaded alongside `compress` into every `ReliableSender`/`SimpleSender` this node
+/// A small `Copy` config threaded into every `ReliableSender`/`SimpleSender` this node
 /// spawns (`with_batching`), and into every `network::Receiver` it spawns (`acks`/
-/// `batch` at `spawn_full`). Committee-wide consistent by construction, same as
-/// `compress_network` (every node's `Parameters` comes from the same generated
-/// config).
+/// `batch` at `spawn_full`). Committee-wide consistent by construction (every node's
+/// `Parameters` comes from the same generated config).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BatchConfig {
     /// Off by default -- no coalescer is ever consulted, byte-identical wire/behavior.
@@ -55,10 +53,10 @@ impl BatchConfig {
 }
 
 /// Bundle frame payload (transport-level, self-contained): `[count: u32-LE]
-/// ( [len: u32-LE][msg bytes] ) x count`. This is the value handed to the existing
-/// `wire_bytes`/outer length-delimited-framing pipeline as a single logical message --
-/// compression (if on) and the outer frame length prefix wrap the WHOLE bundle, and it
-/// occupies exactly one delay-queue slot (one injected latency for the whole bundle).
+/// ( [len: u32-LE][msg bytes] ) x count`. This is the value handed to the outer
+/// length-delimited-framing pipeline as a single logical message -- the outer frame
+/// length prefix wraps the WHOLE bundle, and it occupies exactly one delay-queue slot
+/// (one injected latency for the whole bundle).
 pub(crate) fn encode_bundle(items: &[Bytes]) -> Bytes {
     let payload_bytes: usize = items.iter().map(|m| m.len()).sum();
     let mut out = BytesMut::with_capacity(4 + payload_bytes + 4 * items.len());
@@ -79,10 +77,7 @@ impl fmt::Display for DecodeBundleError {
     }
 }
 
-/// Inverse of `encode_bundle`. `payload` is the already de-framed, already-
-/// decompressed bundle bytes (mirrors the send side's ordering: compress the whole
-/// bundle before the outer frame; decompress the whole frame before splitting it back
-/// into sub-messages).
+/// Inverse of `encode_bundle`. `payload` is the already de-framed bundle bytes.
 pub(crate) fn decode_bundle(payload: &Bytes) -> Result<Vec<Bytes>, DecodeBundleError> {
     let mut buf = payload.clone();
     if buf.remaining() < 4 {
