@@ -3,17 +3,12 @@
 // payload-ready tracking and committed-output forwarding without depending on Vantage's
 // own protocol state (`agb`, `frontier`, `cursor`, `pacemaker`, `resolver`, `control`).
 // Pure code motion out of `node.rs`, mirroring `vantage::wire`'s own extraction (see
-// that module's doc comment): `sync_batches`/`notify_committed` are unchanged from
-// their previous home on `VantageCore`, aside from the `self.wire.` -> `wire.`-style
-// re-pointing their two `Wire`-touching call sites now require -- `PayloadIo` takes
-// `&mut Wire` as a parameter rather than owning or borrowing one as a field, since
-// (unlike `sync_batches`/`notify_committed` themselves) `Wire` is not protocol state:
-// Simple-IT's own `SimpleItCore` builds its own `Wire` and threads it through the same
-// two calls. `VantageCore::on_payload_ready`, which reads/writes `pending_payload` but
-// is not itself one of the two moved methods, is re-pointed to
-// `self.payload.pending_payload` at its two call sites -- the same kind of "self." ->
-// "self.wire."-style re-pointing `node.rs` already required of e.g. `sample_metrics`'s
-// direct `self.wire.cancel_handlers` read after the `Wire` split.
+// that module's doc comment). `PayloadIo` takes `&mut Wire` as a parameter rather than
+// owning or borrowing one as a field, since `Wire` is not protocol state: Simple-IT's
+// own `SimpleItCore` builds its own `Wire` and threads it through the same two calls.
+// `VantageCore::on_payload_ready`, which reads/writes `pending_payload` but is not
+// itself one of the two moved methods, is re-pointed to `self.payload.pending_payload`
+// at its two call sites.
 
 use crate::messages::Header;
 use crate::primary::PrimaryWorkerMessage;
@@ -48,9 +43,11 @@ pub struct PayloadIo {
 
 impl PayloadIo {
     /// D1/§1: ask our own workers to sync `missing` batches for `author`'s block
-    /// (`header_digest`), then spawn one `store.notify_read` waiter per missing key;
-    /// once *every* key for this header has resolved, call
-    /// `LaneManager::set_payload_ready`.
+    /// (`header_digest`), then spawn one `store.notify_read` waiter per newly-pending
+    /// key. Repeated calls merge into the existing per-header set and may resend the
+    /// worker request as a transport retry, but never create a second waiter for the
+    /// same `(header_digest, digest, worker_id)`. Once *every* key for this header has
+    /// resolved, the core calls `LaneManager::set_payload_ready`.
     pub(crate) async fn sync_batches(
         &mut self,
         wire: &mut Wire,
@@ -61,8 +58,35 @@ impl PayloadIo {
         if missing.is_empty() {
             return;
         }
+        let mut seen = HashSet::new();
+        let requested: Vec<(Digest, WorkerId)> = missing
+            .into_iter()
+            .filter(|entry| seen.insert(entry.clone()))
+            .collect();
+        if requested.is_empty() {
+            return;
+        }
+
+        let newly_pending = {
+            let pending = self
+                .pending_payload
+                .entry(header_digest.clone())
+                .or_default();
+            requested
+                .iter()
+                .filter_map(|(digest, worker_id)| {
+                    let entry = (digest.clone(), *worker_id);
+                    pending.insert(entry.clone()).then_some(entry)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // `missing` was produced by a fresh local-store probe. Resend every unique
+        // still-missing entry, including one already pending, so a duplicate accepted
+        // SERVE can retry a lost primary-to-worker Synchronize message. Only waiter
+        // creation is restricted to `newly_pending` below.
         let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
-        for (digest, worker_id) in &missing {
+        for (digest, worker_id) in &requested {
             by_worker
                 .entry(*worker_id)
                 .or_default()
@@ -76,9 +100,7 @@ impl PayloadIo {
             }
         }
 
-        let set: HashSet<(Digest, WorkerId)> = missing.iter().cloned().collect();
-        self.pending_payload.insert(header_digest.clone(), set);
-        for (digest, worker_id) in missing {
+        for (digest, worker_id) in newly_pending {
             let mut store = self.store.clone();
             let tx = self.tx_payload_ready.clone();
             let header_digest = header_digest.clone();

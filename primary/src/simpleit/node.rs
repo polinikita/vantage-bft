@@ -798,7 +798,7 @@ impl SimpleItCore {
                 }
             }
             Inbound::Serve(header) => {
-                let effects = self.rep.on_serve(header);
+                let effects = self.serve_effects(header).await;
                 self.execute(effects).await;
             }
             Inbound::HeadersRequest(digests, requestor) => {
@@ -865,6 +865,22 @@ impl SimpleItCore {
                 self.execute(effects).await;
             }
         }
+    }
+
+    async fn serve_effects(&mut self, header: Header) -> Vec<Effect> {
+        let digest = header.id.clone();
+        let author = header.author;
+        let mut effects = self.rep.on_serve(header.clone());
+        let accepted = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BlockCached(d) if *d == digest));
+        if accepted {
+            let missing = self.lm.missing_payload(&header).await;
+            if !missing.is_empty() {
+                effects.push(Effect::SyncBatches(author, digest, missing));
+            }
+        }
+        effects
     }
 
     fn on_ack_availability(&mut self, availability: AckAvailability) -> Vec<Effect> {
@@ -1374,6 +1390,7 @@ mod tests {
     // node's own repair walk happens to resolve each author's blocks -- see
     // `drain_commit_queue`'s own doc comment for the safety argument.
     use super::*;
+    use crypto::Hash as _;
 
     fn key(byte: u8) -> PublicKey {
         PublicKey([byte; 32])
@@ -1426,6 +1443,163 @@ mod tests {
                 tx_output,
             );
         (core, rx_output)
+    }
+
+    async fn mark_payload(store: &mut Store, digest: &Digest, worker_id: WorkerId) {
+        let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
+        store.write(key, Vec::new()).await;
+    }
+
+    fn served_payload_header(core: &SimpleItCore, author: PublicKey) -> (Header, Digest, Digest) {
+        let missing = Digest([0x31; 32]);
+        let present = Digest([0x32; 32]);
+        let mut payload = BTreeMap::new();
+        payload.insert(missing.clone(), 0);
+        payload.insert(present.clone(), 0);
+        (
+            Header::new_vantage(author, 1, payload, core.genesis.clone(), core.sid.clone()),
+            missing,
+            present,
+        )
+    }
+
+    fn sync_effect(effects: &[Effect]) -> Option<&Effect> {
+        effects
+            .iter()
+            .find(|effect| matches!(effect, Effect::SyncBatches(..)))
+    }
+
+    #[tokio::test]
+    async fn accepted_served_header_syncs_only_missing_payloads() {
+        let committee = crate::common::committee();
+        let keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
+        let (mut core, _) = test_core(keys[0], committee, "serve_missing");
+        let (header, missing, present) = served_payload_header(&core, keys[1]);
+        let mut store = core.lm.store_for_test();
+        mark_payload(&mut store, &present, 0).await;
+        core.rep.authorize((keys[1], 1, header.id.clone()));
+
+        let effects = core.serve_effects(header.clone()).await;
+        assert!(matches!(
+            sync_effect(&effects),
+            Some(Effect::SyncBatches(a, h, entries))
+                if *a == keys[1] && h == &header.id && entries == &vec![(missing, 0)]
+        ));
+        assert!(
+            !core
+                .lm
+                .blocks_handle()
+                .lock()
+                .unwrap()
+                .get(&header.id)
+                .unwrap()
+                .payload_ok
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_accepted_serve_merges_pending_payload_without_duplicate_waiters() {
+        let committee = crate::common::committee();
+        let keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
+        let (mut core, _) = test_core(keys[0], committee, "serve_duplicate");
+        let (header, missing, first_arrival) = served_payload_header(&core, keys[1]);
+        let mut store = core.lm.store_for_test();
+        let (payload_tx, mut payload_rx) = channel(4);
+        core.payload.tx_payload_ready = payload_tx;
+        core.wire.worker_addresses.clear();
+        core.rep.authorize((keys[1], 1, header.id.clone()));
+
+        let effects = core.serve_effects(header.clone()).await;
+        core.execute(effects).await;
+
+        mark_payload(&mut store, &first_arrival, 0).await;
+        let arrived = tokio::time::timeout(Duration::from_secs(1), payload_rx.recv())
+            .await
+            .expect("first payload waiter resolves")
+            .expect("payload-ready channel stays open");
+        assert_eq!(arrived, (header.id.clone(), first_arrival.clone(), 0));
+
+        // Keep the first arrival unconsumed by `on_payload_ready`, then repeat the
+        // accepted serve. The pending set must be unioned, not replaced by the fresh
+        // store probe's one-key result.
+        let effects = core.serve_effects(header.clone()).await;
+        assert!(matches!(
+            sync_effect(&effects),
+            Some(Effect::SyncBatches(a, h, entries))
+                if *a == keys[1]
+                    && h == &header.id
+                    && entries == &vec![(missing.clone(), 0)]
+        ));
+        core.execute(effects).await;
+
+        {
+            let pending = core
+                .payload
+                .pending_payload
+                .get(&header.id)
+                .expect("header remains pending");
+            assert_eq!(pending.len(), 2);
+            assert!(pending.contains(&(first_arrival, 0)));
+            assert!(pending.contains(&(missing.clone(), 0)));
+        }
+
+        mark_payload(&mut store, &missing, 0).await;
+        let arrived = tokio::time::timeout(Duration::from_secs(1), payload_rx.recv())
+            .await
+            .expect("last payload waiter resolves")
+            .expect("payload-ready channel stays open");
+        assert_eq!(arrived, (header.id, missing, 0));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), payload_rx.recv())
+                .await
+                .is_err(),
+            "a duplicate serve must not spawn a second waiter for the same payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_served_header_emits_no_payload_sync() {
+        let committee = crate::common::committee();
+        let keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
+        let (mut core, _) = test_core(keys[0], committee, "serve_rejected");
+        let mut header = Header::new_vantage(
+            keys[1],
+            1,
+            BTreeMap::new(),
+            core.genesis.clone(),
+            core.sid.clone(),
+        );
+        header.id = Digest([0xee; 32]);
+        core.rep.authorize((keys[1], 1, header.id.clone()));
+
+        let effects = core.serve_effects(header).await;
+        assert!(effects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fully_present_served_header_emits_no_payload_sync() {
+        let committee = crate::common::committee();
+        let keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
+        let (mut core, _) = test_core(keys[0], committee, "serve_present");
+        let (mut header, _missing, present) = served_payload_header(&core, keys[1]);
+        header.payload.retain(|digest, _| digest == &present);
+        header.id = header.digest();
+        let mut store = core.lm.store_for_test();
+        mark_payload(&mut store, &present, 0).await;
+        core.rep.authorize((keys[1], 1, header.id.clone()));
+
+        let effects = core.serve_effects(header.clone()).await;
+        assert!(sync_effect(&effects).is_none());
+        assert!(
+            !core
+                .lm
+                .blocks_handle()
+                .lock()
+                .unwrap()
+                .get(&header.id)
+                .unwrap()
+                .payload_ok
+        );
     }
 
     /// `n` chain-linked headers for `author`, heights `1..=n`, NOT inserted into any

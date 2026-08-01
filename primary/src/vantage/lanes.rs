@@ -798,6 +798,11 @@ impl LaneManager {
         self.blocks.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self) -> Store {
+        self.store.clone()
+    }
+
     /// N1: create and self-publish our own next block. Height advances immediately on
     /// self-creation -- lanes are ack-independent (no certificate wait, unlike
     /// Autobahn's `last_parent` gate at proposer.rs:241). Self-delivery counts: we
@@ -839,7 +844,8 @@ impl LaneManager {
         }
 
         let direct = sender == header.author; // N1
-        let payload_ok = self.payload_present(&header).await;
+        let missing_payload = self.missing_payload(&header).await;
+        let payload_ok = missing_payload.is_empty();
         let digest = header.id.clone();
 
         {
@@ -867,37 +873,37 @@ impl LaneManager {
             }
         }
 
-        if direct && !payload_ok {
-            let missing: Vec<(Digest, WorkerId)> = header
-                .payload
-                .iter()
-                .map(|(d, w)| (d.clone(), *w))
-                .collect();
-            effects.push(Effect::SyncBatches(header.author, digest.clone(), missing));
+        if direct && !missing_payload.is_empty() {
+            effects.push(Effect::SyncBatches(
+                header.author,
+                digest.clone(),
+                missing_payload,
+            ));
         }
 
         effects.extend(self.refresh_author(header.author));
         effects
     }
 
-    /// D1's payload gate, reusing the exact key shape
-    /// `synchronizer::Synchronizer::missing_payload`/`payload_receiver::PayloadReceiver`
-    /// already use (`[digest || worker_id LE]`, written on `OthersBatch`). We don't
-    /// store the payload of our own workers under that key (mirroring
-    /// `missing_payload`'s early return for `header.author == self.name`) -- our own
-    /// blocks are always payload-ok since the `OurBatch` digests we proposed with are
-    ///, by construction, digests our own workers already sealed.
-    async fn payload_present(&mut self, header: &Header) -> bool {
+    /// Returns the payload entries not present in the local worker store, using the
+    /// exact key shape `synchronizer::Synchronizer::missing_payload`/
+    /// `payload_receiver::PayloadReceiver` use (`[digest || worker_id LE]`, written
+    /// on `OthersBatch`). We don't store the payload of our own workers under that key
+    /// (mirroring `missing_payload`'s early return for `header.author == self.name`) --
+    /// our own blocks are always payload-ready since the `OurBatch` digests we proposed
+    /// with are, by construction, digests our own workers already sealed.
+    pub(crate) async fn missing_payload(&mut self, header: &Header) -> Vec<(Digest, WorkerId)> {
         if header.author == self.name {
-            return true;
+            return Vec::new();
         }
+        let mut missing = Vec::new();
         for (digest, worker_id) in &header.payload {
             let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
             if self.store.read(key).await.unwrap_or(None).is_none() {
-                return false;
+                missing.push((digest.clone(), *worker_id));
             }
         }
-        true
+        missing
     }
 
     /// Call once a previously-missing block's worker batches have arrived (production:
