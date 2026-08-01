@@ -417,9 +417,18 @@ impl ReplayEpisodes {
     }
 }
 
+/// One author-side replay stream currently accepted for a peer. `generation` makes
+/// completion/removal conditional on the exact accepted stream: a delayed completion
+/// from an expired generation must not clear a newer stream's marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightEntry {
+    pub started: Instant,
+    pub generation: u64,
+}
+
 /// reconnect-replay plan §6: author-side in-flight-replay-stream query, over a
-/// caller-owned map (`VantageCore`/the resume task's shared `Arc<Mutex<HashMap<
-/// PublicKey, Instant>>>` -- see `vantage::wire::InFlightMap`) this module never
+/// caller-owned map (`VantageCore`/the replay task's shared `Arc<Mutex<HashMap<
+/// PublicKey, InFlightEntry>>>` -- see `vantage::wire::InFlightMap`) this module never
 /// allocates or holds itself, keeping this a pure, lock-free, unit-testable
 /// decision: `InFlight` blocks a fresh Hello outright (the running stream already
 /// serves `>= pending_low`, a superset of any concurrent ask -- §6); `Expired`
@@ -429,28 +438,27 @@ impl ReplayEpisodes {
 /// still needed a fresh discovery.
 ///
 /// TTL = `Parameters::replay_episode_max_ms` (audit-3 A6), NOT a shorter value:
-/// strict `Message`-priority scheduling (§5) means replay throughput is not
-/// guaranteed, so a shorter TTL could expire mid-drain and cause a duplicate
-/// re-serve; sizing it to the requester's own episode lifetime avoids that by
-/// construction.
+/// replay remains globally paced, so a shorter TTL could expire mid-drain and cause
+/// a duplicate re-serve; sizing it to the requester's own episode lifetime avoids
+/// that by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InFlightState {
     Absent,
     InFlight,
-    Expired,
+    Expired(u64),
 }
 
 /// See `InFlightState`'s own doc comment.
 pub fn in_flight_state(
-    map: &HashMap<PublicKey, Instant>,
+    map: &HashMap<PublicKey, InFlightEntry>,
     peer: &PublicKey,
     now: Instant,
     ttl: Duration,
 ) -> InFlightState {
     match map.get(peer) {
         None => InFlightState::Absent,
-        Some(&started) if now.duration_since(started) < ttl => InFlightState::InFlight,
-        Some(_) => InFlightState::Expired,
+        Some(entry) if now.duration_since(entry.started) < ttl => InFlightState::InFlight,
+        Some(entry) => InFlightState::Expired(entry.generation),
     }
 }
 
@@ -1095,7 +1103,7 @@ mod tests {
 
     #[test]
     fn in_flight_state_absent_when_never_inserted() {
-        let map: HashMap<PublicKey, Instant> = HashMap::new();
+        let map: HashMap<PublicKey, InFlightEntry> = HashMap::new();
         let peer = key(1);
         assert_eq!(
             in_flight_state(&map, &peer, Instant::now(), Duration::from_millis(60_000)),
@@ -1108,7 +1116,13 @@ mod tests {
         let now = Instant::now();
         let mut map = HashMap::new();
         let peer = key(1);
-        map.insert(peer, now);
+        map.insert(
+            peer,
+            InFlightEntry {
+                started: now,
+                generation: 7,
+            },
+        );
         let ttl = Duration::from_millis(60_000);
 
         assert_eq!(
@@ -1117,7 +1131,7 @@ mod tests {
         );
         assert_eq!(
             in_flight_state(&map, &peer, now + Duration::from_millis(60_001), ttl),
-            InFlightState::Expired,
+            InFlightState::Expired(7),
             "audit-3 A6: TTL = replay_episode_max_ms, distinguishable from a genuinely absent entry"
         );
     }

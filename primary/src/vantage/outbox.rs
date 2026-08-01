@@ -1,7 +1,7 @@
 // reconnect-replay plan §5 (server-authoritative floor, v3): the per-party outbox of
 // every one-shot broadcast this node has sent VOLATILE (`VantageCore::
 // broadcast_recorded`) since it last got pruned -- the raw material a durable replay
-// stream (`ResumeSend::Replay`) is served FROM once a peer's `pending_low` (or its own
+// stream (`ReplaySend`) is served FROM once a peer's `pending_low` (or its own
 // Hello floor hint) names a gap. Keyed by `Pacemaker::own_watermark()` AT SEND TIME
 // (monotone non-decreasing across calls -- audit V1), so "everything sent from view V
 // onward" is a plain `BTreeMap::range` -- no separate index, no per-message sequence

@@ -10,8 +10,8 @@
 // reconnect-replay plan (server-authoritative floor, v3): this module also carries
 // the wire-level half of the reconnect-triggered replay mechanism -- `broadcast_
 // volatile`/`send_volatile` (the outbox's own send path), the `addr_to_peer`/`dirty_
-// map`/`in_flight` handles, and the resume-sender task's `ResumeSend::Replay`
-// scheduling (see that enum and `spawn_resume_sender`'s own doc comments for the
+// map`/`in_flight` handles, and the isolated lane/replay sender scheduling (see
+// `ReplaySend` and `spawn_resume_sender`'s own doc comments for the
 // full design). Audit-3 A9, stated once here for the whole subsystem: unlike
 // Mechanism A's own `Message` traffic (retried end-to-end ABOVE this layer, so a
 // crashed sender task only stalls it), a panic in the resume-sender task is a
@@ -21,20 +21,18 @@
 // symptom (`vantage_replay_pending_low_nudges_total` climbing without bound).
 //
 // Adversarial-audit FINDING 2: `Replay`/`Done` frames ride `network::ReliableSender::
-// send_detached_typed` (detached-durable -- see `run_resume_sender`'s own doc comment
+// send_detached_typed` (detached-durable -- see `run_replay_sender`'s own doc comment
 // for why they must never carry a `CancelHandler` this task would just drop). Durable
-// means requeued forever against a peer that never reconnects, but this never grows
-// unbounded the way a naive "durable, no backpressure" send might: detached-durable
-// frames toward a single dead peer accumulate bounded by exactly one in-flight,
-// budget-capped replay stream (`replay_serve_max_bytes`, <= 8MB) plus that stream's
-// own terminating `Done`, because every serve is Hello-GATED (`Inbound::ResumeHello`
-// is what starts a stream at all -- see `VantageCore::on_resume_hello`'s own in-flight
-// check) -- nothing re-serves the SAME peer again while its one stream is still
-// marked in-flight, regardless of how long that peer stays unreachable.
+// means requeued forever against a peer that never reconnects, so admission has an
+// explicit global logical-byte bound across queued and active replay work: normally
+// `2 * replay_serve_max_bytes`, plus the deliberate sole-oversized-stream exception.
+// A separate 64-slot cap bounds stream metadata. Per-peer generation tokens prevent
+// a stale stream's completion from clearing a newer stream admitted after the TTL.
 
 use crate::messages::Header;
 use crate::primary::PrimaryMessage;
 use crate::vantage::node::Inbound;
+use crate::vantage::resume::InFlightEntry;
 use bytes::Bytes;
 use config::WorkerId;
 use crypto::PublicKey;
@@ -42,6 +40,7 @@ use metrics::Metrics;
 use network::{BatchConfig, CancelHandler, DirtyMap, ReliableSender, SimpleSender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -55,7 +54,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 /// over a borrowed snapshot of this map -- this alias exists only so the two owners
 /// (a struct field and a spawned task's argument) never have to spell out the full
 /// nested type.
-pub(crate) type InFlightMap = Arc<Mutex<HashMap<PublicKey, Instant>>>;
+pub(crate) type InFlightMap = Arc<Mutex<HashMap<PublicKey, InFlightEntry>>>;
 
 /// SECURITY (Fable audit): a message's wire-declared (or positionally-attributed)
 /// sender claim, for `sender_is_member`'s generic non-member gate to check. One `impl`
@@ -167,11 +166,17 @@ pub struct Wire {
     /// the loop-starvation defect this crate's previous per-send `resume::
     /// SEND_TIMEOUT` (deleted) only ever bounded the damage from: a backed-up
     /// destination now costs the sender task's own progress, never
-    /// `VantageCore`/`SimpleItCore`'s run loop's. reconnect-replay plan §5/§7: now
-    /// carries `ResumeSend` (Mechanism A's own `Message` shape, plus v3's own
-    /// `Replay` stream shape) rather than a bare `(SocketAddr, PrimaryMessage)`
-    /// tuple -- see `ResumeSend`'s own doc comment.
-    pub(crate) resume_tx: mpsc::Sender<ResumeSend>,
+    /// `VantageCore`/`SimpleItCore`'s run loop's. Lane traffic is deliberately
+    /// isolated from replay traffic: filling or blocking this queue cannot consume
+    /// replay admission capacity or delay the replay pacing task.
+    pub(crate) resume_lane_tx: mpsc::Sender<LaneSend>,
+    /// Reconnect replay's independently bounded ingress. The wrapper reserves the
+    /// stream's complete logical byte footprint before admission and retains that
+    /// reservation while the stream is queued or active.
+    pub(crate) replay_tx: ReplaySender,
+    /// Unique stream generation source. Generations make task-side completion and
+    /// enqueue-failure cleanup conditional on the exact stream they refer to.
+    pub(crate) replay_generation: AtomicU64,
     pub(crate) cancel_handlers: Vec<CancelHandler>,
     /// Fable perf audit item 4: `cancel_handlers.len()` at the last actual
     /// `prune_cancel_handlers` scan -- `maybe_prune_cancel_handlers` only re-scans
@@ -471,8 +476,8 @@ impl Wire {
             return;
         };
         if self
-            .resume_tx
-            .try_send(ResumeSend::Message(addr, message))
+            .resume_lane_tx
+            .try_send(LaneSend(addr, message))
             .is_err()
         {
             // `Full` (the sender task fell behind draining a backed-up
@@ -501,6 +506,7 @@ impl Wire {
     pub(crate) fn enqueue_replay(
         &self,
         peer: PublicKey,
+        generation: u64,
         msgs: Vec<Bytes>,
         done: PrimaryMessage,
     ) -> bool {
@@ -512,21 +518,31 @@ impl Wire {
         else {
             return false;
         };
-        let ok = self
-            .resume_tx
-            .try_send(ResumeSend::Replay {
-                to: addr,
-                peer,
-                msgs,
-                done,
-            })
-            .is_ok();
+        let ok = self.replay_tx.try_send(ReplaySend {
+            to: addr,
+            peer,
+            generation,
+            msgs,
+            done,
+            reserved_bytes: 0,
+        });
         if !ok {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_replay_enqueue_drops_total.inc();
             }
         }
         ok
+    }
+
+    /// Allocates the next replay-stream generation. Exhausting all `u64`
+    /// generations in one process lifetime is treated as fatal rather than wrapping
+    /// and making a stale completion indistinguishable from a current stream.
+    pub(crate) fn next_replay_generation(&self) -> u64 {
+        self.replay_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("replay generation exhausted")
     }
 
     /// Mechanism A: the author-side counterpart -- same withholding-fidelity gate
@@ -566,35 +582,105 @@ impl Wire {
     }
 }
 
-/// reconnect-replay plan §5/§7: what the resume-sender task actually transmits.
-/// `Message` is Mechanism A's pre-existing shape (a single `PrimaryMessage`, sent
-/// fire-and-forget via the task's own `SimpleSender` -- unchanged semantics, unchanged
-/// wire encoding). `Replay` is v3's own durable replay-stream shape: `msgs` (already-
-/// serialized outbox entries, possibly empty -- see `VantageCore`'s
-/// `Inbound::ResumeHello` handling for when an empty slice is legitimate) chunked and
-/// sent via the task's OWN `ReliableSender` (durable-only -- audit-3 A2: "never sends
-/// volatile"), `done` following as the stream's terminating frame once every chunk
-/// has gone out; `peer` is who to remove from the shared in-flight map at that point.
 #[derive(Debug)]
-pub(crate) enum ResumeSend {
-    Message(SocketAddr, PrimaryMessage),
-    Replay {
-        to: SocketAddr,
-        peer: PublicKey,
-        msgs: Vec<Bytes>,
-        done: PrimaryMessage,
-    },
+pub(crate) struct LaneSend(SocketAddr, PrimaryMessage);
+
+/// One independently admitted durable replay stream. `reserved_bytes` is populated
+/// by `ReplaySender::try_send` and remains reserved across both queued and active
+/// states, until all replay frames and `done` have been handed to `ReliableSender`.
+#[derive(Debug)]
+pub(crate) struct ReplaySend {
+    pub(crate) to: SocketAddr,
+    pub(crate) peer: PublicKey,
+    pub(crate) generation: u64,
+    pub(crate) msgs: Vec<Bytes>,
+    pub(crate) done: PrimaryMessage,
+    pub(crate) reserved_bytes: usize,
+}
+
+/// Replay ingress with two independent resource bounds: a small channel slot cap and
+/// a shared logical-byte reservation covering queued plus active streams. One stream
+/// larger than the normal byte cap is accepted only when it is the sole reservation.
+#[derive(Clone)]
+pub(crate) struct ReplaySender {
+    tx: mpsc::Sender<ReplaySend>,
+    reserved_bytes: Arc<AtomicUsize>,
+    max_reserved_bytes: usize,
+}
+
+impl ReplaySender {
+    pub(crate) fn channel(max_reserved_bytes: usize) -> (Self, mpsc::Receiver<ReplaySend>) {
+        let (tx, rx) = mpsc::channel(REPLAY_SEND_CHANNEL_CAPACITY);
+        (
+            Self {
+                tx,
+                reserved_bytes: Arc::new(AtomicUsize::new(0)),
+                max_reserved_bytes: max_reserved_bytes.max(1),
+            },
+            rx,
+        )
+    }
+
+    fn try_send(&self, mut item: ReplaySend) -> bool {
+        let reserved_bytes = replay_reserved_size(&item.msgs, &item.done);
+        let reserved =
+            self.reserved_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    if current == 0 && reserved_bytes > self.max_reserved_bytes {
+                        Some(reserved_bytes)
+                    } else {
+                        current
+                            .checked_add(reserved_bytes)
+                            .filter(|next| *next <= self.max_reserved_bytes)
+                    }
+                });
+        if reserved.is_err() {
+            return false;
+        }
+
+        item.reserved_bytes = reserved_bytes;
+        if self.tx.try_send(item).is_err() {
+            self.reserved_bytes
+                .fetch_sub(reserved_bytes, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+}
+
+fn replay_reserved_size(msgs: &[Bytes], done: &PrimaryMessage) -> usize {
+    let payload_bytes = msgs
+        .iter()
+        .fold(0usize, |total, msg| total.saturating_add(msg.len()));
+    let done_bytes =
+        usize::try_from(bincode::serialized_size(done).expect("serializes")).unwrap_or(usize::MAX);
+    payload_bytes.saturating_add(done_bytes).max(1)
 }
 
 /// reconnect-replay plan §5: one active replay stream's remaining, not-yet-sent
 /// chunks -- the resume task's own round-robin queue entry. `msgs` shrinks from the
-/// front as `run_resume_sender`'s ticker sends chunks; the stream is done (its
+/// front as `run_replay_sender`'s ticker sends chunks; the stream is done (its
 /// `done` frame sent, `peer` removed from the in-flight map) once it's empty.
 struct ReplayStream {
     to: SocketAddr,
     peer: PublicKey,
+    generation: u64,
     msgs: VecDeque<Bytes>,
     done: PrimaryMessage,
+    reserved_bytes: usize,
+}
+
+impl From<ReplaySend> for ReplayStream {
+    fn from(item: ReplaySend) -> Self {
+        Self {
+            to: item.to,
+            peer: item.peer,
+            generation: item.generation,
+            msgs: item.msgs.into(),
+            done: item.done,
+            reserved_bytes: item.reserved_bytes,
+        }
+    }
 }
 
 /// Mechanism A (sender-side lane resume, `vantage::resume`): capacity of
@@ -605,18 +691,25 @@ struct ReplayStream {
 /// entirely synchronously on the run loop; 4096 comfortably covers one node's own
 /// share of that burst (never the whole committee's traffic through one instance's
 /// one channel -- every node has its own `Wire`, hence its own channel) while
-/// staying a small, fixed amount of memory. A full channel is never a correctness
+/// staying a small, fixed amount of memory. Replay has an independent 64-slot and
+/// logical-byte bound, so lane congestion cannot consume replay capacity. A full
+/// lane channel is never a correctness
 /// bug, only a liveness hiccup: `enqueue_resume`'s `try_send` failing drops one
 /// message, which Mechanism A's own end-to-end retry (`resume::ResumeTrigger`'s
 /// backoff-driven resend, `resume::ResumeServe`'s dedup covering a redundant
-/// re-serve) recovers on a later attempt; `enqueue_replay`'s own `try_send` failing
-/// is audit-3 A2's own Err arm (leaves `pending_low` untouched, recovered by the
-/// next nudge/tick).
-const RESUME_SEND_CHANNEL_CAPACITY: usize = 4096;
+/// re-serve) recovers on a later attempt.
+const RESUME_LANE_CHANNEL_CAPACITY: usize = 4096;
+const REPLAY_SEND_CHANNEL_CAPACITY: usize = 64;
 
-/// Builds this node's ONE dedicated resume-sender task and returns the `mpsc::Sender`
-/// end `Wire::enqueue_resume`/`enqueue_resume_header`/`enqueue_replay` `try_send`
-/// onto. Called once, at `VantageCore::build`/`SimpleItCore::build` time, with the
+pub(crate) struct ResumeSenders {
+    pub(crate) lane: mpsc::Sender<LaneSend>,
+    pub(crate) replay: ReplaySender,
+    pub(crate) generation: AtomicU64,
+}
+
+/// Builds this node's two isolated resume-sender tasks and returns their separate
+/// bounded ingress handles. Called once, at `VantageCore::build`/`SimpleItCore::build`
+/// time, with the
 /// SAME `latency_map`/`batch`/`metrics` values those constructors hand `network`/
 /// `worker_network` (identical configuration convention) -- but these are
 /// DELIBERATELY SEPARATE sender instances (their own connection pools), so a resume
@@ -644,11 +737,8 @@ const RESUME_SEND_CHANNEL_CAPACITY: usize = 4096;
 /// MAIN-pool-only): every `ReliableSender` this node spawns should reconnect
 /// under the SAME cap for the ablation to be uniform.
 ///
-/// The task this spawns (`run_resume_sender`) is free to block/await on every single
-/// send -- that IS its entire reason to exist: letting one slow destination cost
-/// only this task's own progress, never the run loop that used to make this exact
-/// send inline (the loop-starvation defect `resume::SEND_TIMEOUT`, now deleted, used
-/// to merely bound the damage from, rather than eliminate).
+/// The lane task may block on its own `SimpleSender` without delaying replay. The
+/// replay task owns the one global ticker and only uses detached-durable sends.
 ///
 /// reconnect-replay plan §14 A9: a panic in this task is a PERMANENT-LOSS event for
 /// every `pending_low` span it had already raised on the strength of an enqueue that
@@ -669,14 +759,17 @@ pub(crate) fn spawn_resume_sender(
     in_flight: InFlightMap,
     chunk_bytes: usize,
     chunk_interval_ms: u64,
+    replay_serve_max_bytes: usize,
     // KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`):
     // this pool's own `replay` `ReliableSender` below is a SEPARATE connection pool
     // from the main one (`VantageCore`/`SimpleItCore`'s own `Wire::network`) --
     // threaded through here too so the cap applies uniformly to every
     // `ReliableSender` this node spawns, not just the main pool.
     retry_backoff_max_ms: u64,
-) -> mpsc::Sender<ResumeSend> {
-    let (tx, rx) = mpsc::channel(RESUME_SEND_CHANNEL_CAPACITY);
+) -> ResumeSenders {
+    let (lane_tx, lane_rx) = mpsc::channel(RESUME_LANE_CHANNEL_CAPACITY);
+    let max_reserved_bytes = replay_serve_max_bytes.saturating_mul(2).max(1);
+    let (replay_tx, replay_rx) = ReplaySender::channel(max_reserved_bytes);
     let mut messages = SimpleSender::new()
         .with_latency(latency_map.clone())
         .with_batching(batch);
@@ -689,29 +782,33 @@ pub(crate) fn spawn_resume_sender(
         replay = replay.with_metrics(m);
     }
     let chunk_interval = Duration::from_millis(chunk_interval_ms.max(1));
-    tokio::spawn(run_resume_sender(
-        rx,
-        messages,
+    tokio::spawn(run_lane_sender(lane_rx, messages));
+    tokio::spawn(run_replay_sender(
+        replay_rx,
         replay,
         in_flight,
+        replay_tx.reserved_bytes.clone(),
         chunk_bytes.max(1),
         chunk_interval,
     ));
-    tx
+    ResumeSenders {
+        lane: lane_tx,
+        replay: replay_tx,
+        generation: AtomicU64::new(1),
+    }
 }
 
-/// Sends one `ResumeSend::Message` immediately via `messages` -- shared by
-/// `run_resume_sender`'s blocking-recv and drain-the-rest arms.
-async fn send_message_item(messages: &mut SimpleSender, to: SocketAddr, message: PrimaryMessage) {
-    let msg_type = message.type_name();
-    let bytes = bincode::serialize(&message).expect("serializes");
-    messages.send_typed(to, Bytes::from(bytes), msg_type).await;
+/// Mechanism A's isolated best-effort sender. Closing the ingress drains every item
+/// already accepted by the bounded channel, then exits naturally.
+async fn run_lane_sender(mut rx: mpsc::Receiver<LaneSend>, mut messages: SimpleSender) {
+    while let Some(LaneSend(to, message)) = rx.recv().await {
+        let msg_type = message.type_name();
+        let bytes = bincode::serialize(&message).expect("serializes");
+        messages.send_typed(to, Bytes::from(bytes), msg_type).await;
+    }
 }
 
-/// The dedicated off-run-loop task itself, fed by `spawn_resume_sender`'s channel.
-///
-/// Mechanism A's `Message` items are sent IMMEDIATELY, unchanged (see `spawn_resume_
-/// sender`'s doc comment). reconnect-replay plan §5: `Replay` items instead join
+/// The dedicated replay task, fed only by replay ingress. Accepted streams join
 /// `streams` (a `VecDeque`, round-robin by construction -- a stream that isn't yet
 /// fully drained is rotated to the BACK after each chunk, so no single stream can
 /// monopolize the task); a `chunk_interval`-paced ticker sends exactly one
@@ -721,22 +818,13 @@ async fn send_message_item(messages: &mut SimpleSender, to: SocketAddr, message:
 /// `resume::ServeBudget`'s own per-key truncation already accept, never split
 /// mid-message).
 ///
-/// `select!`'s `biased` `rx.recv()` branch (with a `try_recv` drain loop right behind
-/// it) gives `Message` items STRICT priority over the next chunk tick -- module doc,
-/// design doc §5: "draining ALL queued v1 Message items between chunks". Two bounds
-/// keep either side from starving the other, both worth stating explicitly since
-/// neither is enforced by a hard cap in this loop itself: v1 traffic (Mechanism A's
-/// own `Message` items) is inherently rate-bounded by ITS OWN in-flight-1/round-trip
-/// protocol (`resume::ResumeTrigger`'s in-flight cap of 1 per author), so the priority
-/// drain this task gives it is itself rate-bounded, never an unbounded flood; replay
-/// throughput is bounded from the other side by `chunk_interval`/`chunk_bytes`
-/// (`replay_chunk_bytes / replay_chunk_interval_ms` bytes/s, one task, one bucket, by
-/// construction -- design doc §5's "global replay ceiling").
+/// A biased selection gives a due tick priority over ready replay ingress. Only one
+/// stream is admitted per receive iteration; exactly one front stream contributes one
+/// chunk per tick. `MissedTickBehavior::Delay` prevents catch-up bursts, while Tokio's
+/// intentional immediate first tick starts a newly admitted recovery promptly.
 ///
-/// Ends the moment `tx`'s one live clone (held by `Wire`) drops -- `rx.recv()` then
-/// returns `None` and this loop, and the task with it, ends; nothing joins it
-/// explicitly, mirroring every other detached `tokio::spawn` in this codebase. See
-/// `spawn_resume_sender`'s own doc comment (audit-3 A9) for what a PANIC here means.
+/// Closing ingress disables that receive branch; every already accepted stream is
+/// drained through `Done` before the task exits, without polling a closed receiver.
 ///
 /// Adversarial-audit FINDING 2 (BLOCKER): both sends in the chunk-tick arm below use
 /// `ReliableSender::send_detached_typed`, NEVER `send_typed`. `send_typed` returns a
@@ -755,47 +843,28 @@ async fn send_message_item(messages: &mut SimpleSender, to: SocketAddr, message:
 /// `ReplyTargets` is empty, which the A1 guard already treats as never-cancellable);
 /// it is durable-requeued across reconnects exactly like an ordinary `send_typed`
 /// call whose handler the caller correctly kept alive.
-async fn run_resume_sender(
-    mut rx: mpsc::Receiver<ResumeSend>,
-    mut messages: SimpleSender,
+async fn run_replay_sender(
+    mut rx: mpsc::Receiver<ReplaySend>,
     mut replay: ReliableSender,
     in_flight: InFlightMap,
+    reserved_bytes: Arc<AtomicUsize>,
     chunk_bytes: usize,
     chunk_interval: Duration,
 ) {
     let mut streams: VecDeque<ReplayStream> = VecDeque::new();
     let mut ticker = tokio::time::interval(chunk_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ingress_open = true;
     loop {
-        tokio::select! {
-            biased;
-
-            maybe = rx.recv() => {
-                let Some(item) = maybe else { return };
-                match item {
-                    ResumeSend::Message(to, message) => send_message_item(&mut messages, to, message).await,
-                    ResumeSend::Replay { to, peer, msgs, done } => {
-                        streams.push_back(ReplayStream { to, peer, msgs: msgs.into(), done });
-                    }
-                }
-                // Strict priority (module doc): absorb everything ELSE already
-                // waiting before this task ever considers the next chunk tick.
-                while let Ok(item) = rx.try_recv() {
-                    match item {
-                        ResumeSend::Message(to, message) => send_message_item(&mut messages, to, message).await,
-                        ResumeSend::Replay { to, peer, msgs, done } => {
-                            streams.push_back(ReplayStream { to, peer, msgs: msgs.into(), done });
-                        }
-                    }
-                }
-            }
-
-            _ = ticker.tick(), if !streams.is_empty() => {
-                let Some(mut stream) = streams.pop_front() else { continue };
-                let mut sent = 0usize;
-                while sent < chunk_bytes {
-                    let Some(bytes) = stream.msgs.pop_front() else { break };
-                    sent += bytes.len();
+        if !ingress_open && streams.is_empty() {
+            return;
+        }
+        match next_replay_event(&mut rx, &mut ticker, !streams.is_empty(), ingress_open).await {
+            ReplayEvent::Tick => {
+                let Some(mut stream) = streams.pop_front() else {
+                    continue;
+                };
+                for bytes in take_replay_chunk(&mut stream, chunk_bytes) {
                     // Adversarial-audit FINDING 2 (BLOCKER): `send_detached_typed`,
                     // never `send_typed` -- see this fn's own doc comment for why a
                     // discarded `CancelHandler` here was silently losing frames
@@ -808,11 +877,307 @@ async fn run_resume_sender(
                     replay
                         .send_detached_typed(stream.to, Bytes::from(done_bytes), msg_type)
                         .await;
-                    in_flight.lock().unwrap().remove(&stream.peer);
+                    complete_replay_stream(&in_flight, &reserved_bytes, &stream);
                 } else {
                     streams.push_back(stream);
                 }
             }
+            ReplayEvent::Ingress(maybe) => match maybe {
+                Some(item) => streams.push_back((*item).into()),
+                None => ingress_open = false,
+            },
         }
+    }
+}
+
+enum ReplayEvent {
+    Tick,
+    Ingress(Option<Box<ReplaySend>>),
+}
+
+/// Chooses one scheduler action. A due global tick wins over ready ingress, and each
+/// ingress event admits exactly one stream. The caller disables ingress after `None`.
+async fn next_replay_event(
+    rx: &mut mpsc::Receiver<ReplaySend>,
+    ticker: &mut tokio::time::Interval,
+    has_streams: bool,
+    ingress_open: bool,
+) -> ReplayEvent {
+    tokio::select! {
+        biased;
+
+        _ = ticker.tick(), if has_streams => ReplayEvent::Tick,
+        item = rx.recv(), if ingress_open => ReplayEvent::Ingress(item.map(Box::new)),
+    }
+}
+
+fn take_replay_chunk(stream: &mut ReplayStream, chunk_bytes: usize) -> Vec<Bytes> {
+    let mut chunk = Vec::new();
+    let mut sent = 0usize;
+    while sent < chunk_bytes {
+        let Some(bytes) = stream.msgs.pop_front() else {
+            break;
+        };
+        sent = sent.saturating_add(bytes.len());
+        chunk.push(bytes);
+    }
+    chunk
+}
+
+fn complete_replay_stream(
+    in_flight: &InFlightMap,
+    reserved_bytes: &AtomicUsize,
+    stream: &ReplayStream,
+) {
+    remove_in_flight_generation(in_flight, stream.peer, stream.generation);
+    reserved_bytes.fetch_sub(stream.reserved_bytes, Ordering::AcqRel);
+}
+
+/// Removes only the stream generation that actually completed or failed admission.
+/// A stale generation can never clear a newer stream installed for the same peer.
+pub(crate) fn remove_in_flight_generation(
+    in_flight: &InFlightMap,
+    peer: PublicKey,
+    generation: u64,
+) -> bool {
+    let mut guard = in_flight.lock().unwrap();
+    if guard
+        .get(&peer)
+        .is_some_and(|entry| entry.generation == generation)
+    {
+        guard.remove(&peer);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt as _;
+
+    fn key(index: usize) -> PublicKey {
+        crate::common::keys()[index].0
+    }
+
+    fn replay_item(peer: PublicKey, generation: u64, payloads: &[&'static [u8]]) -> ReplaySend {
+        ReplaySend {
+            to: "127.0.0.1:9".parse().unwrap(),
+            peer,
+            generation,
+            msgs: payloads
+                .iter()
+                .map(|payload| Bytes::from_static(payload))
+                .collect(),
+            done: PrimaryMessage::VantageReplayDone(1, true, false, peer),
+            reserved_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn replay_byte_cap_covers_queued_and_active_until_completion() {
+        let peer = key(0);
+        let first = replay_item(peer, 1, &[b"payload"]);
+        let footprint = replay_reserved_size(&first.msgs, &first.done);
+        let (sender, mut rx) = ReplaySender::channel(footprint);
+
+        assert!(sender.try_send(first));
+        assert!(
+            !sender.try_send(replay_item(key(1), 2, &[b"x"])),
+            "the CAS reservation must reject work beyond the byte cap"
+        );
+
+        let stream = ReplayStream::from(rx.try_recv().unwrap());
+        assert_eq!(
+            sender.reserved_bytes.load(Ordering::Acquire),
+            footprint,
+            "receiving a stream must not refund its active reservation"
+        );
+
+        let in_flight = Arc::new(Mutex::new(HashMap::from([(
+            peer,
+            InFlightEntry {
+                started: Instant::now(),
+                generation: 1,
+            },
+        )])));
+        complete_replay_stream(&in_flight, &sender.reserved_bytes, &stream);
+        assert_eq!(sender.reserved_bytes.load(Ordering::Acquire), 0);
+        assert!(!in_flight.lock().unwrap().contains_key(&peer));
+    }
+
+    #[test]
+    fn failed_replay_channel_send_refunds_reservation_immediately() {
+        let (sender, rx) = ReplaySender::channel(usize::MAX);
+        drop(rx);
+
+        assert!(!sender.try_send(replay_item(key(0), 1, &[b"payload"])));
+        assert_eq!(sender.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn one_oversized_stream_is_admitted_only_when_alone() {
+        let (sender, mut rx) = ReplaySender::channel(1);
+        let first_peer = key(0);
+        assert!(sender.try_send(replay_item(first_peer, 1, &[b"oversized"])));
+        assert!(!sender.try_send(replay_item(key(1), 2, &[b"also oversized"])));
+
+        let stream = ReplayStream::from(rx.try_recv().unwrap());
+        let in_flight = Arc::new(Mutex::new(HashMap::new()));
+        complete_replay_stream(&in_flight, &sender.reserved_bytes, &stream);
+
+        assert!(
+            sender.try_send(replay_item(key(1), 2, &[b"also oversized"])),
+            "completion must release the sole oversized reservation"
+        );
+    }
+
+    #[test]
+    fn saturated_lane_ingress_cannot_block_replay_admission() {
+        let (lane_tx, _lane_rx) = mpsc::channel(1);
+        assert!(lane_tx
+            .try_send(LaneSend(
+                "127.0.0.1:9".parse().unwrap(),
+                PrimaryMessage::VantageReplayDone(1, true, false, key(0))
+            ))
+            .is_ok());
+        assert!(lane_tx
+            .try_send(LaneSend(
+                "127.0.0.1:9".parse().unwrap(),
+                PrimaryMessage::VantageReplayDone(1, true, false, key(0))
+            ))
+            .is_err());
+
+        let (replay_tx, mut replay_rx) = ReplaySender::channel(usize::MAX);
+        assert!(replay_tx.try_send(replay_item(key(1), 1, &[b"replay"])));
+        assert!(replay_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn replay_chunks_rotate_round_robin() {
+        let mut streams = VecDeque::from([
+            ReplayStream::from(replay_item(key(0), 1, &[b"a1", b"a2"])),
+            ReplayStream::from(replay_item(key(1), 2, &[b"b1", b"b2"])),
+        ]);
+        let mut order = Vec::new();
+
+        while let Some(mut stream) = streams.pop_front() {
+            order.extend(take_replay_chunk(&mut stream, 1));
+            if !stream.msgs.is_empty() {
+                streams.push_back(stream);
+            }
+        }
+
+        assert_eq!(
+            order,
+            vec![
+                Bytes::from_static(b"a1"),
+                Bytes::from_static(b"b1"),
+                Bytes::from_static(b"a2"),
+                Bytes::from_static(b"b2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_completion_cannot_clear_a_new_generation() {
+        let peer = key(0);
+        let in_flight = Arc::new(Mutex::new(HashMap::from([(
+            peer,
+            InFlightEntry {
+                started: Instant::now(),
+                generation: 2,
+            },
+        )])));
+
+        assert!(!remove_in_flight_generation(&in_flight, peer, 1));
+        assert_eq!(in_flight.lock().unwrap()[&peer].generation, 2);
+        assert!(remove_in_flight_generation(&in_flight, peer, 2));
+        assert!(!in_flight.lock().unwrap().contains_key(&peer));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn due_tick_has_priority_and_first_tick_is_immediate() {
+        let (sender, mut rx) = ReplaySender::channel(usize::MAX);
+        assert!(sender.try_send(replay_item(key(0), 1, &[b"first"])));
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        assert!(matches!(
+            next_replay_event(&mut rx, &mut ticker, false, true).await,
+            ReplayEvent::Ingress(Some(_))
+        ));
+        assert!(sender.try_send(replay_item(key(1), 2, &[b"second"])));
+        assert!(matches!(
+            next_replay_event(&mut rx, &mut ticker, true, true).await,
+            ReplayEvent::Tick
+        ));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the ready ingress item must remain queued when the due tick wins"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_ticker_uses_delay_after_a_missed_tick() {
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        assert!(
+            ticker.tick().now_or_never().is_some(),
+            "first tick is immediate"
+        );
+
+        tokio::time::advance(Duration::from_millis(35)).await;
+        assert!(ticker.tick().now_or_never().is_some());
+        assert!(ticker.tick().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(9)).await;
+        assert!(ticker.tick().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(ticker.tick().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn closed_replay_ingress_drains_all_accepted_streams() {
+        let (sender, rx) = ReplaySender::channel(usize::MAX);
+        let reserved_bytes = sender.reserved_bytes.clone();
+        let first = key(0);
+        let second = key(1);
+        assert!(sender.try_send(replay_item(first, 1, &[])));
+        assert!(sender.try_send(replay_item(second, 2, &[])));
+        let in_flight = Arc::new(Mutex::new(HashMap::from([
+            (
+                first,
+                InFlightEntry {
+                    started: Instant::now(),
+                    generation: 1,
+                },
+            ),
+            (
+                second,
+                InFlightEntry {
+                    started: Instant::now(),
+                    generation: 2,
+                },
+            ),
+        ])));
+        drop(sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_replay_sender(
+                rx,
+                ReliableSender::new(),
+                in_flight.clone(),
+                reserved_bytes.clone(),
+                1,
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("closed ingress must drain and exit");
+
+        assert!(in_flight.lock().unwrap().is_empty());
+        assert_eq!(reserved_bytes.load(Ordering::Acquire), 0);
     }
 }

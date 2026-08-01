@@ -217,7 +217,7 @@ pub enum PrimaryMessage {
     // protocol-specific variant above.
     VantageResumeHello(View, /* sender */ PublicKey),
     // Sent by the resume task after a replay stream's last chunk (`end_key`, always
-    // durable -- rides the SAME `ResumeSend::Replay` frame sequence as the chunks it
+    // durable -- rides the SAME `ReplaySend` frame sequence as the chunks it
     // terminates). `complete` is `false` iff the per-peer serve budget truncated the
     // span before the requester's known need was fully covered (a continuation
     // Hello follows immediately); `clamped` is `true` iff `outbox_floor` truncated

@@ -24,8 +24,8 @@ use crate::vantage::payload::PayloadIo;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
 use crate::vantage::resume::{
-    in_flight_state, InFlightState, NudgeMemo, ReplayEpisodes, ResumeServe, ResumeTrigger,
-    ServeBudget,
+    in_flight_state, InFlightEntry, InFlightState, NudgeMemo, ReplayEpisodes, ResumeServe,
+    ResumeTrigger, ServeBudget,
 };
 use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
@@ -609,13 +609,14 @@ impl VantageCore {
         // need their own copies afterward. reconnect-replay plan §5/§6/§7: also
         // hands the task its own clone of `in_flight` (the remove-after-`Done` side)
         // and the chunk-pacing parameters (§9).
-        let resume_tx = wire::spawn_resume_sender(
+        let resume_senders = wire::spawn_resume_sender(
             latency_map.clone(),
             batch,
             core_metrics.clone(),
             in_flight.clone(),
             parameters.replay_chunk_bytes,
             parameters.replay_chunk_interval_ms,
+            parameters.replay_serve_max_bytes,
             // KNOB 2 (measurement ablation): applies to this pool too -- see
             // `spawn_resume_sender`'s own doc comment.
             parameters.retry_backoff_max_ms,
@@ -674,7 +675,9 @@ impl VantageCore {
                     }
                     s
                 },
-                resume_tx,
+                resume_lane_tx: resume_senders.lane,
+                replay_tx: resume_senders.replay,
+                replay_generation: resume_senders.generation,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
                 other_primaries,
@@ -816,9 +819,13 @@ impl VantageCore {
             };
             tokio::pin!(control_sleep);
 
+            // Use Tokio's fair branch selection. After a healed partition,
+            // `rx_vantage` can remain continuously ready while thousands of queued
+            // lane and consensus messages drain. The previous `biased` selection
+            // always chose that first branch, starving AGB/control deadlines,
+            // reconnect prompts, and `resume_tick` for seconds at a time—the exact
+            // work needed to turn a restored connection back into commits.
             tokio::select! {
-                biased;
-
                 Some(inbound) = rx_vantage.recv() => {
                     let now = Instant::now();
                     let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
@@ -1183,8 +1190,8 @@ impl VantageCore {
         match state {
             InFlightState::InFlight => true,
             InFlightState::Absent => false,
-            InFlightState::Expired => {
-                self.wire.in_flight.lock().unwrap().remove(&peer);
+            InFlightState::Expired(generation) => {
+                wire::remove_in_flight_generation(&self.wire.in_flight, peer, generation);
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_replay_inflight_ttl_expired_total.inc();
                 }
@@ -1343,43 +1350,30 @@ impl VantageCore {
         let (msgs, end_key, complete) = self.outbox.take_budgeted_slice(served_from, remaining);
         let msg_count = msgs.len();
         let served_bytes: usize = msgs.iter().map(Bytes::len).sum();
-        self.serve_budget.record(sender, served_bytes, now, backoff);
 
         let done = PrimaryMessage::VantageReplayDone(end_key, complete, clamped, self.name);
-        // Adversarial-audit FINDING 1 (MAJOR, the observed 60s serve stalls):
-        // insert into the shared in-flight map BEFORE `enqueue_replay`'s
-        // `try_send`, never after. `try_send` makes the stream visible to
-        // `run_resume_sender` immediately; on a quiet system that task's own
-        // ticker is starved (`if !streams.is_empty()` guards `tokio::time::
-        // interval::tick()`, so the interval is never polled while idle), and
-        // with `MissedTickBehavior::Delay` its first poll after a stream finally
-        // arrives fires IMMEDIATELY -- the task can pop the stream, drain a
-        // small slice in one chunk pass, send `Done`, and run `in_flight.
-        // remove(&peer)` as a no-op, ALL before this core's own insert below
-        // ever ran -- plain thread parallelism between two tokio tasks, present
-        // whether or not the `log::debug!` calls around this code are compiled
-        // in. Inserting first closes the window: the task's `remove` always
-        // finds the entry that was placed here, never races one that hasn't
-        // happened yet. On `!enqueued` (the stream never actually reached the
-        // task), the entry is removed again immediately below -- restoring
-        // today's `pending_low`-untouched contract exactly. Do NOT instead move
-        // the insert into the task itself: the window between THIS core's
-        // enqueue and the task's own dequeue would then read the map as
-        // `Absent`, letting a backoff-driven retry Hello enqueue a SECOND,
-        // duplicate stream whose own in-flight marker and this one's would then
-        // cross-clear each other.
-        self.wire.in_flight.lock().unwrap().insert(sender, now);
-        let enqueued = self.wire.enqueue_replay(sender, msgs, done);
+        // Insert before enqueue: the replay task's intentional immediate first tick
+        // may finish a small stream as soon as it becomes visible. The unique
+        // generation makes both task completion and enqueue-failure cleanup remove
+        // only this exact marker, so a stale completion cannot cross-clear a newer
+        // stream installed after TTL expiry.
+        let generation = self.wire.next_replay_generation();
+        self.wire.in_flight.lock().unwrap().insert(
+            sender,
+            InFlightEntry {
+                started: now,
+                generation,
+            },
+        );
+        let enqueued = self.wire.enqueue_replay(sender, generation, msgs, done);
         // --- end await-free section ---
 
         if !enqueued {
             // audit-3 A2: `Wire::enqueue_replay` already counted the drop metric;
             // `pending_low` stays untouched -- the next nudge/tick re-asks. The
-            // in-flight entry inserted above never corresponded to a real
-            // stream (nothing was ever handed to the task) -- remove it now, or
-            // it would spuriously block a later, successful ask for `sender`
-            // until the unrelated 60s TTL expiry eventually sweeps it.
-            self.wire.in_flight.lock().unwrap().remove(&sender);
+            // in-flight entry inserted above never corresponded to a real stream.
+            // Remove only its generation; a concurrent newer generation wins.
+            wire::remove_in_flight_generation(&self.wire.in_flight, sender, generation);
             log::debug!(
                 "vantage node: resume serve suppressed: sender={} served_from={} gate=enqueue-failed",
                 sender,
@@ -1387,6 +1381,7 @@ impl VantageCore {
             );
             return;
         }
+        self.serve_budget.record(sender, served_bytes, now, backoff);
         log::debug!(
             "vantage node: resume serve decision: sender={} served_from={} msgs={} end_key={} complete={} clamped={}",
             sender,
@@ -2885,25 +2880,25 @@ mod tests {
             .expect("peer must be an other-primary of this test committee")
     }
 
-    /// Swaps `core.wire.resume_tx` for a fresh, test-owned channel, returning the
+    /// Swaps `core.wire.replay_tx` for a fresh, test-owned channel, returning the
     /// receiving end so a test can inspect exactly what the Hello-serving/nudge
     /// code enqueues. `build()` (via `test_core`) already spawned a real
     /// resume-sender task fed by the ORIGINAL channel -- swapping the `Sender`
     /// simply orphans that task (it idles forever on an empty channel no one
     /// sends to anymore), harmless for a test that then exits and tears down its
     /// whole `#[tokio::test]` runtime, tasks included.
-    fn intercept_resume_channel(core: &mut VantageCore) -> Receiver<wire::ResumeSend> {
-        let (tx, rx) = channel(64);
-        core.wire.resume_tx = tx;
+    fn intercept_resume_channel(core: &mut VantageCore) -> Receiver<wire::ReplaySend> {
+        let (tx, rx) = wire::ReplaySender::channel(usize::MAX);
+        core.wire.replay_tx = tx;
         rx
     }
 
-    /// Forces every subsequent `Wire::enqueue_replay`/`enqueue_resume` `try_send`
-    /// to fail with `Closed` -- audit-3 A2's own Err arm.
+    /// Forces every subsequent `Wire::enqueue_replay` `try_send` to fail with
+    /// `Closed` -- audit-3 A2's own Err arm.
     fn break_resume_channel(core: &mut VantageCore) {
-        let (tx, rx) = channel::<wire::ResumeSend>(1);
+        let (tx, rx) = wire::ReplaySender::channel(usize::MAX);
         drop(rx);
-        core.wire.resume_tx = tx;
+        core.wire.replay_tx = tx;
     }
 
     fn enqueue_drops(core: &VantageCore) -> u64 {
@@ -2970,15 +2965,12 @@ mod tests {
             .await;
 
         let sent = rx.try_recv().expect("a Replay must have been enqueued");
-        let wire::ResumeSend::Replay {
+        let wire::ReplaySend {
             peer: p,
             msgs,
             done,
             ..
-        } = sent
-        else {
-            panic!("expected a Replay, got {:?}", sent);
-        };
+        } = sent;
         assert_eq!(p, peer);
         assert_eq!(
             msgs,
@@ -3020,12 +3012,9 @@ mod tests {
         core.dispatch_inbound(Inbound::ResumeHello(6, peer), Instant::now())
             .await;
 
-        let wire::ResumeSend::Replay { msgs, done, .. } = rx
+        let wire::ReplaySend { msgs, done, .. } = rx
             .try_recv()
-            .expect("a Done-only Replay must still be enqueued")
-        else {
-            panic!("expected a Replay");
-        };
+            .expect("a Done-only Replay must still be enqueued");
         assert!(msgs.is_empty());
         match done {
             PrimaryMessage::VantageReplayDone(end_key, complete, clamped, _) => {
@@ -3053,9 +3042,7 @@ mod tests {
         core.dispatch_inbound(Inbound::ResumeHello(5, peer), Instant::now())
             .await;
 
-        let wire::ResumeSend::Replay { msgs, done, .. } = rx.try_recv().unwrap() else {
-            panic!("expected a Replay");
-        };
+        let wire::ReplaySend { msgs, done, .. } = rx.try_recv().unwrap();
         assert_eq!(msgs, vec![Bytes::from_static(b"fifty")]);
         match done {
             PrimaryMessage::VantageReplayDone(end_key, complete, clamped, _) => {
@@ -3139,6 +3126,7 @@ mod tests {
         let mut core = test_core(0, "reconnect_a2");
         let (peer, _) = crate::common::keys()[1];
         core.outbox.record(5, Bytes::from_static(b"five"));
+        core.replay_serve_max_bytes = 4;
         let peer_addr = addr_of(&core, peer);
         core.wire.dirty_map.lock().unwrap().insert(peer_addr, 5);
 
@@ -3158,6 +3146,12 @@ mod tests {
             !core.wire.in_flight.lock().unwrap().contains_key(&peer),
             "a failed enqueue must not mark the stream in-flight either"
         );
+        let backoff = Duration::from_millis(core.resume_backoff_ms);
+        assert_eq!(
+            core.serve_budget.remaining(peer, now, backoff, 4),
+            4,
+            "failed admission must leave the complete serve budget available"
+        );
 
         // The channel recovers (e.g. the task caught up) -- the next ask succeeds.
         let mut rx = intercept_resume_channel(&mut core);
@@ -3166,21 +3160,23 @@ mod tests {
             now + Duration::from_millis(10),
         )
         .await;
-        let wire::ResumeSend::Replay { done, .. } =
-            rx.try_recv().expect("the retried ask must be served")
-        else {
-            panic!("expected a Replay");
-        };
+        let wire::ReplaySend { done, .. } = rx.try_recv().expect("the retried ask must be served");
         assert!(matches!(
             done,
             PrimaryMessage::VantageReplayDone(_, true, false, _)
         ));
         assert!(!core.pending_low.contains_key(&peer));
+        assert_eq!(
+            core.serve_budget
+                .remaining(peer, now + Duration::from_millis(10), backoff, 4),
+            0,
+            "the successful retry must consume the admitted payload bytes"
+        );
     }
 
     /// **Adversarial-audit FINDING 1** (MAJOR, the observed 60s serve stalls):
     /// insert-after-enqueue race. `enqueue_replay`'s `try_send` makes the stream
-    /// visible to `run_resume_sender` immediately; that task's own ticker is
+    /// visible to `run_replay_sender` immediately; that task's own ticker is
     /// starved on a quiet system (`if !streams.is_empty()` never polls it while
     /// idle), so with `MissedTickBehavior::Delay` its first poll after a stream
     /// arrives fires IMMEDIATELY -- the task can pop/send/`remove` before the
@@ -3191,7 +3187,7 @@ mod tests {
     /// inserting before enqueueing means the marker is always present by the
     /// time the enqueue's own effects could possibly become visible to a
     /// consumer, so a "task-side remove" -- simulated directly here, standing in
-    /// for `run_resume_sender`'s own tail -- always finds it).
+    /// for `run_replay_sender`'s own tail -- always finds it).
     #[tokio::test]
     async fn resume_hello_in_flight_marker_is_present_for_a_task_side_remove_to_find() {
         let mut core = test_core(0, "reconnect_finding1_success");
@@ -3207,7 +3203,7 @@ mod tests {
             core.wire.in_flight.lock().unwrap().contains_key(&peer),
             "the in-flight marker must be present once a Replay has been enqueued"
         );
-        // Simulate the task-side remove (`run_resume_sender`'s own tail, run
+        // Simulate the task-side remove (`run_replay_sender`'s own tail, run
         // after it sends that stream's `Done`) -- it must always find the entry
         // the core placed, never race one that hasn't happened yet.
         assert!(
@@ -3315,9 +3311,7 @@ mod tests {
         core.replay_serve_max_bytes = 1;
         core.dispatch_inbound(Inbound::ResumeHello(5, peer), now)
             .await;
-        let wire::ResumeSend::Replay { done, .. } = rx.try_recv().unwrap() else {
-            panic!("expected a Replay");
-        };
+        let wire::ReplaySend { done, .. } = rx.try_recv().unwrap();
         assert!(matches!(
             done,
             PrimaryMessage::VantageReplayDone(6, false, false, _)

@@ -506,13 +506,14 @@ impl SimpleItCore {
         // still threaded through because `spawn_resume_sender`/`Wire` are the SAME
         // shared types Vantage uses.
         let in_flight: wire::InFlightMap = Arc::new(Mutex::new(HashMap::new()));
-        let resume_tx = wire::spawn_resume_sender(
+        let resume_senders = wire::spawn_resume_sender(
             latency_map.clone(),
             batch,
             core_metrics.clone(),
             in_flight.clone(),
             parameters.replay_chunk_bytes,
             parameters.replay_chunk_interval_ms,
+            parameters.replay_serve_max_bytes,
             // KNOB 2 (measurement ablation, `config::Parameters::
             // retry_backoff_max_ms`): transport-level, applies to Simple-IT's
             // resume-sender pool too -- see `spawn_resume_sender`'s own doc
@@ -538,7 +539,7 @@ impl SimpleItCore {
                         // comment. Unlike Vantage, Simple-IT never attaches
                         // `with_reconnect_events`/`with_drop_map` here at all
                         // (KNOB 1's reconnect-replay mechanism is Vantage-only --
-                        // see the comment above `resume_tx`'s own construction),
+                        // see the comment above `resume_senders`' own construction),
                         // so this is the only new knob this pool needs.
                         .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms);
                     if let Some(m) = &core_metrics {
@@ -555,7 +556,9 @@ impl SimpleItCore {
                     }
                     s
                 },
-                resume_tx,
+                resume_lane_tx: resume_senders.lane,
+                replay_tx: resume_senders.replay,
+                replay_generation: resume_senders.generation,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
                 other_primaries: other_primaries.clone(),
