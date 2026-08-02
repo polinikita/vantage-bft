@@ -1,0 +1,12 @@
+# Docker-bench override for the shared monitoring stack. Prometheus joins the
+# generated validator network so it can scrape container-internal metrics ports.
+services:
+  prometheus:
+    networks:
+      - default
+      - vantage_net
+
+networks:
+  vantage_net:
+    external: true
+    name: vantage-bench_vantage_net

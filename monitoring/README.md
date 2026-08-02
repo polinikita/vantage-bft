@@ -1,9 +1,10 @@
-# Monitoring stack for `node local-benchmark` and `fab remote`
+# Monitoring stack for local, Docker, and remote benchmarks
 
 Optional. `local-benchmark` runs (and prints its RESULTS block) with no monitoring
-stack at all -- this is only for watching a run live in Grafana. Two flows share the
+stack at all -- this is only for watching a run live in Grafana. Three flows share the
 same `docker-compose.yml`/dashboard: **local mode** (a `node local-benchmark` run on
-this machine) and **orchestration mode** (a live `fab remote` run on AWS).
+this machine), **Docker mode** (one local container per validator), and
+**orchestration mode** (a live `fab remote` run on AWS).
 
 ## Local mode
 
@@ -20,6 +21,22 @@ docker compose -f monitoring/docker-compose.yml up -d
 
 Grafana: <http://localhost:3003> (anonymous admin, no login). Prometheus:
 <http://localhost:9095>.
+
+## Docker mode (`docker-bench`)
+
+`docker-bench/run.sh` starts this monitoring stack automatically, waits until both
+the primary and worker target for every validator are healthy, and prints the direct
+dashboard URL. Its Compose override attaches Prometheus to the private validator
+network; the generated `docker-bench/data/prometheus.yaml` names each process target.
+The validator stack stops after the run, but monitoring remains up so the run can
+still be inspected. From the repository root:
+
+```
+./docker-bench/run.sh --nodes 20 --rate 200 --duration 120 --protocol vantage \
+    --ack-watermarks --digest-statements
+# Dashboard: http://localhost:3003/d/vantage-local-benchmark
+docker compose -f monitoring/docker-compose.yml down   # when finished inspecting
+```
 
 ## Orchestration mode (AWS, `fab remote`)
 
