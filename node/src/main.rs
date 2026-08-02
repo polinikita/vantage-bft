@@ -355,7 +355,7 @@ async fn main() -> Result<()> {
                         .action(ArgAction::Set)
                         .help(
                             "Batching hybrid flush size cap, in bytes -- irrelevant unless \
-                        --batch-messages is set",
+                        batching is enabled (the default)",
                         ),
                 )
                 .arg(
@@ -366,7 +366,7 @@ async fn main() -> Result<()> {
                         .action(ArgAction::Set)
                         .help(
                             "Batching hybrid flush delay, in ms -- irrelevant unless \
-                        --batch-messages is set",
+                        batching is enabled (the default)",
                         ),
                 )
                 .arg(

@@ -172,10 +172,15 @@ def build_local_benchmark_args(cfg: dict, binary: Path) -> list:
         # inject that AWS matrix instead of the pure-loopback mode this config value
         # documents, so the zero must be explicit.
         args += ["--mimic-latency-ms", "0"]
-    # Transport-level batching: optional (not in REQUIRED_KEYS), off by default --
-    # byte-identical wire/behavior when omitted.
-    if cfg.get("batch_messages"):
-        args.append("--batch-messages")
+    # Transport-level batching is ON by default in both Parameters and the native
+    # CLI. Only emit the opt-out flag when explicitly disabled. The old launcher
+    # emitted a now-nonexistent `--batch-messages` opt-in flag when this key was true.
+    batch_messages = cfg.get("batch_messages", True)
+    if not isinstance(batch_messages, bool):
+        sys.exit("batch_messages must be true or false")
+    if not batch_messages:
+        args.append("--no-batch-messages")
+    else:
         if cfg.get("batch_max_bytes") is not None:
             args += ["--batch-max-bytes", str(cfg["batch_max_bytes"])]
         if cfg.get("batch_max_delay_ms") is not None:

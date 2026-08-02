@@ -677,7 +677,7 @@ impl Primary {
                 // use_parallel_proposals: bool,  //default = true (TODO: implement sequential slot option)
                 // let k = 1; //Max open conensus instances at a time.
 
-                // use_fast_path: bool,           //default = false
+                // use_fast_path: bool,           // Autobahn only; default = true
                 // fast_path_timeout: u64,
 
                 // use_ride_share: bool,

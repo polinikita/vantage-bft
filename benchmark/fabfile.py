@@ -172,8 +172,8 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         # Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
         # behavior when off; `fab remote --all-to-all` (or edit this literal) to enable.
         'all_to_all': all_to_all,
-        # Transport-level per-peer outbound batching: off by default, byte-identical
-        # wire/behavior when off; `fab remote --batch-messages` to enable.
+        # Transport-level per-peer outbound batching: on by default (5 ms / 64 KiB);
+        # pass `fab remote --batch-messages=False` for an explicit unbatched run.
         'batch_messages': batch_messages,
         'batch_max_bytes': batch_max_bytes,
         'batch_max_delay_ms': batch_max_delay_ms,

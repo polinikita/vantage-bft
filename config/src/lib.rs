@@ -178,7 +178,7 @@ pub struct Parameters {
     pub use_parallel_proposals: bool, //default = true (TODO: implement sequential slot option)
     pub k: u64,                       //Max open conensus instances at a time.
 
-    pub use_fast_path: bool, //default = false
+    pub use_fast_path: bool, // Autobahn only; default = true (Vantage fast seal is unconditional)
     pub fast_path_timeout: u64,
 
     pub use_ride_share: bool,
@@ -364,9 +364,10 @@ pub struct Parameters {
     #[serde(default)]
     pub mimic_latency_ms: Option<u64>,
 
-    /// Transport-level per-peer outbound message batching (coalescing), off by
-    /// default (`#[serde(default)]` = `false`) -- byte-identical wire/behavior when
-    /// off (see `network` crate's `batch` module doc). Protocol-transparent: applied
+    /// Transport-level per-peer outbound message batching (coalescing), on by
+    /// default (`default_batch_messages()` = `true`). When explicitly turned off it
+    /// restores byte-identical unbatched wire behavior (see `network` crate's `batch`
+    /// module doc). Protocol-transparent: applied
     /// uniformly by the `network` crate to every sender/receiver this node spawns
     /// EXCEPT the client-facing transaction port (clients never batch). Committee-wide
     /// consistent by construction: every node's `Parameters` comes from the same
@@ -1569,7 +1570,7 @@ mod tests {
         assert_eq!(params.protocol, Protocol::Vantage);
         assert_eq!(params.delta_ms, 150);
         assert_eq!(params.mimic_latency_ms, Some(100));
-        // Transport batching is ON by default (5 ms / 64 KB per-destination
+        // Transport batching is ON by default (5 ms / 64 KiB per-destination
         // coalescing) -- a parameters file that omits the key gets it enabled.
         assert!(params.batch_messages);
         // `vantage_gc_window_views` is absent from this (pre-existing shape) file and

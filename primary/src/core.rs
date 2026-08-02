@@ -145,7 +145,7 @@ pub struct Core {
     // E.g. s-1 has not committed, but s has, so we can open s+k
 
     //Configuration options: //TODO: Move to Primary level -> make configurable from main.rs
-    use_fast_path: bool,          //default = false
+    use_fast_path: bool,          // Autobahn only; default = true
     use_optimistic_tips: bool,    //default = true (TODO: implement non optimistic tip option)
     use_parallel_proposals: bool, //default = true (TODO: implement sequential slot option)
     k: u64, //limit k on number of open honest instances (k+f instances can be open) => if require QC, then hard limit to k.

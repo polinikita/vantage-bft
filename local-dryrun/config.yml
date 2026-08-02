@@ -35,6 +35,12 @@ delta_ms: 150
 max_batch_delay_ms: 20
 max_header_delay_ms: 50
 
+# Transport-level per-peer message batching is ON by default. It flushes at either
+# 64 KiB or 5 ms. Set this false only for an explicit unbatched comparison.
+batch_messages: true
+batch_max_bytes: 65536
+batch_max_delay_ms: 5
+
 # PHASE6-SPEC.md R2 crash-fault count: this many trailing nodes are never spawned
 # (committee membership unchanged). 0 = fault-free.
 crash: 0
