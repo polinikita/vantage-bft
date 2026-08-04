@@ -230,7 +230,14 @@ impl Connection {
     async fn run_immediate(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
-            Ok(stream) => Framed::new(stream, LengthDelimitedCodec::new()).split(),
+            Ok(stream) => {
+                // Nagle + delayed-ACK stalls sub-MSS consensus frames by up to an
+                // RTT on real WAN links (invisible on loopback); starfish sets
+                // nodelay on both sides (network.rs:423,444). Best-effort, like
+                // every other socket option here.
+                let _ = stream.set_nodelay(true);
+                Framed::new(stream, LengthDelimitedCodec::new()).split()
+            }
             Err(e) => {
                 warn!(
                     "{}",
@@ -316,7 +323,14 @@ impl Connection {
     async fn run_delayed(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
-            Ok(stream) => Framed::new(stream, LengthDelimitedCodec::new()).split(),
+            Ok(stream) => {
+                // Nagle + delayed-ACK stalls sub-MSS consensus frames by up to an
+                // RTT on real WAN links (invisible on loopback); starfish sets
+                // nodelay on both sides (network.rs:423,444). Best-effort, like
+                // every other socket option here.
+                let _ = stream.set_nodelay(true);
+                Framed::new(stream, LengthDelimitedCodec::new()).split()
+            }
             Err(e) => {
                 warn!(
                     "{}",

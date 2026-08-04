@@ -116,6 +116,10 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                     continue;
                 }
             };
+            // Replies written back on this socket (ReliableSender acks) hit the
+            // same Nagle/delayed-ACK stall as the senders; starfish sets nodelay
+            // on the accept side too (network.rs:444).
+            let _ = socket.set_nodelay(true);
             info!("Incoming connection established with {}", peer);
             Self::spawn_runner(
                 socket,

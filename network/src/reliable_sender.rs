@@ -618,6 +618,9 @@ impl Connection {
         loop {
             match TcpStream::connect(self.address).await {
                 Ok(stream) => {
+                    // Same Nagle/delayed-ACK rationale as `SimpleSender` (starfish
+                    // parity: nodelay on both connect and accept sides).
+                    let _ = stream.set_nodelay(true);
                     info!("Outgoing connection established with {}", self.address);
 
                     // reconnect-replay plan §2.1/§7: a prompt Hello optimization
