@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
                     Arg::new("delta-ms")
                         .long("delta-ms")
                         .value_name("INT")
-                        .default_value("1000")
+                        .default_value("200")
                         .action(ArgAction::Set)
                         .help(
                             "Vantage AGB base delay unit Δ, ms \

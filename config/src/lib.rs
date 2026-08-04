@@ -606,7 +606,12 @@ fn default_max_block_payload() -> usize {
 }
 
 fn default_delta_ms() -> u64 {
-    1000
+    // Delta's contract is "bounds every one-way message delay after GST".  The
+    // ten-region AWS matrix tops out at 154.5 ms one-way (309 ms RTT), so 200 ms
+    // is the tightest defensible default for the shapes this harness emulates;
+    // fault-path latencies scale linearly in Delta (HANDOFF sections 25-26), so
+    // an overly conservative default directly inflates them.
+    200
 }
 
 /// Matches `gc_depth`'s own default, so splitting the two knobs apart changes no

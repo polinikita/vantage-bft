@@ -459,7 +459,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                     "172.28, per spec); override only if that address space collides "
                     "with another docker-compose project already on this host")
     # Parameters passthrough (mirrors `node local-benchmark`'s own flag names).
-    p.add_argument("--delta-ms", type=int, default=1000)
+    p.add_argument("--delta-ms", type=int, default=200)
     p.add_argument("--timeout-delay-ms", type=int, default=1000,
                    help="protocol round timeout in milliseconds (default 1000; "
                         "Simple-IT with Opt-RBC requires 8 * --delta-ms)")
