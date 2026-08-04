@@ -46,6 +46,24 @@ K=$(( ((NODES - 1) * PCT + 99) / 100 ))
 [ "$K" -ge 1 ] || K=1
 [ "$K" -lt "$NODES" ] || { echo "ring-cut.sh: pct=$PCT cuts every peer" >&2; exit 2; }
 
+# RING_OFFSETS overrides which ring offsets are cut (comma-separated, e.g.
+# "7,13"). Default 1..K targets each node's immediate successors -- which is
+# maximally adversarial to round-robin leader succession (leader.rs walks
+# committee order, so slot s hands off to exactly the (x+1) edge). Distant
+# offsets keep the same loss fraction while leaving succession intact,
+# separating "tolerates asymmetric loss" from "tolerates loss aligned with
+# rotation".
+if [ -n "${RING_OFFSETS:-}" ]; then
+    IFS=',' read -r -a OFFSETS <<< "$RING_OFFSETS"
+    for o in "${OFFSETS[@]}"; do
+        [[ "$o" =~ ^[0-9]+$ ]] && [ "$o" -ge 1 ] && [ "$o" -lt "$NODES" ] || {
+            echo "ring-cut.sh: bad offset '$o' in RING_OFFSETS" >&2; exit 2; }
+    done
+else
+    OFFSETS=()
+    for (( o = 1; o <= K; o++ )); do OFFSETS+=("$o"); done
+fi
+
 node_ip() { echo "${IP_PREFIX}$(( IP_OFFSET + $1 ))"; }
 dexec()   { docker exec "vantage-node-$1" "${@:2}"; }
 stamp()   { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
@@ -60,7 +78,7 @@ apply_node() {
     local x="$1" i peer ip port
     remove_node "$x"
     dexec "$x" iptables -N "$CHAIN"
-    for (( i = 1; i <= K; i++ )); do
+    for i in "${OFFSETS[@]}"; do
         peer=$(( (x + i) % NODES ))
         ip="$(node_ip "$peer")"
         for port in "$PORT_P2P" "$PORT_W2W"; do
@@ -72,22 +90,22 @@ apply_node() {
 }
 
 apply_all() {
-    echo "ring-cut: applying K=$K (pct=$PCT%) on $NODES nodes at $(stamp)"
+    echo "ring-cut: applying offsets [${OFFSETS[*]}] (pct=$PCT%) on $NODES nodes at $(stamp)"
     local x
     for (( x = 0; x < NODES; x++ )); do
         apply_node "$x"
     done
-    # Directional validation on the 0 -> 1 edge: 0 cannot reach 1's primary
-    # port, while 1 still reaches 0's.
-    if dexec 0 timeout 2 bash -c "echo > /dev/tcp/$(node_ip 1)/$PORT_P2P" 2>/dev/null; then
-        echo "ring-cut: VALIDATION FAILED -- node 0 can still reach node 1:$PORT_P2P" >&2
+    # Directional validation on the 0 -> (0+first-offset) edge.
+    local v=${OFFSETS[0]}
+    if dexec 0 timeout 2 bash -c "echo > /dev/tcp/$(node_ip "$v")/$PORT_P2P" 2>/dev/null; then
+        echo "ring-cut: VALIDATION FAILED -- node 0 can still reach node $v:$PORT_P2P" >&2
     else
-        echo "ring-cut: validated dead  0 -> 1:$PORT_P2P"
+        echo "ring-cut: validated dead  0 -> $v:$PORT_P2P"
     fi
-    if dexec 1 timeout 2 bash -c "echo > /dev/tcp/$(node_ip 0)/$PORT_P2P" 2>/dev/null; then
-        echo "ring-cut: validated alive 1 -> 0:$PORT_P2P (directional)"
+    if dexec "$v" timeout 2 bash -c "echo > /dev/tcp/$(node_ip 0)/$PORT_P2P" 2>/dev/null; then
+        echo "ring-cut: validated alive $v -> 0:$PORT_P2P (directional)"
     else
-        echo "ring-cut: VALIDATION FAILED -- reverse direction 1 -> 0:$PORT_P2P is dead too" >&2
+        echo "ring-cut: VALIDATION FAILED -- reverse direction $v -> 0:$PORT_P2P is dead too" >&2
     fi
 }
 
