@@ -1592,7 +1592,7 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 16,
+        "w": 12,
         "x": 0,
         "y": 86
       },
@@ -1622,8 +1622,65 @@
           "refId": "A"
         }
       ],
-      "title": "VantageCore utilization by section (% busy)",
-      "type": "timeseries"
+      "title": "VantageCore utilization by section (% wall-clock busy)",
+      "type": "timeseries",
+      "description": "Accumulated WALL time per labeled section of VantageCore's single select loop, as a percent of one core. Wall, not CPU: a section blocked on an .await (the store actor's FIFO, a channel send) counts as fully busy here. Subtract the wait panel to the right to get actual CPU. The labels no longer nest -- every section that calls execute() drops its own timer first -- so summing them over a node approximates how much of the core loop's second was spent not idle. 100% means the single core task is saturated, whatever the machine's other 7 vCPUs are doing."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 86
+      },
+      "id": 9002,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "{{node}} cpu",
+          "expr": "100 * (sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) - sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m]))) / 1e6"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "{{node}} waiting",
+          "expr": "100 * sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) / 1e6"
+        }
+      ],
+      "title": "VantageCore: CPU vs waiting (% of one core)",
+      "type": "timeseries",
+      "description": "Splits the wall time on the left into the part spent computing and the part spent blocked on downstream I/O. 'waiting' is core_wait_timer, opened only around regions known to block (today: store_probe, the payload-presence round-trip through the single store actor); 'cpu' is utilization minus waiting. Reading: cpu rising toward 100 means the core task is compute-bound and more load will queue behind it; waiting rising instead means the core is starved by the store, not by its own work."
     },
     {
       "datasource": {
@@ -1638,8 +1695,8 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 8,
-        "x": 16,
+        "w": 6,
+        "x": 18,
         "y": 86
       },
       "id": 32,
@@ -1663,13 +1720,23 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "core_queue_length{node=~\"$node\",node=~\".*-primary$\"}",
-          "legendFormat": "{{node}}",
-          "refId": "A"
+          "refId": "A",
+          "legendFormat": "{{node}} now",
+          "expr": "core_queue_length{node=~\"$node\",node=~\".*-primary$\"}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "{{node}} peak",
+          "expr": "core_queue_peak{node=~\"$node\",node=~\".*-primary$\"}"
         }
       ],
-      "title": "VantageCore inbound-queue depth",
-      "type": "timeseries"
+      "title": "VantageCore inbound-queue depth (now / peak)",
+      "type": "timeseries",
+      "description": "rx_vantage's depth. 'now' is sampled once/sec from the core thread itself, so it can only be read at an instant that thread is between select branches -- it systematically misses sub-second bursts. 'peak' is the max observed on EVERY loop iteration since the previous sample, reset each publish. Peak growing while 'now' stays near zero is the signature of a core that is falling behind in bursts; both growing together means it is falling behind outright."
     },
     {
       "datasource": {

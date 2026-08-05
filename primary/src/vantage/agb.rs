@@ -553,7 +553,8 @@ fn formed_entry(committee: &Committee, view: View, entry: &ResolutionEntry) -> b
     }
     match entry {
         ResolutionEntry::Full(_, c_u, t_u) | ResolutionEntry::Core(_, c_u, t_u) => {
-            if !strictly_sorted_and_staked(committee, c_u) || !strictly_sorted_and_staked(committee, t_u)
+            if !strictly_sorted_and_staked(committee, c_u)
+                || !strictly_sorted_and_staked(committee, t_u)
             {
                 return false;
             }
@@ -1135,7 +1136,9 @@ impl AgbEngine {
     /// want to assert the census directly rather than only through `Effect::Sealed`.
     #[cfg(test)]
     pub(crate) fn skip_vote_count_for_test(&self, view: View) -> usize {
-        self.views.get(&view).map_or(0, |s| s.skip_vote_statements.len())
+        self.views
+            .get(&view)
+            .map_or(0, |s| s.skip_vote_statements.len())
     }
 
     // ---------------------------------------------------------------- §4 wrapper API
@@ -1417,7 +1420,9 @@ impl AgbEngine {
         // (same total deep-clone count as before this file's efficiency changes --
         // the deep clone above simply moved from the now-Arc'd census entry to this
         // required-owned wire value).
-        effects.push(Effect::BroadcastEcho(self.build_echo_out(&proposal, 1, origin)));
+        effects.push(Effect::BroadcastEcho(
+            self.build_echo_out(&proposal, 1, origin),
+        ));
         // D6-4: release evaluation runs BEFORE R3's ready recheck on this same newly
         // counted echo-stage response; the all-n fastseal trigger stays after.
         self.recheck_lock_release(view);
@@ -1513,8 +1518,13 @@ impl AgbEngine {
     /// PHASE6-SPEC.md §2's `MetaOK` can reuse it against a resolution entry's own
     /// `(C_u, T_u)` instead of the carrying proposal's `(C,T)`.
     fn tip_ok(c: &Manifest, t: &Manifest, lm: &mut LaneManager) -> bool {
+        // Index C by author ONCE instead of scanning it per T entry: both manifests
+        // hold one entry per authority, so the old `c.iter().find(..)` inside the T loop
+        // made this O(n^2) per call -- and `recheck_all` calls it for every pending
+        // view, on the single-threaded core, on every credited availability ref.
+        let by_author: HashMap<_, _> = c.iter().map(|c_ref| (c_ref.0, c_ref)).collect();
         for t_ref in t {
-            if let Some(c_ref) = c.iter().find(|c_ref| c_ref.0 == t_ref.0) {
+            if let Some(c_ref) = by_author.get(&t_ref.0).copied() {
                 if t_ref.1 <= c_ref.1 {
                     return false; // equal-height (or shorter) tip excluded
                 }
@@ -1762,7 +1772,10 @@ impl AgbEngine {
         }
         let ready_for_vote = self.views.get(&u).is_some_and(|s| {
             s.stance == Stance::Free
-                && matches!(s.ready_statements.get(&self.name), Some(ReadyStatement::NoReady))
+                && matches!(
+                    s.ready_statements.get(&self.name),
+                    Some(ReadyStatement::NoReady)
+                )
                 && !matches!(s.sealed, Some(Outcome::Full(..)) | Some(Outcome::Core(..)))
         });
         if !ready_for_vote || self.echo_skip_count(u) < self.two_f_plus_1_parties {
@@ -1805,7 +1818,10 @@ impl AgbEngine {
         if self.views.get(&u).is_some_and(|s| s.skip_sealed) {
             return effects;
         }
-        let count = self.views.get(&u).map_or(0, |s| s.skip_vote_statements.len());
+        let count = self
+            .views
+            .get(&u)
+            .map_or(0, |s| s.skip_vote_statements.len());
         if count < self.two_f_plus_1_parties {
             return effects;
         }
@@ -1911,7 +1927,9 @@ impl AgbEngine {
             );
             // See `recheck_gate`'s matching comment: one deep clone here, same total
             // count as before Efficiency Item 3.
-            effects.push(Effect::BroadcastEcho(self.build_echo_out(&proposal, 0, origin)));
+            effects.push(Effect::BroadcastEcho(
+                self.build_echo_out(&proposal, 0, origin),
+            ));
         } else {
             self.count_echo_statement(view, self.name, EchoStatement::Skip);
             effects.push(Effect::BroadcastEchoSkip(view));
@@ -2160,9 +2178,9 @@ impl AgbEngine {
             // (previously the census `.clone()` above was the deep clone and this
             // value was moved; now the census clone is free and this is the one
             // remaining deep clone).
-            effects.push(Effect::BroadcastReady(self.build_ready_out(
-                &proposal, grade,
-            )));
+            effects.push(Effect::BroadcastReady(
+                self.build_ready_out(&proposal, grade),
+            ));
             effects.extend(self.recheck_completion_and_direct(view, rep));
             break; // one ready-stage statement per view, ever
         }
@@ -2548,9 +2566,9 @@ impl DigestStatements {
         self.buffered_ready = self.buffered_ready.split_off(&floor);
         self.known_bodies = self.known_bodies.split_off(&(floor, Digest::default()));
         self.pending_fetch = self.pending_fetch.split_off(&(floor, Digest::default()));
-        self.fetch_answered = self
-            .fetch_answered
-            .split_off(&(floor, Digest::default(), PublicKey::default()));
+        self.fetch_answered =
+            self.fetch_answered
+                .split_off(&(floor, Digest::default(), PublicKey::default()));
         self.min_live_view = floor;
     }
 
@@ -2911,7 +2929,13 @@ impl DigestStatements {
         if !self.pending_fetch.contains_key(&(view, digest.clone())) {
             return Vec::new(); // unsolicited, or answers a pair we never asked for
         }
-        if !formed(agb.committee(), proposal.view, &proposal.c, &proposal.t, &proposal.m) {
+        if !formed(
+            agb.committee(),
+            proposal.view,
+            &proposal.c,
+            &proposal.t,
+            &proposal.m,
+        ) {
             return Vec::new();
         }
         let body = Arc::new(proposal);

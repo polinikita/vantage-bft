@@ -13,7 +13,8 @@ use crate::vantage::block::{self, block_ok, BlockRef};
 use crate::vantage::Effect;
 use config::{Committee, Stake, WorkerId};
 use crypto::{Digest, PublicKey};
-use metrics::Metrics;
+use metrics::{Metrics, UtilizationTimer};
+use prometheus::IntCounter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -728,6 +729,12 @@ pub struct LaneManager {
 
     /// §6.4 counters; `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
+
+    /// Cached `core_wait_timer{proc="store_probe"}` handle -- resolved on first use,
+    /// then reused, exactly like `VantageCore::cached_utilization_timer`'s caches.
+    /// Times `missing_payload`'s single store round-trip, the one genuine block on
+    /// the VantageCore thread inside this module.
+    wt_store_probe: Option<IntCounter>,
 }
 
 impl LaneManager {
@@ -777,6 +784,7 @@ impl LaneManager {
             pending_avail: HashMap::new(),
             avail_watermark_high: HashMap::new(),
             metrics: None,
+            wt_store_probe: None,
         }
     }
 
@@ -896,14 +904,35 @@ impl LaneManager {
         if header.author == self.name {
             return Vec::new();
         }
-        let mut missing = Vec::new();
-        for (digest, worker_id) in &header.payload {
-            let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
-            if self.store.read(key).await.unwrap_or(None).is_none() {
-                missing.push((digest.clone(), *worker_id));
-            }
-        }
-        missing
+        // ONE store round-trip for the whole payload, not one per entry. The previous
+        // per-entry `store.read(..).await` serialized up to `max_block_payload` (16)
+        // round-trips through the single store actor -- on the VantageCore thread, for
+        // every inbound and every served block -- each queued behind the batch-write
+        // stream sharing that channel. `read_many` preserves input order, so results
+        // zip 1:1 with `header.payload`.
+        let entries: Vec<_> = header.payload.iter().collect();
+        let keys: Vec<_> = entries
+            .iter()
+            .map(|(digest, worker_id)| [digest.as_ref(), &worker_id.to_le_bytes()].concat())
+            .collect();
+        let found = {
+            let _wait = self.metrics.as_ref().map(|metrics| {
+                UtilizationTimer::from_counter(
+                    self.wt_store_probe
+                        .get_or_insert_with(|| {
+                            metrics.core_wait_timer.with_label_values(&["store_probe"])
+                        })
+                        .clone(),
+                )
+            });
+            self.store.read_many(keys).await.unwrap_or_default()
+        };
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| found.get(*i).map(Option::is_none).unwrap_or(true))
+            .map(|(_, (digest, worker_id))| ((*digest).clone(), **worker_id))
+            .collect()
     }
 
     /// Call once a previously-missing block's worker batches have arrived (production:
@@ -1266,7 +1295,11 @@ impl LaneManager {
     /// this is the one extra lookup that lets the SAME "did frontier(author) just
     /// advance" continuation check run at that call site too.
     pub fn author_of(&self, digest: &Digest) -> Option<PublicKey> {
-        self.blocks.lock().unwrap().get(digest).map(|e| e.block.author)
+        self.blocks
+            .lock()
+            .unwrap()
+            .get(digest)
+            .map(|e| e.block.author)
     }
 
     /// Resolves a peer's ack-watermark vector into the exact `BlockRef`s this party's
@@ -1278,7 +1311,11 @@ impl LaneManager {
     /// `Ack::sender` already is; the caller (`VantageCore`/`SimpleItCore::
     /// dispatch_inbound`) has already checked committee membership before reaching
     /// here.
-    pub fn resolve_watermark(&mut self, sender: PublicKey, entries: &[AvailEntry]) -> Vec<BlockRef> {
+    pub fn resolve_watermark(
+        &mut self,
+        sender: PublicKey,
+        entries: &[AvailEntry],
+    ) -> Vec<BlockRef> {
         let mut refs = Vec::new();
         for entry in entries {
             refs.extend(self.resolve_one(sender, entry));
@@ -1373,10 +1410,8 @@ impl LaneManager {
                     refs.push((entry.author, floor_height + 1 + i as Height, d.clone()));
                 }
                 if let Some(last) = suffix.last() {
-                    self.credited_floor.insert(
-                        key,
-                        (floor_height + suffix.len() as Height, last.clone()),
-                    );
+                    self.credited_floor
+                        .insert(key, (floor_height + suffix.len() as Height, last.clone()));
                 }
                 self.pending_avail.remove(&key);
                 refs

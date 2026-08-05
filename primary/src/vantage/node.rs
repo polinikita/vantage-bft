@@ -432,6 +432,27 @@ pub struct VantageCore {
     ut_payload_sync: Option<IntCounter>,
     ut_timer_firing: Option<IntCounter>,
     ut_effect_execution: Option<IntCounter>,
+    /// Fable perf audit (measurement gap): the four `run` branches that carried no
+    /// `utilization_timer` scope at all, so their cost was invisible and the labeled
+    /// sections did not add up to the core's real busy time.
+    ut_avail_flush: Option<IntCounter>,
+    ut_resume_tick: Option<IntCounter>,
+    ut_metrics_tick: Option<IntCounter>,
+    ut_header_seal: Option<IntCounter>,
+    /// Running max of `rx_vantage.len()` since the last 1 Hz publish -- see
+    /// `Metrics::core_queue_peak`.
+    queue_len_peak: usize,
+    /// Set whenever something happens that warrants an `AgbEngine::recheck_all`, and
+    /// serviced ONCE at the end of `execute`'s drain rather than at every trigger.
+    ///
+    /// Why: with ack watermarks on, every peer broadcasts its full per-author watermark
+    /// map every `ack_watermark_period_ms`, and `credit_refs` credits those refs one at
+    /// a time -- so the old per-ref `recheck_all` ran its O(n^2)-per-view scan
+    /// n*(n-1)/period times a second on this single-threaded core (~49k full rechecks/s
+    /// at n=50). Coalescing is sound because `recheck_all` is idempotent and
+    /// order-independent (see its own doc comment): running it once after a batch of
+    /// credits reaches the same fixpoint as running it after each individual credit.
+    recheck_pending: bool,
 }
 
 /// `VantageCore::build`'s return shape: the constructed core, channel ends `spawn`
@@ -731,6 +752,12 @@ impl VantageCore {
             ut_payload_sync: None,
             ut_timer_firing: None,
             ut_effect_execution: None,
+            ut_avail_flush: None,
+            ut_resume_tick: None,
+            ut_metrics_tick: None,
+            ut_header_seal: None,
+            queue_len_peak: 0,
+            recheck_pending: false,
         };
         (
             core,
@@ -819,6 +846,11 @@ impl VantageCore {
             };
             tokio::pin!(control_sleep);
 
+            // Fable perf audit (measurement gap): sampled EVERY loop iteration, not
+            // once/sec -- this is the only place the core is about to yield, so it is
+            // the cheapest honest observation point for the backlog it leaves behind.
+            self.queue_len_peak = self.queue_len_peak.max(rx_vantage.len());
+
             // Use Tokio's fair branch selection. After a healed partition,
             // `rx_vantage` can remain continuously ready while thousands of queued
             // lane and consensus messages drain. The previous `biased` selection
@@ -835,9 +867,10 @@ impl VantageCore {
                 }
 
                 Some((header_digest, digest, worker_id)) = rx_payload_ready.recv() => {
-                    let payload_sync_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_payload_sync, "payload_sync");
+                    // The `payload_sync` scope lives INSIDE `on_payload_ready`, which
+                    // drops it around its own nested `execute` call -- scoping it here
+                    // instead would count all of `effect_execution` twice.
                     self.on_payload_ready(header_digest, digest, worker_id).await;
-                    drop(payload_sync_timer);
                 }
 
                 Some((digest, worker_id)) = rx_our_digests.recv() => {
@@ -876,6 +909,7 @@ impl VantageCore {
                         None => std::future::pending::<()>().await,
                     }
                 }, if avail_tick.is_some() => {
+                    let _avail_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_avail_flush, "avail_flush");
                     if let Some(entries) = self.lm.take_avail_flush() {
                         if let Some(metrics) = &self.metrics {
                             metrics.vantage_avail_sent.inc();
@@ -906,6 +940,7 @@ impl VantageCore {
                 // Mechanism A above -- see `vantage::resume`'s own module doc.
                 _ = resume_tick.tick() => {
                     let now = Instant::now();
+                    let _resume_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_resume_tick, "resume_tick");
                     // KNOB 1 (measurement ablation): the dirty-map sweep feeds
                     // `pending_low`, v3's own bookkeeping -- inert while disabled
                     // (see `Parameters::reconnect_replay`'s own doc comment). In
@@ -972,6 +1007,7 @@ impl VantageCore {
                 }
 
                 _ = metrics_tick.tick() => {
+                    let metrics_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_metrics_tick, "metrics_tick");
                     // Fable perf audit item 4: force an unconditional prune once/sec
                     // regardless of `maybe_prune_cancel_handlers`'s doubling
                     // condition, bounding worst-case staleness to ~1s.
@@ -983,14 +1019,22 @@ impl VantageCore {
                     // ControlLog`'s own coarse, round-based retry cadence).
                     let retry_now = Instant::now();
                     let retry_effects = self.digest_stmts.retry_fetches(retry_now);
+                    // Dropped so the nested `execute` is not double-counted into this
+                    // tick's own label; re-opened for the tail below.
+                    drop(metrics_timer);
                     self.execute(retry_effects, retry_now).await;
+                    let _metrics_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_metrics_tick, "metrics_tick");
                     self.sample_metrics();
                     // METRICS-DASHBOARD-SPEC.md §3: `core_queue_length` -- `rx_vantage`'s
                     // current depth (cheap, `Receiver::len()` is O(1)); `0` (never set)
                     // on the two Autobahn paths, which never construct a `VantageCore`.
+                    let queue_len = rx_vantage.len();
+                    self.queue_len_peak = self.queue_len_peak.max(queue_len);
                     if let Some(metrics) = &self.metrics {
-                        metrics.core_queue_length.set(rx_vantage.len() as i64);
+                        metrics.core_queue_length.set(queue_len as i64);
+                        metrics.core_queue_peak.set(self.queue_len_peak as i64);
                     }
+                    self.queue_len_peak = 0;
                 }
             }
         }
@@ -1003,9 +1047,15 @@ impl VantageCore {
     /// reset `header_timer` themselves afterwards (a local pinned future owned by
     /// `run`, not a struct field, so it can't be reset from here).
     async fn seal_own_header(&mut self, now: Instant) {
+        let seal_timer =
+            Self::cached_utilization_timer(&self.metrics, &mut self.ut_header_seal, "header_seal");
         let payload = self.digests.drain(..).collect();
         self.payload_size = 0;
         let (_, effects) = self.lm.publish_own(payload).await;
+        // Dropped before `execute` so `effect_execution` is not nested inside (and
+        // double-counted into) this label -- same reasoning as `run`'s own
+        // `drop(dispatch_timer)`.
+        drop(seal_timer);
         self.execute(effects, now).await;
     }
 
@@ -1023,6 +1073,11 @@ impl VantageCore {
         worker_id: WorkerId,
     ) {
         let now = Instant::now();
+        let payload_sync_timer = Self::cached_utilization_timer(
+            &self.metrics,
+            &mut self.ut_payload_sync,
+            "payload_sync",
+        );
         let mut resolved = false;
         if let Some(set) = self.payload.pending_payload.get_mut(&header_digest) {
             set.remove(&(digest, worker_id));
@@ -1045,7 +1100,13 @@ impl VantageCore {
             // waiting on -- re-poll it, same reasoning as the `Ack` arm.
             let mut effects = self.lm.set_payload_ready(&header_digest);
             effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+            drop(payload_sync_timer);
             self.execute(effects, now).await;
+            let _payload_sync_timer = Self::cached_utilization_timer(
+                &self.metrics,
+                &mut self.ut_payload_sync,
+                "payload_sync",
+            );
             if let (Some(author), Some(before)) = (author, before) {
                 if self.lm.own_direct_frontier(&author) > before {
                     self.try_resume_request(author, now);
@@ -1697,10 +1758,11 @@ impl VantageCore {
         effects
     }
 
-    fn on_ack_availability(&mut self, availability: AckAvailability, now: Instant) -> Vec<Effect> {
-        let mut effects = self.lm.process_ack_availability(availability);
-        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
-        effects
+    fn on_ack_availability(&mut self, availability: AckAvailability, _now: Instant) -> Vec<Effect> {
+        // Only the availability bookkeeping happens per ref; the resulting
+        // `recheck_all` is coalesced to once per effect drain -- see `recheck_pending`.
+        self.recheck_pending = true;
+        self.lm.process_ack_availability(availability)
     }
 
     fn record_local_ack(&mut self, ack: &Ack, now: Instant) -> Vec<Effect> {
@@ -2090,303 +2152,336 @@ impl VantageCore {
             "effect_execution",
         );
         let mut queue: VecDeque<Effect> = initial.into();
-        while let Some(effect) = queue.pop_front() {
-            match effect {
-                Effect::BroadcastPublish(header) => {
-                    self.wire
-                        .broadcast_message(PrimaryMessage::Header(header, false))
-                        .await
-                }
-                Effect::BroadcastAck(ack) => {
-                    // The self-ack path always runs, flag on or off: our own
-                    // holdings must always count toward our own aggregator (see
-                    // `ack_watermarks`'s own field doc comment). Only the WIRE
-                    // broadcast is suppressed when the watermark front-end replaces
-                    // it -- `LaneManager` itself is unaware of the flag and keeps
-                    // emitting this effect exactly as before.
-                    queue.extend(self.record_local_ack(&ack, now));
-                    if !self.ack_watermarks {
-                        // reconnect-replay plan §2.2/§4: a one-shot broadcast, not
-                        // durable lane data -- outbox-recorded, sent volatile.
-                        self.broadcast_recorded(PrimaryMessage::VantageAck(ack))
-                            .await
-                    }
-                }
-                Effect::SyncBatches(author, header_digest, missing) => {
-                    self.payload
-                        .sync_batches(&mut self.wire, author, header_digest, missing)
-                        .await;
-                }
-                Effect::RequestTo(peer, digest) => {
-                    self.wire
-                        .send_message(
-                            peer,
-                            PrimaryMessage::HeadersRequest(vec![digest], self.name),
-                        )
-                        .await;
-                }
-                Effect::ServeTo(peer, header) => {
-                    self.wire
-                        .send_message(peer, PrimaryMessage::Header(header, true))
-                        .await
-                }
-                Effect::BlockCached(digest) => {
-                    // Ack-watermark front-end: this newly-cached block may complete a
-                    // pending watermark's below-the-head segment for its author --
-                    // retry before `on_block_available` consumes `digest` by value.
-                    for (sender, r) in self.lm.retry_pending_avail(&digest) {
-                        queue.extend(self.credit_refs(sender, vec![r], now));
-                    }
-                    queue.extend(self.rep.on_block_available(digest));
-                    queue.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
-                    queue.extend(self.cursor.retry());
-                }
-                // PHASE7: `Single` rides the pre-PHASE7 `VantagePropose` message
-                // (0/1-entry `M`); `Batch` (`decide_prefix` produced `>= 2` entries)
-                // rides the separate `VantageProposeBatch` message.
-                // reconnect-replay plan §2.2/§4: outbox-recorded, sent volatile.
-                Effect::BroadcastPropose(p) => match p {
-                    ProposalOut::Single(p) => {
-                        self.broadcast_recorded(PrimaryMessage::VantagePropose(p))
-                            .await
-                    }
-                    ProposalOut::Batch(p) => {
-                        self.broadcast_recorded(PrimaryMessage::VantageProposeBatch(p))
-                            .await
-                    }
-                },
-                // PHASE5-SPEC.md §3/D5-3: every response effect is stamped with our
-                // current wish watermark here, at serialization time -- `AgbEngine`
-                // itself stays watermark-free (its own construction sites use a `0`
-                // placeholder, or none at all for `EchoSkip`/`NoReady`, which are
-                // effects carrying just a `View` to begin with).
-                Effect::BroadcastEcho(mut e) => {
-                    e.set_wish(self.pacemaker.own_watermark());
-                    match e {
-                        // signature-free.tex §8.3 "Digest-named AGB statements"
-                        // (`Parameters::digest_statements`): the flag's ENTIRE
-                        // emission-side effect -- when on, send the compact
-                        // `VantageEchoDigest` instead of the full by-value one.
-                        // `AgbEngine` still constructed the identical by-value
-                        // `Echo` above (`build_echo_out`, untouched); this is
-                        // purely an alternate wire encoding of that same value,
-                        // decided here, not inside the engine. Never applies to
-                        // `Batch` (out of scope -- see `EchoDigest`'s own doc
-                        // comment), so a batched-anchors run is unaffected either
-                        // way.
-                        EchoOut::Single(e) if self.digest_statements => {
-                            let msg = e.to_digest(self.agb.sid());
-                            self.broadcast_recorded(PrimaryMessage::VantageEchoDigest(msg))
-                                .await
-                        }
-                        EchoOut::Single(e) => {
-                            self.broadcast_recorded(PrimaryMessage::VantageEcho(e))
-                                .await
-                        }
-                        EchoOut::Batch(e) => {
-                            self.broadcast_recorded(PrimaryMessage::VantageEchoBatch(e))
-                                .await
-                        }
-                    }
-                }
-                Effect::BroadcastEchoSkip(view) => {
-                    let wish = self.pacemaker.own_watermark();
-                    self.broadcast_recorded(PrimaryMessage::VantageEchoSkip(view, self.name, wish))
-                        .await;
-                }
-                Effect::BroadcastReady(mut r) => {
-                    r.set_wish(self.pacemaker.own_watermark());
-                    match r {
-                        // signature-free.tex §8.3: mirrors `Effect::BroadcastEcho`'s
-                        // identical translation immediately above.
-                        ReadyOut::Single(r) if self.digest_statements => {
-                            let msg = r.to_digest(self.agb.sid());
-                            self.broadcast_recorded(PrimaryMessage::VantageReadyDigest(msg))
-                                .await
-                        }
-                        ReadyOut::Single(r) => {
-                            self.broadcast_recorded(PrimaryMessage::VantageReady(r))
-                                .await
-                        }
-                        ReadyOut::Batch(r) => {
-                            self.broadcast_recorded(PrimaryMessage::VantageReadyBatch(r))
-                                .await
-                        }
-                    }
-                }
-                Effect::BroadcastNoReady(view) => {
-                    let wish = self.pacemaker.own_watermark();
-                    self.broadcast_recorded(PrimaryMessage::VantageNoReady(view, self.name, wish))
-                        .await;
-                }
-                // No wish piggyback, unlike `BroadcastEchoSkip`/`BroadcastNoReady`
-                // above (see `Inbound::SkipVote`'s doc comment).
-                Effect::BroadcastSkipVote(view) => {
-                    self.broadcast_recorded(PrimaryMessage::VantageSkipVote(view, self.name))
-                        .await;
-                }
-                Effect::Fixed(view, well_formed) => {
-                    let activated = self.frontier.record_fixed(view, well_formed);
-                    for v in activated {
-                        queue.extend(self.agb.activate(v, now, &mut self.lm, &mut self.rep));
-                    }
-                    queue.extend(self.try_propose_effects(now));
-                    // signature-free.tex §8.3: a proposal just fixed BY VALUE may
-                    // already match digest statements buffered before it arrived --
-                    // drain them now. A no-op if nothing was ever buffered for this
-                    // view, or if `well_formed` is false (`on_local_fixed`'s own
-                    // `fixed_proposal` query returns `None` for `Reject`).
-                    queue.extend(self.digest_stmts.on_local_fixed(
-                        view,
-                        &mut self.agb,
-                        &mut self.rep,
-                    ));
-                }
-                Effect::Completed(view, c, t) => {
-                    queue.extend(self.cursor.on_completed(view, c, t));
-                }
-                Effect::Sealed(view, outcome) => {
-                    queue.extend(self.cursor.on_sealed(view, outcome));
-                }
-                Effect::ArmTimer(view, kind, deadline) => {
-                    self.timers.push(Reverse((deadline, view, kind)));
-                }
-                Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
-                    self.payload
-                        .notify_committed(&mut self.wire, commit_millis, by_worker, headers)
-                        .await;
-                }
-                Effect::BroadcastWish(view) => {
-                    self.broadcast_recorded(PrimaryMessage::VantageWish(view, self.name))
-                        .await
-                }
-                Effect::Enter(view) => {
-                    queue.extend(self.enter_view_effects(view, now));
-                }
-                Effect::RaiseWish(target) => {
-                    queue.extend(self.pacemaker.raise_own_wish(target));
-                }
-
-                // --- PHASE6-SPEC.md §5 (reports + control log) ---
-                Effect::CompletionReportable(view, proposal) => {
-                    // D7-1 (PHASE7-PREP-NOTES.md): this is the FIRST genuine
-                    // completion of a carrier with M != None -- whether we proposed
-                    // it ourselves or another party did -- so it's exactly the
-                    // "observed CompReport for a carrier resolving u" evidence the
-                    // in-flight marker should refresh on, independent of (and in
-                    // addition to) `Resolver::decide{,_prefix}`'s own immediate
-                    // refresh for its own attempts. PHASE7: refreshed for EVERY
-                    // target this carrier's `M` names (0/1 for `Single`, `2..=f` for
-                    // `Batch`) -- this carrier's genuine completion is fresh
-                    // in-flight evidence for all of them, not just the first.
-                    for entry in proposal.entries() {
-                        self.resolver.note_carrier_report(entry.target_view(), now);
-                    }
-                    queue.extend(self.control.on_completion_reportable(view, proposal));
-                }
-                // reconnect-replay plan §2.2/§4: the wish-free one-shots
-                // (CompReport, Control*) below are ALSO outbox-recorded/volatile --
-                // every broadcast in `execute` except `BroadcastPublish`/
-                // `VantageAvail`'s own `avail_tick` arm is.
-                Effect::BroadcastCompReport(view, digest) => {
-                    self.broadcast_recorded(PrimaryMessage::CompReport(view, digest, self.name))
-                        .await;
-                }
-                // PHASE7: `Single`/`None` are byte-identical to the pre-PHASE7 path
-                // (same `ControlInit` message); `Batch` rides the separate,
-                // flag-gated `ControlInitBatch` message.
-                Effect::BroadcastControlInit(proposal, b_w) => match b_w {
-                    None => {
-                        self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, None))
-                            .await
-                    }
-                    Some(ProposalOut::Single(p)) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, Some(p)))
-                            .await
-                    }
-                    Some(ProposalOut::Batch(p)) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlInitBatch(proposal, Some(p)))
-                            .await
-                    }
-                },
-                Effect::BroadcastControlEcho(proposal) => {
-                    self.broadcast_recorded(PrimaryMessage::ControlEcho(proposal, self.name))
-                        .await;
-                }
-                Effect::BroadcastControlReady(proposal) => {
-                    self.broadcast_recorded(PrimaryMessage::ControlReady(proposal, self.name))
-                        .await;
-                }
-                Effect::BroadcastControlCommit(round) => {
-                    self.broadcast_recorded(PrimaryMessage::ControlCommit(round, self.name))
-                        .await;
-                }
-                Effect::BroadcastControlTimeoutVote(round) => {
-                    self.broadcast_recorded(PrimaryMessage::ControlTimeoutVote(round, self.name))
-                        .await;
-                }
-                Effect::BroadcastControlTimeoutAccept(round) => {
-                    self.broadcast_recorded(PrimaryMessage::ControlTimeoutAccept(round, self.name))
-                        .await;
-                }
-                Effect::ControlFetchTo(peer, view, digest) => {
-                    self.wire
-                        .send_message(peer, PrimaryMessage::ControlFetch(view, digest, self.name))
-                        .await;
-                }
-                // PHASE7: `Single` is byte-identical to the pre-PHASE7 path (same
-                // `ControlServe` message); `Batch` rides the separate, flag-gated
-                // `ControlServeBatch` message.
-                Effect::ControlServeTo(peer, view, proposal) => match proposal {
-                    ProposalOut::Single(p) => {
+        // Outer loop: drain the queue, then service any coalesced `recheck_all` ONCE and
+        // drain whatever it produced, until both are quiet. `recheck_all` is idempotent
+        // and order-independent, so this reaches the same fixpoint the old per-trigger
+        // calls did, with one scan per drain instead of one per credited ref.
+        loop {
+            while let Some(effect) = queue.pop_front() {
+                match effect {
+                    Effect::BroadcastPublish(header) => {
                         self.wire
-                            .send_message(peer, PrimaryMessage::ControlServe(view, p))
+                            .broadcast_message(PrimaryMessage::Header(header, false))
                             .await
                     }
-                    ProposalOut::Batch(p) => {
+                    Effect::BroadcastAck(ack) => {
+                        // The self-ack path always runs, flag on or off: our own
+                        // holdings must always count toward our own aggregator (see
+                        // `ack_watermarks`'s own field doc comment). Only the WIRE
+                        // broadcast is suppressed when the watermark front-end replaces
+                        // it -- `LaneManager` itself is unaware of the flag and keeps
+                        // emitting this effect exactly as before.
+                        queue.extend(self.record_local_ack(&ack, now));
+                        if !self.ack_watermarks {
+                            // reconnect-replay plan §2.2/§4: a one-shot broadcast, not
+                            // durable lane data -- outbox-recorded, sent volatile.
+                            self.broadcast_recorded(PrimaryMessage::VantageAck(ack))
+                                .await
+                        }
+                    }
+                    Effect::SyncBatches(author, header_digest, missing) => {
+                        self.payload
+                            .sync_batches(&mut self.wire, author, header_digest, missing)
+                            .await;
+                    }
+                    Effect::RequestTo(peer, digest) => {
                         self.wire
-                            .send_message(peer, PrimaryMessage::ControlServeBatch(view, p))
+                            .send_message(
+                                peer,
+                                PrimaryMessage::HeadersRequest(vec![digest], self.name),
+                            )
+                            .await;
+                    }
+                    Effect::ServeTo(peer, header) => {
+                        self.wire
+                            .send_message(peer, PrimaryMessage::Header(header, true))
                             .await
                     }
-                },
-                Effect::ArmControlTimer(round, deadline) => {
-                    self.control_timers.push(Reverse((deadline, round)));
-                }
-
-                // --- PHASE6-SPEC.md §6 (anchors) ---
-                Effect::ApplyAnchor(view, outcome, refs) => {
-                    for r in refs {
-                        queue.extend(self.rep.authorize(r));
+                    Effect::BlockCached(digest) => {
+                        // Ack-watermark front-end: this newly-cached block may complete a
+                        // pending watermark's below-the-head segment for its author --
+                        // retry before `on_block_available` consumes `digest` by value.
+                        for (sender, r) in self.lm.retry_pending_avail(&digest) {
+                            queue.extend(self.credit_refs(sender, vec![r], now));
+                        }
+                        queue.extend(self.rep.on_block_available(digest));
+                        // Coalesced: one recheck at the end of the drain, not one per
+                        // cached block (see `recheck_pending`).
+                        self.recheck_pending = true;
+                        queue.extend(self.cursor.retry());
                     }
-                    queue.extend(self.agb.submit_anchor(view, outcome));
-                }
-
-                // --- signature-free.tex §8.3 "Digest-named AGB statements" ---
-                Effect::BodyFetchTo(peer, view, digest) => {
-                    self.wire
-                        .send_message(
-                            peer,
-                            PrimaryMessage::VantageBodyFetch(view, digest, self.name),
-                        )
+                    // PHASE7: `Single` rides the pre-PHASE7 `VantagePropose` message
+                    // (0/1-entry `M`); `Batch` (`decide_prefix` produced `>= 2` entries)
+                    // rides the separate `VantageProposeBatch` message.
+                    // reconnect-replay plan §2.2/§4: outbox-recorded, sent volatile.
+                    Effect::BroadcastPropose(p) => match p {
+                        ProposalOut::Single(p) => {
+                            self.broadcast_recorded(PrimaryMessage::VantagePropose(p))
+                                .await
+                        }
+                        ProposalOut::Batch(p) => {
+                            self.broadcast_recorded(PrimaryMessage::VantageProposeBatch(p))
+                                .await
+                        }
+                    },
+                    // PHASE5-SPEC.md §3/D5-3: every response effect is stamped with our
+                    // current wish watermark here, at serialization time -- `AgbEngine`
+                    // itself stays watermark-free (its own construction sites use a `0`
+                    // placeholder, or none at all for `EchoSkip`/`NoReady`, which are
+                    // effects carrying just a `View` to begin with).
+                    Effect::BroadcastEcho(mut e) => {
+                        e.set_wish(self.pacemaker.own_watermark());
+                        match e {
+                            // signature-free.tex §8.3 "Digest-named AGB statements"
+                            // (`Parameters::digest_statements`): the flag's ENTIRE
+                            // emission-side effect -- when on, send the compact
+                            // `VantageEchoDigest` instead of the full by-value one.
+                            // `AgbEngine` still constructed the identical by-value
+                            // `Echo` above (`build_echo_out`, untouched); this is
+                            // purely an alternate wire encoding of that same value,
+                            // decided here, not inside the engine. Never applies to
+                            // `Batch` (out of scope -- see `EchoDigest`'s own doc
+                            // comment), so a batched-anchors run is unaffected either
+                            // way.
+                            EchoOut::Single(e) if self.digest_statements => {
+                                let msg = e.to_digest(self.agb.sid());
+                                self.broadcast_recorded(PrimaryMessage::VantageEchoDigest(msg))
+                                    .await
+                            }
+                            EchoOut::Single(e) => {
+                                self.broadcast_recorded(PrimaryMessage::VantageEcho(e))
+                                    .await
+                            }
+                            EchoOut::Batch(e) => {
+                                self.broadcast_recorded(PrimaryMessage::VantageEchoBatch(e))
+                                    .await
+                            }
+                        }
+                    }
+                    Effect::BroadcastEchoSkip(view) => {
+                        let wish = self.pacemaker.own_watermark();
+                        self.broadcast_recorded(PrimaryMessage::VantageEchoSkip(
+                            view, self.name, wish,
+                        ))
                         .await;
-                }
-                Effect::BodyServeTo(peer, view, proposal) => {
-                    self.wire
-                        .send_message(peer, PrimaryMessage::VantageBodyServe(view, proposal))
+                    }
+                    Effect::BroadcastReady(mut r) => {
+                        r.set_wish(self.pacemaker.own_watermark());
+                        match r {
+                            // signature-free.tex §8.3: mirrors `Effect::BroadcastEcho`'s
+                            // identical translation immediately above.
+                            ReadyOut::Single(r) if self.digest_statements => {
+                                let msg = r.to_digest(self.agb.sid());
+                                self.broadcast_recorded(PrimaryMessage::VantageReadyDigest(msg))
+                                    .await
+                            }
+                            ReadyOut::Single(r) => {
+                                self.broadcast_recorded(PrimaryMessage::VantageReady(r))
+                                    .await
+                            }
+                            ReadyOut::Batch(r) => {
+                                self.broadcast_recorded(PrimaryMessage::VantageReadyBatch(r))
+                                    .await
+                            }
+                        }
+                    }
+                    Effect::BroadcastNoReady(view) => {
+                        let wish = self.pacemaker.own_watermark();
+                        self.broadcast_recorded(PrimaryMessage::VantageNoReady(
+                            view, self.name, wish,
+                        ))
                         .await;
-                }
+                    }
+                    // No wish piggyback, unlike `BroadcastEchoSkip`/`BroadcastNoReady`
+                    // above (see `Inbound::SkipVote`'s doc comment).
+                    Effect::BroadcastSkipVote(view) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageSkipVote(view, self.name))
+                            .await;
+                    }
+                    Effect::Fixed(view, well_formed) => {
+                        let activated = self.frontier.record_fixed(view, well_formed);
+                        for v in activated {
+                            queue.extend(self.agb.activate(v, now, &mut self.lm, &mut self.rep));
+                        }
+                        queue.extend(self.try_propose_effects(now));
+                        // signature-free.tex §8.3: a proposal just fixed BY VALUE may
+                        // already match digest statements buffered before it arrived --
+                        // drain them now. A no-op if nothing was ever buffered for this
+                        // view, or if `well_formed` is false (`on_local_fixed`'s own
+                        // `fixed_proposal` query returns `None` for `Reject`).
+                        queue.extend(self.digest_stmts.on_local_fixed(
+                            view,
+                            &mut self.agb,
+                            &mut self.rep,
+                        ));
+                    }
+                    Effect::Completed(view, c, t) => {
+                        queue.extend(self.cursor.on_completed(view, c, t));
+                    }
+                    Effect::Sealed(view, outcome) => {
+                        queue.extend(self.cursor.on_sealed(view, outcome));
+                    }
+                    Effect::ArmTimer(view, kind, deadline) => {
+                        self.timers.push(Reverse((deadline, view, kind)));
+                    }
+                    Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
+                        self.payload
+                            .notify_committed(&mut self.wire, commit_millis, by_worker, headers)
+                            .await;
+                    }
+                    Effect::BroadcastWish(view) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageWish(view, self.name))
+                            .await
+                    }
+                    Effect::Enter(view) => {
+                        queue.extend(self.enter_view_effects(view, now));
+                    }
+                    Effect::RaiseWish(target) => {
+                        queue.extend(self.pacemaker.raise_own_wish(target));
+                    }
 
-                // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
-                Effect::ResumeServeTo(requester, header) => {
-                    // Non-blocking hand-off onto the dedicated resume-sender task
-                    // (`Wire::enqueue_resume_header` -> `enqueue_resume`) -- never
-                    // `.await`ed, so a burst of `Inbound::LaneResume` arrivals
-                    // queuing many of these back to back (exactly what a
-                    // windowed-withhold recovery produces) costs this effect-drain
-                    // loop nothing beyond the enqueue itself.
-                    self.wire.enqueue_resume_header(requester, header);
+                    // --- PHASE6-SPEC.md §5 (reports + control log) ---
+                    Effect::CompletionReportable(view, proposal) => {
+                        // D7-1 (PHASE7-PREP-NOTES.md): this is the FIRST genuine
+                        // completion of a carrier with M != None -- whether we proposed
+                        // it ourselves or another party did -- so it's exactly the
+                        // "observed CompReport for a carrier resolving u" evidence the
+                        // in-flight marker should refresh on, independent of (and in
+                        // addition to) `Resolver::decide{,_prefix}`'s own immediate
+                        // refresh for its own attempts. PHASE7: refreshed for EVERY
+                        // target this carrier's `M` names (0/1 for `Single`, `2..=f` for
+                        // `Batch`) -- this carrier's genuine completion is fresh
+                        // in-flight evidence for all of them, not just the first.
+                        for entry in proposal.entries() {
+                            self.resolver.note_carrier_report(entry.target_view(), now);
+                        }
+                        queue.extend(self.control.on_completion_reportable(view, proposal));
+                    }
+                    // reconnect-replay plan §2.2/§4: the wish-free one-shots
+                    // (CompReport, Control*) below are ALSO outbox-recorded/volatile --
+                    // every broadcast in `execute` except `BroadcastPublish`/
+                    // `VantageAvail`'s own `avail_tick` arm is.
+                    Effect::BroadcastCompReport(view, digest) => {
+                        self.broadcast_recorded(PrimaryMessage::CompReport(
+                            view, digest, self.name,
+                        ))
+                        .await;
+                    }
+                    // PHASE7: `Single`/`None` are byte-identical to the pre-PHASE7 path
+                    // (same `ControlInit` message); `Batch` rides the separate,
+                    // flag-gated `ControlInitBatch` message.
+                    Effect::BroadcastControlInit(proposal, b_w) => match b_w {
+                        None => {
+                            self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, None))
+                                .await
+                        }
+                        Some(ProposalOut::Single(p)) => {
+                            self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, Some(p)))
+                                .await
+                        }
+                        Some(ProposalOut::Batch(p)) => {
+                            self.broadcast_recorded(PrimaryMessage::ControlInitBatch(
+                                proposal,
+                                Some(p),
+                            ))
+                            .await
+                        }
+                    },
+                    Effect::BroadcastControlEcho(proposal) => {
+                        self.broadcast_recorded(PrimaryMessage::ControlEcho(proposal, self.name))
+                            .await;
+                    }
+                    Effect::BroadcastControlReady(proposal) => {
+                        self.broadcast_recorded(PrimaryMessage::ControlReady(proposal, self.name))
+                            .await;
+                    }
+                    Effect::BroadcastControlCommit(round) => {
+                        self.broadcast_recorded(PrimaryMessage::ControlCommit(round, self.name))
+                            .await;
+                    }
+                    Effect::BroadcastControlTimeoutVote(round) => {
+                        self.broadcast_recorded(PrimaryMessage::ControlTimeoutVote(
+                            round, self.name,
+                        ))
+                        .await;
+                    }
+                    Effect::BroadcastControlTimeoutAccept(round) => {
+                        self.broadcast_recorded(PrimaryMessage::ControlTimeoutAccept(
+                            round, self.name,
+                        ))
+                        .await;
+                    }
+                    Effect::ControlFetchTo(peer, view, digest) => {
+                        self.wire
+                            .send_message(
+                                peer,
+                                PrimaryMessage::ControlFetch(view, digest, self.name),
+                            )
+                            .await;
+                    }
+                    // PHASE7: `Single` is byte-identical to the pre-PHASE7 path (same
+                    // `ControlServe` message); `Batch` rides the separate, flag-gated
+                    // `ControlServeBatch` message.
+                    Effect::ControlServeTo(peer, view, proposal) => match proposal {
+                        ProposalOut::Single(p) => {
+                            self.wire
+                                .send_message(peer, PrimaryMessage::ControlServe(view, p))
+                                .await
+                        }
+                        ProposalOut::Batch(p) => {
+                            self.wire
+                                .send_message(peer, PrimaryMessage::ControlServeBatch(view, p))
+                                .await
+                        }
+                    },
+                    Effect::ArmControlTimer(round, deadline) => {
+                        self.control_timers.push(Reverse((deadline, round)));
+                    }
+
+                    // --- PHASE6-SPEC.md §6 (anchors) ---
+                    Effect::ApplyAnchor(view, outcome, refs) => {
+                        for r in refs {
+                            queue.extend(self.rep.authorize(r));
+                        }
+                        queue.extend(self.agb.submit_anchor(view, outcome));
+                    }
+
+                    // --- signature-free.tex §8.3 "Digest-named AGB statements" ---
+                    Effect::BodyFetchTo(peer, view, digest) => {
+                        self.wire
+                            .send_message(
+                                peer,
+                                PrimaryMessage::VantageBodyFetch(view, digest, self.name),
+                            )
+                            .await;
+                    }
+                    Effect::BodyServeTo(peer, view, proposal) => {
+                        self.wire
+                            .send_message(peer, PrimaryMessage::VantageBodyServe(view, proposal))
+                            .await;
+                    }
+
+                    // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+                    Effect::ResumeServeTo(requester, header) => {
+                        // Non-blocking hand-off onto the dedicated resume-sender task
+                        // (`Wire::enqueue_resume_header` -> `enqueue_resume`) -- never
+                        // `.await`ed, so a burst of `Inbound::LaneResume` arrivals
+                        // queuing many of these back to back (exactly what a
+                        // windowed-withhold recovery produces) costs this effect-drain
+                        // loop nothing beyond the enqueue itself.
+                        self.wire.enqueue_resume_header(requester, header);
+                    }
                 }
             }
+            if !self.recheck_pending {
+                break;
+            }
+            self.recheck_pending = false;
+            let rechecked = self.agb.recheck_all(now, &mut self.lm, &mut self.rep);
+            if rechecked.is_empty() {
+                break;
+            }
+            queue.extend(rechecked);
         }
     }
 

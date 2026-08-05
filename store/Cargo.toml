@@ -7,6 +7,6 @@ publish = false
 
 [dependencies]
 rocksdb = { workspace = true }
-tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
 fdlimit = { workspace = true }
 log = { workspace = true }

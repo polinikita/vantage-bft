@@ -1,10 +1,26 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use rocksdb::{
-    BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, Options, WriteOptions,
+    BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, Options, WriteBatch,
+    WriteOptions,
 };
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
+use tokio::time::{interval, Duration, MissedTickBehavior};
+
+/// Flush cadence for the pending write batch. 50 ms => ~20 flushes/s, matching
+/// production starfish, which writes one application-level batch per protocol event
+/// (own proposal per round + per commit batch) rather than one per item. Before
+/// batching, this store issued one `put_opt` per key: ~2 500 writes/s per validator at
+/// n=50 (every worker persists its own AND all n-1 peers' batches, ~50 seals/s each),
+/// i.e. two orders of magnitude more disk operations than starfish for the same work.
+const FLUSH_INTERVAL_MS: u64 = 50;
+
+/// Memory bound on the un-flushed batch, not a rate knob: a safety valve for load
+/// spikes so `pending` cannot grow without limit between ticks. At the measured
+/// worst case (~128 MB/s of batch bytes per node at n=50 / 250k tx/s) a 50 ms window
+/// holds ~6.4 MB, so the ticker -- not this threshold -- governs the flush rate.
+const MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
 #[path = "tests/store_tests.rs"]
@@ -36,6 +52,12 @@ pub enum StoreProfile {
 pub enum StoreCommand {
     Write(Key, Value),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
+    /// Batched point lookup: one command, one `multi_get`, one reply for N keys.
+    /// Exists because the consensus hot path probes every payload digest of an
+    /// inbound block (up to `max_block_payload`), and issuing those as N separate
+    /// `Read`s serialized N round-trips through this single actor -- each one
+    /// queued behind whatever writes were already in the 100-slot channel.
+    ReadMany(Vec<Key>, oneshot::Sender<StoreResult<Vec<Option<Value>>>>),
     NotifyRead(Key, oneshot::Sender<StoreResult<Value>>),
 }
 
@@ -67,31 +89,108 @@ impl Store {
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
         let (tx, mut rx) = channel(100);
         tokio::spawn(async move {
-            while let Some(command) = rx.recv().await {
-                match command {
-                    StoreCommand::Write(key, value) => {
-                        let _ = db.put_opt(&key, &value, &write_opts);
-                        if let Some(mut senders) = obligations.remove(&key) {
-                            while let Some(s) = senders.pop_front() {
-                                let _ = s.send(Ok(value.clone()));
+            // Writes accumulate in `pending` and land as ONE RocksDB WriteBatch per
+            // flush, so the store issues ~1000/FLUSH_INTERVAL_MS writes per second
+            // instead of one per key. This mirrors production starfish, which flushes a
+            // single application-level batch per protocol event (~20x/s) rather than
+            // per item. `pending` doubles as a read-your-writes overlay: every Read /
+            // ReadMany / NotifyRead consults it BEFORE RocksDB, so deferring the disk
+            // write is invisible to callers, and `notify_read` obligations are still
+            // resolved the moment the value is accepted (durability was already only
+            // page-cache-deep -- `set_sync(false)` -- so this changes no guarantee).
+            let mut pending: HashMap<Key, Value> = HashMap::new();
+            let mut pending_bytes: usize = 0;
+            let mut ticker = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    command = rx.recv() => {
+                        let Some(command) = command else {
+                            // Channel closed: flush what we hold, then exit.
+                            flush_pending(&db, &mut pending, &mut pending_bytes, &write_opts);
+                            break;
+                        };
+                        match command {
+                            StoreCommand::Write(key, value) => {
+                                if let Some(mut senders) = obligations.remove(&key) {
+                                    while let Some(s) = senders.pop_front() {
+                                        let _ = s.send(Ok(value.clone()));
+                                    }
+                                }
+                                pending_bytes += key.len() + value.len();
+                                pending.insert(key, value);
+                                // Safety valve only -- at benchmark rates the ticker
+                                // fires long before this, so the flush rate stays at
+                                // 1000/FLUSH_INTERVAL_MS per second.
+                                if pending_bytes >= MAX_PENDING_BYTES {
+                                    flush_pending(
+                                        &db, &mut pending, &mut pending_bytes, &write_opts,
+                                    );
+                                }
+                            }
+                            StoreCommand::Read(key, sender) => {
+                                let response = match pending.get(&key) {
+                                    Some(value) => Ok(Some(value.clone())),
+                                    None => db.get(&key),
+                                };
+                                let _ = sender.send(response);
+                            }
+                            StoreCommand::ReadMany(keys, sender) => {
+                                // `multi_get` preserves input order 1:1; the pending
+                                // overlay is applied per index so the reply order still
+                                // matches `keys` exactly.
+                                let mut out: Vec<Option<Value>> = Vec::with_capacity(keys.len());
+                                let mut miss_idx = Vec::new();
+                                let mut miss_keys = Vec::new();
+                                for (i, key) in keys.iter().enumerate() {
+                                    match pending.get(key) {
+                                        Some(value) => out.push(Some(value.clone())),
+                                        None => {
+                                            out.push(None);
+                                            miss_idx.push(i);
+                                            miss_keys.push(key);
+                                        }
+                                    }
+                                }
+                                let mut failure = None;
+                                if !miss_keys.is_empty() {
+                                    for (slot, got) in
+                                        miss_idx.iter().zip(db.multi_get(&miss_keys))
+                                    {
+                                        match got {
+                                            Ok(value) => out[*slot] = value,
+                                            Err(e) => {
+                                                failure = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                let _ = sender.send(match failure {
+                                    Some(e) => Err(e),
+                                    None => Ok(out),
+                                });
+                            }
+                            StoreCommand::NotifyRead(key, sender) => {
+                                let response = match pending.get(&key) {
+                                    Some(value) => Ok(Some(value.clone())),
+                                    None => db.get(&key),
+                                };
+                                match response {
+                                    Ok(None) => obligations
+                                        .entry(key)
+                                        .or_insert_with(VecDeque::new)
+                                        .push_back(sender),
+                                    _ => {
+                                        let _ = sender.send(response.map(|x| x.unwrap()));
+                                    }
+                                }
                             }
                         }
                     }
-                    StoreCommand::Read(key, sender) => {
-                        let response = db.get(&key);
-                        let _ = sender.send(response);
-                    }
-                    StoreCommand::NotifyRead(key, sender) => {
-                        let response = db.get(&key);
-                        match response {
-                            Ok(None) => obligations
-                                .entry(key)
-                                .or_insert_with(VecDeque::new)
-                                .push_back(sender),
-                            _ => {
-                                let _ = sender.send(response.map(|x| x.unwrap()));
-                            }
-                        }
+                    _ = ticker.tick() => {
+                        flush_pending(&db, &mut pending, &mut pending_bytes, &write_opts);
                     }
                 }
             }
@@ -115,6 +214,25 @@ impl Store {
             .expect("Failed to receive reply to Read command from store")
     }
 
+    /// Batched counterpart of `read`: one actor round-trip for N keys, results in the
+    /// SAME order as `keys`. An empty `keys` short-circuits without touching the store.
+    pub async fn read_many(&mut self, keys: Vec<Key>) -> StoreResult<Vec<Option<Value>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sender, receiver) = oneshot::channel();
+        if let Err(e) = self
+            .channel
+            .send(StoreCommand::ReadMany(keys, sender))
+            .await
+        {
+            panic!("Failed to send ReadMany command to store: {}", e);
+        }
+        receiver
+            .await
+            .expect("Failed to receive reply to ReadMany command from store")
+    }
+
     pub async fn notify_read(&mut self, key: Key) -> StoreResult<Value> {
         let (sender, receiver) = oneshot::channel();
         if let Err(e) = self
@@ -127,6 +245,29 @@ impl Store {
         receiver
             .await
             .expect("Failed to receive reply to NotifyRead command from store")
+    }
+}
+
+/// Write everything buffered in `pending` as ONE atomic RocksDB batch and clear it.
+/// A no-op when nothing is buffered, mirroring starfish's `has_data_to_write` early
+/// return so idle nodes issue no disk writes at all. Still `sync=false`: this changes
+/// the number of write operations, not the durability class.
+fn flush_pending(
+    db: &rocksdb::DB,
+    pending: &mut HashMap<Key, Value>,
+    pending_bytes: &mut usize,
+    write_opts: &WriteOptions,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut batch = WriteBatch::default();
+    for (key, value) in pending.drain() {
+        batch.put(key, value);
+    }
+    *pending_bytes = 0;
+    if let Err(e) = db.write_opt(batch, write_opts) {
+        log::error!("Failed to flush store write batch: {}", e);
     }
 }
 

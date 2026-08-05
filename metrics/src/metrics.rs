@@ -392,11 +392,29 @@ pub struct Metrics {
     /// adds its elapsed wall time to this counter when it goes out of scope, whether
     /// via normal fall-through or an early return/`?`.
     pub utilization_timer: IntCounterVec,
+    /// Fable perf audit (measurement gap): the WAITING subset of `utilization_timer`,
+    /// same `proc` labeling, same microsecond units, same `Drop`-guard mechanism.
+    /// `utilization_timer` records WALL time, so a section blocked on an `.await`
+    /// (notably the store actor's FIFO) is indistinguishable from one burning CPU.
+    /// Scopes opened against THIS counter mark regions whose cost is known to be
+    /// waiting rather than computing, so the dashboard can read
+    /// `utilization - wait ~= CPU` per section and tell a CPU-bound core apart from
+    /// one starved by a downstream queue. Deliberately NOT a partition of
+    /// `utilization_timer`'s labels: a wait scope nested inside a utilization scope
+    /// contributes to both (that is the point), and `proc` values need not match.
+    pub core_wait_timer: IntCounterVec,
     /// `VantageCore`'s own inbound-message channel depth, sampled the same way as
     /// the Finding-A progress gauges (once/sec, in `VantageCore::run`'s own select
     /// loop) -- `rx_vantage.len()` (a `tokio::sync::mpsc::Receiver` exposes this
     /// cheaply without contorting the channel type). `0` on the two Autobahn paths.
     pub core_queue_length: IntGauge,
+    /// Fable perf audit (measurement gap): the PEAK `rx_vantage.len()` observed since
+    /// the previous 1 Hz sample, reset each time it is published. `core_queue_length`
+    /// is sampled once/sec FROM the busy core thread, so it can only ever be read at
+    /// an instant when that thread is between select branches -- systematically
+    /// missing the sub-second bursts that matter (a core that is CPU-bound shows a
+    /// growing peak even while the instantaneous sample keeps returning ~0).
+    pub core_queue_peak: IntGauge,
 
     // --- METRICS-DASHBOARD-SPEC.md §8 addenda.
     /// Write-once at boot: which protocol this node is running (starfish pattern --
@@ -869,9 +887,22 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            core_wait_timer: register_int_counter_vec_with_registry!(
+                "core_wait_timer",
+                "VantageCore time blocked on downstream I/O in microseconds, by proc",
+                &["proc"],
+                registry,
+            )
+            .unwrap(),
             core_queue_length: register_int_gauge_with_registry!(
                 "core_queue_length",
                 "VantageCore's own inbound-message channel depth",
+                registry,
+            )
+            .unwrap(),
+            core_queue_peak: register_int_gauge_with_registry!(
+                "core_queue_peak",
+                "VantageCore inbound-channel depth: peak since the previous sample",
                 registry,
             )
             .unwrap(),
