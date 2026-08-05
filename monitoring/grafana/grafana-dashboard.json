@@ -50,7 +50,7 @@
     },
     {
       "type": "stat",
-      "title": "Protocol / mode",
+      "title": "Protocol / tx mode",
       "datasource": {
         "type": "prometheus",
         "uid": "Fixed-UID-vantage"
@@ -71,10 +71,12 @@
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "fields": "",
+          "values": false
         },
         "colorMode": "none",
-        "textMode": "auto"
+        "textMode": "name"
       },
       "targets": [
         {
@@ -84,7 +86,20 @@
           },
           "expr": "max by (protocol) (protocol_info{node=~\"$node\"} == 1)",
           "legendFormat": "{{protocol}}",
-          "refId": "A"
+          "refId": "A",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "max by (mode) (transaction_mode_info{node=~\"$node\"} == 1)",
+          "legendFormat": "{{mode}}",
+          "refId": "B",
+          "instant": true,
+          "range": false
         }
       ]
     },
@@ -224,73 +239,6 @@
       "panels": [],
       "title": "Overview",
       "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 8,
-        "x": 0,
-        "y": 4
-      },
-      "id": 2,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "max by (protocol) (protocol_info{node=~\"$node\"} == 1)",
-          "legendFormat": "protocol={{protocol}}",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "max by (mode) (transaction_mode_info{node=~\"$node\"} == 1)",
-          "legendFormat": "mode={{mode}}",
-          "refId": "B"
-        }
-      ],
-      "title": "Protocol / mode running",
-      "type": "stat"
     },
     {
       "datasource": {

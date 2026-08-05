@@ -209,6 +209,18 @@ pub struct Parameters {
     #[serde(default)]
     pub protocol: Protocol,
 
+    /// The load generator's transaction-generation mode ("random"/"all-zero") when
+    /// the HARNESS knows it. Exists purely to give the standalone `node run
+    /// primary`/`node run worker` path a channel for a fact it otherwise cannot
+    /// see: `--mode` belongs to the separate `benchmark_client` process, so without
+    /// this the `transaction_mode_info` gauge stays absent on every deployed
+    /// (docker/fab) run and the dashboard's mode field renders blank -- see
+    /// `Metrics::set_transaction_mode_info`. `None` = genuinely unknown; library and
+    /// production callers leave it unset so the gauge stays absent rather than
+    /// reporting a fabricated mode.
+    #[serde(default)]
+    pub tx_mode: Option<String>,
+
     /// Vantage only (PHASE3-SPEC.md §3.1): the maximum number of payload entries
     /// (worker-batch digests) a single data block may carry -- part of `BlockOK`.
     /// Irrelevant on the two Autobahn paths. Rust-side default is a conservative
@@ -902,6 +914,8 @@ impl Default for Parameters {
             asynchrony_duration: 10_000, //10 seconds
 
             protocol: Protocol::default(),
+
+            tx_mode: None,
             max_block_payload: default_max_block_payload(),
             delta_ms: default_delta_ms(),
             latency_table: None,

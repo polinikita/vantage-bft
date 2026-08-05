@@ -117,6 +117,9 @@ impl Worker {
         let (metrics, reporter) = Metrics::new(&registry);
         // METRICS-DASHBOARD-SPEC.md §8: write-once at boot.
         metrics.set_protocol_info(parameters.protocol.label());
+        if let Some(mode) = parameters.tx_mode.as_deref() {
+            metrics.set_transaction_mode_info(mode);
+        }
         reporter.clone().start();
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Worker {} metrics listening on {}", id, metrics_address);

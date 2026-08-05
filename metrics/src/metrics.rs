@@ -898,13 +898,13 @@ impl Metrics {
     }
 
     /// METRICS-DASHBOARD-SPEC.md §8: write-once, where the caller knows the client's
-    /// tx-generation mode. Only `node local-benchmark` (the in-process vehicle) has
-    /// this in scope at registry-construction time -- the standalone `node run
-    /// primary`/`node run worker` path (what `fab remote` execs) has no channel
-    /// carrying the separate `benchmark_client` process's `--mode` into a primary/
-    /// worker's own registry, so this simply isn't called there and the gauge family
-    /// stays absent (not a misleading zero) on that path. Documented scope decision,
-    /// METRICS-NOTES.md.
+    /// tx-generation mode. `node local-benchmark` (the in-process vehicle) has it in
+    /// scope directly. The standalone `node run primary`/`node run worker` path (what
+    /// `fab remote` and docker-bench exec) has no direct view of the separate
+    /// `benchmark_client` process's `--mode`, so it now reads the harness-supplied
+    /// `Parameters::tx_mode` instead -- set by the generators (docker-bench `gen.py`),
+    /// unset (`None`) for library/production callers, in which case this is not
+    /// called and the gauge family stays absent (not a misleading zero).
     pub fn set_transaction_mode_info(&self, mode: &str) {
         self.transaction_mode_info.with_label_values(&[mode]).set(1);
     }

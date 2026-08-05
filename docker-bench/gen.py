@@ -244,6 +244,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "asynchrony_start": 20_000,
         "asynchrony_duration": 10_000,
         "protocol": args.protocol,
+        "tx_mode": args.mode,
         "max_block_payload": 16,
         "delta_ms": args.delta_ms,
         "vantage_gc_window_views": 50,
