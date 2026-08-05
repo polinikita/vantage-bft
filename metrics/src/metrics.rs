@@ -137,9 +137,16 @@ pub struct Metrics {
     pub vantage_blocks_published: IntCounter,
     /// Blocks this node received (direct publish or relayed) and cached.
     pub vantage_blocks_received: IntCounter,
-    /// Unsigned acks this node broadcast (N3).
+    /// N3 ack CONFIRMATIONS this node produced -- incremented in `LaneManager::
+    /// on_direct_pub_confirmed`, which is deliberately unaware of
+    /// `Parameters::ack_watermarks`. Under `--ack-watermarks` the per-block
+    /// `VantageAck` wire broadcast is suppressed, so this keeps counting while
+    /// nothing is sent: it is a confirmation count, NOT a wire-send count. The
+    /// watermark front-end that replaces those sends is `vantage_avail_sent`.
     pub vantage_acks_sent: IntCounter,
-    /// Unsigned acks this node counted, first-hand (N4).
+    /// Unsigned acks this node counted, first-hand (N4) -- WIRE-sourced only, so
+    /// this is structurally 0 under `--ack-watermarks` (see `vantage_acks_sent`);
+    /// the watermark equivalent is `vantage_avail_credited_refs`.
     pub vantage_acks_received: IntCounter,
     /// `request(h)` messages this node sent (N6/D2).
     pub vantage_repairs_requested: IntCounter,

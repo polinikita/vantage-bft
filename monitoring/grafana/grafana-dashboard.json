@@ -10,7 +10,7 @@
   "panels": [
     {
       "type": "stat",
-      "title": "Validators",
+      "title": "Validators (live)",
       "datasource": {
         "type": "prometheus",
         "uid": "Fixed-UID-vantage"
@@ -42,7 +42,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "count(up{node=~\"$node\",node=~\".*-worker-0$\"})",
+          "expr": "count(up{node=~\"$node\",node=~\".*-worker-0$\"} == 1) or vector(0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -118,7 +118,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "cps"
         },
         "overrides": []
       },
@@ -137,7 +137,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[1m]))",
+          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
           "legendFormat": "",
           "refId": "A"
         }
@@ -145,7 +145,7 @@
     },
     {
       "type": "stat",
-      "title": "Ordering latency p50",
+      "title": "Ordering latency p50 (median validator, cumulative)",
       "datasource": {
         "type": "prometheus",
         "uid": "Fixed-UID-vantage"
@@ -185,7 +185,7 @@
     },
     {
       "type": "stat",
-      "title": "Materialized latency p50",
+      "title": "Materialized latency p50 (median validator, cumulative)",
       "datasource": {
         "type": "prometheus",
         "uid": "Fixed-UID-vantage"
@@ -247,7 +247,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "tps",
+          "unit": "cps",
           "color": {
             "mode": "thresholds"
           },
@@ -408,12 +408,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "seals/s",
+          "expr": "max(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "views sealed/s",
           "refId": "A"
         }
       ],
-      "title": "Seal routes/s (total, all routes)",
+      "title": "Views sealed/s (max validator, all routes)",
       "type": "stat"
     },
     {
@@ -466,12 +466,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route!~\"fast_full|direct_full\"}[10s]))",
-          "legendFormat": "fallback/s",
+          "expr": "max(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route!~\"fast_full|direct_full\"}[10s])) or vector(0)",
+          "legendFormat": "fallback seals/s",
           "refId": "A"
         }
       ],
-      "title": "Fallback seal routes/s (degradation signal)",
+      "title": "Fallback seal routes/s (max validator, degradation signal)",
       "type": "stat"
     },
     {
@@ -481,7 +481,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "tps"
+          "unit": "cps"
         },
         "overrides": []
       },
@@ -518,7 +518,7 @@
         }
       ],
       "description": "One line per validator's worker-0 metrics endpoint. The node label names that validator and worker directly; no committee-wide sum is applied.",
-      "title": "Committed TPS per node",
+      "title": "Committed TPS as observed at each validator (not additive)",
       "type": "timeseries"
     },
     {
@@ -584,7 +584,7 @@
           "refId": "C"
         }
       ],
-      "description": "Submission-to-ordering cumulative p50 for each validator's worker-0 endpoint. clamp_max bounds the plot at 1,000 ms; a line on the ceiling may represent a larger raw value.",
+      "description": "Submission-to-ordering p50/p90/p99 per validator, run-cumulative (the histogram is drained without being cleared, so each point is the quantile over ALL observations so far). The y-axis is capped at 1,000 ms for readability; series above it are drawn off-scale, NOT clamped -- read the legend.",
       "title": "Ordering latency per node (p50/p90/p99, ms)",
       "type": "timeseries"
     },
@@ -651,7 +651,7 @@
           "refId": "C"
         }
       ],
-      "description": "Submission-to-ordering-and-local-payload cumulative p50 for each validator's worker-0 endpoint. clamp_max bounds the plot at 1,000 ms; a line on the ceiling may represent a larger raw value.",
+      "description": "Submission-to-ordering-and-local-payload p50/p90/p99 per validator, run-cumulative (the histogram is drained without being cleared, so each point is the quantile over ALL observations so far). The y-axis is capped at 1,000 ms for readability; series above it are drawn off-scale, NOT clamped -- read the legend.",
       "title": "Materialized latency per node (p50/p90/p99, ms)",
       "type": "timeseries"
     },
@@ -662,7 +662,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -693,12 +693,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (route) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "expr": "avg by (route) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{route}}",
           "refId": "A"
         }
       ],
-      "title": "Seal routes (rate by route) -- Vantage only",
+      "title": "Seal route mix (views/s per validator, avg)",
       "type": "timeseries"
     },
     {
@@ -740,8 +740,17 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum by (node) (latency_misses{node=~\"$node\",node=~\".*-worker-0$\"})",
-          "legendFormat": "{{node}}",
+          "legendFormat": "{{node}} total",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "latency_misses{node=~\"$node\",node=~\".*-worker-0$\"} - on(node) latency_misses_resolved{node=~\"$node\",node=~\".*-worker-0$\"}",
+          "legendFormat": "{{node}} unresolved",
+          "refId": "B"
         }
       ],
       "title": "Latency misses per node",
@@ -802,8 +811,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"})",
-          "legendFormat": "{{node}} entered_view",
+          "expr": "rate(vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"}[10s])",
+          "legendFormat": "{{node}} views entered/s",
           "refId": "A"
         },
         {
@@ -821,11 +830,20 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route=~\"anchor.*\"}[10s]))",
-          "legendFormat": "anchor/s (total)",
+          "legendFormat": "anchor seals/s (total)",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "rate(vantage_control_round{node=~\"$node\",node=~\".*-primary$\"}[10s])",
+          "legendFormat": "{{node}} control rounds/s",
+          "refId": "D"
         }
       ],
-      "description": "vantage_entered_view is a gauge (the highest view entered so far), not a counter -- rate() on it is meaningless, so refId A reads it directly rather than wrapping it in rate().",
+      "description": "All series are per-second rates. vantage_entered_view is a monotone view-number gauge, so rate() is valid and yields views entered/s; it tracks sealed/s 1:1 on a healthy run. anchor/s is empty unless a view falls back to the anchor path.",
       "title": "View entry / seal / anchor rates",
       "type": "timeseries"
     },
@@ -876,13 +894,23 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_control_round{node=~\"$node\",node=~\".*-primary$\"}",
-          "legendFormat": "{{node}} control round",
+          "expr": "vantage_own_watermark{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} wish lead",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "vantage_control_delivered_len{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_control_consume_pos{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} control-log gap",
+          "refId": "C"
         }
       ],
-      "title": "Cursor lag (entered_view - cursor_next_view) / control round",
-      "type": "timeseries"
+      "title": "View lag: cursor / wish / control-log (views)",
+      "type": "timeseries",
+      "description": "Small-integer view gaps, all near zero when healthy. cursor lag = entered but not yet output; wish lead = own wish ahead of entry; control-log gap = delivered but unconsumed control entries (a persistent gap means anchors are blocked on a missing B_w)."
     },
     {
       "datasource": {
@@ -931,8 +959,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_control_delivered_len{node=~\"$node\",node=~\".*-primary$\"}",
-          "legendFormat": "{{node}} delivered_len",
+          "expr": "vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} entered_view",
           "refId": "B"
         },
         {
@@ -940,13 +968,79 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_control_consume_pos{node=~\"$node\",node=~\".*-primary$\"}",
-          "legendFormat": "{{node}} consume_pos",
+          "expr": "vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} cursor_next_view",
           "refId": "C"
         }
       ],
-      "title": "Frontier a_i / control delivered-log len / consume pos",
-      "type": "timeseries"
+      "title": "View frontiers (pacemaker / responsive / output)",
+      "type": "timeseries",
+      "description": "All series are view numbers on one axis and should track within a few views. Sustained separation localizes a stall: entry (pacemaker) vs proposal (frontier) vs output (cursor)."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "id": 9001,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "vantage_own_watermark{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} own_watermark",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "vantage_entry_target{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} entry_target",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "vantage_omega_q{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} omega_q",
+          "refId": "C"
+        }
+      ],
+      "title": "Pacemaker wish / entry (views)",
+      "type": "timeseries",
+      "description": "Wish/entry state (exported but previously on NO panel). Healthy invariant: omega_q >= entry_target >= entered_view, own_watermark leading. A stalled omega_q under a rising own_watermark localizes the stall to PEER wishes, not this node."
     },
     {
       "collapsed": false,
@@ -958,7 +1052,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 53
       },
       "id": 22,
       "panels": [],
@@ -980,7 +1074,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 46
+        "y": 54
       },
       "id": 23,
       "options": {
@@ -1017,7 +1111,7 @@
           "refId": "B"
         }
       ],
-      "title": "Blocks published / received per node (Vantage)",
+      "title": "Blocks published / received per node (Vantage / Simple-IT)",
       "type": "timeseries"
     },
     {
@@ -1035,7 +1129,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 46
+        "y": 54
       },
       "id": 24,
       "options": {
@@ -1059,7 +1153,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum by (node) (rate(vantage_acks_sent{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} sent/s",
+          "legendFormat": "{{node}} ack confirms/s (N3)",
           "refId": "A"
         },
         {
@@ -1068,12 +1162,31 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum by (node) (rate(vantage_acks_received{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} recv/s",
+          "legendFormat": "{{node}} acks recv/s",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_avail_sent{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} avail sent/s",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_avail_credited_refs{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} avail credited/s",
+          "refId": "D"
         }
       ],
-      "title": "Acks sent / received per node (Vantage)",
-      "type": "timeseries"
+      "title": "Ack census per node: per-block acks / watermark avail (Vantage / Simple-IT)",
+      "type": "timeseries",
+      "description": "Under --ack-watermarks the per-block VantageAck broadcast is suppressed, so 'acks recv/s' is structurally 0 while 'ack confirms/s' keeps counting N3 confirmations (LaneManager is flag-unaware) -- that asymmetry is expected, not a failure. The avail_* series are the watermark front-end and are 0 when the flag is off."
     },
     {
       "datasource": {
@@ -1090,7 +1203,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 54
+        "y": 62
       },
       "id": 25,
       "options": {
@@ -1127,7 +1240,7 @@
           "refId": "B"
         }
       ],
-      "title": "Repairs requested / served per node (Vantage)",
+      "title": "Repairs requested / served per node (Vantage / Simple-IT)",
       "type": "timeseries"
     },
     {
@@ -1145,7 +1258,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 62
       },
       "id": 26,
       "options": {
@@ -1168,12 +1281,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=\"Batch\"}[10s]))",
-          "legendFormat": "batches/s",
+          "expr": "sum by (node) (rate(network_messages_sent_total{node=~\"$node\",node=~\".*-worker-0$\",type=\"Batch\"}[10s]))",
+          "legendFormat": "{{node}} batch msgs/s",
           "refId": "A"
         }
       ],
-      "title": "Batches sent/s (worker-to-worker)",
+      "title": "Batch messages sent/s per node (worker-to-worker, incl. broadcast fan-out)",
       "type": "timeseries"
     },
     {
@@ -1183,7 +1296,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "tps"
+          "unit": "cps"
         },
         "overrides": []
       },
@@ -1191,7 +1304,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 62
+        "y": 70
       },
       "id": 27,
       "options": {
@@ -1228,7 +1341,7 @@
           "refId": "B"
         }
       ],
-      "description": "submitted_transactions is client-side and additive; committed_transactions is replicated, so committed/s uses the maximum validator worker-0 rate rather than summing the committee.",
+      "description": "submitted = per-worker client ingress (additive). committed = the SAME cluster-wide committed set observed independently by every worker, so it is NOT additive -- max() is the cluster view (sum would read n-times high). Caveats: committed_transactions needs the `benchmark` cargo feature; the worker-0 filter equals the full cut only with one worker per validator; and it counts only txs whose payload was locally readable (see latency_misses).",
       "title": "Submitted vs. sequenced (committed) transactions/s",
       "type": "timeseries"
     },
@@ -1247,7 +1360,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 62
+        "y": 70
       },
       "id": 28,
       "options": {
@@ -1270,8 +1383,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p50\"})",
-          "legendFormat": "p50",
+          "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p50\"})",
+          "legendFormat": "p50 (worst node, cumulative)",
           "refId": "A"
         },
         {
@@ -1279,8 +1392,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p90\"})",
-          "legendFormat": "p90",
+          "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p90\"})",
+          "legendFormat": "p90 (worst node, cumulative)",
           "refId": "B"
         },
         {
@@ -1288,8 +1401,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p99\"})",
-          "legendFormat": "p99",
+          "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p99\"})",
+          "legendFormat": "p99 (worst node, cumulative)",
           "refId": "C"
         },
         {
@@ -1298,12 +1411,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"max\"})",
-          "legendFormat": "max",
+          "legendFormat": "max (cumulative)",
           "refId": "D"
         }
       ],
-      "title": "Proposed block size (p50/p90/p99/max, bytes, Vantage)",
-      "type": "timeseries"
+      "title": "Proposed block size, cumulative since start (p50/p90/p99/max, bytes)",
+      "type": "timeseries",
+      "description": "Values are cumulative since process start (the histogram is drained without being cleared), so a rise means 'at some point during the run' and v=max never decreases. avg-of-per-node-quantiles is not a cluster quantile, so this reports the worst node."
     },
     {
       "collapsed": false,
@@ -1315,7 +1429,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 78
       },
       "id": 29,
       "panels": [],
@@ -1337,7 +1451,7 @@
         "h": 7,
         "w": 6,
         "x": 0,
-        "y": 71
+        "y": 79
       },
       "id": 30,
       "options": {
@@ -1384,7 +1498,7 @@
         "h": 7,
         "w": 9,
         "x": 6,
-        "y": 71
+        "y": 79
       },
       "id": 34,
       "options": {
@@ -1413,7 +1527,7 @@
         }
       ],
       "description": "Per-validator CPU used by its standalone primary and worker processes, expressed as percent of one logical core and excluding the client load generator. Values may exceed 100% when a validator uses multiple cores. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
-      "title": "CPU usage (per node)",
+      "title": "CPU usage (per validator, % of one core)",
       "type": "timeseries"
     },
     {
@@ -1424,7 +1538,7 @@
       "fieldConfig": {
         "defaults": {
           "min": 0,
-          "unit": "decmbytes"
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -1432,7 +1546,7 @@
         "h": 7,
         "w": 9,
         "x": 15,
-        "y": 71
+        "y": 79
       },
       "id": 35,
       "options": {
@@ -1455,13 +1569,13 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (validator) (label_replace(process_resident_memory_bytes{node=~\"$node\"},\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\")) / 1048576",
+          "expr": "sum by (validator) (label_replace(process_resident_memory_bytes{node=~\"$node\"},\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\"))",
           "legendFormat": "{{validator}}",
           "refId": "A"
         }
       ],
       "description": "Per-validator resident memory summed across its standalone primary and worker processes, excluding the client load generator. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
-      "title": "Memory usage (per node)",
+      "title": "Memory usage (RSS, per validator)",
       "type": "timeseries"
     },
     {
@@ -1479,7 +1593,7 @@
         "h": 7,
         "w": 16,
         "x": 0,
-        "y": 78
+        "y": 86
       },
       "id": 31,
       "options": {
@@ -1525,7 +1639,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 78
+        "y": 86
       },
       "id": 32,
       "options": {
@@ -1578,7 +1692,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 85
+        "y": 93
       },
       "id": 16,
       "options": {
@@ -1619,8 +1733,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady\"}[10s]))",
-          "legendFormat": "agb",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"VantageWish\"}[10s]))",
+          "legendFormat": "pacemaker",
           "refId": "C"
         },
         {
@@ -1628,8 +1742,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"VantageWish\"}[10s]))",
-          "legendFormat": "pacemaker",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch\"}[10s]))",
+          "legendFormat": "agb",
           "refId": "D"
         },
         {
@@ -1637,7 +1751,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"HeadersRequest|Synchronize|BatchRequest\"}[10s]))",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe\"}[10s]))",
           "legendFormat": "repair",
           "refId": "E"
         },
@@ -1646,9 +1760,27 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"CompReport|ControlInit|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe\"}[10s]))",
-          "legendFormat": "control",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone\"}[10s]))",
+          "legendFormat": "resume",
           "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch\"}[10s]))",
+          "legendFormat": "control",
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe\"}[10s]))",
+          "legendFormat": "simple-it",
+          "refId": "H"
         },
         {
           "datasource": {
@@ -1657,7 +1789,7 @@
           },
           "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Vote|Certificate\"}[10s]))",
           "legendFormat": "votes-certs",
-          "refId": "G"
+          "refId": "I"
         },
         {
           "datasource": {
@@ -1666,7 +1798,7 @@
           },
           "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC\"}[10s]))",
           "legendFormat": "consensus",
-          "refId": "H"
+          "refId": "J"
         },
         {
           "datasource": {
@@ -1675,20 +1807,30 @@
           },
           "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"CertificatesRequest|ProposalHeadersRequest\"}[10s]))",
           "legendFormat": "sync",
-          "refId": "I"
+          "refId": "K"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Committed\"}[10s]))",
-          "legendFormat": "metricsplumbing",
-          "refId": "J"
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[10s]))",
+          "legendFormat": "local",
+          "refId": "L"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\"}[10s])) - sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[10s]))",
+          "legendFormat": "uncategorized (BUG if >0)",
+          "refId": "Z"
         }
       ],
       "title": "Messages/s sent by category (stacked)",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Categories cover every wire variant emitted today; the `type` label is derived automatically from the message enum, so a NEW variant would silently vanish from a stacked total -- the 'uncategorized' series is the drift guard and must stay flat at 0."
     },
     {
       "datasource": {
@@ -1712,7 +1854,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 85
+        "y": 93
       },
       "id": 17,
       "options": {
@@ -1753,8 +1895,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady\"}[10s]))",
-          "legendFormat": "agb",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"VantageWish\"}[10s]))",
+          "legendFormat": "pacemaker",
           "refId": "C"
         },
         {
@@ -1762,8 +1904,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"VantageWish\"}[10s]))",
-          "legendFormat": "pacemaker",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch\"}[10s]))",
+          "legendFormat": "agb",
           "refId": "D"
         },
         {
@@ -1771,7 +1913,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"HeadersRequest|Synchronize|BatchRequest\"}[10s]))",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe\"}[10s]))",
           "legendFormat": "repair",
           "refId": "E"
         },
@@ -1780,9 +1922,27 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"CompReport|ControlInit|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe\"}[10s]))",
-          "legendFormat": "control",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone\"}[10s]))",
+          "legendFormat": "resume",
           "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch\"}[10s]))",
+          "legendFormat": "control",
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe\"}[10s]))",
+          "legendFormat": "simple-it",
+          "refId": "H"
         },
         {
           "datasource": {
@@ -1791,7 +1951,7 @@
           },
           "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Vote|Certificate\"}[10s]))",
           "legendFormat": "votes-certs",
-          "refId": "G"
+          "refId": "I"
         },
         {
           "datasource": {
@@ -1800,7 +1960,7 @@
           },
           "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC\"}[10s]))",
           "legendFormat": "consensus",
-          "refId": "H"
+          "refId": "J"
         },
         {
           "datasource": {
@@ -1809,20 +1969,30 @@
           },
           "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"CertificatesRequest|ProposalHeadersRequest\"}[10s]))",
           "legendFormat": "sync",
-          "refId": "I"
+          "refId": "K"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Committed\"}[10s]))",
-          "legendFormat": "metricsplumbing",
-          "refId": "J"
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[10s]))",
+          "legendFormat": "local",
+          "refId": "L"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\"}[10s])) - sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[10s]))",
+          "legendFormat": "uncategorized (BUG if >0)",
+          "refId": "Z"
         }
       ],
       "title": "Bytes/s sent by category (stacked)",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Categories cover every wire variant emitted today; the `type` label is derived automatically from the message enum, so a NEW variant would silently vanish from a stacked total -- the 'uncategorized' series is the drift guard and must stay flat at 0."
     },
     {
       "datasource": {
@@ -1851,7 +2021,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 94
+        "y": 102
       },
       "id": 18,
       "options": {
@@ -1874,13 +2044,13 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(bytes_sent_total{node=~\"$node\"}) / max(committed_bytes{node=~\"$node\",node=~\".*-worker-0$\"})",
-          "legendFormat": "overhead ratio",
+          "expr": "avg(sum by (validator) (label_replace(rate(bytes_sent_total{node=~\"$node\"}[1m]),\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\"))) / max(sum by (validator) (label_replace(rate(committed_bytes{node=~\"$node\",node=~\".*-worker-[0-9]+$\"}[1m]),\"validator\",\"$1\",\"node\",\"(.*)-worker-[0-9]+\")))",
+          "legendFormat": "amplification",
           "refId": "A"
         }
       ],
-      "description": "bytes_sent_total is genuinely additive across processes; committed_bytes is replicated, so the denominator uses the maximum validator worker-0 counter rather than summing the committee.",
-      "title": "Overhead bytes per sequenced byte",
+      "description": "Per-validator amplification: bytes actually put on the wire divided by bytes sequenced. The previous form divided a COMMITTEE-WIDE numerator by a single validator, so it grew linearly with n (read 10.6 where per-validator truth was 2.65). True overhead = value - 1.",
+      "title": "Wire bytes sent per sequenced byte (per validator)",
       "type": "stat"
     },
     {
@@ -1910,7 +2080,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 94
+        "y": 102
       },
       "id": 19,
       "options": {
@@ -1933,13 +2103,13 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(bytes_sent_total{node=~\"$node\"}[10s])) / max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s])) / 512",
-          "legendFormat": "efficiency",
+          "expr": "avg(sum by (validator) (label_replace(rate(bytes_sent_total{node=~\"$node\"}[1m]),\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\"))) / max(sum by (validator) (label_replace(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-[0-9]+$\"}[1m]),\"validator\",\"$1\",\"node\",\"(.*)-worker-[0-9]+\"))) / 512",
+          "legendFormat": "B / 512B-tx",
           "refId": "A"
         }
       ],
-      "description": "bytes_sent_total is genuinely additive across processes; committed_transactions is replicated, so the denominator uses the maximum validator worker-0 rate rather than summing the committee.",
-      "title": "Bandwidth efficiency (512B-normalized)",
+      "description": "Per-validator. Higher is worse (it is amplification, not efficiency).",
+      "title": "Wire bytes sent per 512B-normalized tx (per validator)",
       "type": "stat"
     },
     {
@@ -1969,7 +2139,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 94
+        "y": 102
       },
       "id": 21,
       "options": {
@@ -2002,12 +2172,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum(rate(bytes_received_total{node=~\"$node\"}[1m]))*8",
-          "legendFormat": "received",
+          "legendFormat": "received (incl. client ingress)",
           "refId": "B"
         }
       ],
-      "title": "Network bandwidth, wire (sent / received)",
-      "type": "stat"
+      "title": "Network bandwidth, wire (committee total)",
+      "type": "stat",
+      "description": "Committee-wide totals. received exceeds sent by the client submission rate, because client->worker ingress is counted as received while the unscraped client's send is counted nowhere."
     }
   ],
   "preload": false,
