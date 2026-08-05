@@ -408,13 +408,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "expr": "quantile(0.5, sum by (node) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s])))",
           "legendFormat": "views sealed/s",
           "refId": "A"
         }
       ],
-      "title": "Views sealed/s (max validator, all routes)",
-      "type": "stat"
+      "title": "Views sealed/s (median validator, all routes)",
+      "type": "stat",
+      "description": "Median across validators. Every primary seals the same view once, so this is a per-validator view-sealing rate -- never sum it across nodes (that reads n-times high)."
     },
     {
       "datasource": {
@@ -466,12 +467,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route!~\"fast_full|direct_full\"}[10s])) or vector(0)",
+          "expr": "quantile(0.5, sum by (node) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route!~\"fast_full|direct_full\"}[10s]))) or vector(0)",
           "legendFormat": "fallback seals/s",
           "refId": "A"
         }
       ],
-      "title": "Fallback seal routes/s (max validator, degradation signal)",
+      "title": "Fallback seal routes/s (median validator, degradation signal)",
       "type": "stat"
     },
     {
@@ -693,12 +694,12 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg by (route) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "expr": "quantile by (route) (0.5, rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{route}}",
           "refId": "A"
         }
       ],
-      "title": "Seal route mix (views/s per validator, avg)",
+      "title": "Seal route mix (views/s, median validator)",
       "type": "timeseries"
     },
     {
@@ -829,8 +830,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route=~\"anchor.*\"}[10s]))",
-          "legendFormat": "anchor seals/s (total)",
+          "expr": "quantile(0.5, rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route=~\"anchor.*\"}[10s]))",
+          "legendFormat": "anchor seals/s (median validator)",
           "refId": "C"
         },
         {
