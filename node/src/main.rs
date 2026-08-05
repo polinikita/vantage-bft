@@ -382,17 +382,19 @@ async fn main() -> Result<()> {
                         ),
                 )
                 .arg(
-                    Arg::new("ack-watermarks")
-                        .long("ack-watermarks")
+                    Arg::new("no-ack-watermarks")
+                        .long("no-ack-watermarks")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "Optional, flag-gated replacement for per-block ACK broadcasts \
-                        (N3): each party periodically broadcasts one compact per-author \
-                        lane-availability watermark instead of one ack per (block, acker, \
-                        recipient). Digest-bound, so crediting still resolves to an exact \
-                        block reference before touching the shared ack aggregator. Applies \
-                        to both Vantage and Simple-IT. Off by default -- byte-identical \
-                        wire/behavior when off.",
+                            "DISABLE ack watermarks and go back to per-block ACK broadcasts \
+                        (N3). Watermarks are ON by default: each party periodically \
+                        broadcasts one compact per-author lane-availability watermark \
+                        instead of one ack per (block, acker, recipient), which cut wire \
+                        messages ~3.8x and ~8 pp CPU/node at n=20 / 1000 tx/s with no p50 \
+                        cost (they do cost ~+45 ms at very low load, where the periodic \
+                        tick dominates, and they lengthen the p99 tail). Digest-bound, so \
+                        crediting still resolves to an exact block reference. Applies to \
+                        both Vantage and Simple-IT.",
                         ),
                 )
                 .arg(
@@ -403,21 +405,21 @@ async fn main() -> Result<()> {
                         .action(ArgAction::Set)
                         .help(
                             "Ack-watermark broadcast period, ms -- irrelevant unless \
-                        --ack-watermarks is set",
+                        ack watermarks are enabled (the default)",
                         ),
                 )
                 .arg(
-                    Arg::new("digest-statements")
-                        .long("digest-statements")
+                    Arg::new("no-digest-statements")
+                        .long("no-digest-statements")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "signature-free.tex sec.8.3 'Digest-named AGB statements': every \
-                        Vantage ECHO/READY names its proposal by hash instead of carrying it \
-                        by value (the proposal itself still travels by value only in the \
-                        propose message); a receiver fetches the body on demand from a \
-                        buffered statement's own author if it doesn't already hold it. \
-                        Emission-only: reception handles both encodings unconditionally \
-                        either way. Off by default -- byte-identical wire/behavior when off.",
+                            "DISABLE digest-named AGB statements and carry proposals by value \
+                        in ECHO/READY. Digest naming is ON by default (signature-free.tex \
+                        sec.8.3): every Vantage ECHO/READY names its proposal by hash, and a \
+                        receiver fetches the body on demand from a buffered statement's own \
+                        author if it doesn't already hold it -- this halved wire bytes \
+                        (76.8 -> 38.3 MB/s at n=20 / 1000 tx/s) with p50 unchanged. \
+                        Emission-only: reception handles both encodings either way.",
                         ),
                 ),
         )

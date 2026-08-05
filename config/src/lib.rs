@@ -289,7 +289,7 @@ pub struct Parameters {
     /// `AckAggregator` data plane). `#[serde(default)]` = `false` -- byte-identical
     /// wire/behavior when off: the per-block ack broadcast is unchanged, no periodic
     /// watermark tick is even scheduled, and no `VantageAvail` message is ever sent.
-    #[serde(default)]
+    #[serde(default = "default_ack_watermarks")]
     pub ack_watermarks: bool,
     /// The ack-watermark broadcast period, in ms -- irrelevant when `ack_watermarks`
     /// is off. `#[serde(default)]` (50ms) keeps every pre-existing parameter file
@@ -311,7 +311,7 @@ pub struct Parameters {
     /// observable way. Committee-wide consistent by construction, same reasoning as
     /// `ack_watermarks`: every node's `Parameters` comes from the
     /// same generated config.
-    #[serde(default)]
+    #[serde(default = "default_digest_statements")]
     pub digest_statements: bool,
 
     /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
@@ -605,6 +605,21 @@ fn default_batch_messages() -> bool {
     true
 }
 
+/// ON by default since the n=20 / 1000 tx/s measurement (HANDOFF section 27):
+/// watermarks cut wire messages ~3.8x and ~8 pp CPU per node at no p50 cost
+/// (they cost ~+45 ms only at very low load, where the 50 ms tick dominates).
+/// `--no-ack-watermarks` restores per-block acks.
+fn default_ack_watermarks() -> bool {
+    true
+}
+
+/// ON by default since the same measurement: digest-named AGB statements halve
+/// wire bytes (76.8 -> 38.3 MB/s at n=20 / 1000 tx/s) with p50 unchanged.
+/// `--no-digest-statements` restores value-carrying statements.
+fn default_digest_statements() -> bool {
+    true
+}
+
 fn default_batch_max_bytes() -> usize {
     65_536
 }
@@ -890,9 +905,9 @@ impl Default for Parameters {
             gc_depth: 50,
             vantage_gc_window_views: default_vantage_gc_window_views(),
             simpleit_gc_window_rounds: default_simpleit_gc_window_rounds(),
-            ack_watermarks: false,
+            ack_watermarks: default_ack_watermarks(),
             ack_watermark_period_ms: default_ack_watermark_period_ms(),
-            digest_statements: false,
+            digest_statements: default_digest_statements(),
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,

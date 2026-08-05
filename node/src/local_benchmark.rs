@@ -264,13 +264,13 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         delta_ms, max_batch_delay_ms, max_header_delay_ms
     );
     println!("Data dir: {}", data_dir.display());
-    if matches.get_flag("ack-watermarks") {
+    if !matches.get_flag("no-ack-watermarks") {
         println!(
             "Ack watermarks: ON (periodic per-lane availability broadcast every {} ms, replaces per-block acks)",
             ack_watermark_period_ms
         );
     }
-    if matches.get_flag("digest-statements") {
+    if !matches.get_flag("no-digest-statements") {
         println!(
             "Digest-named AGB statements: ON (Vantage ECHO/READY name their proposal by hash instead of by value)"
         );
@@ -366,9 +366,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
         // behavior when off.
         all_to_all: matches.get_flag("all-to-all"),
-        ack_watermarks: matches.get_flag("ack-watermarks"),
+        ack_watermarks: !matches.get_flag("no-ack-watermarks"),
         ack_watermark_period_ms,
-        digest_statements: matches.get_flag("digest-statements"),
+        digest_statements: !matches.get_flag("no-digest-statements"),
         withhold_senders: withhold,
         // Data-plane withholding fault injector, time-windowed variant:
         // `withhold_at_ms`/`withhold_for_ms` are meaningless/unused whenever

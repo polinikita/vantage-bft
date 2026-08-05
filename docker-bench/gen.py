@@ -249,9 +249,9 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "delta_ms": args.delta_ms,
         "vantage_gc_window_views": 50,
         "simpleit_gc_window_rounds": 50,
-        "ack_watermarks": args.ack_watermarks,
+        "ack_watermarks": not args.no_ack_watermarks,
         "ack_watermark_period_ms": args.ack_watermark_period_ms,
-        "digest_statements": args.digest_statements,
+        "digest_statements": not args.no_digest_statements,
         # Explicit Some(0), not absent/null, REGARDLESS of --no-latency: real one-way
         # delay (when enabled) comes from tc netem, not from this process, so the
         # in-process aws_rtt default (`node run`'s own fallback whenever this key is
@@ -470,9 +470,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--batch-max-bytes", type=int, default=65536)
     p.add_argument("--batch-max-delay-ms", type=int, default=5)
     p.add_argument("--all-to-all", action="store_true")
-    p.add_argument("--ack-watermarks", action="store_true")
+    p.add_argument("--no-ack-watermarks", action="store_true",
+               help="disable periodic availability watermarks (ON by default)")
     p.add_argument("--ack-watermark-period-ms", type=int, default=50)
-    p.add_argument("--digest-statements", action="store_true")
+    p.add_argument("--no-digest-statements", action="store_true",
+               help="disable digest-named AGB statements (ON by default)")
     p.add_argument("--no-reconnect-replay", action="store_true",
                    help="Measurement ablation KNOB 1: disable the server-floored "
                         "volatile one-shot replay mechanism (outbox + Hello/Done "

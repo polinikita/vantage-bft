@@ -77,7 +77,7 @@ docker compose -f docker-compose.yml down
 `--nodes`/`--rate`/`--duration`/`--protocol` are handled by both `run.sh` and `gen.py`;
 every other `gen.py` flag (`--tx-size`, `--mode`, `--no-latency`, `--withhold[-at|-for]`,
 `--delta-ms`, `--max-batch-delay-ms`, `--max-header-delay-ms`, `--all-to-all`,
-`--ack-watermarks[-period-ms]`, `--digest-statements`, `--no-batch-messages`,
+`--no-ack-watermarks`, `--ack-watermark-period-ms`, `--no-digest-statements`, `--no-batch-messages`,
 `--batch-max-bytes`, `--batch-max-delay-ms`) passes straight through `run.sh` to
 `gen.py` and from there into `parameters.json` -- see `python3 gen.py --help`. These
 mirror `node local-benchmark`'s own flag names/semantics one-for-one (they set the same
