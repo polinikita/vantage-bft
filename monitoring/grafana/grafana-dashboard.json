@@ -408,7 +408,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(vantage_seals{node=~\"$node\"}[10s]))",
+          "expr": "sum(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "seals/s",
           "refId": "A"
         }
@@ -466,7 +466,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(vantage_seals{node=~\"$node\",route!~\"fast_full|direct_full\"}[10s]))",
+          "expr": "sum(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route!~\"fast_full|direct_full\"}[10s]))",
           "legendFormat": "fallback/s",
           "refId": "A"
         }
@@ -693,7 +693,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (route) (rate(vantage_seals{node=~\"$node\"}[10s]))",
+          "expr": "sum by (route) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{route}}",
           "refId": "A"
         }
@@ -739,7 +739,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (latency_misses{node=~\"$node\"})",
+          "expr": "sum by (node) (latency_misses{node=~\"$node\",node=~\".*-worker-0$\"})",
           "legendFormat": "{{node}}",
           "refId": "A"
         }
@@ -802,7 +802,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (vantage_entered_view{node=~\"$node\"})",
+          "expr": "sum by (node) (vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"})",
           "legendFormat": "{{node}} entered_view",
           "refId": "A"
         },
@@ -811,7 +811,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_seals{node=~\"$node\"}[10s]))",
+          "expr": "sum by (node) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{node}} sealed/s",
           "refId": "B"
         },
@@ -820,7 +820,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(vantage_seals{node=~\"$node\",route=~\"anchor.*\"}[10s]))",
+          "expr": "sum(rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route=~\"anchor.*\"}[10s]))",
           "legendFormat": "anchor/s (total)",
           "refId": "C"
         }
@@ -867,7 +867,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_entered_view{node=~\"$node\"} - on(node) vantage_cursor_next_view{node=~\"$node\"}",
+          "expr": "vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"}",
           "legendFormat": "{{node}} cursor lag",
           "refId": "A"
         },
@@ -876,7 +876,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_control_round{node=~\"$node\"}",
+          "expr": "vantage_control_round{node=~\"$node\",node=~\".*-primary$\"}",
           "legendFormat": "{{node}} control round",
           "refId": "B"
         }
@@ -922,7 +922,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_frontier_a_i{node=~\"$node\"}",
+          "expr": "vantage_frontier_a_i{node=~\"$node\",node=~\".*-primary$\"}",
           "legendFormat": "{{node}} frontier a_i",
           "refId": "A"
         },
@@ -931,7 +931,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_control_delivered_len{node=~\"$node\"}",
+          "expr": "vantage_control_delivered_len{node=~\"$node\",node=~\".*-primary$\"}",
           "legendFormat": "{{node}} delivered_len",
           "refId": "B"
         },
@@ -940,7 +940,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_control_consume_pos{node=~\"$node\"}",
+          "expr": "vantage_control_consume_pos{node=~\"$node\",node=~\".*-primary$\"}",
           "legendFormat": "{{node}} consume_pos",
           "refId": "C"
         }
@@ -1473,7 +1473,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_blocks_published{node=~\"$node\"}[10s]))",
+          "expr": "sum by (node) (rate(vantage_blocks_published{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{node}} published/s",
           "refId": "A"
         },
@@ -1482,7 +1482,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_blocks_received{node=~\"$node\"}[10s]))",
+          "expr": "sum by (node) (rate(vantage_blocks_received{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{node}} received/s",
           "refId": "B"
         }
@@ -1528,7 +1528,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_acks_sent{node=~\"$node\"}[10s]))",
+          "expr": "sum by (node) (rate(vantage_acks_sent{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{node}} sent/s",
           "refId": "A"
         },
@@ -1537,7 +1537,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_acks_received{node=~\"$node\"}[10s]))",
+          "expr": "sum by (node) (rate(vantage_acks_received{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{node}} recv/s",
           "refId": "B"
         }
@@ -1583,7 +1583,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_repairs_requested{node=~\"$node\"}[10s]))",
+          "expr": "sum by (node) (rate(vantage_repairs_requested{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{node}} requested/s",
           "refId": "A"
         },
@@ -1592,7 +1592,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum by (node) (rate(vantage_repairs_served{node=~\"$node\"}[10s]))",
+          "expr": "sum by (node) (rate(vantage_repairs_served{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{node}} served/s",
           "refId": "B"
         }
@@ -1684,7 +1684,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(submitted_transactions{node=~\"$node\"}[10s]))",
+          "expr": "sum(rate(submitted_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
           "legendFormat": "submitted/s",
           "refId": "A"
         },
@@ -1740,7 +1740,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",v=\"p50\"})",
+          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p50\"})",
           "legendFormat": "p50",
           "refId": "A"
         },
@@ -1749,7 +1749,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",v=\"p90\"})",
+          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p90\"})",
           "legendFormat": "p90",
           "refId": "B"
         },
@@ -1758,7 +1758,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",v=\"p99\"})",
+          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p99\"})",
           "legendFormat": "p99",
           "refId": "C"
         },
@@ -1767,7 +1767,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(proposed_block_size_bytes{node=~\"$node\",v=\"max\"})",
+          "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"max\"})",
           "legendFormat": "max",
           "refId": "D"
         }
@@ -1972,7 +1972,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "100 * rate(utilization_timer{node=~\"$node\"}[10s]) / 1e6",
+          "expr": "100 * rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[10s]) / 1e6",
           "legendFormat": "{{node}} {{proc}}",
           "refId": "A"
         }
@@ -2018,7 +2018,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "core_queue_length{node=~\"$node\"}",
+          "expr": "core_queue_length{node=~\"$node\",node=~\".*-primary$\"}",
           "legendFormat": "{{node}}",
           "refId": "A"
         }
