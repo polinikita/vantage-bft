@@ -4,7 +4,9 @@
 // (f+1=2, 2f+1=3), equal stake -- `test_committee()`.
 
 use super::common::*;
-use crate::vantage::agb::{Echo, EchoOut, Ready, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal};
+use crate::vantage::agb::{
+    Echo, EchoOut, Ready, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal,
+};
 use crate::vantage::Effect;
 
 /// PHASE7: this file only ever drives the `Single` path (never

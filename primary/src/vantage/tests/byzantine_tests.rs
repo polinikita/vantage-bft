@@ -1308,9 +1308,9 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
     // same way `dispatch`'s response arms retry via `recheck_all` in production.
     let effects3 = agb.recheck_all(now, &mut lm, &mut rep);
     assert!(
-        effects3
-            .iter()
-            .any(|e| matches!(e, Effect::BroadcastEcho(EchoOut::Single(echo)) if echo.proposal.view == 4)),
+        effects3.iter().any(
+            |e| matches!(e, Effect::BroadcastEcho(EchoOut::Single(echo)) if echo.proposal.view == 4)
+        ),
         "once the lock releases, the carrying view's Core(1,...) entry must pass MetaOK and echo"
     );
 }

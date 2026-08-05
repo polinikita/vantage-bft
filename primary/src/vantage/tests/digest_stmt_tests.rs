@@ -90,7 +90,13 @@ async fn digest_ready_with_body_held_matches_by_value_transitions() {
     let mut rep_a = dummy_repairer(name_a, ".db_test_digest_equiv_a");
     let (mut lm_a, _store_a) = new_lane_manager(name_a, ".db_test_digest_equiv_a_lm");
     let proposer = agb_a.proposer(1);
-    agb_a.on_propose(proposer, proposal.clone(), Instant::now(), &mut lm_a, &mut rep_a);
+    agb_a.on_propose(
+        proposer,
+        proposal.clone(),
+        Instant::now(),
+        &mut lm_a,
+        &mut rep_a,
+    );
 
     // Engine B: identically seeded (the same by-value propose, so the body is
     // already `Fixed` -- held -- by the time any digest statement arrives), but
@@ -100,11 +106,20 @@ async fn digest_ready_with_body_held_matches_by_value_transitions() {
     let mut agb_b = new_agb_engine(name_b);
     let mut rep_b = dummy_repairer(name_b, ".db_test_digest_equiv_b");
     let (mut lm_b, _store_b) = new_lane_manager(name_b, ".db_test_digest_equiv_b_lm");
-    agb_b.on_propose(proposer, proposal.clone(), Instant::now(), &mut lm_b, &mut rep_b);
+    agb_b.on_propose(
+        proposer,
+        proposal.clone(),
+        Instant::now(),
+        &mut lm_b,
+        &mut rep_b,
+    );
     let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
 
     for (sender, _) in all.iter().take(3) {
-        let e_a = agb_a.on_ready(ready_msg(proposal.clone(), ReadyGrade::One, *sender), &mut rep_a);
+        let e_a = agb_a.on_ready(
+            ready_msg(proposal.clone(), ReadyGrade::One, *sender),
+            &mut rep_a,
+        );
         let msg = ReadyDigest {
             view: 1,
             digest: digest.clone(),
@@ -152,7 +167,13 @@ async fn cross_encoding_one_shot_value_then_digest() {
     let mut rep = dummy_repairer(name, ".db_test_digest_oneshot_fwd");
     let (mut lm, _store) = new_lane_manager(name, ".db_test_digest_oneshot_fwd_lm");
     let proposer = agb.proposer(1);
-    agb.on_propose(proposer, proposal.clone(), Instant::now(), &mut lm, &mut rep);
+    agb.on_propose(
+        proposer,
+        proposal.clone(),
+        Instant::now(),
+        &mut lm,
+        &mut rep,
+    );
     let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
 
     agb.on_echo(echo_msg(proposal.clone(), 1, sender), &mut rep);
@@ -229,7 +250,13 @@ async fn cross_encoding_one_shot_digest_then_value() {
     // completely separate path (exactly as if it had come over the wire
     // untranslated) -- first the body itself is fixed (as `on_propose` requires).
     let proposer = agb.proposer(1);
-    agb.on_propose(proposer, proposal.clone(), Instant::now(), &mut lm, &mut rep);
+    agb.on_propose(
+        proposer,
+        proposal.clone(),
+        Instant::now(),
+        &mut lm,
+        &mut rep,
+    );
     agb.on_echo(echo_msg(proposal.clone(), 1, sender), &mut rep);
     assert_eq!(
         agb.echo_grade1_count_for(1, &proposal.c, &proposal.t),
@@ -249,7 +276,11 @@ async fn cross_encoding_one_shot_digest_then_value() {
         1,
         "still exactly 1 -- the buffered copy must never double-count"
     );
-    assert_eq!(digest_stmts.buffered_echo_count_for_test(1), 0, "drained either way");
+    assert_eq!(
+        digest_stmts.buffered_echo_count_for_test(1),
+        0,
+        "drained either way"
+    );
 }
 
 // ============================================================== Requirement 4:
@@ -282,8 +313,15 @@ async fn buffered_readies_wait_for_body_then_drain_on_serve() {
             wish: 0,
         };
         let effects = digest_stmts.on_ready_digest(msg, Instant::now(), &mut agb, &mut rep);
-        assert_eq!(completed_count(&effects), 0, "buffered-only statements must never complete");
-        assert!(sealed_effects(&effects).is_empty(), "buffered-only statements must never seal");
+        assert_eq!(
+            completed_count(&effects),
+            0,
+            "buffered-only statements must never complete"
+        );
+        assert!(
+            sealed_effects(&effects).is_empty(),
+            "buffered-only statements must never seal"
+        );
         for e in &effects {
             if let Effect::BodyFetchTo(peer, v, d) = e {
                 assert_eq!(*v, 1);
@@ -324,7 +362,11 @@ async fn buffered_readies_wait_for_body_then_drain_on_serve() {
     assert!(matches!(&sealed[0], Outcome::Full(c, t) if *c == proposal.c && *t == proposal.t));
     assert!(agb.completed_for_test(1).is_some());
     assert!(agb.sealed_for_test(1).is_some());
-    assert_eq!(digest_stmts.buffered_ready_count_for_test(1), 0, "fully drained");
+    assert_eq!(
+        digest_stmts.buffered_ready_count_for_test(1),
+        0,
+        "fully drained"
+    );
 
     // CRITICAL: serving must never mark the proposal as directly received from the
     // proposer -- `AgbEngine::fixed_proposal` (the ONLY direct-receipt/rho_i marker
@@ -380,7 +422,10 @@ async fn mismatched_serve_rejected_fetch_retried() {
     assert_ne!(wrong_digest, true_digest);
 
     let rejected = digest_stmts.on_body_serve(1, wrong_proposal, &mut agb, &mut rep);
-    assert!(rejected.is_empty(), "a wrong-digest serve must be rejected outright");
+    assert!(
+        rejected.is_empty(),
+        "a wrong-digest serve must be rejected outright"
+    );
     assert!(
         !digest_stmts.known_body_for_test(1, &wrong_digest),
         "the wrong body must never be memoized"
@@ -399,12 +444,13 @@ async fn mismatched_serve_rejected_fetch_retried() {
     // The original fetch is still outstanding (untouched by the rejection) -- the
     // next periodic retry re-asks the still-buffered sender.
     assert_eq!(digest_stmts.pending_fetch_count_for_test(), 1);
-    let retry_now = Instant::now() + Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1);
+    let retry_now =
+        Instant::now() + Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1);
     let retried = digest_stmts.retry_fetches(retry_now);
     assert!(
-        retried
-            .iter()
-            .any(|e| matches!(e, Effect::BodyFetchTo(peer, 1, d) if *peer == sender && *d == true_digest)),
+        retried.iter().any(
+            |e| matches!(e, Effect::BodyFetchTo(peer, 1, d) if *peer == sender && *d == true_digest)
+        ),
         "the retry must re-fan to the still-buffered sender for the still-unheld true digest"
     );
 
@@ -496,16 +542,29 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
     digest_stmts.on_body_serve(1, proposal.clone(), &mut agb, &mut rep);
     assert!(digest_stmts.known_body_for_test(1, &digest));
     assert_eq!(digest_stmts.pending_fetch_count_for_test(), 0);
-    assert_eq!(digest_stmts.buffered_echo_count_for_test(1), 0, "drained on accept");
+    assert_eq!(
+        digest_stmts.buffered_echo_count_for_test(1),
+        0,
+        "drained on accept"
+    );
 
     // fetch_answered: this party also holds view 1 by value now -- seed it
     // separately so the SERVING side (answering a peer's own fetch) is exercised
     // too, not just the fetching side above.
     let proposer = agb.proposer(1);
-    agb.on_propose(proposer, proposal.clone(), Instant::now(), &mut lm, &mut rep);
+    agb.on_propose(
+        proposer,
+        proposal.clone(),
+        Instant::now(),
+        &mut lm,
+        &mut rep,
+    );
     let (requester, _) = all[1];
     let served = digest_stmts.on_body_fetch(requester, 1, digest.clone(), &agb);
-    assert!(!served.is_empty(), "must serve its own fixed body on request");
+    assert!(
+        !served.is_empty(),
+        "must serve its own fixed body on request"
+    );
     assert_eq!(digest_stmts.fetch_answered_count_for_test(), 1);
 
     digest_stmts.gc_below(2);

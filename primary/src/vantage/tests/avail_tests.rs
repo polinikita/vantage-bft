@@ -194,7 +194,10 @@ async fn resolve_watermark_credits_reach_the_same_availability_marks_as_direct_a
             }
         }
     }
-    assert!(lm.is_q_available(&r, validity), "two distinct senders cross f+1");
+    assert!(
+        lm.is_q_available(&r, validity),
+        "two distinct senders cross f+1"
+    );
     assert!(!lm.is_q_available(&r, quorum), "not yet 2f+1");
 
     let entry = AvailEntry {

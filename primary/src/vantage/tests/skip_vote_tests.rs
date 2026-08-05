@@ -32,7 +32,10 @@ async fn exclusivity_vote_then_non_skip_carrier_is_refused() {
     // completes the vote gate and fires the vote.
     agb.enter(1, now, &mut lm, &mut rep);
     agb.on_echo_absolute_timer(1, &mut rep);
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .collect();
     agb.on_echo_skip(1, others[0].0);
     agb.on_echo_skip(1, others[1].0);
     let effects = agb.on_ready_timer(1);
@@ -61,7 +64,9 @@ async fn exclusivity_vote_then_non_skip_carrier_is_refused() {
     };
     let effects_w = agb.on_propose(proposer_of(4), proposal_w, now, &mut lm, &mut rep);
     assert!(
-        !effects_w.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        !effects_w
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
         "a skip-voted stance must permanently reject a later non-skip carrier"
     );
 }
@@ -84,7 +89,9 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
     agb.enter(1, now, &mut lm, &mut rep);
     agb.on_echo_absolute_timer(1, &mut rep);
     let effects = agb.on_ready_timer(1);
-    assert!(!effects.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
+    assert!(!effects
+        .iter()
+        .any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
 
     // A Full(1, c_ref, []) carrier arrives and is accepted -- own R_i(1) = NoReady
     // trivially satisfies the Full branch's own-ready check, and z(1) is still free.
@@ -101,14 +108,19 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
     };
     let effects_w = agb.on_propose(proposer_of(4), proposal_w, now, &mut lm, &mut rep);
     assert!(
-        effects_w.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        effects_w
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
         "test setup: the carrier must be accepted, claiming z(1) = NonSkip"
     );
     assert_eq!(agb.stance_for_test(1), Stance::NonSkip);
 
     // NOW complete the echo-skip quorum -- the vote gate must refuse, since z(1) is
     // no longer free.
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .collect();
     let e1 = agb.on_echo_skip(1, others[0].0);
     assert!(!e1.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
     let e2 = agb.on_echo_skip(1, others[1].0);
@@ -128,12 +140,17 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
 async fn vote_gate_requires_own_noready_first() {
     let (self_name, _) = authors()[3];
     let mut agb = new_agb_engine(self_name);
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .collect();
 
     for (sender, _) in &others {
         let effects = agb.on_echo_skip(1, *sender);
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(_))),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastSkipVote(_))),
             "own R_i(1) is still pending -- the vote gate must not fire regardless of \
              the echo-skip census"
         );
@@ -151,10 +168,15 @@ async fn vote_gate_requires_own_noready_first() {
 async fn vote_gate_requires_echo_skip_quorum() {
     let (self_name, _) = authors()[3];
     let mut agb = new_agb_engine(self_name);
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .collect();
 
     let effects = agb.on_ready_timer(1);
-    assert!(!effects.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
+    assert!(!effects
+        .iter()
+        .any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
 
     let e1 = agb.on_echo_skip(1, others[0].0);
     assert!(!e1.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
@@ -186,7 +208,9 @@ async fn vote_sent_at_most_once_per_target() {
     agb.on_ready_timer(1);
     for &sender in &others[..4] {
         let effects = agb.on_echo_skip(1, sender);
-        assert!(!effects.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
     }
     let e5 = agb.on_echo_skip(1, others[4]);
     assert!(
@@ -209,7 +233,10 @@ async fn vote_sent_at_most_once_per_target() {
 async fn quorum_seal_via_votes_first_per_author_duplicates_ignored_idempotent_with_anchor() {
     let (self_name, _) = authors()[3];
     let mut agb = new_agb_engine(self_name);
-    let others: Vec<_> = authors().into_iter().filter(|(pk, _)| *pk != self_name).collect();
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .collect();
 
     let e0 = agb.on_skip_vote(1, others[0].0);
     assert!(!e0.iter().any(|e| matches!(e, Effect::Sealed(..))));
@@ -282,7 +309,9 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     };
     let effects4 = agb.on_propose(proposer_of(4), proposal4, now, &mut lm, &mut rep);
     assert!(
-        effects4.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        effects4
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
         "test setup: the Full entry must be accepted"
     );
     assert_eq!(agb.stance_for_test(1), Stance::NonSkip);
@@ -298,7 +327,9 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     };
     let effects5 = agb.on_propose(proposer_of(5), proposal5, now, &mut lm, &mut rep);
     assert!(
-        effects5.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        effects5
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
         "a skip entry must be accepted regardless of z(1) = NonSkip"
     );
     assert_eq!(
@@ -319,7 +350,9 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     };
     let effects6 = agb.on_propose(proposer_of(6), proposal6, now, &mut lm, &mut rep);
     assert!(
-        effects6.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        effects6
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
         "z(1) = NonSkip must be reusable by a later non-skip carrier"
     );
     assert_eq!(agb.stance_for_test(1), Stance::NonSkip);
@@ -354,7 +387,9 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
     };
     let effects = agb.on_propose(proposer_of(1), proposal.clone(), now, &mut lm, &mut rep);
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastEcho(_))),
         "test setup: own positive gate must fire"
     );
     let others: Vec<_> = authors()
@@ -389,7 +424,8 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
     for (sender, _) in others.iter().take(3) {
         let e = agb.on_echo_skip(1, *sender);
         assert!(
-            !e.iter().any(|eff| matches!(eff, Effect::BroadcastSkipVote(_))),
+            !e.iter()
+                .any(|eff| matches!(eff, Effect::BroadcastSkipVote(_))),
             "a party that went ready can never satisfy the vote gate"
         );
     }
@@ -427,7 +463,11 @@ async fn integration_silent_proposer_view_seals_via_votes_with_zero_control_log_
     let dead_idx = nodes.iter().position(|n| n.name == dead_name).unwrap();
     nodes[dead_idx].alive = false;
     let live: Vec<usize> = (0..nodes.len()).filter(|&i| i != dead_idx).collect();
-    assert_eq!(live.len(), 3, "n=4, f=1 -- exactly 2f+1=3 correct parties remain");
+    assert_eq!(
+        live.len(),
+        3,
+        "n=4, f=1 -- exactly 2f+1=3 correct parties remain"
+    );
 
     boot(&mut nodes, now, &mut outbox).await;
     let theta_echo = nodes[live[0]].agb.theta_echo();

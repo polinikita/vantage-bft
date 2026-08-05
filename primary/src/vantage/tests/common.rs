@@ -150,7 +150,11 @@ pub fn new_repairer(name: PublicKey, lm: &LaneManager) -> Repairer {
 
 /// PHASE7: `new_repairer`'s generalization over an arbitrary committee -- see
 /// `new_agb_engine_with_committee`'s identical rationale.
-pub fn new_repairer_with_committee(name: PublicKey, lm: &LaneManager, committee: Committee) -> Repairer {
+pub fn new_repairer_with_committee(
+    name: PublicKey,
+    lm: &LaneManager,
+    committee: Committee,
+) -> Repairer {
     Repairer::new(
         name,
         committee,

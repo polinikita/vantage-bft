@@ -55,7 +55,11 @@ fn setup_engine(
     committee: &Committee,
     name: PublicKey,
     path: &str,
-) -> (AgbEngine, crate::vantage::lanes::LaneManager, crate::vantage::repair::Repairer) {
+) -> (
+    AgbEngine,
+    crate::vantage::lanes::LaneManager,
+    crate::vantage::repair::Repairer,
+) {
     let agb = new_agb_engine_with_committee(name, committee.clone());
     let (lm, _store) = new_lane_manager_with_committee(name, path, committee.clone());
     let rep = new_repairer_with_committee(name, &lm, committee.clone());
@@ -101,7 +105,9 @@ async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
         agb.enter(5, now, &mut lm, &mut rep);
         let effects = agb.on_propose_batch(carrier_sender, proposal, now, &mut lm, &mut rep);
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastEcho(_))),
             "the positive gate must NOT fire while coordinate 2 (u=2) is refusable"
         );
         // The Δ-fallback re-checks the identical conjunction -- it must echo-SKIP the
@@ -114,7 +120,9 @@ async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
             "the fallback must echo-skip the whole carrying view"
         );
         assert!(
-            !effects2.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+            !effects2
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastEcho(_))),
             "a refused vector must never partially echo"
         );
     }
@@ -137,7 +145,9 @@ async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
         agb.enter(5, now, &mut lm, &mut rep);
         let effects = agb.on_propose_batch(carrier_sender, proposal, now, &mut lm, &mut rep);
         assert!(
-            effects.iter().any(|e| matches!(e, Effect::BroadcastEcho(_))),
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastEcho(_))),
             "once every coordinate passes MetaOK, the positive gate must fire"
         );
     }
@@ -146,7 +156,8 @@ async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
 // ============================================================ Anchor batch application
 
 #[tokio::test]
-async fn anchor_batch_application_resolves_two_targets_in_one_apply_and_ignores_a_later_duplicate() {
+async fn anchor_batch_application_resolves_two_targets_in_one_apply_and_ignores_a_later_duplicate()
+{
     let (committee, keys) = batch_committee(9330);
     let name = keys[3].name;
     let sid = block::session_id(&committee);
@@ -200,7 +211,12 @@ async fn anchor_batch_application_resolves_two_targets_in_one_apply_and_ignores_
         "round 1 must have RB-delivered + marked safe by now"
     );
 
-    let committers: Vec<PublicKey> = others.iter().copied().filter(|pk| *pk != name).take(4).collect();
+    let committers: Vec<PublicKey> = others
+        .iter()
+        .copied()
+        .filter(|pk| *pk != name)
+        .take(4)
+        .collect();
     for &pk in &committers {
         effects.extend(control.on_control_commit(pk, 1));
     }
@@ -254,7 +270,12 @@ async fn anchor_batch_application_resolves_two_targets_in_one_apply_and_ignores_
     for &pk in &readiers2 {
         effects2.extend(control.on_control_ready(pk, cp2.clone()));
     }
-    let committers2: Vec<PublicKey> = others.iter().copied().filter(|pk| *pk != name).take(4).collect();
+    let committers2: Vec<PublicKey> = others
+        .iter()
+        .copied()
+        .filter(|pk| *pk != name)
+        .take(4)
+        .collect();
     for &pk in &committers2 {
         effects2.extend(control.on_control_commit(pk, round2));
     }

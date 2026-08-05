@@ -154,8 +154,10 @@ async fn crash_fault_dead_proposer_view_seals_via_grounded_skip_vote() {
         let agb = &node.agb;
         let control = &node.control;
         let resolved = |u: crate::primary::View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-        node.resolver.decide(agb, carrying_view, entry_instant, resolved);
-        node.resolver.decide(agb, carrying_view, entry_instant, resolved)
+        node.resolver
+            .decide(agb, carrying_view, entry_instant, resolved);
+        node.resolver
+            .decide(agb, carrying_view, entry_instant, resolved)
     };
     assert_eq!(
         m, None,

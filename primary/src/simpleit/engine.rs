@@ -527,7 +527,12 @@ impl CutEngine {
     /// goes through `handle_timeout` (not `process_timeout` directly -- that direct
     /// path is reserved for `process_cut_timer`'s own locally-generated timeout,
     /// exactly as upstream keeps the two named entry points distinct).
-    pub fn handle(&mut self, inbound: Inbound, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
+    pub fn handle(
+        &mut self,
+        inbound: Inbound,
+        tips: &Cut,
+        oracle: &dyn TipOracle,
+    ) -> Vec<CutEffect> {
         match inbound {
             Inbound::CutProposal(p) => self.process_cut_proposal(p, tips, oracle),
             Inbound::CutVote(v) => self.process_cut_vote(v, tips, oracle),
@@ -731,7 +736,12 @@ impl CutEngine {
     /// second echo round that actually reaches `mark_cut_safe`. See the module doc
     /// comment's "BRACHA VARIANT" paragraph for the full mechanism and upstream
     /// citation.
-    pub fn process_cut_vote(&mut self, vote: CutVote, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
+    pub fn process_cut_vote(
+        &mut self,
+        vote: CutVote,
+        tips: &Cut,
+        oracle: &dyn TipOracle,
+    ) -> Vec<CutEffect> {
         if vote.verify(&self.committee).is_err() {
             return Vec::new();
         }
@@ -812,7 +822,12 @@ impl CutEngine {
     /// Opt-configured committee -- `config::Protocol` selects exactly one variant for
     /// an entire run -- but a stray/Byzantine `CutReady` should not be able to make an
     /// Opt engine take a Bracha-shaped path it was never configured to run).
-    pub fn process_cut_ready(&mut self, ready: CutReady, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
+    pub fn process_cut_ready(
+        &mut self,
+        ready: CutReady,
+        tips: &Cut,
+        oracle: &dyn TipOracle,
+    ) -> Vec<CutEffect> {
         if self.variant != Variant::Bracha {
             return Vec::new();
         }
@@ -964,7 +979,11 @@ impl CutEngine {
     }
 
     /// Upstream primary/src/core.rs:546-576.
-    pub fn retry_pending_cut_proposals(&mut self, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
+    pub fn retry_pending_cut_proposals(
+        &mut self,
+        tips: &Cut,
+        oracle: &dyn TipOracle,
+    ) -> Vec<CutEffect> {
         if self.pending_cut_children.is_empty() {
             return Vec::new();
         }
@@ -1235,7 +1254,11 @@ impl CutEngine {
             return Vec::new();
         }
 
-        log::info!("BENCH event=timeout_sent round={} node={:?}", round, self.name);
+        log::info!(
+            "BENCH event=timeout_sent round={} node={:?}",
+            round,
+            self.name
+        );
         let timeout = Timeout {
             round,
             author: self.name,
@@ -1267,7 +1290,13 @@ impl CutEngine {
 
         let (mut effects, maybe) = self.send_timeout_accept(round);
         if let Some((weight, timeout_cert)) = maybe {
-            effects.extend(self.handle_timeout_accept_action(round, weight, timeout_cert, tips, oracle));
+            effects.extend(self.handle_timeout_accept_action(
+                round,
+                weight,
+                timeout_cert,
+                tips,
+                oracle,
+            ));
         }
         effects
     }
@@ -1362,7 +1391,12 @@ impl CutEngine {
     /// Upstream primary/src/core.rs:1015-1017. A thin wrapper, kept distinct from
     /// `process_timeout` because upstream keeps it distinct -- see `handle`'s doc
     /// comment for which call site uses which name.
-    pub fn handle_timeout(&mut self, timeout: Timeout, tips: &Cut, oracle: &dyn TipOracle) -> Vec<CutEffect> {
+    pub fn handle_timeout(
+        &mut self,
+        timeout: Timeout,
+        tips: &Cut,
+        oracle: &dyn TipOracle,
+    ) -> Vec<CutEffect> {
         self.process_timeout(timeout, tips, oracle)
     }
 
@@ -1785,7 +1819,10 @@ mod tests {
         let effects = engine.broadcast_cut_ready(1, cut_id_a.clone(), &tips, &oracle);
         match effects.first() {
             Some(CutEffect::Broadcast(CutOut::CutReady(r))) => {
-                assert_eq!(r.cut_id, cut_id_a, "the first call for a round broadcasts CutReady");
+                assert_eq!(
+                    r.cut_id, cut_id_a,
+                    "the first call for a round broadcasts CutReady"
+                );
             }
             other => panic!("expected a CutReady broadcast first, got {other:?}"),
         }
@@ -2017,11 +2054,16 @@ mod tests {
 
             let effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
             let cut_id = find_proposal(&effects).expect("leader proposes").id();
-            assert!(!engine.safe.contains_key(&1), "n={n}: self-vote alone is not enough");
+            assert!(
+                !engine.safe.contains_key(&1),
+                "n={n}: self-vote alone is not enough"
+            );
 
             let mut others = keys.iter().filter(|k| **k != leader);
             while !engine.safe.contains_key(&1) {
-                let author = *others.next().expect("committee large enough to reach mint_threshold");
+                let author = *others
+                    .next()
+                    .expect("committee large enough to reach mint_threshold");
                 engine.process_cut_vote(
                     CutVote {
                         round: 1,
@@ -2061,7 +2103,10 @@ mod tests {
 
         let effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
         let cut_id = find_proposal(&effects).expect("leader proposes").id();
-        assert!(!engine.safe.contains_key(&1), "the leader's own self-vote alone is not enough");
+        assert!(
+            !engine.safe.contains_key(&1),
+            "the leader's own self-vote alone is not enough"
+        );
 
         let quorum = committee.quorum_threshold();
         let mut voted = 1u32; // the leader's own self-vote, above
@@ -2088,7 +2133,10 @@ mod tests {
             }
         }
 
-        assert!(engine.safe.contains_key(&1), "committee is large enough to reach mint_threshold");
+        assert!(
+            engine.safe.contains_key(&1),
+            "committee is large enough to reach mint_threshold"
+        );
         assert_eq!(engine.safe.get(&1), Some(&cut_id));
         assert!(
             voted >= quorum,
@@ -2104,11 +2152,19 @@ mod tests {
         let repeat_author = keys[0];
         let before = engine.safe.get(&1).cloned();
         engine.process_cut_vote(
-            CutVote { round: 1, cut_id: cut_id.clone(), author: repeat_author },
+            CutVote {
+                round: 1,
+                cut_id: cut_id.clone(),
+                author: repeat_author,
+            },
             &tips,
             &oracle,
         );
-        assert_eq!(engine.safe.get(&1), before.as_ref(), "a replayed vote changes nothing");
+        assert_eq!(
+            engine.safe.get(&1),
+            before.as_ref(),
+            "a replayed vote changes nothing"
+        );
     }
 
     /// REQUIRED (task): a forged notarization is impossible -- there is no message a
@@ -2188,7 +2244,11 @@ mod tests {
         let mut effects = Vec::new();
         for author in voters {
             effects = engine.process_cut_vote(
-                CutVote { round: 1, cut_id: round1_id.clone(), author },
+                CutVote {
+                    round: 1,
+                    cut_id: round1_id.clone(),
+                    author,
+                },
                 &tips,
                 &oracle,
             );
@@ -2287,12 +2347,19 @@ mod tests {
         let mut effects = Vec::new();
         for author in voters.clone() {
             effects = engine.process_cut_vote(
-                CutVote { round: 1, cut_id: round1_id.clone(), author },
+                CutVote {
+                    round: 1,
+                    cut_id: round1_id.clone(),
+                    author,
+                },
                 &tips,
                 &oracle,
             );
         }
-        assert!(engine.safe.contains_key(&1), "test setup must actually cross mint_threshold");
+        assert!(
+            engine.safe.contains_key(&1),
+            "test setup must actually cross mint_threshold"
+        );
 
         let fetches = find_fetches(&effects);
         assert!(
@@ -2594,9 +2661,12 @@ mod tests {
         // An observer distinct from round 2's leader (see the assertions below for
         // why that separation matters).
         let observer = agb::proposer(&committee, 2); // round 1's leader, used only as
-                                                      // this engine's own identity
+                                                     // this engine's own identity
         let round2_leader = agb::proposer(&committee, 3);
-        assert_ne!(observer, round2_leader, "test setup needs two distinct leaders");
+        assert_ne!(
+            observer, round2_leader,
+            "test setup needs two distinct leaders"
+        );
 
         let mut engine = CutEngine::new(observer, committee.clone(), 1_000);
 
@@ -2612,7 +2682,10 @@ mod tests {
             tips: tips.clone(),
         };
         let effects = engine.process_cut_proposal(pending_child.clone(), &tips, &oracle);
-        assert!(effects.is_empty(), "round 2 is not yet safe, nothing to do yet");
+        assert!(
+            effects.is_empty(),
+            "round 2 is not yet safe, nothing to do yet"
+        );
         assert!(
             !engine.pending_cut_children.is_empty(),
             "the round-2 proposal should be buffered pending round 1's resolution"
@@ -2628,10 +2701,9 @@ mod tests {
         // Bring in other committee members' timeouts until quorum_threshold.
         let mut others = keys.iter().filter(|k| **k != observer);
         loop {
-            if effects
-                .iter()
-                .any(|e| matches!(e, CutEffect::Broadcast(CutOut::TimeoutAccept(a)) if a.round == 1))
-            {
+            if effects.iter().any(
+                |e| matches!(e, CutEffect::Broadcast(CutOut::TimeoutAccept(a)) if a.round == 1),
+            ) {
                 break;
             }
             let author = *others.next().expect("enough members to reach quorum");
@@ -2651,8 +2723,14 @@ mod tests {
             saw_cert = engine.certified_timed_out.contains(&1);
         }
 
-        assert!(engine.certified_timed_out.contains(&1), "round 1 is certified timed out");
-        assert_eq!(engine.cut_round, 2, "cut_round should advance past the timed-out round");
+        assert!(
+            engine.certified_timed_out.contains(&1),
+            "round 1 is certified timed out"
+        );
+        assert_eq!(
+            engine.cut_round, 2,
+            "cut_round should advance past the timed-out round"
+        );
         assert!(
             engine.pending_cut_children.is_empty(),
             "the pending round-2 child should have been retried"
@@ -2719,11 +2797,7 @@ mod tests {
 
         let round1_leader = agb::proposer(&committee, 2);
         let round2_leader = agb::proposer(&committee, 3);
-        let not_round2_leader = keys
-            .iter()
-            .copied()
-            .find(|k| *k != round2_leader)
-            .unwrap();
+        let not_round2_leader = keys.iter().copied().find(|k| *k != round2_leader).unwrap();
 
         let mut engine = CutEngine::new(round1_leader, committee, 1_000);
 
@@ -2763,7 +2837,8 @@ mod tests {
             !engine.pending_cut_children.contains_key(&(2, parent_id)),
             "both siblings should have been drained from the pending queue"
         );
-        let vote = find_vote_for_round(&effects, 2).expect("the valid sibling should have been voted on");
+        let vote =
+            find_vote_for_round(&effects, 2).expect("the valid sibling should have been voted on");
         assert_eq!(vote.cut_id, valid_child_id);
     }
 
@@ -2787,20 +2862,20 @@ mod tests {
         engine
             .cut_vote_aggregators
             .insert((2, d2.clone()), CutVoteAggregator::new());
-        engine.timeouts_aggregators.insert(1, TimeoutAggregator::new());
-        engine.timeouts_aggregators.insert(2, TimeoutAggregator::new());
+        engine
+            .timeouts_aggregators
+            .insert(1, TimeoutAggregator::new());
+        engine
+            .timeouts_aggregators
+            .insert(2, TimeoutAggregator::new());
         engine
             .timeout_accept_aggregators
             .insert(1, TimeoutAcceptAggregator::new());
         engine
             .timeout_accept_aggregators
             .insert(2, TimeoutAcceptAggregator::new());
-        engine
-            .cut_proposals
-            .insert((1, d1.clone()), proposal_at(1));
-        engine
-            .cut_proposals
-            .insert((2, d2.clone()), proposal_at(2));
+        engine.cut_proposals.insert((1, d1.clone()), proposal_at(1));
+        engine.cut_proposals.insert((2, d2.clone()), proposal_at(2));
         engine
             .pending_cut_children
             .insert((1, d1.clone()), vec![proposal_at(1)]);
@@ -2898,10 +2973,16 @@ mod tests {
 
         // gc_floor moved with it -- sanitize_timeout_accept now rejects round 1.
         assert!(engine
-            .sanitize_timeout_accept(&TimeoutAccept { round: 1, author: key(1) })
+            .sanitize_timeout_accept(&TimeoutAccept {
+                round: 1,
+                author: key(1)
+            })
             .is_err());
         assert!(engine
-            .sanitize_timeout_accept(&TimeoutAccept { round: 2, author: key(1) })
+            .sanitize_timeout_accept(&TimeoutAccept {
+                round: 2,
+                author: key(1)
+            })
             .is_ok());
 
         // Idempotent / monotonic: pruning to an earlier-or-equal floor is a no-op.

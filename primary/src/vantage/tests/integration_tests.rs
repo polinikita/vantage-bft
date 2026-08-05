@@ -153,7 +153,12 @@ async fn four_party_happy_path_identical_output_with_ack_watermarks() {
     // must have reached 2f+1 (quorum) via `resolve_watermark`'s crediting.
     let quorum = test_committee().quorum_threshold();
     for (author, _) in &all {
-        let refs = nodes[0].lm.blocks_handle().lock().unwrap().author_refs(author);
+        let refs = nodes[0]
+            .lm
+            .blocks_handle()
+            .lock()
+            .unwrap()
+            .author_refs(author);
         assert_eq!(refs.len(), 1, "exactly one seeded block per author");
         assert!(
             nodes[0].lm.is_q_available(&refs[0], quorum),
