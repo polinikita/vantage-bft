@@ -2,9 +2,9 @@
 use crate::processor::SerializedBatchMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
+use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
 use crypto::{Blake3Hasher, Digest};
-use crypto::PublicKey;
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
@@ -220,8 +220,7 @@ impl BatchMaker {
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
-        let serialized =
-            bincode::serialize(&message).expect("Failed to serialize our own batch");
+        let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
         // Fable perf audit item 2: wrap the freshly-serialized `Vec<u8>` into `Bytes`
         // once (a cheap pointer/len/cap move, not a copy -- `Bytes::from(Vec<u8>)`
         // takes ownership of the existing allocation). Both consumers below then just
