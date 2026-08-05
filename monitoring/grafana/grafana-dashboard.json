@@ -1666,7 +1666,7 @@
           },
           "refId": "A",
           "legendFormat": "{{node}} cpu",
-          "expr": "100 * (sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) - sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m]))) / 1e6"
+          "expr": "(100 * (sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) - sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m]))) / 1e6) and on(node) protocol_info{protocol=\"vantage\"}"
         },
         {
           "datasource": {
@@ -1675,12 +1675,12 @@
           },
           "refId": "B",
           "legendFormat": "{{node}} waiting",
-          "expr": "100 * sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) / 1e6"
+          "expr": "(100 * sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) / 1e6) and on(node) protocol_info{protocol=\"vantage\"}"
         }
       ],
       "title": "VantageCore: CPU vs waiting (% of one core)",
       "type": "timeseries",
-      "description": "Splits the wall time on the left into the part spent computing and the part spent blocked on downstream I/O. 'waiting' is core_wait_timer, opened only around regions known to block (today: store_probe, the payload-presence round-trip through the single store actor); 'cpu' is utilization minus waiting. Reading: cpu rising toward 100 means the core task is compute-bound and more load will queue behind it; waiting rising instead means the core is starved by the store, not by its own work."
+      "description": "Splits the wall time on the left into the part spent computing and the part spent blocked on downstream I/O. 'waiting' is core_wait_timer, opened only around regions known to block (today: store_probe, the payload-presence round-trip through the single store actor); 'cpu' is utilization minus waiting. Read 'cpu' as an UPPER bound: the inbound_dispatch, effect_execution, avail_flush and resume_tick sections also await the network with no matching wait scope, so some of what lands in 'cpu' is really time in a channel send. Rising 'cpu' still means the core task is compute-bound and more load will queue behind it; rising 'waiting' means it is starved by the store instead. Filtered to protocol=vantage: the store_probe scope lives in LaneManager, which Simple-IT shares, while every utilization scope is Vantage-only -- unfiltered, a Simple-IT run would render negative cpu."
     },
     {
       "datasource": {

@@ -317,7 +317,7 @@ async fn echo_stage_one_shot_after_positive_gate() {
 
     // Re-running the gate check (as production would after any further local-state
     // change) must not send a second echo-stage statement.
-    let more = agb.recheck_all(Instant::now(), &mut lm, &mut rep);
+    let more = agb.recheck_all(&mut lm, &mut rep);
     assert!(!more
         .iter()
         .any(|e| matches!(e, Effect::BroadcastEcho(_) | Effect::BroadcastEchoSkip(_))));
@@ -440,7 +440,7 @@ async fn positive_gate_fires_when_final_enabling_event_is_an_ack() {
         lm.author_ok(&c_ref),
         "test setup: ack stake must actually cross the threshold"
     );
-    let effects = agb.recheck_all(now, &mut lm, &mut rep);
+    let effects = agb.recheck_all(&mut lm, &mut rep);
     let echo =
         echo_effect(&effects).expect("the gate must fire once the ack pushes author_ok true");
     assert_eq!(echo.grade, 1);
@@ -488,7 +488,7 @@ async fn positive_gate_fires_when_final_enabling_event_is_a_payload_ready() {
         effects.iter().any(|e| matches!(e, Effect::BroadcastAck(_))),
         "test setup: payload arrival must confirm DirectPub"
     );
-    let effects = agb.recheck_all(now, &mut lm, &mut rep);
+    let effects = agb.recheck_all(&mut lm, &mut rep);
     let echo = echo_effect(&effects)
         .expect("the gate must fire once the payload arrival makes the entry author_ok");
     assert_eq!(echo.grade, 1);

@@ -849,6 +849,13 @@ impl VantageCore {
             // Fable perf audit (measurement gap): sampled EVERY loop iteration, not
             // once/sec -- this is the only place the core is about to yield, so it is
             // the cheapest honest observation point for the backlog it leaves behind.
+            // `Receiver::len` is amortized O(1) (an Acquire load of the tail position,
+            // with an early return when empty) but tokio documents no complexity, and
+            // its `is_maybe_closed` fallback walks the block list from the head, so the
+            // worst case is O(depth / 32) pointer chases -- ~31 blocks at
+            // CHANNEL_CAPACITY = 1000. That worst case coincides with a deep backlog,
+            // i.e. exactly what this gauge exists to observe; it is a handful of cache
+            // misses against an iteration that is already doing protocol work.
             self.queue_len_peak = self.queue_len_peak.max(rx_vantage.len());
 
             // Use Tokio's fair branch selection. After a healed partition,
@@ -1099,7 +1106,7 @@ impl VantageCore {
             // `direct_pub`/`author_ok` for a C/T entry the positive gate is
             // waiting on -- re-poll it, same reasoning as the `Ack` arm.
             let mut effects = self.lm.set_payload_ready(&header_digest);
-            effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+            effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
             drop(payload_sync_timer);
             self.execute(effects, now).await;
             let _payload_sync_timer = Self::cached_utilization_timer(
@@ -1549,7 +1556,7 @@ impl VantageCore {
                 TimerKind::ReadyAbsolute => effects.extend(self.agb.on_ready_timer(view)),
             }
         }
-        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+        effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
         effects
     }
 
@@ -1752,7 +1759,7 @@ impl VantageCore {
         let mut effects = self.agb.enter(view, now, &mut self.lm, &mut self.rep);
         let activated = self.frontier.enter(view);
         for v in activated {
-            effects.extend(self.agb.activate(v, now, &mut self.lm, &mut self.rep));
+            effects.extend(self.agb.activate(v, &mut self.lm, &mut self.rep));
         }
         effects.extend(self.try_propose_effects(now));
         effects
@@ -1760,7 +1767,14 @@ impl VantageCore {
 
     fn on_ack_availability(&mut self, availability: AckAvailability, _now: Instant) -> Vec<Effect> {
         // Only the availability bookkeeping happens per ref; the resulting
-        // `recheck_all` is coalesced to once per effect drain -- see `recheck_pending`.
+        // `recheck_all` is coalesced to once per effect drain -- see `recheck_pending`
+        // and `execute`'s outer loop for why deferring it that far is sound.
+        //
+        // NOTE `LaneManager::process_ack_availability` returns an empty vec
+        // unconditionally, so on this path the coalesced recheck is the ONLY work the
+        // resulting `execute` call does. `execute` must therefore keep running its
+        // outer loop for an empty `initial`: short-circuiting on `initial.is_empty()`
+        // at any call site would silently kill the whole availability -> echo trigger.
         self.recheck_pending = true;
         self.lm.process_ack_availability(availability)
     }
@@ -1916,7 +1930,7 @@ impl VantageCore {
                     EchoOut::Single(e) => self.agb.on_echo(e, &mut self.rep),
                     EchoOut::Batch(e) => self.agb.on_echo_batch(e, &mut self.rep),
                 });
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 // Paper R1 early-wish trigger: `on_wish` above may just have raised
                 // `omega_i^+`, which can newly satisfy `v <= max(a_i+1, omega_i^+)` for
                 // an owned view this party hasn't proposed yet -- redundant/idempotent
@@ -1927,7 +1941,7 @@ impl VantageCore {
             Inbound::EchoSkip(view, sender, wish) => {
                 let mut effects = self.pacemaker.on_wish(sender, wish);
                 effects.extend(self.agb.on_echo_skip(view, sender));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
@@ -1937,14 +1951,14 @@ impl VantageCore {
                     ReadyOut::Single(r) => self.agb.on_ready(r, &mut self.rep),
                     ReadyOut::Batch(r) => self.agb.on_ready_batch(r, &mut self.rep),
                 });
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::NoReady(view, sender, wish) => {
                 let mut effects = self.pacemaker.on_wish(sender, wish);
                 effects.extend(self.agb.on_noready(view, sender));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
@@ -2007,7 +2021,7 @@ impl VantageCore {
                     &mut self.agb,
                     &mut self.rep,
                 ));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
@@ -2019,7 +2033,7 @@ impl VantageCore {
                     &mut self.agb,
                     &mut self.rep,
                 ));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
@@ -2030,7 +2044,7 @@ impl VantageCore {
                 let mut effects =
                     self.digest_stmts
                         .on_body_serve(view, proposal, &mut self.agb, &mut self.rep);
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
             }
@@ -2153,9 +2167,29 @@ impl VantageCore {
         );
         let mut queue: VecDeque<Effect> = initial.into();
         // Outer loop: drain the queue, then service any coalesced `recheck_all` ONCE and
-        // drain whatever it produced, until both are quiet. `recheck_all` is idempotent
-        // and order-independent, so this reaches the same fixpoint the old per-trigger
-        // calls did, with one scan per drain instead of one per credited ref.
+        // drain whatever it produced, until both are quiet -- one scan per drain instead
+        // of one per credited availability ref (at n=50 the old shape reached ~49k full
+        // scans/s, each O(n^2) before `tip_ok` was indexed).
+        //
+        // Termination: each non-breaking iteration flips at least one view's `echo_sent`
+        // false -> true permanently and removes it from `pending_gate`, and a passing
+        // gate always emits at least one effect, so `rechecked.is_empty()` holds exactly
+        // when nothing transitioned.
+        //
+        // Equivalence to the old per-trigger calls rests on TWO properties, only the
+        // first of which is `recheck_all`'s own. (1) Idempotence: every `recheck_gate`
+        // mutation is downstream of the gate passing, which sets `echo_sent` and drops
+        // the view from `pending_gate`, so a second call cannot re-enter. (2) The
+        // evaluation POINT moved from before the drain to after it, which is only
+        // immaterial because no effect that can be queued alongside a set
+        // `recheck_pending` mutates `AgbEngine` state: the flag is set from
+        // `Effect::BroadcastAck` and `Effect::BlockCached`, both emitted only by
+        // `LaneManager`/`Repairer`, and the co-queued lane/repair/cursor effects touch
+        // neither `views` nor `pending_gate`. `recheck_all`'s own doc comment covers the
+        // one cross-view write that does exist (`stance = NonSkip`) and why it cannot
+        // turn a passing gate into a failing one. A future `Effect` variant that reached
+        // into `AgbEngine` would break property (2) silently -- that, not idempotence,
+        // is the invariant to preserve here.
         loop {
             while let Some(effect) = queue.pop_front() {
                 match effect {
@@ -2301,7 +2335,7 @@ impl VantageCore {
                     Effect::Fixed(view, well_formed) => {
                         let activated = self.frontier.record_fixed(view, well_formed);
                         for v in activated {
-                            queue.extend(self.agb.activate(v, now, &mut self.lm, &mut self.rep));
+                            queue.extend(self.agb.activate(v, &mut self.lm, &mut self.rep));
                         }
                         queue.extend(self.try_propose_effects(now));
                         // signature-free.tex §8.3: a proposal just fixed BY VALUE may
@@ -2477,7 +2511,7 @@ impl VantageCore {
                 break;
             }
             self.recheck_pending = false;
-            let rechecked = self.agb.recheck_all(now, &mut self.lm, &mut self.rep);
+            let rechecked = self.agb.recheck_all(&mut self.lm, &mut self.rep);
             if rechecked.is_empty() {
                 break;
             }

@@ -6,20 +6,41 @@ use rocksdb::{
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::{interval, Duration};
 
-/// Flush cadence for the pending write batch. 50 ms => ~20 flushes/s, matching
-/// production starfish, which writes one application-level batch per protocol event
-/// (own proposal per round + per commit batch) rather than one per item. Before
-/// batching, this store issued one `put_opt` per key: ~2 500 writes/s per validator at
-/// n=50 (every worker persists its own AND all n-1 peers' batches, ~50 seals/s each),
-/// i.e. two orders of magnitude more disk operations than starfish for the same work.
+/// Flush cadence for the pending write batch: 50 ms => 20 `write_opt` calls per second
+/// per `Store` instance. A validator process tree holds one primary store plus one
+/// store per worker (K=1 in every benchmark configuration), so **40 batch writes per
+/// second per validator**, from two independent tickers on the same device.
+///
+/// Reference point, measured in `~/code/iota/crates/starfish`: `DagState::flush`
+/// (`core/src/dag_state.rs:2481`) issues one `WriteBatch` per own proposal
+/// (`core/src/core.rs:1212`, at `min_block_delay = 50 ms` => 20/s) plus one per commit
+/// event (`core/src/commit_observer.rs:228`, reached from `try_commit` only when
+/// leaders were actually sequenced -- the loop `break`s on `sequenced_leaders
+/// .is_empty()`, so this tracks the commit cadence, ~20/s, NOT the peer-block arrival
+/// rate), plus load-dependent transaction-sync solidification
+/// (`commit_observer.rs:522`/`:633`). ~40/s, one DB, `sync=false`.
+///
+/// Before batching, this store issued one `put_opt` per key. Every validator persists
+/// its own AND all n-1 peers' batches, and the client's burst grid is 50 ms
+/// (`node/src/client.rs:65`) so each node seals ~20 batches/s: ~780 `put_opt`/s per
+/// validator at n=20 and ~1 980/s at n=50, i.e. 20-50x more disk write operations than
+/// starfish for the same work. Note this changes the number of write OPERATIONS, not
+/// the number of key-level puts (unchanged) or the bytes written (unchanged).
 const FLUSH_INTERVAL_MS: u64 = 50;
 
 /// Memory bound on the un-flushed batch, not a rate knob: a safety valve for load
 /// spikes so `pending` cannot grow without limit between ticks. At the measured
 /// worst case (~128 MB/s of batch bytes per node at n=50 / 250k tx/s) a 50 ms window
-/// holds ~6.4 MB, so the ticker -- not this threshold -- governs the flush rate.
+/// holds ~6.4 MB, 5x under this threshold, so the ticker -- not this valve -- governs
+/// the flush rate; it would take ~670 MB/s per store to invert that.
+///
+/// PER INSTANCE, so the bound on a one-process-per-validator deployment (docker, AWS,
+/// `benchmark/`) is 2 x 32 MiB. `node/src/local_benchmark.rs` runs every node in ONE
+/// process, where the aggregate worst case is `live_nodes x (1 + workers) x 32 MiB`
+/// (3.2 GiB at n=50) -- unreachable in practice at the rates above, but the reason this
+/// constant is not raised further.
 const MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
@@ -57,7 +78,13 @@ pub enum StoreCommand {
     /// inbound block (up to `max_block_payload`), and issuing those as N separate
     /// `Read`s serialized N round-trips through this single actor -- each one
     /// queued behind whatever writes were already in the 100-slot channel.
-    ReadMany(Vec<Key>, oneshot::Sender<StoreResult<Vec<Option<Value>>>>),
+    /// Errors are per KEY, not per request: a key whose lookup fails is reported as
+    /// `None` (absent) and logged, exactly as N separate `Read`s followed by the
+    /// callers' `unwrap_or(None)` behaved before this command existed. Failing the
+    /// whole request instead would turn one bad key into "every key of this block is
+    /// missing", amplifying a transient read error into up to `max_block_payload`
+    /// spurious batch-sync requests.
+    ReadMany(Vec<Key>, oneshot::Sender<Vec<Option<Value>>>),
     NotifyRead(Key, oneshot::Sender<StoreResult<Value>>),
 }
 
@@ -90,18 +117,38 @@ impl Store {
         let (tx, mut rx) = channel(100);
         tokio::spawn(async move {
             // Writes accumulate in `pending` and land as ONE RocksDB WriteBatch per
-            // flush, so the store issues ~1000/FLUSH_INTERVAL_MS writes per second
-            // instead of one per key. This mirrors production starfish, which flushes a
-            // single application-level batch per protocol event (~20x/s) rather than
-            // per item. `pending` doubles as a read-your-writes overlay: every Read /
-            // ReadMany / NotifyRead consults it BEFORE RocksDB, so deferring the disk
-            // write is invisible to callers, and `notify_read` obligations are still
-            // resolved the moment the value is accepted (durability was already only
-            // page-cache-deep -- `set_sync(false)` -- so this changes no guarantee).
+            // flush: 1000/FLUSH_INTERVAL_MS = 20 `write_opt` calls per second instead of
+            // one per key. `pending` doubles as a read-your-writes overlay: every Read /
+            // ReadMany / NotifyRead consults it BEFORE RocksDB, and `notify_read`
+            // obligations are resolved the moment the value is accepted, so deferring
+            // the disk write is invisible to every caller WITHIN a process lifetime.
+            //
+            // ACROSS lifetimes it is not: `set_sync(false)` still put each WAL record in
+            // the kernel page cache before `put_opt` returned, where it survived a
+            // SIGKILL/`docker kill` and was replayed by WAL recovery on the next
+            // `DB::open`; a `HashMap` in this task's frame does not, and nothing here
+            // flushes on a signal (no handler exists) or on runtime drop (tokio drops
+            // tasks without polling). That IS a durability-class change, from
+            // page-cache-deep to process-memory-deep, for a window of <= 50 ms. It is
+            // unobservable in this artifact for a specific reason, not because
+            // `sync=false` made it free: no code path ever reads store state written by
+            // a PREVIOUS process lifetime. There is no replay-from-disk and no scan --
+            // `db` is private to this actor, `StoreCommand` has no iterator or delete
+            // variant, and every key ever read is a digest that arrived over the network
+            // in the same lifetime. Vantage persists no consensus state at all (headers,
+            // blocks, acks, echoes, readys, control log and the replay outbox are
+            // in-memory), `--crash` leaves nodes unspawned rather than restarting them,
+            // and the benchmark harness wipes the DB directories before every run.
             let mut pending: HashMap<Key, Value> = HashMap::new();
             let mut pending_bytes: usize = 0;
+            // Deliberately the DEFAULT `MissedTickBehavior::Burst`. `Delay` would reset
+            // the deadline to (tick completion + 50 ms) after any branch body that ran
+            // long -- a stalled `write_opt`, a cold `db.get` -- so the effective period
+            // would become (stall + 50 ms) and the schedule would drift permanently away
+            // from "flush at least every 50 ms". With `Burst` the first missed deadline
+            // fires immediately and flushes the backlog, and each additional catch-up
+            // tick is a free no-op thanks to `flush_pending`'s `is_empty` guard.
             let mut ticker = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -121,8 +168,8 @@ impl Store {
                                 pending_bytes += key.len() + value.len();
                                 pending.insert(key, value);
                                 // Safety valve only -- at benchmark rates the ticker
-                                // fires long before this, so the flush rate stays at
-                                // 1000/FLUSH_INTERVAL_MS per second.
+                                // fires long before this, so the rate stays at
+                                // 1000/FLUSH_INTERVAL_MS = 20 batch writes per second.
                                 if pending_bytes >= MAX_PENDING_BYTES {
                                     flush_pending(
                                         &db, &mut pending, &mut pending_bytes, &write_opts,
@@ -153,24 +200,21 @@ impl Store {
                                         }
                                     }
                                 }
-                                let mut failure = None;
-                                if !miss_keys.is_empty() {
-                                    for (slot, got) in
-                                        miss_idx.iter().zip(db.multi_get(&miss_keys))
-                                    {
-                                        match got {
-                                            Ok(value) => out[*slot] = value,
-                                            Err(e) => {
-                                                failure = Some(e);
-                                                break;
-                                            }
-                                        }
+                                for (slot, got) in
+                                    miss_idx.iter().zip(db.multi_get(&miss_keys))
+                                {
+                                    match got {
+                                        Ok(value) => out[*slot] = value,
+                                        // Per-key isolation -- see `ReadMany`'s doc
+                                        // comment. The slot stays `None`.
+                                        Err(e) => log::error!(
+                                            "Store read failed for one key of a batch of {}: {}",
+                                            keys.len(),
+                                            e
+                                        ),
                                     }
                                 }
-                                let _ = sender.send(match failure {
-                                    Some(e) => Err(e),
-                                    None => Ok(out),
-                                });
+                                let _ = sender.send(out);
                             }
                             StoreCommand::NotifyRead(key, sender) => {
                                 let response = match pending.get(&key) {
@@ -215,10 +259,19 @@ impl Store {
     }
 
     /// Batched counterpart of `read`: one actor round-trip for N keys, results in the
-    /// SAME order as `keys`. An empty `keys` short-circuits without touching the store.
-    pub async fn read_many(&mut self, keys: Vec<Key>) -> StoreResult<Vec<Option<Value>>> {
+    /// SAME order as `keys`, with an unreadable key reported as `None` (see
+    /// `StoreCommand::ReadMany`). An empty `keys` short-circuits without touching the
+    /// store.
+    ///
+    /// Snapshot semantics differ from N sequential `read`s in one way worth knowing:
+    /// this is ONE command on a single-task actor, so a `Write` accepted while the batch
+    /// is in flight is visible either to every key or to none, never to a suffix. The
+    /// only caller (`vantage::lanes::missing_payload`) is unaffected -- a marker landing
+    /// mid-probe just means one more entry is reported missing, and the resulting
+    /// `SyncBatches` resolves immediately from the overlay.
+    pub async fn read_many(&mut self, keys: Vec<Key>) -> Vec<Option<Value>> {
         if keys.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let (sender, receiver) = oneshot::channel();
         if let Err(e) = self
@@ -250,8 +303,18 @@ impl Store {
 
 /// Write everything buffered in `pending` as ONE atomic RocksDB batch and clear it.
 /// A no-op when nothing is buffered, mirroring starfish's `has_data_to_write` early
-/// return so idle nodes issue no disk writes at all. Still `sync=false`: this changes
-/// the number of write operations, not the durability class.
+/// return so idle nodes issue no disk writes at all (the 20 Hz task wakeup remains).
+///
+/// Panics if the write fails, matching production starfish, which does exactly this at
+/// `~/code/iota/crates/starfish/core/src/dag_state.rs:2548`
+/// (`.unwrap_or_else(|e| panic!("Failed to write to storage: {e:?}"))`). Batching makes
+/// the alternative untenable: pre-batching, a failed `put_opt` was silently ignored and
+/// lost ONE key; silently ignoring a failed batch would lose up to `MAX_PENDING_BYTES`
+/// at once, and because nothing in this codebase ever rewrites a key, every
+/// `notify_read` waiting on a lost key would hang until its own staleness pruner
+/// cancelled it, while `db.get` kept serving the pre-write value. `write_opt` with
+/// `sync=false` fails only on genuine I/O or corruption errors, which is not a
+/// recoverable condition for a validator.
 fn flush_pending(
     db: &rocksdb::DB,
     pending: &mut HashMap<Key, Value>,
@@ -266,9 +329,8 @@ fn flush_pending(
         batch.put(key, value);
     }
     *pending_bytes = 0;
-    if let Err(e) = db.write_opt(batch, write_opts) {
-        log::error!("Failed to flush store write batch: {}", e);
-    }
+    db.write_opt(batch, write_opts)
+        .unwrap_or_else(|e| panic!("Failed to write store batch to storage: {}", e));
 }
 
 /// DB-wide options shared by both profiles (starfish `rocks_store.rs::open()`, the

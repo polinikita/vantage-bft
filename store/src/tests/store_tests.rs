@@ -69,8 +69,7 @@ async fn read_many_preserves_order_and_gaps() {
             k_a.clone(),
             k_b.clone(),
         ])
-        .await
-        .unwrap();
+        .await;
     assert_eq!(
         got,
         vec![
@@ -83,7 +82,7 @@ async fn read_many_preserves_order_and_gaps() {
     );
 
     // Empty request short-circuits without touching the store.
-    assert!(store.read_many(Vec::new()).await.unwrap().is_empty());
+    assert!(store.read_many(Vec::new()).await.is_empty());
 }
 
 #[tokio::test]
@@ -100,12 +99,12 @@ async fn batched_writes_survive_the_flush() {
     }
 
     // Before any tick: served from the pending overlay.
-    let before = store.read_many(keys.clone()).await.unwrap();
+    let before = store.read_many(keys.clone()).await;
     assert!(before.iter().all(Option::is_some), "pre-flush read failed");
 
     // Let at least one flush tick fire, then read again -- now out of RocksDB.
     tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 3)).await;
-    let after = store.read_many(keys).await.unwrap();
+    let after = store.read_many(keys).await;
     assert_eq!(before, after, "values changed across the flush boundary");
     assert_eq!(after[3], Some(vec![3u8, 0xAA]));
 }

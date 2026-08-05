@@ -48,7 +48,9 @@ COLLECTOR_QUERIES = {
     'bytes_received_total': 'sum(bytes_received_total)',
     'submitted_transactions': 'sum(submitted_transactions)',
     'utilization_timer_by_proc': 'sum by (proc) (utilization_timer)',
+    'core_wait_timer_by_proc': 'sum by (proc) (core_wait_timer)',
     'core_queue_length': 'core_queue_length',
+    'core_queue_peak': 'core_queue_peak',
     'protocol_info': 'protocol_info',
     'transaction_mode_info': 'transaction_mode_info',
     # PER-RATE-POINT NIC-SATURATION CHECK: 'up' is scrape-health (which

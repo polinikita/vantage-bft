@@ -401,7 +401,7 @@ async fn meta_ok_skip_requires_own_noready_for_target() {
     // `recheck_all` (mirrors the production/harness trigger after any own-response
     // change).
     agb.on_ready_timer(1);
-    let effects = agb.recheck_all(now, &mut lm, &mut rep);
+    let effects = agb.recheck_all(&mut lm, &mut rep);
     let echo = effects
         .iter()
         .find_map(|e| match e {

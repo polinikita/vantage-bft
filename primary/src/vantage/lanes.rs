@@ -925,11 +925,13 @@ impl LaneManager {
                         .clone(),
                 )
             });
-            self.store.read_many(keys).await.unwrap_or_default()
+            self.store.read_many(keys).await
         };
         entries
             .iter()
             .enumerate()
+            // `found.len() == keys.len()` by construction; `unwrap_or(true)` is a
+            // defensive "treat as missing", never taken.
             .filter(|(i, _)| found.get(*i).map(Option::is_none).unwrap_or(true))
             .map(|(_, (digest, worker_id))| ((*digest).clone(), **worker_id))
             .collect()

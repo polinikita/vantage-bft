@@ -1306,7 +1306,7 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
 
     // The previously-blocked carrying view's own gate must now unblock, in exactly the
     // same way `dispatch`'s response arms retry via `recheck_all` in production.
-    let effects3 = agb.recheck_all(now, &mut lm, &mut rep);
+    let effects3 = agb.recheck_all(&mut lm, &mut rep);
     assert!(
         effects3.iter().any(
             |e| matches!(e, Effect::BroadcastEcho(EchoOut::Single(echo)) if echo.proposal.view == 4)

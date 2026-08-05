@@ -1207,7 +1207,7 @@ impl AgbEngine {
             }
         }
 
-        effects.extend(self.activate(view, now, lm, rep));
+        effects.extend(self.activate(view, lm, rep));
         effects
     }
 
@@ -1217,7 +1217,6 @@ impl AgbEngine {
     pub fn activate(
         &mut self,
         view: View,
-        now: Instant,
         lm: &mut LaneManager,
         rep: &mut Repairer,
     ) -> Vec<Effect> {
@@ -1237,7 +1236,7 @@ impl AgbEngine {
         if matches!(s.fixed, Fixed::Proposal(..)) && !s.echo_sent {
             self.pending_gate.insert(view);
         }
-        self.recheck_gate(view, now, lm, rep)
+        self.recheck_gate(view, lm, rep)
     }
 
     // ------------------------------------------------------------------------- R1/R2
@@ -1333,19 +1332,14 @@ impl AgbEngine {
             effects.push(Effect::ArmTimer(view, TimerKind::EchoFallback, deadline));
         }
 
-        effects.extend(self.recheck_gate(view, now, lm, rep));
+        effects.extend(self.recheck_gate(view, lm, rep));
         effects
     }
 
     /// R2's positive gate, re-evaluated whenever local state that could satisfy it
     /// changes (ack counts, payload arrivals, block cached, activation) -- call for
     /// every currently pending, active view after any such event.
-    pub fn recheck_all(
-        &mut self,
-        now: Instant,
-        lm: &mut LaneManager,
-        rep: &mut Repairer,
-    ) -> Vec<Effect> {
+    pub fn recheck_all(&mut self, lm: &mut LaneManager, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
         // Efficiency Item 2: `pending_gate` is maintained incrementally (see its
         // field doc and the `activate`/`on_propose`/`echo_sent`-site comments) to
@@ -1355,16 +1349,25 @@ impl AgbEngine {
         //       && matches!(s.fixed, Fixed::Proposal(_, _))).map(|(v, _)| *v)
         // `active`, `fixed`, and `echo_sent` are each one-shot/monotonic (active and
         // fixed only ever become true/set once; echo_sent only ever flips false ->
-        // true), so the three transition sites are exhaustive. Iteration order over
-        // a `HashSet` is just as unspecified as it was over the `HashMap` here
-        // before -- still fine, since each view's `recheck_gate` reads/writes only
-        // that view's own `ViewState` and pushes only that view's effects, so the
-        // per-view effect outcomes (and hence the concatenated `effects` content,
-        // modulo which-view's-chunk-comes-first -- already unordered before) are
-        // independent of processing order.
+        // true), so the three transition sites are exhaustive.
+        //
+        // Iteration order over a `HashSet` is just as unspecified as it was over the
+        // `HashMap` here before, and is still fine -- but NOT because each view's
+        // recheck is self-contained. It is not: `try_meta_ok` writes a DIFFERENT
+        // view's state (`state_mut(*u).stance = NonSkip` for each resolution-entry
+        // target `u`) and `meta_ok_entry` reads target views' echo/ready census, lock
+        // and seal. What makes the order immaterial is the shape of that one
+        // cross-view write: it fires only on `stance == Free`, is one-shot, and
+        // `stance_excludes` rejects only on `SkipVoted` or a sealed `Skip` -- so
+        // `Free -> NonSkip` can only ever REMOVE an exclusion, never add one. Order
+        // can therefore change which view's gate passes first within a scan, but not
+        // whether a view eventually passes; anything still un-echoed stays in
+        // `pending_gate` and is rechecked on the next trigger. The same bound is what
+        // makes `VantageCore::execute`'s coalescing (one scan per effect drain rather
+        // than one per credited availability ref) safe.
         let views: Vec<View> = self.pending_gate.iter().copied().collect();
         for view in views {
-            effects.extend(self.recheck_gate(view, now, lm, rep));
+            effects.extend(self.recheck_gate(view, lm, rep));
         }
         effects
     }
@@ -1372,7 +1375,6 @@ impl AgbEngine {
     fn recheck_gate(
         &mut self,
         view: View,
-        _now: Instant,
         lm: &mut LaneManager,
         rep: &mut Repairer,
     ) -> Vec<Effect> {

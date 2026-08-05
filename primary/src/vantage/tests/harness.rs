@@ -35,6 +35,11 @@ use std::time::Instant;
 pub struct Node {
     pub name: PublicKey,
     pub lm: LaneManager,
+    /// Mirrors `VantageCore::recheck_pending`: `recheck_all` is coalesced to once per
+    /// `drain_local` pass instead of once per credited availability ref. Kept in step
+    /// with production so every suite built on this harness exercises the SAME
+    /// evaluation point production uses -- the whole reason the flag exists.
+    pub recheck_pending: bool,
     pub ack_aggregator: SharedAckAggregator,
     pub rep: Repairer,
     pub agb: AgbEngine,
@@ -149,6 +154,7 @@ impl Node {
             digest_stmts,
             digest_statements: false,
             max_views,
+            recheck_pending: false,
             alive: true,
             timers: Vec::new(),
             control_timers: Vec::new(),
@@ -235,7 +241,7 @@ impl Node {
         let mut effects = self.agb.enter(view, now, &mut self.lm, &mut self.rep);
         let activated = self.frontier.enter(view);
         for v in activated {
-            effects.extend(self.agb.activate(v, now, &mut self.lm, &mut self.rep));
+            effects.extend(self.agb.activate(v, &mut self.lm, &mut self.rep));
         }
         effects.extend(self.try_propose_effects(now));
         effects
@@ -251,10 +257,9 @@ impl Node {
         self.pacemaker.on_wish(sender, x)
     }
 
-    fn on_ack_availability(&mut self, availability: AckAvailability, now: Instant) -> Vec<Effect> {
-        let mut effects = self.lm.process_ack_availability(availability);
-        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
-        effects
+    fn on_ack_availability(&mut self, availability: AckAvailability, _now: Instant) -> Vec<Effect> {
+        self.recheck_pending = true;
+        self.lm.process_ack_availability(availability)
     }
 
     fn record_ack(
@@ -315,13 +320,13 @@ impl Node {
                     EchoOut::Single(e) => self.agb.on_echo(e, &mut self.rep),
                     EchoOut::Batch(e) => self.agb.on_echo_batch(e, &mut self.rep),
                 });
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects
             }
             Inbound::EchoSkip(view, sender, wish) => {
                 let mut effects = self.absorb_wish(sender, wish);
                 effects.extend(self.agb.on_echo_skip(view, sender));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects
             }
             Inbound::Ready(ready) => {
@@ -330,13 +335,13 @@ impl Node {
                     ReadyOut::Single(r) => self.agb.on_ready(r, &mut self.rep),
                     ReadyOut::Batch(r) => self.agb.on_ready_batch(r, &mut self.rep),
                 });
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects
             }
             Inbound::NoReady(view, sender, wish) => {
                 let mut effects = self.absorb_wish(sender, wish);
                 effects.extend(self.agb.on_noready(view, sender));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects
             }
             Inbound::Wish(view, sender) => self.absorb_wish(sender, view),
@@ -376,7 +381,7 @@ impl Node {
                     &mut self.agb,
                     &mut self.rep,
                 ));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects
             }
             Inbound::ReadyDigest(msg) => {
@@ -387,7 +392,7 @@ impl Node {
                     &mut self.agb,
                     &mut self.rep,
                 ));
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects
             }
             Inbound::BodyFetch(view, digest, requester) => self
@@ -397,7 +402,7 @@ impl Node {
                 let mut effects =
                     self.digest_stmts
                         .on_body_serve(view, proposal, &mut self.agb, &mut self.rep);
-                effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+                effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects
             }
             // Mechanism A (`vantage::resume`): mirrors `vantage::node::VantageCore::
@@ -492,7 +497,7 @@ impl Node {
                 TimerKind::ReadyAbsolute => effects.extend(self.agb.on_ready_timer(view)),
             }
         }
-        effects.extend(self.agb.recheck_all(now, &mut self.lm, &mut self.rep));
+        effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
         effects
     }
 
@@ -527,297 +532,324 @@ pub fn drain_local(
     }
     let n = nodes.len();
     let mut queue: VecDeque<Effect> = initial.into();
-    while let Some(effect) = queue.pop_front() {
-        match effect {
-            Effect::BroadcastPublish(header) => {
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::Publish(header.author, header.clone())));
-                    }
-                }
-            }
-            Effect::BroadcastAck(ack) => {
-                // Self-ack path always runs; the fan-out to other nodes is suppressed
-                // when `ack_watermarks` is on, mirroring `VantageCore::execute`'s
-                // identical gating -- a test that turns this on must drive `avail_tick`
-                // itself to substitute the periodic watermark broadcast.
-                let ack_watermarks = nodes[idx].ack_watermarks;
-                {
-                    let node = &mut nodes[idx];
-                    queue.extend(node.record_ack(node.name, ack.reference(), now));
-                }
-                if !ack_watermarks {
+    // Same outer loop as `VantageCore::execute`: drain, then service the coalesced
+    // `recheck_all` ONCE and drain what it produced, until both are quiet.
+    loop {
+        while let Some(effect) = queue.pop_front() {
+            match effect {
+                Effect::BroadcastPublish(header) => {
                     for j in 0..n {
                         if j != idx && nodes[j].alive {
-                            outbox.push_back((j, Inbound::Ack(ack.clone())));
+                            outbox.push_back((j, Inbound::Publish(header.author, header.clone())));
                         }
                     }
                 }
-            }
-            Effect::SyncBatches(..) => {} // payloads are always empty in this harness
-            Effect::RequestTo(peer, digest) => {
-                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                    if nodes[j].alive {
-                        outbox
-                            .push_back((j, Inbound::HeadersRequest(vec![digest], nodes[idx].name)));
+                Effect::BroadcastAck(ack) => {
+                    // Self-ack path always runs; the fan-out to other nodes is suppressed
+                    // when `ack_watermarks` is on, mirroring `VantageCore::execute`'s
+                    // identical gating -- a test that turns this on must drive `avail_tick`
+                    // itself to substitute the periodic watermark broadcast.
+                    let ack_watermarks = nodes[idx].ack_watermarks;
+                    {
+                        let node = &mut nodes[idx];
+                        queue.extend(node.record_ack(node.name, ack.reference(), now));
                     }
-                }
-            }
-            Effect::ServeTo(peer, header) => {
-                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                    if nodes[j].alive {
-                        outbox.push_back((j, Inbound::Serve(header)));
-                    }
-                }
-            }
-            Effect::BlockCached(digest) => {
-                let node = &mut nodes[idx];
-                // Ack-watermark front-end: retry any watermark pending on this
-                // author, before `on_block_available` consumes `digest` by value.
-                let retried = node.lm.retry_pending_avail(&digest);
-                for (sender, r) in retried {
-                    queue.extend(node.record_ack(sender, r, now));
-                }
-                queue.extend(node.rep.on_block_available(digest));
-                queue.extend(node.agb.recheck_all(now, &mut node.lm, &mut node.rep));
-                queue.extend(node.cursor.retry());
-            }
-            Effect::BroadcastPropose(p) => {
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::Propose(p.clone())));
-                    }
-                }
-            }
-            Effect::BroadcastEcho(mut e) => {
-                e.set_wish(nodes[idx].pacemaker.own_watermark());
-                // signature-free.tex §8.3 "Digest-named AGB statements": mirrors
-                // `VantageCore::execute`'s identical emission-side translation --
-                // computed once (not per-destination), never applied to `Batch`.
-                let translated = if nodes[idx].digest_statements {
-                    match &e {
-                        EchoOut::Single(single) => Some(single.to_digest(nodes[idx].agb.sid())),
-                        EchoOut::Batch(_) => None,
-                    }
-                } else {
-                    None
-                };
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        match &translated {
-                            Some(digest_msg) => {
-                                outbox.push_back((j, Inbound::EchoDigest(digest_msg.clone())))
+                    if !ack_watermarks {
+                        for j in 0..n {
+                            if j != idx && nodes[j].alive {
+                                outbox.push_back((j, Inbound::Ack(ack.clone())));
                             }
-                            None => outbox.push_back((j, Inbound::Echo(e.clone()))),
                         }
                     }
                 }
-            }
-            Effect::BroadcastEchoSkip(view) => {
-                let sender = nodes[idx].name;
-                let wish = nodes[idx].pacemaker.own_watermark();
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::EchoSkip(view, sender, wish)));
+                Effect::SyncBatches(..) => {} // payloads are always empty in this harness
+                Effect::RequestTo(peer, digest) => {
+                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                        if nodes[j].alive {
+                            outbox.push_back((
+                                j,
+                                Inbound::HeadersRequest(vec![digest], nodes[idx].name),
+                            ));
+                        }
                     }
                 }
-            }
-            Effect::BroadcastReady(mut r) => {
-                r.set_wish(nodes[idx].pacemaker.own_watermark());
-                // signature-free.tex §8.3: mirrors `Effect::BroadcastEcho`'s
-                // identical translation immediately above.
-                let translated = if nodes[idx].digest_statements {
-                    match &r {
-                        ReadyOut::Single(single) => Some(single.to_digest(nodes[idx].agb.sid())),
-                        ReadyOut::Batch(_) => None,
+                Effect::ServeTo(peer, header) => {
+                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                        if nodes[j].alive {
+                            outbox.push_back((j, Inbound::Serve(header)));
+                        }
                     }
-                } else {
-                    None
-                };
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        match &translated {
-                            Some(digest_msg) => {
-                                outbox.push_back((j, Inbound::ReadyDigest(digest_msg.clone())))
+                }
+                Effect::BlockCached(digest) => {
+                    let node = &mut nodes[idx];
+                    // Ack-watermark front-end: retry any watermark pending on this
+                    // author, before `on_block_available` consumes `digest` by value.
+                    let retried = node.lm.retry_pending_avail(&digest);
+                    for (sender, r) in retried {
+                        queue.extend(node.record_ack(sender, r, now));
+                    }
+                    queue.extend(node.rep.on_block_available(digest));
+                    node.recheck_pending = true;
+                    queue.extend(node.cursor.retry());
+                }
+                Effect::BroadcastPropose(p) => {
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::Propose(p.clone())));
+                        }
+                    }
+                }
+                Effect::BroadcastEcho(mut e) => {
+                    e.set_wish(nodes[idx].pacemaker.own_watermark());
+                    // signature-free.tex §8.3 "Digest-named AGB statements": mirrors
+                    // `VantageCore::execute`'s identical emission-side translation --
+                    // computed once (not per-destination), never applied to `Batch`.
+                    let translated = if nodes[idx].digest_statements {
+                        match &e {
+                            EchoOut::Single(single) => Some(single.to_digest(nodes[idx].agb.sid())),
+                            EchoOut::Batch(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            match &translated {
+                                Some(digest_msg) => {
+                                    outbox.push_back((j, Inbound::EchoDigest(digest_msg.clone())))
+                                }
+                                None => outbox.push_back((j, Inbound::Echo(e.clone()))),
                             }
-                            None => outbox.push_back((j, Inbound::Ready(r.clone()))),
                         }
                     }
                 }
-            }
-            Effect::BroadcastNoReady(view) => {
-                let sender = nodes[idx].name;
-                let wish = nodes[idx].pacemaker.own_watermark();
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::NoReady(view, sender, wish)));
+                Effect::BroadcastEchoSkip(view) => {
+                    let sender = nodes[idx].name;
+                    let wish = nodes[idx].pacemaker.own_watermark();
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::EchoSkip(view, sender, wish)));
+                        }
                     }
                 }
-            }
-            // No wish piggyback, unlike `BroadcastEchoSkip`/`BroadcastNoReady` above.
-            Effect::BroadcastSkipVote(view) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::SkipVote(view, sender)));
+                Effect::BroadcastReady(mut r) => {
+                    r.set_wish(nodes[idx].pacemaker.own_watermark());
+                    // signature-free.tex §8.3: mirrors `Effect::BroadcastEcho`'s
+                    // identical translation immediately above.
+                    let translated = if nodes[idx].digest_statements {
+                        match &r {
+                            ReadyOut::Single(single) => {
+                                Some(single.to_digest(nodes[idx].agb.sid()))
+                            }
+                            ReadyOut::Batch(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            match &translated {
+                                Some(digest_msg) => {
+                                    outbox.push_back((j, Inbound::ReadyDigest(digest_msg.clone())))
+                                }
+                                None => outbox.push_back((j, Inbound::Ready(r.clone()))),
+                            }
+                        }
                     }
                 }
-            }
-            Effect::BroadcastWish(view) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::Wish(view, sender)));
+                Effect::BroadcastNoReady(view) => {
+                    let sender = nodes[idx].name;
+                    let wish = nodes[idx].pacemaker.own_watermark();
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::NoReady(view, sender, wish)));
+                        }
                     }
                 }
-            }
-            Effect::Fixed(view, well_formed) => {
-                let node = &mut nodes[idx];
-                let activated = node.frontier.record_fixed(view, well_formed);
-                for v in activated {
-                    queue.extend(node.agb.activate(v, now, &mut node.lm, &mut node.rep));
+                // No wish piggyback, unlike `BroadcastEchoSkip`/`BroadcastNoReady` above.
+                Effect::BroadcastSkipVote(view) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::SkipVote(view, sender)));
+                        }
+                    }
                 }
-                queue.extend(node.try_propose_effects(now));
-                // signature-free.tex §8.3: mirrors `VantageCore::execute`'s
-                // identical `Effect::Fixed` addendum.
-                queue.extend(
-                    node.digest_stmts
-                        .on_local_fixed(view, &mut node.agb, &mut node.rep),
-                );
-            }
-            Effect::Completed(view, c, t) => {
-                queue.extend(nodes[idx].cursor.on_completed(view, c, t));
-            }
-            Effect::Sealed(view, outcome) => {
-                queue.extend(nodes[idx].cursor.on_sealed(view, outcome));
-            }
-            Effect::ArmTimer(view, kind, deadline) => {
-                nodes[idx].timers.push((deadline, view, kind));
-            }
-            Effect::NotifyCommitted(..) => {}
-            Effect::Enter(view) => {
-                queue.extend(nodes[idx].enter_view_effects(view, now));
-            }
-            Effect::RaiseWish(target) => {
-                queue.extend(nodes[idx].pacemaker.raise_own_wish(target));
-            }
+                Effect::BroadcastWish(view) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::Wish(view, sender)));
+                        }
+                    }
+                }
+                Effect::Fixed(view, well_formed) => {
+                    let node = &mut nodes[idx];
+                    let activated = node.frontier.record_fixed(view, well_formed);
+                    for v in activated {
+                        queue.extend(node.agb.activate(v, &mut node.lm, &mut node.rep));
+                    }
+                    queue.extend(node.try_propose_effects(now));
+                    // signature-free.tex §8.3: mirrors `VantageCore::execute`'s
+                    // identical `Effect::Fixed` addendum.
+                    queue.extend(node.digest_stmts.on_local_fixed(
+                        view,
+                        &mut node.agb,
+                        &mut node.rep,
+                    ));
+                }
+                Effect::Completed(view, c, t) => {
+                    queue.extend(nodes[idx].cursor.on_completed(view, c, t));
+                }
+                Effect::Sealed(view, outcome) => {
+                    queue.extend(nodes[idx].cursor.on_sealed(view, outcome));
+                }
+                Effect::ArmTimer(view, kind, deadline) => {
+                    nodes[idx].timers.push((deadline, view, kind));
+                }
+                Effect::NotifyCommitted(..) => {}
+                Effect::Enter(view) => {
+                    queue.extend(nodes[idx].enter_view_effects(view, now));
+                }
+                Effect::RaiseWish(target) => {
+                    queue.extend(nodes[idx].pacemaker.raise_own_wish(target));
+                }
 
-            // --- PHASE6-SPEC.md §5 (reports + control log) ---
-            Effect::CompletionReportable(view, proposal) => {
-                queue.extend(nodes[idx].control.on_completion_reportable(view, proposal));
-            }
-            Effect::BroadcastCompReport(view, digest) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::CompReport(view, digest.clone(), sender)));
+                // --- PHASE6-SPEC.md §5 (reports + control log) ---
+                Effect::CompletionReportable(view, proposal) => {
+                    queue.extend(nodes[idx].control.on_completion_reportable(view, proposal));
+                }
+                Effect::BroadcastCompReport(view, digest) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox
+                                .push_back((j, Inbound::CompReport(view, digest.clone(), sender)));
+                        }
                     }
                 }
-            }
-            Effect::BroadcastControlInit(proposal, b_w) => {
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlInit(proposal.clone(), b_w.clone())));
+                Effect::BroadcastControlInit(proposal, b_w) => {
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((
+                                j,
+                                Inbound::ControlInit(proposal.clone(), b_w.clone()),
+                            ));
+                        }
                     }
                 }
-            }
-            Effect::BroadcastControlEcho(proposal) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlEcho(sender, proposal.clone())));
+                Effect::BroadcastControlEcho(proposal) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::ControlEcho(sender, proposal.clone())));
+                        }
                     }
                 }
-            }
-            Effect::BroadcastControlReady(proposal) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlReady(sender, proposal.clone())));
+                Effect::BroadcastControlReady(proposal) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::ControlReady(sender, proposal.clone())));
+                        }
                     }
                 }
-            }
-            Effect::BroadcastControlCommit(round) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlCommit(sender, round)));
+                Effect::BroadcastControlCommit(round) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::ControlCommit(sender, round)));
+                        }
                     }
                 }
-            }
-            Effect::BroadcastControlTimeoutVote(round) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlTimeoutVote(sender, round)));
+                Effect::BroadcastControlTimeoutVote(round) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::ControlTimeoutVote(sender, round)));
+                        }
                     }
                 }
-            }
-            Effect::BroadcastControlTimeoutAccept(round) => {
-                let sender = nodes[idx].name;
-                for j in 0..n {
-                    if j != idx && nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlTimeoutAccept(sender, round)));
+                Effect::BroadcastControlTimeoutAccept(round) => {
+                    let sender = nodes[idx].name;
+                    for j in 0..n {
+                        if j != idx && nodes[j].alive {
+                            outbox.push_back((j, Inbound::ControlTimeoutAccept(sender, round)));
+                        }
                     }
                 }
-            }
-            Effect::ControlFetchTo(peer, view, digest) => {
-                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                    if nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlFetch(view, digest, nodes[idx].name)));
+                Effect::ControlFetchTo(peer, view, digest) => {
+                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                        if nodes[j].alive {
+                            outbox.push_back((
+                                j,
+                                Inbound::ControlFetch(view, digest, nodes[idx].name),
+                            ));
+                        }
                     }
                 }
-            }
-            Effect::ControlServeTo(peer, view, proposal) => {
-                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                    if nodes[j].alive {
-                        outbox.push_back((j, Inbound::ControlServe(view, proposal)));
+                Effect::ControlServeTo(peer, view, proposal) => {
+                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                        if nodes[j].alive {
+                            outbox.push_back((j, Inbound::ControlServe(view, proposal)));
+                        }
                     }
                 }
-            }
-            Effect::ArmControlTimer(round, deadline) => {
-                nodes[idx].control_timers.push((deadline, round));
-            }
+                Effect::ArmControlTimer(round, deadline) => {
+                    nodes[idx].control_timers.push((deadline, round));
+                }
 
-            // --- PHASE6-SPEC.md §6 (anchors) ---
-            Effect::ApplyAnchor(view, outcome, refs) => {
-                let node = &mut nodes[idx];
-                for r in refs {
-                    queue.extend(node.rep.authorize(r));
+                // --- PHASE6-SPEC.md §6 (anchors) ---
+                Effect::ApplyAnchor(view, outcome, refs) => {
+                    let node = &mut nodes[idx];
+                    for r in refs {
+                        queue.extend(node.rep.authorize(r));
+                    }
+                    queue.extend(node.agb.submit_anchor(view, outcome));
                 }
-                queue.extend(node.agb.submit_anchor(view, outcome));
-            }
 
-            // --- signature-free.tex §8.3 "Digest-named AGB statements" ---
-            Effect::BodyFetchTo(peer, view, digest) => {
-                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                    if nodes[j].alive {
-                        outbox.push_back((j, Inbound::BodyFetch(view, digest, nodes[idx].name)));
+                // --- signature-free.tex §8.3 "Digest-named AGB statements" ---
+                Effect::BodyFetchTo(peer, view, digest) => {
+                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                        if nodes[j].alive {
+                            outbox
+                                .push_back((j, Inbound::BodyFetch(view, digest, nodes[idx].name)));
+                        }
                     }
                 }
-            }
-            Effect::BodyServeTo(peer, view, proposal) => {
-                if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                    if nodes[j].alive {
-                        outbox.push_back((j, Inbound::BodyServe(view, proposal)));
+                Effect::BodyServeTo(peer, view, proposal) => {
+                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
+                        if nodes[j].alive {
+                            outbox.push_back((j, Inbound::BodyServe(view, proposal)));
+                        }
                     }
                 }
-            }
 
-            // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
-            // Same wire encoding as `Effect::BroadcastPublish` (`Header(_, false)`,
-            // which always maps to `Inbound::Publish` regardless of unicast vs.
-            // broadcast delivery -- see `vantage::wire::Wire::enqueue_resume_header`'s
-            // own doc comment), just routed to exactly one target instead of every
-            // live node.
-            Effect::ResumeServeTo(requester, header) => {
-                if let Some(j) = nodes.iter().position(|nd| nd.name == requester) {
-                    if nodes[j].alive {
-                        outbox.push_back((j, Inbound::Publish(header.author, header.clone())));
+                // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
+                // Same wire encoding as `Effect::BroadcastPublish` (`Header(_, false)`,
+                // which always maps to `Inbound::Publish` regardless of unicast vs.
+                // broadcast delivery -- see `vantage::wire::Wire::enqueue_resume_header`'s
+                // own doc comment), just routed to exactly one target instead of every
+                // live node.
+                Effect::ResumeServeTo(requester, header) => {
+                    if let Some(j) = nodes.iter().position(|nd| nd.name == requester) {
+                        if nodes[j].alive {
+                            outbox.push_back((j, Inbound::Publish(header.author, header.clone())));
+                        }
                     }
                 }
             }
         }
+        if !nodes[idx].recheck_pending {
+            break;
+        }
+        nodes[idx].recheck_pending = false;
+        let node = &mut nodes[idx];
+        let rechecked = node.agb.recheck_all(&mut node.lm, &mut node.rep);
+        if rechecked.is_empty() {
+            break;
+        }
+        queue.extend(rechecked);
     }
 }
 

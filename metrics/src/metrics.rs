@@ -402,6 +402,15 @@ pub struct Metrics {
     /// one starved by a downstream queue. Deliberately NOT a partition of
     /// `utilization_timer`'s labels: a wait scope nested inside a utilization scope
     /// contributes to both (that is the point), and `proc` values need not match.
+    ///
+    /// Two caveats the dashboard has to respect. (a) The `store_probe` scope lives in
+    /// `LaneManager`, which Simple-IT also uses, whereas every `utilization_timer`
+    /// scope is in `vantage::node` -- so on a Simple-IT run this counter advances while
+    /// `utilization_timer` stays flat, and any panel computing `utilization - wait`
+    /// must filter to `protocol_info{protocol="vantage"}` or it renders negative.
+    /// (b) `utilization_timer`'s `avail_flush` / `resume_tick` / `inbound_dispatch` /
+    /// `effect_execution` sections also await the network with no matching wait scope,
+    /// so `utilization - wait` is an UPPER bound on CPU, not an equality.
     pub core_wait_timer: IntCounterVec,
     /// `VantageCore`'s own inbound-message channel depth, sampled the same way as
     /// the Finding-A progress gauges (once/sec, in `VantageCore::run`'s own select
@@ -889,7 +898,7 @@ impl Metrics {
             .unwrap(),
             core_wait_timer: register_int_counter_vec_with_registry!(
                 "core_wait_timer",
-                "VantageCore time blocked on downstream I/O in microseconds, by proc",
+                "Consensus-core time blocked on downstream I/O in microseconds, by proc",
                 &["proc"],
                 registry,
             )
