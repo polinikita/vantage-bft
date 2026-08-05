@@ -266,7 +266,7 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 8,
+        "x": 0,
         "y": 4
       },
       "id": 3,
@@ -325,7 +325,7 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 12,
+        "x": 4,
         "y": 4
       },
       "id": 4,
@@ -384,7 +384,7 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 16,
+        "x": 8,
         "y": 4
       },
       "id": 5,
@@ -442,7 +442,7 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 20,
+        "x": 12,
         "y": 4
       },
       "id": 6,
@@ -488,8 +488,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 0,
-        "y": 8
+        "x": 16,
+        "y": 4
       },
       "id": 7,
       "options": {
@@ -537,8 +537,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 8,
-        "y": 8
+        "x": 0,
+        "y": 12
       },
       "id": 8,
       "options": {
@@ -604,8 +604,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 16,
-        "y": 8
+        "x": 8,
+        "y": 12
       },
       "id": 33,
       "options": {
@@ -670,7 +670,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 20
       },
       "id": 9,
       "options": {
@@ -716,7 +716,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 20
       },
       "id": 10,
       "options": {
@@ -757,7 +757,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 28
       },
       "id": 11,
       "panels": [],
@@ -779,7 +779,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 25
+        "y": 29
       },
       "id": 12,
       "options": {
@@ -844,7 +844,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 25
+        "y": 29
       },
       "id": 13,
       "options": {
@@ -899,7 +899,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 33
+        "y": 37
       },
       "id": 14,
       "options": {
@@ -958,12 +958,603 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 45
       },
-      "id": 15,
+      "id": 22,
+      "panels": [],
+      "title": "Data plane",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_blocks_published{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} published/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_blocks_received{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} received/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Blocks published / received per node (Vantage)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_acks_sent{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} sent/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_acks_received{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} recv/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Acks sent / received per node (Vantage)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "id": 25,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_repairs_requested{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} requested/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (node) (rate(vantage_repairs_served{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
+          "legendFormat": "{{node}} served/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Repairs requested / served per node (Vantage)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "id": 26,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=\"Batch\"}[10s]))",
+          "legendFormat": "batches/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Batches sent/s (worker-to-worker)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 62
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(rate(submitted_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
+          "legendFormat": "submitted/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
+          "legendFormat": "committed/s",
+          "refId": "B"
+        }
+      ],
+      "description": "submitted_transactions is client-side and additive; committed_transactions is replicated, so committed/s uses the maximum validator worker-0 rate rather than summing the committee.",
+      "title": "Submitted vs. sequenced (committed) transactions/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 62
+      },
+      "id": 28,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p50\"})",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p90\"})",
+          "legendFormat": "p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p99\"})",
+          "legendFormat": "p99",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"max\"})",
+          "legendFormat": "max",
+          "refId": "D"
+        }
+      ],
+      "title": "Proposed block size (p50/p90/p99/max, bytes, Vantage)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "id": 29,
       "panels": [],
       "title": "Network & System",
       "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 71
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "up{node=~\"$node\"}",
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Scrape status (up) by node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 9,
+        "x": 6,
+        "y": 71
+      },
+      "id": 34,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (validator) (label_replace(rate(process_cpu_seconds_total{node=~\"$node\"}[1m]),\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\"))",
+          "legendFormat": "{{validator}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Per-validator CPU used by its standalone primary and worker processes, expressed as percent of one logical core and excluding the client load generator. Values may exceed 100% when a validator uses multiple cores. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
+      "title": "CPU usage (per node)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "decmbytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 9,
+        "x": 15,
+        "y": 71
+      },
+      "id": 35,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum by (validator) (label_replace(process_resident_memory_bytes{node=~\"$node\"},\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\")) / 1048576",
+          "legendFormat": "{{validator}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Per-validator resident memory summed across its standalone primary and worker processes, excluding the client load generator. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
+      "title": "Memory usage (per node)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 16,
+        "x": 0,
+        "y": 78
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "100 * rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[10s]) / 1e6",
+          "legendFormat": "{{node}} {{proc}}",
+          "refId": "A"
+        }
+      ],
+      "title": "VantageCore utilization by section (% busy)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 78
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "core_queue_length{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "VantageCore inbound-queue depth",
+      "type": "timeseries"
     },
     {
       "datasource": {
@@ -987,7 +1578,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 42
+        "y": 85
       },
       "id": 16,
       "options": {
@@ -1121,7 +1712,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 42
+        "y": 85
       },
       "id": 17,
       "options": {
@@ -1260,7 +1851,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 51
+        "y": 94
       },
       "id": 18,
       "options": {
@@ -1319,7 +1910,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 51
+        "y": 94
       },
       "id": 19,
       "options": {
@@ -1377,8 +1968,8 @@
       "gridPos": {
         "h": 5,
         "w": 6,
-        "x": 18,
-        "y": 51
+        "x": 12,
+        "y": 94
       },
       "id": 21,
       "options": {
@@ -1417,614 +2008,6 @@
       ],
       "title": "Network bandwidth, wire (sent / received)",
       "type": "stat"
-    },
-    {
-      "collapsed": false,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 56
-      },
-      "id": 22,
-      "panels": [],
-      "title": "Data plane",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 57
-      },
-      "id": 23,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (node) (rate(vantage_blocks_published{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} published/s",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (node) (rate(vantage_blocks_received{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} received/s",
-          "refId": "B"
-        }
-      ],
-      "title": "Blocks published / received per node (Vantage)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 57
-      },
-      "id": 24,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (node) (rate(vantage_acks_sent{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} sent/s",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (node) (rate(vantage_acks_received{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} recv/s",
-          "refId": "B"
-        }
-      ],
-      "title": "Acks sent / received per node (Vantage)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 65
-      },
-      "id": 25,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (node) (rate(vantage_repairs_requested{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} requested/s",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (node) (rate(vantage_repairs_served{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
-          "legendFormat": "{{node}} served/s",
-          "refId": "B"
-        }
-      ],
-      "title": "Repairs requested / served per node (Vantage)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 65
-      },
-      "id": 26,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=\"Batch\"}[10s]))",
-          "legendFormat": "batches/s",
-          "refId": "A"
-        }
-      ],
-      "title": "Batches sent/s (worker-to-worker)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "tps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 73
-      },
-      "id": 27,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum(rate(submitted_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
-          "legendFormat": "submitted/s",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
-          "legendFormat": "committed/s",
-          "refId": "B"
-        }
-      ],
-      "description": "submitted_transactions is client-side and additive; committed_transactions is replicated, so committed/s uses the maximum validator worker-0 rate rather than summing the committee.",
-      "title": "Submitted vs. sequenced (committed) transactions/s",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 73
-      },
-      "id": 28,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p50\"})",
-          "legendFormat": "p50",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p90\"})",
-          "legendFormat": "p90",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "avg(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p99\"})",
-          "legendFormat": "p99",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"max\"})",
-          "legendFormat": "max",
-          "refId": "D"
-        }
-      ],
-      "title": "Proposed block size (p50/p90/p99/max, bytes, Vantage)",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 81
-      },
-      "id": 29,
-      "panels": [],
-      "title": "Network & System",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 6,
-        "x": 0,
-        "y": 82
-      },
-      "id": 30,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "up{node=~\"$node\"}",
-          "legendFormat": "{{node}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Scrape status (up) by node",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "min": 0,
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 9,
-        "x": 6,
-        "y": 82
-      },
-      "id": 34,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (validator) (label_replace(rate(process_cpu_seconds_total{node=~\"$node\"}[1m]),\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\"))",
-          "legendFormat": "{{validator}}",
-          "refId": "A"
-        }
-      ],
-      "description": "Per-validator CPU used by its standalone primary and worker processes, expressed as percent of one logical core and excluding the client load generator. Values may exceed 100% when a validator uses multiple cores. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
-      "title": "CPU usage (per node)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "min": 0,
-          "unit": "decmbytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 9,
-        "x": 15,
-        "y": 82
-      },
-      "id": 35,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "sum by (validator) (label_replace(process_resident_memory_bytes{node=~\"$node\"},\"validator\",\"$1\",\"node\",\"(.*)-(primary|worker-[0-9]+)\")) / 1048576",
-          "legendFormat": "{{validator}}",
-          "refId": "A"
-        }
-      ],
-      "description": "Per-validator resident memory summed across its standalone primary and worker processes, excluding the client load generator. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
-      "title": "Memory usage (per node)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 16,
-        "x": 0,
-        "y": 89
-      },
-      "id": 31,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "100 * rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[10s]) / 1e6",
-          "legendFormat": "{{node}} {{proc}}",
-          "refId": "A"
-        }
-      ],
-      "title": "VantageCore utilization by section (% busy)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 8,
-        "x": 16,
-        "y": 89
-      },
-      "id": 32,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "core_queue_length{node=~\"$node\",node=~\".*-primary$\"}",
-          "legendFormat": "{{node}}",
-          "refId": "A"
-        }
-      ],
-      "title": "VantageCore inbound-queue depth",
-      "type": "timeseries"
     }
   ],
   "preload": false,
