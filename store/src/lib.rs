@@ -160,6 +160,18 @@ impl Store {
                         };
                         match command {
                             StoreCommand::Write(key, value) => {
+                                // ORDERING HAZARD: obligations are drained BEFORE the
+                                // insert, inverting the pre-batching order (`put_opt`
+                                // came first). That is safe only because this whole arm
+                                // is AWAIT-FREE: a woken waiter's follow-up `Read` has
+                                // to traverse the mpsc channel, and cannot be dequeued
+                                // until this arm returns, so read-after-notify is
+                                // guaranteed by FIFO rather than by scheduling -- true
+                                // even on a multi-thread runtime where `oneshot::send`
+                                // can resume the waiter on another core immediately.
+                                // `worker::synchronizer` relies on exactly this. Adding
+                                // any `.await` between here and the insert below breaks
+                                // it silently.
                                 if let Some(mut senders) = obligations.remove(&key) {
                                     while let Some(s) = senders.pop_front() {
                                         let _ = s.send(Ok(value.clone()));
@@ -305,16 +317,24 @@ impl Store {
 /// A no-op when nothing is buffered, mirroring starfish's `has_data_to_write` early
 /// return so idle nodes issue no disk writes at all (the 20 Hz task wakeup remains).
 ///
-/// Panics if the write fails, matching production starfish, which does exactly this at
-/// `~/code/iota/crates/starfish/core/src/dag_state.rs:2548`
-/// (`.unwrap_or_else(|e| panic!("Failed to write to storage: {e:?}"))`). Batching makes
-/// the alternative untenable: pre-batching, a failed `put_opt` was silently ignored and
-/// lost ONE key; silently ignoring a failed batch would lose up to `MAX_PENDING_BYTES`
-/// at once, and because nothing in this codebase ever rewrites a key, every
-/// `notify_read` waiting on a lost key would hang until its own staleness pruner
-/// cancelled it, while `db.get` kept serving the pre-write value. `write_opt` with
-/// `sync=false` fails only on genuine I/O or corruption errors, which is not a
-/// recoverable condition for a validator.
+/// Aborts the process if the write fails. Batching makes the alternatives untenable:
+/// pre-batching, a failed `put_opt` was silently ignored and lost ONE key; silently
+/// ignoring a failed batch would lose up to `MAX_PENDING_BYTES` at once, and because
+/// nothing in this codebase ever rewrites a key, every `notify_read` waiting on a lost
+/// key would hang until its own staleness pruner cancelled it while `db.get` kept
+/// serving the pre-write value. Retrying instead of clearing is no better: a
+/// permanently-unwritable DB would then grow `pending` without bound, since the valve's
+/// own flush attempt fails too.
+///
+/// `abort` rather than `panic!` because this runs on a DETACHED `tokio::spawn`ed task
+/// whose `JoinHandle` is dropped: a panic would unwind only the actor, leaving the node
+/// running against a dead store with every later `Store::write` panicking on the closed
+/// channel in whatever task happened to call it. Production starfish does
+/// `.unwrap_or_else(|e| panic!("Failed to write to storage: {e:?}"))`
+/// (`~/code/iota/crates/starfish/core/src/dag_state.rs:2548`), but its flush runs on the
+/// core thread, so that panic genuinely takes the node down; `abort` is what reproduces
+/// that here. `write_opt` with `sync=false` fails only on genuine I/O or corruption
+/// errors, which is not a recoverable condition for a validator.
 fn flush_pending(
     db: &rocksdb::DB,
     pending: &mut HashMap<Key, Value>,
@@ -329,8 +349,10 @@ fn flush_pending(
         batch.put(key, value);
     }
     *pending_bytes = 0;
-    db.write_opt(batch, write_opts)
-        .unwrap_or_else(|e| panic!("Failed to write store batch to storage: {}", e));
+    db.write_opt(batch, write_opts).unwrap_or_else(|e| {
+        log::error!("Failed to write store batch to storage, aborting: {}", e);
+        std::process::abort();
+    });
 }
 
 /// DB-wide options shared by both profiles (starfish `rocks_store.rs::open()`, the
