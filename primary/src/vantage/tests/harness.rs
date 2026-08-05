@@ -29,7 +29,7 @@ use config::Committee;
 use crypto::PublicKey;
 use metrics::Metrics;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub struct Node {
@@ -143,7 +143,7 @@ impl Node {
         Self {
             name,
             lm,
-            ack_aggregator: Arc::new(Mutex::new(AckAggregator::new(committee))),
+            ack_aggregator: Arc::new(parking_lot::Mutex::new(AckAggregator::new(committee))),
             rep,
             agb,
             frontier,
@@ -269,7 +269,7 @@ impl Node {
         now: Instant,
     ) -> Vec<Effect> {
         let availability = {
-            let mut aggregator = self.ack_aggregator.lock().unwrap();
+            let mut aggregator = self.ack_aggregator.lock();
             aggregator.record_ack(sender, reference).availability
         };
         availability

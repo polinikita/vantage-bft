@@ -13,7 +13,7 @@ use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -38,7 +38,11 @@ pub type CancelHandler = oneshot::Receiver<Bytes>;
 /// never called `with_drop_map` (e.g. the resume-replay pool, §14 A7: "with_
 /// reconnect_events/with_drop_map apply to the MAIN pool only") -- a `Connection`
 /// with no drop map attached simply skips the merge, at zero cost.
-pub type DirtyMap = Arc<Mutex<HashMap<SocketAddr, u64>>>;
+/// Genuinely cross-task: written by each per-connection task on a drop, swept by
+/// the consensus core. `parking_lot::Mutex` for the cheaper uncontended path and
+/// because a poisoned lock is not a state this map can reach (every critical
+/// section is a panic-free map operation).
+pub type DirtyMap = Arc<parking_lot::Mutex<HashMap<SocketAddr, u64>>>;
 
 /// Every `buffer`/`pending_replies`/`delay_queue` entry carries a Vec of reply targets
 /// instead of a single one, so a coalesced bundle's ONE ack can fan out to every
@@ -604,7 +608,7 @@ impl Connection {
     fn report_dropped(&self, min_key: Option<u64>) {
         let Some(key) = min_key else { return };
         let Some(map) = &self.drop_map else { return };
-        let mut guard = map.lock().unwrap();
+        let mut guard = map.lock();
         guard
             .entry(self.address)
             .and_modify(|existing| *existing = (*existing).min(key))

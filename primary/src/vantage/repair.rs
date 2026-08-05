@@ -166,7 +166,7 @@ impl Repairer {
         }
         let digest = block.id.clone();
         {
-            let mut blocks = self.blocks.lock().unwrap();
+            let mut blocks = self.blocks.lock();
             // `block_ok` just passed above for this exact block -- memoize it.
             blocks.upsert(block, false, true, false, true);
         }
@@ -248,7 +248,7 @@ impl Repairer {
             }
 
             let cached = {
-                let blocks = self.blocks.lock().unwrap();
+                let blocks = self.blocks.lock();
                 blocks.get(&h).and_then(|entry| {
                     let b = &entry.block;
                     if b.author == author
@@ -305,7 +305,7 @@ impl Repairer {
     fn retain_and_serve(&mut self, r: &BlockRef, effects: &mut Vec<Effect>) {
         let h = r.2.clone();
         {
-            let mut blocks = self.blocks.lock().unwrap();
+            let mut blocks = self.blocks.lock();
             blocks.mark_retained(&h);
         }
         self.try_serve(&h, effects);
@@ -315,7 +315,7 @@ impl Repairer {
     /// `(j, h)` not yet answered with `serve(h, b)`, marking `(j, h)` answered.
     fn try_serve(&mut self, h: &Digest, effects: &mut Vec<Effect>) {
         let block = {
-            let blocks = self.blocks.lock().unwrap();
+            let blocks = self.blocks.lock();
             match blocks.get(h) {
                 Some(entry) if entry.retained => Some(entry.block.clone()),
                 _ => None,
@@ -362,7 +362,7 @@ impl Repairer {
     #[cfg(test)]
     pub(crate) fn blocks_for_test(
         &self,
-    ) -> std::sync::MutexGuard<'_, crate::vantage::lanes::BlockCache> {
-        self.blocks.lock().unwrap()
+    ) -> parking_lot::MutexGuard<'_, crate::vantage::lanes::BlockCache> {
+        self.blocks.lock()
     }
 }

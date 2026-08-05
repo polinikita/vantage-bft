@@ -17,5 +17,6 @@ async-trait = { workspace = true }
 
 metrics = { path = "../metrics" }
 
+parking_lot = { workspace = true }
 [dev-dependencies]
 bincode = { workspace = true }

@@ -35,12 +35,13 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
 use network::{BatchConfig, DirtyMap, MessageHandler, ReliableSender, SimpleSender, Writer};
+use parking_lot::Mutex;
 use prometheus::IntCounter;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -178,7 +179,7 @@ impl MessageHandler for VantageReceiverHandler {
             }
             PrimaryMessage::VantageAck(a) => {
                 let result = {
-                    let mut aggregator = self.ack_aggregator.lock().unwrap();
+                    let mut aggregator = self.ack_aggregator.lock();
                     aggregator.record_ack(a.sender, a.reference())
                 };
                 if !result.accepted {
@@ -1230,7 +1231,7 @@ impl VantageCore {
     /// and before serving any Hello (§2.4).
     fn sweep_dirty_map(&mut self) {
         let drained: HashMap<SocketAddr, u64> = {
-            let mut guard = self.wire.dirty_map.lock().unwrap();
+            let mut guard = self.wire.dirty_map.lock();
             std::mem::take(&mut *guard)
         };
         for (addr, key) in drained {
@@ -1252,7 +1253,7 @@ impl VantageCore {
     fn check_in_flight(&mut self, peer: PublicKey, now: Instant) -> bool {
         let ttl = Duration::from_millis(self.replay_episode_max_ms);
         let state = {
-            let guard = self.wire.in_flight.lock().unwrap();
+            let guard = self.wire.in_flight.lock();
             in_flight_state(&guard, &peer, now, ttl)
         };
         match state {
@@ -1426,7 +1427,7 @@ impl VantageCore {
         // only this exact marker, so a stale completion cannot cross-clear a newer
         // stream installed after TTL expiry.
         let generation = self.wire.next_replay_generation();
-        self.wire.in_flight.lock().unwrap().insert(
+        self.wire.in_flight.lock().insert(
             sender,
             InFlightEntry {
                 started: now,
@@ -1781,7 +1782,7 @@ impl VantageCore {
 
     fn record_local_ack(&mut self, ack: &Ack, now: Instant) -> Vec<Effect> {
         let availability = {
-            let mut aggregator = self.ack_aggregator.lock().unwrap();
+            let mut aggregator = self.ack_aggregator.lock();
             aggregator
                 .record_ack(self.name, ack.reference())
                 .availability
@@ -1793,7 +1794,7 @@ impl VantageCore {
 
     fn record_injected_ack(&mut self, ack: Ack, now: Instant) -> Vec<Effect> {
         let result = {
-            let mut aggregator = self.ack_aggregator.lock().unwrap();
+            let mut aggregator = self.ack_aggregator.lock();
             aggregator.record_ack(ack.sender, ack.reference())
         };
         if !result.accepted {
@@ -1824,7 +1825,7 @@ impl VantageCore {
         let mut effects = Vec::new();
         for r in refs {
             let result = {
-                let mut aggregator = self.ack_aggregator.lock().unwrap();
+                let mut aggregator = self.ack_aggregator.lock();
                 aggregator.record_ack(sender, r)
             };
             if !result.accepted {
@@ -2665,7 +2666,6 @@ mod tests {
                 .lm
                 .blocks_handle()
                 .lock()
-                .unwrap()
                 .get(&header.id)
                 .unwrap()
                 .payload_ok
@@ -2775,7 +2775,6 @@ mod tests {
                 .lm
                 .blocks_handle()
                 .lock()
-                .unwrap()
                 .get(&header.id)
                 .unwrap()
                 .payload_ok
@@ -2892,7 +2891,6 @@ mod tests {
         let reference = (sender, 7, Digest::default());
         ack_aggregator
             .lock()
-            .unwrap()
             .record_ack(pre_sender, reference.clone());
         let (tx_vantage, mut rx_vantage) = channel(4);
         let handler = VantageReceiverHandler {
@@ -3098,12 +3096,12 @@ mod tests {
         // this party has itself cached -- see that field's own doc comment.
         let reference = (author, 5u64, Digest::default());
         let first_ack = {
-            let mut agg = core.ack_aggregator.lock().unwrap();
+            let mut agg = core.ack_aggregator.lock();
             agg.record_ack(author, reference.clone())
         };
         assert!(first_ack.availability.is_none());
         let second_ack = {
-            let mut agg = core.ack_aggregator.lock().unwrap();
+            let mut agg = core.ack_aggregator.lock();
             agg.record_ack(other_sender, reference.clone())
         };
         let availability = second_ack
@@ -3271,7 +3269,7 @@ mod tests {
         core.outbox.record(100, Bytes::from_static(b"hundred"));
 
         let peer_addr = addr_of(&core, peer);
-        core.wire.dirty_map.lock().unwrap().insert(peer_addr, 5);
+        core.wire.dirty_map.lock().insert(peer_addr, 5);
 
         let mut rx = intercept_resume_channel(&mut core);
 
@@ -3386,7 +3384,7 @@ mod tests {
         core.dispatch_inbound(Inbound::ResumeHello(5, peer), now)
             .await;
         assert!(rx.try_recv().is_ok(), "the first Hello must be served");
-        assert!(core.wire.in_flight.lock().unwrap().contains_key(&peer));
+        assert!(core.wire.in_flight.lock().contains_key(&peer));
 
         // A second Hello while that stream is still marked in-flight (nothing
         // drained/removed it -- see `intercept_resume_channel`'s own doc comment).
@@ -3443,7 +3441,7 @@ mod tests {
         core.outbox.record(5, Bytes::from_static(b"five"));
         core.replay_serve_max_bytes = 4;
         let peer_addr = addr_of(&core, peer);
-        core.wire.dirty_map.lock().unwrap().insert(peer_addr, 5);
+        core.wire.dirty_map.lock().insert(peer_addr, 5);
 
         break_resume_channel(&mut core);
         let drops_before = enqueue_drops(&core);
@@ -3458,7 +3456,7 @@ mod tests {
             "a failed enqueue must leave pending_low exactly as the dirty-map sweep set it"
         );
         assert!(
-            !core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            !core.wire.in_flight.lock().contains_key(&peer),
             "a failed enqueue must not mark the stream in-flight either"
         );
         let backoff = Duration::from_millis(core.resume_backoff_ms);
@@ -3515,14 +3513,14 @@ mod tests {
 
         assert!(rx.try_recv().is_ok(), "the ask must have been enqueued");
         assert!(
-            core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            core.wire.in_flight.lock().contains_key(&peer),
             "the in-flight marker must be present once a Replay has been enqueued"
         );
         // Simulate the task-side remove (`run_replay_sender`'s own tail, run
         // after it sends that stream's `Done`) -- it must always find the entry
         // the core placed, never race one that hasn't happened yet.
         assert!(
-            core.wire.in_flight.lock().unwrap().remove(&peer).is_some(),
+            core.wire.in_flight.lock().remove(&peer).is_some(),
             "a task-side remove must always find the entry -- insert-before-\
              enqueue closes the window where it could race an insert that \
              hasn't happened yet"
@@ -3547,7 +3545,7 @@ mod tests {
             .await;
 
         assert!(
-            !core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            !core.wire.in_flight.lock().contains_key(&peer),
             "a failed enqueue must never strand an in-flight entry"
         );
     }
@@ -3753,7 +3751,7 @@ mod tests {
             "pending_low must not change"
         );
         assert!(
-            !core.wire.in_flight.lock().unwrap().contains_key(&peer),
+            !core.wire.in_flight.lock().contains_key(&peer),
             "the in-flight map must not change"
         );
     }

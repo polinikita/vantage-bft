@@ -38,10 +38,11 @@ use config::WorkerId;
 use crypto::PublicKey;
 use metrics::Metrics;
 use network::{BatchConfig, CancelHandler, DirtyMap, ReliableSender, SimpleSender};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot::error::TryRecvError;
@@ -940,7 +941,7 @@ pub(crate) fn remove_in_flight_generation(
     peer: PublicKey,
     generation: u64,
 ) -> bool {
-    let mut guard = in_flight.lock().unwrap();
+    let mut guard = in_flight.lock();
     if guard
         .get(&peer)
         .is_some_and(|entry| entry.generation == generation)
@@ -1004,7 +1005,7 @@ mod tests {
         )])));
         complete_replay_stream(&in_flight, &sender.reserved_bytes, &stream);
         assert_eq!(sender.reserved_bytes.load(Ordering::Acquire), 0);
-        assert!(!in_flight.lock().unwrap().contains_key(&peer));
+        assert!(!in_flight.lock().contains_key(&peer));
     }
 
     #[test]
@@ -1092,9 +1093,9 @@ mod tests {
         )])));
 
         assert!(!remove_in_flight_generation(&in_flight, peer, 1));
-        assert_eq!(in_flight.lock().unwrap()[&peer].generation, 2);
+        assert_eq!(in_flight.lock()[&peer].generation, 2);
         assert!(remove_in_flight_generation(&in_flight, peer, 2));
-        assert!(!in_flight.lock().unwrap().contains_key(&peer));
+        assert!(!in_flight.lock().contains_key(&peer));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1177,7 +1178,7 @@ mod tests {
         .await
         .expect("closed ingress must drain and exit");
 
-        assert!(in_flight.lock().unwrap().is_empty());
+        assert!(in_flight.lock().is_empty());
         assert_eq!(reserved_bytes.load(Ordering::Acquire), 0);
     }
 }

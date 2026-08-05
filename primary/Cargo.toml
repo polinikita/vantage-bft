@@ -26,6 +26,7 @@ config = { path = "../config" }
 network = { path = "../network" }
 metrics = { path = "../metrics" }
 prometheus = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

@@ -34,12 +34,13 @@ use crypto::{Digest, PublicKey};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::Metrics;
 use network::{BatchConfig, MessageHandler, ReliableSender, SimpleSender, Writer};
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -166,7 +167,7 @@ impl MessageHandler for SimpleItReceiverHandler {
             }
             PrimaryMessage::VantageAck(a) => {
                 let result = {
-                    let mut aggregator = self.ack_aggregator.lock().unwrap();
+                    let mut aggregator = self.ack_aggregator.lock();
                     aggregator.record_ack(a.sender, a.reference())
                 };
                 if !result.accepted {
@@ -889,7 +890,7 @@ impl SimpleItCore {
 
     fn record_local_ack(&mut self, ack: &Ack) -> Vec<Effect> {
         let availability = {
-            let mut aggregator = self.ack_aggregator.lock().unwrap();
+            let mut aggregator = self.ack_aggregator.lock();
             aggregator
                 .record_ack(self.name, ack.reference())
                 .availability
@@ -911,7 +912,7 @@ impl SimpleItCore {
         let mut effects = Vec::new();
         for r in refs {
             let result = {
-                let mut aggregator = self.ack_aggregator.lock().unwrap();
+                let mut aggregator = self.ack_aggregator.lock();
                 aggregator.record_ack(sender, r)
             };
             if !result.accepted {
@@ -1214,7 +1215,7 @@ impl SimpleItCore {
     /// partially.
     fn try_expand_commit(&mut self, proposals: &Cut) -> Option<CommitBatch> {
         let blocks = self.lm.blocks_handle();
-        let blocks = blocks.lock().unwrap();
+        let blocks = blocks.lock();
 
         // Pass 1: resolve, but do not yet apply, every author's suffix.
         let mut resolved: Vec<(PublicKey, Height, Digest, Vec<Digest>)> =
@@ -1490,7 +1491,6 @@ mod tests {
                 .lm
                 .blocks_handle()
                 .lock()
-                .unwrap()
                 .get(&header.id)
                 .unwrap()
                 .payload_ok
@@ -1595,7 +1595,6 @@ mod tests {
                 .lm
                 .blocks_handle()
                 .lock()
-                .unwrap()
                 .get(&header.id)
                 .unwrap()
                 .payload_ok
@@ -1624,7 +1623,6 @@ mod tests {
         core.lm
             .blocks_handle()
             .lock()
-            .unwrap()
             .upsert(header.clone(), true, true, true, true);
     }
 

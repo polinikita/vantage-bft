@@ -7,7 +7,7 @@ use crate::vantage::repair::Repairer;
 use crate::vantage::Effect;
 use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn new_standalone_repairer(name: PublicKey) -> Repairer {
     let committee = test_committee();
@@ -19,7 +19,7 @@ fn new_standalone_repairer(name: PublicKey) -> Repairer {
         sid,
         genesis,
         MAX_BLOCK_PAYLOAD,
-        Arc::new(Mutex::new(BlockCache::new())),
+        Arc::new(parking_lot::Mutex::new(BlockCache::new())),
     )
 }
 
@@ -319,7 +319,7 @@ async fn recursive_walk_settles_and_retains_whole_prefix_via_pending_only_sweep(
     assert!(blocks.get(&h3.id).unwrap().retained);
 }
 
-fn repairer_blocks(repairer: &Repairer) -> std::sync::MutexGuard<'_, BlockCache> {
+fn repairer_blocks(repairer: &Repairer) -> parking_lot::MutexGuard<'_, BlockCache> {
     // `Repairer` doesn't expose its `SharedBlocks` field directly (it isn't needed in
     // production code, where `LaneManager` owns the canonical handle); tests construct
     // repairers standalone, so they need a matching accessor.

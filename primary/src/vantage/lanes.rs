@@ -14,10 +14,11 @@ use crate::vantage::Effect;
 use config::{Committee, Stake, WorkerId};
 use crypto::{Digest, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
+use parking_lot::Mutex;
 use prometheus::IntCounter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use store::Store;
 
 /// Per-block bookkeeping (§3.2 `BlockEntry`).
@@ -857,7 +858,7 @@ impl LaneManager {
         let digest = header.id.clone();
 
         {
-            let mut blocks = self.blocks.lock().unwrap();
+            let mut blocks = self.blocks.lock();
             // `block_ok` just passed above for this exact header -- memoize it.
             blocks.upsert(header.clone(), direct, false, payload_ok, true);
         }
@@ -942,7 +943,7 @@ impl LaneManager {
     /// after writing the payload marker directly). Re-runs the N3 ack check.
     pub fn set_payload_ready(&mut self, digest: &Digest) -> Vec<Effect> {
         let direct_ready = {
-            let mut blocks = self.blocks.lock().unwrap();
+            let mut blocks = self.blocks.lock();
             blocks.set_payload_ok(digest, true);
             blocks.get(digest).and_then(|e| {
                 (e.direct && e.payload_ok).then(|| (e.block.author, e.block.height, digest.clone()))
@@ -1040,7 +1041,7 @@ impl LaneManager {
         let mut expected_height = r.1;
         let mut newly_retained_bytes: u64 = 0;
         {
-            let mut blocks = self.blocks.lock().unwrap();
+            let mut blocks = self.blocks.lock();
             loop {
                 if cur == self.genesis || expected_height == 0 {
                     break;
@@ -1111,7 +1112,7 @@ impl LaneManager {
     }
 
     fn exact_coordinate(&self, r: &BlockRef) -> bool {
-        let blocks = self.blocks.lock().unwrap();
+        let blocks = self.blocks.lock();
         blocks
             .get(&r.2)
             .is_some_and(|e| e.block.author == r.0 && e.block.height == r.1)
@@ -1123,7 +1124,7 @@ impl LaneManager {
         if !self.exact_coordinate(r) {
             return false;
         }
-        let mut blocks = self.blocks.lock().unwrap();
+        let mut blocks = self.blocks.lock();
         blocks.verified_prefix_through_genesis(
             &self.committee,
             &self.sid,
@@ -1159,7 +1160,7 @@ impl LaneManager {
             return false;
         }
         let verified = {
-            let mut blocks = self.blocks.lock().unwrap();
+            let mut blocks = self.blocks.lock();
             blocks.verified_prefix_through_genesis(
                 &self.committee,
                 &self.sid,
@@ -1274,20 +1275,12 @@ impl LaneManager {
     /// `author` yet, so a request naming `from <= 1` (or `0`) clamps up to the
     /// earliest block that could ever legitimately be served.
     pub fn earliest_authored_height(&self, author: &PublicKey) -> Height {
-        self.blocks
-            .lock()
-            .unwrap()
-            .earliest_height(author)
-            .unwrap_or(1)
+        self.blocks.lock().earliest_height(author).unwrap_or(1)
     }
 
     /// Mechanism A serve-side lookup, delegating to `BlockCache::author_block_at`.
     pub fn author_block_at(&self, author: &PublicKey, height: Height) -> Option<Header> {
-        self.blocks
-            .lock()
-            .unwrap()
-            .author_block_at(author, height)
-            .cloned()
+        self.blocks.lock().author_block_at(author, height).cloned()
     }
 
     /// Mechanism A receipt-continuation: the cached author of `digest`'s block, if
@@ -1297,11 +1290,7 @@ impl LaneManager {
     /// this is the one extra lookup that lets the SAME "did frontier(author) just
     /// advance" continuation check run at that call site too.
     pub fn author_of(&self, digest: &Digest) -> Option<PublicKey> {
-        self.blocks
-            .lock()
-            .unwrap()
-            .get(digest)
-            .map(|e| e.block.author)
+        self.blocks.lock().get(digest).map(|e| e.block.author)
     }
 
     /// Resolves a peer's ack-watermark vector into the exact `BlockRef`s this party's
@@ -1334,7 +1323,7 @@ impl LaneManager {
     /// declaring sender.
     pub fn retry_pending_avail(&mut self, digest: &Digest) -> Vec<(PublicKey, BlockRef)> {
         let author = {
-            let blocks = self.blocks.lock().unwrap();
+            let blocks = self.blocks.lock();
             blocks.get(digest).map(|e| e.block.author)
         };
         let Some(author) = author else {
@@ -1395,7 +1384,7 @@ impl LaneManager {
             return Vec::new();
         }
         let segment = {
-            let blocks = self.blocks.lock().unwrap();
+            let blocks = self.blocks.lock();
             blocks.collect_verified_suffix(
                 &self.committee,
                 &self.sid,
@@ -1482,7 +1471,7 @@ impl LaneManager {
     /// node's own N5 registers -- extended in place per the reuse rule rather than
     /// duplicated.
     pub fn prefix_contains(&self, r: &BlockRef, target: &BlockRef) -> bool {
-        let blocks = self.blocks.lock().unwrap();
+        let blocks = self.blocks.lock();
         let author = r.0;
         let mut cur = r.2.clone();
         let mut expected_height = r.1;

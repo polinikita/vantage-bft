@@ -3,7 +3,6 @@ use super::*;
 use crate::common::listener;
 use futures::future::try_join_all;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -198,7 +197,7 @@ async fn handler_less_volatile_entry_survives_pre_send_skip_on_a_live_session() 
 #[tokio::test]
 async fn volatile_arrival_while_disconnected_is_dropped_and_key_min_merged() {
     let address = "127.0.0.1:5308".parse::<SocketAddr>().unwrap();
-    let drop_map: DirtyMap = Arc::new(Mutex::new(HashMap::new()));
+    let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     // No listener at all yet -- every send below is queued via the reconnect-waiter
     // loop, never a live session.
@@ -213,7 +212,7 @@ async fn volatile_arrival_while_disconnected_is_dropped_and_key_min_merged() {
     sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
-        drop_map.lock().unwrap().get(&address).copied(),
+        drop_map.lock().get(&address).copied(),
         Some(55),
         "both volatile arrivals must be dropped and min-merged (55, the smaller key)"
     );
@@ -259,7 +258,7 @@ async fn handler_less_volatile_entry_survives_delayed_pop_skip() {
 #[tokio::test]
 async fn volatile_entry_dropped_at_session_death_is_reported_via_drop_map() {
     let address = "127.0.0.1:5305".parse::<SocketAddr>().unwrap();
-    let drop_map: DirtyMap = Arc::new(Mutex::new(HashMap::new()));
+    let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     // A peer that accepts, lets the message actually get WRITTEN (moving it into
     // `pending_replies`), then drops the connection without ever acking.
@@ -281,7 +280,7 @@ async fn volatile_entry_dropped_at_session_death_is_reported_via_drop_map() {
     // its session-death tail after the peer vanishes.
     sleep(Duration::from_millis(200)).await;
 
-    let map = drop_map.lock().unwrap();
+    let map = drop_map.lock();
     assert_eq!(map.get(&address), Some(&99));
 }
 
@@ -292,7 +291,7 @@ async fn volatile_entry_dropped_at_session_death_is_reported_via_drop_map() {
 #[tokio::test]
 async fn volatile_entry_dropped_mid_coalesce_is_reported_via_drop_map() {
     let address = "127.0.0.1:5306".parse::<SocketAddr>().unwrap();
-    let drop_map: DirtyMap = Arc::new(Mutex::new(HashMap::new()));
+    let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     let handle = tokio::spawn(async move {
         let listener = TcpListener::bind(&address).await.unwrap();
@@ -317,7 +316,7 @@ async fn volatile_entry_dropped_mid_coalesce_is_reported_via_drop_map() {
 
     sleep(Duration::from_millis(200)).await;
 
-    let map = drop_map.lock().unwrap();
+    let map = drop_map.lock();
     assert_eq!(map.get(&address), Some(&13));
 }
 
@@ -388,7 +387,7 @@ async fn durable_arrival_while_disconnected_is_buffered_and_delivered_on_reconne
 #[tokio::test]
 async fn interleaved_arrivals_while_disconnected_only_durable_survives() {
     let address = "127.0.0.1:5310".parse::<SocketAddr>().unwrap();
-    let drop_map: DirtyMap = Arc::new(Mutex::new(HashMap::new()));
+    let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let message = "durable-survivor";
 
     // No listener yet -- both sends are queued via the reconnect-waiter loop, in
@@ -401,7 +400,7 @@ async fn interleaved_arrivals_while_disconnected_only_durable_survives() {
 
     sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        drop_map.lock().unwrap().get(&address).copied(),
+        drop_map.lock().get(&address).copied(),
         Some(77),
         "the volatile arrival must already be dropped and min-merged before any \
          connection ever succeeds"

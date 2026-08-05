@@ -23,5 +23,10 @@ blake3 = "1.5"
 rocksdb = { version = "0.23", features = ["lz4", "zstd"] }
 serial_test = "0.9"
 prometheus = { version = "0.13", features = ["process"] }
+# Already in the graph via prometheus (Cargo.lock pins 0.12.5), so making it direct
+# adds zero crates. Used for the consensus hot-path mutexes: cheaper uncontended
+# lock/unlock than std, and no poisoning check on a lock that cannot be poisoned
+# (every critical section is panic-free field access).
+parking_lot = "0.12"
 axum = "0.7"
 fdlimit = "0.3"

@@ -203,7 +203,7 @@ impl Cursor {
     ) -> (HashMap<WorkerId, Vec<Digest>>, Vec<Header>) {
         let mut out: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
         let mut headers = Vec::with_capacity(hashes.len());
-        let blocks = self.blocks.lock().unwrap();
+        let blocks = self.blocks.lock();
         for h in hashes {
             if let Some(entry) = blocks.get(h) {
                 for (digest, worker_id) in &entry.block.payload {
@@ -222,7 +222,7 @@ impl Cursor {
     /// the same traversal. Returns `None` (caller must wait for a `BlockCached` wakeup)
     /// if any needed prefix isn't yet fully obtained + verified.
     fn expand(&mut self, manifest: &Manifest) -> Option<Vec<Digest>> {
-        let blocks = self.blocks.lock().unwrap();
+        let blocks = self.blocks.lock();
         // First pass (read-only): resolve every entry's NEW suffix against its
         // author's current watermark. Collected before any watermark is mutated, so a
         // `None` (still-missing/unverified prefix somewhere in the manifest) leaves no
