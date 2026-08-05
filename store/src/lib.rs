@@ -11,21 +11,36 @@ use tokio::time::{interval, Duration};
 /// Flush cadence for the pending write batch: 50 ms => 20 `write_opt` calls per second
 /// per `Store` instance. A validator process tree holds one primary store plus one
 /// store per worker (K=1 in every benchmark configuration), so **40 batch writes per
-/// second per validator**, from two independent tickers on the same device.
+/// second per validator**, from two independent tickers on the same device. That rate is
+/// load-INDEPENDENT: it is set by the timer, not by traffic.
 ///
-/// Reference point, measured in `~/code/iota/crates/starfish`: `DagState::flush`
-/// (`core/src/dag_state.rs:2481`) issues one `WriteBatch` per own proposal
-/// (`core/src/core.rs:1212`, at `min_block_delay = 50 ms` => 20/s) plus one per commit
-/// event (`core/src/commit_observer.rs:228`, reached from `try_commit` only when
-/// leaders were actually sequenced -- the loop `break`s on `sequenced_leaders
-/// .is_empty()`, so this tracks the commit cadence, ~20/s, NOT the peer-block arrival
-/// rate), plus load-dependent transaction-sync solidification
-/// (`commit_observer.rs:522`/`:633`). ~40/s, one DB, `sync=false`.
+/// Reference point in `~/code/iota/crates/starfish`: `DagState::flush`
+/// (`core/src/dag_state.rs:2481`) issues one `WriteBatch` per own block
+/// (`core/src/core.rs:1212`) plus one per committed-leader batch
+/// (`core/src/commit_observer.rs:228`). The latter is reached from `try_commit` ONLY
+/// when leaders were actually sequenced -- the loop `break`s on
+/// `sequenced_leaders.is_empty()` -- so it tracks the commit cadence, not the
+/// peer-block arrival rate, and it coalesces (`handle_committed_leaders` takes a
+/// `Vec`), so it is bounded ABOVE by the round rate rather than equal to it. Both
+/// triggers are therefore per-round: `min_block_delay = 50 ms` only caps the round
+/// rate at 20/s, and the achieved rate in production is ~10 rounds/s, giving
+/// **<= 20 write operations/s per validator**, one DB, `sync=false`, no explicit
+/// memtable flush.
+///
+/// This store is at 40/s per validator (20/s x 2 instances), i.e. ~2x starfish rather
+/// than parity, and the gap is structural: starfish has ONE DB where a validator here
+/// has two processes with two RocksDB directories. Halving the tickers to 100 ms would
+/// match starfish exactly, but it would also double the single batch that can block
+/// `vantage::lanes::missing_payload` behind it in the 100-slot channel -- the very
+/// critical-path stall this batching exists to shorten -- and 40 vs 20 batched writes
+/// per second is far below any rate that shows up on the device. The factor of 2 is
+/// deliberate; see the audit trail in `~/vantage-measurements/2026-08-01/HANDOFF.md`
+/// section 30.
 ///
 /// Before batching, this store issued one `put_opt` per key. Every validator persists
 /// its own AND all n-1 peers' batches, and the client's burst grid is 50 ms
 /// (`node/src/client.rs:65`) so each node seals ~20 batches/s: ~780 `put_opt`/s per
-/// validator at n=20 and ~1 980/s at n=50, i.e. 20-50x more disk write operations than
+/// validator at n=20 and ~1 980/s at n=50, i.e. 40-100x more disk write operations than
 /// starfish for the same work. Note this changes the number of write OPERATIONS, not
 /// the number of key-level puts (unchanged) or the bytes written (unchanged).
 const FLUSH_INTERVAL_MS: u64 = 50;
