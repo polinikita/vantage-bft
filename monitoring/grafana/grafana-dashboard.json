@@ -413,13 +413,31 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "clamp_max(transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000, 1000)",
-          "legendFormat": "{{node}}",
+          "expr": "transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000",
+          "legendFormat": "{{node}} p50",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p90\"} / 1000",
+          "legendFormat": "{{node}} p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p99\"} / 1000",
+          "legendFormat": "{{node}} p99",
+          "refId": "C"
         }
       ],
       "description": "Submission-to-ordering cumulative p50 for each validator's worker-0 endpoint. clamp_max bounds the plot at 1,000 ms; a line on the ceiling may represent a larger raw value.",
-      "title": "Ordering latency p50 per node (1 s cap)",
+      "title": "Ordering latency per node (p50/p90/p99, ms)",
       "type": "timeseries"
     },
     {
@@ -462,13 +480,31 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "clamp_max(transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000, 1000)",
-          "legendFormat": "{{node}}",
+          "expr": "transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000",
+          "legendFormat": "{{node}} p50",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p90\"} / 1000",
+          "legendFormat": "{{node}} p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p99\"} / 1000",
+          "legendFormat": "{{node}} p99",
+          "refId": "C"
         }
       ],
       "description": "Submission-to-ordering-and-local-payload cumulative p50 for each validator's worker-0 endpoint. clamp_max bounds the plot at 1,000 ms; a line on the ceiling may represent a larger raw value.",
-      "title": "Materialized latency p50 per node (1 s cap)",
+      "title": "Materialized latency per node (p50/p90/p99, ms)",
       "type": "timeseries"
     },
     {
@@ -1690,7 +1726,7 @@
         }
       ],
       "description": "Per-validator CPU used by its standalone primary and worker processes, expressed as percent of one logical core and excluding the client load generator. Values may exceed 100% when a validator uses multiple cores. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
-      "title": "CPU usage per node",
+      "title": "CPU per node (% of one core; 100% = 1 core)",
       "type": "timeseries"
     },
     {
@@ -1878,7 +1914,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Vantage - local-benchmark / remote",
+  "title": "Vantage \u2014 consensus benchmark",
   "uid": "vantage-local-benchmark",
   "version": 4,
   "weekStart": ""
