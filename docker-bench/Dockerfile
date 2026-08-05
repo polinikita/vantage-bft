@@ -119,5 +119,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/bin/node /usr/local/bin/node
 COPY --from=builder /usr/local/bin/benchmark_client /usr/local/bin/benchmark_client
 COPY docker-bench/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# wan-bench remote entrypoint (arbitrary private IPs; addresses from committee.json
+# + env, not the gen.py contiguous NODE_IP_PREFIX scheme). Selected via
+# `docker run --entrypoint /usr/local/bin/wanbench-entrypoint.sh` by wan-bench.
+COPY docker-bench/wanbench-entrypoint.sh /usr/local/bin/wanbench-entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/wanbench-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

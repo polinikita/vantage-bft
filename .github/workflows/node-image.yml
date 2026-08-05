@@ -1,0 +1,33 @@
+# Build the vantage node docker image and push it to GHCR on every push to main,
+# tagged by commit SHA (+ latest). wan-bench pulls
+# ghcr.io/<owner>/vantage-node:<sha> (see ~/code/wan-bench). The Actions
+# GITHUB_TOKEN has packages:write, so no PAT is needed.
+name: node-image
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker-bench/Dockerfile
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/vantage-node:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/vantage-node:latest
