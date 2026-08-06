@@ -22,11 +22,72 @@ use std::{
 };
 
 use prometheus::{
+    core::{Collector, Desc},
+    proto::MetricFamily,
     register_int_counter_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry, IntCounter,
-    IntCounterVec, IntGauge, IntGaugeVec, Registry,
+    register_int_gauge_vec_with_registry, register_int_gauge_with_registry, Gauge, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
 use tokio::time::Instant;
+
+/// Publishes `metrics_active_seconds`: how long this node's metrics-active window has
+/// been open, or 0 while it is closed / not configured.
+///
+/// This is the starfish `benchmark_duration` idea (`crates/orchestrator/src/
+/// measurements.rs`): the VALIDATOR owns the clock that rates are divided by, so the
+/// harness never has to infer the window from its own wall clock. Dividing a committed
+/// delta by an orchestrator-chosen scrape interval understates TPS whenever the window
+/// opened partway through that interval -- the counter only accumulated for part of it.
+/// With this series the harness divides by `Δmetrics_active_seconds` instead, which is
+/// exactly the in-window time, so a warmup can no longer distort the rate and
+/// `--warmup` no longer has to be configured relative to the window budget.
+///
+/// A `Collector` rather than a periodically-ticked gauge on purpose: `collect` runs on
+/// every `/metrics` scrape, so the value is exact AT SCRAPE TIME. The 10s
+/// `MetricReporter` tick would otherwise quantise the denominator by up to 10s, ~8% of
+/// a 120s measurement window.
+struct ActiveWindowCollector {
+    active_from_millis: Arc<AtomicU64>,
+    gauge: Gauge,
+}
+
+impl ActiveWindowCollector {
+    fn new(active_from_millis: Arc<AtomicU64>) -> Self {
+        let gauge = Gauge::with_opts(Opts::new(
+            "metrics_active_seconds",
+            "Seconds this node's metrics-active window has been open (0 = closed)",
+        ))
+        .expect("static metric opts are valid");
+        Self {
+            active_from_millis,
+            gauge,
+        }
+    }
+}
+
+impl Collector for ActiveWindowCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.gauge.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let from = self.active_from_millis.load(std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // 0 when ungated (from == 0) or before the window opens: the harness reads that
+        // as "no node-side clock" and falls back to its wall-clock window, which is
+        // byte-identical to the behaviour before this series existed.
+        let seconds = if from == 0 || now <= from {
+            0.0
+        } else {
+            (now - from) as f64 / 1000.0
+        };
+        self.gauge.set(seconds);
+        self.gauge.collect()
+    }
+}
 
 /// METRICS-DASHBOARD-SPEC.md §3: starfish-style (`metrics.rs:1325-1376`) Drop-guard
 /// busy-time timer, ported minimally (only the `IntCounterVec`-labeled, owned variant
@@ -573,6 +634,17 @@ impl Metrics {
     /// reporter-side) pair. Both primary and worker call this on their own registry;
     /// only worker's copy is ever observed into in Phase 2 (see PHASE2-NOTES.md).
     pub fn new(registry: &Registry) -> (Arc<Self>, Arc<MetricReporter>) {
+        // The node-side active-window clock the harness divides rates by. Created here
+        // so the collector and `Metrics::active_from_millis` share ONE Arc: arming the
+        // window via `set_active_from_millis` is then immediately visible to every
+        // subsequent scrape. Registration failure is non-fatal -- a duplicate registry
+        // (only tests build several) must not take a validator down over one series.
+        let active_from_millis = Arc::new(AtomicU64::new(0));
+        if let Err(e) = registry.register(Box::new(ActiveWindowCollector::new(
+            active_from_millis.clone(),
+        ))) {
+            log::warn!("could not register metrics_active_seconds: {e}");
+        }
         let (transaction_committed_latency_hist, transaction_committed_latency) = histogram();
         let (transaction_materialised_latency_hist, transaction_materialised_latency) = histogram();
         let (proposed_block_size_bytes_hist, proposed_block_size_bytes) = histogram();
@@ -957,7 +1029,7 @@ impl Metrics {
             // current behaviour when nothing sets it") -- see this field's own doc
             // comment for what would need to set it false.
             metrics_active: Arc::new(AtomicBool::new(true)),
-            active_from_millis: Arc::new(AtomicU64::new(0)),
+            active_from_millis,
         };
 
         (Arc::new(metrics), Arc::new(reporter))
@@ -1054,6 +1126,49 @@ impl MetricReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_seconds(registry: &Registry) -> Option<f64> {
+        registry
+            .gather()
+            .into_iter()
+            .find(|f| f.get_name() == "metrics_active_seconds")
+            .map(|f| f.get_metric()[0].get_gauge().get_value())
+    }
+
+    #[test]
+    fn active_seconds_is_zero_until_the_window_is_armed() {
+        // Ungated runs must expose 0, which the harness reads as "no node-side clock"
+        // and falls back to its own wall-clock window -- identical to the behaviour
+        // before this series existed.
+        let registry = Registry::new();
+        let (metrics, _reporter) = Metrics::new(&registry);
+        assert_eq!(active_seconds(&registry), Some(0.0));
+        metrics.set_active_from_millis(None);
+        assert_eq!(active_seconds(&registry), Some(0.0));
+    }
+
+    #[test]
+    fn active_seconds_is_computed_at_scrape_time_not_on_a_tick() {
+        // The whole point of the Collector: no MetricReporter tick runs in this test, so
+        // a periodically-published gauge would stay at 0. Arming the window 5s in the
+        // past must therefore read ~5s on the very next gather.
+        let registry = Registry::new();
+        let (metrics, _reporter) = Metrics::new(&registry);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        metrics.set_active_from_millis(Some(now - 5_000));
+        let seconds = active_seconds(&registry).expect("series is registered");
+        assert!(
+            (4.5..6.0).contains(&seconds),
+            "expected ~5s of open window, got {seconds}"
+        );
+        // A window that opens in the FUTURE is still closed, hence 0 -- never negative,
+        // which would poison a rate denominator.
+        metrics.set_active_from_millis(Some(now + 60_000));
+        assert_eq!(active_seconds(&registry), Some(0.0));
+    }
 
     #[test]
     fn metrics_active_window_is_disabled_by_default() {
