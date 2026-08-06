@@ -13,7 +13,7 @@ From the repository root:
 ```
 # Terminal 1: start the benchmark (writes .local-bench/prometheus.yaml on boot)
 ./target/release/node local-benchmark --nodes 4 --workers 1 --rate 240000 \
-    --tx-size 512 --protocol autobahn-optimistic --mode all-zero --duration 60
+    --tx-size 512 --protocol autobahn-optimistic --mode all_zero --duration 60
 
 # Terminal 2, once .local-bench/prometheus.yaml exists:
 docker compose -f monitoring/docker-compose.yml up -d

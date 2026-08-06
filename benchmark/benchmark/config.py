@@ -484,11 +484,16 @@ class BenchParameters:
             self.tx_size = int(json['tx_size'])
 
             # Additive: pre-Phase-2 bench params without 'tx_mode' keep the
-            # upstream-equivalent all-zero payload.
-            self.tx_mode = str(json['tx_mode']) if 'tx_mode' in json else 'all-zero'
-            if self.tx_mode not in ('all-zero', 'random'):
+            # upstream-equivalent all_zero payload.
+            self.tx_mode = str(json['tx_mode']) if 'tx_mode' in json else 'all_zero'
+            # Legacy hyphen spelling ('all-zero') accepted as an alias; starfish-aligned
+            # snake_case ('all_zero') is canonical. Single normalization site -- every
+            # downstream use of `self.tx_mode` (commands.py::run_client, remote.py) sees
+            # only the canonical spelling.
+            self.tx_mode = self.tx_mode.replace('-', '_')
+            if self.tx_mode not in ('all_zero', 'random'):
                 raise ConfigError(
-                    f"Invalid tx_mode '{self.tx_mode}': expected 'all-zero' or 'random'"
+                    f"Invalid tx_mode '{self.tx_mode}': expected 'all_zero' or 'random'"
                 )
 
             self.duration = int(json['duration'])

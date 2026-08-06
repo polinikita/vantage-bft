@@ -58,13 +58,15 @@ class CommandMaker:
                 f'--store {store} --parameters {parameters} worker --id {id}')
 
     @staticmethod
-    def run_client(address, size, rate, nodes, mode='all-zero'):
+    def run_client(address, size, rate, nodes, mode='all_zero'):
         assert isinstance(address, str)
         assert isinstance(size, int) and size > 0
         assert isinstance(rate, int) and rate >= 0
         assert isinstance(nodes, list)
         assert all(isinstance(x, str) for x in nodes)
-        assert mode in ('all-zero', 'random')
+        # Canonical spelling only -- the legacy 'all-zero' alias is normalized once,
+        # at config.py's BenchParameters parse site, before it ever reaches here.
+        assert mode in ('all_zero', 'random')
         nodes = f'--nodes {" ".join(nodes)}' if nodes else ''
         return (f'./benchmark_client {address} --size {size} --rate {rate} '
                 f'--mode {mode} {nodes}')

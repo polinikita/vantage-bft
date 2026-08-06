@@ -16,8 +16,10 @@ use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// How the transaction payload (bytes 17..size) is filled. Mirrors starfish's
-/// `TransactionMode` (`all-zero` is upstream-equivalent; `random` is the honest mode that
-/// defeats accidental compression/dedup anywhere in the stack).
+/// `TransactionMode` (`all_zero` is upstream-equivalent; `random` is the honest mode that
+/// defeats accidental compression/dedup anywhere in the stack). `all_zero` (snake_case)
+/// is the starfish-aligned canonical wire spelling; `parse` also accepts the legacy
+/// `all-zero` (hyphen) spelling as an alias.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TransactionMode {
     AllZero,
@@ -26,18 +28,20 @@ pub enum TransactionMode {
 
 impl TransactionMode {
     pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "all-zero" => Ok(Self::AllZero),
+        // Legacy hyphen spelling ("all-zero") accepted as an alias; starfish-aligned
+        // snake_case ("all_zero") is canonical.
+        match s.replace('-', "_").as_str() {
+            "all_zero" => Ok(Self::AllZero),
             "random" => Ok(Self::Random),
             _ => Err(anyhow::anyhow!(
-                "invalid --mode '{}': expected 'all-zero' or 'random'",
+                "invalid --mode '{}': expected 'all_zero' or 'random'",
                 s
             )),
         }
     }
 
     /// METRICS-DASHBOARD-SPEC.md §8: canonical string label for `transaction_mode_info`
-    /// -- the exact strings `--mode` already accepts. Only called from
+    /// -- the exact (canonical) strings `--mode` already accepts. Only called from
     /// `local_benchmark.rs`, which is compiled into the `node` binary target, not
     /// `benchmark_client` (both share this file via `#[path = "client.rs"]`, so
     /// clippy's per-binary dead-code analysis flags it as unused from
@@ -46,7 +50,7 @@ impl TransactionMode {
     #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
-            TransactionMode::AllZero => "all-zero",
+            TransactionMode::AllZero => "all_zero",
             TransactionMode::Random => "random",
         }
     }

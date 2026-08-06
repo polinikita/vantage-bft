@@ -134,9 +134,9 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         'rate': [50_000],
         'tx_size': 512,
         # METRICS-DASHBOARD-SPEC.md §8: 'random' is now the default transaction
-        # mode everywhere (all-zero stays available). Guard/gate/sweep benchmarks
-        # must override this back to 'all-zero' explicitly for comparability with
-        # historical gate numbers (all of which are all-zero).
+        # mode everywhere (all_zero stays available). Guard/gate/sweep benchmarks
+        # must override this back to 'all_zero' explicitly for comparability with
+        # historical gate numbers (all of which are all_zero).
         'tx_mode': 'random',
         'duration': 60,
         'runs': 1,
@@ -214,7 +214,7 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
 
     Target campaign:
       - nodes = [20], workers = 1, faults = 0, collocate (default)
-      - tx_size = 512 B, tx_mode = 'all-zero' (comparability with gate numbers)
+      - tx_size = 512 B, tx_mode = 'all_zero' (comparability with gate numbers)
       - duration = 180 s per point, runs = 1
       - rate SWEEP ascending toward saturation:
           [50k, 100k, 150k, 200k, 250k] tx/s
@@ -254,7 +254,7 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
             'collocate': True,
             'rate': [int(r) for r in str(rates).split(',') if r.strip()],
             'tx_size': 512,
-            'tx_mode': 'all-zero',
+            'tx_mode': 'all_zero',
             'duration': int(duration),
             'runs': 1,
             'early_stop_margin': float(early_stop_margin),

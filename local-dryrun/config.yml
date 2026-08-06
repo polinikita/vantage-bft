@@ -19,8 +19,8 @@ workers: 1
 rate: 1000          # tx/s
 tx_size: 512        # bytes
 
-# Transaction payload mode: all-zero | random (METRICS-DASHBOARD-SPEC.md §8: random
-# is the new default everywhere -- pin all-zero here if you need a number comparable
+# Transaction payload mode: all_zero | random (METRICS-DASHBOARD-SPEC.md §8: random
+# is the new default everywhere -- pin all_zero here if you need a number comparable
 # to this repo's historical (pre-§8) gate/sweep figures).
 mode: random
 

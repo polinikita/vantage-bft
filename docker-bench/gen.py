@@ -453,7 +453,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                     "informational only here -- run.sh/results.py are what actually enforce it)")
     p.add_argument("--protocol", choices=PROTOCOL_CHOICES, default="vantage")
     p.add_argument("--tx-size", type=int, default=512, help="transaction size, bytes (default 512)")
-    p.add_argument("--mode", choices=["all-zero", "random"], default="random")
+    # "all-zero" (hyphen) kept as a legacy alias; "all_zero" (snake_case) is the
+    # starfish-aligned canonical spelling -- normalized just below, right after
+    # parsing, so every downstream use (parameters.json's tx_mode, the compose
+    # file's TX_MODE env, manifest.json) sees only the canonical spelling.
+    p.add_argument("--mode", choices=["all_zero", "all-zero", "random"], default="random")
     p.add_argument("--no-latency", dest="latency", action="store_false",
                     help="skip tc netem injection entirely (pure docker-LAN speed)")
     p.add_argument("--node-bin", default=None, help="path to a prebuilt `node` binary "
@@ -501,6 +505,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "'info,primary::vantage::resume=debug' -- overrides the -vv "
                         "default; omit for the normal info-level logs")
     args = p.parse_args(argv)
+    # Single normalization site for the legacy hyphen alias -- see --mode's help
+    # above. Every use of `args.mode` from here on sees the canonical spelling.
+    args.mode = args.mode.replace("-", "_")
 
     if not (1 <= args.nodes <= MAX_NODES):
         p.error(f"--nodes must be between 1 and {MAX_NODES}")

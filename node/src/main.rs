@@ -153,13 +153,16 @@ async fn main() -> Result<()> {
                         .long("mode")
                         .value_name("MODE")
                         .default_value("random")
-                        .value_parser(["all-zero", "random"])
+                        // "all-zero" (hyphen) kept as a legacy alias; "all_zero" (snake_case)
+                        // is the starfish-aligned canonical spelling normalized in
+                        // `TransactionMode::parse`.
+                        .value_parser(["all_zero", "all-zero", "random"])
                         .action(ArgAction::Set)
                         .help(
                             "Transaction payload mode (default 'random' as \
-                        of METRICS-DASHBOARD-SPEC.md §8 -- pin '--mode all-zero' explicitly for \
+                        of METRICS-DASHBOARD-SPEC.md §8 -- pin '--mode all_zero' explicitly for \
                         comparability with historical gate/sweep numbers, all of which are \
-                        all-zero)",
+                        all_zero; legacy 'all-zero' spelling still accepted)",
                         ),
                 )
                 .arg(

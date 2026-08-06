@@ -55,11 +55,14 @@ async fn main() -> Result<()> {
                 .value_name("MODE")
                 .required(false)
                 .default_value("random")
-                .value_parser(["all-zero", "random"])
+                // "all-zero" (hyphen) kept as a legacy alias; "all_zero" (snake_case) is
+                // the starfish-aligned canonical spelling normalized in
+                // `TransactionMode::parse`.
+                .value_parser(["all_zero", "all-zero", "random"])
                 .action(ArgAction::Set)
                 .help(
-                    "Transaction payload mode: 'all-zero' or 'random' (default, as of \
-                    METRICS-DASHBOARD-SPEC.md §8)",
+                    "Transaction payload mode: 'all_zero' or 'random' (default, as of \
+                    METRICS-DASHBOARD-SPEC.md §8; legacy 'all-zero' spelling still accepted)",
                 ),
         )
         .arg_required_else_help(true)

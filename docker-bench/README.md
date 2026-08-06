@@ -264,7 +264,7 @@ mode`) -- confirmed against `benchmark/benchmark/commands.py::run_client`, which
 exactly what `fab remote`'s own distributed deployment already runs. Its CLI is:
 
 ```
-benchmark_client <ADDR> --size <bytes> --rate <tx/s> --mode all-zero|random [--nodes <addr>...]
+benchmark_client <ADDR> --size <bytes> --rate <tx/s> --mode all_zero|random [--nodes <addr>...]
 ```
 
 `entrypoint.sh` invokes it with `<ADDR>` = this node's own co-located worker-0

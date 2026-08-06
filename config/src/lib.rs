@@ -209,7 +209,7 @@ pub struct Parameters {
     #[serde(default)]
     pub protocol: Protocol,
 
-    /// The load generator's transaction-generation mode ("random"/"all-zero") when
+    /// The load generator's transaction-generation mode ("random"/"all_zero") when
     /// the HARNESS knows it. Exists purely to give the standalone `node run
     /// primary`/`node run worker` path a channel for a fact it otherwise cannot
     /// see: `--mode` belongs to the separate `benchmark_client` process, so without
