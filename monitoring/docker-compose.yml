@@ -29,10 +29,15 @@
 services:
   prometheus:
     image: prom/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
     ports:
       - "9095:9090"
     volumes:
       - ${PROMETHEUS_CONFIG:-../.local-bench/prometheus.yaml}:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -53,3 +58,6 @@ services:
       - ./grafana/dashboard.yaml:/etc/grafana/provisioning/dashboards/main.yaml:ro
       - ./grafana/grafana-dashboard.json:/var/lib/grafana/dashboards/grafana-dashboard.json:ro
     restart: unless-stopped
+
+volumes:
+  prometheus_data:

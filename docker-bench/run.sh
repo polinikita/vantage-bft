@@ -100,7 +100,8 @@ echo "==> [4/7] starting Prometheus and Grafana"
 # gen.py deletes and recreates data/prometheus.yaml each run. A bind-mounted file in
 # an existing Prometheus container would otherwise retain the deleted inode and keep
 # scraping the previous run's targets, even though the source path looks unchanged to
-# Compose. Recreate Prometheus deliberately, then start/reuse Grafana.
+# Compose. Recreate Prometheus deliberately; its named TSDB volume preserves the
+# rolling 24-hour history across container recreation. Then start/reuse Grafana.
 monitoring_compose up -d --force-recreate prometheus
 monitoring_compose up -d grafana
 PROMETHEUS_CONTAINER_ID="$(monitoring_compose ps -q prometheus)"

@@ -17,7 +17,7 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 3,
+        "w": 2,
         "x": 0,
         "y": 0
       },
@@ -57,8 +57,8 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 7,
-        "x": 3,
+        "w": 5,
+        "x": 2,
         "y": 0
       },
       "fieldConfig": {
@@ -112,12 +112,13 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 5,
-        "x": 10,
+        "w": 3,
+        "x": 7,
         "y": 0
       },
       "fieldConfig": {
         "defaults": {
+          "min": 0,
           "unit": "cps"
         },
         "overrides": []
@@ -137,7 +138,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
+          "expr": "quantile(0.5, rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
           "legendFormat": "",
           "refId": "A"
         }
@@ -153,7 +154,7 @@
       "gridPos": {
         "h": 3,
         "w": 4,
-        "x": 15,
+        "x": 16,
         "y": 0
       },
       "fieldConfig": {
@@ -192,8 +193,8 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 5,
-        "x": 19,
+        "w": 4,
+        "x": 20,
         "y": 0
       },
       "fieldConfig": {
@@ -224,82 +225,6 @@
       ]
     },
     {
-      "collapsed": false,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 3
-      },
-      "id": 1,
-      "panels": [],
-      "title": "Overview",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "cps",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 0,
-        "y": 4
-      },
-      "id": 3,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "max(rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
-          "legendFormat": "total TPS",
-          "refId": "A"
-        }
-      ],
-      "description": "Every validator's worker-0 observes the replicated commit sequence, so the total is the maximum worker-0 rate rather than a committee-wide sum, which would inflate TPS by committee size.",
-      "title": "Committed TPS (total)",
-      "type": "stat"
-    },
-    {
       "datasource": {
         "type": "prometheus",
         "uid": "Fixed-UID-vantage"
@@ -323,10 +248,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 4
+        "h": 3,
+        "w": 3,
+        "x": 10,
+        "y": 0
       },
       "id": 4,
       "options": {
@@ -355,7 +280,7 @@
         }
       ],
       "description": "Every validator's worker-0 observes the replicated commit sequence, so the total is the maximum worker-0 byte rate rather than a committee-wide sum.",
-      "title": "Committed bytes rate (total)",
+      "title": "Committed bytes/s",
       "type": "stat"
     },
     {
@@ -382,10 +307,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 4
+        "h": 3,
+        "w": 3,
+        "x": 13,
+        "y": 0
       },
       "id": 5,
       "options": {
@@ -413,9 +338,26 @@
           "refId": "A"
         }
       ],
-      "title": "Views sealed/s (median validator, all routes)",
+      "title": "Views sealed/s",
       "type": "stat",
       "description": "Median across validators. Every primary seals the same view once, so this is a per-validator view-sealing rate -- never sum it across nodes (that reads n-times high)."
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 3
+      },
+      "id": 1,
+      "panels": [],
+      "title": "Overview",
+      "type": "row"
     },
     {
       "datasource": {
@@ -425,253 +367,45 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
+          "custom": {
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "fillOpacity": 60
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total"
+            },
+            "properties": [
               {
-                "color": "red",
-                "value": null
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none",
+                  "group": "B"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
               }
             ]
           }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 4
-      },
-      "id": 6,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "quantile(0.5, sum by (node) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route!~\"fast_full|direct_full\"}[10s]))) or vector(0)",
-          "legendFormat": "fallback seals/s",
-          "refId": "A"
-        }
-      ],
-      "title": "Fallback seal routes/s (median validator, degradation signal)",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "cps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 4
-      },
-      "id": 7,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s])",
-          "legendFormat": "{{node}}",
-          "refId": "A"
-        }
-      ],
-      "description": "One line per validator's worker-0 metrics endpoint. The node label names that validator and worker directly; no committee-wide sum is applied.",
-      "title": "Committed TPS as observed at each validator (not additive)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "max": 1000,
-          "min": 0,
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 12
-      },
-      "id": 8,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000",
-          "legendFormat": "{{node}} p50",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p90\"} / 1000",
-          "legendFormat": "{{node}} p90",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "transaction_committed_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p99\"} / 1000",
-          "legendFormat": "{{node}} p99",
-          "refId": "C"
-        }
-      ],
-      "description": "Submission-to-ordering p50/p90/p99 per validator, run-cumulative (the histogram is drained without being cleared, so each point is the quantile over ALL observations so far). The y-axis is capped at 1,000 ms for readability; series above it are drawn off-scale, NOT clamped -- read the legend.",
-      "title": "Ordering latency per node (p50/p90/p99, ms)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "max": 1000,
-          "min": 0,
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 12
-      },
-      "id": 33,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p50\"} / 1000",
-          "legendFormat": "{{node}} p50",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p90\"} / 1000",
-          "legendFormat": "{{node}} p90",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "expr": "transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-0$\",v=\"p99\"} / 1000",
-          "legendFormat": "{{node}} p99",
-          "refId": "C"
-        }
-      ],
-      "description": "Submission-to-ordering-and-local-payload p50/p90/p99 per validator, run-cumulative (the histogram is drained without being cleared, so each point is the quantile over ALL observations so far). The y-axis is capped at 1,000 ms for readability; series above it are drawn off-scale, NOT clamped -- read the legend.",
-      "title": "Materialized latency per node (p50/p90/p99, ms)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops"
-        },
-        "overrides": []
+        ]
       },
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 20
+        "x": 12,
+        "y": 4
       },
       "id": 9,
       "options": {
@@ -697,10 +431,20 @@
           "expr": "quantile by (route) (0.5, rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s]))",
           "legendFormat": "{{route}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(quantile by (route) (0.5, rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\"}[10s])))",
+          "legendFormat": "total",
+          "refId": "B"
         }
       ],
-      "title": "Seal route mix (views/s, median validator)",
-      "type": "timeseries"
+      "title": "Seal route mix (stacked views/s, median validator)",
+      "type": "timeseries",
+      "description": "Routes are stacked normally. The total reference line is the exact sum of the displayed per-route medians and is excluded from the stack to avoid double-counting."
     },
     {
       "datasource": {
@@ -755,6 +499,214 @@
         }
       ],
       "title": "Latency misses per node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "quantile(0.5, sum by (node) (rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route!~\"fast_full|direct_full\"}[10s]))) or vector(0)",
+          "legendFormat": "fallback seals/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Fallback seal routes/s (median validator)",
+      "type": "timeseries",
+      "description": "Median per-validator rate of every seal route except fast_full and direct_full. Any sustained non-zero value is a degradation signal."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "quantile(0.5, rate(committed_transactions{node=~\"$node\",node=~\".*-worker-0$\"}[10s]))",
+          "legendFormat": "median TPS",
+          "refId": "A"
+        }
+      ],
+      "description": "Median across validator worker-0 observations of the same replicated commit stream. This is deliberately neither a per-validator fan-out nor a committee-wide sum.",
+      "title": "Committed TPS (median validator)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "quantile(0.5, transaction_committed_latency{node=~\"$node\",node=~\".*-worker-[0-9]+$\",v=\"p50\"}) / 1000",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "quantile(0.5, transaction_committed_latency{node=~\"$node\",node=~\".*-worker-[0-9]+$\",v=\"p95\"}) / 1000",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "description": "Submission-to-ordering p50/p95, run-cumulative, aggregated as the median across all selected worker percentile gauges. The source exports per-worker percentile gauges rather than mergeable histogram buckets, so these are committee medians of worker percentiles, not pooled global percentiles. The y-axis uses the full observed range.",
+      "title": "Ordering latency (median across workers, p50/p95)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 33,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "quantile(0.5, transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-[0-9]+$\",v=\"p50\"}) / 1000",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "quantile(0.5, transaction_materialised_latency{node=~\"$node\",node=~\".*-worker-[0-9]+$\",v=\"p95\"}) / 1000",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "description": "Submission-to-ordering-and-local-payload p50/p95, run-cumulative, aggregated as the median across all selected worker percentile gauges. The source exports per-worker percentile gauges rather than mergeable histogram buckets, so these are committee medians of worker percentiles, not pooled global percentiles. The y-axis uses the full observed range.",
+      "title": "Materialized latency (median across workers, p50/p95)",
       "type": "timeseries"
     },
     {
@@ -926,7 +878,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 37
       },
@@ -992,8 +944,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 45
+        "x": 12,
+        "y": 37
       },
       "id": 9001,
       "options": {
@@ -1053,7 +1005,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 45
       },
       "id": 22,
       "panels": [],
@@ -1075,7 +1027,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 54
+        "y": 46
       },
       "id": 23,
       "options": {
@@ -1130,7 +1082,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 46
       },
       "id": 24,
       "options": {
@@ -1204,7 +1156,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 62
+        "y": 54
       },
       "id": 25,
       "options": {
@@ -1259,7 +1211,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 62
+        "y": 54
       },
       "id": 26,
       "options": {
@@ -1305,7 +1257,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 70
+        "y": 62
       },
       "id": 27,
       "options": {
@@ -1361,7 +1313,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 70
+        "y": 62
       },
       "id": 28,
       "options": {
@@ -1430,7 +1382,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 70
       },
       "id": 29,
       "panels": [],
@@ -1452,7 +1404,7 @@
         "h": 7,
         "w": 6,
         "x": 0,
-        "y": 79
+        "y": 71
       },
       "id": 30,
       "options": {
@@ -1499,7 +1451,7 @@
         "h": 7,
         "w": 9,
         "x": 6,
-        "y": 79
+        "y": 71
       },
       "id": 34,
       "options": {
@@ -1547,7 +1499,7 @@
         "h": 7,
         "w": 9,
         "x": 15,
-        "y": 79
+        "y": 71
       },
       "id": 35,
       "options": {
@@ -1594,7 +1546,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 78
       },
       "id": 31,
       "options": {
@@ -1641,7 +1593,7 @@
         "h": 7,
         "w": 6,
         "x": 12,
-        "y": 86
+        "y": 78
       },
       "id": 9002,
       "options": {
@@ -1697,7 +1649,7 @@
         "h": 7,
         "w": 6,
         "x": 18,
-        "y": 86
+        "y": 78
       },
       "id": 32,
       "options": {
@@ -1760,7 +1712,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 85
       },
       "id": 16,
       "options": {
@@ -1922,7 +1874,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 93
+        "y": 85
       },
       "id": 17,
       "options": {
@@ -2089,7 +2041,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 102
+        "y": 94
       },
       "id": 18,
       "options": {
@@ -2148,7 +2100,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 102
+        "y": 94
       },
       "id": 19,
       "options": {
@@ -2207,7 +2159,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 102
+        "y": 94
       },
       "id": 21,
       "options": {

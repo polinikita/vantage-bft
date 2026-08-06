@@ -22,6 +22,12 @@ docker compose -f monitoring/docker-compose.yml up -d
 Grafana: <http://localhost:3003> (anonymous admin, no login). Prometheus:
 <http://localhost:9095>.
 
+Prometheus stores its TSDB in the `prometheus_data` Docker volume and retains a
+rolling 24 hours of samples. The volume survives container recreation and ordinary
+`docker compose down`; Prometheus prunes older blocks automatically while it is
+running. Use `docker compose -f monitoring/docker-compose.yml down -v` only when the
+entire metrics history should be deleted immediately.
+
 ## Docker mode (`docker-bench`)
 
 `docker-bench/run.sh` starts this monitoring stack automatically, waits until both
@@ -29,7 +35,8 @@ the primary and worker target for every validator are healthy, and prints the di
 dashboard URL. Its Compose override attaches Prometheus to the private validator
 network; the generated `docker-bench/data/prometheus.yaml` names each process target.
 The validator stack stops after the run, but monitoring remains up so the run can
-still be inspected. From the repository root:
+still be inspected. Recreating Prometheus for a later run changes its scrape targets
+without discarding samples from the preceding 24 hours. From the repository root:
 
 ```
 ./docker-bench/run.sh --nodes 20 --rate 200 --duration 120 --protocol vantage \
@@ -75,16 +82,17 @@ with "All", filters every panel -- populated from Prometheus's own `up{node=...}
 label, which comes from each scrape target's static `labels:` block, not from the
 app):
 
-- **Overview**: a prominent protocol/mode stat panel (`protocol_info`/
-  `transaction_mode_info`, METRICS-DASHBOARD-SPEC.md §8), committed TPS (one
-  worker-0 series per validator + total stat), committed bytes rate, per-validator
-  ordering and materialized p50 transaction latency (both visually capped at one
-  second), seal-route rate (total + a fallback-route stat as a degradation signal),
-  and latency misses.
+- **Top summary / Overview**: a prominent protocol/mode stat panel (`protocol_info`/
+  `transaction_mode_info`, METRICS-DASHBOARD-SPEC.md §8), committed TPS as the median
+  validator's worker-0 observation, committed bytes rate, ordering and materialized
+  p50/p95 transaction latency aggregated as the median across worker percentile
+  gauges with an automatic y-axis range, a stacked seal-route mix with an explicit
+  total line, median fallback-route rate as a degradation signal, and latency misses.
+  Overview panels use a balanced two-column layout.
 - **Consensus** (Vantage-only -- empty/no-data on the two Autobahn paths, which never
   observe into these): view entry/seal/anchor rates, cursor lag (`entered_view -
   cursor_next_view`), control round, frontier `a_i`, control delivered-log
-  len/consume pos.
+  len/consume pos. Panels use a balanced two-column layout.
 - **Network**: messages/s and bytes/s sent, stacked by traffic category (the §2
   category map, encoded directly as per-category Prometheus `type=~"..."` regex
   queries -- one legend line per category; whichever protocol is actually running

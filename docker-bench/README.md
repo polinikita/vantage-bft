@@ -50,11 +50,15 @@ The dashboard includes committed TPS, ordering and materialized transaction late
 CPU, and resident memory per validator, plus all protocol/network metrics. Prometheus
 scrapes one primary and one worker process per validator through the private Docker
 network. Monitoring remains up after the validators stop so the completed run stays
-inspectable; stop it when finished with:
+inspectable. Its named TSDB volume keeps a rolling 24 hours of samples across runs
+and Prometheus automatically prunes older data. Stop monitoring when finished with:
 
 ```
 docker compose -f ../monitoring/docker-compose.yml down
 ```
+
+That command preserves the 24-hour metrics volume. Add `-v` to delete the complete
+metrics history immediately.
 
 While a run is in flight (from another terminal):
 

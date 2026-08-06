@@ -469,8 +469,8 @@ pub struct MetricReporter {
 }
 
 /// Publishes a `PreciseHistogram<T>` as a `name{v="..."}` gauge vector: exact count, sum,
-/// max and the p25/p50/p75/p90/p99 quantiles -- exactly starfish's exposition shape, so
-/// the harness parses it with the same plain regex starfish's own orchestrator uses.
+/// max and the p25/p50/p75/p90/p95/p99 quantiles. This preserves starfish's exposition
+/// shape and adds p95 for the benchmark dashboard.
 pub struct HistogramReporter<T> {
     histogram: PreciseHistogram<T>,
     gauge: IntGaugeVec,
@@ -507,7 +507,9 @@ impl<T: Ord + AddAssign + DivUsize + Copy + Default + AsPrometheusMetric> Histog
     /// registers this same shape but never observes into it) simply omits the metric
     /// from its scrape output rather than reporting a misleading zero.
     pub fn report(&mut self) {
-        let Some([p25, p50, p75, p90, p99]) = self.histogram.pcts([250, 500, 750, 900, 990]) else {
+        let Some([p25, p50, p75, p90, p95, p99]) =
+            self.histogram.pcts([250, 500, 750, 900, 950, 990])
+        else {
             return;
         };
         let Some(max) = self.histogram.max() else {
@@ -525,6 +527,9 @@ impl<T: Ord + AddAssign + DivUsize + Copy + Default + AsPrometheusMetric> Histog
         self.gauge
             .with_label_values(&["p90"])
             .set(p90.as_prometheus_metric());
+        self.gauge
+            .with_label_values(&["p95"])
+            .set(p95.as_prometheus_metric());
         self.gauge
             .with_label_values(&["p99"])
             .set(p99.as_prometheus_metric());
@@ -1001,5 +1006,42 @@ impl MetricReporter {
         let mut tx_size = self.proposed_transaction_size_bytes.lock().unwrap();
         tx_size.receive_all();
         tx_size.report();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn histogram_reporter_exports_p95() {
+        let registry = Registry::new();
+        let (histogram, sender) = histogram();
+        let mut reporter = HistogramReporter::new_in_registry(histogram, &registry, "latency");
+
+        for value in 1..=100 {
+            sender.observe(value);
+        }
+        reporter.receive_all();
+        reporter.report();
+
+        let p95 = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.get_name() == "latency")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.get_name() == "v" && label.get_value() == "p95")
+                    })
+                    .map(|metric| metric.get_gauge().get_value() as usize)
+            });
+
+        assert_eq!(p95, Some(96));
     }
 }
