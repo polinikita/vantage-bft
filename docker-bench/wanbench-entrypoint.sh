@@ -11,6 +11,12 @@
 #
 #   OWN_TX_ADDR    this node's own worker transactions endpoint, e.g. 10.0.0.4:6005
 #   PEER_TX_ADDRS  space-separated transactions endpoints of ALL nodes
+#   ACTIVATE_AT_MS optional absolute epoch-ms instant before which the client submits
+#                  nothing. Must equal parameters.json's `metrics_active_at_ms`, which
+#                  wan-bench derives from the same value, so the first transaction
+#                  submitted is also the first one the nodes count. Unset -> submit
+#                  immediately, which folds the committee-formation transient into the
+#                  run's latency distribution.
 #
 # Files are bind-mounted by wan-bench at /wanbench. Latency is applied by wan-bench
 # on the HOST (tc netem) in netem mode, or self-injected by `node` via the extra
@@ -21,6 +27,7 @@ set -euo pipefail
 : "${OWN_TX_ADDR:?wan-bench must pass OWN_TX_ADDR}"
 : "${PEER_TX_ADDRS:?wan-bench must pass PEER_TX_ADDRS}"
 RATE="${RATE:-100}"; TX_SIZE="${TX_SIZE:-512}"; TX_MODE="${TX_MODE:-random}"
+ACTIVATE_AT_MS="${ACTIVATE_AT_MS:-}"
 VERBOSITY="${NODE_VERBOSITY:--vv}"
 
 KEYS=/wanbench/key.json
@@ -49,9 +56,16 @@ WORKER_PID=$!
 
 # shellcheck disable=SC2206
 PEERS=($PEER_TX_ADDRS)
-echo "wanbench: client -> $OWN_TX_ADDR, ${#PEERS[@]} peers, rate ${RATE} tx/s"
+CLIENT_EXTRA=()
+if [ -n "$ACTIVATE_AT_MS" ]; then
+  CLIENT_EXTRA+=(--activate-at-ms "$ACTIVATE_AT_MS")
+fi
+echo "wanbench: client -> $OWN_TX_ADDR, ${#PEERS[@]} peers, rate ${RATE} tx/s${ACTIVATE_AT_MS:+, submitting from ${ACTIVATE_AT_MS} (epoch ms)}"
+# --nodes takes num_args(1..), so it must come LAST: any flag after it would be
+# swallowed as another address.
 /usr/local/bin/benchmark_client "$OWN_TX_ADDR" \
     --size "$TX_SIZE" --rate "$RATE" --mode "$TX_MODE" \
+    "${CLIENT_EXTRA[@]}" \
     --nodes "${PEERS[@]}" \
     >"$LOGDIR/client.log" 2>&1 &
 CLIENT_PID=$!

@@ -62,6 +62,19 @@ pub struct Client {
     pub rate: u64,
     pub nodes: Vec<SocketAddr>, //specifies the addresses of all nodes. Currently only used to wait for them to be alive, but also necessary if we wanted to receive result replies (from any node).
     pub mode: TransactionMode,
+    /// Benchmark only: absolute wall-clock instant (epoch milliseconds) before which
+    /// no transaction is submitted. Must be the SAME instant the nodes were given as
+    /// `config::Parameters::metrics_active_at_ms`, so that the first transaction this
+    /// client submits is also the first one the nodes count -- one value shared by
+    /// both sides, rather than two independently-computed delays that can drift.
+    ///
+    /// Why this is needed on top of `wait()`: `wait()` only blocks until every peer's
+    /// transaction port ACCEPTS TCP, and a node binds that listener long before its
+    /// committee is functional. Measured 2026-08-06 at n=50: transactions kept being
+    /// submitted through a ~7.4s committee-formation window, and their multi-second
+    /// latencies pinned the reported p99 near 3.5s at every offered rate.
+    /// `None` submits immediately, as before this field existed.
+    pub activate_at_ms: Option<u64>,
 }
 
 impl Client {
@@ -82,6 +95,38 @@ impl Client {
         let stream = TcpStream::connect(self.target)
             .await
             .context(format!("failed to connect to {}", self.target))?;
+
+        // Hold off submission until the metrics-active window opens (see
+        // `activate_at_ms`). Deliberately AFTER the connect, so the TCP session is
+        // already established when the window opens and the first transaction isn't
+        // delayed by a handshake.
+        if let Some(at) = self.activate_at_ms {
+            let now_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before the unix epoch")
+                .as_millis() as u64;
+            if at > now_millis {
+                let wait = at - now_millis;
+                info!(
+                    "Holding transaction submission for {} ms, until the \
+                     metrics-active window opens at {} (epoch ms)",
+                    wait, at
+                );
+                sleep(Duration::from_millis(wait)).await;
+            } else {
+                // Already past it: the harness's budget was too small for how long
+                // deploy actually took, so the early transactions this client is
+                // about to submit WILL be counted. Loud, because it silently
+                // reintroduces exactly the startup skew the window exists to remove.
+                warn!(
+                    "Metrics-active window at {} (epoch ms) already elapsed {} ms ago; \
+                     submitting immediately -- the startup transient will be included \
+                     in this run's latency distribution",
+                    at,
+                    now_millis - at
+                );
+            }
+        }
 
         // Submit all transactions.
         //

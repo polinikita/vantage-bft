@@ -238,6 +238,30 @@ pub struct Parameters {
     #[serde(default = "default_delta_ms")]
     pub delta_ms: u64,
 
+    /// Benchmark only: absolute wall-clock instant (epoch milliseconds) from which
+    /// commit-time observations count toward the rate-relevant metrics. A
+    /// transaction whose EMBEDDED submission timestamp predates this instant is
+    /// skipped in `worker::synchronizer::read_and_observe_batch`, so the startup
+    /// transient never enters the latency histograms or the committed counters.
+    ///
+    /// Why an absolute instant rather than a per-node uptime offset: nodes do not
+    /// boot together (a 50-node `deploy` spans ~40s), so "N ms after my own start"
+    /// means a different moment on every machine, and an early-booting node would
+    /// still capture the committee-formation transient. Cross-machine clock sync is
+    /// already load-bearing for this metric -- the latency is `commit_millis` minus a
+    /// timestamp stamped by a DIFFERENT machine's client (see
+    /// `read_and_observe_batch`'s own "NTP-grade sync is assumed, not enforced"),
+    /// so keying the window off a shared absolute instant introduces no new
+    /// assumption.
+    ///
+    /// The harness must set this EARLIER than its first metrics scrape, or the
+    /// baseline scrape reads a partly-gated counter and the windowed TPS it derives
+    /// is overstated. `None` (the default, and absent from every pre-existing
+    /// parameters file) disables the gate entirely: every observation counts, which
+    /// is byte-identical to the behaviour before this field existed.
+    #[serde(default)]
+    pub metrics_active_at_ms: Option<u64>,
+
     /// Vantage only: how many VIEWS of per-view internal state `VantageCore` retains
     /// behind its resolved prefix before `collect_internal_garbage` prunes
     /// (`AgbEngine`/`Frontier`/`ControlLog`/`Resolver`). Carrier bodies are additionally
@@ -933,6 +957,8 @@ impl Default for Parameters {
             tx_mode: None,
             max_block_payload: default_max_block_payload(),
             delta_ms: default_delta_ms(),
+            // No gate by default: every observation counts, as before this field.
+            metrics_active_at_ms: None,
             latency_table: None,
             mimic_latency_ms: None,
             batch_messages: true,

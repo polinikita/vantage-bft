@@ -120,6 +120,10 @@ impl Worker {
         if let Some(mode) = parameters.tx_mode.as_deref() {
             metrics.set_transaction_mode_info(mode);
         }
+        // Metrics-active window: the worker owns the commit-time observation path
+        // (`synchronizer::read_and_observe_batch`), so this is where the gate must be
+        // armed. Absent from parameters.json -> no gate, as before.
+        metrics.set_active_from_millis(parameters.metrics_active_at_ms);
         reporter.clone().start();
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Worker {} metrics listening on {}", id, metrics_address);

@@ -65,6 +65,21 @@ async fn main() -> Result<()> {
                     METRICS-DASHBOARD-SPEC.md §8; legacy 'all-zero' spelling still accepted)",
                 ),
         )
+        .arg(
+            Arg::new("activate-at-ms")
+                .long("activate-at-ms")
+                .value_name("EPOCH_MS")
+                .required(false)
+                .action(ArgAction::Set)
+                .help(
+                    "Absolute epoch-millisecond instant before which no transaction is \
+                     submitted. Pass the SAME value the nodes were given as \
+                     parameters.json's `metrics_active_at_ms`, so the first transaction \
+                     submitted is also the first one counted. Omit to submit immediately \
+                     (which includes the committee-formation transient in the run's \
+                     latency distribution)",
+                ),
+        )
         .arg_required_else_help(true)
         .get_matches();
 
@@ -106,12 +121,23 @@ async fn main() -> Result<()> {
 
     info!("Transaction mode: {:?}", mode);
 
+    let activate_at_ms = matches
+        .get_one::<String>("activate-at-ms")
+        .map(|x| x.parse::<u64>())
+        .transpose()
+        .context("--activate-at-ms must be a non-negative integer (epoch milliseconds)")?;
+
+    if let Some(at) = activate_at_ms {
+        info!("Metrics-active window opens at: {} (epoch ms)", at);
+    }
+
     let client = Client {
         target,
         size,
         rate,
         nodes,
         mode,
+        activate_at_ms,
     };
 
     // Wait for all nodes to be online and synchronized.

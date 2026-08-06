@@ -14,7 +14,10 @@
 
 use std::{
     ops::AddAssign,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -454,6 +457,22 @@ pub struct Metrics {
     /// currently one long-lived instance per primary/worker, but the struct is
     /// `Clone` -- observes the same flag.
     pub metrics_active: Arc<AtomicBool>,
+    /// Absolute wall-clock instant (epoch milliseconds) from which an observation
+    /// counts; `0` means "no gate" (every observation counts, the pre-existing
+    /// behaviour). Set write-once at boot from `config::Parameters::
+    /// metrics_active_at_ms` -- see that field for why the window is an absolute
+    /// instant rather than a per-node uptime offset.
+    ///
+    /// This is the FINE-GRAINED companion to `metrics_active` above: that flag gates
+    /// a whole `observe_committed` call, whereas this compares each transaction's own
+    /// embedded submission timestamp, so a transaction submitted during warmup is
+    /// excluded even though it commits inside the active window. Exactness matters
+    /// here: the startup transient is precisely the population whose SUBMISSION was
+    /// early, and it is those transactions whose multi-second latencies dominated
+    /// p99 (measured 2026-08-06: a fixed ~7.4s submission window contributed ~5% of
+    /// all observations at every offered rate, pinning p99 near 3.5s while p95 stayed
+    /// under 600ms).
+    pub active_from_millis: Arc<AtomicU64>,
 }
 
 /// Owns the receiving half of the latency histogram and periodically drains + publishes
@@ -938,6 +957,7 @@ impl Metrics {
             // current behaviour when nothing sets it") -- see this field's own doc
             // comment for what would need to set it false.
             metrics_active: Arc::new(AtomicBool::new(true)),
+            active_from_millis: Arc::new(AtomicU64::new(0)),
         };
 
         (Arc::new(metrics), Arc::new(reporter))
@@ -959,6 +979,28 @@ impl Metrics {
     /// called and the gauge family stays absent (not a misleading zero).
     pub fn set_transaction_mode_info(&self, mode: &str) {
         self.transaction_mode_info.with_label_values(&[mode]).set(1);
+    }
+
+    /// Write-once at boot (same discipline as `set_protocol_info` above): open the
+    /// metrics-active window at an absolute epoch-millisecond instant. `None` leaves
+    /// the gate disabled, which is byte-identical to the behaviour before
+    /// `active_from_millis` existed.
+    pub fn set_active_from_millis(&self, at_millis: Option<u64>) {
+        if let Some(at) = at_millis {
+            self.active_from_millis
+                .store(at, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// True iff a transaction submitted at `submitted_millis` falls inside the
+    /// metrics-active window. Cheap and allocation-free -- called once per committed
+    /// transaction on the hot path (240k+ tx/s), hence `Relaxed`: the value is
+    /// written once at boot and never changes, so no ordering is needed.
+    pub fn counts_toward_metrics(&self, submitted_millis: u64) -> bool {
+        let from = self
+            .active_from_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
+        from == 0 || submitted_millis >= from
     }
 }
 
@@ -1012,6 +1054,35 @@ impl MetricReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_active_window_is_disabled_by_default() {
+        // Every parameters file predating `metrics_active_at_ms` must behave exactly
+        // as before: no gate, every observation counts, however old its timestamp.
+        let registry = Registry::new();
+        let (metrics, _reporter) = Metrics::new(&registry);
+        assert!(metrics.counts_toward_metrics(0));
+        assert!(metrics.counts_toward_metrics(1_770_000_000_000));
+        metrics.set_active_from_millis(None);
+        assert!(metrics.counts_toward_metrics(0));
+    }
+
+    #[test]
+    fn metrics_active_window_excludes_transactions_submitted_before_it_opens() {
+        // The gate keys off the transaction's own SUBMISSION instant, not its commit
+        // instant: the startup transient is precisely the population that was
+        // submitted while the committee was still forming, and a transaction
+        // submitted then still commits (late) inside the active window.
+        let registry = Registry::new();
+        let (metrics, _reporter) = Metrics::new(&registry);
+        let window_open = 1_770_000_012_500;
+        metrics.set_active_from_millis(Some(window_open));
+
+        assert!(!metrics.counts_toward_metrics(window_open - 1));
+        assert!(!metrics.counts_toward_metrics(0));
+        assert!(metrics.counts_toward_metrics(window_open));
+        assert!(metrics.counts_toward_metrics(window_open + 1));
+    }
 
     #[test]
     fn histogram_reporter_exports_p95() {

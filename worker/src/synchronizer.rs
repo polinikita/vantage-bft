@@ -647,6 +647,16 @@ impl Synchronizer {
                 continue;
             }
             let submitted_millis = u64::from_le_bytes(tx[9..17].try_into().unwrap());
+            // Metrics-active window (see `Metrics::active_from_millis`): a transaction
+            // SUBMITTED before the window opened is skipped outright -- it contributes
+            // to neither latency series nor the committed counters. Gating on the
+            // submission instant rather than the commit instant is the point: the
+            // startup transient is exactly the population that was submitted while the
+            // committee was still forming, and those are the observations that pinned
+            // p99 near 3.5s. A no-op (`from == 0`) unless the harness set the window.
+            if !self.metrics.counts_toward_metrics(submitted_millis) {
+                continue;
+            }
             // saturating_sub: tolerate any clock skew between client and node
             // instead of panicking (NTP-grade sync is assumed, not enforced).
             let committed_latency =

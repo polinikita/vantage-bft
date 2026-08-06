@@ -883,6 +883,10 @@ fn spawn_node_workers(
                 rate: rate_share,
                 nodes: all_worker_addresses.to_vec(),
                 mode,
+                // Every node in a local benchmark boots in ONE process, so there is no
+                // multi-second deploy spread to ride out and no window to align to.
+                // The AWS harness is what sets this (see `Client::activate_at_ms`).
+                activate_at_ms: None,
             };
             client_handles.push(tokio::spawn(async move {
                 client.wait().await;
