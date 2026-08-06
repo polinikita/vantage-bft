@@ -87,8 +87,9 @@ app):
   validator's worker-0 observation, committed bytes rate, ordering and materialized
   p50/p95 transaction latency aggregated as the median across worker percentile
   gauges with an automatic y-axis range, a stacked seal-route mix with an explicit
-  total line, median fallback-route rate as a degradation signal, and latency misses.
-  Overview panels use a balanced two-column layout.
+  total line, median fallback-route rate as a degradation signal, latency misses,
+  median VantageCore thread utilization, and a stacked median wall-time profile by
+  core operation. Overview panels use a balanced two-column layout.
 - **Consensus** (Vantage-only -- empty/no-data on the two Autobahn paths, which never
   observe into these): view entry/seal/anchor rates, cursor lag (`entered_view -
   cursor_next_view`), control round, frontier `a_i`, control delivered-log
