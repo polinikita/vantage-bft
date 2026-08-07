@@ -779,3 +779,140 @@ async fn recovery_budget_defers_requests_instead_of_dropping_them() {
         );
     }
 }
+
+// --- BlockCache eviction floor (2026-08-07). `BlockCache` kept "every block this node has
+// ever obtained" with no eviction: 2.504 MB/s/node at n=30, ~4,286 B per entry, growing at
+// the committee's block rate -- OOM against 8 GiB in ~8-10 min at n=100.
+//
+// The floor is "EVERY peer has confirmed holding this lane at or above h". These tests pin
+// the safety side, because an over-eager floor drops a block a peer still needs and starves
+// exactly the repair path this module was rewritten to fix.
+
+/// A lane nobody has reported on must never be evictable. `None`, not zero: an incomplete
+/// picture has to BLOCK eviction, not authorise it from height 0.
+#[tokio::test]
+async fn eviction_floor_is_unknown_until_every_peer_has_reported() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 31_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let n_peers = committee.others_primaries(&watcher).len();
+    let mut rep = wide_repairer(watcher, &committee);
+
+    assert_eq!(
+        rep.universally_held_below(&author),
+        None,
+        "no reports at all"
+    );
+
+    // All but one peer reports a high height -- still not evictable.
+    for k in keys.iter().skip(1).take(n_peers - 1) {
+        rep.note_holder(k.name, author, 500);
+    }
+    assert_eq!(
+        rep.universally_held_below(&author),
+        None,
+        "one silent peer must pin the lane, not be treated as height 0"
+    );
+}
+
+/// With every peer reporting, the floor is the MINIMUM -- the slowest peer decides. Taking a
+/// median or a quorum here would drop blocks the laggard still needs.
+#[tokio::test]
+async fn eviction_floor_is_the_slowest_peer_not_a_quorum() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 32_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let n_peers = committee.others_primaries(&watcher).len();
+    let mut rep = wide_repairer(watcher, &committee);
+
+    // One peer is far behind and STAYS behind -- note_holder is monotone, so a laggard has
+    // to be given its low height and never raised (trying to lower it later is correctly
+    // ignored, which is itself pinned by `note_holder_never_regresses`).
+    let laggard = keys[1].name;
+    for (i, k) in keys.iter().skip(1).take(n_peers).enumerate() {
+        let height = if k.name == laggard {
+            7
+        } else {
+            1000 + i as u64
+        };
+        rep.note_holder(k.name, author, height);
+    }
+    assert_eq!(
+        rep.universally_held_below(&author),
+        Some(7),
+        "the floor must be the minimum across peers, not a quorum or a median"
+    );
+}
+
+/// `evict_author_below` drops strictly below the cut, keeps the rest, and touches no other
+/// author's lane.
+#[tokio::test]
+async fn eviction_drops_only_below_the_cut_and_only_that_author() {
+    use crate::vantage::lanes::BlockCache;
+    let all = authors();
+    let (a1, _) = all[1];
+    let (a2, _) = all[2];
+    let sid = session_id(&test_committee());
+    let genesis = genesis_digest(&sid);
+    let mut cache = BlockCache::new();
+
+    let mut mk = |author, height| {
+        let h = Header::new_vantage(
+            author,
+            height,
+            BTreeMap::new(),
+            genesis.clone(),
+            sid.clone(),
+        );
+        let id = h.id.clone();
+        cache.upsert(h, true, false, true, true);
+        id
+    };
+    let ids1: Vec<_> = (1..=10).map(|k| mk(a1, k)).collect();
+    let ids2: Vec<_> = (1..=10).map(|k| mk(a2, k)).collect();
+    assert_eq!(cache.len(), 20);
+
+    let dropped = cache.evict_author_below(&a1, 6);
+    assert_eq!(dropped, 5, "heights 1..=5 of a1");
+    for (k, id) in ids1.iter().enumerate() {
+        let height = k as u64 + 1;
+        assert_eq!(
+            cache.contains(id),
+            height >= 6,
+            "a1 height {height} retention is wrong after evicting below 6"
+        );
+    }
+    for id in &ids2 {
+        assert!(
+            cache.contains(id),
+            "another author's lane must be untouched"
+        );
+    }
+    assert_eq!(cache.len(), 15);
+}
+
+/// Evicting a lane with no cached blocks, or below a cut under everything held, is a no-op
+/// rather than a panic -- the driver calls this once per known author every tick.
+#[tokio::test]
+async fn eviction_of_an_absent_or_untouched_lane_is_a_noop() {
+    use crate::vantage::lanes::BlockCache;
+    let all = authors();
+    let (a1, _) = all[1];
+    let (absent, _) = all[3];
+    let sid = session_id(&test_committee());
+    let genesis = genesis_digest(&sid);
+    let mut cache = BlockCache::new();
+    cache.upsert(
+        Header::new_vantage(a1, 9, BTreeMap::new(), genesis, sid),
+        true,
+        false,
+        true,
+        true,
+    );
+
+    assert_eq!(cache.evict_author_below(&absent, 100), 0);
+    assert_eq!(
+        cache.evict_author_below(&a1, 9),
+        0,
+        "cut equals the only height"
+    );
+    assert_eq!(cache.len(), 1);
+}

@@ -474,6 +474,32 @@ impl Repairer {
         }
     }
 
+    /// The height below which EVERY peer has confirmed holding `author`'s lane, or `None`
+    /// if any peer has not been heard from about this author at all.
+    ///
+    /// This is the safe floor for evicting `author`'s blocks from the shared cache: if all
+    /// n-1 peers have credited height >= h, no correct peer can still need h from us, so
+    /// dropping it cannot starve anyone's repair. `None` -- not zero -- when the picture is
+    /// incomplete, so a missing peer blocks eviction rather than authorising it.
+    ///
+    /// A single lagging peer therefore pins this floor and memory keeps growing. That is
+    /// deliberate: the alternative, evicting above the floor to force progress, trades a
+    /// bounded and observable memory problem for an unbounded liveness one -- it would
+    /// recreate exactly the starved-repair failure this module was rewritten to fix.
+    /// `vantage_block_cache_evict_blocked` reports when this is happening.
+    pub fn universally_held_below(&self, author: &PublicKey) -> Option<Height> {
+        let by_peer = self.holders.get(author)?;
+        if by_peer.len() < self.peers.len() {
+            return None; // not every peer has been heard from about this lane
+        }
+        by_peer.values().copied().min()
+    }
+
+    /// Every author this node has holder information for -- the eviction driver's work list.
+    pub fn known_lane_authors(&self) -> Vec<PublicKey> {
+        self.holders.keys().copied().collect()
+    }
+
     /// Peers that have confirmed holding `author`'s lane at or above `height`, capped at
     /// `want`. Ordered by descending confirmed height, so the peers furthest ahead -- and
     /// therefore least likely to have pruned the block -- are asked first.

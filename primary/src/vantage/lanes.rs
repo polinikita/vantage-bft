@@ -103,17 +103,54 @@ impl BlockCache {
         self.by_digest.get(h)
     }
 
-    /// Entries held, exported as `vantage_block_cache_len`. This cache has NO eviction --
-    /// see the type's doc comment, "every block this node has ever obtained" -- so this
-    /// series is monotone and is the primary suspect for the ~2.8 MB/s/node RSS growth that
-    /// `local-dryrun/rss-growth.sh` measures. Read it against that script's MB/s to get
-    /// bytes-per-block, which is the number that decides whether eviction is worth building.
+    /// Entries held, exported as `vantage_block_cache_len`. Measured at 4,286 bytes of
+    /// per-node RSS growth per entry, growing at exactly the committee's block rate
+    /// (`local-dryrun/rss-growth.sh`), which is why `evict_author_below` exists.
     pub fn len(&self) -> usize {
         self.by_digest.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_digest.is_empty()
+    }
+
+    /// Drop every cached block of `author` strictly below `height`. Returns how many
+    /// entries went away.
+    ///
+    /// MEMORY (2026-08-07): this type kept "every block this node has ever obtained" with no
+    /// eviction of any kind, which after the `AckAggregator` retirement was the dominant
+    /// remaining leak -- 2.504 MB/s/node at n=30, ~4,286 B per entry, with `len()` climbing
+    /// at exactly the committee block rate (584/s = 30 nodes x 20 blocks/s at a 50ms header
+    /// delay). Extrapolated to n=100 that is OOM against 8 GiB in roughly 8-10 minutes.
+    ///
+    /// SAFETY IS THE CALLER'S: this method is a mechanical delete and will happily drop a
+    /// block the node still needs. `height` must be a floor below which no correct party --
+    /// local or remote -- can still require the data. `LaneManager::evict_universally_held`
+    /// derives it from "every peer has confirmed holding this lane at or above h", which
+    /// makes serving requests below it unnecessary by construction. Do not call this with a
+    /// floor derived from local progress alone: N8 forbids discarding retained blocks
+    /// precisely because peers may still ask for them, and starving a peer's repair is the
+    /// failure this whole line of work exists to fix.
+    pub fn evict_author_below(&mut self, author: &PublicKey, height: Height) -> usize {
+        let Some(by_height) = self.by_author.get_mut(author) else {
+            return 0;
+        };
+        // `split_off` keeps `height..` in place and hands back everything below it, the same
+        // GC discipline `AgbEngine`/`ControlLog` use -- no `retain`, no full-map scan.
+        let keep = by_height.split_off(&height);
+        let below = std::mem::replace(by_height, keep);
+        let mut dropped = 0;
+        for (_, digests) in below {
+            for d in digests {
+                if self.by_digest.remove(&d).is_some() {
+                    dropped += 1;
+                }
+            }
+        }
+        if by_height.is_empty() {
+            self.by_author.remove(author);
+        }
+        dropped
     }
 
     pub fn contains(&self, h: &Digest) -> bool {
@@ -888,6 +925,28 @@ impl LaneManager {
     /// message.
     pub fn block_cache_len(&self) -> usize {
         self.blocks.lock().len()
+    }
+
+    /// Evict cached blocks of `author` that every peer has confirmed holding, keeping the
+    /// most recent `keep` heights as slack. Returns entries dropped.
+    ///
+    /// `floor` comes from `Repairer::universally_held_below`, i.e. "all n-1 peers have
+    /// credited this lane at or above this height", which is what makes the drop safe --
+    /// see `BlockCache::evict_author_below` for why the caller owns that argument. `keep`
+    /// exists because the floor is derived from credits that can lag the node's own
+    /// position slightly; it costs a few blocks per lane and removes any dependence on
+    /// credit timing.
+    pub fn evict_universally_held(
+        &mut self,
+        author: &PublicKey,
+        floor: Height,
+        keep: Height,
+    ) -> usize {
+        let cut = floor.saturating_sub(keep);
+        if cut == 0 {
+            return 0;
+        }
+        self.blocks.lock().evict_author_below(author, cut)
     }
 
     pub fn blocks_handle(&self) -> SharedBlocks {

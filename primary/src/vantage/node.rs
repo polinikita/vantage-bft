@@ -1724,6 +1724,66 @@ impl VantageCore {
     /// PHASE7-PREP-NOTES.md Finding A: publish the six progress gauges from each
     /// component's own accessor -- metrics-only, no effects, no protocol interaction.
     /// A no-op if this node was spawned without a `Metrics` handle.
+    /// Drop cached blocks that every peer has confirmed holding.
+    ///
+    /// NOT CALLED. Kept, with its mechanism and tests, because the analysis is worth more
+    /// than the code: this floor is UNSOUND and the measurement that shows it is cheap to
+    /// repeat. Do not wire it back in without fixing the flaw below.
+    ///
+    /// Motivation (2026-08-07): `BlockCache` has no eviction at all -- "every block this node
+    /// has ever obtained" -- and after the `AckAggregator` retirement it is the dominant
+    /// remaining leak: 2.504 MB/s/node at n=30, ~4,286 B per entry, `block_cache_len` climbing
+    /// at exactly the committee block rate. At n=100 that is OOM against 8 GiB in ~8-10 min.
+    /// Enabling this did work as a memory fix -- `block_cache_len` went flat (+0/s from
+    /// +584/s) and growth fell to 1.463 MB/s/node.
+    ///
+    /// WHY IT IS UNSOUND. The floor is "all n-1 peers have credited this lane at or above h"
+    /// (`Repairer::universally_held_below`), which establishes that no PEER can still need h
+    /// from us. It says nothing about whether WE still need h: `Cursor::expand` requires every
+    /// block named by a manifest at any view >= `next_view`, and those manifests can reference
+    /// arbitrarily low lane heights. Worse, the condition is perversely inverted -- a lagging
+    /// node is exactly the one whose peers are all ahead of it, so the floor comes back HIGH
+    /// precisely for the node that can least afford to drop anything, and it evicts the blocks
+    /// its own cursor still needs to output.
+    ///
+    /// Measured, with `--withhold 5` (local-dryrun/repro-anchor.sh, 60s, n=30):
+    ///     eviction off:  entered/cursor 1749/532,  vote_skip     60
+    ///     eviction on:   entered/cursor 1758/49,   vote_skip 23,575
+    /// i.e. the output cursor collapsed 10x and the committee skipped 400x more views.
+    ///
+    /// Note WHICH test caught it: n=20 @ 1000 tx/s and n=30 @ 100 tx/s both PASSED with
+    /// eviction enabled. Only the deliberately asymmetric repro exposed it. A clean-path
+    /// suite would have shipped this.
+    ///
+    /// A correct floor needs a LOCAL-progress term as well -- something bounding the lowest
+    /// lane height still reachable from a manifest at or above `Cursor::next_view`. That is
+    /// not cheaply invertible from (author, height) today, which is why this is parked rather
+    /// than patched.
+    #[allow(dead_code)]
+    fn evict_universally_held_blocks(&mut self) {
+        const KEEP_HEIGHTS: crate::primary::Height = 64;
+        let mut dropped = 0usize;
+        let mut blocked = 0u64;
+        for author in self.rep.known_lane_authors() {
+            match self.rep.universally_held_below(&author) {
+                Some(floor) => {
+                    dropped += self.lm.evict_universally_held(&author, floor, KEEP_HEIGHTS);
+                }
+                None => blocked += 1,
+            }
+        }
+        if let Some(metrics) = &self.metrics {
+            if dropped > 0 {
+                metrics
+                    .vantage_block_cache_evicted_total
+                    .inc_by(dropped as u64);
+            }
+            metrics
+                .vantage_block_cache_evict_blocked
+                .set(blocked as i64);
+        }
+    }
+
     fn sample_metrics(&self) {
         let Some(metrics) = &self.metrics else { return };
         metrics

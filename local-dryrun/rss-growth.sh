@@ -95,6 +95,10 @@ print(f" samples             : {n} ({span}s measured slope)")
 if cspan:
     cache_rate = (clast - cfirst) / cspan
     print(f" block_cache_len     : {cfirst:8,} -> {clast:,}  (+{cache_rate:,.0f} entries/s, node 0)")
+    if cache_rate <= 0:
+        # Eviction is holding the cache flat, so per-entry attribution is meaningless
+        # (dividing by ~0). Whatever growth remains is in some OTHER collection.
+        print(" => cache is BOUNDED; residual growth is elsewhere")
     if cache_rate > 0:
         # Per-node RSS growth attributed to one block-cache entry. If this lands in a
         # plausible header-plus-index range (roughly 0.3-1.5 KB) the cache accounts for

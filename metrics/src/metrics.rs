@@ -417,6 +417,14 @@ pub struct Metrics {
     /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
     /// the gate the two should track each other at ~1/(n-1).
     pub vantage_repair_fanout_loops_total: IntCounter,
+    /// Cached blocks evicted because every peer confirmed holding them. Zero means eviction
+    /// is not acting -- check `vantage_block_cache_evict_blocked` before concluding the cache
+    /// is simply small.
+    pub vantage_block_cache_evicted_total: IntCounter,
+    /// Lanes whose eviction floor is unknown because some peer has not reported on that lane,
+    /// so their blocks are pinned in memory. Nonzero is safe but means memory keeps growing
+    /// for those lanes: a lagging peer pins its lane rather than authorising an unsafe drop.
+    pub vantage_block_cache_evict_blocked: IntGauge,
     /// Times a repair request was deferred to the next tick because this tick's recovery
     /// allowance (`RECOVERY_EMIT_PER_TICK`) was exhausted. Zero on a healthy node. Nonzero
     /// means a node is recovering at the ceiling -- which is the intended behaviour, not an
@@ -1047,6 +1055,19 @@ impl Metrics {
                 "vantage_repair_fanout_loops_total",
                 "Times settle reached the missing-block branch (fan-out considered, not \
                  necessarily emitted); compare with vantage_repairs_requested",
+                registry,
+            )
+            .unwrap(),
+            vantage_block_cache_evicted_total: register_int_counter_with_registry!(
+                "vantage_block_cache_evicted_total",
+                "Cached blocks evicted because every peer confirmed holding them",
+                registry,
+            )
+            .unwrap(),
+            vantage_block_cache_evict_blocked: register_int_gauge_with_registry!(
+                "vantage_block_cache_evict_blocked",
+                "Lanes pinned in memory because some peer has not reported on them (safe, \
+                 but memory keeps growing for those lanes)",
                 registry,
             )
             .unwrap(),
