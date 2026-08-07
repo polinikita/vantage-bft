@@ -15,7 +15,7 @@ use crate::vantage::{BlockRef, Effect};
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct Repairer {
@@ -48,6 +48,18 @@ pub struct Repairer {
     /// `settle` succeeds for it; it never leaves any other way, so this is always exactly
     /// `authorized \ settled` without needing to recompute the set difference.
     pending_settle: HashSet<BlockRef>,
+    /// n=100 straggler fix (2026-08-08): `digest -> refs whose walk stalled on it`.
+    /// This is what makes `on_block_available` cost O(refs waiting for THIS digest)
+    /// instead of O(`pending_settle`) -- see that method's own doc comment for the
+    /// 612M-`settle`-call measurement that motivated it.
+    blocked_on: HashMap<Digest, HashSet<BlockRef>>,
+    /// The inverse of `blocked_on`, so re-blocking a ref on a deeper digest can drop
+    /// its stale bucket entry. Together they maintain "each pending ref sits in at
+    /// most one bucket".
+    blocked_at: HashMap<BlockRef, Digest>,
+    /// Mirrors `vantage_repair_settle_calls_total` so tests can assert on it without a
+    /// metrics handle (`metrics` is `None` in most unit tests).
+    settle_calls: u64,
     /// N6: `(peer, h)` we have sent `request(h)` to, ever -- at most one, no retries.
     requested: HashSet<(PublicKey, Digest)>,
     /// N6/P1-2: every hash we have ever requested (union of `requested`'s second
@@ -90,6 +102,9 @@ impl Repairer {
             authorized: HashSet::new(),
             settled: HashSet::new(),
             pending_settle: HashSet::new(),
+            blocked_on: HashMap::new(),
+            blocked_at: HashMap::new(),
+            settle_calls: 0,
             requested: HashSet::new(),
             requested_hashes: HashSet::new(),
             pending_req: HashSet::new(),
@@ -144,19 +159,63 @@ impl Repairer {
     /// settles before its own walk succeeds) completes and is memoized into `settled`;
     /// every *descendant* still in `pending_settle` (blocked earlier, waiting on exactly
     /// this ancestor) then short-circuits into that memoized `true` at the top of
-    /// `settle` the moment its own turn in this same loop is reached (or on the next
-    /// arrival, if this one doesn't reach it) -- no re-walk of the settled ancestor
-    /// itself is needed, unlike the previous re-settle-everything sweep. A ref that
-    /// fails to settle this round (still blocked on a different/deeper missing digest)
-    /// simply stays in `pending_settle`, tried again on the next arrival -- identical
-    /// externally-observable behavior to the old sweep, just amortized.
-    pub fn on_block_available(&mut self, _digest: Digest) -> Vec<Effect> {
+    /// `settle`.
+    ///
+    /// n=100 straggler fix (2026-08-08), THE dominant cost: this used to ignore
+    /// `digest` and re-walk ALL of `pending_settle` on every newly cached block. A
+    /// straggler holds thousands of unsettled refs (measured `pending_settle_len` =
+    /// 4,967, and nothing GCs it), so the sweep was O(P) per arrival and produced
+    /// **612,424,724 `settle` calls** against 60,262 received blocks -- a ratio of
+    /// 10,163, i.e. ~2xP, the 2x being the double sweep this commit also removes. That
+    /// alone was 80.3s of `effect_execution` versus 2.57s on a healthy node, which
+    /// saturated the single core and pinned the 1000-slot inbound queue.
+    ///
+    /// Now indexed: a ref that blocks records the digest it blocked ON (`blocked_on`),
+    /// and an arrival wakes only the refs actually waiting for it. A digest nobody
+    /// waits on costs one hash lookup. The correctness argument is the same one the
+    /// paragraph above already makes -- a ref that fails to settle stays pending and is
+    /// retried when the digest it NOW blocks on arrives -- with the bucket standing in
+    /// for the full set. `blocked_on` is taken by value so a re-blocked ref reinserts
+    /// itself under its new digest, which keeps the index self-cleaning with no
+    /// separate eviction pass.
+    pub fn on_block_available(&mut self, digest: Digest) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let refs: Vec<BlockRef> = self.pending_settle.iter().cloned().collect();
-        for r in refs {
-            self.settle(r, &mut effects);
+        let Some(waiting) = self.blocked_on.remove(&digest) else {
+            return effects;
+        };
+        for r in waiting {
+            // Skip refs that have since settled or been GC'd out of `pending_settle`;
+            // `settle` would short-circuit anyway, but this avoids the call entirely.
+            if self.pending_settle.contains(&r) {
+                self.blocked_at.remove(&r);
+                self.settle(r, &mut effects);
+            } else {
+                self.blocked_at.remove(&r);
+            }
         }
         effects
+    }
+
+    /// Record that every ref in `refs` (the walk's origin plus every ancestor it walked
+    /// past) is blocked on `h`. Moving a ref between buckets drops its stale entry
+    /// first, so a ref is in at most one bucket at a time -- the invariant that keeps
+    /// `blocked_on` from accumulating duplicates across re-blocks.
+    fn record_blocked(&mut self, refs: &[BlockRef], h: &Digest) {
+        for r in refs {
+            if let Some(prev) = self.blocked_at.get(r) {
+                if prev == h {
+                    continue;
+                }
+                if let Some(bucket) = self.blocked_on.get_mut(prev) {
+                    bucket.remove(r);
+                    if bucket.is_empty() {
+                        self.blocked_on.remove(prev);
+                    }
+                }
+            }
+            self.blocked_at.insert(r.clone(), h.clone());
+            self.blocked_on.entry(h.clone()).or_default().insert(r.clone());
+        }
     }
 
     /// On `serve(h, b)` **for a requested `h`** (N6 -- this gate is normative, not
@@ -198,6 +257,17 @@ impl Repairer {
         // (D1 (iii)), which only ever gates *acking*, never repair/retention. A
         // caller that also wants the batch bytes synced can still do so separately;
         // Phase 3's repair walk itself only ever needs the chain of headers.
+        // This inline sweep is deliberately KEPT, though it duplicates the one
+        // `VantageCore::execute`'s `Effect::BlockCached` arm performs (the failing
+        // n=100 run's `settle_calls / blocks_received` = 10,163 against
+        // `pending_settle_len` = 4,967 is exactly that 2x). Removing it was tried and
+        // reverted: now that `on_block_available` is digest-indexed, the duplicate
+        // costs 2 x O(refs waiting on THIS digest) rather than 2 x O(pending_settle),
+        // so the 2x is negligible -- while dropping it changes `Repairer`'s contract
+        // (`on_serve` would no longer settle anything on its own, only signal that the
+        // caller should), which every standalone use of this type would have to know.
+        // Not worth a contract change for a constant factor on an operation that is no
+        // longer hot.
         let mut effects = vec![Effect::BlockCached(digest.clone())];
         effects.extend(self.on_block_available(digest));
         effects
@@ -259,6 +329,7 @@ impl Repairer {
     /// identical `Effect`s in identical order, identical return value -- just O(1) stack
     /// depth instead of O(chain length).
     fn settle(&mut self, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
+        self.settle_calls += 1;
         if let Some(metrics) = &self.metrics {
             metrics.vantage_repair_settle_calls_total.inc();
         }
@@ -325,6 +396,18 @@ impl Repairer {
                         }
                     }
                 }
+                // Index the blockage so `on_block_available(h)` wakes exactly these
+                // refs. `frames` holds every descendant this walk passed through on the
+                // way down and `cur` is the missing block itself -- all of them are
+                // waiting on `h`, and all of them are in `pending_settle` (`cur` via the
+                // `note_authorized` on the previous iteration, the origin via the
+                // caller's own `authorize`). Recording the whole stalled sub-chain, not
+                // just `cur`, is what preserves the old sweep's behaviour: when `h`
+                // lands, whichever of them is tried first walks the now-complete chain
+                // and settles all of it, and the rest short-circuit on `settled`.
+                let mut waiting = frames.clone();
+                waiting.push(cur.clone());
+                self.record_blocked(&waiting, &h);
                 break false;
             };
 
@@ -414,6 +497,22 @@ impl Repairer {
     #[cfg(test)]
     pub(crate) fn was_requested_hash(&self, h: &Digest) -> bool {
         self.requested_hashes.contains(h)
+    }
+
+    /// How many refs are waiting on `h` -- lets tests assert that a re-blocked ref
+    /// LEAVES its previous bucket, the invariant that keeps `blocked_on` from growing
+    /// into the very set the digest index exists to stop scanning.
+    #[cfg(test)]
+    pub(crate) fn blocked_on_len_for_test(&self, h: &Digest) -> usize {
+        self.blocked_on.get(h).map_or(0, |s| s.len())
+    }
+
+    /// Total `settle` calls, mirroring `vantage_repair_settle_calls_total` for tests
+    /// that assert an arrival did NO settling at all (the metrics handle is `None` in
+    /// most unit tests, so the counter itself is unreadable there).
+    #[cfg(test)]
+    pub(crate) fn settle_calls_for_test(&self) -> u64 {
+        self.settle_calls
     }
 
     #[cfg(test)]

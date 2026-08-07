@@ -376,3 +376,101 @@ async fn requested_hashes_membership_implies_every_peer_was_requested() {
         "a repeat authorize on a still-missing digest must emit no new requests"
     );
 }
+
+/// n=100 straggler fix (2026-08-08): `on_block_available` is digest-indexed. A block
+/// nobody is waiting on must cost nothing -- before this, EVERY arrival re-walked all
+/// of `pending_settle`, which on the failing n=100 run produced 612,424,724 `settle`
+/// calls against 60,262 received blocks (a ratio of 10,163).
+#[tokio::test]
+async fn an_arrival_nobody_waits_on_settles_nothing() {
+    let all = authors();
+    let (watcher, _) = all[0];
+    let (author, _) = all[1];
+    let mut repairer = new_standalone_repairer(watcher);
+    let sid = session_id(&test_committee());
+    let genesis = genesis_digest(&sid);
+
+    let wanted = Header::new_vantage(author, 1, BTreeMap::new(), genesis.clone(), sid.clone());
+    let unrelated = Header::new_vantage(author, 7, BTreeMap::new(), genesis, sid);
+
+    repairer.authorize((author, 1, wanted.id.clone()));
+    let before = repairer.settle_calls_for_test();
+    // An unrelated digest: no ref is blocked on it.
+    let effects = repairer.on_block_available(unrelated.id.clone());
+    assert!(effects.is_empty());
+    assert_eq!(
+        repairer.settle_calls_for_test(),
+        before,
+        "an arrival with an empty wait-bucket must not call settle at all"
+    );
+}
+
+/// The bucket must wake exactly the refs waiting on that digest, and the walk must
+/// still advance -- i.e. the index is a filter on the old sweep, not a change to it.
+#[tokio::test]
+async fn an_arrival_wakes_only_the_refs_waiting_on_it() {
+    let all = authors();
+    let (watcher, _) = all[0];
+    let (a1, _) = all[1];
+    let (a2, _) = all[2];
+    let mut repairer = new_standalone_repairer(watcher);
+    let sid = session_id(&test_committee());
+    let genesis = genesis_digest(&sid);
+    let n_peers = test_committee().others_primaries(&watcher).len();
+
+    // Two independent lanes, each authorized at height 2 so each blocks on its own h1.
+    let l1h1 = Header::new_vantage(a1, 1, BTreeMap::new(), genesis.clone(), sid.clone());
+    let l1h2 = Header::new_vantage(a1, 2, BTreeMap::new(), l1h1.id.clone(), sid.clone());
+    let l2h1 = Header::new_vantage(a2, 1, BTreeMap::new(), genesis, sid.clone());
+    let l2h2 = Header::new_vantage(a2, 2, BTreeMap::new(), l2h1.id.clone(), sid);
+
+    repairer.authorize((a1, 2, l1h2.id.clone()));
+    repairer.authorize((a2, 2, l2h2.id.clone()));
+
+    // Serving lane 1's head advances lane 1 only: the new requests are all for l1h1.
+    let effects = repairer.on_serve(l1h2.clone());
+    let reqs = requests_for(&effects);
+    assert_eq!(reqs.len(), n_peers);
+    assert!(reqs.iter().all(|(_, h)| h == &l1h1.id),
+            "lane 2 must not have been touched by lane 1's arrival");
+
+    // And lane 2 still advances when its own block arrives.
+    let effects = repairer.on_serve(l2h2.clone());
+    let reqs = requests_for(&effects);
+    assert_eq!(reqs.len(), n_peers);
+    assert!(reqs.iter().all(|(_, h)| h == &l2h1.id));
+}
+
+/// Re-blocking moves a ref between buckets rather than leaving it in both, so the
+/// index cannot accumulate duplicates as a walk descends a deep gap one level per
+/// arrival. Without this the buckets would grow like the set we just stopped scanning.
+#[tokio::test]
+async fn a_reblocked_ref_leaves_its_previous_bucket() {
+    let all = authors();
+    let (watcher, _) = all[0];
+    let (author, _) = all[1];
+    let mut repairer = new_standalone_repairer(watcher);
+    let sid = session_id(&test_committee());
+    let genesis = genesis_digest(&sid);
+
+    let h1 = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid.clone());
+    let h2 = Header::new_vantage(author, 2, BTreeMap::new(), h1.id.clone(), sid.clone());
+    let h3 = Header::new_vantage(author, 3, BTreeMap::new(), h2.id.clone(), sid);
+    let r3 = (author, 3, h3.id.clone());
+
+    repairer.authorize(r3.clone());
+    assert_eq!(repairer.blocked_on_len_for_test(&h3.id), 1, "r3 blocks on h3");
+
+    // h3 arrives: r3's walk descends and now blocks on h2 instead.
+    repairer.on_serve(h3.clone());
+    assert_eq!(repairer.blocked_on_len_for_test(&h3.id), 0,
+               "the h3 bucket must be emptied, not left holding a stale r3");
+    assert!(repairer.blocked_on_len_for_test(&h2.id) >= 1, "r3 now blocks on h2");
+
+    // The whole chain still settles once the rest arrives -- behaviour unchanged.
+    repairer.on_serve(h2.clone());
+    repairer.on_serve(h1.clone());
+    assert!(repairer.is_settled(&r3), "the chain must still settle end to end");
+    assert_eq!(repairer.blocked_on_len_for_test(&h1.id), 0);
+    assert_eq!(repairer.blocked_on_len_for_test(&h2.id), 0);
+}
