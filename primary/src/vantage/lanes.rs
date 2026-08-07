@@ -713,6 +713,14 @@ pub struct LaneManager {
     /// resolve locally yet -- retried by `retry_pending_avail` once a new block is
     /// cached. Bounded by O(n^2), same as `credited_floor`, no GC needed.
     pending_avail: HashMap<(PublicKey, PublicKey), AvailEntry>,
+    /// n=100 straggler fix (2026-08-08): `author -> senders with a stashed entry for that
+    /// author`. `retry_pending_avail` used to scan ALL of `pending_avail` and filter by
+    /// author on every newly cached block; this makes it O(senders waiting on THIS
+    /// author). The same un-indexed-sweep shape as `Repairer::on_block_available`'s, in
+    /// a second place -- measured 426M scan iterations on an n=100 straggler. Kept as a
+    /// strict mirror of `pending_avail`'s key set: every insert/remove below updates
+    /// both, and an emptied bucket is dropped so the index cannot leak authors.
+    pending_avail_by_author: HashMap<PublicKey, HashSet<PublicKey>>,
 
     /// Mechanism A (sender-side lane resume, `vantage::resume`) requester-side
     /// trigger input: per-author max height that has reached at least an
@@ -783,6 +791,7 @@ impl LaneManager {
             avail_dirty: false,
             credited_floor: HashMap::new(),
             pending_avail: HashMap::new(),
+            pending_avail_by_author: HashMap::new(),
             avail_watermark_high: HashMap::new(),
             metrics: None,
             wt_store_probe: None,
@@ -805,6 +814,26 @@ impl LaneManager {
 
     pub fn blocks_handle(&self) -> SharedBlocks {
         self.blocks.clone()
+    }
+
+    /// The `pending_avail` index's own key set, for the test that pins it as a strict
+    /// mirror of `pending_avail`. A drifted index would silently stop retrying a stashed
+    /// avail entry -- the sender's watermark would then never resolve.
+    #[cfg(test)]
+    pub(crate) fn pending_avail_index_for_test(
+        &self,
+    ) -> std::collections::HashSet<(PublicKey, PublicKey)> {
+        self.pending_avail_by_author
+            .iter()
+            .flat_map(|(author, senders)| senders.iter().map(move |s| (*s, *author)))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_avail_keys_for_test(
+        &self,
+    ) -> std::collections::HashSet<(PublicKey, PublicKey)> {
+        self.pending_avail.keys().copied().collect()
     }
 
     #[cfg(test)]
@@ -1330,11 +1359,10 @@ impl LaneManager {
             return Vec::new();
         };
         let keys: Vec<(PublicKey, PublicKey)> = self
-            .pending_avail
-            .keys()
-            .filter(|(_, a)| *a == author)
-            .cloned()
-            .collect();
+            .pending_avail_by_author
+            .get(&author)
+            .map(|senders| senders.iter().map(|sender| (*sender, author)).collect())
+            .unwrap_or_default();
         let mut out = Vec::new();
         for key in keys {
             let sender = key.0;
@@ -1405,9 +1433,19 @@ impl LaneManager {
                         .insert(key, (floor_height + suffix.len() as Height, last.clone()));
                 }
                 self.pending_avail.remove(&key);
+                if let Some(senders) = self.pending_avail_by_author.get_mut(&key.1) {
+                    senders.remove(&key.0);
+                    if senders.is_empty() {
+                        self.pending_avail_by_author.remove(&key.1);
+                    }
+                }
                 refs
             }
             None => {
+                self.pending_avail_by_author
+                    .entry(key.1)
+                    .or_default()
+                    .insert(key.0);
                 self.pending_avail.insert(key, entry.clone());
                 vec![(entry.author, entry.height, entry.head.clone())]
             }

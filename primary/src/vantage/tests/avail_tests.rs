@@ -217,3 +217,53 @@ async fn resolve_watermark_credits_reach_the_same_availability_marks_as_direct_a
          third direct ack would"
     );
 }
+
+/// n=100 straggler fix (2026-08-08): `retry_pending_avail` is indexed by author instead
+/// of scanning all of `pending_avail` on every newly cached block. The index must stay a
+/// strict mirror of the map's key set at every step -- a drifted index silently stops
+/// retrying a stashed entry, and that sender's watermark then never resolves.
+#[tokio::test]
+async fn pending_avail_index_mirrors_the_map_through_stash_and_resolve() {
+    let (watcher, _) = authors()[0];
+    let (author, _) = authors()[1];
+    let (sender_a, _) = authors()[2];
+    let (sender_b, _) = authors()[3];
+    let (mut lm, _store) = new_lane_manager(watcher, ".db_test_avail_index_mirror");
+    let sid = lm.sid().clone();
+    let genesis = lm.genesis().clone();
+
+    let h1 = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid.clone());
+    let h2 = Header::new_vantage(author, 2, BTreeMap::new(), h1.id.clone(), sid);
+    let entry = AvailEntry {
+        author,
+        height: 2,
+        head: h2.id.clone(),
+    };
+
+    let check = |lm: &crate::vantage::lanes::LaneManager, note: &str| {
+        assert_eq!(
+            lm.pending_avail_index_for_test(),
+            lm.pending_avail_keys_for_test(),
+            "index drifted from pending_avail {note}"
+        );
+    };
+
+    check(&lm, "before anything");
+    // Unresolvable (nothing cached) -> both senders get stashed.
+    lm.resolve_watermark(sender_a, std::slice::from_ref(&entry));
+    check(&lm, "after the first stash");
+    lm.resolve_watermark(sender_b, std::slice::from_ref(&entry));
+    check(&lm, "after the second stash");
+    assert_eq!(lm.pending_avail_keys_for_test().len(), 2);
+
+    // The chain arrives; the retry resolves both and must clear both index entries.
+    lm.process_publish(author, h1.clone()).await;
+    lm.process_publish(author, h2.clone()).await;
+    let backfilled = lm.retry_pending_avail(&h1.id);
+    assert!(!backfilled.is_empty(), "the retry should have resolved something");
+    check(&lm, "after the resolving retry");
+    assert!(
+        lm.pending_avail_keys_for_test().is_empty(),
+        "both stashed entries should have resolved and been removed"
+    );
+}

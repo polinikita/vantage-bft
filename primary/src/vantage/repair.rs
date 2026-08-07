@@ -69,7 +69,13 @@ pub struct Repairer {
     /// ever asking, outside §6.3's documented (attacker-cost-proportional) exposure.
     requested_hashes: HashSet<Digest>,
     /// N7: `(requester, h)` recorded on a direct `request(h)`, even before we hold `h`.
-    pending_req: HashSet<(PublicKey, Digest)>,
+    /// n=100 straggler fix (2026-08-08): indexed BY DIGEST rather than a flat
+    /// `HashSet<(PublicKey, Digest)>`. `try_serve` ran a linear scan of the whole set on
+    /// every retained block, and nothing removes an entry except being served -- so on a
+    /// straggler (measured |pending_req| ~ 10.4k) that scan ran inside
+    /// `inbound_dispatch` once per settled frame. Same un-indexed-sweep shape as
+    /// `on_block_available`'s, in a third place.
+    pending_req: HashMap<Digest, HashSet<PublicKey>>,
     /// N7: `(requester, h)` we have already served -- at most one answer, ever.
     answered: HashSet<(PublicKey, Digest)>,
 
@@ -107,7 +113,7 @@ impl Repairer {
             settle_calls: 0,
             requested: HashSet::new(),
             requested_hashes: HashSet::new(),
-            pending_req: HashSet::new(),
+            pending_req: HashMap::new(),
             answered: HashSet::new(),
             metrics: None,
         }
@@ -277,7 +283,7 @@ impl Repairer {
     /// already answered -- even when the block is not held yet -- then try-serve.
     pub fn on_request(&mut self, requester: PublicKey, h: Digest) -> Vec<Effect> {
         if !self.answered.contains(&(requester, h.clone())) {
-            self.pending_req.insert((requester, h.clone()));
+            self.pending_req.entry(h.clone()).or_default().insert(requester);
         }
         let mut effects = Vec::new();
         self.try_serve(&h, &mut effects);
@@ -461,17 +467,26 @@ impl Repairer {
         };
         let pending: Vec<PublicKey> = self
             .pending_req
-            .iter()
-            .filter(|(_, dh)| dh == h)
-            .map(|(peer, _)| *peer)
-            .filter(|peer| !self.answered.contains(&(*peer, h.clone())))
-            .collect();
+            .get(h)
+            .map(|peers| {
+                peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| !self.answered.contains(&(*peer, h.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
         for peer in pending {
             self.answered.insert((peer, h.clone()));
             // Paper: "remove it from pendingReq" -- `answered` already makes the
             // (peer, h) pair permanently inert, but do the removal too so the set
             // doesn't grow forever.
-            self.pending_req.remove(&(peer, h.clone()));
+            if let Some(peers) = self.pending_req.get_mut(h) {
+                peers.remove(&peer);
+                if peers.is_empty() {
+                    self.pending_req.remove(h);
+                }
+            }
             effects.push(Effect::ServeTo(peer, block.clone()));
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_repairs_served.inc();
