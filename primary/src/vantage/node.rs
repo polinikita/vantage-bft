@@ -792,7 +792,13 @@ impl VantageCore {
                     if parameters.reconnect_replay {
                         s = s
                             .with_reconnect_events(reconnect_tx)
-                            .with_drop_map(dirty_map.clone());
+                            .with_drop_map(dirty_map.clone())
+                            // n=100 straggler fix (2026-08-08): gated on the same
+                            // flag as the drop map deliberately -- shedding is only
+                            // safe because every volatile message is outbox-recorded
+                            // and replay-recoverable, which is exactly what this
+                            // flag turns off (see `Parameters::volatile_soft_cap`).
+                            .with_volatile_soft_cap(parameters.volatile_soft_cap);
                     }
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
@@ -1724,6 +1730,9 @@ impl VantageCore {
         metrics.vantage_omega_q.set(self.pacemaker.omega_q() as i64);
         metrics.vantage_frontier_a_i.set(self.frontier.a_i() as i64);
         metrics
+            .vantage_pending_gate_len
+            .set(self.agb.pending_gate_len() as i64);
+        metrics
             .vantage_cursor_next_view
             .set(self.cursor.next_view() as i64);
         metrics
@@ -2302,7 +2311,10 @@ impl VantageCore {
         // Termination: each non-breaking iteration flips at least one view's `echo_sent`
         // false -> true permanently and removes it from `pending_gate`, and a passing
         // gate always emits at least one effect, so `rechecked.is_empty()` holds exactly
-        // when nothing transitioned.
+        // when nothing transitioned -- since the n=100 straggler fix, "nothing
+        // transitioned within the RECHECK_BUDGET-view window scanned this call" (see
+        // `AgbEngine::recheck_all`); unscanned views wait for the next trigger, the
+        // same eventual-recheck contract deferral has always had here.
         //
         // Equivalence to the old per-trigger calls rests on TWO properties, only the
         // first of which is `recheck_all`'s own. (1) Idempotence: every `recheck_gate`

@@ -537,6 +537,24 @@ pub struct Parameters {
     #[serde(default = "default_resume_batch")]
     pub resume_batch: u64,
 
+    /// n=100 straggler fix (2026-08-08): per-destination outbound queue depth at
+    /// which the MAIN pool sheds a volatile send at enqueue -- min-merging its
+    /// filing key into the drop map exactly like a session-death discard, so the
+    /// reconnect-replay nudge/Hello path recovers it -- instead of blocking the
+    /// consensus core behind the slowest peer. This is the trigger the 2026-08-07
+    /// investigation found missing: every replay path required a session DEATH, so
+    /// a connected-but-slow straggler (291 established sessions, zero drops) never
+    /// earned a replay episode and could not recover missed one-shots. `0` disables
+    /// (the pre-existing blocking behavior). Only consulted when `reconnect_replay`
+    /// is on -- shedding without the outbox+replay mechanism behind it would be a
+    /// hidden loss, so `VantageCore` gates the attach on that flag. Sized so a
+    /// healthy peer's queue (depth ~ rate x RTT, single digits) never grazes it,
+    /// while a peer draining slower than organic broadcast volume crosses it within
+    /// tens of seconds. `#[serde(default)]` keeps every pre-existing parameter file
+    /// valid.
+    #[serde(default = "default_volatile_soft_cap")]
+    pub volatile_soft_cap: usize,
+
     /// KNOB 1 (measurement ablation): master on/off switch for the newer,
     /// server-floored volatile one-shot replay mechanism (`vantage::outbox::Outbox`
     /// plus the Hello/Done exchange -- `replay_history_views`/`replay_chunk_bytes`/
@@ -716,6 +734,11 @@ fn default_resume_backoff_ms() -> u64 {
 /// `Parameters::resume_batch`'s own doc comment.
 fn default_resume_batch() -> u64 {
     64
+}
+
+/// `Parameters::volatile_soft_cap`'s own doc comment.
+fn default_volatile_soft_cap() -> usize {
+    1_024
 }
 
 /// `Parameters::reconnect_replay`'s own doc comment.
@@ -995,6 +1018,7 @@ impl Default for Parameters {
             resume_backoff_ms: default_resume_backoff_ms(),
             resume_max_concurrent: default_resume_max_concurrent(),
             resume_batch: default_resume_batch(),
+            volatile_soft_cap: default_volatile_soft_cap(),
             reconnect_replay: default_reconnect_replay(),
             retry_backoff_max_ms: default_retry_backoff_max_ms(),
             replay_history_views: default_replay_history_views(),
@@ -1110,7 +1134,7 @@ impl Parameters {
         info!(
             "Reconnect replay (server-floored volatile one-shot replay) {}: outbox {} views / \
              {} B, replay chunk {} B / {} ms, per-peer serve budget {} B, episode/in-flight TTL \
-             {} ms, retry backoff cap {} ms",
+             {} ms, retry backoff cap {} ms, volatile soft cap {} msgs",
             // KNOB 1/2 (measurement ablation): every run's log must self-document
             // which of the three arms it is -- see `reconnect_replay`'s own doc
             // comment for the arm definitions. The two flags are otherwise
@@ -1126,7 +1150,8 @@ impl Parameters {
             self.replay_chunk_interval_ms,
             self.replay_serve_max_bytes,
             self.replay_episode_max_ms,
-            self.retry_backoff_max_ms
+            self.retry_backoff_max_ms,
+            self.volatile_soft_cap
         );
         if self.withhold_senders > 0 {
             match self.withhold_at_ms {

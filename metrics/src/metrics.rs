@@ -381,6 +381,11 @@ pub struct Metrics {
     /// (a persistent gap between this and `delivered_len` means every subsequent anchor
     /// is blocked on a still-missing `B_w`, not on delivery itself).
     pub vantage_control_consume_pos: IntGauge,
+    /// `AgbEngine::pending_gate.len()` -- views active+fixed but not yet echoed, i.e.
+    /// the population `recheck_all`'s budgeted scan rotates over. Near-zero on a
+    /// healthy node; growth tracking the node's view gap is the n=100 straggler
+    /// death-spiral signature (2026-08-08 investigation) this gauge exists to confirm.
+    pub vantage_pending_gate_len: IntGauge,
 
     // --- Metrics/dashboard expansion (METRICS-DASHBOARD-SPEC.md §1): wire-layer
     // counters, hooked in the `network` crate itself so every protocol (Autobahn
@@ -419,6 +424,14 @@ pub struct Metrics {
     /// frame, so `network_messages_sent_total` (sum) / `network_frames_sent_total`
     /// reads directly as the coalescing ratio.
     pub network_frames_sent_total: IntCounter,
+    /// Volatile sends shed at enqueue because the destination's outbound queue depth
+    /// reached `ReliableSender`'s volatile soft cap -- each shed message's filing key
+    /// is min-merged into the drop map exactly like a session-death discard, so the
+    /// reconnect-replay nudge/Hello path recovers it (`n=100 straggler fix
+    /// 2026-08-08: a connected-but-slow peer now earns replay episodes without a
+    /// session death). Sustained growth against one peer means that peer cannot keep
+    /// up with organic broadcast volume; zero is the healthy steady state.
+    pub network_volatile_shed_total: IntCounter,
 
     // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
     /// Transactions the worker's `BatchMaker` received from a client, before batching
@@ -938,6 +951,12 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_pending_gate_len: register_int_gauge_with_registry!(
+                "vantage_pending_gate_len",
+                "AgbEngine: views active+fixed but not yet echoed (recheck_all's scan population)",
+                registry,
+            )
+            .unwrap(),
             bytes_sent_total: register_int_counter_with_registry!(
                 "bytes_sent_total",
                 "Total bytes physically written to the wire (length prefix included)",
@@ -982,6 +1001,13 @@ impl Metrics {
                 "network_frames_sent_total",
                 "Physical wire frames sent (bundles count once); compare against \
                  network_messages_sent_total for the batching coalescing ratio",
+                registry,
+            )
+            .unwrap(),
+            network_volatile_shed_total: register_int_counter_with_registry!(
+                "network_volatile_shed_total",
+                "Volatile sends shed at enqueue (outbound queue depth reached the soft \
+                 cap); every shed key is min-merged into the drop map for replay",
                 registry,
             )
             .unwrap(),

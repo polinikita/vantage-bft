@@ -15,7 +15,7 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, sleep_until, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -116,6 +116,27 @@ pub struct ReliableSender {
     /// attach-before-any-connection-spawns convention as `with_latency`/
     /// `with_metrics`/`with_batching`/`with_reconnect_events`/`with_drop_map`.
     retry_backoff_max_ms: u64,
+    /// n=100 straggler fix (2026-08-08, `config::Parameters::volatile_soft_cap`):
+    /// per-destination outbound queue depth at which `send_volatile` SHEDS a new
+    /// volatile message at enqueue -- min-merging its filing key into the drop map
+    /// (identical semantics/accounting to the reconnect-waiter's and session-death
+    /// discard sites) -- instead of `send().await`ing, which at a full channel
+    /// blocks the CALLER (the single consensus core) on the slowest peer. `0`
+    /// disables shedding entirely (the pre-existing blocking behavior, and the
+    /// default -- byte-identical for every pool that never opts in).
+    ///
+    /// Why depth-at-the-channel is the right signal: while a session is up,
+    /// `Connection::keep_alive_*` blocks in `writer.send().await` once the peer's
+    /// TCP window is full and stops draining the channel, so a slow-but-alive peer
+    /// accumulates its backlog exactly here. (The link-down case never accumulates
+    /// at all: the reconnect-waiter already counts-and-drops volatile arrivals
+    /// immediately.) Shedding is safe for exactly the reason the waiter's own doc
+    /// comment gives: every volatile message is outbox-recorded BEFORE it reaches
+    /// any send path, and the min-merge lands before any later dirty-map sweep, so
+    /// a shed key is always a subset of served-later -- with the decisive addition
+    /// that this trigger requires NO session death, closing the "connected-but-slow
+    /// peer never earns a replay episode" gap.
+    volatile_soft_cap: usize,
 }
 
 impl std::default::Default for ReliableSender {
@@ -135,6 +156,7 @@ impl ReliableSender {
             reconnect_events: None,
             drop_map: None,
             retry_backoff_max_ms: DEFAULT_RETRY_BACKOFF_MAX_MS,
+            volatile_soft_cap: 0,
         }
     }
 
@@ -197,6 +219,17 @@ impl ReliableSender {
     /// landed alongside it, across three benchmark arms).
     pub fn with_retry_backoff_max_ms(mut self, ms: u64) -> Self {
         self.retry_backoff_max_ms = ms;
+        self
+    }
+
+    /// Opt in to volatile shedding at the given queue depth (see
+    /// `volatile_soft_cap`'s own field doc comment) -- same attach-once convention
+    /// as the other `with_*` builders. Only meaningful on a pool that also attaches
+    /// `with_drop_map`: shedding without one still never blocks, but the shed key
+    /// is unaccounted (mirroring `report_dropped`'s own silently-no-op contract for
+    /// a misconfigured pool).
+    pub fn with_volatile_soft_cap(mut self, cap: usize) -> Self {
+        self.volatile_soft_cap = cap;
         self
     }
 
@@ -335,20 +368,62 @@ impl ReliableSender {
     /// drop map, never requeued) if the session dies before it's acked. Returns
     /// nothing: there is no cancel handler at all for a volatile send (audit m8) --
     /// nothing for the caller to track once the enqueue below succeeds.
+    ///
+    /// n=100 straggler fix (2026-08-08): when `volatile_soft_cap` is set, a send
+    /// against a destination whose queue depth has reached the cap is SHED here --
+    /// counted into the drop map exactly like a session-death discard -- instead of
+    /// enqueued (and, at a truly full channel, instead of blocking the caller). See
+    /// `volatile_soft_cap`'s own field doc comment for why depth-at-the-channel is
+    /// the accumulation point and why shedding is always replay-covered.
     pub async fn send_volatile(&mut self, address: SocketAddr, data: Bytes, key: u64) {
         if !self.connections.contains_key(&address) {
             let tx = self.spawn_connection(address);
             self.connections.insert(address, tx);
         }
-        self.connections
-            .get(&address)
-            .unwrap()
-            .send(InnerMessage {
+        let tx = self.connections.get(&address).unwrap();
+        if self.volatile_soft_cap == 0 {
+            tx.send(InnerMessage {
                 data,
                 class: SendClass::Volatile(key),
             })
             .await
             .expect("Failed to send internal message");
+            return;
+        }
+        let depth = tx.max_capacity().saturating_sub(tx.capacity());
+        if depth >= self.volatile_soft_cap {
+            self.record_volatile_shed(address, key);
+            return;
+        }
+        match tx.try_send(InnerMessage {
+            data,
+            class: SendClass::Volatile(key),
+        }) {
+            Ok(()) => {}
+            // Unreachable while `volatile_soft_cap` << channel capacity (the depth
+            // check above fired first), kept as the same shed for completeness.
+            Err(TrySendError::Full(_)) => self.record_volatile_shed(address, key),
+            // Parity with the blocking path's `expect`: a closed connection channel
+            // is a logic error (the `Connection` task never exits), not a shed.
+            Err(TrySendError::Closed(_)) => panic!("Failed to send internal message"),
+        }
+    }
+
+    /// The shed accounting `send_volatile` shares with `Connection`'s discard sites:
+    /// min-merge `key` into the drop map under `address` (the identical merge
+    /// `Connection::report_dropped` performs at session death -- a shed with no drop
+    /// map attached is silently unaccounted, same contract), plus one counter tick.
+    fn record_volatile_shed(&self, address: SocketAddr, key: u64) {
+        if let Some(map) = &self.drop_map {
+            let mut guard = map.lock();
+            guard
+                .entry(address)
+                .and_modify(|existing| *existing = (*existing).min(key))
+                .or_insert(key);
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.network_volatile_shed_total.inc();
+        }
     }
 
     /// Broadcast variant of `send_volatile`.

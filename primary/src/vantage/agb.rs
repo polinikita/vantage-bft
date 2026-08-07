@@ -787,6 +787,12 @@ pub struct AgbEngine {
     /// membership (`activate`, `on_propose`, and every `echo_sent = true` site) --
     /// see those call sites for the exact insert/remove reasoning.
     pending_gate: BTreeSet<View>,
+    /// n=100 straggler fix (2026-08-08): where `recheck_all`'s budgeted scan resumes
+    /// -- the successor of the last view the previous call gate-checked, in ring
+    /// order over `pending_gate`. Only consulted when the set exceeds
+    /// `RECHECK_BUDGET`; a stale value (an echoed or pruned view) is harmless, since
+    /// `BTreeSet::range` keys off the bound, not membership.
+    recheck_cursor: View,
     /// Lowest view for which this engine may still create/read per-view state. Views
     /// below this have crossed the node-level GC floor and are treated as already
     /// resolved for late-message/timer purposes.
@@ -794,6 +800,31 @@ pub struct AgbEngine {
     /// PHASE6-SPEC.md §9 gate amendment: per-view seal-route counters.
     /// `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
+}
+
+/// n=100 straggler fix (2026-08-08): per-call ceiling on how many `pending_gate`
+/// views one `recheck_all` invocation gate-checks. Sized so the budget never binds
+/// on a healthy node (whose set holds 0-2 views) and caps a straggler's per-call
+/// cost at ~budget x O(n) census lookups (tens of microseconds at n=100) while
+/// still rotating over even a 10k-view backlog within ~160 triggers -- triggers
+/// arrive per inbound response, so sub-second in practice.
+const RECHECK_BUDGET: usize = 64;
+
+/// The <= `budget` views one budgeted `recheck_all` call scans: ring order over
+/// `pending`, starting at `cursor` and wrapping to the smallest view once the
+/// upper range is exhausted. Returns the whole set (ascending) whenever it fits
+/// within `budget` -- the pre-budget behavior, byte-identical. Pure; the caller
+/// advances its cursor to `last scanned + 1`.
+pub(crate) fn recheck_window(pending: &BTreeSet<View>, cursor: View, budget: usize) -> Vec<View> {
+    if pending.len() <= budget {
+        return pending.iter().copied().collect();
+    }
+    let mut window: Vec<View> = pending.range(cursor..).take(budget).copied().collect();
+    if window.len() < budget {
+        let remaining = budget - window.len();
+        window.extend(pending.range(..cursor).take(remaining).copied());
+    }
+    window
 }
 
 impl AgbEngine {
@@ -812,6 +843,7 @@ impl AgbEngine {
             quorum,
             views: BTreeMap::new(),
             pending_gate: BTreeSet::new(),
+            recheck_cursor: 1,
             min_live_view: 1,
             metrics: None,
         }
@@ -894,6 +926,13 @@ impl AgbEngine {
         self.views = self.views.split_off(&floor);
         self.pending_gate = self.pending_gate.split_off(&floor);
         self.min_live_view = floor;
+    }
+
+    /// Current `pending_gate` size -- exported as `vantage_pending_gate_len` by
+    /// `VantageCore::sample_metrics` (see that gauge's doc comment for why this is
+    /// the straggler death-spiral confirmation signal).
+    pub fn pending_gate_len(&self) -> usize {
+        self.pending_gate.len()
     }
 
     /// Efficiency Item 1: `ViewProposal::digest` is a pure function of the
@@ -1365,7 +1404,23 @@ impl AgbEngine {
         // `pending_gate` and is rechecked on the next trigger. The same bound is what
         // makes `VantageCore::execute`'s coalescing (one scan per effect drain rather
         // than one per credited availability ref) safe.
-        let views: Vec<View> = self.pending_gate.iter().copied().collect();
+        //
+        // n=100 straggler fix (2026-08-08): the scan is additionally BUDGETED to
+        // `RECHECK_BUDGET` views per call, resumed round-robin across calls via
+        // `recheck_cursor` (see `recheck_window`). Safety rests on the exact sentence
+        // already doing the work above: "anything still un-echoed stays in
+        // `pending_gate` and is rechecked on the next trigger" -- the budget only
+        // ever DEFERS a recheck to a later trigger, never skips one, and triggers
+        // arrive per inbound response and per effect drain. Healthy nodes hold 0-2
+        // pending views, so the budget never binds there; it binds exactly on a
+        // straggler whose gates fail wholesale (its `pending_gate` grows with its
+        // view gap), where the pre-budget full scan -- re-run per inbound message --
+        // cost O(gap x n) each and collapsed intake to ~10% (the measured ~500x
+        // per-message cost explosion; see `vantage_pending_gate_len`).
+        let views = recheck_window(&self.pending_gate, self.recheck_cursor, RECHECK_BUDGET);
+        if let Some(last) = views.last() {
+            self.recheck_cursor = last.saturating_add(1);
+        }
         for view in views {
             effects.extend(self.recheck_gate(view, lm, rep));
         }
@@ -2986,5 +3041,56 @@ impl DigestStatements {
     #[cfg(test)]
     pub(crate) fn known_body_for_test(&self, view: View, digest: &Digest) -> bool {
         self.known_bodies.contains_key(&(view, digest.clone()))
+    }
+}
+
+#[cfg(test)]
+mod recheck_window_tests {
+    use super::*;
+
+    fn set(views: &[View]) -> BTreeSet<View> {
+        views.iter().copied().collect()
+    }
+
+    #[test]
+    fn within_budget_returns_the_whole_set_ascending() {
+        let pending = set(&[9, 3, 7]);
+        assert_eq!(recheck_window(&pending, 8, 3), vec![3, 7, 9]);
+        // Cursor is irrelevant whenever the set fits -- pre-budget behavior.
+        assert_eq!(recheck_window(&pending, 0, 64), vec![3, 7, 9]);
+    }
+
+    #[test]
+    fn over_budget_takes_exactly_budget_from_the_cursor() {
+        let pending = set(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(recheck_window(&pending, 3, 2), vec![3, 4]);
+    }
+
+    #[test]
+    fn wraps_past_the_end_to_the_smallest_views() {
+        let pending = set(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(recheck_window(&pending, 5, 4), vec![5, 6, 1, 2]);
+    }
+
+    #[test]
+    fn a_cursor_on_a_missing_view_starts_at_the_next_present_one() {
+        let pending = set(&[10, 20, 30, 40]);
+        assert_eq!(recheck_window(&pending, 21, 2), vec![30, 40]);
+    }
+
+    #[test]
+    fn successive_windows_cover_every_view() {
+        // Simulate `recheck_all`'s cursor advancement: every view must be scanned
+        // within ceil(len/budget) consecutive calls, with no view starved.
+        let pending: BTreeSet<View> = (1..=10).collect();
+        let mut cursor = 4;
+        let mut seen = BTreeSet::new();
+        for _ in 0..4 {
+            let window = recheck_window(&pending, cursor, 3);
+            assert_eq!(window.len(), 3);
+            cursor = window.last().unwrap().saturating_add(1);
+            seen.extend(window);
+        }
+        assert_eq!(seen, pending, "4 windows of 3 must cover all 10 views");
     }
 }

@@ -579,3 +579,72 @@ async fn detached_entry_is_requeued_across_a_session_death_like_any_durable_entr
 
     assert!(handle.await.is_ok());
 }
+
+/// n=100 straggler fix (2026-08-08): a volatile send against a destination whose
+/// queue depth has reached `volatile_soft_cap` is shed -- min-merged into the drop
+/// map under the destination's address, exactly like a session-death discard --
+/// instead of enqueued or blocked on. The connection channel is injected directly
+/// (no `Connection` task ever drains it), so the observed depth is exact.
+#[tokio::test]
+async fn volatile_soft_cap_sheds_into_the_drop_map_instead_of_blocking() {
+    let address = "127.0.0.1:5320".parse::<SocketAddr>().unwrap();
+    let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut sender = ReliableSender::new()
+        .with_drop_map(drop_map.clone())
+        .with_volatile_soft_cap(2);
+    let (tx, _rx) = mpsc::channel(100);
+    sender.connections.insert(address, tx);
+
+    // Depths 0 and 1 are below the cap: both enqueue, nothing is recorded.
+    sender.send_volatile(address, Bytes::from("a"), 9).await;
+    sender.send_volatile(address, Bytes::from("b"), 8).await;
+    assert!(drop_map.lock().is_empty());
+
+    // Depth 2 has reached the cap: shed, key recorded.
+    sender.send_volatile(address, Bytes::from("c"), 7).await;
+    assert_eq!(drop_map.lock().get(&address), Some(&7));
+
+    // A lower key min-merges; a higher one leaves the recorded floor alone --
+    // `Connection::report_dropped`'s exact convention.
+    sender.send_volatile(address, Bytes::from("d"), 3).await;
+    assert_eq!(drop_map.lock().get(&address), Some(&3));
+    sender.send_volatile(address, Bytes::from("e"), 5).await;
+    assert_eq!(drop_map.lock().get(&address), Some(&3));
+}
+
+/// A shed with no drop map attached is silently unaccounted (never a panic, never
+/// an enqueue) -- mirroring `report_dropped`'s own contract for a misconfigured
+/// pool.
+#[tokio::test]
+async fn volatile_soft_cap_without_a_drop_map_sheds_silently() {
+    let address = "127.0.0.1:5321".parse::<SocketAddr>().unwrap();
+    let mut sender = ReliableSender::new().with_volatile_soft_cap(1);
+    let (tx, mut rx) = mpsc::channel(100);
+    sender.connections.insert(address, tx);
+
+    sender.send_volatile(address, Bytes::from("kept"), 1).await;
+    sender.send_volatile(address, Bytes::from("shed"), 2).await;
+
+    // Exactly the first message was enqueued.
+    assert!(rx.try_recv().is_ok());
+    assert!(rx.try_recv().is_err());
+}
+
+/// `volatile_soft_cap = 0` (the default) keeps the pre-existing enqueue behavior:
+/// no depth check, no shedding, every send lands on the channel.
+#[tokio::test]
+async fn volatile_soft_cap_zero_never_sheds() {
+    let address = "127.0.0.1:5322".parse::<SocketAddr>().unwrap();
+    let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut sender = ReliableSender::new().with_drop_map(drop_map.clone());
+    let (tx, mut rx) = mpsc::channel(100);
+    sender.connections.insert(address, tx);
+
+    for key in 0..5 {
+        sender.send_volatile(address, Bytes::from("m"), key).await;
+    }
+    for _ in 0..5 {
+        assert!(rx.try_recv().is_ok());
+    }
+    assert!(drop_map.lock().is_empty());
+}
