@@ -3,7 +3,7 @@
 // `LaneManager::{take_avail_flush, resolve_watermark, retry_pending_avail}`.
 use super::common::*;
 use crate::messages::Header;
-use crate::vantage::lanes::{AckAggregator, AvailEntry};
+use crate::vantage::lanes::{AckAggregator, AckAvailability, AckThreshold, AvailEntry};
 use std::collections::BTreeMap;
 
 /// Own DIRECT-PREFIX watermark: advances incrementally as blocks are confirmed
@@ -268,5 +268,48 @@ async fn pending_avail_index_mirrors_the_map_through_stash_and_resolve() {
     assert!(
         lm.pending_avail_keys_for_test().is_empty(),
         "both stashed entries should have resolved and been removed"
+    );
+}
+
+/// ACK FAN-IN (2026-08-07): a credit for a ref already at the terminal `Quorum` threshold
+/// must not be produced at all. `record_ack` already returns no availability for such a ref,
+/// so the work was pure waste -- and it dominated core time at n=100: 190,292 credited
+/// refs/s per node, 96.3 per avail message (one watermark entry per author), 48.1s of a
+/// 122.6s window at 2.06us each = 39% of one core against 49% total inbound_dispatch. All n
+/// senders credit the same block; only the first 2f+1 can change anything.
+#[tokio::test]
+async fn a_watermark_does_not_recredit_a_ref_already_at_quorum() {
+    let all = authors();
+    let (watcher, _) = all[0];
+    let (author, _) = all[1];
+    let (mut lm, _store) = new_lane_manager(watcher, ".db_test_avail_skip_quorum");
+    let chain = direct_chain(&mut lm, author, 2).await;
+    let head = chain.last().unwrap();
+    let r = (author, 2u64, head.id.clone());
+
+    // Before quorum: the watermark yields the ref, as it must.
+    let entry = AvailEntry {
+        author,
+        height: 2,
+        head: head.id.clone(),
+    };
+    let first = lm.resolve_watermark(all[2].0, std::slice::from_ref(&entry));
+    assert!(
+        first.iter().any(|x| x.1 == 2),
+        "a ref below quorum must still be credited"
+    );
+
+    // Mark it Quorum, exactly as `process_ack_availability` would on a real mark.
+    lm.process_ack_availability(AckAvailability {
+        reference: r.clone(),
+        threshold: AckThreshold::Quorum,
+    });
+
+    // A later sender's watermark covering the same height must now produce nothing for it:
+    // quorum is terminal, so this credit could not change any output.
+    let later = lm.resolve_watermark(all[3].0, &[entry]);
+    assert!(
+        !later.iter().any(|x| x == &r),
+        "a ref already at quorum was re-credited: {later:?}"
     );
 }

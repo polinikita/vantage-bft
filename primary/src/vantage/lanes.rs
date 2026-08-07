@@ -1269,6 +1269,14 @@ impl LaneManager {
 
     /// §4 query: `is_q_available(ref, q)`, `q` typically `committee.validity_threshold()`
     /// (f+1) or `committee.quorum_threshold()` (2f+1).
+    /// Whether `r` has already reached the terminal `Quorum` threshold, so no further
+    /// credit for it can change any output. Read from this node's OWN consumed marks
+    /// (`ack_availability`), which `process_ack_availability` maintains -- not from the
+    /// shared aggregator, which would need a lock on the hot path.
+    fn is_at_quorum(&self, r: &BlockRef) -> bool {
+        matches!(self.ack_availability.get(r), Some(AckThreshold::Quorum))
+    }
+
     pub fn is_q_available(&self, r: &BlockRef, q: Stake) -> bool {
         match self.ack_availability.get(r) {
             Some(AckThreshold::Quorum) => q <= self.committee.quorum_threshold(),
@@ -1563,7 +1571,25 @@ impl LaneManager {
             Some(suffix) => {
                 let mut refs = Vec::with_capacity(suffix.len());
                 for (i, d) in suffix.iter().enumerate() {
-                    refs.push((entry.author, floor_height + 1 + i as Height, d.clone()));
+                    let r = (entry.author, floor_height + 1 + i as Height, d.clone());
+                    // ACK FAN-IN (2026-08-07): skip a ref already at `Quorum`. That
+                    // threshold is TERMINAL -- `AckAggregator::record_ack` returns no
+                    // availability once it is reached -- so crediting it again cannot
+                    // change any output, and the work is pure waste: a `BlockRef` clone
+                    // here, then three hash lookups on 72-byte keys plus a set insert in
+                    // `record_ack`, per ref.
+                    //
+                    // This is the dominant cost at n=100. Measured on the 2026-08-07 run:
+                    // 190,292 credited refs/s per node, 96.3 per avail message (one
+                    // watermark entry per author, so n per message), 48.1s of a 122.6s
+                    // window at 2.06us each = 39% of one core, against 49% total
+                    // `inbound_dispatch`. All n senders credit the same block, but only
+                    // the first 2f+1 of them can change anything.
+                    if !self.is_at_quorum(&r) {
+                        refs.push(r);
+                    } else if let Some(metrics) = &self.metrics {
+                        metrics.vantage_avail_credit_skipped_total.inc();
+                    }
                 }
                 if let Some(last) = suffix.last() {
                     self.credited_floor
@@ -1584,7 +1610,21 @@ impl LaneManager {
                     .or_default()
                     .insert(key.0);
                 self.pending_avail.insert(key, entry.clone());
-                vec![(entry.author, entry.height, entry.head.clone())]
+                // Same skip as above, and it matters MORE here: this branch is re-entered
+                // by `retry_pending_avail` on every newly cached block of this author, so a
+                // (sender, author) pair whose segment stays unresolved re-credits the SAME
+                // head ref once per arriving block -- unboundedly. The stash is still kept
+                // (the retry is what eventually advances the floor); only the redundant
+                // credit is dropped.
+                let head = (entry.author, entry.height, entry.head.clone());
+                if self.is_at_quorum(&head) {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.vantage_avail_credit_skipped_total.inc();
+                    }
+                    Vec::new()
+                } else {
+                    vec![head]
+                }
             }
         }
     }

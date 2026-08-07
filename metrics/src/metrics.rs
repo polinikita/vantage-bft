@@ -422,6 +422,15 @@ pub struct Metrics {
     /// congestion should climb to the maximum -- a fixed ceiling was a measured regression
     /// (node 96 deferred 9,224 requests while reporting zero drops).
     pub vantage_repair_emit_ceiling: IntGauge,
+    /// Availability credits skipped because the ref had already reached the terminal
+    /// `Quorum` threshold, so the credit could not change any output.
+    ///
+    /// This is the ack fan-in's waste, and it dominated core time at n=100: 190,292
+    /// credited refs/s per node, 96.3 per avail message (one watermark entry per author),
+    /// 48.1s of a 122.6s window at 2.06us each = 39% of one core against 49% total
+    /// `inbound_dispatch`. All n senders credit the same block; only the first 2f+1 matter.
+    /// Compare against `vantage_avail_credited_refs` for the fraction eliminated.
+    pub vantage_avail_credit_skipped_total: IntCounter,
     /// Repair requests outstanding (emitted, digest not yet in hand). Capped by
     /// `RECOVERY_IN_FLIGHT_MAX`. This is what bounds INBOUND: an answer only arrives for
     /// something we asked for. A rate limit alone does not -- the 2026-08-07 run had 3,420
@@ -1072,6 +1081,13 @@ impl Metrics {
             vantage_repair_emit_ceiling: register_int_gauge_with_registry!(
                 "vantage_repair_emit_ceiling",
                 "Adaptive per-tick ceiling on repair-request emission (AIMD on bulk drops)",
+                registry,
+            )
+            .unwrap(),
+            vantage_avail_credit_skipped_total: register_int_counter_with_registry!(
+                "vantage_avail_credit_skipped_total",
+                "Availability credits skipped because the ref was already at quorum (the \
+                 ack fan-in's waste; compare with vantage_avail_credited_refs)",
                 registry,
             )
             .unwrap(),
