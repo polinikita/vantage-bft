@@ -138,3 +138,80 @@ async fn ack_withheld_until_payload_arrives() {
     assert!(effects.iter().any(|e| matches!(e, Effect::BroadcastAck(_))));
     assert!(lm.direct_pub(&r));
 }
+
+/// MEMORY (2026-08-07): once a ref reaches `Quorum` its per-sender dedup set and weight
+/// are dead, and holding them was the dominant memory leak at n=100 -- measured RSS growth
+/// of 13.43 MB/s per node (1.19 -> 2.73 GiB over a 123s window, ~7 min to OOM on 8 GiB).
+/// One `HashSet<PublicKey>` of ~97 entries is ~4.2 KB, kept per block ever seen, forever;
+/// the run's own counters put it at 403,418 blocks x ~4.3 KB = 1.73 GB.
+///
+/// Pins BOTH halves, because either alone is a bug: the working state must be released,
+/// AND a later ack for a retired ref must not resurrect it (without the `emitted == Quorum`
+/// short-circuit the very next ack would recreate the set and restart the weight from one
+/// sender's stake).
+#[tokio::test]
+async fn quorum_retires_the_per_ref_working_state_and_late_acks_do_not_resurrect_it() {
+    let all = authors(); // n=4, f=1 => f+1=2, 2f+1=3
+    let (author, _) = all[1];
+    let r = (author, 1u64, Digest([9u8; 32]));
+    let mut aggregator = AckAggregator::new(test_committee());
+
+    assert_eq!(aggregator.senders_tracked(), 0);
+    aggregator.record_ack(all[0].0, r.clone());
+    assert_eq!(aggregator.senders_tracked(), 1, "accumulating below quorum");
+    let validity = aggregator.record_ack(all[1].0, r.clone()).availability;
+    assert_eq!(validity.map(|a| a.threshold), Some(AckThreshold::Validity));
+    assert_eq!(aggregator.senders_tracked(), 1, "still needed below quorum");
+
+    let quorum = aggregator.record_ack(all[2].0, r.clone()).availability;
+    assert_eq!(quorum.map(|a| a.threshold), Some(AckThreshold::Quorum));
+    assert_eq!(
+        aggregator.senders_tracked(),
+        0,
+        "quorum is terminal -- the per-ref working state must be released"
+    );
+    assert_eq!(aggregator.refs_retired(), 1, "retirement marker kept");
+
+    // The 4th sender's ack: accepted, but emits nothing and must not re-allocate.
+    let late = aggregator.record_ack(all[3].0, r.clone());
+    assert!(late.accepted);
+    assert!(
+        late.availability.is_none(),
+        "no threshold can follow Quorum"
+    );
+    assert_eq!(
+        aggregator.senders_tracked(),
+        0,
+        "a late ack resurrected the retired working state -- the leak is back"
+    );
+
+    // A DIFFERENT ref is unaffected: retirement is per-ref, not global.
+    let r2 = (author, 2u64, Digest([8u8; 32]));
+    aggregator.record_ack(all[0].0, r2);
+    assert_eq!(aggregator.senders_tracked(), 1);
+}
+
+/// The retirement must not weaken the ack COUNT: quorum still requires 2f+1 distinct
+/// senders. A retirement that fired early (say at Validity) would emit Quorum-grade
+/// availability on f+1 stake, which is a soundness break, not a memory optimization.
+#[tokio::test]
+async fn retirement_does_not_lower_the_quorum_requirement() {
+    let all = authors();
+    let (author, _) = all[1];
+    let r = (author, 7u64, Digest([3u8; 32]));
+    let mut aggregator = AckAggregator::new(test_committee());
+
+    // Two distinct senders reach f+1 only; the set must still be live afterwards.
+    assert!(aggregator
+        .record_ack(all[0].0, r.clone())
+        .availability
+        .is_none());
+    let v = aggregator.record_ack(all[2].0, r.clone()).availability;
+    assert_eq!(v.map(|a| a.threshold), Some(AckThreshold::Validity));
+    assert_eq!(
+        aggregator.senders_tracked(),
+        1,
+        "retiring at Validity would emit quorum availability on f+1 stake"
+    );
+    assert_eq!(aggregator.refs_retired(), 1);
+}

@@ -417,6 +417,17 @@ pub struct Metrics {
     /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
     /// the gate the two should track each other at ~1/(n-1).
     pub vantage_repair_fanout_loops_total: IntCounter,
+    /// `AckAggregator::senders` size: refs whose first-hand ack set is still being
+    /// accumulated. Retired at `Quorum`, so this tracks refs still BELOW quorum and must
+    /// NOT grow with every block ever seen -- that growth was the dominant memory leak at
+    /// n=100 (13.43 MB/s per node, 1.19 -> 2.73 GiB over a 123s window, ~7 min to OOM on an
+    /// 8 GiB box). One `HashSet<PublicKey>` of ~97 entries is ~4.2 KB, held per block
+    /// forever.
+    pub vantage_ack_senders_tracked: IntGauge,
+    /// `AckAggregator::emitted` size: refs retired after reaching a threshold. ~73 B each
+    /// against `senders`' ~4.2 KB, so retirement is a ~59x cut -- but this map is still
+    /// unbounded (~0.8 GB/hour at n=100), and this is the series that shows it.
+    pub vantage_ack_refs_retired: IntGauge,
     /// Digests whose peer fan-out is started but not yet complete (`Repairer::fanout`).
     /// The n=100 recovery fix stages coverage instead of asking all n-1 peers at once, so
     /// this is the outstanding-repair backlog: healthy nodes sit near zero, and a node in
@@ -1026,6 +1037,19 @@ impl Metrics {
                 "vantage_repair_fanout_loops_total",
                 "Times settle reached the missing-block branch (fan-out considered, not \
                  necessarily emitted); compare with vantage_repairs_requested",
+                registry,
+            )
+            .unwrap(),
+            vantage_ack_senders_tracked: register_int_gauge_with_registry!(
+                "vantage_ack_senders_tracked",
+                "AckAggregator: refs still accumulating first-hand acks (retired at \
+                 quorum; must not grow with every block ever seen)",
+                registry,
+            )
+            .unwrap(),
+            vantage_ack_refs_retired: register_int_gauge_with_registry!(
+                "vantage_ack_refs_retired",
+                "AckAggregator: refs retired after reaching a threshold (still unbounded)",
                 registry,
             )
             .unwrap(),

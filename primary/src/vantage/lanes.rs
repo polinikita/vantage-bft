@@ -583,8 +583,20 @@ pub struct AckAggregationResult {
 pub struct AckAggregator {
     committee: Committee,
     members: HashSet<PublicKey>,
+    /// Per-ref first-hand sender dedup set. RETIRED once the ref reaches `Quorum` -- see
+    /// `record_ack`'s doc comment for the 13.4 MB/s leak that made this necessary.
     senders: HashMap<BlockRef, HashSet<PublicKey>>,
+    /// Per-ref accumulated stake. Retired alongside `senders`, for the same reason.
     weights: HashMap<BlockRef, Stake>,
+    /// The highest threshold already emitted per ref. Outlives `senders`/`weights` and
+    /// doubles as the "retired" marker: `Quorum` here means the other two maps have been
+    /// dropped on purpose, not that they were never populated.
+    ///
+    /// STILL UNBOUNDED, deliberately: one entry is ~73 B against `senders`' ~4.2 KB, so
+    /// retiring the other two cuts growth ~59x (13.4 -> ~0.23 MB/s), but this map alone
+    /// still grows about 0.8 GB/hour at n=100. Bounding it needs a safe floor below which
+    /// a re-emitted availability mark is known harmless, which is the same policy question
+    /// as `Repairer`'s GC floor -- not decidable here.
     emitted: HashMap<BlockRef, AckThreshold>,
 }
 
@@ -600,10 +612,36 @@ impl AckAggregator {
         }
     }
 
+    /// Record a first-hand ack and report whether it crossed a new availability threshold.
+    ///
+    /// MEMORY (2026-08-07): once a ref reaches `Quorum` -- the top threshold -- no further
+    /// ack for it can change any output, so its `senders` set and `weights` entry are dead
+    /// and are dropped. Keeping them was the dominant memory leak at n=100: measured RSS
+    /// growth of 13.43 MB/s per node, 1.19 -> 2.73 GiB across a 123s window, i.e. OOM
+    /// against an 8 GiB box in about 7 minutes. The run only survived because it was short.
+    ///
+    /// The arithmetic, from that run's own counters: 403,418 blocks received x ~100 senders
+    /// each = 40.3M acks (`vantage_avail_credited_refs` read 39.3M), and `senders` held one
+    /// `HashSet<PublicKey>` of ~97 entries -- about 4.2 KB with capacity rounding -- per
+    /// block ever seen, forever. 403,418 x 4.3 KB = 1.73 GB, or 14.1 MB/s over the window.
+    ///
+    /// Correctness of the drop: a later ack for a retired ref is short-circuited by the
+    /// `emitted == Quorum` check below, BEFORE `senders` is touched, so it neither
+    /// re-allocates the set nor re-counts stake nor re-emits a mark. Without that check the
+    /// drop would be a bug -- the set would be recreated by the very next ack and the
+    /// weight would restart from one sender's stake.
     pub fn record_ack(&mut self, sender: PublicKey, reference: BlockRef) -> AckAggregationResult {
         if !self.members.contains(&sender) {
             return AckAggregationResult {
                 accepted: false,
+                availability: None,
+            };
+        }
+        // Retired: `Quorum` is terminal, so nothing this ack could do would be observable.
+        // Must precede every `senders`/`weights` access -- see the doc comment above.
+        if self.emitted.get(&reference) == Some(&AckThreshold::Quorum) {
+            return AckAggregationResult {
+                accepted: true,
                 availability: None,
             };
         }
@@ -647,6 +685,12 @@ impl AckAggregator {
             };
         }
         self.emitted.insert(reference.clone(), threshold);
+        if threshold == AckThreshold::Quorum {
+            // Terminal threshold reached: retire the per-ref working state. The `emitted`
+            // entry left behind is what makes every subsequent ack a single hash lookup.
+            self.senders.remove(&reference);
+            self.weights.remove(&reference);
+        }
         AckAggregationResult {
             accepted: true,
             availability: Some(AckAvailability {
@@ -654,6 +698,20 @@ impl AckAggregator {
                 threshold,
             }),
         }
+    }
+
+    /// Live per-ref working-state size (`senders`), exported as
+    /// `vantage_ack_senders_tracked` so the retirement above is observable: it should sit
+    /// near the count of refs still BELOW quorum, not grow with every block ever seen.
+    pub fn senders_tracked(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Refs that have reached a threshold and been retired (`emitted`). Exported as
+    /// `vantage_ack_refs_retired` -- still unbounded by design, see the field's comment,
+    /// so this is the series that shows the remaining ~0.23 MB/s.
+    pub fn refs_retired(&self) -> usize {
+        self.emitted.len()
     }
 }
 
