@@ -133,6 +133,7 @@ async fn meta_ok_full_passes_once_own_ready_is_grade_one_same_payload() {
                 sender: *sender,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -183,6 +184,7 @@ async fn meta_ok_rejects_carrier_targeting_a_pruned_view() {
                 sender: *sender,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -234,6 +236,7 @@ async fn meta_ok_full_rejects_when_own_ready_is_grade_zero() {
                 sender: s,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -276,6 +279,7 @@ async fn meta_ok_full_rejects_when_own_ready_names_different_payload() {
                 sender: *sender,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -327,6 +331,7 @@ async fn meta_ok_core_passes_with_grade_zero_and_rejects_grade_one() {
                 sender: s,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -361,6 +366,7 @@ async fn meta_ok_core_passes_with_grade_zero_and_rejects_grade_one() {
                 sender: *s,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep2,
         );
@@ -438,6 +444,7 @@ async fn meta_ok_lock_rule_blocks_non_matching_entry_while_lock_active() {
                 sender: *s,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -499,6 +506,7 @@ async fn origin_bit_one_iff_own_echo_matches_full_payload_grade1() {
                 sender: *s,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -548,6 +556,7 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
                 sender: *s,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -576,6 +585,7 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
             sender: p1,
             wish: 0,
             origin: Some(0),
+            avail: None,
         },
         &mut rep,
     );
@@ -591,6 +601,7 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
             sender: p2,
             wish: 0,
             origin: Some(0),
+            avail: None,
         },
         &mut rep,
     );
@@ -615,6 +626,7 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
                 sender: *s,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep2,
         );
@@ -636,6 +648,7 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
             sender: p1b,
             wish: 0,
             origin: Some(1),
+            avail: None,
         },
         &mut rep2,
     );
@@ -647,6 +660,7 @@ async fn ready_ok_blocks_ready_until_f_plus_1_origin_one_echoes_then_fires() {
             sender: p2b,
             wish: 0,
             origin: Some(0),
+            avail: None,
         },
         &mut rep2,
     );

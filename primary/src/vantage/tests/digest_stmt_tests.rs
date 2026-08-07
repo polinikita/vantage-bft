@@ -50,6 +50,7 @@ fn echo_msg(proposal: ViewProposal, grade: u8, sender: PublicKey) -> Echo {
         sender,
         wish: 0,
         origin: None,
+        avail: None,
     }
 }
 
@@ -186,6 +187,7 @@ async fn cross_encoding_one_shot_value_then_digest() {
         sender,
         wish: 0,
         origin: None,
+        avail: None,
     };
     let effects = digest_stmts.on_echo_digest(msg, Instant::now(), &mut agb, &mut rep);
     assert!(
@@ -231,6 +233,7 @@ async fn cross_encoding_one_shot_digest_then_value() {
         sender,
         wish: 0,
         origin: None,
+        avail: None,
     };
     let effects = digest_stmts.on_echo_digest(msg, Instant::now(), &mut agb, &mut rep);
     assert_eq!(
@@ -533,6 +536,7 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
         sender,
         wish: 0,
         origin: None,
+        avail: None,
     };
     digest_stmts.on_echo_digest(msg, Instant::now(), &mut agb, &mut rep);
     assert_eq!(digest_stmts.buffered_echo_count_for_test(1), 1);
@@ -586,6 +590,7 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
         sender: all[2].0,
         wish: 0,
         origin: None,
+        avail: None,
     };
     let effects = digest_stmts.on_echo_digest(late, Instant::now(), &mut agb, &mut rep);
     assert!(effects.is_empty());

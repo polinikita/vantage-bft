@@ -1063,7 +1063,10 @@ impl SimpleItCore {
                 | Effect::ArmControlTimer(_, _)
                 | Effect::ApplyAnchor(_, _, _)
                 | Effect::BodyFetchTo(_, _, _)
-                | Effect::BodyServeTo(_, _, _)) => {
+                | Effect::BodyServeTo(_, _, _)
+                // AVAIL-ECHO-SPEC.md: produced only by `AgbEngine::on_echo`, and
+                // SimpleItCore has no AGB engine at all.
+                | Effect::AvailClaimed(_, _)) => {
                     debug_assert!(
                         false,
                         "SimpleItCore's data-plane effect loop received a Vantage-\

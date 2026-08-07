@@ -562,6 +562,21 @@ pub fn drain_local(
                         }
                     }
                 }
+                // AVAIL-ECHO-SPEC.md: mirror `VantageCore::execute`'s arm exactly, so an
+                // integration test with `echo_avail_claims` on exercises the real
+                // crediting path (monotonicity + linkage + credit_refs) rather than
+                // silently dropping every claim.
+                Effect::AvailClaimed(sender, resolved) => {
+                    let refs = nodes[idx].lm.note_claim(sender, &resolved);
+                    let credited: Vec<_> = refs
+                        .into_iter()
+                        .flat_map(|r| {
+                            let node = &mut nodes[idx];
+                            node.record_ack(sender, r, now)
+                        })
+                        .collect();
+                    queue.extend(credited);
+                }
                 Effect::SyncBatches(..) => {} // payloads are always empty in this harness
                 Effect::RequestTo(peer, digest) => {
                     if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {

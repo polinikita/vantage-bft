@@ -511,6 +511,7 @@ async fn echo_with_out_of_range_grade_is_dropped_not_counted() {
         sender,
         wish: 0,
         origin: None,
+        avail: None,
     };
     let (bad_sender, _) = authors()[1];
 

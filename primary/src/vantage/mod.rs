@@ -232,6 +232,20 @@ pub enum Effect {
     /// never `Wire::send_message` directly -- so the withholding fault injector
     /// still governs it mid-window (checked at enqueue time, before hand-off).
     ResumeServeTo(PublicKey /* requester */, Header),
+    /// AVAIL-ECHO-SPEC.md (`Parameters::echo_avail_claims`): `sender`'s positional
+    /// availability claims, already resolved against the echoed proposal's reference
+    /// vector. `bool` is "this was an at-tip bit", which the receiver needs in order to
+    /// skip the linkage check -- an at-tip claim's digest came from the proposal itself,
+    /// which `proposal_digest` commits to, whereas a short claim's anchor is the sender's
+    /// own word and must be verified against our copy.
+    ///
+    /// An `Effect` rather than a direct call because BOTH echo encodings funnel through
+    /// `AgbEngine::on_echo` -- the by-value `VantageEcho` arm and, via
+    /// `DigestStatements`, the `VantageEchoDigest` one that production actually sends --
+    /// so emitting here covers both with one hook, and keeps `AgbEngine` free of the
+    /// `LaneManager`/`BlockCache` access that crediting needs. Resolved refs rather than
+    /// the proposal itself so this never clones a manifest pair (~14 KB at n=100).
+    AvailClaimed(PublicKey, Vec<(BlockRef, bool)>),
 }
 
 pub mod control;

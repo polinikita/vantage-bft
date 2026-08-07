@@ -51,6 +51,7 @@ async fn w3_echo_stage_completes_pair_raises_wish_to_u_plus_2() {
                 sender: *pk,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -158,6 +159,7 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
             sender,
             wish: 3,
             origin: None,
+            avail: None,
         })),
         now,
     )
@@ -171,6 +173,7 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
             sender,
             wish: 7,
             origin: None,
+            avail: None,
         })),
         now,
     )
@@ -193,6 +196,7 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
                 sender: s2,
                 wish: 0,
                 origin: None,
+                avail: None,
             })),
             now,
         )
@@ -212,6 +216,7 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
                 sender: s3,
                 wish: 0,
                 origin: None,
+                avail: None,
             })),
             now,
         )
@@ -273,6 +278,7 @@ async fn w4_piggyback_rides_on_all_four_response_types() {
             sender: s1,
             wish: 9,
             origin: None,
+            avail: None,
         })),
         now,
     )

@@ -338,6 +338,31 @@ pub struct Parameters {
     #[serde(default = "default_digest_statements")]
     pub digest_statements: bool,
 
+    /// AVAIL-ECHO-SPEC.md: carry availability acknowledgments POSITIONALLY on the AGB
+    /// echo -- a bit per lane against the echoed proposal's own reference vector --
+    /// instead of `VantageAvail`'s explicit `(a,k,h)` tuples.
+    ///
+    /// Same statements, different encoding: a set bit denotes exactly the reference at
+    /// that index in `claim::manifest_refs(proposal)`, counted first-hand from the
+    /// echo's channel sender at the unchanged thresholds. `Definition (Availability)`
+    /// is untouched, and the claim rides OUTSIDE the echo's counting identity exactly
+    /// like `Echo::wish` and `Echo::origin` already do.
+    ///
+    /// Why: measured per node on the 2026-08-07 n=100 run at `e46f6e1`,
+    /// `network_bytes_sent_total{type="VantageAvail"}` was 18.330 of 19.880 MB/s --
+    /// **92.2% of the node's entire wire budget**, at 9,258 B per message against a
+    /// 2,203 B average, while `Header` was 1.4%. Autobahn at the same throughput pushes
+    /// 4.34 MB/s with no acknowledgment layer at all.
+    ///
+    /// `#[serde(default)]` = `false`, and when off NOTHING changes: no claim is ever
+    /// constructed, the field serializes as `None`, and `avail_tick` keeps flushing
+    /// `VantageAvail` as before. When ON, the periodic flush is not scheduled and the
+    /// claims replace it. Committee-wide consistent by construction, same reasoning as
+    /// `ack_watermarks`/`digest_statements`: every node's `Parameters` comes from the
+    /// same generated config.
+    #[serde(default)]
+    pub echo_avail_claims: bool,
+
     /// PHASE7-PREP-NOTES.md (optional, WAN-shaped local runs): an optional
     /// per-authority-pair one-way latency table, applied to THIS node's own
     /// primary-to-primary connections at spawn time via `Committee::latency_map`
@@ -978,6 +1003,9 @@ impl Default for Parameters {
             ack_watermarks: default_ack_watermarks(),
             ack_watermark_period_ms: default_ack_watermark_period_ms(),
             digest_statements: default_digest_statements(),
+            // AVAIL-ECHO-SPEC.md: off by default, so `Parameters::default()` and every
+            // config predating the field keep the explicit-tuple `VantageAvail` path.
+            echo_avail_claims: false,
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,

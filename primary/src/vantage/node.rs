@@ -409,6 +409,11 @@ pub struct VantageCore {
     /// doc comment) -- reception of either wire encoding is NEVER gated by this
     /// flag, on this or any other party.
     digest_statements: bool,
+    /// AVAIL-ECHO-SPEC.md (`Parameters::echo_avail_claims`): carry availability
+    /// acknowledgments positionally on the AGB echo instead of `VantageAvail`'s explicit
+    /// tuples. Gates BOTH sides of the swap -- emission of the claim in
+    /// `Effect::BroadcastEcho`, and whether `avail_tick` is scheduled at all.
+    echo_avail_claims: bool,
 
     /// Mechanism A (sender-side lane resume, `vantage::resume`): the requester-side
     /// per-lane trigger memo (two-consecutive-ticks persistence + request backoff).
@@ -836,6 +841,7 @@ impl VantageCore {
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
             digest_statements: parameters.digest_statements,
+            echo_avail_claims: parameters.echo_avail_claims,
             resume_trigger: ResumeTrigger::with_max_concurrent(parameters.resume_max_concurrent),
             resume_serve: ResumeServe::new(),
             resume_check_period_ms: parameters.resume_check_period_ms,
@@ -920,7 +926,11 @@ impl VantageCore {
         // periodic broadcast tick, constructed ONLY when the flag is on -- do not add
         // a tick at all when it's off (mirrors the `agb_sleep`/`control_sleep`
         // `Option`-guarded-select-arm idiom just below/above in this same loop).
-        let mut avail_tick = if self.ack_watermarks {
+        // AVAIL-ECHO-SPEC.md: when claims ride the echo they REPLACE this flush, so the
+        // tick is not scheduled at all -- that is where the 92.2% of wire bytes
+        // `VantageAvail` accounted for actually goes away. Without this the two paths
+        // would both run and the optimization would cost bandwidth instead of saving it.
+        let mut avail_tick = if self.ack_watermarks && !self.echo_avail_claims {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(self.ack_watermark_period_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2436,6 +2446,18 @@ impl VantageCore {
                             .broadcast_message(PrimaryMessage::Header(header, false))
                             .await
                     }
+                    // AVAIL-ECHO-SPEC.md: a peer's positional availability claims, already
+                    // resolved positionally by `on_echo`. Handled here because crediting
+                    // needs `LaneManager`/`BlockCache` access the engine deliberately
+                    // lacks: `note_claim` applies monotonicity and (for short claims) the
+                    // linkage check, and whatever survives is credited through the SAME
+                    // `credit_refs` the explicit-tuple path uses -- so the aggregator, the
+                    // threshold marks and `Repairer::holders` all behave identically and
+                    // this really is only a change of encoding.
+                    Effect::AvailClaimed(sender, resolved) => {
+                        let refs = self.lm.note_claim(sender, &resolved);
+                        queue.extend(self.credit_refs(sender, refs, now));
+                    }
                     Effect::BroadcastAck(ack) => {
                         // The self-ack path always runs, flag on or off: our own
                         // holdings must always count toward our own aggregator (see
@@ -2503,6 +2525,18 @@ impl VantageCore {
                     // effects carrying just a `View` to begin with).
                     Effect::BroadcastEcho(mut e) => {
                         e.set_wish(self.pacemaker.own_watermark());
+                        // AVAIL-ECHO-SPEC.md (`Parameters::echo_avail_claims`): stamp this
+                        // party's positional availability claims here, at the serialization
+                        // boundary and never inside `AgbEngine` -- identical discipline to
+                        // `set_wish` on the line above, and for the same reason: the engine
+                        // is deliberately free of both watermark and availability state.
+                        // Only `Single` carries claims; `Batch` is out of scope exactly as
+                        // it is for `digest_statements` below.
+                        if self.echo_avail_claims {
+                            if let EchoOut::Single(inner) = &mut e {
+                                inner.avail = Some(self.lm.build_avail_claim(&inner.proposal));
+                            }
+                        }
                         match e {
                             // signature-free.tex §8.3 "Digest-named AGB statements"
                             // (`Parameters::digest_statements`): the flag's ENTIRE
@@ -3096,6 +3130,7 @@ mod tests {
             sender: fake,
             wish: 0,
             origin: None,
+            avail: None,
         };
         let effects = core
             .dispatch_inbound(Inbound::Echo(EchoOut::Single(echo)), Instant::now())
@@ -3166,6 +3201,7 @@ mod tests {
             sender: member,
             wish: 0,
             origin: None,
+            avail: None,
         };
         let effects = core
             .dispatch_inbound(Inbound::Echo(EchoOut::Single(echo)), Instant::now())

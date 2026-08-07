@@ -69,6 +69,7 @@ async fn fastseal_fires_on_all_n_matching_echoes() {
                 sender,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );
@@ -104,6 +105,7 @@ async fn lock_deactivates_at_f_plus_1_nonmatching_and_never_reactivates() {
             sender: others[2].0,
             wish: 0,
             origin: None,
+            avail: None,
         },
         &mut rep,
     );
@@ -123,6 +125,7 @@ async fn fastseal_produces_no_completion_or_direct_side_effects() {
                 sender,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );

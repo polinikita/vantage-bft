@@ -43,6 +43,7 @@ fn echo(
         sender,
         wish: 0,
         origin: None,
+        avail: None,
     }
 }
 

@@ -209,6 +209,26 @@ fn encoded_claim_is_tens_of_bytes_not_kilobytes() {
 use super::common::*;
 use crate::vantage::avail::AvailResolver;
 
+/// What `AgbEngine::on_echo` does before emitting `Effect::AvailClaimed`: resolve the
+/// claim positionally and mark which entries were at-tip bits (the receiver needs that to
+/// know whether a linkage check applies).
+fn resolved(p: &ViewProposal, c: &AvailClaim) -> Vec<(BlockRef, bool)> {
+    let refs = manifest_refs(p);
+    let at_tip: std::collections::HashSet<Digest> = refs
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| c.is_at_tip(*j))
+        .map(|(_, r)| r.2.clone())
+        .collect();
+    c.resolve(&refs)
+        .into_iter()
+        .map(|r| {
+            let tip = at_tip.contains(&r.2);
+            (r, tip)
+        })
+        .collect()
+}
+
 /// A node claims at-tip exactly for the lanes whose named block it holds verified, and
 /// short for a lane it holds only partly. A lane it has nothing for gets no claim --
 /// silence is not a negative acknowledgment.
@@ -303,7 +323,7 @@ async fn avail_height_is_the_quorum_order_statistic() {
         );
         let mut c = AvailClaim::with_capacity(1);
         c.set_at_tip(0);
-        res.note_claim(a[i].0, &p, &c);
+        res.note_claim(a[i].0, &resolved(&p, &c));
     }
     assert_eq!(
         res.avail_height(&target),
@@ -336,17 +356,17 @@ async fn note_claim_is_monotone_per_sender() {
     };
     let (p4, c4) = at(4);
     assert_eq!(
-        res.note_claim(a[1].0, &p4, &c4).len(),
+        res.note_claim(a[1].0, &resolved(&p4, &c4)).len(),
         1,
         "first claim counts"
     );
     let (p2, c2) = at(2);
     assert!(
-        res.note_claim(a[1].0, &p2, &c2).is_empty(),
+        res.note_claim(a[1].0, &resolved(&p2, &c2)).is_empty(),
         "a lower re-claim must be dropped"
     );
     assert!(
-        res.note_claim(a[1].0, &p4, &c4).is_empty(),
+        res.note_claim(a[1].0, &resolved(&p4, &c4)).is_empty(),
         "an equal re-claim must be dropped"
     );
     assert_eq!(
@@ -373,7 +393,7 @@ async fn short_claims_need_verifiable_linkage() {
     // Anchored at a digest we DO hold at height 2 -> credited.
     let mut good = AvailClaim::with_capacity(1);
     assert!(good.push_short(0, 2, chain[1].id.clone()));
-    let got = res.note_claim(a[1].0, &p, &good);
+    let got = res.note_claim(a[1].0, &resolved(&p, &good));
     assert_eq!(got.len(), 1);
     assert_eq!(got[0], (target, 2, chain[1].id.clone()));
 
@@ -381,7 +401,7 @@ async fn short_claims_need_verifiable_linkage() {
     let mut bogus = AvailClaim::with_capacity(1);
     assert!(bogus.push_short(0, 1, dig(199)));
     assert!(
-        res.note_claim(a[2].0, &p, &bogus).is_empty(),
+        res.note_claim(a[2].0, &resolved(&p, &bogus)).is_empty(),
         "unverifiable linkage must be dropped"
     );
 }
@@ -400,8 +420,125 @@ async fn note_claim_ignores_non_members() {
     let mut c = AvailClaim::with_capacity(1);
     c.set_at_tip(0);
     assert!(
-        res.note_claim(key(250), &p, &c).is_empty(),
+        res.note_claim(key(250), &resolved(&p, &c)).is_empty(),
         "a non-committee sender must be ignored"
     );
     assert_eq!(res.claimed_len_for_test(), 0);
+}
+
+/// The claim survives the digest-named encoding, which is what production actually sends
+/// (`digest_statements` defaults to true). Attaching claims only to by-value echoes would
+/// have left them unused in every real run -- AVAIL-ECHO-SPEC §6.5.
+#[test]
+fn to_digest_carries_the_claim() {
+    let a = authors();
+    let p = proposal(vec![r(1, 10, 1), r(2, 20, 2)], vec![], None);
+    let mut c = AvailClaim::with_capacity(2);
+    c.set_at_tip(0);
+    assert!(c.push_short(1, 5, dig(9)));
+
+    let echo = crate::vantage::agb::Echo {
+        proposal: p,
+        grade: 1,
+        sender: a[0].0,
+        wish: 3,
+        origin: None,
+        avail: Some(c.clone()),
+    };
+    let d = echo.to_digest(&test_sid());
+    assert_eq!(
+        d.avail.as_ref(),
+        Some(&c),
+        "the digest-named encoding must carry the claim, or the optimization is dead in \
+         exactly the configuration production runs"
+    );
+
+    // And it must survive the wire round-trip in that form.
+    let back: crate::vantage::agb::EchoDigest =
+        bincode::deserialize(&bincode::serialize(&d).expect("ser")).expect("de");
+    assert_eq!(back.avail, Some(c));
+}
+
+/// `on_echo` surfaces a piggybacked claim as `Effect::AvailClaimed`, marking which entries
+/// were at-tip bits -- reception is UNCONDITIONAL of any local flag, mirroring
+/// `digest_statements`, because refusing to count a first-hand statement we received would
+/// be a liveness bug.
+#[tokio::test]
+async fn on_echo_emits_availclaimed_with_at_tip_marks() {
+    use crate::vantage::Effect;
+    let a = authors();
+    let (me, target) = (a[0].0, a[1].0);
+    let (mut lm, _s) = new_lane_manager(me, ".db_test_claim_effect");
+    let chain = direct_chain(&mut lm, target, 4).await;
+
+    let p = proposal(vec![(target, 4, chain[3].id.clone())], vec![], None);
+    let mut c = AvailClaim::with_capacity(1);
+    c.set_at_tip(0);
+    let echo = crate::vantage::agb::Echo {
+        proposal: p,
+        grade: 1,
+        sender: a[1].0,
+        wish: 0,
+        origin: None,
+        avail: Some(c),
+    };
+
+    let committee = test_committee();
+    let mut agb = new_agb_engine(me);
+    let mut rep = crate::vantage::repair::Repairer::new(
+        me,
+        committee,
+        test_sid(),
+        lm.genesis().clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    );
+    let effects = agb.on_echo(echo, &mut rep);
+    let claimed: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::AvailClaimed(s, refs) => Some((*s, refs.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(claimed.len(), 1, "exactly one AvailClaimed effect");
+    assert_eq!(claimed[0].0, a[1].0, "attributed to the echo's sender");
+    assert_eq!(claimed[0].1.len(), 1);
+    assert_eq!(claimed[0].1[0].0, (target, 4, chain[3].id.clone()));
+    assert!(claimed[0].1[0].1, "an at-tip bit must be marked as such");
+}
+
+/// No claim on the echo => no effect at all, so a run with the flag off is byte-identical.
+#[tokio::test]
+async fn on_echo_without_a_claim_emits_nothing_extra() {
+    use crate::vantage::Effect;
+    let a = authors();
+    let me = a[0].0;
+    let (lm, _s) = new_lane_manager(me, ".db_test_claim_absent");
+    let p = proposal(vec![r(2, 1, 5)], vec![], None);
+    let echo = crate::vantage::agb::Echo {
+        proposal: p,
+        grade: 1,
+        sender: a[1].0,
+        wish: 0,
+        origin: None,
+        avail: None,
+    };
+    let committee = test_committee();
+    let mut agb = new_agb_engine(me);
+    let mut rep = crate::vantage::repair::Repairer::new(
+        me,
+        committee,
+        test_sid(),
+        lm.genesis().clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    );
+    let effects = agb.on_echo(echo, &mut rep);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::AvailClaimed(_, _))),
+        "flag off => no claim => no AvailClaimed effect"
+    );
 }

@@ -405,6 +405,7 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
                 sender: *sender,
                 wish: 0,
                 origin: None,
+                avail: None,
             },
             &mut rep,
         );

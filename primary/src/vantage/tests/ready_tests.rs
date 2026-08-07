@@ -33,6 +33,7 @@ fn echo(proposal: ViewProposal, grade: u8, sender: crypto::PublicKey) -> Echo {
         sender,
         wish: 0,
         origin: None,
+        avail: None,
     }
 }
 

@@ -1257,6 +1257,7 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
             sender: other_a,
             wish: 0,
             origin: None,
+            avail: None,
         },
         &mut rep,
     );
@@ -1283,6 +1284,7 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
             sender: other_b,
             wish: 0,
             origin: None,
+            avail: None,
         },
         &mut rep,
     );

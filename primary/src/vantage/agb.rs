@@ -172,6 +172,19 @@ pub struct Echo {
     /// counting identity: two counted echoes for the same `(view, digest)` may carry
     /// different `origin` bits, and both are individually tallied by R3's `ReadyOK`.
     pub origin: Option<u8>,
+    /// AVAIL-ECHO-SPEC.md (`Parameters::echo_avail_claims`): this sender's positional
+    /// availability claims against `proposal`'s own reference vector -- a bit per lane
+    /// instead of `VantageAvail`'s explicit `(a,k,h)` tuples.
+    ///
+    /// THIRD field of the kind `wish` and `origin` established, and outside counting
+    /// identity for the same reason: `proposal_digest` never reads it, and two echoes
+    /// counted as the same statement may carry different claims. `AgbEngine` constructs
+    /// this as `None` (the engine is deliberately availability-free, exactly as it is
+    /// watermark-free -- see `wish`); `VantageCore` fills it in at serialization time
+    /// from `LaneManager::build_avail_claim`, immediately before sending, and only when
+    /// the flag is on.
+    #[serde(default)]
+    pub avail: Option<crate::vantage::claim::AvailClaim>,
 }
 
 /// signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
@@ -190,6 +203,15 @@ pub struct EchoDigest {
     pub sender: PublicKey,
     pub wish: View,
     pub origin: Option<u8>,
+    /// AVAIL-ECHO-SPEC.md §6.5: the claim rides the digest-named encoding too, because
+    /// that is what production actually sends (`digest_statements` defaults to true) --
+    /// attaching claims only to by-value echoes would leave them unused in every real
+    /// run. The lane indices address the BODY's reference vector, so a receiver holding
+    /// only the digest cannot resolve them yet; `DigestStatements` already buffers such a
+    /// statement until a verified body arrives (`buffered_echo` -> `known_bodies`), and
+    /// the claim is carried along that same path rather than through a second stash.
+    #[serde(default)]
+    pub avail: Option<crate::vantage::claim::AvailClaim>,
 }
 
 impl Echo {
@@ -210,6 +232,10 @@ impl Echo {
             sender: self.sender,
             wish: self.wish,
             origin: self.origin,
+            // Carried through, like `wish`/`origin`: this is an alternate ENCODING of the
+            // same statement, so dropping the claim here would silently disable the
+            // optimization in exactly the configuration production runs.
+            avail: self.avail.clone(),
         }
     }
 }
@@ -1526,6 +1552,9 @@ impl AgbEngine {
                 sender: self.name,
                 wish: 0, // D5-3: stamped by `VantageCore` at serialization time
                 origin: origin.into_iter().next().flatten(),
+                // AVAIL-ECHO-SPEC.md: like `wish`, stamped by `VantageCore` at
+                // serialization time -- the engine is availability-free.
+                avail: None,
             }),
             ProposalOut::Batch(p) => EchoOut::Batch(EchoBatch {
                 proposal: p.clone(),
@@ -2041,7 +2070,37 @@ impl AgbEngine {
     /// one). The `origin` bit travels verbatim (it's the SENDER's own annotation, never
     /// recomputed here).
     pub fn on_echo(&mut self, echo: Echo, rep: &mut Repairer) -> Vec<Effect> {
-        self.on_echo_any(EchoOut::Single(echo), rep)
+        // AVAIL-ECHO-SPEC.md: surface the piggybacked availability claim as an effect
+        // before the echo is consumed. Emitted UNCONDITIONALLY of any local flag, exactly
+        // as `digest_statements` reception is (see that flag's own doc comment): a peer
+        // may send claims whether or not this party emits them, and refusing to count a
+        // first-hand statement we received would be a liveness bug, not a safety one.
+        // Resolution is positional and pure -- `manifest_refs` plus bit tests, no
+        // `BlockCache` -- so the engine stays free of availability state; the linkage
+        // check and the crediting itself happen in `VantageCore::execute`.
+        let mut effects = Vec::new();
+        if let Some(claim) = &echo.avail {
+            let refs = crate::vantage::claim::manifest_refs(&echo.proposal);
+            let at_tip: std::collections::HashSet<Digest> = refs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| claim.is_at_tip(*j))
+                .map(|(_, r)| r.2.clone())
+                .collect();
+            let resolved: Vec<(BlockRef, bool)> = claim
+                .resolve(&refs)
+                .into_iter()
+                .map(|r| {
+                    let tip = at_tip.contains(&r.2);
+                    (r, tip)
+                })
+                .collect();
+            if !resolved.is_empty() {
+                effects.push(Effect::AvailClaimed(echo.sender, resolved));
+            }
+        }
+        effects.extend(self.on_echo_any(EchoOut::Single(echo), rep));
+        effects
     }
 
     /// PHASE7 (signature-free.tex's "Batched resolution entries" paragraph): the `EchoBatch` counterpart of
@@ -2553,9 +2612,22 @@ impl AgbEngine {
 
 /// clippy::type_complexity: named factor-outs for `DigestStatements`'s two buffered-
 /// statement maps -- the payload a sender's one-shot buffered ECHO/READY digest
-/// statement carries (the digest it named, plus its own grade/origin), keyed
-/// `View -> PublicKey -> ..` in the struct itself.
-type BufferedEcho = (Digest, u8, Option<u8>);
+/// statement carries (the digest it named, plus its own grade/origin and, since
+/// AVAIL-ECHO-SPEC.md, its availability claim), keyed `View -> PublicKey -> ..` in the
+/// struct itself.
+///
+/// The claim MUST be buffered alongside the rest: its lane indices address the BODY's
+/// reference vector, so a statement that arrives before its body cannot be resolved yet,
+/// and dropping the claim here would silently lose every acknowledgment that raced its
+/// proposal -- the common case for a node that is behind, which is exactly when
+/// availability matters. Carried along the existing `buffered_echo -> known_bodies` path
+/// rather than through a second stash of its own.
+type BufferedEcho = (
+    Digest,
+    u8,
+    Option<u8>,
+    Option<crate::vantage::claim::AvailClaim>,
+);
 type BufferedReady = (Digest, ReadyGrade);
 
 /// The translation layer's per-view/per-(view,digest) state -- see the module
@@ -2697,12 +2769,18 @@ impl DigestStatements {
 
         let mut echo_bucket_empty = false;
         if let Some(senders) = self.buffered_echo.get_mut(&view) {
-            let due: Vec<(PublicKey, u8, Option<u8>)> = senders
+            #[allow(clippy::type_complexity)]
+            let due: Vec<(
+                PublicKey,
+                u8,
+                Option<u8>,
+                Option<crate::vantage::claim::AvailClaim>,
+            )> = senders
                 .iter()
-                .filter(|(_, (d, _, _))| d == digest)
-                .map(|(s, (_, g, o))| (*s, *g, *o))
+                .filter(|(_, (d, _, _, _))| d == digest)
+                .map(|(s, (_, g, o, a))| (*s, *g, *o, a.clone()))
                 .collect();
-            for (sender, grade, origin) in due {
+            for (sender, grade, origin, avail) in due {
                 senders.remove(&sender);
                 // `wish` is irrelevant here: it was already absorbed at reception
                 // time (`VantageCore::dispatch_inbound`'s `Inbound::EchoDigest` arm
@@ -2715,6 +2793,9 @@ impl DigestStatements {
                     sender,
                     wish: 0,
                     origin,
+                    // The claim was buffered with the statement precisely so it survives
+                    // to here: its lane indices address THIS body's reference vector.
+                    avail,
                 };
                 effects.extend(agb.on_echo(echo, rep));
             }
@@ -2755,20 +2836,25 @@ impl DigestStatements {
     /// `AgbEngine::count_echo_statement`'s own per-(view,sender) dedup exactly --
     /// `Entry::or_insert` never overwrites an already-present sender), then ensures a
     /// fetch is outstanding for `(view, digest)`.
-    fn buffer_echo(
-        &mut self,
-        view: View,
-        digest: Digest,
-        sender: PublicKey,
-        grade: u8,
-        origin: Option<u8>,
-        now: Instant,
-    ) -> Vec<Effect> {
+    ///
+    /// Takes the whole `EchoDigest` rather than its fields one by one: adding the
+    /// availability claim pushed the scalar form to 8 parameters, and every one of them
+    /// already travels together on the message.
+    fn buffer_echo(&mut self, msg: EchoDigest, now: Instant) -> Vec<Effect> {
+        let EchoDigest {
+            view,
+            digest,
+            grade,
+            sender,
+            origin,
+            avail,
+            ..
+        } = msg;
         self.buffered_echo
             .entry(view)
             .or_default()
             .entry(sender)
-            .or_insert_with(|| (digest.clone(), grade, origin));
+            .or_insert_with(|| (digest.clone(), grade, origin, avail));
         self.ensure_fetch(view, digest, now)
     }
 
@@ -2801,7 +2887,7 @@ impl DigestStatements {
             targets.extend(
                 senders
                     .iter()
-                    .filter(|(_, (d, _, _))| d == digest)
+                    .filter(|(_, (d, _, _, _))| d == digest)
                     .map(|(s, _)| *s),
             );
         }
@@ -2914,10 +3000,11 @@ impl DigestStatements {
                 sender: msg.sender,
                 wish: msg.wish,
                 origin: msg.origin,
+                avail: msg.avail.clone(),
             };
             return agb.on_echo(echo, rep);
         }
-        self.buffer_echo(msg.view, msg.digest, msg.sender, msg.grade, msg.origin, now)
+        self.buffer_echo(msg, now)
     }
 
     /// An inbound digest-named READY (`VantageReadyDigest`) -- `on_echo_digest`'s

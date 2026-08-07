@@ -1554,6 +1554,26 @@ impl LaneManager {
         self.avail.resolve_watermark(sender, entries)
     }
 
+    /// AVAIL-ECHO-SPEC.md: the positional-claim counterpart of `resolve_watermark` --
+    /// `sender`'s echo-piggybacked claims, already resolved positionally by
+    /// `AgbEngine::on_echo`, returned as the refs that survive monotonicity and (for short
+    /// claims) linkage. Same delegation to `avail::AvailResolver`, and the caller feeds the
+    /// result through the same `credit_refs`, so the two front-ends differ only in encoding.
+    pub fn note_claim(
+        &mut self,
+        sender: PublicKey,
+        resolved: &[(BlockRef, bool)],
+    ) -> Vec<BlockRef> {
+        self.avail.note_claim(sender, resolved)
+    }
+
+    /// AVAIL-ECHO-SPEC.md: the quorum availability height for `author`'s lane as computed
+    /// from positional claims -- the 2f+1-th largest claimed height. Exposed for the
+    /// shadow comparison against the explicit-tuple path's own watermark.
+    pub fn claim_avail_height(&self, author: &PublicKey) -> Height {
+        self.avail.avail_height(author)
+    }
+
     /// Re-attempt every `(sender, author)` watermark entry pending on `digest`'s author.
     pub fn retry_pending_avail(&mut self, digest: &Digest) -> Vec<(PublicKey, BlockRef)> {
         self.avail.retry_pending_avail(digest)

@@ -160,22 +160,14 @@ impl AvailResolver {
     pub fn note_claim(
         &mut self,
         sender: PublicKey,
-        proposal: &crate::vantage::agb::ViewProposal,
-        claim: &crate::vantage::claim::AvailClaim,
+        resolved: &[(BlockRef, bool)],
     ) -> Vec<BlockRef> {
         if !self.committee.authorities.contains_key(&sender) {
             return Vec::new();
         }
-        let refs = crate::vantage::claim::manifest_refs(proposal);
-        let at_tip: HashSet<Digest> = refs
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| claim.is_at_tip(*j))
-            .map(|(_, r)| r.2.clone())
-            .collect();
         let mut out = Vec::new();
         let blocks = self.blocks.lock();
-        for r in claim.resolve(&refs) {
+        for (r, at_tip) in resolved {
             let (author, height, digest) = (r.0, r.1, r.2.clone());
             // (1) monotone per (author, sender).
             let per_author = self.claimed.entry(author).or_default();
@@ -183,7 +175,7 @@ impl AvailResolver {
                 continue;
             }
             // (2) linkage, short claims only (an at-tip digest came from the proposal).
-            if !at_tip.contains(&digest) {
+            if !*at_tip {
                 let verifiable = blocks.get(&digest).is_some_and(|e| {
                     e.block.author == author && e.block.height == height && e.block_ok_verified
                 });
