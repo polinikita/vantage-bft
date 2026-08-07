@@ -3,8 +3,9 @@ use super::common::*;
 use crate::messages::Header;
 use crate::vantage::block::{genesis_digest, session_id};
 use crate::vantage::lanes::BlockCache;
-use crate::vantage::repair::Repairer;
+use crate::vantage::repair::{Repairer, FANOUT_FIRST};
 use crate::vantage::Effect;
+use config::Committee;
 use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -326,54 +327,69 @@ fn repairer_blocks(repairer: &Repairer) -> parking_lot::MutexGuard<'_, BlockCach
     repairer.blocks_for_test()
 }
 
-/// n=100 straggler fix (2026-08-08): `settle`'s peer fan-out is gated on
-/// `requested_hashes.insert(h)` rather than run unconditionally. The gate is only sound
-/// because `requested_hashes.contains(h)` implies `requested` already holds `(p, h)`
-/// for EVERY other primary -- if some path ever inserted into `requested_hashes`
-/// without also filling `requested`, the gate would silently suppress real requests and
-/// the block would never be asked for from anyone.
+/// `settle`'s peer fan-out is gated on `requested_hashes.insert(h)` rather than run
+/// unconditionally (the 2026-08-08 straggler fix; it is what makes a repeated miss on the
+/// same digest O(1), which `on_block_available`'s walks depend on).
 ///
-/// This pins that invariant directly, so such a path cannot be added unnoticed.
+/// That gate's soundness condition CHANGED with the 2026-08-07 bounded fan-out. It used to
+/// be "`requested_hashes.contains(h)` implies `requested` already holds `(p, h)` for every
+/// other primary" -- true only while the first round asked everyone. Now the first round
+/// asks `FANOUT_FIRST` peers, so the condition is weaker but must still exclude the
+/// dangerous case: a gated digest whose coverage is INCOMPLETE and which is no longer
+/// scheduled to widen would never be asked of the remaining peers, silently losing N6's
+/// eventual-coverage guarantee. So the invariant is: gated implies complete-or-escalating.
+///
+/// Checked at n=10, where the first round is genuinely partial -- at n=4 there are 3 peers,
+/// below `FANOUT_FIRST`, so coverage completes immediately and the property is vacuous.
 #[tokio::test]
-async fn requested_hashes_membership_implies_every_peer_was_requested() {
-    let name = crate::common::keys()[0].0;
-    let mut repairer = new_standalone_repairer(name);
-    let committee = test_committee();
-    let author = crate::common::keys()[1].0;
-    let header = Header::default();
-    let h = header.id.clone();
-
-    let effects = repairer.authorize((author, 1, h.clone()));
-    let requested = requests_for(&effects);
-
-    // One request per OTHER primary, exactly once each, all for this digest.
+async fn requested_hashes_set_implies_coverage_complete_or_escalating() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 26_000);
+    let (name, author) = (keys[0].name, keys[1].name);
     let peers: Vec<PublicKey> = committee
         .others_primaries(&name)
         .into_iter()
         .map(|(pk, _)| pk)
         .collect();
-    assert_eq!(requested.len(), peers.len());
-    for peer in &peers {
-        assert!(
-            requested.contains(&(*peer, h.clone())),
-            "peer {peer} was not asked for the missing digest"
-        );
-    }
+    let mut repairer = wide_repairer(name, &committee);
+    let h = Header::default().id.clone();
+
+    let requested = requests_for(&repairer.authorize((author, 1, h.clone())));
     assert!(repairer.was_requested_hash(&h), "the hash gate must be set");
-    for peer in &peers {
-        assert!(
-            repairer.was_requested(peer, &h),
-            "requested_hashes is set but peer {peer} is missing from `requested` -- \
-             settle's gate would now suppress this peer's request forever"
-        );
-    }
+
+    // Partial coverage now -- and therefore an escalation must be scheduled.
+    assert_eq!(requested.len(), FANOUT_FIRST);
+    assert!(requested.len() < peers.len());
+    assert_eq!(repairer.fanout_asked_for_test(&h), Some(FANOUT_FIRST));
+    assert!(
+        repairer.is_escalating_for_test(&h),
+        "gated with partial coverage but NOT queued to widen -- the remaining peers \
+         would never be asked and N6's eventual guarantee would be lost"
+    );
 
     // Re-authorizing the same still-missing ref emits nothing (the gate short-circuits),
-    // which is the property the fix relies on for its ~99x cost reduction.
+    // which is the property the 2026-08-08 fix relies on for its cost reduction.
     let again = repairer.authorize((author, 1, h.clone()));
     assert!(
         requests_for(&again).is_empty(),
         "a repeat authorize on a still-missing digest must emit no new requests"
+    );
+
+    // Drive escalation to completion: every peer is in `requested`, and only then is the
+    // per-digest state allowed to disappear.
+    let mut all = requested;
+    for _ in 0..8 {
+        all.extend(requests_for(&repairer.retry_requests()));
+    }
+    for peer in &peers {
+        assert!(
+            repairer.was_requested(peer, &h),
+            "peer {peer} was never asked even after full escalation"
+        );
+    }
+    assert_eq!(all.len(), peers.len(), "no peer may be asked twice");
+    assert!(
+        repairer.fanout_asked_for_test(&h).is_none() && !repairer.is_escalating_for_test(&h),
+        "state must be dropped only once coverage is complete"
     );
 }
 
@@ -488,4 +504,146 @@ async fn a_reblocked_ref_leaves_its_previous_bucket() {
     );
     assert_eq!(repairer.blocked_on_len_for_test(&h1.id), 0);
     assert_eq!(repairer.blocked_on_len_for_test(&h2.id), 0);
+}
+
+// --- n=100 recovery fix (2026-08-07): bounded, escalating, height-prioritised fan-out.
+//
+// The n=4 fixture above cannot exercise any of this: it has 3 peers, below
+// `FANOUT_FIRST`, so its first round already covers the committee and the staged path
+// never runs. These use a 10-party committee (9 peers) instead.
+
+/// A standalone `Repairer` over an arbitrary committee -- `new_standalone_repairer`'s
+/// generalization, same rationale as `new_agb_engine_with_committee`.
+fn wide_repairer(name: PublicKey, committee: &Committee) -> Repairer {
+    let sid = session_id(committee);
+    let genesis = genesis_digest(&sid);
+    Repairer::new(
+        name,
+        committee.clone(),
+        sid,
+        genesis,
+        MAX_BLOCK_PAYLOAD,
+        Arc::new(parking_lot::Mutex::new(BlockCache::new())),
+    )
+}
+
+/// The first round asks `FANOUT_FIRST` peers, NOT all n-1. On the failing n=100 run every
+/// stalled node's `vantage_repairs_requested` was an exact multiple of 99 (node 72:
+/// 5,133,249 = 51,851 distinct digests x 99 peers), and the 99 answers per digest
+/// overflowed the bulk inbound queue -- 663,546 drops versus 186 on a healthy node --
+/// so the body the node needed was itself dropped.
+#[tokio::test]
+async fn fanout_first_round_is_bounded() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 21_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let n_peers = committee.others_primaries(&watcher).len();
+    assert!(
+        n_peers > FANOUT_FIRST,
+        "fixture must exceed the first-round width to test anything"
+    );
+    let mut rep = wide_repairer(watcher, &committee);
+
+    let effects = rep.authorize((author, 5u64, Digest([7u8; 32])));
+    assert_eq!(requests_for(&effects).len(), FANOUT_FIRST);
+}
+
+/// N6's guarantee is EVENTUAL full coverage, and it must be full rather than a quorum:
+/// the holder set is only guaranteed f+1 stake, so worst case exactly one member is
+/// correct and its identity is unknown. Escalation must therefore reach every peer, and
+/// must never ask the same peer twice.
+#[tokio::test]
+async fn fanout_escalates_to_every_peer_without_repeating_one() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 22_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let n_peers = committee.others_primaries(&watcher).len();
+    let mut rep = wide_repairer(watcher, &committee);
+    let h = Digest([7u8; 32]);
+
+    let mut asked = requests_for(&rep.authorize((author, 5u64, h.clone())));
+    // 4 -> 8 -> 16(clamped): full coverage inside a handful of ticks.
+    for _ in 0..8 {
+        asked.extend(requests_for(&rep.retry_requests()));
+    }
+    let distinct: std::collections::HashSet<_> = asked.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        distinct.len(),
+        n_peers,
+        "every peer must eventually be asked"
+    );
+    assert_eq!(
+        asked.len(),
+        n_peers,
+        "no (peer, digest) may be requested twice -- N6 says at most once, ever"
+    );
+    assert!(asked.iter().all(|(_, d)| d == &h));
+}
+
+/// Escalation stops as soon as the digest is in hand: a node that has what it asked for
+/// must not keep widening the fan-out, or the bounded first round buys nothing over time.
+#[tokio::test]
+async fn fanout_stops_escalating_once_the_digest_arrives() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 23_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let sid = session_id(&committee);
+    let genesis = genesis_digest(&sid);
+    let mut rep = wide_repairer(watcher, &committee);
+
+    let h1 = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
+    let first = requests_for(&rep.authorize((author, 1, h1.id.clone())));
+    assert_eq!(first.len(), FANOUT_FIRST);
+
+    rep.on_serve(h1.clone());
+    for _ in 0..4 {
+        assert!(
+            requests_for(&rep.retry_requests()).is_empty(),
+            "a digest already served must never be re-fanned"
+        );
+    }
+}
+
+/// Different digests must start at different peers. With a fixed start, every node's
+/// first `FANOUT_FIRST` requests land on the same few peers, so at n=100 a handful of
+/// nodes would serve the committee's entire repair load while the rest served none.
+#[tokio::test]
+async fn fanout_start_is_spread_across_digests() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 24_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let mut rep = wide_repairer(watcher, &committee);
+
+    let mut firsts = std::collections::HashSet::new();
+    for i in 0..16u8 {
+        let effects = rep.authorize((author, 5u64, Digest([i; 32])));
+        if let Some((peer, _)) = requests_for(&effects).first() {
+            firsts.insert(*peer);
+        }
+    }
+    assert!(
+        firsts.len() > 1,
+        "all {} digests began their fan-out at the same peer -- load is not spread",
+        16
+    );
+}
+
+/// Escalation is ordered by the missing block's HEIGHT, lowest first. Repair is parallel
+/// (the failing nodes had tens of thousands of digests outstanding) but output is strictly
+/// serial -- `Cursor::pump` only advances `next_view` -- so budget spent on a high digest
+/// is budget spent on something the node provably cannot use yet.
+#[tokio::test]
+async fn fanout_escalates_the_lowest_height_first() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 25_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let mut rep = wide_repairer(watcher, &committee);
+
+    let (low, high) = (Digest([1u8; 32]), Digest([2u8; 32]));
+    // Authorize the HIGH one first, so insertion order and height order disagree.
+    rep.authorize((author, 900u64, high.clone()));
+    rep.authorize((author, 5u64, low.clone()));
+
+    let order = requests_for(&rep.retry_requests());
+    let first_low = order.iter().position(|(_, d)| d == &low);
+    let first_high = order.iter().position(|(_, d)| d == &high);
+    assert!(
+        first_low < first_high,
+        "the lower height must escalate first: {first_low:?} vs {first_high:?}"
+    );
 }

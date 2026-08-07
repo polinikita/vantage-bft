@@ -1159,7 +1159,15 @@ impl VantageCore {
                     // tick rather than a dedicated timer queue (mirrors `control::
                     // ControlLog`'s own coarse, round-based retry cadence).
                     let retry_now = Instant::now();
-                    let retry_effects = self.digest_stmts.retry_fetches(retry_now);
+                    let mut retry_effects = self.digest_stmts.retry_fetches(retry_now);
+                    // n=100 recovery fix (2026-08-07): widen the repair fan-out for
+                    // digests still outstanding. `Repairer` asks only `FANOUT_FIRST` peers
+                    // on the first miss -- asking all n-1 at once is what let a small
+                    // asymmetry become a permanent one (see `Repairer::fan_out`) -- so
+                    // full coverage, and therefore N6's eventual guarantee, is reached
+                    // here. Same tick, same rationale as `retry_fetches` above: coarse,
+                    // budgeted, no dedicated timer.
+                    retry_effects.extend(self.rep.retry_requests());
                     // Dropped so the nested `execute` is not double-counted into this
                     // tick's own label; re-opened for the tail below.
                     drop(metrics_timer);

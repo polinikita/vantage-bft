@@ -4,19 +4,46 @@
 // `pendingReq`, `answered`) and shares `lanes::BlockCache` with `LaneManager` (see
 // lanes.rs's module doc for why). Shape follows `HeaderWaiter`+`Helper`
 // (request-out / answer-in split) with the paper's differences (D2): requests fan out
-// to all other primaries once, no retry timers; serving keeps `pendingReq` for blocks
-// not yet held instead of dropping unknown digests (Autobahn's `Helper` drops them,
-// helper.rs:77 -- we must not, N7).
+// to every other primary at most once per peer, ESCALATING in batches off the node's
+// 1s tick rather than all at once (see `fan_out`); serving keeps `pendingReq` for
+// blocks not yet held instead of dropping unknown digests (Autobahn's `Helper` drops
+// them, helper.rs:77 -- we must not, N7).
 
 use crate::messages::Header;
+use crate::primary::Height;
 use crate::vantage::block::block_ok;
 use crate::vantage::lanes::SharedBlocks;
 use crate::vantage::{BlockRef, Effect};
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+
+/// Peers asked in the FIRST round for a newly-missing digest. The full fan-out is still
+/// reached by escalation (`fan_out`), so this only sets how much traffic the common case
+/// costs -- and in the common case the block is held by nearly everyone, so a handful of
+/// peers answers immediately.
+pub(crate) const FANOUT_FIRST: usize = 4;
+
+/// Digests escalated per `retry_requests` call. Without a budget the escalation pass is
+/// itself an unbounded per-tick sweep -- the exact shape that made `on_block_available`,
+/// `retry_pending_avail` and `try_serve` pathological at n=100.
+pub(crate) const FANOUT_ESCALATE_BUDGET: usize = 256;
+
+/// Per-digest fan-out progress. See `fan_out` for why coverage is staged.
+struct FanoutState {
+    /// Where in `peers` this digest's fan-out begins, derived from the digest itself.
+    /// Without this every node asks `peers[0..k]` for every digest, so peer 0 serves the
+    /// whole committee's repair load while peer n-1 serves none. Digest-derived (not
+    /// random) keeps it deterministic and reproducible across runs.
+    start: usize,
+    /// How many peers, counting forward from `start` (wrapping), have been asked.
+    asked: usize,
+    /// Size of the NEXT batch. Doubling reaches all n-1 peers in O(log n) ticks, so the
+    /// worst-case time-to-full-coverage stays small while the common case stays cheap.
+    next_width: usize,
+}
 
 pub struct Repairer {
     committee: Committee,
@@ -68,6 +95,26 @@ pub struct Repairer {
     /// unbounded valid blocks of a peer's own lane into the shared cache without us
     /// ever asking, outside §6.3's documented (attacker-cost-proportional) exposure.
     requested_hashes: HashSet<Digest>,
+    /// n=100 recovery fix (2026-08-07): per-digest fan-out progress, for digests whose
+    /// coverage is not yet complete. Removed on arrival (`on_block_available`) and when
+    /// nothing waits on the digest any more (`retry_requests`), so it is bounded by the
+    /// genuinely-outstanding set rather than by history.
+    fanout: HashMap<Digest, FanoutState>,
+    /// Escalation order for `fanout`, keyed by the missing block's HEIGHT so the lowest
+    /// escalates first. Not FIFO, and the difference matters: repair is parallel (the
+    /// failing n=100 nodes had 6,328-51,851 digests outstanding at once) while output is
+    /// strictly serial -- `Cursor::pump` only ever advances `next_view` and breaks on the
+    /// first `expand` miss, and `AgbEngine::ensure_fetch` says it outright: "resolution is
+    /// strictly sequential, so the lowest pending view is the one actually blocking
+    /// progress and the far-ahead ones are useless until it clears". Escalating in arrival
+    /// order therefore spends the escalation budget on digests the node provably cannot use
+    /// yet, while the one digest that would unblock the cursor waits its turn behind tens
+    /// of thousands of them. `ensure_fetch` already acts on this (it evicts the HIGHEST
+    /// views); `Repairer` had no notion of priority at all.
+    ///
+    /// Entries whose digest is no longer in `fanout` are skipped and dropped, so this is
+    /// self-cleaning without a separate eviction pass.
+    fanout_queue: BTreeSet<(Height, Digest)>,
     /// N7: `(requester, h)` recorded on a direct `request(h)`, even before we hold `h`.
     /// n=100 straggler fix (2026-08-08): indexed BY DIGEST rather than a flat
     /// `HashSet<(PublicKey, Digest)>`. `try_serve` ran a linear scan of the whole set on
@@ -113,6 +160,8 @@ impl Repairer {
             settle_calls: 0,
             requested: HashSet::new(),
             requested_hashes: HashSet::new(),
+            fanout: HashMap::new(),
+            fanout_queue: BTreeSet::new(),
             pending_req: HashMap::new(),
             answered: HashSet::new(),
             metrics: None,
@@ -186,6 +235,11 @@ impl Repairer {
     /// separate eviction pass.
     pub fn on_block_available(&mut self, digest: Digest) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // The digest is in hand, so no further fan-out round is ever needed for it. The
+        // matching `fanout_queue` entry is left to be skipped-and-dropped by
+        // `retry_requests` rather than searched for here -- this runs once per cached
+        // block, and one hash removal is the whole budget it deserves.
+        self.fanout.remove(&digest);
         let Some(waiting) = self.blocked_on.remove(&digest) else {
             return effects;
         };
@@ -225,6 +279,114 @@ impl Repairer {
                 .or_default()
                 .insert(r.clone());
         }
+    }
+
+    /// Emit the next batch of `request(h)` for a digest we are missing.
+    ///
+    /// n=100 recovery fix (2026-08-07). This used to ask ALL n-1 peers the first time a
+    /// digest was missed. On the failing n=100 run every stalled node's
+    /// `vantage_repairs_requested` was an exact multiple of 99 -- node 72 sent 5,133,249
+    /// = 51,851 distinct digests x 99 peers. The ANSWERS are what killed it: 99 copies of
+    /// each body arrived, overflowed the bounded bulk inbound queue
+    /// (`vantage_bulk_inbound_dropped_total` 663,546 versus 186 healthy), and the copy the
+    /// node actually needed was among the drops -- so the digest stayed missing and the
+    /// backlog grew. Stalled nodes received MORE wire messages than healthy ones (2.57M
+    /// vs 2.08M) while committing nothing: repair was manufacturing the congestion that
+    /// stopped the repair landing.
+    ///
+    /// Coverage is staged instead -- `FANOUT_FIRST` peers now, doubling per tick until all
+    /// n-1 are asked. That leaves N6's guarantee intact because the guarantee is about
+    /// EVENTUAL coverage, and it does have to be FULL coverage rather than a quorum: the
+    /// holder set is only guaranteed f+1 *stake*, so in the worst case exactly one of its
+    /// members is correct and which one is unknown. Any bounded subset can miss it;
+    /// asking everyone eventually cannot.
+    fn fan_out(&mut self, h: &Digest, effects: &mut Vec<Effect>) {
+        let n = self.peers.len();
+        if n == 0 {
+            return;
+        }
+        let entry = self.fanout.entry(h.clone()).or_insert_with(|| FanoutState {
+            start: Self::fanout_start(h, n),
+            asked: 0,
+            next_width: FANOUT_FIRST,
+        });
+        if entry.asked >= n {
+            return;
+        }
+        let (start, from) = (entry.start, entry.asked);
+        let take = entry.next_width.min(n - from);
+        entry.asked = from + take;
+        entry.next_width = entry.next_width.saturating_mul(2);
+        for k in 0..take {
+            let peer = self.peers[(start + from + k) % n];
+            if self.requested.insert((peer, h.clone())) {
+                effects.push(Effect::RequestTo(peer, h.clone()));
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_repairs_requested.inc();
+                }
+            }
+        }
+    }
+
+    /// Where in `peers` a digest's fan-out starts. Spreading by digest matters at n=100:
+    /// with a fixed start, every node's first `FANOUT_FIRST` requests land on the same few
+    /// peers, concentrating the committee's whole repair-serve load onto them while the
+    /// rest serve nothing.
+    fn fanout_start(h: &Digest, n: usize) -> usize {
+        // A digest is already a hash, so any 8 bytes of it are uniform -- no re-hashing.
+        let mut acc = [0u8; 8];
+        acc.copy_from_slice(&h.0[..8]);
+        (u64::from_le_bytes(acc) % n as u64) as usize
+    }
+
+    /// Widen the fan-out for digests still outstanding. Driven by the node's existing 1s
+    /// tick (`node.rs`'s `metrics_tick`, next to `AgbEngine::retry_fetches`), budgeted to
+    /// `FANOUT_ESCALATE_BUDGET` digests per call so the escalation pass cannot itself
+    /// become the unbounded per-tick sweep this whole class of bug is made of, and FIFO so
+    /// the longest-outstanding digest escalates first.
+    pub fn retry_requests(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let budget = FANOUT_ESCALATE_BUDGET.min(self.fanout_queue.len());
+        // Escalated entries are re-inserted, so draining in place would re-visit them
+        // within the same call (they sort at or below the cursor). Collect the batch first.
+        let batch: Vec<(Height, Digest)> = self.fanout_queue.iter().take(budget).cloned().collect();
+        for key in batch {
+            self.fanout_queue.remove(&key);
+            let (_, h) = &key;
+            // Arrived already: `on_block_available` dropped the `fanout` entry.
+            if !self.fanout.contains_key(h) {
+                continue;
+            }
+            // Nothing waits on it any more (whatever did has settled, or was dropped), so
+            // stop spending requests on it.
+            if !self.blocked_on.contains_key(h) {
+                self.fanout.remove(h);
+                continue;
+            }
+            self.fan_out(&key.1.clone(), &mut effects);
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_repair_fanout_escalations_total.inc();
+            }
+            if self
+                .fanout
+                .get(&key.1)
+                .is_some_and(|s| s.asked < self.peers.len())
+            {
+                self.fanout_queue.insert(key);
+            } else {
+                // Fully covered: N6's fan-out obligation for `h` is discharged, so the
+                // per-digest state is dead weight from here on. Dropping it is safe --
+                // `requested_hashes` (never pruned) is what gates `on_serve`, and
+                // `requested` (never pruned) is what prevents a re-ask.
+                self.fanout.remove(&key.1);
+            }
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .vantage_repair_fanout_pending
+                .set(self.fanout.len() as i64);
+        }
+        effects
     }
 
     /// On `serve(h, b)` **for a requested `h`** (N6 -- this gate is normative, not
@@ -398,15 +560,14 @@ impl Repairer {
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_repair_fanout_loops_total.inc();
                 }
+                // n=100 recovery fix (2026-08-07): the FIRST round only. `requested_
+                // hashes` still gates entry, so a repeated miss on the same digest stays
+                // O(1) here (the property the 2026-08-08 gate introduced and which
+                // `on_block_available`'s walks depend on); widening coverage is
+                // `retry_requests`' job, off the node's 1s tick.
                 if self.requested_hashes.insert(h.clone()) {
-                    for peer in &self.peers {
-                        if self.requested.insert((*peer, h.clone())) {
-                            effects.push(Effect::RequestTo(*peer, h.clone()));
-                            if let Some(metrics) = &self.metrics {
-                                metrics.vantage_repairs_requested.inc();
-                            }
-                        }
-                    }
+                    self.fanout_queue.insert((height, h.clone()));
+                    self.fan_out(&h, effects);
                 }
                 // Index the blockage so `on_block_available(h)` wakes exactly these
                 // refs. `frames` holds every descendant this walk passed through on the
@@ -514,10 +675,25 @@ impl Repairer {
     }
 
     /// Test accessors for the two sets whose relationship makes `settle`'s fan-out gate
-    /// sound -- see `requested_hashes_membership_implies_every_peer_was_requested`.
+    /// sound -- see `requested_hashes_set_implies_coverage_complete_or_escalating`.
     #[cfg(test)]
     pub(crate) fn was_requested_hash(&self, h: &Digest) -> bool {
         self.requested_hashes.contains(h)
+    }
+
+    /// How many peers have been asked for `h` so far, or `None` once coverage is complete
+    /// and the per-digest state has been dropped. Together with `is_escalating_for_test`
+    /// this pins the property the fan-out gate now rests on: a gated digest is either
+    /// fully covered or still scheduled to widen.
+    #[cfg(test)]
+    pub(crate) fn fanout_asked_for_test(&self, h: &Digest) -> Option<usize> {
+        self.fanout.get(h).map(|s| s.asked)
+    }
+
+    /// Whether `h` is still queued for a further fan-out round.
+    #[cfg(test)]
+    pub(crate) fn is_escalating_for_test(&self, h: &Digest) -> bool {
+        self.fanout_queue.iter().any(|(_, d)| d == h)
     }
 
     /// How many refs are waiting on `h` -- lets tests assert that a re-blocked ref

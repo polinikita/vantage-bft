@@ -417,6 +417,16 @@ pub struct Metrics {
     /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
     /// the gate the two should track each other at ~1/(n-1).
     pub vantage_repair_fanout_loops_total: IntCounter,
+    /// Digests whose peer fan-out is started but not yet complete (`Repairer::fanout`).
+    /// The n=100 recovery fix stages coverage instead of asking all n-1 peers at once, so
+    /// this is the outstanding-repair backlog: healthy nodes sit near zero, and a node in
+    /// recovery shows the real size of its gap (the 2026-08-07 run's stalled nodes were
+    /// missing 6,328-51,851 distinct digests, which no counter exposed at the time).
+    pub vantage_repair_fanout_pending: IntGauge,
+    /// Fan-out rounds beyond the first, i.e. how often the first `FANOUT_FIRST` peers
+    /// failed to answer and coverage had to widen. Near-zero means the bounded first round
+    /// is sufficient in practice; large means peers are not holding what we ask for.
+    pub vantage_repair_fanout_escalations_total: IntCounter,
 
     // --- Metrics/dashboard expansion (METRICS-DASHBOARD-SPEC.md §1): wire-layer
     // counters, hooked in the `network` crate itself so every protocol (Autobahn
@@ -1016,6 +1026,20 @@ impl Metrics {
                 "vantage_repair_fanout_loops_total",
                 "Times settle reached the missing-block branch (fan-out considered, not \
                  necessarily emitted); compare with vantage_repairs_requested",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_fanout_pending: register_int_gauge_with_registry!(
+                "vantage_repair_fanout_pending",
+                "Repairer: digests whose peer fan-out is started but not yet complete \
+                 (the outstanding-repair backlog, i.e. the size of this node's gap)",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_fanout_escalations_total: register_int_counter_with_registry!(
+                "vantage_repair_fanout_escalations_total",
+                "Repairer: fan-out rounds beyond the first (coverage had to widen because \
+                 the bounded first round went unanswered)",
                 registry,
             )
             .unwrap(),
