@@ -39,8 +39,15 @@ use crate::vantage::BlockRef;
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+
+/// Per-author cap on the remembered at-quorum set. Bounds it at O(n x this) -- about 5 MB at
+/// n=100 -- against the unbounded growth the first version had (~720 MB/hour per node).
+/// Generous on purpose: the entries that matter are recent (the retry re-credit and
+/// late-sender credits both concern the current tip region), so a large window costs little
+/// and forgetting an old entry only costs one redundant credit.
+pub(crate) const AT_QUORUM_HEIGHTS: usize = 1_024;
 
 pub struct AvailResolver {
     committee: Committee,
@@ -67,7 +74,19 @@ pub struct AvailResolver {
     /// availability past quorum, so all n senders credit the same block but only the first
     /// 2f+1 can change anything -- and `retry_pending_avail` re-credits a stuck head ref once
     /// per arriving block, unboundedly, until this cuts it off.
-    at_quorum: HashSet<BlockRef>,
+    ///
+    /// BOUNDED per author to the most recent `AT_QUORUM_HEIGHTS` heights. The first version of
+    /// this was a flat `HashSet<BlockRef>` that only ever grew -- ~2,000 refs/s at n=100 x
+    /// ~100 B, about 720 MB/hour per node, i.e. a fresh instance of exactly the leak class
+    /// this file's own header complains about. Pruning is safe because the set is a pure
+    /// OPTIMIZATION: forgetting an entry costs one redundant credit (work), never correctness.
+    ///
+    /// Kept keyed by `(Height, Digest)` rather than collapsed to a per-author high-water
+    /// height, even though quorum at height h normally implies quorum below it. Under an
+    /// equivocating author two forks can sit at the same height, and a height-only mark would
+    /// let fork A's quorum suppress crediting for fork B -- which is liveness-only, but it is
+    /// a Byzantine-triggerable liveness bug, and the digest costs 32 bytes to avoid.
+    at_quorum: HashMap<PublicKey, BTreeSet<(Height, Digest)>>,
 
     metrics: Option<Arc<Metrics>>,
 }
@@ -89,7 +108,7 @@ impl AvailResolver {
             credited_floor: HashMap::new(),
             pending_avail: HashMap::new(),
             pending_avail_by_author: HashMap::new(),
-            at_quorum: HashSet::new(),
+            at_quorum: HashMap::new(),
             metrics: None,
         }
     }
@@ -102,10 +121,31 @@ impl AvailResolver {
     /// Record that `r` reached `threshold`, so future credits for it can be skipped once it
     /// is terminal. Fed from the marks this resolver emits, which is why it needs no access
     /// to the core's own `ack_availability`.
+    ///
+    /// Prunes this author's set to the most recent `AT_QUORUM_HEIGHTS` heights. See the field
+    /// for why forgetting an entry is safe (it costs a redundant credit, never correctness)
+    /// and why the digest stays in the key.
     pub fn note_threshold(&mut self, r: &BlockRef, threshold: AckThreshold) {
-        if threshold == AckThreshold::Quorum {
-            self.at_quorum.insert(r.clone());
+        if threshold != AckThreshold::Quorum {
+            return;
         }
+        let per_author = self.at_quorum.entry(r.0).or_default();
+        per_author.insert((r.1, r.2.clone()));
+        // `split_off` keeps the recent tail and drops the old head, the same GC discipline
+        // used elsewhere in this crate -- no `retain`, no full scan.
+        if per_author.len() > AT_QUORUM_HEIGHTS {
+            if let Some(&(cut, _)) = per_author.iter().nth(per_author.len() - AT_QUORUM_HEIGHTS) {
+                let keep = per_author.split_off(&(cut, Digest([0u8; 32])));
+                *per_author = keep;
+            }
+        }
+    }
+
+    /// Whether `r` is known to have reached the terminal `Quorum` threshold.
+    fn is_at_quorum(&self, r: &BlockRef) -> bool {
+        self.at_quorum
+            .get(&r.0)
+            .is_some_and(|set| set.contains(&(r.1, r.2.clone())))
     }
 
     /// N5 ack-watermark front-end: resolve every entry in one peer's watermark message.
@@ -185,7 +225,7 @@ impl AvailResolver {
                 let mut refs = Vec::with_capacity(suffix.len());
                 for (i, d) in suffix.iter().enumerate() {
                     let r = (entry.author, floor_height + 1 + i as Height, d.clone());
-                    if self.at_quorum.contains(&r) {
+                    if self.is_at_quorum(&r) {
                         if let Some(metrics) = &self.metrics {
                             metrics.vantage_avail_credit_skipped_total.inc();
                         }
@@ -213,7 +253,7 @@ impl AvailResolver {
                     .insert(key.0);
                 self.pending_avail.insert(key, entry.clone());
                 let head = (entry.author, entry.height, entry.head.clone());
-                if self.at_quorum.contains(&head) {
+                if self.is_at_quorum(&head) {
                     if let Some(metrics) = &self.metrics {
                         metrics.vantage_avail_credit_skipped_total.inc();
                     }
@@ -223,6 +263,17 @@ impl AvailResolver {
                 }
             }
         }
+    }
+
+    /// Remembered at-quorum entries for `author`, for the bound test.
+    #[cfg(test)]
+    pub(crate) fn at_quorum_len_for_test(&self, author: &PublicKey) -> usize {
+        self.at_quorum.get(author).map_or(0, |s| s.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_at_quorum_for_test(&self, r: &BlockRef) -> bool {
+        self.is_at_quorum(r)
     }
 
     /// The `pending_avail` index's own key set, for the test that pins it as a strict mirror

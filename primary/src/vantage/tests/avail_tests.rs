@@ -4,6 +4,7 @@
 use super::common::*;
 use crate::messages::Header;
 use crate::vantage::lanes::{AckAggregator, AckAvailability, AckThreshold, AvailEntry};
+use crypto::Digest;
 use std::collections::BTreeMap;
 
 /// Own DIRECT-PREFIX watermark: advances incrementally as blocks are confirmed
@@ -311,5 +312,48 @@ async fn a_watermark_does_not_recredit_a_ref_already_at_quorum() {
     assert!(
         !later.iter().any(|x| x == &r),
         "a ref already at quorum was re-credited: {later:?}"
+    );
+}
+
+/// The at-quorum memo must stay BOUNDED. Its first version was a flat `HashSet<BlockRef>`
+/// that only ever grew: ~2,000 refs/s at n=100 x ~100 B is about 720 MB/hour per node -- a
+/// fresh instance of exactly the leak class this work exists to remove. Forgetting an entry
+/// is safe (it costs one redundant credit, never correctness), so it is pruned per author.
+#[tokio::test]
+async fn at_quorum_memo_is_bounded_per_author() {
+    use crate::vantage::avail::{AvailResolver, AT_QUORUM_HEIGHTS};
+    let committee = test_committee();
+    let sid = crate::vantage::block::session_id(&committee);
+    let genesis = crate::vantage::block::genesis_digest(&sid);
+    let (author, _) = authors()[1];
+    let mut r = AvailResolver::new(
+        committee,
+        sid,
+        genesis,
+        MAX_BLOCK_PAYLOAD,
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::vantage::lanes::BlockCache::new(),
+        )),
+    );
+
+    for h in 1..=(AT_QUORUM_HEIGHTS as u64 * 3) {
+        r.note_threshold(
+            &(author, h, Digest([(h % 251) as u8; 32])),
+            crate::vantage::lanes::AckThreshold::Quorum,
+        );
+    }
+    let held = r.at_quorum_len_for_test(&author);
+    assert!(
+        held <= AT_QUORUM_HEIGHTS,
+        "at_quorum grew to {held}, cap is {AT_QUORUM_HEIGHTS}"
+    );
+    // And it must keep the RECENT end -- that is where the redundant credits actually are.
+    assert!(
+        r.is_at_quorum_for_test(&(
+            author,
+            AT_QUORUM_HEIGHTS as u64 * 3,
+            Digest([((AT_QUORUM_HEIGHTS as u64 * 3) % 251) as u8; 32])
+        )),
+        "pruning dropped the newest entry instead of the oldest"
     );
 }
