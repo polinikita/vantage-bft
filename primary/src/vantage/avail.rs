@@ -88,6 +88,17 @@ pub struct AvailResolver {
     /// a Byzantine-triggerable liveness bug, and the digest costs 32 bytes to avoid.
     at_quorum: HashMap<PublicKey, BTreeSet<(Height, Digest)>>,
 
+    /// AVAIL-ECHO-SPEC.md step 4: the positional-claim front-end's state, keyed
+    /// `author -> sender -> (height, anchor digest)` -- the highest verified prefix each
+    /// sender has claimed on that author's lane.
+    ///
+    /// This is the SAME information `credited_floor` holds, transposed: that map is
+    /// `(sender, author) -> height` and exists to avoid re-crediting; this one is indexed
+    /// author-first because the question it answers is per-lane ("what stake has claimed
+    /// at least h?"), which is an order statistic over senders. Bounded at O(n^2) by
+    /// construction -- one entry per (author, sender) pair, overwritten in place.
+    claimed: HashMap<PublicKey, HashMap<PublicKey, (Height, Digest)>>,
+
     metrics: Option<Arc<Metrics>>,
 }
 
@@ -109,6 +120,7 @@ impl AvailResolver {
             pending_avail: HashMap::new(),
             pending_avail_by_author: HashMap::new(),
             at_quorum: HashMap::new(),
+            claimed: HashMap::new(),
             metrics: None,
         }
     }
@@ -125,6 +137,101 @@ impl AvailResolver {
     /// Prunes this author's set to the most recent `AT_QUORUM_HEIGHTS` heights. See the field
     /// for why forgetting an entry is safe (it costs a redundant credit, never correctness)
     /// and why the digest stays in the key.
+    /// AVAIL-ECHO-SPEC.md step 4: record `sender`'s positional claims, carried on an AGB
+    /// echo for `proposal`. Returns the refs newly credited, for the caller to feed the
+    /// shared `AckAggregator` exactly as `resolve_watermark`'s output is fed.
+    ///
+    /// Per claimed lane the sender asserts possession of the whole verified prefix through
+    /// `(author, height)` on the chain ending at that claim's digest. Two checks before it
+    /// counts, both of which a Byzantine sender can fail without harming anyone else:
+    ///
+    ///   1. MONOTONICITY. A claim at or below what this sender already claimed for that
+    ///      author is dropped. Availability is a prefix fact, so a sender's own claims can
+    ///      only advance; letting one regress would re-credit the same prefix forever, which
+    ///      is the unbounded-recredit shape `at_quorum` exists to stop on the other path.
+    ///   2. LINKAGE, for short claims only. The sender could not prove its prefix lies on
+    ///      `chain(named)` without holding that chain (spec §4), so it sends its own head
+    ///      digest and we check it here against OUR copy: the block it names must be held,
+    ///      verified, and sit at exactly that coordinate. An at-tip claim needs no such
+    ///      check -- its digest IS the proposal's, which `proposal_digest` already commits
+    ///      to. When we cannot verify a short claim (we lack the block), we DROP rather
+    ///      than stash: the sender re-claims on the next view's echo at no extra cost,
+    ///      which is the simplification that lets `pending_avail` disappear.
+    pub fn note_claim(
+        &mut self,
+        sender: PublicKey,
+        proposal: &crate::vantage::agb::ViewProposal,
+        claim: &crate::vantage::claim::AvailClaim,
+    ) -> Vec<BlockRef> {
+        if !self.committee.authorities.contains_key(&sender) {
+            return Vec::new();
+        }
+        let refs = crate::vantage::claim::manifest_refs(proposal);
+        let at_tip: HashSet<Digest> = refs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| claim.is_at_tip(*j))
+            .map(|(_, r)| r.2.clone())
+            .collect();
+        let mut out = Vec::new();
+        let blocks = self.blocks.lock();
+        for r in claim.resolve(&refs) {
+            let (author, height, digest) = (r.0, r.1, r.2.clone());
+            // (1) monotone per (author, sender).
+            let per_author = self.claimed.entry(author).or_default();
+            if per_author.get(&sender).is_some_and(|(h, _)| *h >= height) {
+                continue;
+            }
+            // (2) linkage, short claims only (an at-tip digest came from the proposal).
+            if !at_tip.contains(&digest) {
+                let verifiable = blocks.get(&digest).is_some_and(|e| {
+                    e.block.author == author && e.block.height == height && e.block_ok_verified
+                });
+                if !verifiable {
+                    continue;
+                }
+            }
+            per_author.insert(sender, (height, digest.clone()));
+            out.push((author, height, digest));
+        }
+        out
+    }
+
+    /// The greatest height on `author`'s lane that a quorum of stake has claimed, i.e. the
+    /// availability watermark the positional front-end computes. `0` if no quorum exists.
+    ///
+    /// A stake-weighted order statistic over at most `n` claims: sort descending by claimed
+    /// height and walk until accumulated stake reaches `quorum_threshold`. `O(n log n)` per
+    /// call against the old path's per-ref hash work -- and called once per lane per view
+    /// rather than once per (sender, block).
+    ///
+    /// Monotone in the claims, because each sender's entry is itself monotone (see
+    /// `note_claim`), which is what makes it a safe replacement for `credited_floor`.
+    pub fn avail_height(&self, author: &PublicKey) -> Height {
+        let Some(per_author) = self.claimed.get(author) else {
+            return 0;
+        };
+        let mut by_height: Vec<(Height, config::Stake)> = per_author
+            .iter()
+            .map(|(s, (h, _))| (*h, self.committee.stake(s)))
+            .collect();
+        by_height.sort_unstable_by_key(|(h, _)| std::cmp::Reverse(*h));
+        let mut acc: config::Stake = 0;
+        for (h, stake) in by_height {
+            acc += stake;
+            if acc >= self.committee.quorum_threshold() {
+                return h;
+            }
+        }
+        0
+    }
+
+    /// Live claim-state size, for the bound test: total `(author, sender)` entries.
+    #[cfg(test)]
+    pub(crate) fn claimed_len_for_test(&self) -> usize {
+        self.claimed.values().map(|m| m.len()).sum()
+    }
+
     pub fn note_threshold(&mut self, r: &BlockRef, threshold: AckThreshold) {
         if threshold != AckThreshold::Quorum {
             return;

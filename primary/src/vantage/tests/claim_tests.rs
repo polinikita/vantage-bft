@@ -200,3 +200,208 @@ fn encoded_claim_is_tens_of_bytes_not_kilobytes() {
     let back: AvailClaim = bincode::deserialize(&bincode::serialize(&d).expect("ser")).expect("de");
     assert_eq!(back, d, "wire round-trip must be exact");
 }
+
+// ---------------------------------------------------------------------------
+// AVAIL-ECHO-SPEC.md steps 3-4: sender-side construction and receiver-side
+// aggregation, against a real LaneManager / AvailResolver.
+// ---------------------------------------------------------------------------
+
+use super::common::*;
+use crate::vantage::avail::AvailResolver;
+
+/// A node claims at-tip exactly for the lanes whose named block it holds verified, and
+/// short for a lane it holds only partly. A lane it has nothing for gets no claim --
+/// silence is not a negative acknowledgment.
+#[tokio::test]
+async fn sender_claims_at_tip_short_and_stays_silent() {
+    let a = authors();
+    let (me, held, partial, unknown) = (a[0].0, a[1].0, a[2].0, a[3].0);
+    let (mut lm, _s) = new_lane_manager(me, ".db_test_claim_sender");
+
+    let held_chain = direct_chain(&mut lm, held, 3).await;
+    let partial_chain = direct_chain(&mut lm, partial, 2).await;
+
+    // C names `held` at its true tip, `partial` ABOVE what we hold, `unknown` at all.
+    let p = proposal(
+        vec![
+            (held, 3, held_chain[2].id.clone()),
+            (partial, 5, dig(200)),
+            (unknown, 4, dig(201)),
+        ],
+        vec![],
+        None,
+    );
+    let claim = lm.build_avail_claim(&p);
+
+    assert!(
+        claim.is_at_tip(0),
+        "lane we hold at the named height => at-tip"
+    );
+    assert!(
+        !claim.is_at_tip(1),
+        "lane we hold only partly is not at-tip"
+    );
+    assert_eq!(claim.short.len(), 1, "exactly one short claim");
+    assert_eq!(claim.short[0].lane, 1);
+    assert_eq!(claim.short[0].delta, 3, "named 5, hold 2 => delta 3");
+    assert_eq!(
+        claim.short[0].head, partial_chain[1].id,
+        "short claim carries OUR head digest at our frontier"
+    );
+    assert_eq!(claim.claimed(), 2, "the unknown author must draw no claim");
+}
+
+/// An equivocating author draws NO claim when our lane is a different chain at the named
+/// height: claiming either endpoint would assert something about a chain we do not hold.
+#[tokio::test]
+async fn sender_stays_silent_on_a_forked_lane_at_the_named_height() {
+    let a = authors();
+    let (me, forker) = (a[0].0, a[1].0);
+    let (mut lm, _s) = new_lane_manager(me, ".db_test_claim_fork");
+    let ours = direct_chain(&mut lm, forker, 3).await;
+
+    // Named height is one we reach, but the digest is a different branch.
+    let p = proposal(vec![(forker, 3, dig(250))], vec![], None);
+    let claim = lm.build_avail_claim(&p);
+    assert_eq!(
+        claim.claimed(),
+        0,
+        "we hold height 3 for this author, but on another chain ({:?}) -- no claim",
+        ours[2].id
+    );
+}
+
+/// A resolver sharing the LaneManager's block cache, so linkage checks see the same
+/// blocks the sender does.
+fn resolver(lm: &crate::vantage::lanes::LaneManager) -> AvailResolver {
+    AvailResolver::new(
+        test_committee(),
+        lm.sid().clone(),
+        lm.genesis().clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    )
+}
+
+/// `avail_height` is the greatest height a QUORUM of stake has claimed -- the 2f+1-th
+/// largest claim, not the largest and not the smallest.
+#[tokio::test]
+async fn avail_height_is_the_quorum_order_statistic() {
+    let a = authors();
+    let (me, target) = (a[0].0, a[1].0);
+    let (mut lm, _s) = new_lane_manager(me, ".db_test_claim_quorum");
+    let chain = direct_chain(&mut lm, target, 5).await;
+    let mut res = resolver(&lm);
+
+    // Equal stakes, n=4 => quorum_threshold is 3 authorities. Claims 5,4,3,1 => the
+    // 3rd-largest is 3.
+    for (i, h) in [(0usize, 5u64), (1, 4), (2, 3), (3, 1)] {
+        let p = proposal(
+            vec![(target, h, chain[(h - 1) as usize].id.clone())],
+            vec![],
+            None,
+        );
+        let mut c = AvailClaim::with_capacity(1);
+        c.set_at_tip(0);
+        res.note_claim(a[i].0, &p, &c);
+    }
+    assert_eq!(
+        res.avail_height(&target),
+        3,
+        "quorum height is the 2f+1-th largest claim"
+    );
+    assert_eq!(res.avail_height(&me), 0, "no claims for a lane => 0");
+}
+
+/// A sender's claims may only ADVANCE. A regression is dropped, or the same prefix would
+/// be re-credited forever -- the unbounded-recredit shape `at_quorum` exists to stop on
+/// the tuple path.
+#[tokio::test]
+async fn note_claim_is_monotone_per_sender() {
+    let a = authors();
+    let (me, target) = (a[0].0, a[1].0);
+    let (mut lm, _s) = new_lane_manager(me, ".db_test_claim_monotone");
+    let chain = direct_chain(&mut lm, target, 4).await;
+    let mut res = resolver(&lm);
+
+    let at = |h: u64| {
+        let p = proposal(
+            vec![(target, h, chain[(h - 1) as usize].id.clone())],
+            vec![],
+            None,
+        );
+        let mut c = AvailClaim::with_capacity(1);
+        c.set_at_tip(0);
+        (p, c)
+    };
+    let (p4, c4) = at(4);
+    assert_eq!(
+        res.note_claim(a[1].0, &p4, &c4).len(),
+        1,
+        "first claim counts"
+    );
+    let (p2, c2) = at(2);
+    assert!(
+        res.note_claim(a[1].0, &p2, &c2).is_empty(),
+        "a lower re-claim must be dropped"
+    );
+    assert!(
+        res.note_claim(a[1].0, &p4, &c4).is_empty(),
+        "an equal re-claim must be dropped"
+    );
+    assert_eq!(
+        res.claimed_len_for_test(),
+        1,
+        "one entry per (author, sender)"
+    );
+    assert_eq!(res.avail_height(&target), 0, "one claim is not a quorum");
+}
+
+/// A short claim is credited only if its anchoring digest is one we hold at exactly that
+/// coordinate. Unverifiable short claims are dropped, not stashed: the sender re-claims on
+/// the next view's echo, which is what lets `pending_avail` disappear.
+#[tokio::test]
+async fn short_claims_need_verifiable_linkage() {
+    let a = authors();
+    let (me, target) = (a[0].0, a[1].0);
+    let (mut lm, _s) = new_lane_manager(me, ".db_test_claim_linkage");
+    let chain = direct_chain(&mut lm, target, 4).await;
+    let mut res = resolver(&lm);
+
+    let p = proposal(vec![(target, 4, chain[3].id.clone())], vec![], None);
+
+    // Anchored at a digest we DO hold at height 2 -> credited.
+    let mut good = AvailClaim::with_capacity(1);
+    assert!(good.push_short(0, 2, chain[1].id.clone()));
+    let got = res.note_claim(a[1].0, &p, &good);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0], (target, 2, chain[1].id.clone()));
+
+    // Anchored at a digest we do not hold -> dropped.
+    let mut bogus = AvailClaim::with_capacity(1);
+    assert!(bogus.push_short(0, 1, dig(199)));
+    assert!(
+        res.note_claim(a[2].0, &p, &bogus).is_empty(),
+        "unverifiable linkage must be dropped"
+    );
+}
+
+/// Claims from a non-member are ignored outright, mirroring `AckAggregator::record_ack`'s
+/// own membership gate: without it an attacker could mint throwaway keypairs and inflate
+/// any lane's quorum count.
+#[tokio::test]
+async fn note_claim_ignores_non_members() {
+    let a = authors();
+    let (me, target) = (a[0].0, a[1].0);
+    let (mut lm, _s) = new_lane_manager(me, ".db_test_claim_nonmember");
+    let chain = direct_chain(&mut lm, target, 2).await;
+    let mut res = resolver(&lm);
+    let p = proposal(vec![(target, 2, chain[1].id.clone())], vec![], None);
+    let mut c = AvailClaim::with_capacity(1);
+    c.set_at_tip(0);
+    assert!(
+        res.note_claim(key(250), &p, &c).is_empty(),
+        "a non-committee sender must be ignored"
+    );
+    assert_eq!(res.claimed_len_for_test(), 0);
+}

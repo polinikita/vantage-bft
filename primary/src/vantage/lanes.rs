@@ -10,6 +10,7 @@
 use crate::messages::{Ack, Header};
 use crate::primary::Height;
 use crate::vantage::block::{self, block_ok, BlockRef};
+use crate::vantage::claim::{manifest_refs, AvailClaim};
 use crate::vantage::Effect;
 use config::{Committee, Stake, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -1437,6 +1438,61 @@ impl LaneManager {
             .get(author)
             .map(|(h, _)| *h)
             .unwrap_or(0)
+    }
+
+    /// AVAIL-ECHO-SPEC.md step 3: this party's own availability claims against
+    /// `proposal`, for piggybacking on the AGB echo it is about to send.
+    ///
+    /// One pass over `manifest_refs`, reading only `own_avail_watermark` (the contiguous
+    /// DirectPub prefix per author, maintained unconditionally -- see
+    /// `own_direct_frontier`) plus one `BlockCache` lookup per at-tip candidate. That
+    /// makes it O(|refs|) with no chain walk, against `resolve_watermark`'s
+    /// `collect_verified_suffix` per entry -- the whole point is that the sender already
+    /// knows what it holds.
+    ///
+    /// Three outcomes per lane, exactly as the spec's §4 states:
+    ///   - own watermark reaches the named height AND the named digest is held, verified,
+    ///     at that exact coordinate  => at-tip bit. Holding the named digest is what makes
+    ///     this a claim about the RIGHT chain; an author that forked has two digests at one
+    ///     height and only one of them is the proposal's.
+    ///   - own watermark is short but nonzero => `ShortClaim` at our own frontier, carrying
+    ///     OUR head digest. We cannot prove here that our prefix lies on `chain(named)`
+    ///     without holding that chain, so the receiver re-checks the linkage against its
+    ///     own copy (`AvailResolver::note_claim`). Emitting it is what keeps the ack rate
+    ///     from collapsing under ragged frontiers.
+    ///   - nothing held for that author => no claim. Silence is not a negative
+    ///     acknowledgment; it just carries no information.
+    ///
+    /// Claiming ABOVE the named height is deliberately inexpressible: there is no digest
+    /// in the proposal to anchor it, and availability only ever has to certify what a
+    /// proposal names (spec §3, consequence 2).
+    pub fn build_avail_claim(&self, proposal: &crate::vantage::agb::ViewProposal) -> AvailClaim {
+        let refs = manifest_refs(proposal);
+        let mut claim = AvailClaim::with_capacity(refs.len());
+        let blocks = self.blocks.lock();
+        for (j, r) in refs.iter().enumerate() {
+            let (author, height, digest) = (r.0, r.1, &r.2);
+            let Some((own_h, own_head)) = self.own_avail_watermark.get(&author) else {
+                continue;
+            };
+            if *own_h >= height {
+                let holds_named = blocks.get(digest).is_some_and(|e| {
+                    e.block.author == author
+                        && e.block.height == height
+                        && e.block.id == *digest
+                        && e.block_ok_verified
+                });
+                if holds_named {
+                    claim.set_at_tip(j);
+                }
+                // else: our lane for this author is a DIFFERENT chain at that height (the
+                // author equivocated). Claiming either endpoint would be a claim about a
+                // chain we do not hold, so we say nothing.
+            } else if *own_h > 0 {
+                claim.push_short(j, height - *own_h, own_head.clone());
+            }
+        }
+        claim
     }
 
     /// Mechanism A requester-side trigger input: `avail(a)` in the design doc -- see
