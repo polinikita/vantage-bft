@@ -31,14 +31,35 @@ pub(crate) const FANOUT_FIRST: usize = 4;
 /// `retry_pending_avail` and `try_serve` pathological at n=100.
 pub(crate) const FANOUT_ESCALATE_BUDGET: usize = 256;
 
+/// Total `request(h)` messages this node will emit per 1s tick, across BOTH first rounds
+/// and escalations.
+///
+/// The per-mechanism caps that already existed (fan-out width, escalation count, body-fetch
+/// cap of 1024, 8 concurrent resume episodes) each bound their own mechanism and nothing
+/// bounds their SUM -- so a node in deep recovery runs all of them at once, which is
+/// precisely the load that saturated the core. This is the ceiling on the dominant term:
+/// measured on the 2026-08-07 runs, repair requests outweighed lane-resume requests by more
+/// than 100x (223,122 versus 1,328 on a degraded node, and 4.1M versus 534 before the
+/// fan-out was bounded), so bounding repair is what bounding "recovery" mostly means.
+///
+/// 2048/s against a 4-peer first round is ~512 new digests/s, enough to work through the
+/// 6,109-digest gap the degraded n=100 nodes showed in about 12s, while keeping egress an
+/// order of magnitude below the level that caused the collapse.
+pub(crate) const RECOVERY_EMIT_PER_TICK: usize = 2_048;
+
 /// Per-digest fan-out progress. See `fan_out` for why coverage is staged.
 struct FanoutState {
-    /// Where in `peers` this digest's fan-out begins, derived from the digest itself.
-    /// Without this every node asks `peers[0..k]` for every digest, so peer 0 serves the
-    /// whole committee's repair load while peer n-1 serves none. Digest-derived (not
-    /// random) keeps it deterministic and reproducible across runs.
+    /// The missing block's coordinate, kept so each round can re-consult `holders` for
+    /// peers known to hold this author's lane at this height.
+    author: PublicKey,
+    height: Height,
+    /// Where in `peers` this digest's fill order begins, derived from the digest itself.
+    /// Used only for peers we have NO holder information about: without it every node
+    /// would fall back to `peers[0..k]` for every digest, so peer 0 absorbs the whole
+    /// committee's repair load while peer n-1 serves none. Digest-derived rather than
+    /// random, so it stays deterministic and reproducible across runs.
     start: usize,
-    /// How many peers, counting forward from `start` (wrapping), have been asked.
+    /// How many distinct peers have been asked for this digest so far.
     asked: usize,
     /// Size of the NEXT batch. Doubling reaches all n-1 peers in O(log n) ticks, so the
     /// worst-case time-to-full-coverage stays small while the common case stays cheap.
@@ -115,6 +136,30 @@ pub struct Repairer {
     /// Entries whose digest is no longer in `fanout` are skipped and dropped, so this is
     /// self-cleaning without a separate eviction pass.
     fanout_queue: BTreeSet<(Height, Digest)>,
+    /// `author -> peer -> highest height that peer has confirmed holding of author's lane`.
+    ///
+    /// Fed by `note_holder` from the same availability credits `LaneManager` already
+    /// consumes, so it costs no new messages -- it is information the node receives and
+    /// then threw away. `fan_out` uses it to pick the FIRST round of peers, which is what
+    /// decides whether a bounded fan-out actually finds the block.
+    ///
+    /// Motivation, measured on the 2026-08-07 n=100 run AFTER bounding the fan-out: the
+    /// still-degraded nodes reported `vantage_repair_fanout_escalations_total` 6,101 against
+    /// `vantage_repair_fanout_pending` 6,109 -- essentially EVERY outstanding digest needed
+    /// a round beyond the first four peers. The width was not the problem; the choice was.
+    /// Peers were picked by hashing the digest, which spreads serve load perfectly and
+    /// ignores the only thing that matters: whether the peer has the data.
+    ///
+    /// Bounded O(n^2) -- 100 x 100 x 40 B = ~400 KB at n=100 -- and monotone per entry, so
+    /// it needs no GC.
+    holders: HashMap<PublicKey, HashMap<PublicKey, Height>>,
+    /// Requests still permitted this tick (`RECOVERY_EMIT_PER_TICK`, refilled by
+    /// `retry_requests`). Checked BEFORE `requested`/`requested_hashes` are written, never
+    /// after: those two are permanent one-shot records, so denying a request after recording
+    /// it would mean the peer is never asked again -- a liveness bug wearing a congestion
+    /// control's clothing. A denied digest keeps its `fanout` state and its queue entry, so
+    /// the next tick simply picks it up.
+    emit_budget: usize,
     /// N7: `(requester, h)` recorded on a direct `request(h)`, even before we hold `h`.
     /// n=100 straggler fix (2026-08-08): indexed BY DIGEST rather than a flat
     /// `HashSet<(PublicKey, Digest)>`. `try_serve` ran a linear scan of the whole set on
@@ -162,6 +207,8 @@ impl Repairer {
             requested_hashes: HashSet::new(),
             fanout: HashMap::new(),
             fanout_queue: BTreeSet::new(),
+            holders: HashMap::new(),
+            emit_budget: RECOVERY_EMIT_PER_TICK,
             pending_req: HashMap::new(),
             answered: HashSet::new(),
             metrics: None,
@@ -300,32 +347,149 @@ impl Repairer {
     /// holder set is only guaranteed f+1 *stake*, so in the worst case exactly one of its
     /// members is correct and which one is unknown. Any bounded subset can miss it;
     /// asking everyone eventually cannot.
+    ///
+    /// TARGET CHOICE (2026-08-07, second iteration): each round prefers peers KNOWN to hold
+    /// this author's lane at this height (`holders`, fed by the availability credits the node
+    /// already receives), highest confirmed height first, and only falls back to the
+    /// digest-spread rotation for peers we know nothing about. Bounding the width without
+    /// this fixed the flood but not the recovery: the still-degraded n=100 nodes showed
+    /// `escalations` 6,101 against `fanout_pending` 6,109, i.e. essentially every digest
+    /// needed a round beyond the first four. Four peers is enough -- four peers chosen by
+    /// hashing the digest is not.
     fn fan_out(&mut self, h: &Digest, effects: &mut Vec<Effect>) {
         let n = self.peers.len();
         if n == 0 {
             return;
         }
-        let entry = self.fanout.entry(h.clone()).or_insert_with(|| FanoutState {
-            start: Self::fanout_start(h, n),
-            asked: 0,
-            next_width: FANOUT_FIRST,
-        });
-        if entry.asked >= n {
-            return;
+        // Read everything the round needs, then drop the borrow: the target choice below
+        // consults `holders`/`requested`, which are other fields of `self`.
+        let (author, height, start, asked, take) = {
+            let Some(entry) = self.fanout.get_mut(h) else {
+                return; // never created without a coordinate; see `begin_fanout`
+            };
+            if entry.asked >= n {
+                return;
+            }
+            let take = entry.next_width.min(n - entry.asked);
+            entry.next_width = entry.next_width.saturating_mul(2);
+            (entry.author, entry.height, entry.start, entry.asked, take)
+        };
+
+        // Peers that have confirmed this exact lane height, best-informed first, skipping
+        // any already asked (N6: at most one request per (peer, digest), ever).
+        let mut targets: Vec<PublicKey> = Vec::with_capacity(take);
+        for peer in self.likely_holders(&author, height, n) {
+            if targets.len() >= take {
+                break;
+            }
+            if !self.requested.contains(&(peer, h.clone())) {
+                targets.push(peer);
+            }
         }
-        let (start, from) = (entry.start, entry.asked);
-        let take = entry.next_width.min(n - from);
-        entry.asked = from + take;
-        entry.next_width = entry.next_width.saturating_mul(2);
-        for k in 0..take {
-            let peer = self.peers[(start + from + k) % n];
+        // Fill the rest from the digest-spread rotation. Scans at most n peers, so a round
+        // stays O(n) even when most of the committee has already been asked.
+        let mut scanned = 0;
+        while targets.len() < take && scanned < n {
+            let peer = self.peers[(start + asked + scanned) % n];
+            if !self.requested.contains(&(peer, h.clone())) && !targets.contains(&peer) {
+                targets.push(peer);
+            }
+            scanned += 1;
+        }
+
+        // Truncate to what the tick's recovery budget still allows. Done here, before any
+        // `requested`/`requested_hashes` write, for the reason those fields' comments give.
+        targets.truncate(self.emit_budget);
+        let emitted = targets.len();
+        if emitted == 0 && self.emit_budget == 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_repair_budget_deferred_total.inc();
+            }
+            return; // try again next tick; state and queue entry are intact
+        }
+        self.emit_budget -= emitted;
+        for peer in targets {
             if self.requested.insert((peer, h.clone())) {
+                // Only now is the digest genuinely "requested", which is what `on_serve`'s
+                // P1-2 gate means. Setting it earlier would let a digest we never asked for
+                // accept an unsolicited serve.
+                self.requested_hashes.insert(h.clone());
                 effects.push(Effect::RequestTo(peer, h.clone()));
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_repairs_requested.inc();
                 }
             }
         }
+        if let Some(entry) = self.fanout.get_mut(h) {
+            // Count what was actually asked, not what was budgeted. If the fill loop found
+            // nobody new, every peer has already been asked, so jump straight to full
+            // coverage -- that is what retires the digest in `retry_requests` instead of
+            // leaving it queued forever emitting nothing.
+            entry.asked = if emitted == 0 {
+                n
+            } else {
+                entry.asked + emitted
+            };
+        }
+    }
+
+    /// Create the per-digest fan-out state for a newly-missing block and emit its first
+    /// round. Separate from `fan_out` because only the `settle` miss branch knows the
+    /// coordinate; later rounds read it back from `FanoutState`.
+    fn begin_fanout(
+        &mut self,
+        h: &Digest,
+        author: PublicKey,
+        height: Height,
+        effects: &mut Vec<Effect>,
+    ) {
+        let n = self.peers.len();
+        if n == 0 {
+            return;
+        }
+        self.fanout.entry(h.clone()).or_insert_with(|| FanoutState {
+            author,
+            height,
+            start: Self::fanout_start(h, n),
+            asked: 0,
+            next_width: FANOUT_FIRST,
+        });
+        self.fan_out(h, effects);
+    }
+
+    /// Record that `peer` has confirmed holding `author`'s lane up to `height`. Monotone:
+    /// a lower height never regresses an entry.
+    ///
+    /// Called for every availability credit the node already processes (`credit_refs`), so
+    /// this is free in wire terms. See `holders` for why the first fan-out round needs it.
+    pub fn note_holder(&mut self, peer: PublicKey, author: PublicKey, height: Height) {
+        let entry = self
+            .holders
+            .entry(author)
+            .or_default()
+            .entry(peer)
+            .or_insert(0);
+        if height > *entry {
+            *entry = height;
+        }
+    }
+
+    /// Peers that have confirmed holding `author`'s lane at or above `height`, capped at
+    /// `want`. Ordered by descending confirmed height, so the peers furthest ahead -- and
+    /// therefore least likely to have pruned the block -- are asked first.
+    fn likely_holders(&self, author: &PublicKey, height: Height, want: usize) -> Vec<PublicKey> {
+        let Some(by_peer) = self.holders.get(author) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<(Height, PublicKey)> = by_peer
+            .iter()
+            .filter(|(_, &h)| h >= height)
+            .map(|(p, &h)| (h, *p))
+            .collect();
+        // Descending height, then by key so the order is deterministic across nodes and
+        // runs (a HashMap iteration order would not be).
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        candidates.into_iter().take(want).map(|(_, p)| p).collect()
     }
 
     /// Where in `peers` a digest's fan-out starts. Spreading by digest matters at n=100:
@@ -346,6 +510,9 @@ impl Repairer {
     /// the longest-outstanding digest escalates first.
     pub fn retry_requests(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // Refill the tick's recovery allowance. This is the ONE place it is refilled, so the
+        // ceiling applies to the hot-path first rounds too, not just to escalations.
+        self.emit_budget = RECOVERY_EMIT_PER_TICK;
         let budget = FANOUT_ESCALATE_BUDGET.min(self.fanout_queue.len());
         // Escalated entries are re-inserted, so draining in place would re-visit them
         // within the same call (they sort at or below the cursor). Collect the batch first.
@@ -565,9 +732,15 @@ impl Repairer {
                 // O(1) here (the property the 2026-08-08 gate introduced and which
                 // `on_block_available`'s walks depend on); widening coverage is
                 // `retry_requests`' job, off the node's 1s tick.
-                if self.requested_hashes.insert(h.clone()) {
+                // "Already being asked for" is now `fanout` OR `requested_hashes`, not
+                // `requested_hashes` alone: with a recovery budget, a digest can be known
+                // and queued before any request has actually gone out, and
+                // `requested_hashes` is deliberately only set once one has (see `fan_out`).
+                // Either way a repeated miss on the same digest stays O(1) here, which is
+                // what `on_block_available`'s walks depend on.
+                if !self.requested_hashes.contains(&h) && !self.fanout.contains_key(&h) {
                     self.fanout_queue.insert((height, h.clone()));
-                    self.fan_out(&h, effects);
+                    self.begin_fanout(&h, author, height, effects);
                 }
                 // Index the blockage so `on_block_available(h)` wakes exactly these
                 // refs. `frames` holds every descendant this walk passed through on the

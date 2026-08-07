@@ -417,6 +417,11 @@ pub struct Metrics {
     /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
     /// the gate the two should track each other at ~1/(n-1).
     pub vantage_repair_fanout_loops_total: IntCounter,
+    /// Times a repair request was deferred to the next tick because this tick's recovery
+    /// allowance (`RECOVERY_EMIT_PER_TICK`) was exhausted. Zero on a healthy node. Nonzero
+    /// means a node is recovering at the ceiling -- which is the intended behaviour, not an
+    /// error: the per-mechanism caps bound each mechanism, and this bounds their sum.
+    pub vantage_repair_budget_deferred_total: IntCounter,
     /// `BlockCache` entries held. The cache has NO eviction ("every block this node has
     /// ever obtained"), so this is monotone and is the leading suspect for the residual
     /// ~2.8 MB/s/node RSS growth that `local-dryrun/rss-growth.sh` measures. Divide that
@@ -1042,6 +1047,13 @@ impl Metrics {
                 "vantage_repair_fanout_loops_total",
                 "Times settle reached the missing-block branch (fan-out considered, not \
                  necessarily emitted); compare with vantage_repairs_requested",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_budget_deferred_total: register_int_counter_with_registry!(
+                "vantage_repair_budget_deferred_total",
+                "Repair requests deferred to the next tick because this tick's recovery \
+                 allowance was spent (bounds the SUM of the recovery mechanisms)",
                 registry,
             )
             .unwrap(),

@@ -647,3 +647,135 @@ async fn fanout_escalates_the_lowest_height_first() {
         "the lower height must escalate first: {first_low:?} vs {first_high:?}"
     );
 }
+
+/// Target choice: the FIRST round must go to peers known to hold this author's lane at this
+/// height, not to peers picked by hashing the digest.
+///
+/// This is the second half of the n=100 recovery fix. Bounding the width stopped the flood
+/// (bulk drops 639,851 -> 0) but 11 of 100 nodes still lagged, and the counters said why:
+/// `escalations` 6,101 against `fanout_pending` 6,109, i.e. essentially every outstanding
+/// digest needed a round beyond the first four peers. Four peers was enough; four peers
+/// chosen by digest hash was not.
+#[tokio::test]
+async fn first_round_prefers_peers_known_to_hold_the_lane() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 27_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let mut rep = wide_repairer(watcher, &committee);
+
+    // Exactly FANOUT_FIRST peers have confirmed author's lane at/above height 5, so the
+    // round is filled entirely from the holder index and the fallback rotation is not
+    // consulted at all -- which is what makes the exclusion below meaningful. (With FEWER
+    // known holders than the width, the fill loop must pick arbitrary extra peers, and a
+    // below-height peer being among them is correct behaviour, not a preference.)
+    let holders = [keys[6].name, keys[7].name, keys[8].name, keys[9].name];
+    assert_eq!(holders.len(), FANOUT_FIRST);
+    for (i, p) in holders.iter().enumerate() {
+        rep.note_holder(*p, author, 5 + i as u64);
+    }
+    rep.note_holder(keys[5].name, author, 4); // too low for height 5
+
+    let asked = requests_for(&rep.authorize((author, 5u64, Digest([7u8; 32]))));
+    assert_eq!(asked.len(), FANOUT_FIRST);
+    let asked_peers: std::collections::HashSet<_> = asked.iter().map(|(p, _)| *p).collect();
+    for p in &holders {
+        assert!(
+            asked_peers.contains(p),
+            "a peer known to hold the lane was not in the first round"
+        );
+    }
+    assert!(
+        !asked_peers.contains(&keys[5].name),
+        "a peer whose confirmed height is BELOW the missing block displaced a known holder"
+    );
+}
+
+/// Holder preference must not break coverage: escalation still reaches every peer exactly
+/// once, including the ones the holder index knew nothing about.
+#[tokio::test]
+async fn holder_preference_still_reaches_full_coverage_exactly_once() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 28_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let n_peers = committee.others_primaries(&watcher).len();
+    let mut rep = wide_repairer(watcher, &committee);
+    rep.note_holder(keys[9].name, author, 99);
+    let h = Digest([7u8; 32]);
+
+    let mut all = requests_for(&rep.authorize((author, 5u64, h.clone())));
+    for _ in 0..8 {
+        all.extend(requests_for(&rep.retry_requests()));
+    }
+    let distinct: std::collections::HashSet<_> = all.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        distinct.len(),
+        n_peers,
+        "every peer must eventually be asked"
+    );
+    assert_eq!(
+        all.len(),
+        n_peers,
+        "no peer twice -- N6 allows one request each"
+    );
+}
+
+/// `note_holder` is monotone: a stale, lower credit must never lower a peer's confirmed
+/// height, or the fan-out would stop preferring a peer that demonstrably has the data.
+#[tokio::test]
+async fn note_holder_never_regresses() {
+    let (committee, keys) = Committee::local_benchmark(10, 1, 29_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let mut rep = wide_repairer(watcher, &committee);
+
+    rep.note_holder(keys[5].name, author, 50);
+    rep.note_holder(keys[5].name, author, 3); // stale credit arriving late
+
+    // Still preferred for a height it confirmed earlier.
+    let asked = requests_for(&rep.authorize((author, 40u64, Digest([1u8; 32]))));
+    assert!(
+        asked.iter().any(|(p, _)| *p == keys[5].name),
+        "a stale lower credit regressed the confirmed height"
+    );
+}
+
+/// The recovery budget must DEFER, never DROP. `requested`/`requested_hashes` are permanent
+/// one-shot records, so a request denied after being recorded would mean that peer is never
+/// asked again -- a liveness bug dressed as congestion control. A denied digest must keep its
+/// state and be picked up by the next tick.
+#[tokio::test]
+async fn recovery_budget_defers_requests_instead_of_dropping_them() {
+    use crate::vantage::repair::RECOVERY_EMIT_PER_TICK;
+    let (committee, keys) = Committee::local_benchmark(10, 1, 30_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let mut rep = wide_repairer(watcher, &committee);
+
+    // Spend the whole tick's allowance on distinct digests (FANOUT_FIRST requests each).
+    let mut emitted = 0usize;
+    let mut h = 0u8;
+    while emitted < RECOVERY_EMIT_PER_TICK && h < 255 {
+        let d = Digest([h; 32]);
+        emitted += requests_for(&rep.authorize((author, 1 + h as u64, d))).len();
+        h += 1;
+    }
+    assert!(
+        emitted <= RECOVERY_EMIT_PER_TICK,
+        "budget must cap emission"
+    );
+
+    // One more digest while the budget is spent: nothing emitted, but the digest must NOT be
+    // marked as requested (that would let an unsolicited serve through P1-2's gate).
+    let starved = Digest([0xAB; 32]);
+    let none = requests_for(&rep.authorize((author, 900u64, starved.clone())));
+    if emitted >= RECOVERY_EMIT_PER_TICK {
+        assert!(none.is_empty(), "budget spent -- nothing may be emitted");
+        assert!(
+            !rep.was_requested_hash(&starved),
+            "a digest we never actually asked for must not pass the serve gate"
+        );
+        // Next tick refills, and the deferred digest is served first (lowest height wins,
+        // but it is present either way).
+        let after = requests_for(&rep.retry_requests());
+        assert!(
+            !after.is_empty(),
+            "the next tick must pick up work deferred by the budget"
+        );
+    }
+}

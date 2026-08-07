@@ -1989,6 +1989,11 @@ impl VantageCore {
     fn credit_refs(&mut self, sender: PublicKey, refs: Vec<BlockRef>, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
         for r in refs {
+            // Repair target choice (2026-08-07): a credit is `sender` telling us it holds
+            // `r.0`'s lane at height `r.1`, which is exactly what the repair fan-out needs
+            // to pick its first round of peers. The information was already arriving and
+            // being discarded; see `Repairer::holders`.
+            self.rep.note_holder(sender, r.0, r.1);
             let result = {
                 let mut aggregator = self.ack_aggregator.lock();
                 aggregator.record_ack(sender, r)
