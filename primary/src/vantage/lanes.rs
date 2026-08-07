@@ -470,6 +470,12 @@ impl BlockCache {
             if !entry.pinned_at(author, expected_height) {
                 return None; // cross-author graft (§1 "one author index") or height gap
             }
+            // NOTE (2026-08-07): unlike `collect_verified_suffix` and
+            // `verified_prefix_through_genesis`, this walk re-runs `block_ok` rather than
+            // consulting `BlockEntry::block_ok_verified`. Left as-is deliberately: this
+            // function has NO production callers -- `expand`/the gate amendment replaced it
+            // with the suffix/prefix walks -- so memoizing it would be a change to dead code
+            // and would imply a hot-path win that does not exist.
             if !block_ok(&entry.block, committee, sid, max_block_payload) {
                 return None;
             }
@@ -815,12 +821,16 @@ pub struct LaneManager {
     /// which `sender`'s watermark has already been credited for `author`'s lane.
     /// Bounded by O(n^2) (sender x author pairs, n = committee size) -- plain
     /// `HashMap`, no GC needed.
-    credited_floor: HashMap<(PublicKey, PublicKey), (Height, Digest)>,
+    /// MOVED (2026-08-07): watermark resolution now lives in `avail::AvailResolver`, so it
+    /// can be lifted off the core thread -- it consumes ~190k per-(sender, author, height)
+    /// facts per second at n=100 and emits only ~4k monotone threshold marks, a ~47x funnel.
+    /// Held here for now so the call sites and tests are unchanged; the threading move is the
+    /// next step. See that module's header for the measurements.
+    avail: crate::vantage::avail::AvailResolver,
     /// Per (sender, author) latest-wins pending slot: a watermark entry whose head
     /// resolved (attested, credited) but whose segment below the head did not fully
     /// resolve locally yet -- retried by `retry_pending_avail` once a new block is
     /// cached. Bounded by O(n^2), same as `credited_floor`, no GC needed.
-    pending_avail: HashMap<(PublicKey, PublicKey), AvailEntry>,
     /// n=100 straggler fix (2026-08-08): `author -> senders with a stashed entry for that
     /// author`. `retry_pending_avail` used to scan ALL of `pending_avail` and filter by
     /// author on every newly cached block; this makes it O(senders waiting on THIS
@@ -828,7 +838,6 @@ pub struct LaneManager {
     /// a second place -- measured 426M scan iterations on an n=100 straggler. Kept as a
     /// strict mirror of `pending_avail`'s key set: every insert/remove below updates
     /// both, and an emptied bucket is dropped so the index cannot leak authors.
-    pending_avail_by_author: HashMap<PublicKey, HashSet<PublicKey>>,
 
     /// Mechanism A (sender-side lane resume, `vantage::resume`) requester-side
     /// trigger input: per-author max height that has reached at least an
@@ -879,6 +888,15 @@ impl LaneManager {
     ) -> Self {
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
+        // Built before the struct literal: it borrows the same committee/sid/genesis/blocks
+        // the literal then moves.
+        let avail = crate::vantage::avail::AvailResolver::new(
+            committee.clone(),
+            sid.clone(),
+            genesis.clone(),
+            max_block_payload,
+            blocks.clone(),
+        );
         Self {
             name,
             committee,
@@ -897,9 +915,7 @@ impl LaneManager {
             own_frontier: (0, genesis),
             own_avail_watermark: HashMap::new(),
             avail_dirty: false,
-            credited_floor: HashMap::new(),
-            pending_avail: HashMap::new(),
-            pending_avail_by_author: HashMap::new(),
+            avail,
             avail_watermark_high: HashMap::new(),
             metrics: None,
             wt_store_probe: None,
@@ -960,17 +976,14 @@ impl LaneManager {
     pub(crate) fn pending_avail_index_for_test(
         &self,
     ) -> std::collections::HashSet<(PublicKey, PublicKey)> {
-        self.pending_avail_by_author
-            .iter()
-            .flat_map(|(author, senders)| senders.iter().map(move |s| (*s, *author)))
-            .collect()
+        self.avail.pending_avail_index_for_test()
     }
 
     #[cfg(test)]
     pub(crate) fn pending_avail_keys_for_test(
         &self,
     ) -> std::collections::HashSet<(PublicKey, PublicKey)> {
-        self.pending_avail.keys().copied().collect()
+        self.avail.pending_avail_keys_for_test()
     }
 
     #[cfg(test)]
@@ -1248,6 +1261,13 @@ impl LaneManager {
             return Vec::new();
         }
         self.ack_availability.insert(r.clone(), threshold);
+        // Tell the resolver, so it can stop crediting this ref once the threshold is
+        // terminal. `Quorum` admits no further change, and all n senders credit the same
+        // block while only the first 2f+1 matter -- plus `retry_pending_avail` re-credits a
+        // stuck head ref once per arriving block until this cuts it off. The resolver keeps
+        // its own set rather than reading `ack_availability`, so it stays independent of core
+        // state and can move off the core thread.
+        self.avail.note_threshold(&r, threshold);
         // Mechanism A (`vantage::resume`): every mark reaching this point is, by
         // construction, at least `Validity` (f+1) -- `AckAggregator::record_ack`
         // never emits anything weaker -- so this is unconditional, not gated on
@@ -1269,14 +1289,6 @@ impl LaneManager {
 
     /// §4 query: `is_q_available(ref, q)`, `q` typically `committee.validity_threshold()`
     /// (f+1) or `committee.quorum_threshold()` (2f+1).
-    /// Whether `r` has already reached the terminal `Quorum` threshold, so no further
-    /// credit for it can change any output. Read from this node's OWN consumed marks
-    /// (`ack_availability`), which `process_ack_availability` maintains -- not from the
-    /// shared aggregator, which would need a lock on the hot path.
-    fn is_at_quorum(&self, r: &BlockRef) -> bool {
-        matches!(self.ack_availability.get(r), Some(AckThreshold::Quorum))
-    }
-
     pub fn is_q_available(&self, r: &BlockRef, q: Stake) -> bool {
         match self.ack_availability.get(r) {
             Some(AckThreshold::Quorum) => q <= self.committee.quorum_threshold(),
@@ -1475,158 +1487,20 @@ impl LaneManager {
     /// `sender` is the watermark's declaring party -- D4-trusted the same way an
     /// `Ack::sender` already is; the caller (`VantageCore`/`SimpleItCore::
     /// dispatch_inbound`) has already checked committee membership before reaching
-    /// here.
+    /// N5 ack-watermark front-end. Delegates to `avail::AvailResolver` -- see that module
+    /// for why resolution is a separate type (it is a ~47x funnel and belongs off the core
+    /// thread).
     pub fn resolve_watermark(
         &mut self,
         sender: PublicKey,
         entries: &[AvailEntry],
     ) -> Vec<BlockRef> {
-        let mut refs = Vec::new();
-        for entry in entries {
-            refs.extend(self.resolve_one(sender, entry));
-        }
-        refs
+        self.avail.resolve_watermark(sender, entries)
     }
 
-    /// Re-attempt every `(sender, author)` watermark entry pending on `digest`'s
-    /// author, now that `digest` has just been cached -- hook: both cores'
-    /// `Effect::BlockCached` handling (mirroring `Repairer::on_block_available`'s
-    /// identical "retry on new cache content" role for repair, and `refresh_author`'s
-    /// own retry-on-new-content role for direct acks). Returns `(sender, ref)` pairs so
-    /// the caller can credit each through the shared aggregator under the correct
-    /// declaring sender.
+    /// Re-attempt every `(sender, author)` watermark entry pending on `digest`'s author.
     pub fn retry_pending_avail(&mut self, digest: &Digest) -> Vec<(PublicKey, BlockRef)> {
-        let author = {
-            let blocks = self.blocks.lock();
-            blocks.get(digest).map(|e| e.block.author)
-        };
-        let Some(author) = author else {
-            return Vec::new();
-        };
-        let keys: Vec<(PublicKey, PublicKey)> = self
-            .pending_avail_by_author
-            .get(&author)
-            .map(|senders| senders.iter().map(|sender| (*sender, author)).collect())
-            .unwrap_or_default();
-        let mut out = Vec::new();
-        for key in keys {
-            let sender = key.0;
-            let Some(entry) = self.pending_avail.get(&key).cloned() else {
-                continue;
-            };
-            for r in self.resolve_one(sender, &entry) {
-                out.push((sender, r));
-            }
-        }
-        out
-    }
-
-    /// Per-entry core of `resolve_watermark`/`retry_pending_avail`: resolves `entry`
-    /// against `sender`'s current credited floor for `entry.author`.
-    ///
-    /// Monotone: an entry whose DECLARED height is at or below the floor is ignored --
-    /// pure liveness (a stale/duplicate resend costs nothing).
-    ///
-    /// On a successful resolve, the credited refs and the new floor are derived from
-    /// the WALK's own result (`BlockCache::collect_verified_suffix`, which re-derives
-    /// every height from the ACTUAL cached chain, never from the caller's declared
-    /// `entry.height`) -- so a lying declared height can never advance the floor past
-    /// what was genuinely verified; it can only make this call a harmless no-op or
-    /// degrade to the head-alone case below.
-    ///
-    /// On failure (the segment below the head does not fully resolve -- including the
-    /// head itself not being cached at all, per `collect_verified_suffix`'s own
-    /// contract), the head ref alone is credited, EXACTLY as a direct ack for that
-    /// exact `(author, height, digest)` tuple would be (the declaring party attests
-    /// holding it), using the caller's DECLARED `entry.height` -- the same trust model
-    /// `Ack::reference` already applies to a wire-declared height (see `messages::Ack`'s
-    /// doc comment): if the declared height doesn't match the digest's real cached
-    /// height, the resulting ref is simply inert downstream (`exact_coordinate`'s
-    /// pinned-height check rejects it the same way a wrong-height Ack already would),
-    /// never unsound. The floor is NOT advanced past what's already recorded, and the
-    /// entry is stashed (latest-wins, keyed `(sender, author)`) for
-    /// `retry_pending_avail` to retry later.
-    fn resolve_one(&mut self, sender: PublicKey, entry: &AvailEntry) -> Vec<BlockRef> {
-        let key = (sender, entry.author);
-        let (floor_height, floor_digest) = self
-            .credited_floor
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| (0, self.genesis.clone()));
-        if entry.height <= floor_height {
-            return Vec::new();
-        }
-        let segment = {
-            let blocks = self.blocks.lock();
-            blocks.collect_verified_suffix(
-                &self.committee,
-                &self.sid,
-                self.max_block_payload,
-                floor_height,
-                &floor_digest,
-                &entry.head,
-            )
-        };
-        match segment {
-            Some(suffix) => {
-                let mut refs = Vec::with_capacity(suffix.len());
-                for (i, d) in suffix.iter().enumerate() {
-                    let r = (entry.author, floor_height + 1 + i as Height, d.clone());
-                    // ACK FAN-IN (2026-08-07): skip a ref already at `Quorum`. That
-                    // threshold is TERMINAL -- `AckAggregator::record_ack` returns no
-                    // availability once it is reached -- so crediting it again cannot
-                    // change any output, and the work is pure waste: a `BlockRef` clone
-                    // here, then three hash lookups on 72-byte keys plus a set insert in
-                    // `record_ack`, per ref.
-                    //
-                    // This is the dominant cost at n=100. Measured on the 2026-08-07 run:
-                    // 190,292 credited refs/s per node, 96.3 per avail message (one
-                    // watermark entry per author, so n per message), 48.1s of a 122.6s
-                    // window at 2.06us each = 39% of one core, against 49% total
-                    // `inbound_dispatch`. All n senders credit the same block, but only
-                    // the first 2f+1 of them can change anything.
-                    if !self.is_at_quorum(&r) {
-                        refs.push(r);
-                    } else if let Some(metrics) = &self.metrics {
-                        metrics.vantage_avail_credit_skipped_total.inc();
-                    }
-                }
-                if let Some(last) = suffix.last() {
-                    self.credited_floor
-                        .insert(key, (floor_height + suffix.len() as Height, last.clone()));
-                }
-                self.pending_avail.remove(&key);
-                if let Some(senders) = self.pending_avail_by_author.get_mut(&key.1) {
-                    senders.remove(&key.0);
-                    if senders.is_empty() {
-                        self.pending_avail_by_author.remove(&key.1);
-                    }
-                }
-                refs
-            }
-            None => {
-                self.pending_avail_by_author
-                    .entry(key.1)
-                    .or_default()
-                    .insert(key.0);
-                self.pending_avail.insert(key, entry.clone());
-                // Same skip as above, and it matters MORE here: this branch is re-entered
-                // by `retry_pending_avail` on every newly cached block of this author, so a
-                // (sender, author) pair whose segment stays unresolved re-credits the SAME
-                // head ref once per arriving block -- unboundedly. The stash is still kept
-                // (the retry is what eventually advances the floor); only the redundant
-                // credit is dropped.
-                let head = (entry.author, entry.height, entry.head.clone());
-                if self.is_at_quorum(&head) {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.vantage_avail_credit_skipped_total.inc();
-                    }
-                    Vec::new()
-                } else {
-                    vec![head]
-                }
-            }
-        }
+        self.avail.retry_pending_avail(digest)
     }
 
     /// N5: refresh both registers for `author` from the monotone direct/quorum indexes.

@@ -8,6 +8,7 @@
 // assemblies never construct anything in this module.
 
 pub mod agb;
+pub mod avail;
 pub mod block;
 pub mod cursor;
 pub mod frontier;
