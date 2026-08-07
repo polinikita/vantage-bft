@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Scrape every docker-bench container's published Prometheus endpoint and report
 committed TPS / latency, matching node/src/local_benchmark.rs's own summary formula
-and TIMELINE line format (see that file's `print_results`/timeline loop).
+(see that file's `print_results`/timeline loop). The TIMELINE line shares that
+printer's first three fields but samples every 10s (not 1 Hz) and appends
+tps/p50_ms/mat_p50_ms -- see `watch`'s own doc comment.
 
 stdlib only (urllib for HTTP, no `requests`; hand-rolled Prometheus text-exposition
 parser, no `prometheus_client`).
@@ -37,6 +39,10 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = SCRIPT_DIR / "data" / "manifest.json"
+# One source of truth for the link `watch` prints (run.sh echoes the same URL --
+# port from monitoring/docker-compose.yml's Grafana mapping, dashboard UID from the
+# provisioned vantage-local-benchmark dashboard).
+GRAFANA_DASHBOARD_URL = "http://localhost:3003/d/vantage-local-benchmark"
 
 _LABEL_RE = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 
@@ -106,7 +112,7 @@ def median(values: list[int]) -> int:
 
 class NodeSnapshot:
     __slots__ = ("reachable", "committed_transactions", "submitted_transactions",
-                 "count", "p50", "p90", "p99")
+                 "count", "p50", "p90", "p99", "m50", "m90", "m99")
 
     def __init__(self):
         self.reachable = False
@@ -114,6 +120,7 @@ class NodeSnapshot:
         self.submitted_transactions = 0
         self.count = 0
         self.p50 = self.p90 = self.p99 = None
+        self.m50 = self.m90 = self.m99 = None
 
 
 def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
@@ -130,6 +137,13 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         s.p50 = gauge_by_label(samples, "transaction_committed_latency", "v", "p50")
         s.p90 = gauge_by_label(samples, "transaction_committed_latency", "v", "p90")
         s.p99 = gauge_by_label(samples, "transaction_committed_latency", "v", "p99")
+    # Same gauge family shape as above, one histogram later in the pipeline: stops
+    # the clock when the block's payload is locally in hand (the starfish-comparable
+    # series -- metrics/src/snapshot.rs's own doc comment).
+    if gauge_by_label(samples, "transaction_materialised_latency", "v", "count"):
+        s.m50 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p50")
+        s.m90 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p90")
+        s.m99 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p99")
     return s
 
 
@@ -158,6 +172,26 @@ def latency_line(snapshots: list[NodeSnapshot]) -> str:
     )
 
 
+def materialised_line(snapshots: list[NodeSnapshot]) -> str:
+    with_latency = [s for s in snapshots if s.reachable and s.m50 is not None]
+    if not with_latency:
+        return " Materialised transaction latency: no observations yet"
+    m50 = median([s.m50 for s in with_latency])
+    m90 = median([s.m90 for s in with_latency])
+    m99 = median([s.m99 for s in with_latency])
+    return (
+        f" Materialised transaction latency: p50/p90/p99 {m50 / 1000:.2f}/"
+        f"{m90 / 1000:.2f}/{m99 / 1000:.2f} ms (same refresh caveat)"
+    )
+
+
+def median_p50_ms(snapshots: list[NodeSnapshot], attr: str) -> str:
+    """Committee-median p50 (`attr` is `p50` or `m50`), formatted for a TIMELINE
+    field -- `-` until the first reporter tick publishes the gauges."""
+    values = [getattr(s, attr) for s in snapshots if s.reachable and getattr(s, attr) is not None]
+    return f"{median(values) / 1000:.1f}" if values else "-"
+
+
 def print_summary(snapshots: list[NodeSnapshot], n_expected: int) -> None:
     """Point-in-time read of the monotonic counters -- deliberately NOT a rate.
     `committed_transactions` counts from container start, not from whenever this
@@ -179,15 +213,26 @@ def print_summary(snapshots: list[NodeSnapshot], n_expected: int) -> None:
     print(f" Committed total (cumulative since container start): {total} tx")
     print(f" Submitted (summed across nodes): {submitted} tx")
     print(latency_line(snapshots))
+    print(materialised_line(snapshots))
     print("-----------------------------------------")
 
 
-def watch(manifest: dict, duration: int | None) -> None:
-    """Prints one `TIMELINE:` line per second (byte-identical format to `node
-    local-benchmark --timeline`), then a SUMMARY computed from THIS watch's own first
-    and last samples -- self-baselined, so it is correct regardless of how long the
-    cluster had already been running before this call started (unlike a one-shot
-    cumulative-total/externally-given-duration division; see `print_summary`)."""
+def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
+    """Prints one `TIMELINE:` line per `interval` seconds (default 10 -- matching
+    the nodes' own `MetricReporter` gauge refresh, so the appended latency fields
+    are exactly one tick old, never mid-window noise; `node local-benchmark
+    --timeline`'s in-process printer stays at 1 Hz, so the two formats share the
+    first three fields but are no longer byte-identical), then a SUMMARY computed
+    from THIS watch's own first and last samples -- self-baselined, so it is correct
+    regardless of how long the cluster had already been running before this call
+    started (unlike a one-shot cumulative-total/externally-given-duration division;
+    see `print_summary`).
+
+    Each line: `committed_delta` spans the whole interval (NOT per second -- `tps`
+    is the per-second rate), and `p50_ms`/`mat_p50_ms` are the committee-median p50
+    of the committed/materialised latency gauges (`-` until first published)."""
+    print(f"Grafana dashboard: {GRAFANA_DASHBOARD_URL}")
+    sys.stdout.flush()
     prev_total = 0
     first_total: int | None = None
     first_elapsed = 0
@@ -195,17 +240,20 @@ def watch(manifest: dict, duration: int | None) -> None:
     elapsed = 0
     try:
         while duration is None or elapsed < duration:
-            time.sleep(1)
-            elapsed += 1
+            time.sleep(interval)
+            elapsed += interval
             snapshots = snapshot_all(manifest)
             last_snapshots = snapshots
             total = committed_total(snapshots)
             if first_total is None:
                 first_total = total
                 first_elapsed = elapsed
+            delta = max(0, total - prev_total)
             print(
                 f"TIMELINE: sec={elapsed} committed_total={total} "
-                f"committed_delta={max(0, total - prev_total)}"
+                f"committed_delta={delta} tps={delta / interval:.0f} "
+                f"p50_ms={median_p50_ms(snapshots, 'p50')} "
+                f"mat_p50_ms={median_p50_ms(snapshots, 'm50')}"
             )
             sys.stdout.flush()
             prev_total = total
@@ -213,7 +261,7 @@ def watch(manifest: dict, duration: int | None) -> None:
         print()
 
     if not last_snapshots or first_total is None or elapsed <= first_elapsed:
-        return  # too short a window to derive a rate from (e.g. duration <= 1)
+        return  # too short a window to derive a rate from (e.g. duration <= interval)
     window = elapsed - first_elapsed
     rate = (prev_total - first_total) / window
     print("-----------------------------------------")
@@ -221,26 +269,31 @@ def watch(manifest: dict, duration: int | None) -> None:
     print("-----------------------------------------")
     print(f" Consensus TPS: {rate:.0f} tx/s  (delta {prev_total - first_total} tx / {window}s)")
     print(latency_line(last_snapshots))
+    print(materialised_line(last_snapshots))
     print("-----------------------------------------")
 
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--watch", action="store_true",
-                    help="poll at 1 Hz, printing a TIMELINE: line each second "
-                    "(node local-benchmark's own --timeline format), then a SUMMARY "
-                    "with a TPS rate self-baselined from this watch's own first/last "
+                    help="poll every --interval seconds, printing a TIMELINE: line "
+                    "per sample (committed total/delta/tps plus committee-median "
+                    "p50 committed and materialised latency), then a SUMMARY with a "
+                    "TPS rate self-baselined from this watch's own first/last "
                     "samples. Without --watch, prints a point-in-time snapshot only "
                     "(no derived rate -- see print_summary's own doc comment for why)")
     p.add_argument("--duration", type=float, default=None,
                     help="--watch only: stop after this many seconds (default: until "
                     "Ctrl-C)")
+    p.add_argument("--interval", type=int, default=10,
+                    help="--watch only: seconds between TIMELINE samples (default "
+                    "10, matching the nodes' own latency-gauge refresh)")
     args = p.parse_args(argv)
 
     manifest = load_manifest()
     if args.watch:
         duration = int(args.duration) if args.duration else None
-        watch(manifest, duration)
+        watch(manifest, duration, max(1, args.interval))
     else:
         snapshots = snapshot_all(manifest)
         print_summary(snapshots, manifest["nodes"])

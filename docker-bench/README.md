@@ -37,10 +37,13 @@ cd docker-bench
 
 This generates the config, builds the image, brings up 4 containers on a private
 `172.28.0.0/16` bridge network, waits for them to come up, prints a live
-`TIMELINE: sec=... committed_total=... committed_delta=...` line once per second for
-60s (the same format `node local-benchmark --timeline` uses), prints a final summary,
-then tears the validator stack down. It also starts the shared Prometheus/Grafana
-monitoring stack and prints the direct dashboard URL:
+`TIMELINE: sec=... committed_total=... committed_delta=... tps=... p50_ms=...
+mat_p50_ms=...` line every 10 seconds for 60s (`committed_delta` spans the whole
+10s window; the two latency fields are the committee-median p50 of the committed
+and materialised histograms; `--interval` overrides the cadence), prints a final
+summary, then tears the validator stack down. It also starts the shared
+Prometheus/Grafana monitoring stack and prints the direct dashboard URL -- echoed
+again by `--watch` itself right above the timeline:
 
 ```
 http://localhost:3003/d/vantage-local-benchmark
@@ -298,10 +301,12 @@ print. The one real caveat: those gauges only refresh every 10s (each node's own
 `MetricReporter::REPORT_INTERVAL`), and only the in-process harness can call
 `force_report()` to flush the tail before its own final read -- an external HTTP
 scraper structurally can't. So a one-shot `results.py` read can be up to ~10s stale;
-`--watch` mode (1 Hz, `TIMELINE: sec=<n> committed_total=<n> committed_delta=<n>` --
-byte-for-byte the same line format `node local-benchmark --timeline` prints) is the
-more faithful way to see a run's actual shape, and is what both `run.sh` and the blip
-demo below use.
+`--watch` mode (every 10s by default -- matching that gauge refresh exactly, so the
+appended `p50_ms`/`mat_p50_ms` fields are one tick old, never mid-window noise;
+`TIMELINE: sec=<n> committed_total=<n> committed_delta=<n> tps=<n> p50_ms=<n>
+mat_p50_ms=<n>`, sharing the first three fields with `node local-benchmark
+--timeline`'s 1 Hz printer) is the more faithful way to see a run's actual shape,
+and is what both `run.sh` and the blip demo below use.
 
 Committed TPS uses the same formula as `local_benchmark.rs::print_results`: **max
 across nodes** of each node's own `committed_transactions` (every node counts
