@@ -988,6 +988,77 @@ async fn recovery_ceiling_grows_when_clean_and_backs_off_on_drops() {
     );
 }
 
+/// A deep-but-not-overflowing core queue must NOT throttle recovery -- the `adc6048`
+/// regression, reproduced exactly.
+///
+/// Measured on the 2026-08-07 n=100 run: all four degraded nodes sat at `emit_ceiling` =
+/// `RECOVERY_EMIT_MIN` deferring 38-61% of their repair demand (deferred 282-299/s against
+/// requested 192-245/s) while `vantage_bulk_inbound_dropped_total` was ZERO on all 100 nodes.
+/// The main queue really was deep -- but from availability crediting (128,942 refs/s), which
+/// repair cannot influence, against repair's own 193 requests/s. Backing off freed nothing and
+/// left a ~5,000-block gap unable to close.
+///
+/// So a busy main queue must be ignored by this loop, and only NEAR-OVERFLOW (where consensus
+/// traffic is about to be shed) may back it off. The escalation-width cap keeps the lower
+/// threshold, because the duplicates IT suppresses genuinely are repair's own doing.
+#[tokio::test]
+async fn a_busy_core_queue_does_not_throttle_recovery_but_near_overflow_does() {
+    use crate::vantage::repair::{
+        CORE_QUEUE_CONGESTED, CORE_QUEUE_NEAR_OVERFLOW, RECOVERY_EMIT_MAX, RECOVERY_EMIT_MIN,
+    };
+    let (committee, keys) = Committee::local_benchmark(10, 1, 33_100);
+    let registry = prometheus::Registry::new();
+    let (metrics, _reporter) = metrics::Metrics::new(&registry);
+    let mut rep = wide_repairer(keys[0].name, &committee).with_metrics(metrics.clone());
+
+    let ceiling = || {
+        registry
+            .gather()
+            .iter()
+            .find(|f| f.get_name() == "vantage_repair_emit_ceiling")
+            .and_then(|f| {
+                f.get_metric()
+                    .first()
+                    .map(|m| m.get_gauge().get_value() as usize)
+            })
+            .unwrap_or(0)
+    };
+
+    // The adc6048 state: queue deep enough to have tripped the old threshold, zero drops.
+    rep.observe_core_queue(CORE_QUEUE_CONGESTED);
+    for _ in 0..24 {
+        rep.retry_requests();
+    }
+    assert_eq!(
+        ceiling(),
+        RECOVERY_EMIT_MAX,
+        "a busy-but-not-overflowing queue must not throttle: repair is ~0.15% of that load, \
+         so backing off cannot drain it and only blocks recovery"
+    );
+
+    // Near overflow, consensus traffic is about to be shed -- back off whatever the cause.
+    rep.observe_core_queue(CORE_QUEUE_NEAR_OVERFLOW);
+    for _ in 0..40 {
+        rep.retry_requests();
+    }
+    assert_eq!(
+        ceiling(),
+        RECOVERY_EMIT_MIN,
+        "the near-overflow backstop must still engage"
+    );
+
+    // And it must recover once the queue drains, or one bad moment pins the node forever.
+    rep.observe_core_queue(0);
+    for _ in 0..24 {
+        rep.retry_requests();
+    }
+    assert_eq!(
+        ceiling(),
+        RECOVERY_EMIT_MAX,
+        "backstop must release when the queue drains"
+    );
+}
+
 /// The IN-FLIGHT window bounds inbound, which a rate limit alone does not.
 ///
 /// Measured on the 2026-08-07 n=100 run: 3,420 outstanding digests asked of ~49 peers each

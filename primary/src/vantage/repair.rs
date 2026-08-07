@@ -51,10 +51,39 @@ pub(crate) const RECOVERY_EMIT_MIN: usize = 256;
 /// emitted before the fan-out was bounded, so this is a bound, not a licence.
 pub(crate) const RECOVERY_EMIT_MAX: usize = 65_536;
 
-/// Core inbound-queue depth above which the node counts as congested. The queue is 1000
-/// slots; measured on the 2026-08-07 n=100 run, degraded nodes sat pinned at exactly 1000
-/// while healthy nodes sat at 9-17, so anything near the cap is unambiguous.
+/// Core inbound-queue depth above which the node counts as congested, for the ESCALATION
+/// WIDTH cap only (`fan_out`). The queue is 1000 slots; measured on the 2026-08-07 n=100 run,
+/// degraded nodes sat pinned at exactly 1000 while healthy nodes sat at 9-17, so anything
+/// near the cap is unambiguous.
+///
+/// This use is correctly attributed and stays at "merely busy": widening ONE digest to ~49
+/// peers invites ~49 copies of the same block onto the main queue, and those duplicates are
+/// entirely repair's own doing. Backing off narrows a self-inflicted amplification.
 pub(crate) const CORE_QUEUE_CONGESTED: usize = 256;
+
+/// Core inbound-queue depth at which `adapt_recovery_ceiling` backs off -- deliberately just
+/// under the 1000-slot cap, NOT at "merely busy" like `CORE_QUEUE_CONGESTED` above.
+///
+/// The emit ceiling read `CORE_QUEUE_CONGESTED` for one run and that was a control-loop
+/// MISATTRIBUTION, measured on the 2026-08-07 n=100 run at `adc6048`. All four degraded nodes
+/// sat at `emit_ceiling` = `RECOVERY_EMIT_MIN` deferring 38-61% of their repair demand
+/// (deferred 282-299/s against requested 192-245/s) while `bulk_inbound_dropped_total` was
+/// ZERO on all 100 nodes -- nothing was overflowing anywhere. The main queue was indeed deep,
+/// but from availability CREDITING (128,942 refs/s, ~= n x (2f+1) x block_rate), which repair
+/// cannot influence; repair itself was 193 requests/s, ~0.15% of the node's load. So the loop
+/// throttled the one thing a lagging node needs, in response to load that would not decrease
+/// however far it backed off: cutting repair 60% freed nothing and left a 5,000-block gap
+/// unable to close. Same failure as the fixed 2048/tick budget this AIMD replaced, at 256 --
+/// 8x worse than the bug it was written to fix.
+///
+/// Why the two thresholds differ: the width cap throttles DUPLICATE answers for one digest
+/// (self-inflicted, worth suppressing early); the emit ceiling throttles DISTINCT blocks the
+/// node is missing (each needed exactly once, and suppressing them prevents recovery). At
+/// ~900 the queue is genuinely about to shed CONSENSUS traffic, which is worth backing off
+/// for whatever the cause. Below that, absorption is bounded by `RECOVERY_IN_FLIGHT_MAX`,
+/// which is closed-loop -- a slot frees only when an answer lands or is retired -- and so
+/// self-limits on the real answer rate instead of guessing at it.
+pub(crate) const CORE_QUEUE_NEAR_OVERFLOW: usize = 900;
 
 /// Maximum requests outstanding (emitted, digest not yet in hand) at any moment.
 ///
@@ -547,14 +576,35 @@ impl Repairer {
     ///
     /// The DELTA matters, not the absolute counter: drops never decrease, so reacting to the
     /// total would throttle a node forever after one bad moment.
-    /// CONGESTION SIGNAL (corrected 2026-08-07, second iteration): the core inbound queue
-    /// depth, NOT bulk-inbound drops. The first version of this used drops alone, and the
-    /// n=100 measurement showed why that is blind: degraded nodes sat pinned at
-    /// `core_queue_length` 1000 -- its cap -- while `bulk_inbound_dropped` read exactly 0,
-    /// because the flood was on the MAIN queue. An AIMD on drops would have doubled its
-    /// ceiling all the way to the maximum while the node was already drowning.
+    ///
+    /// CONGESTION SIGNAL, third and current iteration (2026-08-07, `adc6048` run). The signal
+    /// must be one this controller's actuator can actually MOVE. Its actuator is "how many
+    /// `request(h)` to emit", so the only load it induces on itself is the answers it invites.
+    /// History of getting this wrong twice:
+    ///   1. Bulk-inbound drops alone -- blind in the pre-fan-out-cap era, when a x99 request
+    ///      flood pinned the MAIN queue at 1000 while the bulk queue never dropped anything.
+    ///   2. Core inbound-queue depth at 256 -- the mirror error. See
+    ///      `CORE_QUEUE_NEAR_OVERFLOW`: the main queue is dominated by availability crediting
+    ///      (~= n x (2f+1) x block_rate; 128,942 refs/s at n=100), which repair cannot
+    ///      influence, so the loop throttled recovery in response to load that was not its
+    ///      own and would not decrease however far it backed off.
+    ///
+    /// Note (1) and (2) are NOT symmetric mistakes about which queue to read: they are the
+    /// same mistake about ATTRIBUTION. Neither signal isolated repair's own contribution.
+    ///
+    /// So: bulk drops are the primary signal (the fleet, including us, is shedding service
+    /// traffic -- back off regardless of cause), the core queue is a backstop only at ~900
+    /// where consensus traffic is about to be shed, and absorption proper is left to
+    /// `RECOVERY_IN_FLIGHT_MAX`, which is closed-loop: a slot frees only when an answer
+    /// lands or is retired, so it self-limits on the real answer rate instead of guessing.
+    ///
+    /// What is deliberately NOT used: bulk-queue DEPTH. `Inbound::is_bulk` covers only
+    /// inbound service REQUESTS (`HeadersRequest`/`ControlFetch`/`BodyFetch`/`LaneResume`/
+    /// `ResumeHello`) -- serve RESPONSES were moved to the main queue on purpose, so bulk
+    /// depth measures what PEERS ask of us, not what we can absorb. Reading it here would be
+    /// a third misattribution of exactly the same kind.
     fn adapt_recovery_ceiling(&mut self) {
-        let congested = self.core_queue_len >= CORE_QUEUE_CONGESTED;
+        let congested = self.core_queue_len >= CORE_QUEUE_NEAR_OVERFLOW;
         let new_drops = match &self.metrics {
             Some(metrics) => {
                 let now = metrics.vantage_bulk_inbound_dropped_total.get();
@@ -577,8 +627,11 @@ impl Repairer {
         }
     }
 
-    /// Report the core inbound queue depth, so `adapt_recovery_ceiling` can see the queue it
-    /// is meant to protect. Called from the same 1s tick that samples the gauge.
+    /// Report the core inbound queue depth, for `adapt_recovery_ceiling`'s near-overflow
+    /// BACKSTOP (`CORE_QUEUE_NEAR_OVERFLOW`, ~900 of 1000) and for `fan_out`'s escalation
+    /// width cap (`CORE_QUEUE_CONGESTED`, 256). It is NOT the emit ceiling's primary
+    /// congestion signal -- repair's own emission cannot move this queue. Called from the
+    /// same 1s tick that samples the gauge.
     pub fn observe_core_queue(&mut self, len: usize) {
         self.core_queue_len = len;
     }
