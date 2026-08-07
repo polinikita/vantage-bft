@@ -19,8 +19,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 pub struct Repairer {
-    name: PublicKey,
     committee: Committee,
+    /// The other primaries' keys, resolved ONCE at construction. `Committee::
+    /// others_primaries` builds a fresh `Vec<(PublicKey, PrimaryAddresses)>` per call
+    /// (~12.7 KB at n=100, addresses included, none of which the repair fan-out
+    /// wants), and `settle`'s miss branch used to call it on every miss. The committee
+    /// is immutable for a run, so this is the same list, allocated never instead of
+    /// per call.
+    peers: Vec<PublicKey>,
     sid: Digest,
     genesis: Digest,
     max_block_payload: usize,
@@ -69,7 +75,13 @@ impl Repairer {
         blocks: SharedBlocks,
     ) -> Self {
         Self {
-            name,
+            // `name` itself is no longer stored: its only reader was `settle`'s
+            // `others_primaries(&self.name)` call, which `peers` now replaces.
+            peers: committee
+                .others_primaries(&name)
+                .into_iter()
+                .map(|(pk, _)| pk)
+                .collect(),
             committee,
             sid,
             genesis,
@@ -161,6 +173,17 @@ impl Repairer {
         if !self.requested_hashes.contains(&block.id) {
             return Vec::new();
         }
+        // NOTE (2026-08-08): a duplicate serve of an already-cached-and-verified digest
+        // must NOT be short-circuited here, even though its repair work is redundant.
+        // `VantageCore::serve_effects` gates the PAYLOAD re-probe on this function
+        // emitting `Effect::BlockCached` (node.rs:2282-2290), and the payload state can
+        // legitimately have advanced between two serves of the same header -- the
+        // second probe asks only for what is still missing and merges into the existing
+        // pending set. Pinned by `duplicate_accepted_serve_merges_pending_payload_
+        // without_duplicate_waiters`. The duplicate-serve amplification this creates
+        // (~n-1 identical serves per requested digest, each driving a `pending_settle`
+        // sweep) is real and is addressed where it belongs -- by making the sweep
+        // digest-indexed rather than O(pending_settle) -- not by dropping serves.
         if !block_ok(&block, &self.committee, &self.sid, self.max_block_payload) {
             return Vec::new();
         }
@@ -236,6 +259,9 @@ impl Repairer {
     /// identical `Effect`s in identical order, identical return value -- just O(1) stack
     /// depth instead of O(chain length).
     fn settle(&mut self, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_repair_settle_calls_total.inc();
+        }
         let mut cur = r;
         let mut frames: Vec<BlockRef> = Vec::new();
         let verified = loop {
@@ -264,12 +290,38 @@ impl Repairer {
             };
 
             let Some(block) = cached else {
-                self.requested_hashes.insert(h.clone());
-                for (peer, _) in self.committee.others_primaries(&self.name) {
-                    if self.requested.insert((peer, h.clone())) {
-                        effects.push(Effect::RequestTo(peer, h.clone()));
-                        if let Some(metrics) = &self.metrics {
-                            metrics.vantage_repairs_requested.inc();
+                // n=100 straggler fix (2026-08-08): the fan-out loop is GATED on
+                // `requested_hashes` rather than run unconditionally. Equivalence is
+                // exact, not approximate: `requested_hashes` is inserted only here,
+                // `requested` only just below, neither is ever removed from, and
+                // `committee` is immutable -- so `requested_hashes.contains(h)` holds
+                // iff `requested` already contains `(p, h)` for EVERY p in
+                // `others_primaries`, i.e. iff the loop below would emit nothing. Same
+                // effects, same order, same state.
+                //
+                // What it removes: `on_block_available` re-walks all of
+                // `pending_settle` on EVERY block arrival (and again from `on_serve`),
+                // so a node missing k blocks re-ran this loop once per miss per
+                // arrival while emitting nothing at all. Measured on the failing
+                // n=100 run: ~1,920 missing blocks x ~13k arrivals ~= 25M misses x 99
+                // peers ~= 2.5B iterations, each paying a `Digest` clone, a SipHash of
+                // a 64-byte key, a probe into a 190k-entry set, and -- via
+                // `others_primaries` -- a fresh ~12.7 KB `Vec` allocation. That
+                // accounted for ~100s of the 103.85s `effect_execution` (healthy:
+                // 2.99s), which saturated the single core, pinned the 1000-slot
+                // inbound queue, and cut organic block intake to ~10%. The 190,080
+                // messages themselves cost ~0.4s -- the loop, not the traffic, was the
+                // bottleneck.
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_repair_fanout_loops_total.inc();
+                }
+                if self.requested_hashes.insert(h.clone()) {
+                    for peer in &self.peers {
+                        if self.requested.insert((*peer, h.clone())) {
+                            effects.push(Effect::RequestTo(*peer, h.clone()));
+                            if let Some(metrics) = &self.metrics {
+                                metrics.vantage_repairs_requested.inc();
+                            }
                         }
                     }
                 }
@@ -347,6 +399,26 @@ impl Repairer {
     #[cfg(test)]
     pub(crate) fn requested_count(&self) -> usize {
         self.requested.len()
+    }
+
+    /// Current `pending_settle` size -- exported as `vantage_pending_settle_len` by
+    /// `VantageCore::sample_metrics`. See that gauge's doc comment for why this is the
+    /// number to watch: it is the `P` in `on_block_available`'s O(P) per-block sweep,
+    /// and nothing GCs it.
+    pub fn pending_settle_len(&self) -> usize {
+        self.pending_settle.len()
+    }
+
+    /// Test accessors for the two sets whose relationship makes `settle`'s fan-out gate
+    /// sound -- see `requested_hashes_membership_implies_every_peer_was_requested`.
+    #[cfg(test)]
+    pub(crate) fn was_requested_hash(&self, h: &Digest) -> bool {
+        self.requested_hashes.contains(h)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn was_requested(&self, peer: &PublicKey, h: &Digest) -> bool {
+        self.requested.contains(&(*peer, h.clone()))
     }
 
     #[cfg(test)]

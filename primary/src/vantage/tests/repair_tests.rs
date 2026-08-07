@@ -325,3 +325,54 @@ fn repairer_blocks(repairer: &Repairer) -> parking_lot::MutexGuard<'_, BlockCach
     // repairers standalone, so they need a matching accessor.
     repairer.blocks_for_test()
 }
+
+/// n=100 straggler fix (2026-08-08): `settle`'s peer fan-out is gated on
+/// `requested_hashes.insert(h)` rather than run unconditionally. The gate is only sound
+/// because `requested_hashes.contains(h)` implies `requested` already holds `(p, h)`
+/// for EVERY other primary -- if some path ever inserted into `requested_hashes`
+/// without also filling `requested`, the gate would silently suppress real requests and
+/// the block would never be asked for from anyone.
+///
+/// This pins that invariant directly, so such a path cannot be added unnoticed.
+#[tokio::test]
+async fn requested_hashes_membership_implies_every_peer_was_requested() {
+    let name = crate::common::keys()[0].0;
+    let mut repairer = new_standalone_repairer(name);
+    let committee = test_committee();
+    let author = crate::common::keys()[1].0;
+    let header = Header::default();
+    let h = header.id.clone();
+
+    let effects = repairer.authorize((author, 1, h.clone()));
+    let requested = requests_for(&effects);
+
+    // One request per OTHER primary, exactly once each, all for this digest.
+    let peers: Vec<PublicKey> = committee
+        .others_primaries(&name)
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .collect();
+    assert_eq!(requested.len(), peers.len());
+    for peer in &peers {
+        assert!(
+            requested.contains(&(*peer, h.clone())),
+            "peer {peer} was not asked for the missing digest"
+        );
+    }
+    assert!(repairer.was_requested_hash(&h), "the hash gate must be set");
+    for peer in &peers {
+        assert!(
+            repairer.was_requested(peer, &h),
+            "requested_hashes is set but peer {peer} is missing from `requested` -- \
+             settle's gate would now suppress this peer's request forever"
+        );
+    }
+
+    // Re-authorizing the same still-missing ref emits nothing (the gate short-circuits),
+    // which is the property the fix relies on for its ~99x cost reduction.
+    let again = repairer.authorize((author, 1, h.clone()));
+    assert!(
+        requests_for(&again).is_empty(),
+        "a repeat authorize on a still-missing digest must emit no new requests"
+    );
+}

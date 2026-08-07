@@ -385,7 +385,27 @@ pub struct Metrics {
     /// the population `recheck_all`'s budgeted scan rotates over. Near-zero on a
     /// healthy node; growth tracking the node's view gap is the n=100 straggler
     /// death-spiral signature (2026-08-08 investigation) this gauge exists to confirm.
+    /// MEASURED 0 on healthy AND straggling nodes alike, which is what eliminated
+    /// `recheck_all` as the n=100 cause and pointed at `Repairer` instead.
     pub vantage_pending_gate_len: IntGauge,
+    /// `Repairer::pending_settle.len()` -- authorized-but-unsettled refs. This is the
+    /// `P` in `on_block_available`'s O(P) re-sweep-per-cached-block, and it has no GC,
+    /// so a node that cannot obtain a block keeps its refs here forever. The n=100
+    /// analysis inferred P >= 1,920 indirectly (from `repairs_requested / (n-1)`);
+    /// this measures it directly.
+    pub vantage_pending_settle_len: IntGauge,
+    /// Total `Repairer::settle` calls -- the actual work `on_block_available`'s sweep
+    /// generates, which no counter previously exposed. `settle_calls / blocks_received`
+    /// is the sweep amplification: ~1 is healthy, ~P means the sweep is the bottleneck
+    /// (the n=100 straggler estimate was ~91.6 MILLION calls).
+    pub vantage_repair_settle_calls_total: IntCounter,
+    /// Times `settle` entered its missing-block branch, i.e. how often the peer
+    /// fan-out was CONSIDERED. Compare against `vantage_repairs_requested`, which only
+    /// counts requests actually emitted: before the 2026-08-08 gate the ratio was the
+    /// pure-waste multiplier (every miss re-ran an n-1 loop that emitted nothing), and
+    /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
+    /// the gate the two should track each other at ~1/(n-1).
+    pub vantage_repair_fanout_loops_total: IntCounter,
 
     // --- Metrics/dashboard expansion (METRICS-DASHBOARD-SPEC.md §1): wire-layer
     // counters, hooked in the `network` crate itself so every protocol (Autobahn
@@ -954,6 +974,25 @@ impl Metrics {
             vantage_pending_gate_len: register_int_gauge_with_registry!(
                 "vantage_pending_gate_len",
                 "AgbEngine: views active+fixed but not yet echoed (recheck_all's scan population)",
+                registry,
+            )
+            .unwrap(),
+            vantage_pending_settle_len: register_int_gauge_with_registry!(
+                "vantage_pending_settle_len",
+                "Repairer: authorized-but-unsettled refs (on_block_available's sweep population)",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_settle_calls_total: register_int_counter_with_registry!(
+                "vantage_repair_settle_calls_total",
+                "Repairer::settle calls; divide by blocks_received for the sweep amplification",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_fanout_loops_total: register_int_counter_with_registry!(
+                "vantage_repair_fanout_loops_total",
+                "Times settle reached the missing-block branch (fan-out considered, not \
+                 necessarily emitted); compare with vantage_repairs_requested",
                 registry,
             )
             .unwrap(),

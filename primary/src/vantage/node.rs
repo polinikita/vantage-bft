@@ -1733,6 +1733,9 @@ impl VantageCore {
             .vantage_pending_gate_len
             .set(self.agb.pending_gate_len() as i64);
         metrics
+            .vantage_pending_settle_len
+            .set(self.rep.pending_settle_len() as i64);
+        metrics
             .vantage_cursor_next_view
             .set(self.cursor.next_view() as i64);
         metrics
