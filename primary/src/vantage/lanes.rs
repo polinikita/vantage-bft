@@ -103,6 +103,19 @@ impl BlockCache {
         self.by_digest.get(h)
     }
 
+    /// Entries held, exported as `vantage_block_cache_len`. This cache has NO eviction --
+    /// see the type's doc comment, "every block this node has ever obtained" -- so this
+    /// series is monotone and is the primary suspect for the ~2.8 MB/s/node RSS growth that
+    /// `local-dryrun/rss-growth.sh` measures. Read it against that script's MB/s to get
+    /// bytes-per-block, which is the number that decides whether eviction is worth building.
+    pub fn len(&self) -> usize {
+        self.by_digest.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_digest.is_empty()
+    }
+
     pub fn contains(&self, h: &Digest) -> bool {
         self.by_digest.contains_key(h)
     }
@@ -868,6 +881,13 @@ impl LaneManager {
 
     pub fn genesis(&self) -> &Digest {
         &self.genesis
+    }
+
+    /// Shared block-cache size, for `vantage_block_cache_len`. Takes the same lock the
+    /// hot paths do, so it is sampled once per second from `sample_metrics`, never per
+    /// message.
+    pub fn block_cache_len(&self) -> usize {
+        self.blocks.lock().len()
     }
 
     pub fn blocks_handle(&self) -> SharedBlocks {

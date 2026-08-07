@@ -1746,6 +1746,9 @@ impl VantageCore {
         metrics
             .vantage_pending_body_fetch_len
             .set(self.digest_stmts.pending_fetch_len() as i64);
+        metrics
+            .vantage_block_cache_len
+            .set(self.lm.block_cache_len() as i64);
         // Memory fix (2026-08-07): `senders_tracked` must stay near the count of refs
         // still BELOW quorum rather than growing with every block ever seen -- that
         // growth was 13.43 MB/s per node at n=100. `refs_retired` is the residual.

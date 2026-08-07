@@ -417,6 +417,11 @@ pub struct Metrics {
     /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
     /// the gate the two should track each other at ~1/(n-1).
     pub vantage_repair_fanout_loops_total: IntCounter,
+    /// `BlockCache` entries held. The cache has NO eviction ("every block this node has
+    /// ever obtained"), so this is monotone and is the leading suspect for the residual
+    /// ~2.8 MB/s/node RSS growth that `local-dryrun/rss-growth.sh` measures. Divide that
+    /// MB/s by this series' growth to get bytes-per-block.
+    pub vantage_block_cache_len: IntGauge,
     /// `AckAggregator::senders` size: refs whose first-hand ack set is still being
     /// accumulated. Retired at `Quorum`, so this tracks refs still BELOW quorum and must
     /// NOT grow with every block ever seen -- that growth was the dominant memory leak at
@@ -1037,6 +1042,12 @@ impl Metrics {
                 "vantage_repair_fanout_loops_total",
                 "Times settle reached the missing-block branch (fan-out considered, not \
                  necessarily emitted); compare with vantage_repairs_requested",
+                registry,
+            )
+            .unwrap(),
+            vantage_block_cache_len: register_int_gauge_with_registry!(
+                "vantage_block_cache_len",
+                "BlockCache entries held (no eviction exists, so monotone)",
                 registry,
             )
             .unwrap(),

@@ -198,6 +198,12 @@ pub struct VantageProgress {
     pub own_watermark: i64,
     pub entry_target: i64,
     pub omega_q: i64,
+    /// `BlockCache` entries held. Included here because this is the ONLY reliable way to
+    /// read a vantage gauge under `local-benchmark`: its HTTP metrics endpoints serve a
+    /// registry the core never writes to (every gauge reads 0 there, including
+    /// `entered_view`, while this same registry shows thousands of views). The cache has no
+    /// eviction, so watching it here is how a leak gets attributed locally.
+    pub block_cache_len: i64,
 }
 
 /// Reads the six Finding-A progress gauges. These `IntGauge`s are always registered
@@ -225,6 +231,7 @@ pub fn read_vantage_progress(registry: &Registry) -> Option<VantageProgress> {
         own_watermark: gauge("vantage_own_watermark").unwrap_or(0),
         entry_target: gauge("vantage_entry_target").unwrap_or(0),
         omega_q: gauge("vantage_omega_q").unwrap_or(0),
+        block_cache_len: gauge("vantage_block_cache_len").unwrap_or(0),
     })
 }
 
