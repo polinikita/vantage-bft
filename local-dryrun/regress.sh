@@ -23,7 +23,15 @@
 # cursor/seal-route signals to be meaningful, short enough to run on every iteration
 # without thinking about it.
 #
-# Usage:  ./local-dryrun/regress.sh [duration_s] [nodes] [rate]
+# RTT MODE (4th arg, default `wan`). `wan` omits --mimic-latency-ms entirely, which makes
+# `local-benchmark` default to `LatencyTable::aws_rtt(n)` -- the SAME 10-region AWS matrix the
+# AWS mimic runs use, since wanbench passes `mimic_latency_ms: None` in mimic mode and the
+# node expands it identically. So local latency percentiles are directly comparable to a
+# recorded AWS sweep; under `loopback` they are not, and were quietly ~5x lower (75ms p50
+# local against 414-421ms on AWS at the same n and rate). `loopback` remains available as the
+# fast shape-only smoke test, with its own thresholds.
+#
+# Usage:  ./local-dryrun/regress.sh [duration_s] [nodes] [rate] [wan|loopback]
 # Exits non-zero on regression, naming the threshold that failed.
 set -uo pipefail
 
@@ -39,10 +47,23 @@ DELTA_MS=200          # mirrors configs/sweep20-vantage.yaml / sweep100-vantage.
 MAX_BATCH_DELAY_MS=20
 MAX_HEADER_DELAY_MS=50
 
+RTT_MODE="${4:-wan}"
+
 MIN_TPS=$(( RATE * 85 / 100 ))   # 85% of offered
-MAX_P50_MS=250
-MAX_P99_MS=800
 MAX_CURSOR_LAG=50                # healthy is 1-2; 50 is a wide net for a laptop hiccup
+if [ "$RTT_MODE" = "loopback" ]; then
+    LATENCY_FLAG="--mimic-latency-ms 0"   # explicit 0 is the only way to get pure loopback
+    MAX_P50_MS=250
+    MAX_P99_MS=800
+else
+    # No flag at all -> local-benchmark defaults to aws_rtt(n), the same table the AWS mimic
+    # runs use. Thresholds sized from the recorded AWS sweeps (n=10/20/50 all landed at p50
+    # 406-434ms, p99 550-611ms across every rate), with laptop headroom on top -- the mimic
+    # only adds delay, it does not make the box faster.
+    LATENCY_FLAG=""
+    MAX_P50_MS=900
+    MAX_P99_MS=2000
+fi
 
 DATA_DIR="${TMPDIR:-/tmp}/vantage-regress-$$"
 # Outside --data-dir on purpose: local-benchmark clears that directory on boot, which
@@ -58,13 +79,18 @@ fi
 mkdir -p "$DATA_DIR"
 trap 'rm -rf "$DATA_DIR" "$LOG"' EXIT
 
-echo "==> running n=$NODES @ $RATE tx/s for ${DURATION}s (delta=${DELTA_MS}ms, loopback)"
+if [ "$RTT_MODE" = "loopback" ]; then
+    echo "==> running n=$NODES @ $RATE tx/s for ${DURATION}s (delta=${DELTA_MS}ms, loopback)"
+else
+    echo "==> running n=$NODES @ $RATE tx/s for ${DURATION}s (delta=${DELTA_MS}ms, aws_rtt($NODES) WAN mimic -- same table as the AWS runs)"
+fi
+# shellcheck disable=SC2086  # LATENCY_FLAG is intentionally word-split (empty = use aws_rtt)
 RUST_LOG=warn ./target/release/node local-benchmark \
     --nodes "$NODES" --workers 1 --rate "$RATE" --tx-size "$TX_SIZE" \
     --protocol vantage --mode random --duration "$DURATION" \
     --delta-ms "$DELTA_MS" --max-batch-delay-ms "$MAX_BATCH_DELAY_MS" \
     --max-header-delay-ms "$MAX_HEADER_DELAY_MS" --crash 0 \
-    --data-dir "$DATA_DIR" --mimic-latency-ms 0 \
+    --data-dir "$DATA_DIR" $LATENCY_FLAG \
     --batch-max-bytes 65536 --batch-max-delay-ms 5 --timeline > "$LOG" 2>&1
 rc=$?
 if [ $rc -ne 0 ]; then
@@ -104,7 +130,7 @@ PY
 
 echo
 echo "-----------------------------------------"
-printf ' n=%s @ %s tx/s, %ss\n' "$NODES" "$RATE" "$DURATION"
+printf ' n=%s @ %s tx/s, %ss, rtt=%s\n' "$NODES" "$RATE" "$DURATION" "$RTT_MODE"
 printf ' Consensus TPS : %s   (>= %s)\n' "$TPS" "$MIN_TPS"
 printf ' p50/p90/p99   : %s/%s/%s ms   (p50 <= %s, p99 <= %s)\n' \
        "$P50" "$P90" "$P99" "$MAX_P50_MS" "$MAX_P99_MS"
