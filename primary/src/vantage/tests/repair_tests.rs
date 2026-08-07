@@ -431,8 +431,10 @@ async fn an_arrival_wakes_only_the_refs_waiting_on_it() {
     let effects = repairer.on_serve(l1h2.clone());
     let reqs = requests_for(&effects);
     assert_eq!(reqs.len(), n_peers);
-    assert!(reqs.iter().all(|(_, h)| h == &l1h1.id),
-            "lane 2 must not have been touched by lane 1's arrival");
+    assert!(
+        reqs.iter().all(|(_, h)| h == &l1h1.id),
+        "lane 2 must not have been touched by lane 1's arrival"
+    );
 
     // And lane 2 still advances when its own block arrives.
     let effects = repairer.on_serve(l2h2.clone());
@@ -459,18 +461,31 @@ async fn a_reblocked_ref_leaves_its_previous_bucket() {
     let r3 = (author, 3, h3.id.clone());
 
     repairer.authorize(r3.clone());
-    assert_eq!(repairer.blocked_on_len_for_test(&h3.id), 1, "r3 blocks on h3");
+    assert_eq!(
+        repairer.blocked_on_len_for_test(&h3.id),
+        1,
+        "r3 blocks on h3"
+    );
 
     // h3 arrives: r3's walk descends and now blocks on h2 instead.
     repairer.on_serve(h3.clone());
-    assert_eq!(repairer.blocked_on_len_for_test(&h3.id), 0,
-               "the h3 bucket must be emptied, not left holding a stale r3");
-    assert!(repairer.blocked_on_len_for_test(&h2.id) >= 1, "r3 now blocks on h2");
+    assert_eq!(
+        repairer.blocked_on_len_for_test(&h3.id),
+        0,
+        "the h3 bucket must be emptied, not left holding a stale r3"
+    );
+    assert!(
+        repairer.blocked_on_len_for_test(&h2.id) >= 1,
+        "r3 now blocks on h2"
+    );
 
     // The whole chain still settles once the rest arrives -- behaviour unchanged.
     repairer.on_serve(h2.clone());
     repairer.on_serve(h1.clone());
-    assert!(repairer.is_settled(&r3), "the chain must still settle end to end");
+    assert!(
+        repairer.is_settled(&r3),
+        "the chain must still settle end to end"
+    );
     assert_eq!(repairer.blocked_on_len_for_test(&h1.id), 0);
     assert_eq!(repairer.blocked_on_len_for_test(&h2.id), 0);
 }

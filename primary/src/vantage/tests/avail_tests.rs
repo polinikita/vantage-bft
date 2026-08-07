@@ -260,7 +260,10 @@ async fn pending_avail_index_mirrors_the_map_through_stash_and_resolve() {
     lm.process_publish(author, h1.clone()).await;
     lm.process_publish(author, h2.clone()).await;
     let backfilled = lm.retry_pending_avail(&h1.id);
-    assert!(!backfilled.is_empty(), "the retry should have resolved something");
+    assert!(
+        !backfilled.is_empty(),
+        "the retry should have resolved something"
+    );
     check(&lm, "after the resolving retry");
     assert!(
         lm.pending_avail_keys_for_test().is_empty(),

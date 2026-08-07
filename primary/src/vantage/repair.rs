@@ -220,7 +220,10 @@ impl Repairer {
                 }
             }
             self.blocked_at.insert(r.clone(), h.clone());
-            self.blocked_on.entry(h.clone()).or_default().insert(r.clone());
+            self.blocked_on
+                .entry(h.clone())
+                .or_default()
+                .insert(r.clone());
         }
     }
 
@@ -283,7 +286,10 @@ impl Repairer {
     /// already answered -- even when the block is not held yet -- then try-serve.
     pub fn on_request(&mut self, requester: PublicKey, h: Digest) -> Vec<Effect> {
         if !self.answered.contains(&(requester, h.clone())) {
-            self.pending_req.entry(h.clone()).or_default().insert(requester);
+            self.pending_req
+                .entry(h.clone())
+                .or_default()
+                .insert(requester);
         }
         let mut effects = Vec::new();
         self.try_serve(&h, &mut effects);
