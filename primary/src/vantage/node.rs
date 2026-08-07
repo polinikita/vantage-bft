@@ -1167,6 +1167,10 @@ impl VantageCore {
                     // full coverage, and therefore N6's eventual guarantee, is reached
                     // here. Same tick, same rationale as `retry_fetches` above: coarse,
                     // budgeted, no dedicated timer.
+                    // Feed the repair budget the queue it exists to protect. The previous
+                    // signal (bulk-inbound drops) was blind: degraded n=100 nodes sat pinned
+                    // at this queue's 1000-slot cap while drops read exactly 0.
+                    self.rep.observe_core_queue(rx_vantage.len());
                     retry_effects.extend(self.rep.retry_requests());
                     // Dropped so the nested `execute` is not double-counted into this
                     // tick's own label; re-opened for the tail below.

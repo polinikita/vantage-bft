@@ -422,6 +422,12 @@ pub struct Metrics {
     /// congestion should climb to the maximum -- a fixed ceiling was a measured regression
     /// (node 96 deferred 9,224 requests while reporting zero drops).
     pub vantage_repair_emit_ceiling: IntGauge,
+    /// Repair requests outstanding (emitted, digest not yet in hand). Capped by
+    /// `RECOVERY_IN_FLIGHT_MAX`. This is what bounds INBOUND: an answer only arrives for
+    /// something we asked for. A rate limit alone does not -- the 2026-08-07 run had 3,420
+    /// digests asked of ~49 peers each, ~167k invited answers, which pinned
+    /// `core_queue_length` at its 1000-slot cap while `bulk_inbound_dropped` stayed 0.
+    pub vantage_repair_in_flight: IntGauge,
     /// Cached blocks evicted because every peer confirmed holding them. Zero means eviction
     /// is not acting -- check `vantage_block_cache_evict_blocked` before concluding the cache
     /// is simply small.
@@ -1066,6 +1072,12 @@ impl Metrics {
             vantage_repair_emit_ceiling: register_int_gauge_with_registry!(
                 "vantage_repair_emit_ceiling",
                 "Adaptive per-tick ceiling on repair-request emission (AIMD on bulk drops)",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_in_flight: register_int_gauge_with_registry!(
+                "vantage_repair_in_flight",
+                "Repair requests outstanding (the window that bounds inbound answers)",
                 registry,
             )
             .unwrap(),

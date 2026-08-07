@@ -987,3 +987,91 @@ async fn recovery_ceiling_grows_when_clean_and_backs_off_on_drops() {
         "must floor, never starve to zero"
     );
 }
+
+/// The IN-FLIGHT window bounds inbound, which a rate limit alone does not.
+///
+/// Measured on the 2026-08-07 n=100 run: 3,420 outstanding digests asked of ~49 peers each
+/// = ~167,000 invited answers, each costing a block_ok verify, a cache insert and a settle
+/// walk on the single-threaded core. That pinned `core_queue_length` at its 1000-slot cap
+/// while `bulk_inbound_dropped` read 0 -- the flood was on the MAIN queue, and self-invited.
+/// An answer can only arrive for something we asked for, so capping outstanding asks caps
+/// arrivals.
+///
+/// Also pins the release path: every request counted into the window must be released when
+/// its digest arrives, or the window latches shut and the node stops asking forever.
+#[tokio::test]
+async fn in_flight_window_caps_outstanding_requests_and_is_released_on_arrival() {
+    use crate::vantage::repair::RECOVERY_IN_FLIGHT_MAX;
+    let (committee, keys) = Committee::local_benchmark(10, 1, 34_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let sid = session_id(&committee);
+    let genesis = genesis_digest(&sid);
+    let mut rep = wide_repairer(watcher, &committee);
+
+    // Ask for many distinct digests; emission must stop at the window.
+    let mut total = 0usize;
+    for k in 1..=400u64 {
+        total += requests_for(&rep.authorize((author, k, Digest([(k % 251) as u8; 32])))).len();
+    }
+    assert!(
+        total <= RECOVERY_IN_FLIGHT_MAX,
+        "emitted {total} requests, window is {RECOVERY_IN_FLIGHT_MAX}"
+    );
+
+    // A real arrival must return slots to the window, or recovery deadlocks. Fresh repairer:
+    // the loop above deliberately saturated the window, so a request made now would emit
+    // nothing and there would be nothing to release -- which would make this pass vacuously.
+    let mut rep2 = wide_repairer(watcher, &committee);
+    let h1 = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
+    rep2.authorize((author, 1, h1.id.clone()));
+    let before = rep2.in_flight_for_test();
+    assert_eq!(
+        before, FANOUT_FIRST,
+        "the first round must occupy the window"
+    );
+    rep2.on_serve(h1.clone());
+    assert_eq!(
+        rep2.in_flight_for_test(),
+        0,
+        "arrival must release every slot the digest held, or the window latches shut"
+    );
+}
+
+/// Under congestion, one digest must not be escalated to the whole committee. Widening to
+/// ~49 peers (the measured value) invites 49 copies of the same block into the queue that is
+/// already the bottleneck.
+#[tokio::test]
+async fn escalation_width_is_capped_while_the_core_queue_is_congested() {
+    use crate::vantage::repair::{CORE_QUEUE_CONGESTED, ESCALATE_WIDTH_MAX};
+    let (committee, keys) = Committee::local_benchmark(20, 1, 35_000);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let n_peers = committee.others_primaries(&watcher).len();
+    assert!(n_peers > ESCALATE_WIDTH_MAX, "fixture must exceed the cap");
+    let mut rep = wide_repairer(watcher, &committee);
+    let h = Digest([5u8; 32]);
+
+    rep.observe_core_queue(CORE_QUEUE_CONGESTED);
+    let mut asked = requests_for(&rep.authorize((author, 5u64, h.clone())));
+    for _ in 0..10 {
+        asked.extend(requests_for(&rep.retry_requests()));
+    }
+    let distinct: std::collections::HashSet<_> = asked.iter().map(|(p, _)| *p).collect();
+    assert!(
+        distinct.len() <= ESCALATE_WIDTH_MAX,
+        "congested: asked {} peers, cap is {ESCALATE_WIDTH_MAX}",
+        distinct.len()
+    );
+
+    // Once the queue drains, coverage must resume widening -- the cap delays N6's eventual
+    // coverage, it must not abandon it.
+    rep.observe_core_queue(0);
+    for _ in 0..10 {
+        asked.extend(requests_for(&rep.retry_requests()));
+    }
+    let distinct: std::collections::HashSet<_> = asked.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        distinct.len(),
+        n_peers,
+        "coverage must resume to every peer once uncongested"
+    );
+}

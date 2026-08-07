@@ -51,6 +51,29 @@ pub(crate) const RECOVERY_EMIT_MIN: usize = 256;
 /// emitted before the fan-out was bounded, so this is a bound, not a licence.
 pub(crate) const RECOVERY_EMIT_MAX: usize = 65_536;
 
+/// Core inbound-queue depth above which the node counts as congested. The queue is 1000
+/// slots; measured on the 2026-08-07 n=100 run, degraded nodes sat pinned at exactly 1000
+/// while healthy nodes sat at 9-17, so anything near the cap is unambiguous.
+pub(crate) const CORE_QUEUE_CONGESTED: usize = 256;
+
+/// Maximum requests outstanding (emitted, digest not yet in hand) at any moment.
+///
+/// A RATE limit alone does not bound inbound: the 2026-08-07 run had 3,420 outstanding
+/// digests asked of ~49 peers each = ~167,000 invited answers, every one of which costs a
+/// `block_ok` verify, a cache insert and a settle walk on the single-threaded core. That is
+/// what pinned `core_queue_length` at its 1000-slot cap while `bulk_inbound_dropped` stayed
+/// at 0 -- the flood was on the main queue, and it was self-invited. This is the window that
+/// bounds it, in the same sense as a TCP congestion window: answers cannot exceed what was
+/// asked for, so capping outstanding asks caps inbound.
+pub(crate) const RECOVERY_IN_FLIGHT_MAX: usize = 512;
+
+/// Peers a single digest may be asked of before escalation stops widening. Escalating to
+/// near-full coverage (the measured ~49) invites 49 copies of one block; if the first
+/// `ESCALATE_WIDTH_MAX` peers -- chosen holder-first -- did not answer, the bottleneck is
+/// almost certainly local intake, and asking more peers makes it worse. N6's eventual
+/// guarantee is preserved because the cap lifts as soon as the node is no longer congested.
+pub(crate) const ESCALATE_WIDTH_MAX: usize = 8;
+
 /// Per-digest fan-out progress. See `fan_out` for why coverage is staged.
 struct FanoutState {
     /// The missing block's coordinate, kept so each round can re-consult `holders` for
@@ -172,6 +195,14 @@ pub struct Repairer {
     /// to the DELTA. The absolute counter is useless here -- it never decreases, so a node
     /// that dropped messages once would be throttled for the rest of the run.
     last_bulk_drops: u64,
+    /// Core inbound-queue depth as of the last tick, supplied by the caller. This -- not
+    /// bulk drops -- is the load-bearing congestion signal: on the 2026-08-07 run degraded
+    /// nodes were pinned at the 1000-slot cap while `bulk_inbound_dropped` read 0, so an
+    /// AIMD driven by drops alone would have doubled its ceiling while the node drowned.
+    core_queue_len: usize,
+    /// Requests emitted whose digest has not yet arrived. Bounded by
+    /// `RECOVERY_IN_FLIGHT_MAX`; see that constant for why a rate limit alone is not enough.
+    in_flight: usize,
     /// N7: `(requester, h)` recorded on a direct `request(h)`, even before we hold `h`.
     /// n=100 straggler fix (2026-08-08): indexed BY DIGEST rather than a flat
     /// `HashSet<(PublicKey, Digest)>`. `try_serve` ran a linear scan of the whole set on
@@ -223,6 +254,8 @@ impl Repairer {
             emit_budget: RECOVERY_EMIT_START,
             emit_ceiling: RECOVERY_EMIT_START,
             last_bulk_drops: 0,
+            core_queue_len: 0,
+            in_flight: 0,
             pending_req: HashMap::new(),
             answered: HashSet::new(),
             metrics: None,
@@ -300,7 +333,14 @@ impl Repairer {
         // matching `fanout_queue` entry is left to be skipped-and-dropped by
         // `retry_requests` rather than searched for here -- this runs once per cached
         // block, and one hash removal is the whole budget it deserves.
-        self.fanout.remove(&digest);
+        //
+        // Releasing `in_flight` here is what keeps the window from latching shut: every
+        // request counted into it is released either by the digest arriving (here) or by the
+        // digest being retired in `retry_requests`. Miss either path and the node stops
+        // asking for anything, forever.
+        if let Some(state) = self.fanout.remove(&digest) {
+            self.in_flight = self.in_flight.saturating_sub(state.asked);
+        }
         let Some(waiting) = self.blocked_on.remove(&digest) else {
             return effects;
         };
@@ -384,7 +424,19 @@ impl Repairer {
             if entry.asked >= n {
                 return;
             }
-            let take = entry.next_width.min(n - entry.asked);
+            // Cap how wide one digest's coverage may get. Escalating to near-full coverage
+            // (~49 peers measured) invites 49 copies of one block into a queue that is
+            // already the bottleneck. The cap lifts once the node is uncongested, so N6's
+            // eventual coverage is delayed, never abandoned.
+            let width_cap = if self.core_queue_len >= CORE_QUEUE_CONGESTED {
+                ESCALATE_WIDTH_MAX.min(n)
+            } else {
+                n
+            };
+            if entry.asked >= width_cap {
+                return;
+            }
+            let take = entry.next_width.min(width_cap - entry.asked);
             entry.next_width = entry.next_width.saturating_mul(2);
             (entry.author, entry.height, entry.start, entry.asked, take)
         };
@@ -411,17 +463,21 @@ impl Repairer {
             scanned += 1;
         }
 
-        // Truncate to what the tick's recovery budget still allows. Done here, before any
-        // `requested`/`requested_hashes` write, for the reason those fields' comments give.
-        targets.truncate(self.emit_budget);
+        // Truncate to what the tick's recovery budget AND the in-flight window still allow.
+        // Done here, before any `requested`/`requested_hashes` write, for the reason those
+        // fields' comments give. The window is what actually bounds INBOUND: an answer can
+        // only arrive for something we asked for, so capping outstanding asks caps arrivals.
+        let room = RECOVERY_IN_FLIGHT_MAX.saturating_sub(self.in_flight);
+        targets.truncate(self.emit_budget.min(room));
         let emitted = targets.len();
-        if emitted == 0 && self.emit_budget == 0 {
+        if emitted == 0 && (self.emit_budget == 0 || room == 0) {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_repair_budget_deferred_total.inc();
             }
             return; // try again next tick; state and queue entry are intact
         }
         self.emit_budget -= emitted;
+        self.in_flight += emitted;
         for peer in targets {
             if self.requested.insert((peer, h.clone())) {
                 // Only now is the digest genuinely "requested", which is what `on_serve`'s
@@ -491,21 +547,40 @@ impl Repairer {
     ///
     /// The DELTA matters, not the absolute counter: drops never decrease, so reacting to the
     /// total would throttle a node forever after one bad moment.
+    /// CONGESTION SIGNAL (corrected 2026-08-07, second iteration): the core inbound queue
+    /// depth, NOT bulk-inbound drops. The first version of this used drops alone, and the
+    /// n=100 measurement showed why that is blind: degraded nodes sat pinned at
+    /// `core_queue_length` 1000 -- its cap -- while `bulk_inbound_dropped` read exactly 0,
+    /// because the flood was on the MAIN queue. An AIMD on drops would have doubled its
+    /// ceiling all the way to the maximum while the node was already drowning.
     fn adapt_recovery_ceiling(&mut self) {
-        let Some(metrics) = &self.metrics else {
-            return; // tests without a metrics handle keep the starting ceiling
+        let congested = self.core_queue_len >= CORE_QUEUE_CONGESTED;
+        let new_drops = match &self.metrics {
+            Some(metrics) => {
+                let now = metrics.vantage_bulk_inbound_dropped_total.get();
+                let d = now.saturating_sub(self.last_bulk_drops);
+                self.last_bulk_drops = now;
+                d
+            }
+            None => 0,
         };
-        let now = metrics.vantage_bulk_inbound_dropped_total.get();
-        let new_drops = now.saturating_sub(self.last_bulk_drops);
-        self.last_bulk_drops = now;
-        self.emit_ceiling = if new_drops > 0 {
+        self.emit_ceiling = if congested || new_drops > 0 {
             (self.emit_ceiling / 2).max(RECOVERY_EMIT_MIN)
         } else {
             self.emit_ceiling.saturating_mul(2).min(RECOVERY_EMIT_MAX)
         };
-        metrics
-            .vantage_repair_emit_ceiling
-            .set(self.emit_ceiling as i64);
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .vantage_repair_emit_ceiling
+                .set(self.emit_ceiling as i64);
+            metrics.vantage_repair_in_flight.set(self.in_flight as i64);
+        }
+    }
+
+    /// Report the core inbound queue depth, so `adapt_recovery_ceiling` can see the queue it
+    /// is meant to protect. Called from the same 1s tick that samples the gauge.
+    pub fn observe_core_queue(&mut self, len: usize) {
+        self.core_queue_len = len;
     }
 
     /// Record that `peer` has confirmed holding `author`'s lane up to `height`. Monotone:
@@ -603,27 +678,42 @@ impl Repairer {
                 continue;
             }
             // Nothing waits on it any more (whatever did has settled, or was dropped), so
-            // stop spending requests on it.
+            // stop spending requests on it. Release its window slots -- every request counted
+            // into `in_flight` must be released on exactly one of the two retirement paths,
+            // or the window latches shut and the node stops asking for anything forever.
             if !self.blocked_on.contains_key(h) {
-                self.fanout.remove(h);
+                if let Some(state) = self.fanout.remove(h) {
+                    self.in_flight = self.in_flight.saturating_sub(state.asked);
+                }
                 continue;
             }
+            let before = effects.len();
             self.fan_out(&key.1.clone(), &mut effects);
-            if let Some(metrics) = &self.metrics {
-                metrics.vantage_repair_fanout_escalations_total.inc();
+            if effects.len() > before {
+                // Only count a round that actually went out. Under the congestion width cap
+                // a queued digest is visited every tick and emits nothing, which would
+                // otherwise inflate this counter into meaninglessness.
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_repair_fanout_escalations_total.inc();
+                }
             }
             if self
                 .fanout
                 .get(&key.1)
                 .is_some_and(|s| s.asked < self.peers.len())
             {
+                // Still short of full coverage -- requeue. Note this includes a digest parked
+                // at the congestion width cap: it stays queued, emitting nothing, and resumes
+                // widening once the queue drains.
                 self.fanout_queue.insert(key);
             } else {
                 // Fully covered: N6's fan-out obligation for `h` is discharged, so the
                 // per-digest state is dead weight from here on. Dropping it is safe --
                 // `requested_hashes` (never pruned) is what gates `on_serve`, and
                 // `requested` (never pruned) is what prevents a re-ask.
-                self.fanout.remove(&key.1);
+                if let Some(state) = self.fanout.remove(&key.1) {
+                    self.in_flight = self.in_flight.saturating_sub(state.asked);
+                }
             }
         }
         if let Some(metrics) = &self.metrics {
@@ -939,6 +1029,12 @@ impl Repairer {
     #[cfg(test)]
     pub(crate) fn fanout_asked_for_test(&self, h: &Digest) -> Option<usize> {
         self.fanout.get(h).map(|s| s.asked)
+    }
+
+    /// Outstanding-request count, for the window test.
+    #[cfg(test)]
+    pub(crate) fn in_flight_for_test(&self) -> usize {
+        self.in_flight
     }
 
     /// Whether `h` is still queued for a further fan-out round.
