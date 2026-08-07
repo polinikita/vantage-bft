@@ -142,11 +142,37 @@ pub struct ResumeTrigger {
     /// then, every check for the SAME still-open request is suppressed unless
     /// `backoff` has elapsed since `sent_at`.
     in_flight: HashMap<PublicKey, (Height, Instant)>,
+    /// GLOBAL cap on simultaneously-`established` episodes; 0 = unlimited (the
+    /// behaviour before this field existed).
+    ///
+    /// The `in_flight` cap above is PER AUTHOR -- one outstanding request each -- which
+    /// at n=100 permits 99 episodes streaming at receipt pace at once. That is exactly
+    /// what ignited vantage's n=100 collapse on 2026-08-07: lane resume re-served
+    /// 122,736 blocks per node (zero at n=50), and executing that recovery traffic put
+    /// the single-threaded core at 87.2% of one core in `effect_execution` (1.3% at
+    /// n=50) with its inbound queue pinned at capacity. Organic delivery then fell to
+    /// ~5% of published blocks, producing more gaps, which opened more episodes.
+    ///
+    /// Capping how many episodes may be established at once bounds that feedback: the
+    /// rest stay `pending` and are promoted as earlier episodes close, so recovery still
+    /// completes -- just serially enough that the core keeps up with consensus. Authors
+    /// already established are never demoted, so no episode is starved mid-stream.
+    max_concurrent: usize,
 }
 
 impl ResumeTrigger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `new` with the global concurrent-episode cap set (`Parameters::
+    /// resume_max_concurrent`); 0 keeps the pre-cap unlimited behaviour. See
+    /// `max_concurrent`'s own doc comment for the n=100 collapse this bounds.
+    pub fn with_max_concurrent(max_concurrent: usize) -> Self {
+        Self {
+            max_concurrent,
+            ..Self::default()
+        }
     }
 
     /// One check's worth of the design doc's step-2/step-3 logic, for a single
@@ -187,6 +213,16 @@ impl ResumeTrigger {
         }
         if !self.established.contains(&author) {
             if self.pending.get(&author) == Some(&from) {
+                // GLOBAL concurrency cap (see `max_concurrent`): this author has earned
+                // persistence, but if enough episodes are already streaming we leave it
+                // `pending` at the CURRENT `from` and promote it on a later tick, once an
+                // earlier episode closes. Keeping the pending entry (rather than
+                // clearing it) means it is promoted immediately when a slot frees,
+                // without re-earning the two-consecutive-ticks bar.
+                if self.max_concurrent != 0 && self.established.len() >= self.max_concurrent {
+                    self.pending.insert(author, from);
+                    return None;
+                }
                 self.established.insert(author);
                 // Falls through to the in-flight-cap-gated fire below -- the tick
                 // that crosses the persistence bar also sends the first request;
@@ -570,6 +606,65 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(trigger.check(author, 10, 10, now, backoff, 1), None);
             assert_eq!(trigger.check(author, 10, 9, now, backoff, 1), None);
+        }
+    }
+
+    /// GLOBAL concurrency cap (`max_concurrent`): with a cap of 2, only two authors may
+    /// have an episode established at once; the third stays deferred until one closes.
+    ///
+    /// This is what bounds the n=100 collapse of 2026-08-07 -- the pre-existing
+    /// in-flight cap is PER AUTHOR, so 99 authors could stream simultaneously, and the
+    /// resulting 122,736 blocks re-served per node saturated the single-threaded core.
+    #[test]
+    fn global_cap_defers_extra_episodes_until_a_slot_frees() {
+        let mut trigger = ResumeTrigger::with_max_concurrent(2);
+        let (a, b, c) = (key(1), key(2), key(3));
+        let t0 = Instant::now();
+        let backoff = Duration::from_millis(4_000);
+        let tick = Duration::from_millis(1_000);
+
+        // Each author needs two consecutive observations of the same gap to establish.
+        for author in [a, b, c] {
+            assert_eq!(trigger.check(author, 10, 12, t0, backoff, 1), None);
+        }
+        // Second observation: the first two establish and fire; the third is capped.
+        assert_eq!(trigger.check(a, 10, 12, t0 + tick, backoff, 1), Some(11));
+        assert_eq!(trigger.check(b, 10, 12, t0 + tick, backoff, 1), Some(11));
+        assert_eq!(
+            trigger.check(c, 10, 12, t0 + tick, backoff, 1),
+            None,
+            "third episode must be deferred by the global cap, not established"
+        );
+
+        // `a`'s gap closes (avail < frontier+1), freeing a slot.
+        assert_eq!(trigger.check(a, 12, 12, t0 + 2 * tick, backoff, 1), None);
+        // `c` is promoted on its very next check -- its pending entry was preserved, so
+        // it does NOT have to re-earn the two-consecutive-ticks bar.
+        assert_eq!(
+            trigger.check(c, 10, 12, t0 + 2 * tick, backoff, 1),
+            Some(11),
+            "a freed slot must promote the deferred episode immediately"
+        );
+    }
+
+    /// A zero cap means unlimited -- the behaviour before `max_concurrent` existed, so
+    /// every pre-existing parameter file and `ResumeTrigger::new()` caller is unchanged.
+    #[test]
+    fn zero_cap_is_unlimited() {
+        let mut trigger = ResumeTrigger::with_max_concurrent(0);
+        let t0 = Instant::now();
+        let backoff = Duration::from_millis(4_000);
+        let tick = Duration::from_millis(1_000);
+        let authors: Vec<_> = (1..=20).map(key).collect();
+        for author in &authors {
+            assert_eq!(trigger.check(*author, 10, 12, t0, backoff, 1), None);
+        }
+        for author in &authors {
+            assert_eq!(
+                trigger.check(*author, 10, 12, t0 + tick, backoff, 1),
+                Some(11),
+                "no cap must let every established episode fire"
+            );
         }
     }
 

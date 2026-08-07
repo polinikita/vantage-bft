@@ -71,7 +71,9 @@ impl Collector for ActiveWindowCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
-        let from = self.active_from_millis.load(std::sync::atomic::Ordering::Relaxed);
+        let from = self
+            .active_from_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -226,6 +228,13 @@ pub struct Metrics {
     /// exclusive per node/run, so there is no ambiguity in practice about which
     /// assembly a nonzero reading came from.
     pub vantage_rejected_nonmember_total: IntCounter,
+    /// Bulk recovery messages dropped because the bulk inbound queue was full
+    /// (`vantage::node::VantageReceiverHandler::tx_bulk`). Every message counted here
+    /// is re-requestable -- served payload or a fetch/resume request -- so a nonzero
+    /// reading means the core is behind on recovery traffic, NOT that consensus data
+    /// was lost. Sustained growth is the signal that resume serving needs throttling;
+    /// zero is the healthy steady state.
+    pub vantage_bulk_inbound_dropped_total: IntCounter,
     /// Optional ack-watermark front-end (`Parameters::ack_watermarks`): periodic
     /// per-lane availability broadcasts this node sent (one per period with a
     /// nonempty flush -- see `vantage::lanes::LaneManager::take_avail_flush` --, not
@@ -763,6 +772,12 @@ impl Metrics {
             vantage_rejected_nonmember_total: register_int_counter_with_registry!(
                 "vantage_rejected_nonmember_total",
                 "Inbound vantage wire messages dropped for a non-committee-member declared sender",
+                registry,
+            )
+            .unwrap(),
+            vantage_bulk_inbound_dropped_total: register_int_counter_with_registry!(
+                "vantage_bulk_inbound_dropped_total",
+                "Bulk recovery messages dropped because the bulk inbound queue was full",
                 registry,
             )
             .unwrap(),

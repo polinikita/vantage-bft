@@ -55,6 +55,14 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 /// (e.g. an equivocating leader's two different proposals each going to a disjoint
 /// subset) -- every constituent field type is already `Clone`, so this is a free,
 /// behavior-neutral derive (production code never clones an `Inbound`).
+/// Capacity of the bulk recovery queue (`VantageReceiverHandler::tx_bulk`).
+///
+/// Deliberately a fraction of `CHANNEL_CAPACITY` (1000): this queue exists to BOUND how
+/// much re-served payload can be in flight toward the single-threaded core at once, so
+/// sizing it generously would recreate the shared-budget problem it removes. Overflow
+/// drops, which is sound -- every message routed here is re-requestable.
+const BULK_CHANNEL_CAPACITY: usize = 128;
+
 #[derive(Debug, Clone)]
 pub enum Inbound {
     /// `Header(h, false)`: publish path. Provenance is claimed-by-author (D4 ruling,
@@ -141,12 +149,59 @@ pub enum Inbound {
     ReplayDone(View, bool, bool, PublicKey),
 }
 
+impl Inbound {
+    /// Is this BULK RECOVERY traffic rather than consensus-critical traffic?
+    ///
+    /// Bulk = anything whose loss is recoverable by the requester simply asking again:
+    /// served payload (`Serve`/`BodyServe`/`ControlServe`), the requests that ask for
+    /// it (`HeadersRequest`/`BodyFetch`/`ControlFetch`/`LaneResume`), and the
+    /// reconnect-replay control exchange (`ResumeHello`/`ReplayDone`).
+    ///
+    /// Everything else is consensus-critical -- AGB echo/ready/wish/propose/skip,
+    /// comp-reports, the whole control log, and lane availability/acks -- and a dropped
+    /// one either stalls a view or is only recovered by a much more expensive path.
+    ///
+    /// `Publish` is deliberately NOT bulk: it is the ORGANIC car-delivery path, i.e.
+    /// exactly the traffic whose starvation collapsed the n=100 run. Demoting it would
+    /// have made that worse, not better.
+    fn is_bulk(&self) -> bool {
+        matches!(
+            self,
+            Inbound::Serve(_)
+                | Inbound::HeadersRequest(_, _)
+                | Inbound::ControlFetch(_, _, _)
+                | Inbound::ControlServe(_, _)
+                | Inbound::BodyFetch(_, _, _)
+                | Inbound::BodyServe(_, _)
+                | Inbound::LaneResume(_, _, _)
+                | Inbound::ResumeHello(_, _)
+                | Inbound::ReplayDone(_, _, _, _)
+        )
+    }
+}
+
 /// Network receiver handler for the Vantage assembly's `primary_to_primary` port.
 /// Deliberately a distinct type from Autobahn's `PrimaryReceiverHandler` (which stays
 /// byte-identical, untouched) -- the two assemblies never share a handler.
 #[derive(Clone)]
 pub struct VantageReceiverHandler {
     pub tx: Sender<Inbound>,
+    /// Second, SEPARATE inbound queue for bulk recovery traffic (`Inbound::is_bulk`).
+    ///
+    /// Vantage's n=100 collapse of 2026-08-07: lane resume ignited on ~every lane
+    /// (122,736 blocks re-served per node; ZERO at n=50) and the served payload shared
+    /// this one 1000-slot channel with AGB echoes, acks and control messages. The queue
+    /// pinned at capacity on 100/100 nodes, `tx.send().await` below then blocked the
+    /// network receiver task -- which stops it reading frames at all -- and organic
+    /// block delivery fell to ~5% of published. More holes produced more resume, which
+    /// is what made the collapse self-sustaining.
+    ///
+    /// Splitting the queues means recovery traffic can never consume the budget
+    /// consensus messages need: a resume backlog now fills only its own (smaller)
+    /// channel, and bulk enqueues are `try_send` -- dropped rather than allowed to
+    /// stall the reader, which is sound because every message routed here is
+    /// re-requestable by construction (a resume/serve/fetch response).
+    pub tx_bulk: Sender<Inbound>,
     pub ack_aggregator: SharedAckAggregator,
     /// METRICS-DASHBOARD-SPEC.md §1: `None` only in tests that construct this handler
     /// directly without wiring metrics (matches `VantageCore`'s own optional-handle
@@ -252,6 +307,19 @@ impl MessageHandler for VantageReceiverHandler {
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
         };
+        // Bulk recovery traffic goes to its own queue, non-blocking: a full bulk
+        // channel drops the message rather than stalling this receiver task, and the
+        // requester re-asks on its next resume tick. Consensus traffic keeps the
+        // original awaiting send on its own channel, so nothing about its delivery
+        // guarantees changes -- it simply no longer queues behind re-served payload.
+        if inbound.is_bulk() {
+            if self.tx_bulk.try_send(inbound).is_err() {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_bulk_inbound_dropped_total.inc();
+                }
+            }
+            return Ok(());
+        }
         self.tx
             .send(inbound)
             .await
@@ -465,7 +533,10 @@ pub struct VantageCore {
 type BuildOutput = (
     VantageCore,
     Receiver<Inbound>,
+    // Bulk recovery queue -- see `VantageReceiverHandler::tx_bulk`.
+    Receiver<Inbound>,
     Receiver<(Digest, Digest, WorkerId)>,
+    Sender<Inbound>,
     Sender<Inbound>,
     SharedAckAggregator,
     Receiver<SocketAddr>,
@@ -482,11 +553,25 @@ impl VantageCore {
         metrics: Option<Arc<Metrics>>,
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
-    ) -> (Sender<Inbound>, SharedAckAggregator) {
-        let (core, rx_vantage, rx_payload_ready, tx_vantage, ack_aggregator, reconnect_rx) =
-            Self::build(name, committee, parameters, store, metrics, tx_output);
-        tokio::spawn(core.run(rx_vantage, rx_our_digests, rx_payload_ready, reconnect_rx));
-        (tx_vantage, ack_aggregator)
+    ) -> (Sender<Inbound>, Sender<Inbound>, SharedAckAggregator) {
+        let (
+            core,
+            rx_vantage,
+            rx_bulk,
+            rx_payload_ready,
+            tx_vantage,
+            tx_bulk,
+            ack_aggregator,
+            reconnect_rx,
+        ) = Self::build(name, committee, parameters, store, metrics, tx_output);
+        tokio::spawn(core.run(
+            rx_vantage,
+            rx_bulk,
+            rx_our_digests,
+            rx_payload_ready,
+            reconnect_rx,
+        ));
+        (tx_vantage, tx_bulk, ack_aggregator)
     }
 
     /// Everything `spawn` used to do up through constructing `core`, split out purely
@@ -503,6 +588,11 @@ impl VantageCore {
         tx_output: Sender<Header>,
     ) -> BuildOutput {
         let (tx_vantage, rx_vantage) = channel(CHANNEL_CAPACITY);
+        // Bulk recovery queue, deliberately SMALLER than the consensus queue: its whole
+        // purpose is to bound how much re-served payload can be in flight toward the
+        // core at once. Oversizing it would just recreate the shared-budget problem it
+        // exists to remove (see `VantageReceiverHandler::tx_bulk`).
+        let (tx_bulk, rx_bulk) = channel(BULK_CHANNEL_CAPACITY);
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
 
         // SECURITY (Fable audit): captured before `committee` is consumed below building
@@ -719,7 +809,7 @@ impl VantageCore {
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
             digest_statements: parameters.digest_statements,
-            resume_trigger: ResumeTrigger::new(),
+            resume_trigger: ResumeTrigger::with_max_concurrent(parameters.resume_max_concurrent),
             resume_serve: ResumeServe::new(),
             resume_check_period_ms: parameters.resume_check_period_ms,
             resume_backoff_ms: parameters.resume_backoff_ms,
@@ -763,8 +853,10 @@ impl VantageCore {
         (
             core,
             rx_vantage,
+            rx_bulk,
             rx_payload_ready,
             tx_vantage,
+            tx_bulk,
             ack_aggregator,
             reconnect_rx,
         )
@@ -773,6 +865,7 @@ impl VantageCore {
     async fn run(
         mut self,
         mut rx_vantage: Receiver<Inbound>,
+        mut rx_bulk: Receiver<Inbound>,
         mut rx_our_digests: Receiver<(Digest, WorkerId)>,
         mut rx_payload_ready: Receiver<(Digest, Digest, WorkerId)>,
         mut reconnect_rx: Receiver<SocketAddr>,
@@ -867,6 +960,19 @@ impl VantageCore {
             // work needed to turn a restored connection back into commits.
             tokio::select! {
                 Some(inbound) = rx_vantage.recv() => {
+                    let now = Instant::now();
+                    let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
+                    let effects = self.dispatch_inbound(inbound, now).await;
+                    drop(dispatch_timer);
+                    self.execute(effects, now).await;
+                }
+
+                // Bulk recovery traffic, on its own queue so it cannot consume the
+                // budget consensus messages need (see `VantageReceiverHandler::tx_bulk`
+                // for the n=100 collapse this addresses). `select!` is unbiased, so a
+                // saturated bulk queue now costs consensus roughly half the core's
+                // attention instead of ~95% of it.
+                Some(inbound) = rx_bulk.recv() => {
                     let now = Instant::now();
                     let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
                     let effects = self.dispatch_inbound(inbound, now).await;
@@ -2542,6 +2648,49 @@ impl VantageCore {
 
 #[cfg(test)]
 mod tests {
+    /// The bulk/consensus split (`Inbound::is_bulk`) decides which inbound queue a
+    /// message lands on, and getting it wrong is not symmetric: demoting a
+    /// consensus-critical message to the droppable bulk queue can stall a view, while
+    /// promoting bulk traffic recreates the shared-budget problem that collapsed n=100
+    /// on 2026-08-07 (resume payload starving AGB echoes/acks out of one 1000-slot
+    /// channel). Pin both directions.
+    #[test]
+    fn bulk_classification_covers_recovery_traffic_only() {
+        use crypto::PublicKey;
+        let k = PublicKey::default();
+        let d = Digest::default();
+
+        // Recovery traffic: re-requestable, so droppable.
+        for inbound in [
+            Inbound::Serve(Header::default()),
+            Inbound::HeadersRequest(vec![d.clone()], k),
+            Inbound::ControlFetch(1, d.clone(), k),
+            Inbound::BodyFetch(1, d.clone(), k),
+            Inbound::LaneResume(k, 1, k),
+            Inbound::ResumeHello(1, k),
+            Inbound::ReplayDone(1, true, false, k),
+        ] {
+            assert!(inbound.is_bulk(), "must be bulk: {inbound:?}");
+        }
+
+        // Consensus-critical: never demoted. `Publish` is included deliberately -- it is
+        // the ORGANIC car-delivery path, i.e. exactly the traffic whose starvation
+        // collapsed the n=100 run, so demoting it would have made things worse.
+        for inbound in [
+            Inbound::Publish(k, Header::default()),
+            Inbound::EchoSkip(1, k, 1),
+            Inbound::NoReady(1, k, 1),
+            Inbound::Wish(1, k),
+            Inbound::CompReport(1, d.clone(), k),
+            Inbound::ControlCommit(k, 1),
+            Inbound::ControlTimeoutVote(k, 1),
+            Inbound::ControlTimeoutAccept(k, 1),
+            Inbound::SkipVote(1, k),
+        ] {
+            assert!(!inbound.is_bulk(), "must stay consensus-class: {inbound:?}");
+        }
+    }
+
     // SECURITY (Fable audit) regression coverage: `dispatch_inbound`'s membership
     // gate, exercised against a real `VantageCore` (via the private `build`
     // constructor split out of `spawn` for exactly this purpose -- see `build`'s doc
@@ -2576,15 +2725,23 @@ mod tests {
         let registry = prometheus::Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         let (tx_output, _rx_output) = channel(1);
-        let (core, _rx_vantage, _rx_payload_ready, _tx_vantage, _ack_aggregator, _reconnect_rx) =
-            VantageCore::build(
-                name,
-                committee,
-                Parameters::default(),
-                store,
-                Some(metrics),
-                tx_output,
-            );
+        let (
+            core,
+            _rx_vantage,
+            _rx_bulk,
+            _rx_payload_ready,
+            _tx_vantage,
+            _tx_bulk,
+            _ack_aggregator,
+            _reconnect_rx,
+        ) = VantageCore::build(
+            name,
+            committee,
+            Parameters::default(),
+            store,
+            Some(metrics),
+            tx_output,
+        );
         core
     }
 
@@ -2893,8 +3050,12 @@ mod tests {
             .lock()
             .record_ack(pre_sender, reference.clone());
         let (tx_vantage, mut rx_vantage) = channel(4);
+        // This test only exercises consensus-class inbound (an Ack), so the bulk queue
+        // is never used -- but it must exist. Held so it is not dropped/closed.
+        let (tx_bulk, _rx_bulk) = channel(4);
         let handler = VantageReceiverHandler {
             tx: tx_vantage,
+            tx_bulk,
             ack_aggregator,
             metrics: None,
         };

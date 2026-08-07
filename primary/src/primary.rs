@@ -442,15 +442,16 @@ impl Primary {
                 // Core/Proposer/HeaderWaiter/Helper/consensus entirely. Only the
                 // worker-facing receiver and the metrics server (already booted above)
                 // are shared with Autobahn.
-                let (tx_vantage, ack_aggregator) = crate::vantage::VantageCore::spawn(
-                    name,
-                    committee.clone(),
-                    parameters.clone(),
-                    store.clone(),
-                    Some(metrics.clone()),
-                    rx_our_digests,
-                    tx_output,
-                );
+                let (tx_vantage, tx_vantage_bulk, ack_aggregator) =
+                    crate::vantage::VantageCore::spawn(
+                        name,
+                        committee.clone(),
+                        parameters.clone(),
+                        store.clone(),
+                        Some(metrics.clone()),
+                        rx_our_digests,
+                        tx_output,
+                    );
 
                 // Spawn the network receiver listening to messages from the other
                 // primaries, routed into `VantageCore` (not `Core`).
@@ -464,6 +465,7 @@ impl Primary {
                     /* handler */
                     crate::vantage::node::VantageReceiverHandler {
                         tx: tx_vantage,
+                        tx_bulk: tx_vantage_bulk,
                         ack_aggregator,
                         metrics: Some(metrics.clone()),
                     },

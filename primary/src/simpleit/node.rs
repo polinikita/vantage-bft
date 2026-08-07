@@ -589,7 +589,7 @@ impl SimpleItCore {
             payload_size: 0,
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
-            resume_trigger: ResumeTrigger::new(),
+            resume_trigger: ResumeTrigger::with_max_concurrent(parameters.resume_max_concurrent),
             resume_serve: ResumeServe::new(),
             resume_check_period_ms: parameters.resume_check_period_ms,
             resume_backoff_ms: parameters.resume_backoff_ms,

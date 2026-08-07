@@ -295,10 +295,12 @@ impl Wire {
         if let PrimaryMessage::Header(header, false) = &message {
             if let Some(metrics) = &self.metrics {
                 metrics.proposed_block_size_bytes.observe(bytes.len());
-                let header_bytes = bincode::serialize(header).expect("serializes");
-                metrics
-                    .proposed_header_size_bytes
-                    .observe(header_bytes.len());
+                // `serialized_size` COMPUTES the length without building the buffer --
+                // the previous `bincode::serialize(header)` allocated and encoded a
+                // whole second copy of every published car purely to call `.len()` on
+                // it. Same value, on the hot publish path.
+                let header_len = bincode::serialized_size(header).expect("serializes") as usize;
+                metrics.proposed_header_size_bytes.observe(header_len);
             }
             // Data-plane withholding fault injector (`--withhold`): this is the ONLY
             // original-dissemination publish of a header (`ServeTo`'s `Header(_,
@@ -346,7 +348,7 @@ impl Wire {
         key: u64,
     ) {
         self.network
-            .broadcast_volatile_typed(self.other_primary_addrs.clone(), payload, key, msg_type)
+            .broadcast_volatile_typed(&self.other_primary_addrs, payload, key, msg_type)
             .await;
     }
 
@@ -390,13 +392,11 @@ impl Wire {
     /// `other_primary_addrs` is precomputed once (see its own doc comment) -- this
     /// `.clone()` is a straight contiguous `Vec<SocketAddr>` memcpy.
     async fn broadcast(&mut self, payload: Vec<u8>, msg_type: &'static str) {
+        // Slice variant: this is the own-car publish path, and cloning the 99-element
+        // address list on every publish allocated and copied for no reason.
         let handlers = self
             .network
-            .broadcast_typed(
-                self.other_primary_addrs.clone(),
-                Bytes::from(payload),
-                msg_type,
-            )
+            .broadcast_typed_slice(&self.other_primary_addrs, Bytes::from(payload), msg_type)
             .await;
         self.cancel_handlers.extend(handlers);
     }

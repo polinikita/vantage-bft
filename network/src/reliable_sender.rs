@@ -288,9 +288,31 @@ impl ReliableSender {
         data: Bytes,
         msg_type: &'static str,
     ) -> Vec<CancelHandler> {
-        let mut handlers = Vec::new();
+        // One metrics observation per destination, as before -- but recorded once for
+        // all N instead of once per peer (see `record_typed_sent_n`). Same values.
+        record_typed_sent_n(&self.metrics, msg_type, data.len(), addresses.len() as u64);
+        let mut handlers = Vec::with_capacity(addresses.len());
         for address in addresses {
-            handlers.push(self.send_typed(address, data.clone(), msg_type).await);
+            handlers.push(self.send(address, data.clone()).await);
+        }
+        handlers
+    }
+
+    /// `broadcast_typed` over a BORROWED address list, for callers whose list is stable
+    /// for the run (vantage's `Wire::broadcast`, the own-car publish path). Identical
+    /// behaviour; exists purely so the hot path does not allocate and copy the address
+    /// Vec on every broadcast. `lucky_broadcast_typed` still needs the owned variant
+    /// because it shuffles and truncates.
+    pub async fn broadcast_typed_slice(
+        &mut self,
+        addresses: &[SocketAddr],
+        data: Bytes,
+        msg_type: &'static str,
+    ) -> Vec<CancelHandler> {
+        record_typed_sent_n(&self.metrics, msg_type, data.len(), addresses.len() as u64);
+        let mut handlers = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            handlers.push(self.send(*address, data.clone()).await);
         }
         handlers
     }
@@ -349,16 +371,27 @@ impl ReliableSender {
     }
 
     /// Typed variant of `broadcast_volatile`.
+    ///
+    /// Takes `&[SocketAddr]`: the caller's address list is stable for a run, and
+    /// cloning it per broadcast allocated a fresh Vec and copied N addresses on the
+    /// consensus core's own thread. Metrics are recorded ONCE for all N destinations
+    /// (`record_typed_sent_n`) rather than per peer -- see that function's comment for
+    /// why the per-peer version was 2N label lookups of pure overhead. Counter values
+    /// are unchanged.
+    ///
+    /// Both changes target vantage's n=100 congestion collapse (2026-08-07): the core
+    /// sat at 87.2% of one core in `effect_execution` versus 1.3% at n=50, and every
+    /// AGB broadcast fans out through here.
     pub async fn broadcast_volatile_typed(
         &mut self,
-        addresses: Vec<SocketAddr>,
+        addresses: &[SocketAddr],
         data: Bytes,
         key: u64,
         msg_type: &'static str,
     ) {
+        record_typed_sent_n(&self.metrics, msg_type, data.len(), addresses.len() as u64);
         for address in addresses {
-            self.send_volatile_typed(address, data.clone(), key, msg_type)
-                .await;
+            self.send_volatile(*address, data.clone(), key).await;
         }
     }
 
@@ -406,15 +439,37 @@ pub(crate) fn record_typed_sent(
     msg_type: &'static str,
     len: usize,
 ) {
+    record_typed_sent_n(metrics, msg_type, len, 1);
+}
+
+/// `record_typed_sent` for `n` identical destinations at once, so a broadcast pays ONE
+/// pair of label lookups instead of one pair per peer.
+///
+/// Each `with_label_values` hashes the label slice and takes the vec's RwLock; doing
+/// that inside a per-peer loop cost 2N lookups per broadcast (198 at n=100) purely to
+/// produce sums that `inc_by` yields identically. Vantage's n=100 collapse of
+/// 2026-08-07 had the single-threaded consensus core at 87.2% of one core inside
+/// `effect_execution` (1.3% at n=50) with its inbound queue pinned at capacity, and
+/// this loop is on that path -- every AGB echo/car/ack broadcast passes through it.
+/// The emitted counter values are byte-identical to the per-peer version.
+pub(crate) fn record_typed_sent_n(
+    metrics: &Option<Arc<Metrics>>,
+    msg_type: &'static str,
+    len: usize,
+    n: u64,
+) {
+    if n == 0 {
+        return;
+    }
     if let Some(metrics) = metrics {
         metrics
             .network_messages_sent_total
             .with_label_values(&[msg_type])
-            .inc();
+            .inc_by(n);
         metrics
             .network_bytes_sent_total
             .with_label_values(&[msg_type])
-            .inc_by(len as u64);
+            .inc_by(len as u64 * n);
     }
 }
 

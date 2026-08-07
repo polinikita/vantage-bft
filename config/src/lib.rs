@@ -519,6 +519,21 @@ pub struct Parameters {
     /// tens of ms per author, so even a short fault window backs up a lane by
     /// hundreds of blocks) in low single-digit seconds instead of tens of seconds.
     /// `#[serde(default)]` (64) keeps every pre-existing parameter file valid.
+    /// GLOBAL cap on how many lane-resume EPISODES one node may have established at
+    /// once (`vantage::resume::ResumeTrigger::max_concurrent`); 0 = unlimited, the
+    /// behaviour before this field existed.
+    ///
+    /// The pre-existing in-flight cap is per author -- one outstanding request each --
+    /// so at n=100 up to 99 episodes stream simultaneously at receipt pace. That
+    /// ignited the 2026-08-07 n=100 congestion collapse: 122,736 blocks re-served per
+    /// node (zero at n=50) put the single-threaded core at 87.2% of one core executing
+    /// effects, pinning its inbound queue and cutting organic delivery to ~5%, which
+    /// produced further gaps. Bounding concurrency breaks that loop; deferred episodes
+    /// stay `pending` and are promoted as earlier ones close, so recovery still
+    /// completes.
+    #[serde(default = "default_resume_max_concurrent")]
+    pub resume_max_concurrent: usize,
+
     #[serde(default = "default_resume_batch")]
     pub resume_batch: u64,
 
@@ -715,6 +730,14 @@ fn default_retry_backoff_max_ms() -> u64 {
 }
 
 /// `Parameters::replay_history_views`'s own doc comment.
+/// 8 concurrent resume episodes: enough that recovery is not serialised to a crawl,
+/// small enough that the single-threaded core keeps servicing consensus alongside it.
+/// n=50 -- which never collapsed -- ran with ZERO episodes open, so this bound is far
+/// above anything a healthy run needs.
+fn default_resume_max_concurrent() -> usize {
+    8
+}
+
 fn default_replay_history_views() -> u64 {
     512
 }
@@ -970,6 +993,7 @@ impl Default for Parameters {
             withhold_window: None,
             resume_check_period_ms: default_resume_check_period_ms(),
             resume_backoff_ms: default_resume_backoff_ms(),
+            resume_max_concurrent: default_resume_max_concurrent(),
             resume_batch: default_resume_batch(),
             reconnect_replay: default_reconnect_replay(),
             retry_backoff_max_ms: default_retry_backoff_max_ms(),
