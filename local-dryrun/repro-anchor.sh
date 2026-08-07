@@ -103,11 +103,20 @@ case "${ROUTES:-}" in *anchor_full*|*anchor_skip*) anchor=1 ;; esac
 
 if [ "$LAG_MAX" != "-1" ] && [ "$LAG_MAX" -gt "$MAX_CURSOR_LAG" ] 2>/dev/null; then
     if [ "$anchor" -eq 0 ]; then
-        echo "REPRODUCED: cursor lag $LAG_MAX with ZERO anchor_* seals -- split views are" >&2
-        echo "  wedging the output cursor because the anchor/resolution path never seals." >&2
+        echo "REPRODUCED (absent): cursor lag $LAG_MAX with ZERO anchor_* seals -- the" >&2
+        echo "  anchor/resolution path never sealed at all." >&2
         exit 1
     fi
-    echo "cursor lag $LAG_MAX but anchor_* seals ARE present -- lag is not the anchor gap" >&2
+    # Measured 2026-08-08 at the defaults: anchor_full=6090 over 30 nodes/60s = 3.4
+    # seals/s/node against 28.7 views/s entering, i.e. ~12% of the needed rate, and a
+    # 1,223-view cursor backlog that keeps growing. So the path WORKS and is simply
+    # rate-limited far below the view rate -- which is the same shape as the AWS n=100
+    # failure (entered 554 / cursor 1), where it started at view 1 and never escaped.
+    # This is the interesting outcome, not a script error.
+    echo "REPRODUCED (rate-limited): cursor lag $LAG_MAX WITH anchor_* seals present." >&2
+    echo "  The anchor path functions but cannot keep up with the view rate, so the" >&2
+    echo "  output cursor falls unboundedly behind. Compare anchor seals/s against the" >&2
+    echo "  view rate above." >&2
     exit 1
 fi
 if [ "$anchor" -eq 1 ]; then
