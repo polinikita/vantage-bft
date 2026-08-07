@@ -270,6 +270,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             ack_watermark_period_ms
         );
     }
+    if matches.get_flag("echo-avail-claims") {
+        println!(
+            "Echo availability claims: ON (positional bit-per-lane on the AGB echo; the \
+             periodic VantageAvail flush is NOT scheduled)"
+        );
+    }
     if !matches.get_flag("no-digest-statements") {
         println!(
             "Digest-named AGB statements: ON (Vantage ECHO/READY name their proposal by hash instead of by value)"
@@ -367,6 +373,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // behavior when off.
         all_to_all: matches.get_flag("all-to-all"),
         ack_watermarks: !matches.get_flag("no-ack-watermarks"),
+        echo_avail_claims: matches.get_flag("echo-avail-claims"),
         ack_watermark_period_ms,
         digest_statements: !matches.get_flag("no-digest-statements"),
         withhold_senders: withhold,

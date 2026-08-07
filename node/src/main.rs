@@ -385,6 +385,24 @@ async fn main() -> Result<()> {
                         ),
                 )
                 .arg(
+                    Arg::new("echo-avail-claims")
+                        .long("echo-avail-claims")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "AVAIL-ECHO-SPEC.md: carry availability acknowledgments \
+                        POSITIONALLY on the AGB echo -- a bit per lane against the echoed \
+                        proposal's own reference vector -- instead of VantageAvail's \
+                        explicit (author, height, digest) tuples, and stop scheduling the \
+                        periodic watermark flush entirely. Same statements, same \
+                        thresholds, same Definition(Availability): only the encoding \
+                        changes. Measured motivation, n=100 per node: VantageAvail was \
+                        18.330 of 19.880 MB/s -- 92.2% of the node's entire wire budget, \
+                        at 9,258 B per message -- while Header was 1.4%. OFF by default; \
+                        requires --no-ack-watermarks NOT be set, since claims replace that \
+                        front-end rather than the per-block ACK path.",
+                        ),
+                )
+                .arg(
                     Arg::new("no-ack-watermarks")
                         .long("no-ack-watermarks")
                         .action(ArgAction::SetTrue)
