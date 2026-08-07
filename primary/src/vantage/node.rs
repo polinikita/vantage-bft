@@ -55,13 +55,22 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 /// (e.g. an equivocating leader's two different proposals each going to a disjoint
 /// subset) -- every constituent field type is already `Clone`, so this is a free,
 /// behavior-neutral derive (production code never clones an `Inbound`).
-/// Capacity of the bulk recovery queue (`VantageReceiverHandler::tx_bulk`).
+/// Capacity of the SERVICE-REQUEST queue (`VantageReceiverHandler::tx_bulk`).
 ///
-/// Deliberately a fraction of `CHANNEL_CAPACITY` (1000): this queue exists to BOUND how
-/// much re-served payload can be in flight toward the single-threaded core at once, so
-/// sizing it generously would recreate the shared-budget problem it removes. Overflow
-/// drops, which is sound -- every message routed here is re-requestable.
-const BULK_CHANNEL_CAPACITY: usize = 128;
+/// Sized for the request flood a single node can face: at n=100, up to 99 peers may be
+/// asking it to serve a lane/body/header at once, repeatedly, and each entry is small
+/// (`LaneResume` is two keys and a height). Generous headroom is therefore cheap here --
+/// what must stay bounded is not this queue's length but the WORK it induces, which
+/// `Parameters::resume_max_concurrent` caps on the requester side.
+///
+/// The first version of this split sized it at 128 and routed served payload here too.
+/// The n=100 run of 2026-08-07 showed why that was wrong: lagging nodes dropped 90
+/// messages/second (53k median, 130k peak) and received only 6% of blocks and 4% of
+/// avail, because incoming SERVE RESPONSES -- the very data they needed to catch up --
+/// queued behind, and were dropped alongside, the flood of requests the 78 healthy peers
+/// were making OF them. Head-of-line blocking inside the recovery queue itself. See
+/// `Inbound::is_bulk` for the corrected axis.
+const BULK_CHANNEL_CAPACITY: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub enum Inbound {
@@ -150,32 +159,44 @@ pub enum Inbound {
 }
 
 impl Inbound {
-    /// Is this BULK RECOVERY traffic rather than consensus-critical traffic?
+    /// Is this a SERVICE REQUEST from a peer -- work this node may decline -- rather
+    /// than data this node needs?
     ///
-    /// Bulk = anything whose loss is recoverable by the requester simply asking again:
-    /// served payload (`Serve`/`BodyServe`/`ControlServe`), the requests that ask for
-    /// it (`HeadersRequest`/`BodyFetch`/`ControlFetch`/`LaneResume`), and the
-    /// reconnect-replay control exchange (`ResumeHello`/`ReplayDone`).
+    /// The axis is "who is owed something", NOT "is it recovery traffic":
     ///
-    /// Everything else is consensus-critical -- AGB echo/ready/wish/propose/skip,
-    /// comp-reports, the whole control log, and lane availability/acks -- and a dropped
-    /// one either stalls a view or is only recovered by a much more expensive path.
+    ///   bulk (droppable): requests OTHERS make OF US. `LaneResume`, `HeadersRequest`,
+    ///     `BodyFetch`, `ControlFetch`, `ResumeHello`. Declining one costs the REQUESTER
+    ///     a retry on its next tick; it costs us nothing, and a node too busy to serve
+    ///     is exactly a node that should be declining.
     ///
-    /// `Publish` is deliberately NOT bulk: it is the ORGANIC car-delivery path, i.e.
-    /// exactly the traffic whose starvation collapsed the n=100 run. Demoting it would
-    /// have made that worse, not better.
+    ///   consensus-class: RESPONSES to requests WE made -- `Serve`, `BodyServe`,
+    ///     `ControlServe`, `ReplayDone` -- plus all AGB/control/availability traffic.
+    ///     A dropped response is data we asked for and are blocked on.
+    ///
+    /// The first version of this split used "is it recovery traffic" instead, which put
+    /// served payload in the droppable queue. The n=100 run of 2026-08-07 showed the
+    /// consequence: lagging nodes dropped 90 messages/second (53k median, 130k peak) and
+    /// received only 6% of blocks and 4% of avail, because their incoming serve
+    /// RESPONSES sat behind -- and were dropped alongside -- the flood of requests the 78
+    /// healthy peers were making of them. The node least able to spare capacity was the
+    /// one throwing away its own catch-up data. Splitting on "requests of us" vs
+    /// "responses to us" makes the droppable class exactly the one whose loss is free.
+    ///
+    /// In-flight serve responses stay bounded without a small queue:
+    /// `Parameters::resume_max_concurrent` (8) x `resume_batch` (64) caps them at ~512,
+    /// inside `CHANNEL_CAPACITY` (1000).
+    ///
+    /// `Publish` is deliberately consensus-class: it is the ORGANIC car-delivery path --
+    /// and also how a resume batch is delivered -- i.e. exactly the traffic whose
+    /// starvation collapsed the n=100 run.
     fn is_bulk(&self) -> bool {
         matches!(
             self,
-            Inbound::Serve(_)
-                | Inbound::HeadersRequest(_, _)
+            Inbound::HeadersRequest(_, _)
                 | Inbound::ControlFetch(_, _, _)
-                | Inbound::ControlServe(_, _)
                 | Inbound::BodyFetch(_, _, _)
-                | Inbound::BodyServe(_, _)
                 | Inbound::LaneResume(_, _, _)
                 | Inbound::ResumeHello(_, _)
-                | Inbound::ReplayDone(_, _, _, _)
         )
     }
 }
@@ -2648,34 +2669,49 @@ impl VantageCore {
 
 #[cfg(test)]
 mod tests {
-    /// The bulk/consensus split (`Inbound::is_bulk`) decides which inbound queue a
-    /// message lands on, and getting it wrong is not symmetric: demoting a
-    /// consensus-critical message to the droppable bulk queue can stall a view, while
-    /// promoting bulk traffic recreates the shared-budget problem that collapsed n=100
-    /// on 2026-08-07 (resume payload starving AGB echoes/acks out of one 1000-slot
-    /// channel). Pin both directions.
+    /// `Inbound::is_bulk` decides which inbound queue a message lands on, and the two
+    /// error directions are not symmetric, so pin both.
+    ///
+    /// Demoting a message we are BLOCKED ON is how the first version of this split hurt
+    /// the very nodes it meant to help (2026-08-07 n=100: lagging nodes dropped 90
+    /// msg/s -- 53k median -- and received only 6% of blocks, because their serve
+    /// RESPONSES shared one queue with the requests 78 healthy peers were making OF
+    /// them). Promoting requests others make of us recreates the shared-budget problem
+    /// the split exists to remove.
     #[test]
-    fn bulk_classification_covers_recovery_traffic_only() {
+    fn bulk_class_is_requests_of_us_not_responses_to_us() {
         use crypto::PublicKey;
         let k = PublicKey::default();
         let d = Digest::default();
 
-        // Recovery traffic: re-requestable, so droppable.
+        // Requests OTHERS make OF US: declining costs the requester a retry, us nothing.
         for inbound in [
-            Inbound::Serve(Header::default()),
             Inbound::HeadersRequest(vec![d.clone()], k),
             Inbound::ControlFetch(1, d.clone(), k),
             Inbound::BodyFetch(1, d.clone(), k),
             Inbound::LaneResume(k, 1, k),
             Inbound::ResumeHello(1, k),
-            Inbound::ReplayDone(1, true, false, k),
         ] {
-            assert!(inbound.is_bulk(), "must be bulk: {inbound:?}");
+            assert!(
+                inbound.is_bulk(),
+                "a request of us must be droppable: {inbound:?}"
+            );
         }
 
-        // Consensus-critical: never demoted. `Publish` is included deliberately -- it is
-        // the ORGANIC car-delivery path, i.e. exactly the traffic whose starvation
-        // collapsed the n=100 run, so demoting it would have made things worse.
+        // RESPONSES to requests WE made: data we are blocked on. Never droppable.
+        for inbound in [
+            Inbound::Serve(Header::default()),
+            Inbound::ReplayDone(1, true, false, k),
+        ] {
+            assert!(
+                !inbound.is_bulk(),
+                "a response to our own request must not be droppable: {inbound:?}"
+            );
+        }
+
+        // Consensus traffic proper, including `Publish` -- the organic car-delivery path
+        // AND how a resume batch arrives, i.e. the traffic whose starvation collapsed the
+        // n=100 run.
         for inbound in [
             Inbound::Publish(k, Header::default()),
             Inbound::EchoSkip(1, k, 1),
