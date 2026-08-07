@@ -742,7 +742,7 @@ async fn note_holder_never_regresses() {
 /// state and be picked up by the next tick.
 #[tokio::test]
 async fn recovery_budget_defers_requests_instead_of_dropping_them() {
-    use crate::vantage::repair::RECOVERY_EMIT_PER_TICK;
+    use crate::vantage::repair::RECOVERY_EMIT_START;
     let (committee, keys) = Committee::local_benchmark(10, 1, 30_000);
     let (watcher, author) = (keys[0].name, keys[1].name);
     let mut rep = wide_repairer(watcher, &committee);
@@ -750,21 +750,18 @@ async fn recovery_budget_defers_requests_instead_of_dropping_them() {
     // Spend the whole tick's allowance on distinct digests (FANOUT_FIRST requests each).
     let mut emitted = 0usize;
     let mut h = 0u8;
-    while emitted < RECOVERY_EMIT_PER_TICK && h < 255 {
+    while emitted < RECOVERY_EMIT_START && h < 255 {
         let d = Digest([h; 32]);
         emitted += requests_for(&rep.authorize((author, 1 + h as u64, d))).len();
         h += 1;
     }
-    assert!(
-        emitted <= RECOVERY_EMIT_PER_TICK,
-        "budget must cap emission"
-    );
+    assert!(emitted <= RECOVERY_EMIT_START, "budget must cap emission");
 
     // One more digest while the budget is spent: nothing emitted, but the digest must NOT be
     // marked as requested (that would let an unsolicited serve through P1-2's gate).
     let starved = Digest([0xAB; 32]);
     let none = requests_for(&rep.authorize((author, 900u64, starved.clone())));
-    if emitted >= RECOVERY_EMIT_PER_TICK {
+    if emitted >= RECOVERY_EMIT_START {
         assert!(none.is_empty(), "budget spent -- nothing may be emitted");
         assert!(
             !rep.was_requested_hash(&starved),
@@ -915,4 +912,78 @@ async fn eviction_of_an_absent_or_untouched_lane_is_a_noop() {
         "cut equals the only height"
     );
     assert_eq!(cache.len(), 1);
+}
+
+/// The recovery ceiling must be CONDITIONAL, not constant.
+///
+/// A fixed ceiling was a measured regression (n=100 at 43f4f0c): node 96 deferred 5,425 and
+/// 9,224 requests across two attempts, healthy nodes deferred 0, and its own
+/// `vantage_bulk_inbound_dropped_total` was ZERO the whole time. There was no congestion --
+/// the constant simply refused work to the one node that needed to recover, leaving its
+/// cursor 481/452 views behind and failing a 200-view gate the previous build passed at 74.
+///
+/// So: double on a clean tick, halve on a tick that saw new bulk drops, clamped both ways.
+#[tokio::test]
+async fn recovery_ceiling_grows_when_clean_and_backs_off_on_drops() {
+    use crate::vantage::repair::{RECOVERY_EMIT_MAX, RECOVERY_EMIT_MIN, RECOVERY_EMIT_START};
+    let (committee, keys) = Committee::local_benchmark(10, 1, 33_000);
+    let registry = prometheus::Registry::new();
+    // `Metrics::new` already hands back an `Arc<Metrics>`.
+    let (metrics, _reporter) = metrics::Metrics::new(&registry);
+    let mut rep = wide_repairer(keys[0].name, &committee).with_metrics(metrics.clone());
+
+    let ceiling = || {
+        registry
+            .gather()
+            .iter()
+            .find(|f| f.get_name() == "vantage_repair_emit_ceiling")
+            .and_then(|f| {
+                f.get_metric()
+                    .first()
+                    .map(|m| m.get_gauge().get_value() as usize)
+            })
+            .unwrap_or(0)
+    };
+
+    // Clean ticks: the ceiling climbs, so a node with headroom is allowed to use it.
+    rep.retry_requests();
+    assert_eq!(
+        ceiling(),
+        RECOVERY_EMIT_START * 2,
+        "a clean tick must loosen"
+    );
+    for _ in 0..20 {
+        rep.retry_requests();
+    }
+    assert_eq!(
+        ceiling(),
+        RECOVERY_EMIT_MAX,
+        "clean ticks must reach the cap, not overshoot"
+    );
+
+    // A tick that saw new drops halves it -- reacting to the DELTA, not the total.
+    metrics.vantage_bulk_inbound_dropped_total.inc_by(1);
+    rep.retry_requests();
+    assert_eq!(ceiling(), RECOVERY_EMIT_MAX / 2, "new drops must back off");
+
+    // No further drops: the same total must not keep throttling (the absolute counter never
+    // decreases, so reacting to it would pin a node down forever after one bad moment).
+    rep.retry_requests();
+    assert_eq!(
+        ceiling(),
+        RECOVERY_EMIT_MAX,
+        "a stale drop total must not keep throttling"
+    );
+
+    // Sustained drops floor out rather than reaching zero: congestion control must never
+    // starve recovery completely.
+    for _ in 0..40 {
+        metrics.vantage_bulk_inbound_dropped_total.inc_by(1);
+        rep.retry_requests();
+    }
+    assert_eq!(
+        ceiling(),
+        RECOVERY_EMIT_MIN,
+        "must floor, never starve to zero"
+    );
 }

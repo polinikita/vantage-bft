@@ -31,21 +31,25 @@ pub(crate) const FANOUT_FIRST: usize = 4;
 /// `retry_pending_avail` and `try_serve` pathological at n=100.
 pub(crate) const FANOUT_ESCALATE_BUDGET: usize = 256;
 
-/// Total `request(h)` messages this node will emit per 1s tick, across BOTH first rounds
-/// and escalations.
+/// Starting per-tick ceiling on `request(h)` emission, across BOTH first rounds and
+/// escalations. Adapts at runtime -- see `adapt_recovery_ceiling`.
 ///
 /// The per-mechanism caps that already existed (fan-out width, escalation count, body-fetch
 /// cap of 1024, 8 concurrent resume episodes) each bound their own mechanism and nothing
 /// bounds their SUM -- so a node in deep recovery runs all of them at once, which is
-/// precisely the load that saturated the core. This is the ceiling on the dominant term:
-/// measured on the 2026-08-07 runs, repair requests outweighed lane-resume requests by more
-/// than 100x (223,122 versus 1,328 on a degraded node, and 4.1M versus 534 before the
-/// fan-out was bounded), so bounding repair is what bounding "recovery" mostly means.
-///
-/// 2048/s against a 4-peer first round is ~512 new digests/s, enough to work through the
-/// 6,109-digest gap the degraded n=100 nodes showed in about 12s, while keeping egress an
-/// order of magnitude below the level that caused the collapse.
-pub(crate) const RECOVERY_EMIT_PER_TICK: usize = 2_048;
+/// precisely the load that saturated the core. This bounds the dominant term: measured on
+/// the 2026-08-07 runs, repair requests outweighed lane-resume requests by more than 100x
+/// (223,122 versus 1,328 on a degraded node, and 4.1M versus 534 before the fan-out was
+/// bounded), so bounding repair is what bounding "recovery" mostly means.
+pub(crate) const RECOVERY_EMIT_START: usize = 2_048;
+
+/// Floor for the adaptive ceiling: the rate a node keeps even while it is visibly drowning,
+/// so congestion control can never starve recovery to a stop.
+pub(crate) const RECOVERY_EMIT_MIN: usize = 256;
+
+/// Cap for the adaptive ceiling. Still ~30x below the ~4.7M requests a single stalled node
+/// emitted before the fan-out was bounded, so this is a bound, not a licence.
+pub(crate) const RECOVERY_EMIT_MAX: usize = 65_536;
 
 /// Per-digest fan-out progress. See `fan_out` for why coverage is staged.
 struct FanoutState {
@@ -153,13 +157,21 @@ pub struct Repairer {
     /// Bounded O(n^2) -- 100 x 100 x 40 B = ~400 KB at n=100 -- and monotone per entry, so
     /// it needs no GC.
     holders: HashMap<PublicKey, HashMap<PublicKey, Height>>,
-    /// Requests still permitted this tick (`RECOVERY_EMIT_PER_TICK`, refilled by
-    /// `retry_requests`). Checked BEFORE `requested`/`requested_hashes` are written, never
-    /// after: those two are permanent one-shot records, so denying a request after recording
-    /// it would mean the peer is never asked again -- a liveness bug wearing a congestion
-    /// control's clothing. A denied digest keeps its `fanout` state and its queue entry, so
-    /// the next tick simply picks it up.
+    /// Requests still permitted this tick, refilled to `emit_ceiling` by `retry_requests`.
+    /// Checked BEFORE `requested`/`requested_hashes` are written, never after: those two are
+    /// permanent one-shot records, so denying a request after recording it would mean the
+    /// peer is never asked again -- a liveness bug wearing a congestion control's clothing.
+    /// A denied digest keeps its `fanout` state and its queue entry, so the next tick simply
+    /// picks it up.
     emit_budget: usize,
+    /// The adaptive per-tick ceiling. See `adapt_recovery_ceiling` for why this is not a
+    /// constant: a fixed 2048 throttled the one node that most needed to recover, while that
+    /// node was reporting ZERO congestion.
+    emit_ceiling: usize,
+    /// `vantage_bulk_inbound_dropped_total` as of the previous tick, so the ceiling can react
+    /// to the DELTA. The absolute counter is useless here -- it never decreases, so a node
+    /// that dropped messages once would be throttled for the rest of the run.
+    last_bulk_drops: u64,
     /// N7: `(requester, h)` recorded on a direct `request(h)`, even before we hold `h`.
     /// n=100 straggler fix (2026-08-08): indexed BY DIGEST rather than a flat
     /// `HashSet<(PublicKey, Digest)>`. `try_serve` ran a linear scan of the whole set on
@@ -208,7 +220,9 @@ impl Repairer {
             fanout: HashMap::new(),
             fanout_queue: BTreeSet::new(),
             holders: HashMap::new(),
-            emit_budget: RECOVERY_EMIT_PER_TICK,
+            emit_budget: RECOVERY_EMIT_START,
+            emit_ceiling: RECOVERY_EMIT_START,
+            last_bulk_drops: 0,
             pending_req: HashMap::new(),
             answered: HashSet::new(),
             metrics: None,
@@ -457,6 +471,43 @@ impl Repairer {
         self.fan_out(h, effects);
     }
 
+    /// Move the per-tick recovery ceiling toward what the node can actually absorb.
+    ///
+    /// A FIXED ceiling was a regression, measured on the 2026-08-07 n=100 run at 43f4f0c:
+    /// node 96 reported `vantage_repair_budget_deferred_total` 5,425 and 9,224 across two
+    /// attempts (healthy nodes: 0) while `vantage_bulk_inbound_dropped_total` was ZERO. There
+    /// was no congestion; the node had headroom and the constant refused it work anyway. Its
+    /// cursor ended 481 and 452 views behind, failing the 200-view quality gate that the
+    /// previous build had passed at worst 74. Capping recovery unconditionally simply
+    /// exchanged the original failure (too much recovery traffic -> core collapse) for its
+    /// mirror image (too little -> recovery never catches up).
+    ///
+    /// So the ceiling is conditional, AIMD on the same signal that diagnosed the original
+    /// bug: halve on any new bulk-inbound drop, double on a clean tick. A node that is
+    /// drowning backs off; a node with headroom -- which is exactly the node that needs to
+    /// recover -- is allowed to use it. `RECOVERY_EMIT_MIN` keeps a drowning node making
+    /// some progress rather than none; `RECOVERY_EMIT_MAX` keeps a clean node from
+    /// rediscovering the unbounded behaviour.
+    ///
+    /// The DELTA matters, not the absolute counter: drops never decrease, so reacting to the
+    /// total would throttle a node forever after one bad moment.
+    fn adapt_recovery_ceiling(&mut self) {
+        let Some(metrics) = &self.metrics else {
+            return; // tests without a metrics handle keep the starting ceiling
+        };
+        let now = metrics.vantage_bulk_inbound_dropped_total.get();
+        let new_drops = now.saturating_sub(self.last_bulk_drops);
+        self.last_bulk_drops = now;
+        self.emit_ceiling = if new_drops > 0 {
+            (self.emit_ceiling / 2).max(RECOVERY_EMIT_MIN)
+        } else {
+            self.emit_ceiling.saturating_mul(2).min(RECOVERY_EMIT_MAX)
+        };
+        metrics
+            .vantage_repair_emit_ceiling
+            .set(self.emit_ceiling as i64);
+    }
+
     /// Record that `peer` has confirmed holding `author`'s lane up to `height`. Monotone:
     /// a lower height never regresses an entry.
     ///
@@ -538,7 +589,8 @@ impl Repairer {
         let mut effects = Vec::new();
         // Refill the tick's recovery allowance. This is the ONE place it is refilled, so the
         // ceiling applies to the hot-path first rounds too, not just to escalations.
-        self.emit_budget = RECOVERY_EMIT_PER_TICK;
+        self.adapt_recovery_ceiling();
+        self.emit_budget = self.emit_ceiling;
         let budget = FANOUT_ESCALATE_BUDGET.min(self.fanout_queue.len());
         // Escalated entries are re-inserted, so draining in place would re-visit them
         // within the same call (they sort at or below the cursor). Collect the batch first.

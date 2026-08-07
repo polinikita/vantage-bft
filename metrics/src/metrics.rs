@@ -417,6 +417,11 @@ pub struct Metrics {
     /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
     /// the gate the two should track each other at ~1/(n-1).
     pub vantage_repair_fanout_loops_total: IntCounter,
+    /// Current adaptive per-tick ceiling on repair-request emission. AIMD on bulk-inbound
+    /// drops: halves on a dropping tick, doubles on a clean one. A node in recovery with no
+    /// congestion should climb to the maximum -- a fixed ceiling was a measured regression
+    /// (node 96 deferred 9,224 requests while reporting zero drops).
+    pub vantage_repair_emit_ceiling: IntGauge,
     /// Cached blocks evicted because every peer confirmed holding them. Zero means eviction
     /// is not acting -- check `vantage_block_cache_evict_blocked` before concluding the cache
     /// is simply small.
@@ -1055,6 +1060,12 @@ impl Metrics {
                 "vantage_repair_fanout_loops_total",
                 "Times settle reached the missing-block branch (fan-out considered, not \
                  necessarily emitted); compare with vantage_repairs_requested",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_emit_ceiling: register_int_gauge_with_registry!(
+                "vantage_repair_emit_ceiling",
+                "Adaptive per-tick ceiling on repair-request emission (AIMD on bulk drops)",
                 registry,
             )
             .unwrap(),
