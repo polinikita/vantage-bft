@@ -419,6 +419,14 @@ impl Primary {
         if let Some(mode) = parameters.tx_mode.as_deref() {
             metrics.set_transaction_mode_info(mode);
         }
+        // Arm the metrics-active window here too, matching `Worker::spawn`. The primary
+        // does not gate anything on it (commit-time observation lives in the worker's
+        // `synchronizer`), but `ActiveWindowCollector` publishes
+        // `metrics_active_seconds` from this same value -- so leaving it unset made the
+        // primary's series read a permanent 0 in every scrape, an active false lead
+        // during the 2026-08-07/08 n=100 investigation (it looks exactly like "the
+        // measurement window never opened").
+        metrics.set_active_from_millis(parameters.metrics_active_at_ms);
         reporter.clone().start();
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Primary {} metrics listening on {}", name, metrics_address);

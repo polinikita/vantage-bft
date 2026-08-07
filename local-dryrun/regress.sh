@@ -19,6 +19,10 @@
 #                                 the few transactions that do commit are fast.
 #   no node with cursor <= 1   -- a wedged cursor, the same failure's terminal state.
 #
+# Budget: under a MINUTE end to end (30s run + a cached build). Long enough for the
+# cursor/seal-route signals to be meaningful, short enough to run on every iteration
+# without thinking about it.
+#
 # Usage:  ./local-dryrun/regress.sh [duration_s] [nodes] [rate]
 # Exits non-zero on regression, naming the threshold that failed.
 set -uo pipefail
@@ -27,7 +31,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-DURATION="${1:-60}"
+DURATION="${1:-30}"
 NODES="${2:-30}"
 RATE="${3:-100}"
 TX_SIZE=512

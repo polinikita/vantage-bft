@@ -810,6 +810,15 @@ pub struct AgbEngine {
 /// arrive per inbound response, so sub-second in practice.
 const RECHECK_BUDGET: usize = 64;
 
+/// n=100 straggler fix (2026-08-08): ceiling on `DigestStatements::pending_fetch`. It
+/// was unbounded, cleared only on a successful serve/local-fix or by a `gc_below` whose
+/// floor cannot advance on a stalled node, while `retry_fetches` re-fans every overdue
+/// entry once a second -- making total fetches quadratic in stall duration (measured
+/// 84,386 on a straggler vs 2,004 healthy). Sized well above the number of views a
+/// healthy node ever has outstanding, so it binds only on a node that has genuinely
+/// stopped resolving. See `ensure_fetch` for why eviction takes the HIGHEST views.
+pub(crate) const MAX_PENDING_FETCH: usize = 1_024;
+
 /// The <= `budget` views one budgeted `recheck_all` call scans: ring order over
 /// `pending`, starting at `cursor` and wrapping to the smallest view once the
 /// upper range is exhausted. Returns the whole set (ascending) whenever it fits
@@ -2824,6 +2833,46 @@ impl DigestStatements {
             }
             _ => {}
         }
+        // n=100 straggler fix (2026-08-08): bound `pending_fetch`. It is cleared only by
+        // a successful serve/local-fix or by `gc_below`, whose floor is
+        // `resolved_watermark - gc_window` -- so on a node whose resolution has stalled
+        // it never prunes, and `retry_fetches` re-fans EVERY overdue entry off the 1s
+        // tick. Total fetches sent are therefore QUADRATIC in stall duration: measured
+        // 84,386 on a straggler versus 2,004 healthy (42x), and its own fetches name
+        // views the rest of the network has already pruned, so they are answered empty
+        // (network-wide answer rate 7.8% for body fetch vs 85.2% for header repair).
+        //
+        // Evicting the HIGHEST views is the right direction, not the lowest: resolution
+        // is strictly sequential, so the lowest pending view is the one actually
+        // blocking progress and the far-ahead ones are useless until it clears.
+        // Dropping one is free -- `on_echo_digest`/`on_ready_digest` re-create the pair
+        // on the next statement arrival, and `buffered_echo`/`buffered_ready` retain the
+        // statement regardless -- so this only stops budget being spent on views the
+        // node cannot use yet.
+        if self.pending_fetch.len() >= MAX_PENDING_FETCH {
+            while self.pending_fetch.len() >= MAX_PENDING_FETCH {
+                let Some((highest, _)) = self.pending_fetch.iter().next_back() else {
+                    break;
+                };
+                let highest = highest.clone();
+                // Never evict the pair we are about to insert in favour of itself.
+                if highest <= key {
+                    break;
+                }
+                self.pending_fetch.remove(&highest);
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_body_fetch_evicted_total.inc();
+                }
+            }
+            if self.pending_fetch.len() >= MAX_PENDING_FETCH {
+                // Everything pending is at or below `key`, i.e. all of it is more
+                // urgent. Skip this fetch rather than displace a blocking one.
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_body_fetch_evicted_total.inc();
+                }
+                return Vec::new();
+            }
+        }
         self.pending_fetch.insert(key, now);
         let targets = self.fetch_targets(view, &digest);
         if let Some(metrics) = &self.metrics {
@@ -3028,8 +3077,22 @@ impl DigestStatements {
         self.buffered_ready.get(&view).map_or(0, |m| m.len())
     }
 
+    /// Is any fetch pending for `view`? Lets the cap test assert on WHICH end eviction
+    /// takes without exposing the map itself.
+    #[cfg(test)]
+    pub(crate) fn has_pending_fetch_for_test(&self, view: View) -> bool {
+        self.pending_fetch.keys().any(|(v, _)| *v == view)
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_fetch_count_for_test(&self) -> usize {
+        self.pending_fetch.len()
+    }
+
+    /// Outstanding body fetches -- exported as `vantage_pending_body_fetch_len` by
+    /// `VantageCore::sample_metrics`. The production counterpart of
+    /// `pending_fetch_count_for_test`, which was the only way to see this before.
+    pub fn pending_fetch_len(&self) -> usize {
         self.pending_fetch.len()
     }
 

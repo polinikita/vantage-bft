@@ -591,3 +591,50 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
     assert!(effects.is_empty());
     assert_eq!(digest_stmts.buffered_echo_count_for_test(1), 0);
 }
+
+/// n=100 straggler fix (2026-08-08): `pending_fetch` is capped, and eviction takes the
+/// HIGHEST views. That direction is load-bearing -- resolution is strictly sequential,
+/// so the LOWEST pending view is the one actually blocking progress while far-ahead
+/// views are useless until it clears. Evicting the lowest would throw away exactly the
+/// fetch the node needs to make progress.
+#[tokio::test]
+async fn pending_fetch_is_capped_and_evicts_the_highest_views() {
+    use crate::vantage::agb::MAX_PENDING_FETCH;
+    let all = authors();
+    let (name, _) = all[3];
+    let (sender, _) = all[0];
+    let mut agb = new_agb_engine(name);
+    let mut rep = dummy_repairer(name, ".db_test_pending_fetch_cap");
+    let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
+    let now = Instant::now();
+
+    // Fill well past the ceiling, ascending. Each distinct view/digest pair creates one
+    // pending fetch (the statement is buffered, so the pair is re-creatable at will).
+    let total = MAX_PENDING_FETCH + 50;
+    for v in 1..=total {
+        let msg = ReadyDigest {
+            view: v as u64,
+            digest: Digest([(v % 251) as u8; 32]),
+            grade: ReadyGrade::One,
+            sender,
+            wish: 0,
+        };
+        digest_stmts.on_ready_digest(msg, now, &mut agb, &mut rep);
+    }
+
+    let len = digest_stmts.pending_fetch_count_for_test();
+    assert!(
+        len <= MAX_PENDING_FETCH,
+        "pending_fetch grew to {len}, above the {MAX_PENDING_FETCH} ceiling"
+    );
+    // The LOW views must have survived -- they are the ones blocking resolution.
+    assert!(
+        digest_stmts.has_pending_fetch_for_test(1),
+        "view 1 was evicted; the lowest pending view must be retained"
+    );
+    // And the far-ahead ones must be the casualties.
+    assert!(
+        !digest_stmts.has_pending_fetch_for_test(total as u64),
+        "the highest view survived; eviction is taking the wrong end"
+    );
+}

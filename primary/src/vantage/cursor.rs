@@ -117,6 +117,26 @@ impl Cursor {
     fn pump(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         while let Some(input) = self.pending.get(&self.next_view) {
+            // Check `sealed` BEFORE cloning `completed`. `completed` is an
+            // `Option<(Manifest, Manifest)>` -- up to 2n `(PublicKey, Height, Digest)`
+            // entries, ~14 KB at n=100 -- and `pump` is reached from `Cursor::retry` on
+            // EVERY `Effect::BlockCached`, i.e. once per received block (287k on the
+            // 2026-08-07 n=100 run). Whenever the tip is still gopen the old order
+            // cloned all of it and then immediately hit the `break` below, so a wedged
+            // cursor turned every arriving block into a large pointless allocation.
+            if input.sealed.is_none() {
+                // Still gopen. Emit this view's core prefix K if we can (that is
+                // independent of the seal), then wait.
+                if !self.core_emitted.contains(&self.next_view) {
+                    if let Some((c, _t)) = input.completed.clone() {
+                        if let Some(hashes) = self.expand(&c) {
+                            self.core_emitted.insert(self.next_view);
+                            effects.extend(self.emit(hashes));
+                        }
+                    }
+                }
+                break;
+            }
             let (completed, sealed) = (input.completed.clone(), input.sealed.clone());
 
             // Locally completed but open: emit K, do not advance (tip stays open).

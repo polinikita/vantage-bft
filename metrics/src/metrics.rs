@@ -388,6 +388,17 @@ pub struct Metrics {
     /// MEASURED 0 on healthy AND straggling nodes alike, which is what eliminated
     /// `recheck_all` as the n=100 cause and pointed at `Repairer` instead.
     pub vantage_pending_gate_len: IntGauge,
+    /// `DigestStatements::pending_fetch.len()` -- outstanding AGB body fetches. Was
+    /// observable only through a `#[cfg(test)]` accessor, which made the 2026-08-08
+    /// body-fetch storm impossible to characterise from a scrape: the fetch COUNT alone
+    /// cannot separate "many pending pairs, few targets each" from the reverse. Bounded
+    /// by `agb::MAX_PENDING_FETCH`; sitting at that ceiling means resolution has stalled.
+    pub vantage_pending_body_fetch_len: IntGauge,
+    /// Body-fetch pairs dropped at `ensure_fetch` because `pending_fetch` was at its
+    /// ceiling. Nonzero means the node is accumulating views it cannot resolve; each
+    /// eviction is free (the pair is re-created from the retained statement on the next
+    /// arrival) and prevents quadratic retry growth.
+    pub vantage_body_fetch_evicted_total: IntCounter,
     /// `Repairer::pending_settle.len()` -- authorized-but-unsettled refs. This is the
     /// `P` in `on_block_available`'s O(P) re-sweep-per-cached-block, and it has no GC,
     /// so a node that cannot obtain a block keeps its refs here forever. The n=100
@@ -974,6 +985,18 @@ impl Metrics {
             vantage_pending_gate_len: register_int_gauge_with_registry!(
                 "vantage_pending_gate_len",
                 "AgbEngine: views active+fixed but not yet echoed (recheck_all's scan population)",
+                registry,
+            )
+            .unwrap(),
+            vantage_pending_body_fetch_len: register_int_gauge_with_registry!(
+                "vantage_pending_body_fetch_len",
+                "DigestStatements: outstanding AGB body fetches (capped by MAX_PENDING_FETCH)",
+                registry,
+            )
+            .unwrap(),
+            vantage_body_fetch_evicted_total: register_int_counter_with_registry!(
+                "vantage_body_fetch_evicted_total",
+                "Body-fetch pairs dropped because pending_fetch hit its ceiling",
                 registry,
             )
             .unwrap(),
