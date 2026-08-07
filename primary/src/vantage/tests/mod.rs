@@ -3,6 +3,8 @@
 mod ack_tests;
 mod avail_tests;
 mod chain_tests;
+// AVAIL-ECHO-SPEC.md: positional availability acknowledgments.
+mod claim_tests;
 mod common;
 mod metrics_tests;
 mod registers_tests;

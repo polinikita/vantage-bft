@@ -10,6 +10,7 @@
 pub mod agb;
 pub mod avail;
 pub mod block;
+pub mod claim;
 pub mod cursor;
 pub mod frontier;
 pub mod lanes;
