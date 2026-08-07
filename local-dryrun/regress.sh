@@ -45,6 +45,15 @@ RATE="${3:-100}"
 TX_SIZE=512
 DELTA_MS=200          # mirrors configs/sweep20-vantage.yaml / sweep100-vantage.yaml
 MAX_BATCH_DELAY_MS=20
+# 50, deliberately NOT mirroring sweep100-vantage.yaml, which moved to 100 on 2026-08-07.
+# This guard's job is to catch behaviour changes against a FIXED baseline, so it holds the
+# value every recorded local run used; changing it would silently rebase every threshold
+# below. Block cadence is an experiment parameter, not a property of the code under test --
+# to exercise the 100 ms arm locally use docker-bench, which takes it as a flag:
+#   docker-bench/run.sh --nodes 20 --rate 5000 --duration 90 --protocol vantage \
+#       --mode random --delta-ms 200 --max-header-delay-ms 100
+# Measured there, n=20 @ 5000 tx/s, 50 vs 100 ms: credited refs/s/node 2,990 -> 1,304
+# (-56%), TPS 5,019 -> 5,021, p50 428.5 -> 441.5 ms. See sweep100-vantage.yaml's own note.
 MAX_HEADER_DELAY_MS=50
 
 RTT_MODE="${4:-wan}"
