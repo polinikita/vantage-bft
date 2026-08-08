@@ -254,7 +254,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "tx_mode": args.mode,
         "max_block_payload": 16,
         "delta_ms": args.delta_ms,
-        "vantage_gc_window_views": 50,
+        "vantage_gc_window_views": 200,
         "simpleit_gc_window_rounds": 50,
         "ack_watermarks": not args.no_ack_watermarks,
         "ack_watermark_period_ms": args.ack_watermark_period_ms,

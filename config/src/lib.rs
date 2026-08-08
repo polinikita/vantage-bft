@@ -273,8 +273,9 @@ pub struct Parameters {
     /// (`Core`/`garbage_collector`); a Vantage view and an Autobahn round are different
     /// counters with different cadence, so one integer cannot correctly serve both, and an
     /// operator tuning `gc_depth` for Autobahn was silently resizing Vantage's retention
-    /// window. `#[serde(default)]` keeps every pre-existing parameter file valid, and the
-    /// default matches `gc_depth`'s so behaviour is unchanged for anyone who never sets it.
+    /// window. `#[serde(default)]` keeps every pre-existing parameter file valid. The
+    /// default was originally `gc_depth`'s 50 for exactly that reason; it is now 200 -- see
+    /// `default_vantage_gc_window_views` for the measurement that motivated raising it.
     ///
     /// `VantageCore::build` clamps this to >= 1: a window of 0 would put the GC floor at
     /// the resolved watermark itself and prune state for the view being resolved.
@@ -289,9 +290,11 @@ pub struct Parameters {
     /// `vantage_gc_window_views` (Vantage views) for the identical reason
     /// `vantage_gc_window_views`'s own doc comment gives: a Simple-IT cut round is yet
     /// another counter with its own cadence, distinct from either. `#[serde(default)]`
-    /// keeps every pre-existing parameter file valid; the default matches the other
-    /// two windows' so behaviour is uniform across all three protocols for an operator
-    /// who never sets any of them.
+    /// keeps every pre-existing parameter file valid. NOTE this default no longer matches
+    /// `vantage_gc_window_views`, which was raised to 200 on evidence specific to Vantage's
+    /// strictly-serial output cursor (see `default_vantage_gc_window_views`); Simple-IT has
+    /// not been measured for the same failure, so its window is left where it was rather
+    /// than moved on someone else's evidence.
     ///
     /// `SimpleItCore::build` clamps this to >= 1, matching `vantage_gc_window_views`'s
     /// own clamp for the identical reason (a window of 0 would prune the round
@@ -723,14 +726,34 @@ fn default_delta_ms() -> u64 {
     200
 }
 
-/// Matches `gc_depth`'s own default, so splitting the two knobs apart changes no
-/// existing deployment's behaviour.
+/// 200 views, 4x the 50 it was originally set to (which matched `gc_depth`'s default, so
+/// that splitting the two knobs apart changed nothing at the time).
+///
+/// Raised because 50 views is a very short retention horizon in wall-clock terms. Measured
+/// view rates: ~8.7 views/s locally at n=20 and ~11.5 views/s on AWS at n=100, so 50 views
+/// is only **4-6 SECONDS** of history, and a node that falls further behind than that can
+/// never obtain the prefix its strictly-serial output cursor needs -- every peer has already
+/// pruned it. Demonstrated directly on 2026-08-08: a validator started 60s late at n=20
+/// caught its AGB view up completely (`entered_view` 1 -> 2,870 in 23s, tracking the
+/// committee median exactly) while its output cursor never left view 1 and it committed
+/// ZERO in 181s, at two different load levels. Its header requests plateaued within 23s --
+/// it had stopped asking, because nothing could answer.
+///
+/// 200 views is ~17-23s of history at those rates. That is a real widening of the
+/// straggler-recovery window, NOT a fix for late joining: the same measurement shows
+/// stragglers on the AWS n=100 runs sitting 177-882 views behind the median, so only the
+/// mildest of them come back inside this horizon. Catching up from an arbitrary lag needs a
+/// state-sync/snapshot path, which this codebase does not have.
+///
+/// Cost is retained per-view component state (`collect_internal_garbage` prunes below
+/// `resolved_watermark - gc_window`), so this trades RSS for recovery headroom.
 fn default_vantage_gc_window_views() -> u64 {
-    50
+    200
 }
 
-/// Matches `vantage_gc_window_views`'/`gc_depth`'s own default -- see
-/// `simpleit_gc_window_rounds`'s doc comment.
+/// Left at 50 while `vantage_gc_window_views` moved to 200 -- see
+/// `simpleit_gc_window_rounds`'s own doc comment for why the two are not the same counter,
+/// and `default_vantage_gc_window_views` for what motivated raising only the Vantage one.
 fn default_simpleit_gc_window_rounds() -> u64 {
     50
 }
@@ -1710,11 +1733,21 @@ mod tests {
         // Transport batching is ON by default (5 ms / 64 KiB per-destination
         // coalescing) -- a parameters file that omits the key gets it enabled.
         assert!(params.batch_messages);
-        // `vantage_gc_window_views` is absent from this (pre-existing shape) file and
-        // must default to the same 50 the Vantage GC previously took from `gc_depth`,
-        // so splitting the two knobs apart changes nothing for existing parameter files.
-        assert_eq!(params.vantage_gc_window_views, 50);
-        assert_eq!(params.vantage_gc_window_views, params.gc_depth);
+        // `vantage_gc_window_views` is absent from this (pre-existing shape) file, so the
+        // property under test is that it still deserializes and picks up the default. That
+        // default is now 200, NOT `gc_depth`'s 50: at the measured 8.7-11.5 views/s, 50
+        // views is only 4-6 seconds of retained history, which is less than the lag a
+        // straggler routinely accumulates -- see `default_vantage_gc_window_views`.
+        assert_eq!(params.vantage_gc_window_views, 200);
+        // Deliberately DECOUPLED from `gc_depth` now. This used to assert equality to show
+        // that splitting the two knobs changed nothing; the split has since been used, and
+        // asserting equality again would silently re-tie a Vantage view window to an
+        // Autobahn round count.
+        assert_ne!(params.vantage_gc_window_views, params.gc_depth);
+        assert_eq!(
+            params.gc_depth, 50,
+            "the Autobahn knob is untouched by that change"
+        );
         // `latency_table` is `#[serde(skip)]`: never present in the file, always
         // `None` after deserialization -- `node run` builds it from
         // `mimic_latency_ms` at spawn.
