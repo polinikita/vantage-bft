@@ -227,12 +227,28 @@ impl ControlLog {
     const FETCH_RETRY_ROUNDS: Round = 8;
 
     /// How many GC windows of carrier bodies to keep past `min_live_view`, purely to serve
-    /// peers that have fallen behind. One full extra window doubles the distance a party
-    /// can lag and still catch up, at the cost of retaining `ViewProposal` bodies for that
-    /// span. NOTE: this widens the catch-up window, it does not make it unbounded -- a
-    /// party lagging further than `(1 + SERVE_MARGIN_WINDOWS)` windows still cannot obtain
-    /// `B_w` from anyone, which needs a real state-transfer/snapshot path to fix properly.
-    pub const SERVE_MARGIN_WINDOWS: View = 1;
+    /// peers that have fallen behind. Each extra window widens the distance a party can lag
+    /// and still catch up, at the cost of retaining `ViewProposal` bodies for that span.
+    /// NOTE: this widens the catch-up window, it does not make it unbounded -- a party
+    /// lagging further than `(1 + SERVE_MARGIN_WINDOWS)` windows still cannot obtain `B_w`
+    /// from anyone, which needs a real state-transfer/snapshot path to fix properly.
+    ///
+    /// 2 (was 1), so the servable span is `3 x gc_window` = 600 views at the current
+    /// window. Sizing argument, from measured view rates (~18.5/s locally at n=20 with
+    /// delta_ms 200, ~11.5/s on AWS at n=100): a 10-second outage costs ~200 views, and a
+    /// recovering party must close that gap while the floor keeps RISING at the committee's
+    /// own view rate -- so it converges only while it sustains more than that rate, which it
+    /// does not during the fetch/verify ramp. Break-even sizing therefore spends the entire
+    /// margin on the ramp; measured on 2026-08-08, a lagging node's header requests
+    /// plateaued within 23s rather than closing its gap. 3x the outage leaves room for the
+    /// ramp.
+    ///
+    /// Raised HERE rather than by raising `gc_window` to 300 for the same 600-view span,
+    /// because this knob retains only carrier bodies (`ViewProposal`s) for the extra
+    /// distance, whereas `gc_window` also governs per-view component state across `agb`,
+    /// `digest_stmts`, `frontier`, `resolver` and the timer heap -- strictly more memory for
+    /// the identical catch-up benefit.
+    pub const SERVE_MARGIN_WINDOWS: View = 2;
 
     fn is_pruned_view(&self, view: View) -> bool {
         view < self.min_live_view
