@@ -10,8 +10,8 @@ pub mod snapshot;
 pub mod stat;
 
 pub use crate::metrics::{
-    AsPrometheusMetric, HistogramReporter, MetricReporter, Metrics, UtilizationTimer,
-    UtilizationTimerVecExt,
+    spawn_queue_sampler, AsPrometheusMetric, HistogramReporter, MetricReporter, Metrics,
+    QueueProbe, StoreProbe, UtilizationTimer, UtilizationTimerVecExt,
 };
 pub use crate::prometheus::{register_process_collector, start_prometheus_server};
 pub use crate::snapshot::{

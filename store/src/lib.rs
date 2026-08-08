@@ -127,6 +127,23 @@ pub struct Store {
     /// therefore always a real stall (a blocking `write_opt`/`db.get`, a wedged
     /// runtime, or a dead task) rather than quiet.
     heartbeat_millis: Arc<AtomicU64>,
+    /// Monotonic count of commands actually DEQUEUED from the command channel.
+    ///
+    /// The discriminator `heartbeat_millis` alone cannot provide, and the reason the
+    /// 2026-08-08 wedge was first misread as saturation. `queue_depth` counts PERMITS
+    /// HELD, not messages queued, and a `send()` future that is assigned a permit but
+    /// never polled again holds it forever. So `depth == capacity` has two completely
+    /// different causes:
+    ///
+    ///   depth full + drain ADVANCING  -> genuine saturation; the actor is the bottleneck.
+    ///   depth full + drain FLAT + heartbeat FRESH -> the queue is EMPTY and every permit
+    ///       is held by an unpollable `send()` future. The actor is idle and the senders
+    ///       are deadlocked against it.
+    ///
+    /// The second case is what actually happened, and no combination of the other two
+    /// signals distinguishes it. Incremented once per dequeued command, so it is also a
+    /// direct measure of actor throughput.
+    commands_drained: Arc<AtomicU64>,
 }
 
 /// Wall-clock epoch milliseconds, saturating to 0 before the epoch. Local to this
@@ -164,6 +181,8 @@ impl Store {
         let (tx, mut rx) = channel(100);
         let heartbeat_millis = Arc::new(AtomicU64::new(now_millis()));
         let heartbeat = heartbeat_millis.clone();
+        let commands_drained = Arc::new(AtomicU64::new(0));
+        let drained = commands_drained.clone();
         tokio::spawn(async move {
             // Writes accumulate in `pending` and land as ONE RocksDB WriteBatch per
             // flush: 1000/FLUSH_INTERVAL_MS = 20 `write_opt` calls per second instead of
@@ -202,6 +221,11 @@ impl Store {
             loop {
                 tokio::select! {
                     command = rx.recv() => {
+                        // Counted here, on DEQUEUE, before the command is handled: this
+                        // is what separates a saturated actor from an idle one whose
+                        // permits are all held by unpollable senders. See
+                        // `commands_drained`.
+                        drained.fetch_add(1, Ordering::Relaxed);
                         let Some(command) = command else {
                             // Channel closed: flush what we hold, then exit.
                             flush_pending(&db, &mut pending, &mut pending_bytes, &write_opts);
@@ -309,6 +333,7 @@ impl Store {
         Ok(Self {
             channel: tx,
             heartbeat_millis,
+            commands_drained,
         })
     }
 
@@ -335,6 +360,13 @@ impl Store {
     /// "now" and one sampler can publish both stores' ages consistently.
     pub fn heartbeat_millis(&self) -> u64 {
         self.heartbeat_millis.load(Ordering::Relaxed)
+    }
+
+    /// Commands dequeued since construction -- see `commands_drained`. Monotonic, so a
+    /// reader takes deltas; flat across an interval while `queue_depth` reads full is the
+    /// zombie-permit signature.
+    pub fn commands_drained(&self) -> u64 {
+        self.commands_drained.load(Ordering::Relaxed)
     }
 
     pub async fn write(&mut self, key: Key, value: Value) {

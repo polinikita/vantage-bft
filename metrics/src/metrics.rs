@@ -26,6 +26,135 @@ use std::{
 /// and therefore N registries, inside one process and one hook.
 static PROCESS_PANICS: AtomicU64 = AtomicU64::new(0);
 
+/// How often `spawn_queue_sampler` reads every probe. 10 Hz: fast enough that a queue
+/// which fills and drains inside one publish interval still registers in the peak, cheap
+/// enough to be irrelevant (a handful of atomic loads per tick).
+const QUEUE_SAMPLE_INTERVAL_MS: u64 = 100;
+
+/// How often `spawn_queue_sampler` publishes, in sample ticks. 1 s, matching the other
+/// progress gauges, so a dashboard reads them all on one cadence.
+const QUEUE_PUBLISH_EVERY: u32 = 10;
+
+/// Occupancy reader for one bounded channel, type-erased so probes over channels of
+/// different message types can be sampled by one task.
+///
+/// Occupancy is `Sender::max_capacity() - Sender::capacity()`, which needs no counter on
+/// the send path and no change to any producer -- these channels sit on the transaction hot
+/// path. NOTE it counts permits HELD, not messages queued; the two diverge exactly in the
+/// deadlock case, which is why `StoreProbe` also carries a drain counter.
+pub struct QueueProbe {
+    pub stage: &'static str,
+    /// Returns `(depth, capacity)`.
+    pub occupancy: Box<dyn Fn() -> (usize, usize) + Send + Sync>,
+}
+
+/// The store actor's own channel plus the two liveness readings that disambiguate a full
+/// one. Separate from `QueueProbe` because those readings have no analogue for a plain
+/// channel.
+pub struct StoreProbe {
+    /// Returns `(depth, capacity)` of the actor's command channel.
+    pub occupancy: Box<dyn Fn() -> (usize, usize) + Send + Sync>,
+    /// Epoch-ms stamp of the actor's last completed loop iteration.
+    pub heartbeat_millis: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// Monotonic count of commands the actor has dequeued.
+    pub commands_drained: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+/// Publish bounded-queue occupancy and store-actor liveness until the process exits.
+///
+/// Lives here, taking closures rather than a `store::Store`, so BOTH the primary and the
+/// worker can use one implementation without `metrics` gaining a `store` dependency. The
+/// primary needs it too: it has its own store and its own per-key `notify_read` waiters,
+/// and until this was shared its store was entirely unobserved -- the same class of blind
+/// spot that made the worker wedge take a day to find. Pass an empty `probes` for a process
+/// with no pipeline channels of its own.
+pub fn spawn_queue_sampler(probes: Vec<QueueProbe>, store: StoreProbe, metrics: Arc<Metrics>) {
+    // Write-once: bounds never change, and publishing them lets a dashboard show occupancy
+    // as a fraction without hard-coding each channel's constant.
+    for p in &probes {
+        let (_, capacity) = (p.occupancy)();
+        metrics
+            .worker_queue_capacity
+            .with_label_values(&[p.stage])
+            .set(capacity as i64);
+    }
+    let (_, store_capacity) = (store.occupancy)();
+    metrics
+        .worker_queue_capacity
+        .with_label_values(&["store"])
+        .set(store_capacity as i64);
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(QUEUE_SAMPLE_INTERVAL_MS));
+        let mut peaks: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+        let mut age_peak: u64 = 0;
+        // The store counter is monotonic and process-local; the Prometheus counter is
+        // advanced by the DELTA so it keeps counter semantics across restarts of neither.
+        let mut drained_reported: u64 = 0;
+        let mut ticks: u32 = 0;
+        loop {
+            ticker.tick().await;
+            ticks += 1;
+
+            let mut latest: Vec<(&'static str, usize)> = Vec::with_capacity(probes.len() + 1);
+            for p in &probes {
+                let (depth, _) = (p.occupancy)();
+                latest.push((p.stage, depth));
+            }
+            let (store_depth, _) = (store.occupancy)();
+            latest.push(("store", store_depth));
+            for (stage, depth) in &latest {
+                let slot = peaks.entry(stage).or_insert(0);
+                *slot = (*slot).max(*depth);
+            }
+            // Age, not the raw stamp, so the READER's clock defines "now" -- the actor's
+            // own clock could be the thing that is stuck. Saturating: a stamp from the
+            // future (clock step) reads 0 rather than wrapping.
+            let age = now_millis().saturating_sub((store.heartbeat_millis)());
+            age_peak = age_peak.max(age);
+
+            if !ticks.is_multiple_of(QUEUE_PUBLISH_EVERY) {
+                continue;
+            }
+            for (stage, depth) in &latest {
+                metrics
+                    .worker_queue_depth
+                    .with_label_values(&[stage])
+                    .set(*depth as i64);
+            }
+            for (stage, peak) in peaks.iter_mut() {
+                metrics
+                    .worker_queue_peak
+                    .with_label_values(&[stage])
+                    .set(*peak as i64);
+                *peak = 0;
+            }
+            metrics
+                .store_actor_heartbeat_age_ms
+                .set(age.min(i64::MAX as u64) as i64);
+            metrics
+                .store_actor_heartbeat_age_ms_peak
+                .set(age_peak.min(i64::MAX as u64) as i64);
+            age_peak = 0;
+
+            let drained = (store.commands_drained)();
+            metrics
+                .store_commands_drained_total
+                .inc_by(drained.saturating_sub(drained_reported));
+            drained_reported = drained;
+        }
+    });
+}
+
+/// Wall-clock epoch milliseconds; see `spawn_queue_sampler`'s use of it.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 use prometheus::{
     core::{Collector, Desc},
     proto::MetricFamily,
@@ -678,6 +807,33 @@ pub struct Metrics {
     /// pinned full, whereas a **dead** actor (task panic) shows the same growing age
     /// alongside a nonzero `process_panics_total`.
     pub store_actor_heartbeat_age_ms: IntGauge,
+    /// Peak `store_actor_heartbeat_age_ms` over the second preceding each publish, reset
+    /// on publish. The instantaneous gauge above can only report the age at the moment of
+    /// a scrape, so a stall that started and ended between two scrapes -- a RocksDB write
+    /// stall, a cold `db.get` on a compacting LSM -- is invisible to it.
+    pub store_actor_heartbeat_age_ms_peak: IntGauge,
+    /// Commands the store actor has DEQUEUED (see `store::Store::commands_drained`).
+    ///
+    /// The discriminator that `store_actor_heartbeat_age_ms` cannot provide on its own,
+    /// and the metric that would have prevented misreading the 2026-08-08 wedge as
+    /// saturation. `worker_queue_depth{queue="store"}` counts permits HELD, not messages
+    /// queued, so a full reading has two opposite causes:
+    ///
+    ///   full + this ADVANCING -> real saturation; the actor is the bottleneck.
+    ///   full + this FLAT + heartbeat fresh -> the queue is EMPTY and every permit sits in
+    ///       a `send()` future that will never be polled again. Actor idle, senders
+    ///       deadlocked against it. This is what actually happened.
+    pub store_commands_drained_total: IntCounter,
+    /// Headers whose payload is still incomplete (`PayloadIo::pending_payload`). Unbounded
+    /// by design while a worker is not materialising, so its growth IS the symptom.
+    pub vantage_pending_payload_headers: IntGauge,
+    /// Total outstanding `(digest, worker_id)` keys across those headers -- the quantity
+    /// that actually scales with the backlog, since one header can miss many batches.
+    pub vantage_pending_payload_keys: IntGauge,
+    /// Size of `PayloadIo::last_synchronize`. Was insert-only (one entry per distinct
+    /// `(digest, worker_id)` ever synced, never removed) and so grew without bound for the
+    /// life of the process; now pruned, and this is how that stays true.
+    pub vantage_last_synchronize_len: IntGauge,
     /// Panics observed by this process's panic hook (`install_panic_hook`).
     ///
     /// tokio silently absorbs a panicking task: the panic travels in the `JoinHandle`,
@@ -1386,6 +1542,36 @@ impl Metrics {
             store_actor_heartbeat_age_ms: register_int_gauge_with_registry!(
                 "store_actor_heartbeat_age_ms",
                 "Milliseconds since the store actor last completed a loop iteration",
+                registry,
+            )
+            .unwrap(),
+            store_actor_heartbeat_age_ms_peak: register_int_gauge_with_registry!(
+                "store_actor_heartbeat_age_ms_peak",
+                "Store-actor staleness: peak since the previous publish",
+                registry,
+            )
+            .unwrap(),
+            store_commands_drained_total: register_int_counter_with_registry!(
+                "store_commands_drained_total",
+                "Commands dequeued by the store actor (flat while depth is full = deadlock)",
+                registry,
+            )
+            .unwrap(),
+            vantage_pending_payload_headers: register_int_gauge_with_registry!(
+                "vantage_pending_payload_headers",
+                "Headers whose payload is still incomplete",
+                registry,
+            )
+            .unwrap(),
+            vantage_pending_payload_keys: register_int_gauge_with_registry!(
+                "vantage_pending_payload_keys",
+                "Outstanding (batch digest, worker) keys across all incomplete headers",
+                registry,
+            )
+            .unwrap(),
+            vantage_last_synchronize_len: register_int_gauge_with_registry!(
+                "vantage_last_synchronize_len",
+                "Size of the per-key Synchronize rate-limit map",
                 registry,
             )
             .unwrap(),

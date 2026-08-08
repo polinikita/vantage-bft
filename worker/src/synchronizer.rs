@@ -1,10 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::worker::{Round, WorkerMessage};
+use crate::worker::{Round, WorkerMessage, CHANNEL_CAPACITY};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
-use futures::stream::futures_unordered::FuturesUnordered;
-use futures::stream::StreamExt as _;
 use log::{debug, error};
 use metrics::Metrics;
 use network::{BatchConfig, SimpleSender};
@@ -12,9 +10,7 @@ use primary::PrimaryWorkerMessage;
 use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 #[cfg(feature = "benchmark")]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -41,12 +37,6 @@ const TIMER_RESOLUTION: u64 = 1_000;
 /// GC timing calls for one.
 #[cfg(feature = "benchmark")]
 const BENCHMARK_METRICS_RETENTION_MILLIS: u64 = 10 * 60 * 1_000;
-
-/// clippy::type_complexity: named alias for `metrics_waiting`'s element type in
-/// `run` (mirrors `primary::core::SlotViewTimerFuture`'s identical justification).
-/// Declared unconditionally, matching `metrics_waiting` itself (see `run`'s doc
-/// comment on that variable for why it stays unconditional).
-type MetricsRetryFuture = Pin<Box<dyn Future<Output = Option<(Digest, u64)>> + Send>>;
 
 /// A digest whose batch missed the local store at commit time, deferred rather than
 /// dropped by `Synchronizer::observe_committed` -- returned to its caller (`run`),
@@ -241,22 +231,50 @@ impl Synchronizer {
     }
 
     /// Main loop listening to the primary's messages.
+    ///
+    /// # Waiters are SPAWNED TASKS, not `FuturesUnordered` residents
+    ///
+    /// Both waiter families used to live in `FuturesUnordered` polled by the `select!`
+    /// below. That deadlocks this task against the store, and it is the confirmed cause
+    /// of the 2026-08-08 n=50 netem wedge (nodes stopped committing entirely while their
+    /// store actor sat IDLE with its command channel reading "full"):
+    ///
+    /// 1. `tokio::sync::mpsc` accounts a bounded channel's occupancy as permits, and
+    ///    releasing one ASSIGNS it to the front waiter of the semaphore's FIFO and pops
+    ///    that waiter from the queue -- it does not merely wake it. A `send()` future
+    ///    holding an assigned permit that is never polled again never completes the send
+    ///    and never returns the permit.
+    /// 2. A `FuturesUnordered` resident is polled only when its owning task returns to
+    ///    this `select!`. The `Synchronize` arm awaits the store mid-arm, so while it is
+    ///    suspended there NONE of the waiters can be polled.
+    /// 3. So every permit the store actor released went to a waiter that could not run.
+    ///    At >= 100 such futures (the store channel's bound) ahead of it in the FIFO, the
+    ///    arm's own store operation could never acquire a permit -- this task waiting on
+    ///    itself -- and `Processor`/`Helper` starved behind the same queue.
+    ///
+    /// A spawned task is scheduled independently, so an assigned permit is always
+    /// consumed and the deadlock class disappears at any channel capacity. The primary
+    /// already used this shape (`vantage::payload`'s per-key waiters) and never exhibited
+    /// the wedge. Cancellation is unchanged: dropping the `tx_cancel` in `self.pending`
+    /// makes the waiter's `handler.recv()` resolve, which ends the task, so nothing leaks.
+    ///
+    /// Results come back over a bounded channel. A waiter parked on that send holds no
+    /// store permit -- `notify_read` has already completed its own send by then -- so the
+    /// back-pressure here cannot recreate (1).
     async fn run(&mut self) {
-        let mut waiting = FuturesUnordered::new();
+        let (tx_waiter, mut rx_waiter) =
+            channel::<Result<Option<Digest>, StoreError>>(CHANNEL_CAPACITY);
         // Starfish-parity real transaction latency (PHASE2-SPEC.md #5, amended):
-        // metrics-only retry waiters for deferred misses (see `observe_committed`'s
-        // doc comment) -- structurally the same "wait for `store.notify_read` or be
-        // canceled" shape as `waiting` above, just for a different consumer
-        // (`finish_deferred_retry` instead of `self.pending.remove`). Declared with
-        // an explicit boxed-future element type (rather than relying on inference
-        // from a push site) so this stays well-typed even on a non-`benchmark`
-        // build, where nothing ever pushes into it. An always-empty
-        // `FuturesUnordered` here does not busy-loop the `select!` below: per
-        // `tokio::select!`'s documented lifecycle, a branch whose future resolves to
-        // a value that doesn't match its pattern is disabled for that ONE call, not
-        // retried -- the surrounding loop only iterates again once some OTHER,
-        // genuinely pending branch (a real message, a real timer) wakes it.
-        let mut metrics_waiting: FuturesUnordered<MetricsRetryFuture> = FuturesUnordered::new();
+        // metrics-only retry waiters for deferred misses (see `observe_committed`'s doc
+        // comment) -- structurally the same "wait for `store.notify_read` or be canceled"
+        // shape as the waiters above, just for a different consumer
+        // (`finish_deferred_retry` instead of `self.pending.remove`). Declared
+        // unconditionally so `run` stays well-typed on a non-`benchmark` build, where
+        // nothing ever sends into it.
+        let (tx_metrics_waiter, mut rx_metrics_waiter) =
+            channel::<Option<(Digest, u64)>>(CHANNEL_CAPACITY);
+        #[cfg(not(feature = "benchmark"))]
+        let _ = &tx_metrics_waiter;
 
         let timer = sleep(Duration::from_millis(TIMER_RESOLUTION));
         tokio::pin!(timer);
@@ -271,33 +289,56 @@ impl Synchronizer {
                             .expect("Failed to measure time")
                             .as_millis();
 
+                        // Drop already-pending digests BEFORE touching the store: dedup
+                        // needs no I/O, and every entry skipped here is one fewer store
+                        // round trip.
+                        let candidates: Vec<Digest> = digests
+                            .into_iter()
+                            .filter(|digest| !self.pending.contains_key(digest))
+                            .collect();
+
+                        // ONE store round trip for the whole message, not one per digest.
+                        // The sequential form suspended this arm D times per Synchronize,
+                        // and every suspension was a window in which the waiters could not
+                        // be polled -- the amplifier of the deadlock described on `run`.
+                        // At the measured 793-958 Synchronize/s on a wedged node, with
+                        // multi-digest messages, that was thousands of suspensions/s.
+                        //
+                        // Deviation from the per-key form: `read_many` reports an
+                        // unreadable key as `None`, indistinguishable from absent (it logs
+                        // per key -- see `StoreCommand::ReadMany`), where the old code
+                        // `continue`d and created no waiter. Treating an error as missing
+                        // is the safe direction: re-requesting a batch we may already hold
+                        // wastes bandwidth, whereas failing to request one we lack is a
+                        // liveness bug.
+                        let present = if candidates.is_empty() {
+                            Vec::new()
+                        } else {
+                            self.store
+                                .read_many(candidates.iter().map(|d| d.to_vec()).collect())
+                                .await
+                        };
+
                         let mut missing = Vec::new();
-                        for digest in digests {
-                            // Ensure we do not send twice the same sync request.
-                            if self.pending.contains_key(&digest) {
+                        for (digest, found) in candidates.into_iter().zip(present) {
+                            if found.is_some() {
+                                // The batch arrived in the meantime: no need to request it.
                                 continue;
                             }
+                            missing.push(digest.clone());
+                            debug!("Requesting sync for batch {}", digest);
 
-                            // Check if we received the batch in the meantime.
-                            match self.store.read(digest.to_vec()).await {
-                                Ok(None) => {
-                                    missing.push(digest.clone());
-                                    debug!("Requesting sync for batch {}", digest);
-                                },
-                                Ok(Some(_)) => {
-                                    // The batch arrived in the meantime: no need to request it.
-                                },
-                                Err(e) => {
-                                    error!("{}", e);
-                                    continue;
-                                }
-                            }
-
-                            // Add the digest to the waiter.
-                            let deliver = digest.clone();
+                            // SPAWNED, not pushed onto a `FuturesUnordered` -- see `run`.
                             let (tx_cancel, rx_cancel) = channel(1);
-                            let fut = Self::waiter(digest.clone(), self.store.clone(), deliver, rx_cancel);
-                            waiting.push(fut);
+                            let store = self.store.clone();
+                            let tx_result = tx_waiter.clone();
+                            let deliver = digest.clone();
+                            let missing_key = digest.clone();
+                            tokio::spawn(async move {
+                                let result =
+                                    Self::waiter(missing_key, store, deliver, rx_cancel).await;
+                                let _ = tx_result.send(result).await;
+                            });
                             self.pending.insert(digest, (self.round, tx_cancel, now));
                         }
 
@@ -340,18 +381,29 @@ impl Synchronizer {
                         // Starfish-parity real transaction latency (PHASE2-SPEC.md #5).
                         #[cfg(feature = "benchmark")]
                         for miss in self.observe_committed(commit_millis, digests).await {
-                            metrics_waiting.push(Box::pin(Self::metrics_waiter(
-                                miss.digest,
-                                miss.commit_millis,
-                                self.store.clone(),
-                                miss.cancel,
-                            )));
+                            // SPAWNED, for the same reason as the sync waiters -- see
+                            // `run`. These are the more dangerous of the two families:
+                            // there is one per deferred commit miss, so a node that is
+                            // behind accumulates them exactly when it can least afford an
+                            // unpollable permit holder.
+                            let store = self.store.clone();
+                            let tx_result = tx_metrics_waiter.clone();
+                            tokio::spawn(async move {
+                                let resolved = Self::metrics_waiter(
+                                    miss.digest,
+                                    miss.commit_millis,
+                                    store,
+                                    miss.cancel,
+                                )
+                                .await;
+                                let _ = tx_result.send(resolved).await;
+                            });
                         }
                     }
                 },
 
-                // Stream out the futures of the `FuturesUnordered` that completed.
-                Some(result) = waiting.next() => match result {
+                // A sync waiter finished (batch landed, or the wait was canceled).
+                Some(result) = rx_waiter.recv() => match result {
                     Ok(Some(digest)) => {
                         // We got the batch, remove it from the pending list.
                         self.pending.remove(&digest);
@@ -365,7 +417,7 @@ impl Synchronizer {
                 // A deferred commit-metrics miss either resolved (its batch landed in
                 // the store) or was canceled (pruned as stale by `prune_stale`) --
                 // see `observe_committed`'s doc comment and `metrics_waiter`.
-                Some(resolved) = metrics_waiting.next() => {
+                Some(resolved) = rx_metrics_waiter.recv() => {
                     #[cfg(feature = "benchmark")]
                     if let Some((digest, commit_millis)) = resolved {
                         self.finish_deferred_retry(digest, commit_millis).await;

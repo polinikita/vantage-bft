@@ -867,6 +867,9 @@ impl VantageCore {
                 tx_payload_ready,
                 tx_output,
                 last_synchronize: HashMap::new(),
+                last_retry_synchronize: HashMap::new(),
+                last_synchronize_pruned_at: Instant::now(),
+                metrics: core_metrics.clone(),
             },
             // Clamped to >= 1: a window of 0 would place the GC floor at the resolved
             // watermark itself and prune state for the view being resolved.
@@ -1247,6 +1250,10 @@ impl VantageCore {
             set.remove(&(digest, worker_id));
             resolved = set.is_empty();
         }
+        // Republish here as well as in `sync_batches`: this is the SHRINK path, and a node
+        // that has caught up stops calling `sync_batches` entirely -- without this the
+        // gauges would freeze at their high-water mark and read as a permanent backlog.
+        self.payload.publish_sizes();
         if resolved {
             self.payload.pending_payload.remove(&header_digest);
             // Mechanism A receipt-continuation (design doc step 3): the DELAYED

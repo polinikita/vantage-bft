@@ -20,7 +20,7 @@ use bytes::Bytes;
 use config::{Committee, Parameters, Protocol, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use log::info;
-use metrics::{start_prometheus_server, MetricReporter, Metrics};
+use metrics::{spawn_queue_sampler, start_prometheus_server, MetricReporter, Metrics, StoreProbe};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
@@ -431,6 +431,27 @@ impl Primary {
         // `JoinHandle`, so a dead subsystem leaves the process serving metrics and every
         // unrelated counter advancing. See `Metrics::install_panic_hook`.
         Metrics::install_panic_hook(metrics.clone());
+        // The primary's OWN store, which had no observability at all: the first cut of this
+        // instrument sampled only the worker's, so `store_actor_heartbeat_age_ms` was
+        // registered in this process and never written -- it read 0 forever, which is
+        // indistinguishable from perfect health. The primary runs its own store actor and
+        // its own per-key `notify_read` waiters (`vantage::payload::sync_batches`), so it is
+        // subject to the same permit-starvation class the worker wedged on. No pipeline
+        // channels here, hence the empty probe list.
+        spawn_queue_sampler(
+            Vec::new(),
+            {
+                let depth = store.clone();
+                let beat = store.clone();
+                let drained = store.clone();
+                StoreProbe {
+                    occupancy: Box::new(move || (depth.queue_depth(), depth.queue_capacity())),
+                    heartbeat_millis: Box::new(move || beat.heartbeat_millis()),
+                    commands_drained: Box::new(move || drained.commands_drained()),
+                }
+            },
+            metrics.clone(),
+        );
         reporter.clone().start();
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Primary {} metrics listening on {}", name, metrics_address);

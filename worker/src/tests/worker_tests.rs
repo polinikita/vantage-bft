@@ -63,13 +63,13 @@ async fn probe_reports_channel_occupancy() {
     let (tx, _rx) = channel::<u64>(4);
     let p = probe("under_test", tx.clone());
 
-    assert_eq!((p.read)(), (0, 4));
+    assert_eq!((p.occupancy)(), (0, 4));
 
     // `_rx` is held but never polled, so these stay buffered.
     tx.send(1).await.unwrap();
     tx.send(2).await.unwrap();
     tx.send(3).await.unwrap();
-    assert_eq!((p.read)(), (3, 4));
+    assert_eq!((p.occupancy)(), (3, 4));
 }
 
 /// The sampler publishes depth, peak and capacity for every probe plus the store.
@@ -90,9 +90,13 @@ async fn sampler_publishes_depth_peak_and_capacity() {
     tx.send(1).await.unwrap();
     tx.send(2).await.unwrap();
 
+    // A little traffic, so the drain counter has something to report.
+    let mut writer = store.clone();
+    writer.write(vec![9u8], vec![9u8]).await;
+
     spawn_queue_sampler(
         vec![probe("under_test", tx.clone())],
-        store,
+        store_probe(store),
         metrics.clone(),
     );
 
@@ -112,11 +116,10 @@ async fn sampler_publishes_depth_peak_and_capacity() {
         100
     );
 
-    // One publish interval plus a tick of margin.
-    tokio::time::sleep(Duration::from_millis(
-        QUEUE_SAMPLE_INTERVAL_MS * QUEUE_PUBLISH_EVERY as u64 + QUEUE_SAMPLE_INTERVAL_MS * 2,
-    ))
-    .await;
+    // One publish interval (1s) plus margin. Deliberately a literal rather than the
+    // sampler's own constants: those are private to `metrics`, and a test that reads them
+    // would pass even if the cadence were changed to something useless.
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
 
     assert_eq!(
         metrics
@@ -140,6 +143,19 @@ async fn sampler_publishes_depth_peak_and_capacity() {
             .with_label_values(&["store"])
             .get(),
         0
+    );
+    // The drain counter must have seen the write above -- this is the reading that
+    // separates a saturated actor from one whose permits are held by unpollable senders.
+    assert!(
+        metrics.store_commands_drained_total.get() >= 1,
+        "drain counter never advanced despite a completed write: {}",
+        metrics.store_commands_drained_total.get()
+    );
+    // Peak staleness is published too, and on an idle store it stays small.
+    assert!(
+        metrics.store_actor_heartbeat_age_ms_peak.get() < 500,
+        "store actor peak staleness too high for an idle test: {} ms",
+        metrics.store_actor_heartbeat_age_ms_peak.get()
     );
     assert!(
         metrics.store_actor_heartbeat_age_ms.get() < 500,

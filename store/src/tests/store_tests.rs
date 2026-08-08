@@ -178,3 +178,35 @@ async fn queue_depth_reports_occupancy() {
     assert_eq!(store.queue_depth(), 0);
     assert!(store.queue_depth() <= capacity);
 }
+
+/// The drain counter advances as commands are dequeued.
+///
+/// This is the discriminator `heartbeat_millis` cannot provide: `queue_depth` counts
+/// PERMITS HELD, so a full reading means either genuine saturation (drain advancing) or
+/// permits captured by never-polled `send()` futures (drain flat, queue actually empty).
+/// The 2026-08-08 wedge was the second, and was first misread as the first.
+#[tokio::test]
+async fn drain_counter_advances_with_dequeued_commands() {
+    let path = ".db_test_drain_counter";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+
+    assert_eq!(store.commands_drained(), 0);
+
+    for i in 0..5u8 {
+        store.write(vec![i], vec![i]).await;
+    }
+    // One read to force a round trip, so every preceding write is certainly dequeued.
+    let _ = store.read(vec![0u8]).await;
+    let after_writes = store.commands_drained();
+    assert!(
+        after_writes >= 6,
+        "expected >= 6 commands drained (5 writes + 1 read), got {after_writes}"
+    );
+
+    let _ = store.read(vec![1u8]).await;
+    assert!(
+        store.commands_drained() > after_writes,
+        "drain counter must be monotonic across further commands"
+    );
+}
