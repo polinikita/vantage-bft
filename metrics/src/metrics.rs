@@ -556,18 +556,13 @@ pub struct Metrics {
     /// congestion should climb to the maximum -- a fixed ceiling was a measured regression
     /// (node 96 deferred 9,224 requests while reporting zero drops).
     pub vantage_repair_emit_ceiling: IntGauge,
-    /// WHY `vantage_repair_emit_ceiling` was last halved, split by cause. Exists because a
-    /// gauge alone cannot answer it, and that ambiguity cost a full debugging cycle: on the
-    /// 2026-08-08 n=50/200k netem run the failed nodes reported `emit_ceiling` = 256 (the
-    /// floor) while BOTH inputs read zero -- `core_queue_peak` 0 and
-    /// `vantage_bulk_inbound_dropped_total` 0 in ABSOLUTE terms, not merely as a delta. One
-    /// of those three readings has to be wrong and a gauge cannot say which. These two
-    /// counters make the cause self-reporting: their sum must equal the number of halvings,
-    /// so a floored ceiling with both at zero is then a provable instrumentation bug rather
-    /// than an inference.
+    /// Legacy/control counter for emit-ceiling halvings caused by core-queue pressure.
+    /// Registered but deliberately never incremented in the queue-backoff ablation, so it
+    /// stays a stable zero while preserving dashboard and time-series compatibility with the
+    /// baseline arm. A nonzero value therefore proves the wrong binary is running.
     pub vantage_repair_ceiling_halved_by_queue: IntCounter,
-    /// Companion to `vantage_repair_ceiling_halved_by_queue`: halvings caused by NEW
-    /// bulk-inbound drops since the previous tick.
+    /// Emit-ceiling halvings caused by NEW bulk-inbound drops since the previous tick; the
+    /// only active halving cause in the queue-backoff ablation.
     pub vantage_repair_ceiling_halved_by_drops: IntCounter,
     /// Ticks on which `adapt_recovery_ceiling` ran and RAISED (or held at max) the ceiling.
     /// The denominator: if the ceiling is pinned at the floor, this distinguishes "the
@@ -1357,7 +1352,7 @@ impl Metrics {
             .unwrap(),
             vantage_repair_ceiling_halved_by_queue: register_int_counter_with_registry!(
                 "vantage_repair_ceiling_halved_by_queue",
-                "Repair emit-ceiling halvings caused by core-queue near-overflow",
+                "Legacy core-queue emit-ceiling halvings (zero in queue-backoff ablation)",
                 registry,
             )
             .unwrap(),

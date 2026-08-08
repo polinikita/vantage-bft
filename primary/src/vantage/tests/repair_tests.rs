@@ -988,24 +988,18 @@ async fn recovery_ceiling_grows_when_clean_and_backs_off_on_drops() {
     );
 }
 
-/// A deep-but-not-overflowing core queue must NOT throttle recovery -- the `adc6048`
-/// regression, reproduced exactly.
+/// Sustained core-queue pressure must not latch the emit ceiling at its floor.
 ///
-/// Measured on the 2026-08-07 n=100 run: all four degraded nodes sat at `emit_ceiling` =
-/// `RECOVERY_EMIT_MIN` deferring 38-61% of their repair demand (deferred 282-299/s against
-/// requested 192-245/s) while `vantage_bulk_inbound_dropped_total` was ZERO on all 100 nodes.
-/// The main queue really was deep -- but from availability crediting (128,942 refs/s), which
-/// repair cannot influence, against repair's own 193 requests/s. Backing off freed nothing and
-/// left a ~5,000-block gap unable to close.
+/// In the 5s-cadence 2026-08-08 n=100 run, 23 healthy nodes reached the 1000-slot cap for
+/// 1-3 samples and recovered. Three nodes stayed saturated, were halved on every tick to 256,
+/// and never recovered. This A/B removes only that queue input: the queue still caps one
+/// digest's fan-out width, and the 512-slot in-flight window still bounds invited answers.
 ///
-/// So a busy main queue must be ignored by this loop, and only NEAR-OVERFLOW (where consensus
-/// traffic is about to be shed) may back it off. The escalation-width cap keeps the lower
-/// threshold, because the duplicates IT suppresses genuinely are repair's own doing.
+/// The legacy queue-halving counter stays registered at zero so a benchmark can verify that
+/// it actually ran this arm. New bulk drops remain the attributed backoff signal.
 #[tokio::test]
-async fn a_busy_core_queue_does_not_throttle_recovery_but_near_overflow_does() {
-    use crate::vantage::repair::{
-        CORE_QUEUE_CONGESTED, CORE_QUEUE_NEAR_OVERFLOW, RECOVERY_EMIT_MAX, RECOVERY_EMIT_MIN,
-    };
+async fn sustained_core_queue_pressure_does_not_throttle_recovery_ceiling() {
+    use crate::vantage::repair::RECOVERY_EMIT_MAX;
     let (committee, keys) = Committee::local_benchmark(10, 1, 33_100);
     let registry = prometheus::Registry::new();
     let (metrics, _reporter) = metrics::Metrics::new(&registry);
@@ -1024,38 +1018,39 @@ async fn a_busy_core_queue_does_not_throttle_recovery_but_near_overflow_does() {
             .unwrap_or(0)
     };
 
-    // The adc6048 state: queue deep enough to have tripped the old threshold, zero drops.
-    rep.observe_core_queue(CORE_QUEUE_CONGESTED);
+    // Stronger than the measured state: keep reporting a maximally deep queue for every
+    // tick. With zero bulk drops, the emit ceiling must still climb to its cap.
+    rep.observe_core_queue(usize::MAX);
     for _ in 0..24 {
         rep.retry_requests();
     }
     assert_eq!(
         ceiling(),
         RECOVERY_EMIT_MAX,
-        "a busy-but-not-overflowing queue must not throttle: repair is ~0.15% of that load, \
-         so backing off cannot drain it and only blocks recovery"
+        "core-queue pressure is not an attributed emit-ceiling signal in this arm"
+    );
+    assert_eq!(
+        metrics.vantage_repair_ceiling_halved_by_queue.get(),
+        0,
+        "legacy counter must prove queue backoff is disabled"
     );
 
-    // Near overflow, consensus traffic is about to be shed -- back off whatever the cause.
-    rep.observe_core_queue(CORE_QUEUE_NEAR_OVERFLOW);
-    for _ in 0..40 {
-        rep.retry_requests();
-    }
+    // A real, attributed signal still halves the ceiling even with the same full queue.
+    metrics.vantage_bulk_inbound_dropped_total.inc();
+    rep.retry_requests();
     assert_eq!(
         ceiling(),
-        RECOVERY_EMIT_MIN,
-        "the near-overflow backstop must still engage"
+        RECOVERY_EMIT_MAX / 2,
+        "a new bulk drop must remain the backoff signal"
     );
 
-    // And it must recover once the queue drains, or one bad moment pins the node forever.
-    rep.observe_core_queue(0);
-    for _ in 0..24 {
-        rep.retry_requests();
-    }
+    // With no new drop, the ceiling recovers on the next tick despite sustained queue
+    // pressure. This is the precise latch behavior the experiment removes.
+    rep.retry_requests();
     assert_eq!(
         ceiling(),
         RECOVERY_EMIT_MAX,
-        "backstop must release when the queue drains"
+        "the queue must not latch recovery"
     );
 }
 
