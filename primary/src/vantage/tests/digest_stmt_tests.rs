@@ -11,6 +11,7 @@
 use super::common::*;
 use crate::vantage::agb::{
     DigestStatements, Echo, EchoDigest, Outcome, Ready, ReadyDigest, ReadyGrade, ViewProposal,
+    FETCH_WIDTH_START,
 };
 use crate::vantage::{Effect, Repairer};
 use crypto::{Digest, PublicKey};
@@ -641,5 +642,162 @@ async fn pending_fetch_is_capped_and_evicts_the_highest_views() {
     assert!(
         !digest_stmts.has_pending_fetch_for_test(total as u64),
         "the highest view survived; eviction is taking the wrong end"
+    );
+}
+
+/// Body fetch asks a NARROW set first and widens only on retry, instead of asking every
+/// buffered author every time.
+///
+/// The full fan-out was measured at 433,656 `VantageBodyFetch` on one 2026-08-08 n=100
+/// straggler against 53 on a healthy node -- 153 pending pairs x ~37 targets x 76 retry
+/// rounds -- at ~50us per send on the single consensus core, and at a network-wide answer
+/// rate of 7.8%.
+#[tokio::test]
+async fn body_fetch_starts_narrow_and_widens_on_retry() {
+    let all = authors();
+    let sid = test_sid();
+    let proposal = ViewProposal {
+        view: 1,
+        c: vec![(all[0].0, 1, Digest([7u8; 32]))],
+        t: Vec::new(),
+        m: None,
+    };
+    let digest = proposal.digest(&sid);
+
+    let (me, _) = all[3];
+    let mut agb = new_agb_engine(me);
+    let mut rep = dummy_repairer(me, ".db_test_fetch_width");
+    let mut ds = DigestStatements::new(TEST_DELTA_MS);
+
+    // Every author in the test committee buffers the same (view, digest). The committee
+    // is small, so full width is only a handful -- the point is that the FIRST ask is
+    // narrower than that, and widens only when it goes unanswered.
+    let mut t0 = Instant::now();
+    let count = |effects: &[Effect]| {
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::BodyFetchTo(_, 1, d) if *d == digest))
+            .count()
+    };
+
+    let mut widths = Vec::new();
+    for (n, (sender, _)) in all.iter().enumerate() {
+        let effects = ds.on_ready_digest(
+            ReadyDigest {
+                view: 1,
+                digest: digest.clone(),
+                grade: ReadyGrade::One,
+                sender: *sender,
+                wish: 0,
+            },
+            t0,
+            &mut agb,
+            &mut rep,
+        );
+        if n == 0 {
+            widths.push(count(&effects));
+        } else {
+            // Latched on the pair: buffering another author must not re-ask.
+            assert_eq!(
+                count(&effects),
+                0,
+                "the per-pair latch must suppress re-asks"
+            );
+        }
+    }
+    let full = ds.fetch_targets_len_for_test(1, &digest);
+    for _ in 0..2 {
+        t0 += Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1);
+        widths.push(count(&ds.retry_fetches(t0)));
+    }
+
+    // The first ask happens when only ONE author has buffered, so it is 1 here; what
+    // matters is that it is bounded by the width and strictly below the set the old code
+    // would have used once everyone buffered.
+    assert!(
+        widths[0] <= FETCH_WIDTH_START,
+        "the first ask must be bounded by the start width: {widths:?}"
+    );
+    assert!(
+        widths[0] < full,
+        "the first ask must be narrower than the full buffered set: {widths:?} (full={full})"
+    );
+    assert!(
+        widths[1] > widths[0],
+        "an unanswered ask must widen: {widths:?}"
+    );
+    assert!(
+        widths.iter().all(|w| *w <= full),
+        "never exceed the buffered set: {widths:?} (full={full})"
+    );
+}
+
+/// A pair is ABANDONED after the attempt cap rather than re-asked forever -- and is
+/// re-created by the next statement for that view, which is what makes abandoning safe.
+#[tokio::test]
+async fn body_fetch_is_abandoned_after_the_cap_and_recreated_by_a_new_statement() {
+    let all = authors();
+    let sid = test_sid();
+    let proposal = ViewProposal {
+        view: 1,
+        c: vec![(all[0].0, 1, Digest([5u8; 32]))],
+        t: Vec::new(),
+        m: None,
+    };
+    let digest = proposal.digest(&sid);
+
+    let (me, _) = all[3];
+    let mut agb = new_agb_engine(me);
+    let mut rep = dummy_repairer(me, ".db_test_fetch_abandon");
+    let mut ds = DigestStatements::new(TEST_DELTA_MS);
+
+    let (sender, _) = all[0];
+    let mut t = Instant::now();
+    ds.on_ready_digest(
+        ReadyDigest {
+            view: 1,
+            digest: digest.clone(),
+            grade: ReadyGrade::One,
+            sender,
+            wish: 0,
+        },
+        t,
+        &mut agb,
+        &mut rep,
+    );
+    assert_eq!(ds.pending_fetch_count_for_test(), 1);
+
+    // Retry past the cap. Nothing answers, so the pair must be dropped rather than
+    // keep paying fan-out for the rest of the run.
+    for _ in 0..8 {
+        t += Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1);
+        ds.retry_fetches(t);
+    }
+    assert_eq!(
+        ds.pending_fetch_count_for_test(),
+        0,
+        "an unanswerable pair must be abandoned, not retried forever"
+    );
+
+    // The safety argument: a later statement for the same view re-creates it, so
+    // abandoning is "stop spending until the view proves it is still live", not
+    // "never fetch this again".
+    let (sender2, _) = all[1];
+    ds.on_ready_digest(
+        ReadyDigest {
+            view: 1,
+            digest: digest.clone(),
+            grade: ReadyGrade::One,
+            sender: sender2,
+            wish: 0,
+        },
+        t,
+        &mut agb,
+        &mut rep,
+    );
+    assert_eq!(
+        ds.pending_fetch_count_for_test(),
+        1,
+        "a fresh statement must revive the fetch"
     );
 }

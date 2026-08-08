@@ -845,6 +845,49 @@ const RECHECK_BUDGET: usize = 64;
 /// stopped resolving. See `ensure_fetch` for why eviction takes the HIGHEST views.
 pub(crate) const MAX_PENDING_FETCH: usize = 1_024;
 
+/// Buffered authors asked on a pair's FIRST body fetch, doubling per retry.
+///
+/// `ensure_fetch` used to ask EVERY buffered author of the pair, every retry, forever.
+/// Measured on the 2026-08-08 n=100 netem run, on a node whose core was 96% busy:
+/// **433,656 `VantageBodyFetch` sent against 53 on a healthy node** -- 153 pending pairs x
+/// ~37 targets x 76 retry rounds (`fetch_retry_interval` is `delta_ms * 8` = 1.6s). Those
+/// sends are executed on the core thread at a measured ~50 us each, which accounts for
+/// roughly 22s of the node's +29.8s `effect_execution` excess.
+///
+/// And they are overwhelmingly wasted: this module's own note at `ensure_fetch` records a
+/// network-wide body-fetch answer rate of **7.8%**, against 85.2% for header repair,
+/// because a stalled node's fetches name views the rest of the committee has already
+/// pruned. Asking 37 peers for something ~92% of them cannot answer is the wrong shape.
+///
+/// Mirrors the staged escalation `Repairer` already uses for header repair (see
+/// `repair::FanoutState`): start narrow, widen only if the narrow ask goes unanswered.
+pub(crate) const FETCH_WIDTH_START: usize = 2;
+
+/// Retries after which a pair is ABANDONED rather than asked again.
+///
+/// The width doubling alone does not bound anything: after ~5 retries it reaches full
+/// width and a pair that can never be answered keeps paying full fan-out for the rest of
+/// the run -- which is exactly the measured state. What bounds it is giving up.
+///
+/// Dropping a pair is free, and this module already relies on that: see `ensure_fetch`'s
+/// eviction note -- `on_echo_digest`/`on_ready_digest` re-create the pair on the next
+/// statement arrival for that view, and `buffered_echo`/`buffered_ready` retain the
+/// statement regardless. So abandoning is not "never fetch this again": it is "stop
+/// spending until something tells us the view is still live". A view that has genuinely
+/// gone quiet is one the committee has moved past, and fetching its body cannot help.
+///
+/// 4 attempts at widths 2/4/8/16 is 30 messages per pair, against the 2,812 measured.
+const MAX_FETCH_ATTEMPTS: u32 = 4;
+
+/// Per-pair body-fetch progress: when it was last asked, how wide to ask next, and how
+/// many times it has been asked. See `FETCH_WIDTH_START` / `MAX_FETCH_ATTEMPTS`.
+#[derive(Clone, Copy, Debug)]
+struct FetchState {
+    last: Instant,
+    next_width: usize,
+    attempts: u32,
+}
+
 /// The <= `budget` views one budgeted `recheck_all` call scans: ring order over
 /// `pending`, starting at `cursor` and wrapping to the smallest view once the
 /// upper range is exhausted. Returns the whole set (ascending) whenever it fits
@@ -2651,7 +2694,7 @@ pub struct DigestStatements {
     /// fan-out. Mirrors `control::ControlLog::pending_fetch`'s identical role, with
     /// an `Instant` clock standing in for that type's `Round` one -- an AGB view has
     /// no per-view round counter of its own to retry against.
-    pending_fetch: BTreeMap<(View, Digest), Instant>,
+    pending_fetch: BTreeMap<(View, Digest), FetchState>,
     /// Per-requester serve dedup on the answering side: at most one `VantageBodyServe`
     /// per (view, digest, requester), ever. Mirrors `control::ControlLog::
     /// fetch_answered` exactly.
@@ -2913,11 +2956,29 @@ impl DigestStatements {
             return Vec::new();
         }
         let key = (view, digest.clone());
+        // Width and attempt count carried forward from any previous attempt on this pair.
+        let mut width = FETCH_WIDTH_START;
+        let mut attempts = 0;
         match self.pending_fetch.get(&key) {
-            Some(&last) if now.saturating_duration_since(last) < self.fetch_retry_interval => {
+            Some(state)
+                if now.saturating_duration_since(state.last) < self.fetch_retry_interval =>
+            {
                 return Vec::new();
             }
-            _ => {}
+            Some(state) => {
+                // Give up rather than keep paying full fan-out for a pair nobody answers.
+                // Safe to forget entirely -- see `MAX_FETCH_ATTEMPTS`.
+                if state.attempts >= MAX_FETCH_ATTEMPTS {
+                    self.pending_fetch.remove(&key);
+                    if let Some(metrics) = &self.metrics {
+                        metrics.vantage_body_fetch_abandoned_total.inc();
+                    }
+                    return Vec::new();
+                }
+                width = state.next_width;
+                attempts = state.attempts;
+            }
+            None => {}
         }
         // n=100 straggler fix (2026-08-08): bound `pending_fetch`. It is cleared only by
         // a successful serve/local-fix or by `gc_below`, whose floor is
@@ -2959,8 +3020,19 @@ impl DigestStatements {
                 return Vec::new();
             }
         }
-        self.pending_fetch.insert(key, now);
-        let targets = self.fetch_targets(view, &digest);
+        self.pending_fetch.insert(
+            key,
+            FetchState {
+                last: now,
+                next_width: width.saturating_mul(2),
+                attempts: attempts + 1,
+            },
+        );
+        // `fetch_targets` is deterministic (a `BTreeSet` of public keys), so truncating
+        // takes a STABLE prefix: a retry that widens strictly adds peers rather than
+        // re-rolling the set, and every peer asked at width w is still asked at 2w.
+        let mut targets = self.fetch_targets(view, &digest);
+        targets.truncate(width);
         if let Some(metrics) = &self.metrics {
             for _ in &targets {
                 metrics.vantage_body_fetches_sent.inc();
@@ -3144,7 +3216,9 @@ impl DigestStatements {
         let due: Vec<(View, Digest)> = self
             .pending_fetch
             .iter()
-            .filter(|(_, &last)| now.saturating_duration_since(last) >= self.fetch_retry_interval)
+            .filter(|(_, state)| {
+                now.saturating_duration_since(state.last) >= self.fetch_retry_interval
+            })
             .map(|(k, _)| k.clone())
             .collect();
         let mut effects = Vec::new();
@@ -3166,6 +3240,11 @@ impl DigestStatements {
 
     /// Is any fetch pending for `view`? Lets the cap test assert on WHICH end eviction
     /// takes without exposing the map itself.
+    #[cfg(test)]
+    pub(crate) fn fetch_targets_len_for_test(&self, view: View, digest: &Digest) -> usize {
+        self.fetch_targets(view, digest).len()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_pending_fetch_for_test(&self, view: View) -> bool {
         self.pending_fetch.keys().any(|(v, _)| *v == view)

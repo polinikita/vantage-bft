@@ -849,6 +849,13 @@ pub struct Metrics {
     /// short-circuits on a memo, orders of magnitude larger once a hole forces full
     /// re-walks. A straggler whose walk-step rate is NOT elevated refutes the hypothesis.
     pub vantage_walk_steps_total: IntCounterVec,
+    /// Body-fetch pairs given up on after `MAX_FETCH_ATTEMPTS` rather than asked again.
+    ///
+    /// Abandoning is safe and re-creatable (see `MAX_FETCH_ATTEMPTS`), so a healthy rate
+    /// here is not an error -- it is the mechanism working. What it bounds: a stalled node
+    /// sent 433,656 body fetches in 120s against 53 on a healthy peer, at a network-wide
+    /// answer rate of 7.8%, each send costing ~50us on the single consensus core.
+    pub vantage_body_fetch_abandoned_total: IntCounter,
     /// Panics observed by this process's panic hook (`install_panic_hook`).
     ///
     /// tokio silently absorbs a panicking task: the panic travels in the `JoinHandle`,
@@ -1594,6 +1601,12 @@ impl Metrics {
                 "vantage_walk_steps_total",
                 "Nodes visited by the O(gap) prefix walks, by family",
                 &["family"],
+                registry,
+            )
+            .unwrap(),
+            vantage_body_fetch_abandoned_total: register_int_counter_with_registry!(
+                "vantage_body_fetch_abandoned_total",
+                "Body-fetch pairs abandoned after the attempt cap rather than re-asked",
                 registry,
             )
             .unwrap(),
