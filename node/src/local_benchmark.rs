@@ -559,6 +559,21 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                                 p.control_delivered_len, p.control_consume_pos,
                                 p.own_watermark, p.entry_target, p.omega_q, p.block_cache_len
                             );
+                            // Walk-step totals, on their own grep-parseable line so the
+                            // existing timeline parser is untouched. These are the three
+                            // O(gap) prefix walks (`vantage_walk_steps_total`); a victim's
+                            // rate exploding while a peer's stays flat is what confirms
+                            // the un-memoized-negative-walk hypothesis, and a victim whose
+                            // rate does NOT rise refutes it.
+                            let w = read_counter_vec(registry, "vantage_walk_steps_total", "family");
+                            println!(
+                                "WALK: sec={} node={} chain={} direct={} settle={} blocks={}",
+                                elapsed, i,
+                                w.get("chain").copied().unwrap_or(0),
+                                w.get("direct").copied().unwrap_or(0),
+                                w.get("settle").copied().unwrap_or(0),
+                                read_counter(registry, "vantage_blocks_received"),
+                            );
                         }
                     }
                     let mut committed_by_node: std::collections::BTreeMap<usize, u64> =

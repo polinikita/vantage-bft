@@ -93,6 +93,25 @@ impl BlockEntry {
 pub struct BlockCache {
     by_digest: HashMap<Digest, BlockEntry>,
     by_author: HashMap<PublicKey, BTreeMap<Height, HashSet<Digest>>>,
+    /// Total nodes visited by `verified_prefix_through_genesis` / `direct_prefix_ok`
+    /// since construction, monotonic.
+    ///
+    /// Both walks memoize only SUCCESS (`chain_verified` / `direct_prefix_verified`; see
+    /// those fields' doc comments -- "a failed check never caches `false`"). So a cached
+    /// suffix sitting above a MISSING block is re-walked, in full, on every call, and
+    /// these predicates are called per inbound message via `recheck_all` and per publish
+    /// via `refresh_author`. The 2026-08-08 n=100 straggler hypothesis is that this is
+    /// where a pinned node's core goes: 10/100 nodes ran their core at 97% busy with
+    /// `inbound_dispatch` and `effect_execution` each ~2.5x healthy, on FEWER messages and
+    /// FEWER settle calls than healthy nodes -- i.e. the cost is per-event, ~99 us/message
+    /// against ~39 us healthy, which volume-based explanations cannot produce.
+    ///
+    /// Plain `u64` rather than a metrics counter: incrementing a labeled Prometheus
+    /// counter per visited node would itself be a hot-path cost of the same order as the
+    /// step being counted. Flushed once a second by `VantageCore::sample_metrics`, the
+    /// convention this module already uses for `vantage_block_cache_len`.
+    walk_steps_chain: u64,
+    walk_steps_direct: u64,
 }
 
 impl BlockCache {
@@ -102,6 +121,14 @@ impl BlockCache {
 
     pub fn get(&self, h: &Digest) -> Option<&BlockEntry> {
         self.by_digest.get(h)
+    }
+
+    /// Monotonic walk-step totals `(chain, direct)` -- see `walk_steps_chain`. Read as a
+    /// delta against the previous sample; the ratio to `blocks_received` is the diagnostic
+    /// (expected <= ~2x when every walk short-circuits, orders of magnitude above that
+    /// when a hole forces full re-walks).
+    pub fn walk_steps(&self) -> (u64, u64) {
+        (self.walk_steps_chain, self.walk_steps_direct)
     }
 
     /// Entries held, exported as `vantage_block_cache_len`. Measured at 4,286 bytes of
@@ -320,23 +347,30 @@ impl BlockCache {
         let mut expected_height = start.block.height;
         let mut cur = h.clone();
         let mut newly_walked: Vec<Digest> = Vec::new();
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
             if &cur == genesis {
                 if expected_height != 0 {
+                    self.walk_steps_direct += steps;
                     return false;
                 }
                 break;
             }
             if expected_height == 0 {
+                self.walk_steps_direct += steps;
                 return false; // ran out of height before reaching genesis
             }
             let Some(entry) = self.by_digest.get(&cur) else {
+                self.walk_steps_direct += steps;
                 return false;
             };
             if !entry.pinned_at(author, expected_height) {
+                self.walk_steps_direct += steps;
                 return false; // cross-author graft (§1 "one author index") or height gap
             }
             if !(entry.direct && entry.payload_ok) {
+                self.walk_steps_direct += steps;
                 return false;
             }
             if entry.direct_prefix_verified {
@@ -346,6 +380,7 @@ impl BlockCache {
             cur = entry.block.parent_cert.header_digest.clone();
             expected_height -= 1;
         }
+        self.walk_steps_direct += steps;
         for d in &newly_walked {
             if let Some(e) = self.by_digest.get_mut(d) {
                 e.direct_prefix_verified = true;
@@ -397,23 +432,30 @@ impl BlockCache {
         let mut expected_height = start.block.height;
         let mut cur = h.clone();
         let mut newly_walked: Vec<Digest> = Vec::new();
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
             if &cur == genesis {
                 if expected_height != 0 {
+                    self.walk_steps_chain += steps;
                     return false;
                 }
                 break;
             }
             if expected_height == 0 {
+                self.walk_steps_chain += steps;
                 return false;
             }
             let Some(entry) = self.by_digest.get(&cur) else {
+                self.walk_steps_chain += steps;
                 return false;
             };
             if !entry.pinned_at(author, expected_height) {
+                self.walk_steps_chain += steps;
                 return false; // cross-author graft (§1 "one author index") or height gap
             }
             if !entry.block_ok_verified {
+                self.walk_steps_chain += steps;
                 return false;
             }
             if entry.chain_verified {
@@ -423,6 +465,7 @@ impl BlockCache {
             cur = entry.block.parent_cert.header_digest.clone();
             expected_height -= 1;
         }
+        self.walk_steps_chain += steps;
         for d in &newly_walked {
             if let Some(e) = self.by_digest.get_mut(d) {
                 e.chain_verified = true;

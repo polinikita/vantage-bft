@@ -533,6 +533,12 @@ pub struct VantageCore {
     ut_avail_flush: Option<IntCounter>,
     ut_resume_tick: Option<IntCounter>,
     ut_metrics_tick: Option<IntCounter>,
+    /// Last published `(chain, direct, settle)` walk-step totals, so `sample_metrics` can
+    /// emit DELTAS into `vantage_walk_steps_total` (a Prometheus counter) from three
+    /// monotonic in-process `u64`s. The counters themselves live where the walks are
+    /// (`BlockCache`, `Repairer`) because incrementing a labeled metric per visited node
+    /// would cost as much as the step being counted.
+    walk_steps_published: (u64, u64, u64),
     ut_header_seal: Option<IntCounter>,
     /// Running max of `rx_vantage.len()` since the last 1 Hz publish -- see
     /// `Metrics::core_queue_peak`.
@@ -883,6 +889,7 @@ impl VantageCore {
             ut_avail_flush: None,
             ut_resume_tick: None,
             ut_metrics_tick: None,
+            walk_steps_published: (0, 0, 0),
             ut_header_seal: None,
             queue_len_peak: 0,
             recheck_pending: false,
@@ -1818,7 +1825,28 @@ impl VantageCore {
         }
     }
 
-    fn sample_metrics(&self) {
+    fn sample_metrics(&mut self) {
+        // Walk-step deltas first, and via a scoped borrow: the three totals live in
+        // `BlockCache`/`Repairer` and this needs `&mut self.walk_steps_published`, which
+        // cannot coexist with the long `metrics` borrow the rest of this function holds.
+        if self.metrics.is_some() {
+            let chain_direct = self.lm.blocks_handle().lock().walk_steps();
+            let now = (chain_direct.0, chain_direct.1, self.rep.walk_steps_settle());
+            let prev = self.walk_steps_published;
+            if let Some(metrics) = &self.metrics {
+                for (family, cur, was) in [
+                    ("chain", now.0, prev.0),
+                    ("direct", now.1, prev.1),
+                    ("settle", now.2, prev.2),
+                ] {
+                    metrics
+                        .vantage_walk_steps_total
+                        .with_label_values(&[family])
+                        .inc_by(cur.saturating_sub(was));
+                }
+            }
+            self.walk_steps_published = now;
+        }
         let Some(metrics) = &self.metrics else { return };
         metrics
             .vantage_entered_view

@@ -834,6 +834,21 @@ pub struct Metrics {
     /// `(digest, worker_id)` ever synced, never removed) and so grew without bound for the
     /// life of the process; now pruned, and this is how that stays true.
     pub vantage_last_synchronize_len: IntGauge,
+    /// Nodes visited by the three O(gap) prefix walks, by `family`:
+    /// `chain` (`verified_prefix_through_genesis`), `direct` (`direct_prefix_ok`),
+    /// `settle` (`Repairer::settle`'s descend).
+    ///
+    /// All three memoize SUCCESS only, so a cached suffix above a MISSING block is
+    /// re-walked in full on every call -- and all three are called per inbound message
+    /// (`recheck_all`) or per publish (`refresh_author`). This family exists to test that
+    /// as the cause of the 2026-08-08 n=100 straggler tail, where 10/100 nodes ran their
+    /// core at 97% busy on FEWER messages and FEWER settle calls than healthy nodes
+    /// (~99 us/message against ~39 us), which no volume-based explanation fits.
+    ///
+    /// Read as a ratio to `blocks_received`: bounded (order 1x) when every walk
+    /// short-circuits on a memo, orders of magnitude larger once a hole forces full
+    /// re-walks. A straggler whose walk-step rate is NOT elevated refutes the hypothesis.
+    pub vantage_walk_steps_total: IntCounterVec,
     /// Panics observed by this process's panic hook (`install_panic_hook`).
     ///
     /// tokio silently absorbs a panicking task: the panic travels in the `JoinHandle`,
@@ -1572,6 +1587,13 @@ impl Metrics {
             vantage_last_synchronize_len: register_int_gauge_with_registry!(
                 "vantage_last_synchronize_len",
                 "Size of the per-key Synchronize rate-limit map",
+                registry,
+            )
+            .unwrap(),
+            vantage_walk_steps_total: register_int_counter_vec_with_registry!(
+                "vantage_walk_steps_total",
+                "Nodes visited by the O(gap) prefix walks, by family",
+                &["family"],
                 registry,
             )
             .unwrap(),

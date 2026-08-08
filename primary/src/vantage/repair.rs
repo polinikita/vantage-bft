@@ -277,6 +277,16 @@ pub struct Repairer {
 
     /// §6.4 counters; `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
+    /// Nodes visited by `settle`'s descend since construction, monotonic.
+    ///
+    /// The third of the three walk counters (see `BlockCache::walk_steps_chain`). `settle`
+    /// descends through the cached-but-unsettled suffix on every authorized tip, and the
+    /// `blocked_at` index is consulted only by `on_block_available`, never during the
+    /// descend itself -- so a node with a hole re-descends the whole suffix per authorized
+    /// tip. Measured 51.4k fan-out misses on a 2026-08-08 n=100 straggler against 27 on a
+    /// healthy node. Plain `u64` for the same reason as the other two: a labeled counter
+    /// increment per visited node would cost as much as the step it counts.
+    walk_steps_settle: u64,
 }
 
 impl Repairer {
@@ -321,6 +331,7 @@ impl Repairer {
             pending_req: HashMap::new(),
             answered: HashSet::new(),
             metrics: None,
+            walk_steps_settle: 0,
         }
     }
 
@@ -1040,6 +1051,11 @@ impl Repairer {
     /// Net effect: identical `settled`/`requested_hashes`/`requested` mutations,
     /// identical `Effect`s in identical order, identical return value -- just O(1) stack
     /// depth instead of O(chain length).
+    /// Monotonic total for `settle`'s descend -- see `walk_steps_settle`.
+    pub(crate) fn walk_steps_settle(&self) -> u64 {
+        self.walk_steps_settle
+    }
+
     fn settle(&mut self, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
         self.settle_calls += 1;
         if let Some(metrics) = &self.metrics {
@@ -1047,7 +1063,12 @@ impl Repairer {
         }
         let mut cur = r;
         let mut frames: Vec<BlockRef> = Vec::new();
+        // Nodes visited by this descend, accumulated into `walk_steps_settle` on exit --
+        // see that field. Counted per iteration including the terminating one, matching
+        // `BlockCache`'s two walk counters so the three are directly comparable.
+        let mut steps: u64 = 0;
         let verified = loop {
+            steps += 1;
             if self.settled.contains(&cur) {
                 break true;
             }
@@ -1144,6 +1165,7 @@ impl Repairer {
             frames.push(cur);
             cur = parent_ref;
         };
+        self.walk_steps_settle += steps;
 
         if verified {
             while let Some(frame) = frames.pop() {
