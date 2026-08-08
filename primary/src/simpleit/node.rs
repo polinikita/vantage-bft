@@ -580,6 +580,7 @@ impl SimpleItCore {
                 store,
                 tx_payload_ready,
                 tx_output,
+                last_synchronize: HashMap::new(),
             },
             cut,
             pending_timers: FuturesUnordered::new(),

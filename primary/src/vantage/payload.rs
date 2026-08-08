@@ -16,6 +16,7 @@ use crate::vantage::wire::Wire;
 use config::WorkerId;
 use crypto::{Digest, PublicKey};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::Sender;
 
@@ -39,7 +40,26 @@ pub struct PayloadIo {
     /// `node::main`'s `analyze(rx_output)` loop returning on a closed channel is what
     /// hit the `unreachable!()` right after every primary's boot line.
     pub(crate) tx_output: Sender<Header>,
+
+    /// Last time a `Synchronize` actually went to a worker for this `(digest, worker_id)`,
+    /// so a re-send is a RETRY rather than an unbounded repeat. See
+    /// `SYNCHRONIZE_RESEND_MIN_INTERVAL`.
+    pub(crate) last_synchronize: HashMap<(Digest, WorkerId), Instant>,
 }
+
+/// Minimum gap between two `Synchronize` messages naming the same `(digest, worker_id)`.
+///
+/// `sync_batches` used to re-send EVERY still-missing entry on EVERY call, deliberately, as
+/// a transport retry for a lost primary-to-worker message. Measured on the 2026-08-08 n=50
+/// @200k netem run, that turned into request amplification on exactly the nodes that could
+/// least afford it: a node whose worker had stopped materialising had every arriving header
+/// re-request its whole missing set, producing **~600 Synchronize/s against ~11/s on a
+/// healthy node** -- all of it aimed at a worker that was already not draining its store
+/// queue. The retry is still wanted; repeating it per header arrival is not.
+///
+/// One second matches `Parameters::sync_retry_delay`'s own order for the worker-side retry,
+/// so the two layers do not beat against each other.
+const SYNCHRONIZE_RESEND_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
 
 impl PayloadIo {
     /// D1/§1: ask our own workers to sync `missing` batches for `author`'s block
@@ -81,12 +101,26 @@ impl PayloadIo {
                 .collect::<Vec<_>>()
         };
 
-        // `missing` was produced by a fresh local-store probe. Resend every unique
-        // still-missing entry, including one already pending, so a duplicate accepted
-        // SERVE can retry a lost primary-to-worker Synchronize message. Only waiter
-        // creation is restricted to `newly_pending` below.
+        // `missing` was produced by a fresh local-store probe, so re-sending a still-pending
+        // entry is a legitimate retry for a lost primary-to-worker Synchronize -- but only at
+        // a bounded rate. Send an entry when it is newly pending, or when its last send is
+        // older than `SYNCHRONIZE_RESEND_MIN_INTERVAL`; skip it otherwise. Without the gate
+        // every arriving header re-requested the whole missing set, measured at ~600
+        // Synchronize/s on a wedged node against ~11/s healthy. Waiter creation stays
+        // restricted to `newly_pending` regardless.
+        let now = Instant::now();
+        let newly: HashSet<(Digest, WorkerId)> = newly_pending.iter().cloned().collect();
         let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
         for (digest, worker_id) in &requested {
+            let key = (digest.clone(), *worker_id);
+            let due = newly.contains(&key)
+                || self.last_synchronize.get(&key).is_none_or(|last| {
+                    now.duration_since(*last) >= SYNCHRONIZE_RESEND_MIN_INTERVAL
+                });
+            if !due {
+                continue;
+            }
+            self.last_synchronize.insert(key, now);
             by_worker
                 .entry(*worker_id)
                 .or_default()

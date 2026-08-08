@@ -391,6 +391,20 @@ impl Synchronizer {
                             retry.push(digest.clone());
                         }
                     }
+                    // REFRESH the timestamps of everything just retried, or this is not a
+                    // retry timer -- it is a re-broadcast-everything-forever timer. The
+                    // timestamp is set once at `pending.insert` and was never updated here,
+                    // so a digest that went one `sync_retry_delay` without arriving was
+                    // re-broadcast on EVERY subsequent tick for as long as it stayed
+                    // pending: unbounded request amplification, growing with the size of the
+                    // backlog, aimed at a worker that is by definition already behind.
+                    // Measured on the 2026-08-08 n=50 @200k netem run alongside the
+                    // primary-side twin in `vantage::payload::sync_batches`.
+                    for digest in &retry {
+                        if let Some((_, _, timestamp)) = self.pending.get_mut(digest) {
+                            *timestamp = now;
+                        }
+                    }
                     if !retry.is_empty() {
                         let message = WorkerMessage::BatchRequest(retry, self.name);
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");

@@ -866,6 +866,7 @@ impl VantageCore {
                 store,
                 tx_payload_ready,
                 tx_output,
+                last_synchronize: HashMap::new(),
             },
             // Clamped to >= 1: a window of 0 would place the GC floor at the resolved
             // watermark itself and prune state for the view being resolved.
