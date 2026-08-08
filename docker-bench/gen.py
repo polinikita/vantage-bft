@@ -338,15 +338,25 @@ def render_tc_script(i: int, n: int, iface_hint: str, enabled: bool) -> str:
         # netem's own default is 1000 PACKETS per qdisc and it tail-drops past it
         # SILENTLY -- no error, no log, and the loss lands inside the emulated WAN where
         # it reads as protocol packet loss. A delay qdisc must hold the whole
-        # bandwidth-delay product: in-flight packets per class ~= per-peer pps x one-way
-        # delay, so at n=50 / 200k tx/s (~2 MB/s per peer) and ~105 ms one-way that is
-        # ~1,400 packets at 1500 B MTU -- over the default. Worse, it is latency-tiered
-        # by construction: the highest-RTT classes hit the cap FIRST, so the artifact
-        # concentrates on exactly the regions a real WAN failure would, and a local
-        # repro would chase a ghost. wan-bench already sets this (prepare.py's
-        # `netem limit`); docker-bench did not, which made it unusable for netem repros
-        # at n=50+. 100k packets is far above any plausible in-flight count here and
-        # costs only queue headroom (netem allocates lazily).
+        # bandwidth-delay product: in-flight bytes per class = per-peer rate x one-way delay.
+        #
+        # HOW MUCH HEADROOM THE DEFAULT ACTUALLY HAS, measured rather than guessed (AWS
+        # n=50 @ 200k tx/s under netem): 102.66 MB/s per node across 49 peers = 2.10 MB/s
+        # per peer, ~4.2 MB/s bidirectional per link. At the worst region pair's 154 ms
+        # one-way that is 323,693 B in flight = ~216 packets at 1500 B MTU -- only 22% of
+        # netem's 1000-packet default, and with TSO/GSO the kernel queues large skbs so the
+        # real count is a handful. The default was therefore NOT being exceeded at that
+        # scale. An earlier version of this comment claimed ~1,400 packets and was wrong by
+        # roughly an order of magnitude.
+        #
+        # Set anyway, because the margin is finite and the failure is silent: 1000 packets
+        # x 1500 B / 154 ms is ~9.7 MB/s per peer, so the default binds at about 4.6x this
+        # rate -- reachable by raising the offered load, and sooner on bursty traffic. It is
+        # also LATENCY-TIERED, so the highest-RTT classes hit any cap first and the artifact
+        # would concentrate on exactly the regions a real WAN failure does, making a local
+        # repro chase a ghost. wan-bench already sets it (prepare.py's `netem limit`);
+        # docker-bench did not. 100k packets costs only queue headroom -- netem allocates
+        # lazily.
         lines.append(f'tc qdisc add dev "$IFACE" parent 1:{mid} handle {mid}: '
                      f'netem limit {NETEM_LIMIT_PKTS} delay {delay:.1f}ms')
         lines.append(
