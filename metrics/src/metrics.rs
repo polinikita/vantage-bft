@@ -15,11 +15,16 @@
 use std::{
     ops::AddAssign,
     sync::{
-        atomic::{AtomicBool, AtomicU64},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         Arc, Mutex,
     },
     time::Duration,
 };
+
+/// Process-wide panic tally, owned by `Metrics::install_panic_hook`'s singleton hook
+/// rather than by any one `Metrics` instance -- `node local-benchmark` runs N nodes,
+/// and therefore N registries, inside one process and one hook.
+static PROCESS_PANICS: AtomicU64 = AtomicU64::new(0);
 
 use prometheus::{
     core::{Collector, Desc},
@@ -624,6 +629,70 @@ pub struct Metrics {
     /// missing the sub-second bursts that matter (a core that is CPU-bound shows a
     /// growing peak even while the instantaneous sample keeps returning ~0).
     pub core_queue_peak: IntGauge,
+
+    // --- Worker-process observability (2026-08-08 wedge post-mortem).
+    //
+    // Under n=50 @ 200k tx/s with real netem queues, 5-8/50 nodes stopped committing
+    // while their PRIMARIES stayed healthy -- cursor advancing, seal mix normal. The
+    // worker's `network_bytes_received{Batch}` delta was exactly 0 on those nodes,
+    // worker CPU 10s against 74s healthy, and the primary was sending its own worker
+    // ~600 `Synchronize`/s against ~11/s. Everything touching the worker's `Store`
+    // froze together and nothing else did.
+    //
+    // Diagnosing that took a raw-scrape review and four refuted hypotheses, for one
+    // structural reason: between `submitted_transactions` and
+    // `committed_transactions` -- two counters in two different processes -- the
+    // worker published NOTHING about its own internal pipeline. Every bounded channel
+    // between the two was invisible, so a wedge in any of them looked identical from
+    // the outside to a slow primary. These three families close that gap.
+    /// Occupancy of each bounded worker channel, sampled at 10 Hz by
+    /// `Worker::spawn`'s sampler task and published once a second. Labels are the
+    /// pipeline stages the channel feeds: `synchronizer` (primary -> worker
+    /// `Synchronize`, the path that carried the 600/s flood), `batch_maker` (client
+    /// transactions), `processor_own` (our sealed batches), `processor_peer` (batches
+    /// from other workers -- the path that read a flat zero), `helper` (peer batch
+    /// requests), `primary_connector` (worker -> primary digests), and `store` (the
+    /// store actor's own command channel).
+    ///
+    /// A wedge shows as one or more of these pinned at `worker_queue_capacity`; which
+    /// ones are pinned localises it to a stage without a debugger. Absent on the
+    /// primary process, which has no worker channels.
+    pub worker_queue_depth: IntGaugeVec,
+    /// Peak `worker_queue_depth` over the second preceding each publish, reset on
+    /// publish -- the same instantaneous-vs-burst argument as `core_queue_peak`. A
+    /// channel that is momentarily full 5 times a second reads ~0 on every 1 Hz
+    /// instantaneous sample.
+    pub worker_queue_peak: IntGaugeVec,
+    /// The bound each labeled channel was constructed with, so a dashboard plots
+    /// occupancy as a fraction without hard-coding `CHANNEL_CAPACITY` (1000) or the
+    /// store actor's own 100. Write-once at boot; same label set as the two above.
+    pub worker_queue_capacity: IntGaugeVec,
+    /// Milliseconds since the store actor last COMPLETED a `select!` iteration (see
+    /// `store::Store::heartbeat_millis`). Steady state is under
+    /// `FLUSH_INTERVAL_MS` (50) because the flush ticker fires unconditionally, so
+    /// this is load-independent and a large value is always a real stall.
+    ///
+    /// This is the reading that separates the two live hypotheses for the wedge, and
+    /// it does so remotely, from a scrape, with no thread dump: a **blocked** actor
+    /// (RocksDB write stall, cold `db.get`) shows a growing age with the channel
+    /// pinned full, whereas a **dead** actor (task panic) shows the same growing age
+    /// alongside a nonzero `process_panics_total`.
+    pub store_actor_heartbeat_age_ms: IntGauge,
+    /// Panics observed by this process's panic hook (`install_panic_hook`).
+    ///
+    /// tokio silently absorbs a panicking task: the panic travels in the `JoinHandle`,
+    /// and every task in this codebase is spawned fire-and-forget, so a dead subsystem
+    /// leaves the process alive, the metrics server answering, and every OTHER counter
+    /// still advancing. That is precisely what a wedged worker looked like from
+    /// outside. A nonzero value here turns "we cannot tell whether it parked or died"
+    /// into an answer, from a scrape.
+    ///
+    /// A GAUGE rather than a counter, deliberately: the hook is a process-global
+    /// singleton but `Metrics` is not (`node local-benchmark` builds one per in-process
+    /// node), so the value published is the process-wide running total written straight
+    /// from the hook. A counter's `inc_by` contract cannot express "mirror a global
+    /// that other registries also observe" without per-registry reconciliation state.
+    pub process_panics: IntGauge,
 
     // --- METRICS-DASHBOARD-SPEC.md §8 addenda.
     /// Write-once at boot: which protocol this node is running (starfish pattern --
@@ -1293,6 +1362,39 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            worker_queue_depth: register_int_gauge_vec_with_registry!(
+                "worker_queue_depth",
+                "Occupancy of each bounded worker pipeline channel, by stage",
+                &["queue"],
+                registry,
+            )
+            .unwrap(),
+            worker_queue_peak: register_int_gauge_vec_with_registry!(
+                "worker_queue_peak",
+                "Worker channel occupancy: peak since the previous publish, by stage",
+                &["queue"],
+                registry,
+            )
+            .unwrap(),
+            worker_queue_capacity: register_int_gauge_vec_with_registry!(
+                "worker_queue_capacity",
+                "Bound each worker pipeline channel was constructed with, by stage",
+                &["queue"],
+                registry,
+            )
+            .unwrap(),
+            store_actor_heartbeat_age_ms: register_int_gauge_with_registry!(
+                "store_actor_heartbeat_age_ms",
+                "Milliseconds since the store actor last completed a loop iteration",
+                registry,
+            )
+            .unwrap(),
+            process_panics: register_int_gauge_with_registry!(
+                "process_panics",
+                "Panics observed by this process's panic hook (tokio absorbs task panics)",
+                registry,
+            )
+            .unwrap(),
             protocol_info: register_int_gauge_vec_with_registry!(
                 "protocol_info",
                 "Write-once at boot: which protocol this node is running (value always 1)",
@@ -1321,6 +1423,58 @@ impl Metrics {
     /// `Worker::spawn`, both always know `parameters.protocol`).
     pub fn set_protocol_info(&self, protocol: &str) {
         self.protocol_info.with_label_values(&[protocol]).set(1);
+    }
+
+    /// Make a task panic visible instead of silent: publish it to `process_panics` and
+    /// log it at `error` with payload, location, thread and backtrace.
+    ///
+    /// Installed once per process (`Once`), chaining to whatever hook was in place so
+    /// the default "thread panicked at ..." message is not lost. Both `Primary::spawn`
+    /// and `Worker::spawn` call this, and whichever runs first owns the gauge -- see
+    /// `process_panics`' doc for why that is the right trade rather than a limitation.
+    ///
+    /// Why this exists at all: nothing in this codebase awaits a `JoinHandle`, so tokio
+    /// has nowhere to report a panicking task and the panic is dropped on the floor. A
+    /// subsystem can die while the process stays up, the metrics server keeps serving,
+    /// and every unrelated counter keeps advancing -- indistinguishable from a healthy
+    /// node under load until you diff two scrapes and notice one delta is exactly zero.
+    /// That cost most of a day on 2026-08-08.
+    pub fn install_panic_hook(metrics: Arc<Self>) {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(move || {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let count = PROCESS_PANICS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                metrics.process_panics.set(count as i64);
+                // `PanicHookInfo::payload` is `&dyn Any`; the two shapes `panic!` ever
+                // produces are `&str` (literal) and `String` (formatted).
+                let payload = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                let location = info
+                    .location()
+                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                    .unwrap_or_else(|| "<unknown location>".to_string());
+                log::error!(
+                    "PANIC #{} in thread {:?} at {}: {}\n{}",
+                    count,
+                    std::thread::current().name().unwrap_or("<unnamed>"),
+                    location,
+                    payload,
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                previous(info);
+            }));
+        });
+    }
+
+    /// Process-wide panic count, for callers that want the number without owning the
+    /// registry the hook happened to bind to (see `install_panic_hook`).
+    pub fn process_panic_count() -> u64 {
+        PROCESS_PANICS.load(AtomicOrdering::Relaxed)
     }
 
     /// METRICS-DASHBOARD-SPEC.md §8: write-once, where the caller knows the client's
@@ -1511,5 +1665,39 @@ mod tests {
             });
 
         assert_eq!(p95, Some(96));
+    }
+
+    /// The hook counts a panic and publishes it, and installing it twice is a no-op.
+    ///
+    /// The point of the whole mechanism is that a panicking tokio task is otherwise
+    /// invisible (nothing awaits a `JoinHandle`), so "the hook is wired" has to be an
+    /// assertion rather than an assumption -- a `Once` used wrongly fails silently and
+    /// would leave the metric at a permanently reassuring 0.
+    ///
+    /// `catch_unwind` keeps the panic from failing the test; the chained default hook
+    /// writes to stderr, which cargo captures and shows only on failure. The
+    /// `Backtrace::force_capture()` in the hook is inside `log::error!`'s argument list
+    /// and no logger is installed in tests, so the macro's level check short-circuits
+    /// before evaluating it -- no backtrace is captured or printed here.
+    #[test]
+    fn panic_hook_counts_and_publishes() {
+        let registry = Registry::new();
+        let (metrics, _reporter) = Metrics::new(&registry);
+        Metrics::install_panic_hook(metrics.clone());
+        // Second call must not chain a second hook (which would double-count).
+        Metrics::install_panic_hook(metrics.clone());
+
+        let before = Metrics::process_panic_count();
+        let caught = std::panic::catch_unwind(|| panic!("deliberate: panic_hook test"));
+        assert!(caught.is_err(), "the closure was supposed to panic");
+        let after = Metrics::process_panic_count();
+
+        // Exactly one, not two: proves the second `install_panic_hook` was inert. A
+        // delta rather than an absolute, because the tally is process-wide and other
+        // tests share this binary.
+        assert_eq!(after - before, 1, "hook counted {} panics", after - before);
+        // The gauge tracks the same global. `>=` because another test in this binary may
+        // have panicked and bumped it between the two reads above.
+        assert!(metrics.process_panics.get() >= 1);
     }
 }

@@ -30,6 +30,119 @@ pub mod worker_tests;
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
+/// How often the queue sampler reads every probe. 10 Hz: fast enough that a channel
+/// which fills and drains within one publish interval still registers in the peak,
+/// cheap enough to be irrelevant (one atomic load per probe per tick, 7 probes).
+const QUEUE_SAMPLE_INTERVAL_MS: u64 = 100;
+
+/// How often the sampler publishes. 1 s, matching the primary's own progress gauges,
+/// so a dashboard reads both families on the same cadence. Each publish writes the
+/// latest depth and the max over the preceding second, then clears the max.
+const QUEUE_PUBLISH_EVERY: u32 = 10;
+
+/// A type-erased occupancy reader for one bounded channel, so probes over channels of
+/// different message types (`Transaction`, `SerializedBatchMessage`,
+/// `PrimaryWorkerMessage`, ...) can live in one `Vec` and be sampled by one task.
+///
+/// Holding a `Sender` clone here keeps that channel open for the process's lifetime.
+/// That is intended and harmless: every one of these senders is already cloned into a
+/// long-lived network handler or spawned task, so none of them was ever going to be
+/// dropped while the node runs, and the sampler therefore changes no shutdown
+/// behaviour. It does mean a probe is not a way to observe channel CLOSURE -- only
+/// occupancy.
+struct QueueProbe {
+    stage: &'static str,
+    /// Returns `(depth, capacity)`.
+    read: Box<dyn Fn() -> (usize, usize) + Send + Sync>,
+}
+
+/// Build a probe over a bounded `tokio::sync::mpsc` sender.
+///
+/// `Sender::capacity()` is the live permit count and `max_capacity()` the constructed
+/// bound, so occupancy needs no counter on the send path and no change to any
+/// producer -- which matters because these channels sit on the transaction hot path.
+fn probe<T: Send + 'static>(stage: &'static str, tx: Sender<T>) -> QueueProbe {
+    QueueProbe {
+        stage,
+        read: Box::new(move || (tx.max_capacity() - tx.capacity(), tx.max_capacity())),
+    }
+}
+
+/// Publish worker pipeline occupancy and store-actor liveness until the process exits.
+///
+/// See `metrics::Metrics::worker_queue_depth` for why this exists: between
+/// `submitted_transactions` and `committed_transactions` the worker published nothing
+/// about its own internals, so a wedge in any intermediate channel was invisible.
+fn spawn_queue_sampler(probes: Vec<QueueProbe>, store: Store, metrics: Arc<Metrics>) {
+    // Write-once: the bounds never change, and publishing them lets a dashboard show
+    // occupancy as a fraction without hard-coding CHANNEL_CAPACITY or the store's 100.
+    for p in &probes {
+        let (_, capacity) = (p.read)();
+        metrics
+            .worker_queue_capacity
+            .with_label_values(&[p.stage])
+            .set(capacity as i64);
+    }
+    metrics
+        .worker_queue_capacity
+        .with_label_values(&["store"])
+        .set(store.queue_capacity() as i64);
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(QUEUE_SAMPLE_INTERVAL_MS));
+        let mut peaks: HashMap<&'static str, usize> = HashMap::new();
+        let mut ticks: u32 = 0;
+        loop {
+            ticker.tick().await;
+            ticks += 1;
+
+            let mut latest: Vec<(&'static str, usize)> = Vec::with_capacity(probes.len() + 1);
+            for p in &probes {
+                let (depth, _) = (p.read)();
+                latest.push((p.stage, depth));
+            }
+            latest.push(("store", store.queue_depth()));
+            for (stage, depth) in &latest {
+                let slot = peaks.entry(stage).or_insert(0);
+                *slot = (*slot).max(*depth);
+            }
+
+            if !ticks.is_multiple_of(QUEUE_PUBLISH_EVERY) {
+                continue;
+            }
+            for (stage, depth) in &latest {
+                metrics
+                    .worker_queue_depth
+                    .with_label_values(&[stage])
+                    .set(*depth as i64);
+            }
+            for (stage, peak) in peaks.iter_mut() {
+                metrics
+                    .worker_queue_peak
+                    .with_label_values(&[stage])
+                    .set(*peak as i64);
+                *peak = 0;
+            }
+
+            // Age, not the raw stamp, so the READER's clock defines "now" -- the store
+            // actor's own clock could be the thing that is stuck. Saturating: a stamp
+            // from the future (clock step) reports 0 rather than wrapping to ~2^64.
+            let age = metrics_now_millis().saturating_sub(store.heartbeat_millis());
+            metrics
+                .store_actor_heartbeat_age_ms
+                .set(age.min(i64::MAX as u64) as i64);
+        }
+    });
+}
+
+/// Wall-clock epoch milliseconds; see `spawn_queue_sampler`'s use of it.
+fn metrics_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// The primary round number.
 // TODO: Move to the primary.
 pub type Round = u64;
@@ -171,11 +284,18 @@ impl Worker {
             batch,
         };
 
-        // Spawn all worker tasks.
+        // Task panics are otherwise dropped on the floor (nothing awaits a
+        // `JoinHandle` anywhere in this codebase) -- see `install_panic_hook`.
+        Metrics::install_panic_hook(metrics.clone());
+
+        // Spawn all worker tasks. Each `handle_*` returns occupancy probes over the
+        // bounded channels it created, which `spawn_queue_sampler` then publishes.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages(); //spawns async task that listens for network message from Primary
-        worker.handle_clients_transactions(tx_primary.clone()); //spawns async task that listens for network messages from Client
-        worker.handle_workers_messages(tx_primary); //spawns async task that listens for network messages from other Workers
+        let mut probes = vec![probe("primary_connector", tx_primary.clone())];
+        probes.extend(worker.handle_primary_messages()); //spawns async task that listens for network message from Primary
+        probes.extend(worker.handle_clients_transactions(tx_primary.clone())); //spawns async task that listens for network messages from Client
+        probes.extend(worker.handle_workers_messages(tx_primary)); //spawns async task that listens for network messages from other Workers
+        spawn_queue_sampler(probes, worker.store.clone(), metrics.clone());
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -207,8 +327,13 @@ impl Worker {
     ///////////////////////// TASK INSTANTIATORS ///////////////////////////////////
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    ///
+    /// Returns occupancy probes over the channels it creates, for the sampler in
+    /// `spawn`. `synchronizer` is the path that carried the ~600 `Synchronize`/s flood
+    /// on wedged nodes on 2026-08-08 against ~11/s healthy.
+    fn handle_primary_messages(&self) -> Vec<QueueProbe> {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY); //channel between PrimaryReceiverHandler and Synchronizer
+        let probes = vec![probe("synchronizer", tx_synchronizer.clone())];
 
         // Receive incoming messages from our primary.
         let mut address = self
@@ -251,14 +376,28 @@ impl Worker {
             "Worker {} listening to primary messages on {}",
             self.id, address
         );
+        probes
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+    ///
+    /// Returns occupancy probes over the channels it creates (see
+    /// `handle_primary_messages`). `processor_own` carries OUR sealed batches; the
+    /// same-typed channel in `handle_workers_messages` carries peers' and is labeled
+    /// `processor_peer`, because a wedge on one and not the other means very different
+    /// things.
+    fn handle_clients_transactions(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+    ) -> Vec<QueueProbe> {
         //tx_primary: channel between processor and PrimaryConnector
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY); //channel between TxReceive (Client) and batch maker
                                                                           //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY); //channel between quorum waiter and processor
+        let probes = vec![
+            probe("batch_maker", tx_batch_maker.clone()),
+            probe("processor_own", tx_processor.clone()),
+        ];
 
         // We first receive clients' transactions from the network.
         let mut address = self
@@ -352,12 +491,24 @@ impl Worker {
             "Worker {} listening to client transactions on {}",
             self.id, address
         );
+        probes
     }
 
     /// Spawn all tasks responsible to handle messages from other workers.
-    fn handle_workers_messages(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+    ///
+    /// Returns occupancy probes over the channels it creates (see
+    /// `handle_primary_messages`). `processor_peer` is the inbound `Batch` path whose
+    /// byte counter read a flat zero on every wedged node on 2026-08-08.
+    fn handle_workers_messages(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+    ) -> Vec<QueueProbe> {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY); //channel between WorkReceiverHandler and Helper
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY); //channel between WorkReceiverHandler and Processor
+        let probes = vec![
+            probe("helper", tx_helper.clone()),
+            probe("processor_peer", tx_processor.clone()),
+        ];
 
         // Receive incoming messages from other workers.
         let mut address = self
@@ -410,6 +561,7 @@ impl Worker {
             "Worker {} listening to worker messages on {}",
             self.id, address
         );
+        probes
     }
 }
 

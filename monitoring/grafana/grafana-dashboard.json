@@ -2344,6 +2344,131 @@
       "title": "Network bandwidth, wire (committee total)",
       "type": "stat",
       "description": "Committee-wide totals. received exceeds sent by the client submission rate, because client->worker ingress is counted as received while the unscraped client's send is counted nowhere."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 107
+      },
+      "id": 9100,
+      "panels": [],
+      "title": "Worker pipeline",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 108
+      },
+      "id": 9101,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "{{queue}}",
+          "expr": "max by (queue) (worker_queue_peak{node=~\"$node\",node=~\".*-worker-0$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "bound",
+          "expr": "max(worker_queue_capacity{node=~\"$node\",node=~\".*-worker-0$\"})"
+        }
+      ],
+      "title": "Worker channel occupancy, peak per stage (worst validator)",
+      "type": "timeseries",
+      "description": "Peak occupancy of each bounded channel inside the worker, reduced to the WORST validator per stage -- a wedge is one node out of n, so a median would hide it. Stages: synchronizer (primary->worker Synchronize), batch_maker (client tx), processor_own / processor_peer (our vs peers' batches), helper (peer batch requests), primary_connector (worker->primary digests), store (the store actor's own command channel). A stage sitting at 'bound' is a stalled stage, and WHICH stage localizes the fault without a debugger. Note the bounds differ: the pipeline channels hold 1000, the store actor 100, so read each series against its own cap."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 108
+      },
+      "id": 9102,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "store actor age (ms)",
+          "expr": "max(store_actor_heartbeat_age_ms{node=~\"$node\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "panics (count)",
+          "expr": "sum(process_panics{node=~\"$node\"})"
+        }
+      ],
+      "title": "Store-actor staleness and panics (worst validator)",
+      "type": "timeseries",
+      "description": "Milliseconds since the store actor last COMPLETED a loop iteration, worst node. Its flush ticker fires unconditionally every 50 ms, so steady state is <50 ms at ANY load and this is load-independent: a large value is always a real stall, never just quiet. Together with the occupancy panel this separates the two failure modes -- a BLOCKED actor (RocksDB write stall) shows growing age with store occupancy pinned at 100, while a DEAD actor (task panic) shows growing age plus a nonzero panic count. Panics are otherwise invisible: nothing awaits a JoinHandle, so tokio drops a task panic silently and every unrelated counter keeps advancing."
     }
   ],
   "preload": false,

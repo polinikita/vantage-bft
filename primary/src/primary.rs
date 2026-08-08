@@ -427,6 +427,10 @@ impl Primary {
         // during the 2026-08-07/08 n=100 investigation (it looks exactly like "the
         // measurement window never opened").
         metrics.set_active_from_millis(parameters.metrics_active_at_ms);
+        // Task panics are otherwise dropped on the floor -- nothing here awaits a
+        // `JoinHandle`, so a dead subsystem leaves the process serving metrics and every
+        // unrelated counter advancing. See `Metrics::install_panic_hook`.
+        Metrics::install_panic_hook(metrics.clone());
         reporter.clone().start();
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Primary {} metrics listening on {}", name, metrics_address);

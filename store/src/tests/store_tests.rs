@@ -136,3 +136,45 @@ async fn read_notify() {
     store.write(key, value).await;
     assert!(handle.await.is_ok());
 }
+
+/// The actor's liveness heartbeat advances on the flush ticker alone, with no traffic.
+///
+/// This is the property the wedge diagnostic rests on: if the heartbeat only moved when
+/// commands arrived, a quiet store would be indistinguishable from a stalled one and
+/// `store_actor_heartbeat_age_ms` would fire on idle nodes.
+#[tokio::test]
+async fn heartbeat_advances_while_idle() {
+    let path = ".db_test_heartbeat_idle";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+
+    let first = store.heartbeat_millis();
+    assert!(first > 0, "heartbeat must be stamped at construction");
+
+    // Strictly more than three flush ticks, and no commands sent in between.
+    tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 3 + 20)).await;
+
+    assert!(
+        store.heartbeat_millis() > first,
+        "idle heartbeat did not advance: {} -> {}",
+        first,
+        store.heartbeat_millis()
+    );
+}
+
+/// An idle store reports an empty command channel against the bound it was built with.
+#[tokio::test]
+async fn queue_depth_reports_occupancy() {
+    let path = ".db_test_queue_depth";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+
+    let capacity = store.queue_capacity();
+    assert!(capacity > 0, "capacity must be the constructed bound");
+
+    // Drained: the actor consumes each command as fast as it is sent.
+    store.write(vec![1u8], vec![2u8]).await;
+    tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS + 20)).await;
+    assert_eq!(store.queue_depth(), 0);
+    assert!(store.queue_depth() <= capacity);
+}

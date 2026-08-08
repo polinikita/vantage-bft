@@ -4,6 +4,8 @@ use rocksdb::{
     WriteOptions,
 };
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 use tokio::time::{interval, Duration};
@@ -106,6 +108,36 @@ pub enum StoreCommand {
 #[derive(Clone)]
 pub struct Store {
     channel: Sender<StoreCommand>,
+    /// Epoch-millisecond stamp written by the actor task at the END of every
+    /// completed `select!` iteration -- a liveness heartbeat, NOT a flush timestamp.
+    ///
+    /// Motivated by the 2026-08-08 n=50 netem investigation, where 5-8/50 nodes
+    /// stopped committing while their primaries stayed healthy: everything in the
+    /// worker that touched its `Store` froze simultaneously and permanently, and
+    /// there was no metric anywhere that could distinguish "the actor is blocked
+    /// inside RocksDB" from "the actor's task is gone" from "the senders are simply
+    /// backed up". Four primary-side hypotheses were each refuted by the next
+    /// measurement because this subsystem was unobserved.
+    ///
+    /// A flush timestamp would NOT work here: `flush_pending` is guarded on
+    /// `is_empty`, so an idle store legitimately never flushes and its "age" would
+    /// grow without any fault. The heartbeat has no such idle false positive --
+    /// `ticker` fires unconditionally every `FLUSH_INTERVAL_MS`, so a live actor
+    /// refreshes this at least 20 times a second at ANY load, and a stale value is
+    /// therefore always a real stall (a blocking `write_opt`/`db.get`, a wedged
+    /// runtime, or a dead task) rather than quiet.
+    heartbeat_millis: Arc<AtomicU64>,
+}
+
+/// Wall-clock epoch milliseconds, saturating to 0 before the epoch. Local to this
+/// crate so `store` keeps its four-dependency manifest (no `metrics` edge: the
+/// sampler that turns these readings into gauges lives in `worker`, which already
+/// depends on both).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Store {
@@ -130,6 +162,8 @@ impl Store {
 
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
         let (tx, mut rx) = channel(100);
+        let heartbeat_millis = Arc::new(AtomicU64::new(now_millis()));
+        let heartbeat = heartbeat_millis.clone();
         tokio::spawn(async move {
             // Writes accumulate in `pending` and land as ONE RocksDB WriteBatch per
             // flush: 1000/FLUSH_INTERVAL_MS = 20 `write_opt` calls per second instead of
@@ -264,9 +298,43 @@ impl Store {
                         flush_pending(&db, &mut pending, &mut pending_bytes, &write_opts);
                     }
                 }
+                // AFTER the select body, not before it: this records "the actor last
+                // COMPLETED a unit of work at t", so a `write_opt`/`db.get` that blocks
+                // for 30s leaves the stamp 30s stale for exactly that span. Stamping at
+                // the top of the loop instead would mark the actor alive immediately
+                // before it blocks, hiding precisely the stall this exists to catch.
+                heartbeat.store(now_millis(), Ordering::Relaxed);
             }
         });
-        Ok(Self { channel: tx })
+        Ok(Self {
+            channel: tx,
+            heartbeat_millis,
+        })
+    }
+
+    /// Occupancy of the actor's bounded command channel (capacity `queue_capacity()`).
+    ///
+    /// `Sender::max_capacity() - Sender::capacity()` needs no added state and no
+    /// bookkeeping on the send path: `capacity` is the live permit count. Pinned AT
+    /// capacity means every `Store` caller in the process -- `worker::Processor`,
+    /// `Helper`, `Synchronizer`, `vantage::lanes::missing_payload` -- is parked on
+    /// `send`, which is the signature of the 2026-08-08 worker wedge.
+    pub fn queue_depth(&self) -> usize {
+        self.channel.max_capacity() - self.channel.capacity()
+    }
+
+    /// The bound itself, so a dashboard can plot occupancy as a fraction without
+    /// hard-coding the constant that `new_with_profile` chose.
+    pub fn queue_capacity(&self) -> usize {
+        self.channel.max_capacity()
+    }
+
+    /// Epoch-ms stamp of the actor's last completed loop iteration -- see
+    /// `heartbeat_millis`. Callers report the AGE (`now - this`); the raw stamp is
+    /// returned instead of the age so the reader's clock, not the store's, defines
+    /// "now" and one sampler can publish both stores' ages consistently.
+    pub fn heartbeat_millis(&self) -> u64 {
+        self.heartbeat_millis.load(Ordering::Relaxed)
     }
 
     pub async fn write(&mut self, key: Key, value: Value) {
