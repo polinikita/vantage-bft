@@ -422,6 +422,30 @@ pub struct Metrics {
     /// congestion should climb to the maximum -- a fixed ceiling was a measured regression
     /// (node 96 deferred 9,224 requests while reporting zero drops).
     pub vantage_repair_emit_ceiling: IntGauge,
+    /// WHY `vantage_repair_emit_ceiling` was last halved, split by cause. Exists because a
+    /// gauge alone cannot answer it, and that ambiguity cost a full debugging cycle: on the
+    /// 2026-08-08 n=50/200k netem run the failed nodes reported `emit_ceiling` = 256 (the
+    /// floor) while BOTH inputs read zero -- `core_queue_peak` 0 and
+    /// `vantage_bulk_inbound_dropped_total` 0 in ABSOLUTE terms, not merely as a delta. One
+    /// of those three readings has to be wrong and a gauge cannot say which. These two
+    /// counters make the cause self-reporting: their sum must equal the number of halvings,
+    /// so a floored ceiling with both at zero is then a provable instrumentation bug rather
+    /// than an inference.
+    pub vantage_repair_ceiling_halved_by_queue: IntCounter,
+    /// Companion to `vantage_repair_ceiling_halved_by_queue`: halvings caused by NEW
+    /// bulk-inbound drops since the previous tick.
+    pub vantage_repair_ceiling_halved_by_drops: IntCounter,
+    /// Ticks on which `adapt_recovery_ceiling` ran and RAISED (or held at max) the ceiling.
+    /// The denominator: if the ceiling is pinned at the floor, this distinguishes "the
+    /// controller keeps choosing to halve" from "the controller stopped running and the
+    /// gauge is stale", which are opposite bugs with opposite fixes.
+    pub vantage_repair_ceiling_raised: IntCounter,
+    /// In-flight repair slots reclaimed by `ASK_TIMEOUT_TICKS` because a round went
+    /// unanswered. Nonzero means asks are being lost -- most likely the receiver's bulk
+    /// queue `try_send`-dropping `HeadersRequest`, which N6 makes unrecoverable without
+    /// this reclaim. Expected at/near zero on a healthy run; a rising value is the signal
+    /// that repair requests are being burned.
+    pub vantage_repair_asks_reclaimed_total: IntCounter,
     /// Availability credits skipped because the ref had already reached the terminal
     /// `Quorum` threshold, so the credit could not change any output.
     ///
@@ -1081,6 +1105,30 @@ impl Metrics {
             vantage_repair_emit_ceiling: register_int_gauge_with_registry!(
                 "vantage_repair_emit_ceiling",
                 "Adaptive per-tick ceiling on repair-request emission (AIMD on bulk drops)",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_ceiling_halved_by_queue: register_int_counter_with_registry!(
+                "vantage_repair_ceiling_halved_by_queue",
+                "Repair emit-ceiling halvings caused by core-queue near-overflow",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_ceiling_halved_by_drops: register_int_counter_with_registry!(
+                "vantage_repair_ceiling_halved_by_drops",
+                "Repair emit-ceiling halvings caused by new bulk-inbound drops",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_ceiling_raised: register_int_counter_with_registry!(
+                "vantage_repair_ceiling_raised",
+                "Ticks on which the repair emit ceiling was raised or held at maximum",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_asks_reclaimed_total: register_int_counter_with_registry!(
+                "vantage_repair_asks_reclaimed_total",
+                "In-flight repair slots reclaimed after an unanswered round timed out",
                 registry,
             )
             .unwrap(),

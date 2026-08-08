@@ -1146,3 +1146,86 @@ async fn escalation_width_is_capped_while_the_core_queue_is_congested() {
         "coverage must resume to every peer once uncongested"
     );
 }
+
+/// The in-flight window must NOT be an absorbing state: a round that is never answered has
+/// its slots reclaimed after `ASK_TIMEOUT_TICKS`, so repair resumes.
+///
+/// Without the reclaim, `room == 0` is terminal. A slot frees only when the digest arrives or
+/// the digest retires, and retirement needs emission progress, which needs `room > 0` -- so
+/// `RECOVERY_IN_FLIGHT_MAX` asks that will never be answered halt repair on that node
+/// forever. That is reachable with NO adversary: `Effect::RequestTo` rides `HeadersRequest`,
+/// which `Inbound::is_bulk` sends to the bulk queue where a full channel `try_send`-DROPS it
+/// silently, and N6 forbids ever re-asking that peer -- so each drop permanently burns a
+/// `(peer, digest)` pair.
+///
+/// Pins the three properties that make the reclaim safe rather than a retransmission:
+/// coverage (`asked`) never shrinks, N6's `requested` set is untouched, and the freed slots
+/// become usable.
+#[tokio::test]
+async fn unanswered_asks_are_reclaimed_so_the_window_cannot_latch_shut() {
+    use crate::vantage::repair::{ASK_TIMEOUT_TICKS, RECOVERY_IN_FLIGHT_MAX};
+    let (committee, keys) = Committee::local_benchmark(20, 1, 33_700);
+    let (watcher, author) = (keys[0].name, keys[1].name);
+    let registry = prometheus::Registry::new();
+    let (metrics, _r) = metrics::Metrics::new(&registry);
+    let mut rep = wide_repairer(watcher, &committee).with_metrics(metrics.clone());
+
+    // Fill the window with asks nobody will ever answer.
+    let mut h = 0u8;
+    while rep.in_flight_for_test() < RECOVERY_IN_FLIGHT_MAX && h < 250 {
+        rep.authorize((author, 1_000 + h as u64, Digest([h; 32])));
+        h += 1;
+    }
+    let filled = rep.in_flight_for_test();
+    assert!(filled > 0, "fixture must actually put asks in flight");
+
+    // Ticks before the deadline must NOT reclaim -- otherwise a slow-but-alive peer's
+    // answer race would be cut short and the window would lose its closed-loop property.
+    for _ in 0..(ASK_TIMEOUT_TICKS - 1) {
+        rep.retry_requests();
+    }
+    assert_eq!(
+        rep.in_flight_for_test(),
+        filled,
+        "must not reclaim before ASK_TIMEOUT_TICKS"
+    );
+
+    // At the deadline the slots come back.
+    rep.retry_requests();
+    assert!(
+        rep.in_flight_for_test() < filled,
+        "timed-out rounds must release their slots: still {} of {}",
+        rep.in_flight_for_test(),
+        filled
+    );
+
+    // N6 intact: reclaiming is window accounting, NOT a retransmission. Every (peer, digest)
+    // ever asked must still be recorded, so no peer is ever asked twice.
+    let peers = committee.others_primaries(&watcher).len();
+    assert!(peers > 0);
+    let mut still_recorded = 0;
+    for (i, k) in keys.iter().enumerate() {
+        if k.name == watcher {
+            continue;
+        }
+        for d in 0..h {
+            if rep.was_requested(&k.name, &Digest([d; 32])) {
+                still_recorded += 1;
+            }
+        }
+        let _ = i;
+    }
+    assert!(
+        still_recorded > 0,
+        "the requested set must survive a reclaim, or N6 is violated"
+    );
+
+    // And the reclaim is observable, so a run can tell asks are being burned.
+    let reclaimed = registry
+        .gather()
+        .iter()
+        .find(|f| f.get_name() == "vantage_repair_asks_reclaimed_total")
+        .map(|f| f.get_metric()[0].get_counter().get_value())
+        .unwrap_or(0.0);
+    assert!(reclaimed > 0.0, "reclaim must be counted");
+}

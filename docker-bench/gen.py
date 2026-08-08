@@ -86,6 +86,10 @@ MAX_NODES = 30  # owner constraint, raised from 20 on 2026-08-05 for the n=30
 # docker-bench instead bakes it into real `tc netem` delay, so every node's
 # parameters.json below pins `mimic_latency_ms: 0` to disable the in-process
 # simulation and avoid injecting the delay twice.
+# Per-class netem queue depth in PACKETS -- see its use in `render_tc_script` for why
+# netem's 1000-packet default is a trap at n>=50.
+NETEM_LIMIT_PKTS = 100_000
+
 RTT_LATENCY_TABLE = [
     [1, 14, 104, 112, 198, 65, 68, 110, 201, 146],
     [14, 1, 106, 122, 196, 78, 67, 103, 189, 142],
@@ -330,7 +334,21 @@ def render_tc_script(i: int, n: int, iface_hint: str, enabled: bool) -> str:
         lines.append(f"# node {i} -> node {j} ({peer_ip}): {delay:.1f} ms one-way "
                       f"(region {i % 10} -> region {j % 10}, RTT {RTT_LATENCY_TABLE[i % 10][j % 10]} ms)")
         lines.append(f'tc class add dev "$IFACE" parent 1: classid 1:{mid} htb rate 10gbit quantum 60000')
-        lines.append(f'tc qdisc add dev "$IFACE" parent 1:{mid} handle {mid}: netem delay {delay:.1f}ms')
+        # `limit` BEFORE `delay` (canonical netem argument order), and EXPLICIT because
+        # netem's own default is 1000 PACKETS per qdisc and it tail-drops past it
+        # SILENTLY -- no error, no log, and the loss lands inside the emulated WAN where
+        # it reads as protocol packet loss. A delay qdisc must hold the whole
+        # bandwidth-delay product: in-flight packets per class ~= per-peer pps x one-way
+        # delay, so at n=50 / 200k tx/s (~2 MB/s per peer) and ~105 ms one-way that is
+        # ~1,400 packets at 1500 B MTU -- over the default. Worse, it is latency-tiered
+        # by construction: the highest-RTT classes hit the cap FIRST, so the artifact
+        # concentrates on exactly the regions a real WAN failure would, and a local
+        # repro would chase a ghost. wan-bench already sets this (prepare.py's
+        # `netem limit`); docker-bench did not, which made it unusable for netem repros
+        # at n=50+. 100k packets is far above any plausible in-flight count here and
+        # costs only queue headroom (netem allocates lazily).
+        lines.append(f'tc qdisc add dev "$IFACE" parent 1:{mid} handle {mid}: '
+                     f'netem limit {NETEM_LIMIT_PKTS} delay {delay:.1f}ms')
         lines.append(
             f'tc filter add dev "$IFACE" protocol ip parent 1:0 prio 1 u32 '
             f'match ip dst {peer_ip}/32 flowid 1:{mid}'

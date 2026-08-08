@@ -96,6 +96,24 @@ pub(crate) const CORE_QUEUE_NEAR_OVERFLOW: usize = 900;
 /// asked for, so capping outstanding asks caps inbound.
 pub(crate) const RECOVERY_IN_FLIGHT_MAX: usize = 512;
 
+/// Ticks (1s each -- `retry_requests` is driven by the node's own 1s tick) after which an
+/// unanswered round's in-flight slots are RECLAIMED and the digest is escalated to fresh
+/// peers.
+///
+/// Without this the window is an absorbing state. A slot is freed only when the digest
+/// arrives or the digest retires, and retirement requires emission progress, which requires
+/// `room > 0` -- so `RECOVERY_IN_FLIGHT_MAX` asks that will never be answered halt repair on
+/// that node permanently. That is reachable WITHOUT an adversary: `Effect::RequestTo` is sent
+/// as `HeadersRequest`, which `Inbound::is_bulk` routes to the bulk queue and `try_send`
+/// DROPS silently when full (node.rs) -- and N6 forbids ever re-asking that peer, so each
+/// drop permanently burns a `(peer, digest)` pair. A window without a retransmission timer
+/// latches on loss, and loss here is by design.
+///
+/// Reclaiming a slot is NOT a retransmission: `requested`/`requested_hashes` are untouched,
+/// so N6's "at most one request per (peer, digest) ever" still holds exactly. Only the
+/// window accounting is corrected, which lets escalation reach peers it has not yet asked.
+pub(crate) const ASK_TIMEOUT_TICKS: u64 = 4;
+
 /// Peers a single digest may be asked of before escalation stops widening. Escalating to
 /// near-full coverage (the measured ~49) invites 49 copies of one block; if the first
 /// `ESCALATE_WIDTH_MAX` peers -- chosen holder-first -- did not answer, the bottleneck is
@@ -120,6 +138,15 @@ struct FanoutState {
     /// Size of the NEXT batch. Doubling reaches all n-1 peers in O(log n) ticks, so the
     /// worst-case time-to-full-coverage stays small while the common case stays cheap.
     next_width: usize,
+    /// How many of this digest's asks are CURRENTLY counted in `Repairer::in_flight`.
+    /// Distinct from `asked`, which is monotone coverage bookkeeping and must never shrink
+    /// (N6). The two diverge the moment `ASK_TIMEOUT_TICKS` reclaims a round's slots: the
+    /// window forgets those asks, coverage does not. Keeping them separate is what makes
+    /// the release exact -- releasing `asked` after a reclaim would double-release and
+    /// silently WIDEN the window instead of holding it.
+    in_flight_asks: usize,
+    /// `Repairer::ticks` when this digest last had a round go out, for the timeout.
+    asked_at: u64,
 }
 
 pub struct Repairer {
@@ -229,6 +256,11 @@ pub struct Repairer {
     /// nodes were pinned at the 1000-slot cap while `bulk_inbound_dropped` read 0, so an
     /// AIMD driven by drops alone would have doubled its ceiling while the node drowned.
     core_queue_len: usize,
+    /// Monotone count of `retry_requests` calls -- the node's own 1s tick, used as the clock
+    /// for `ASK_TIMEOUT_TICKS`. A tick count rather than an `Instant` deliberately: it keeps
+    /// `Repairer` free of wall-clock state, so every timeout test is deterministic and needs
+    /// no sleeping.
+    ticks: u64,
     /// Requests emitted whose digest has not yet arrived. Bounded by
     /// `RECOVERY_IN_FLIGHT_MAX`; see that constant for why a rate limit alone is not enough.
     in_flight: usize,
@@ -284,6 +316,7 @@ impl Repairer {
             emit_ceiling: RECOVERY_EMIT_START,
             last_bulk_drops: 0,
             core_queue_len: 0,
+            ticks: 0,
             in_flight: 0,
             pending_req: HashMap::new(),
             answered: HashSet::new(),
@@ -368,7 +401,7 @@ impl Repairer {
         // digest being retired in `retry_requests`. Miss either path and the node stops
         // asking for anything, forever.
         if let Some(state) = self.fanout.remove(&digest) {
-            self.in_flight = self.in_flight.saturating_sub(state.asked);
+            self.in_flight = self.in_flight.saturating_sub(state.in_flight_asks);
         }
         let Some(waiting) = self.blocked_on.remove(&digest) else {
             return effects;
@@ -496,6 +529,7 @@ impl Repairer {
         // Done here, before any `requested`/`requested_hashes` write, for the reason those
         // fields' comments give. The window is what actually bounds INBOUND: an answer can
         // only arrive for something we asked for, so capping outstanding asks caps arrivals.
+        let now_tick = self.ticks;
         let room = RECOVERY_IN_FLIGHT_MAX.saturating_sub(self.in_flight);
         targets.truncate(self.emit_budget.min(room));
         let emitted = targets.len();
@@ -529,6 +563,8 @@ impl Repairer {
             } else {
                 entry.asked + emitted
             };
+            entry.in_flight_asks += emitted;
+            entry.asked_at = now_tick;
         }
     }
 
@@ -552,6 +588,8 @@ impl Repairer {
             start: Self::fanout_start(h, n),
             asked: 0,
             next_width: FANOUT_FIRST,
+            in_flight_asks: 0,
+            asked_at: 0,
         });
         self.fan_out(h, effects);
     }
@@ -624,6 +662,30 @@ impl Repairer {
                 .vantage_repair_emit_ceiling
                 .set(self.emit_ceiling as i64);
             metrics.vantage_repair_in_flight.set(self.in_flight as i64);
+            // WHY the ceiling moved, not just where it landed. A gauge cannot answer that,
+            // and the ambiguity cost a full debugging cycle: on the 2026-08-08 n=50/200k
+            // netem run the failed nodes reported `emit_ceiling` = 256 (the floor) with
+            // BOTH inputs at zero in ABSOLUTE terms -- `core_queue_peak` 0 and
+            // `bulk_inbound_dropped_total` 0. Those three readings cannot all be true, and
+            // with only a gauge there is no way to say which is lying. Counting the causes
+            // makes it self-reporting: halved_by_queue + halved_by_drops must equal the
+            // number of halvings, and `raised` is the denominator that separates "the
+            // controller keeps halving" from "the controller stopped running and the gauge
+            // is stale" -- opposite bugs with opposite fixes.
+            //
+            // Both causes are counted when both hold, so the sum can exceed the halving
+            // count; that is deliberate, since the interesting question is which signal is
+            // ever active at all, not how a tie was broken.
+            if congested || new_drops > 0 {
+                if congested {
+                    metrics.vantage_repair_ceiling_halved_by_queue.inc();
+                }
+                if new_drops > 0 {
+                    metrics.vantage_repair_ceiling_halved_by_drops.inc();
+                }
+            } else {
+                metrics.vantage_repair_ceiling_raised.inc();
+            }
         }
     }
 
@@ -715,6 +777,34 @@ impl Repairer {
     /// the longest-outstanding digest escalates first.
     pub fn retry_requests(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
+        self.ticks += 1;
+        // RECLAIM timed-out rounds BEFORE refilling and escalating, so the freed slots are
+        // usable in this very tick rather than the next one. Without this the in-flight
+        // window is an absorbing state -- see `ASK_TIMEOUT_TICKS` for the two ways a node
+        // reaches `room == 0` with asks that will never be answered, one of which needs no
+        // adversary at all (the harness's own bulk-queue `try_send` drops).
+        //
+        // Coverage bookkeeping (`asked`, `requested`, `requested_hashes`) is deliberately
+        // untouched: this corrects window accounting only, so N6's one-request-per-(peer,
+        // digest)-ever still holds exactly and escalation resumes toward peers not yet asked.
+        let now_tick = self.ticks;
+        let mut reclaimed = 0usize;
+        for (_, state) in self.fanout.iter_mut() {
+            if state.in_flight_asks > 0
+                && now_tick.saturating_sub(state.asked_at) >= ASK_TIMEOUT_TICKS
+            {
+                reclaimed += state.in_flight_asks;
+                state.in_flight_asks = 0;
+            }
+        }
+        if reclaimed > 0 {
+            self.in_flight = self.in_flight.saturating_sub(reclaimed);
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_repair_asks_reclaimed_total
+                    .inc_by(reclaimed as u64);
+            }
+        }
         // Refill the tick's recovery allowance. This is the ONE place it is refilled, so the
         // ceiling applies to the hot-path first rounds too, not just to escalations.
         self.adapt_recovery_ceiling();
@@ -736,7 +826,7 @@ impl Repairer {
             // or the window latches shut and the node stops asking for anything forever.
             if !self.blocked_on.contains_key(h) {
                 if let Some(state) = self.fanout.remove(h) {
-                    self.in_flight = self.in_flight.saturating_sub(state.asked);
+                    self.in_flight = self.in_flight.saturating_sub(state.in_flight_asks);
                 }
                 continue;
             }
@@ -765,7 +855,7 @@ impl Repairer {
                 // `requested_hashes` (never pruned) is what gates `on_serve`, and
                 // `requested` (never pruned) is what prevents a re-ask.
                 if let Some(state) = self.fanout.remove(&key.1) {
-                    self.in_flight = self.in_flight.saturating_sub(state.asked);
+                    self.in_flight = self.in_flight.saturating_sub(state.in_flight_asks);
                 }
             }
         }
