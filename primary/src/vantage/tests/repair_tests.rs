@@ -1182,7 +1182,12 @@ async fn unanswered_asks_are_reclaimed_so_the_window_cannot_latch_shut() {
     // Ticks before the deadline must NOT reclaim -- otherwise a slow-but-alive peer's
     // answer race would be cut short and the window would lose its closed-loop property.
     for _ in 0..(ASK_TIMEOUT_TICKS - 1) {
-        rep.retry_requests();
+        let early = requests_for(&rep.retry_requests());
+        assert!(
+            early.is_empty(),
+            "before the deadline the window is full, so no request may go out -- \
+             emitting here would mean the window is not bounding at all"
+        );
     }
     assert_eq!(
         rep.in_flight_for_test(),
@@ -1190,13 +1195,16 @@ async fn unanswered_asks_are_reclaimed_so_the_window_cannot_latch_shut() {
         "must not reclaim before ASK_TIMEOUT_TICKS"
     );
 
-    // At the deadline the slots come back.
-    rep.retry_requests();
+    // At the deadline the slots come back AND are immediately reused. Note what must NOT
+    // be asserted here: that `in_flight` drops. The reclaim frees slots and the very same
+    // tick spends them on peers not yet asked, so a saturated window legitimately reads
+    // saturated again afterwards -- the observable recovery is that requests flow at all,
+    // which is precisely what the absorbing state prevented.
+    let resumed = requests_for(&rep.retry_requests());
     assert!(
-        rep.in_flight_for_test() < filled,
-        "timed-out rounds must release their slots: still {} of {}",
-        rep.in_flight_for_test(),
-        filled
+        !resumed.is_empty(),
+        "after the timeout the node must be able to ask again; it asked nobody, so the \
+         window is still latched shut"
     );
 
     // N6 intact: reclaiming is window accounting, NOT a retransmission. Every (peer, digest)

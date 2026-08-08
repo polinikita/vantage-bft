@@ -1773,6 +1773,18 @@ impl VantageCore {
     /// lane height still reachable from a manifest at or above `Cursor::next_view`. That is
     /// not cheaply invertible from (author, height) today, which is why this is parked rather
     /// than patched.
+    ///
+    /// SECOND UNSOUNDNESS, found in a 2026-08-08 review and NOT covered by the local-progress
+    /// term above -- whoever re-wires eviction must handle both. Evicting a block that is
+    /// REQUESTED but not yet SETTLED strands its digest permanently. Such a block exists
+    /// whenever a serve arrived but its parent is still missing: it is cached and NOT retained
+    /// (retention happens only when a walk verifies through genesis, N8), so it is eligible
+    /// for eviction, and `BlockCache::evict_author_below` checks nothing per-entry. Once
+    /// evicted, `Repairer` cannot re-ask for it: `requested`/`requested_hashes` are never
+    /// pruned (N6), so `settle`'s fan-out gate treats the digest as already covered and emits
+    /// nothing, forever. The block is gone, unrequestable, and its whole sub-chain stays in
+    /// `pending_settle`. Any eviction floor must therefore also exclude digests in
+    /// `requested_hashes` whose ref is not yet in `settled`.
     #[allow(dead_code)]
     fn evict_universally_held_blocks(&mut self) {
         const KEEP_HEIGHTS: crate::primary::Height = 64;

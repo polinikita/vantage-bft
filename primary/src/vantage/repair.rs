@@ -499,14 +499,13 @@ impl Repairer {
                 return;
             }
             let take = entry.next_width.min(width_cap - entry.asked);
-            entry.next_width = entry.next_width.saturating_mul(2);
             (entry.author, entry.height, entry.start, entry.asked, take)
         };
 
         // Peers that have confirmed this exact lane height, best-informed first, skipping
         // any already asked (N6: at most one request per (peer, digest), ever).
         let mut targets: Vec<PublicKey> = Vec::with_capacity(take);
-        for peer in self.likely_holders(&author, height, n) {
+        for peer in self.likely_holders(&author, height, n, h) {
             if targets.len() >= take {
                 break;
             }
@@ -531,11 +530,19 @@ impl Repairer {
         // only arrive for something we asked for, so capping outstanding asks caps arrivals.
         let now_tick = self.ticks;
         let room = RECOVERY_IN_FLIGHT_MAX.saturating_sub(self.in_flight);
+        let wanted = targets.len();
         targets.truncate(self.emit_budget.min(room));
         let emitted = targets.len();
         if emitted == 0 && (self.emit_budget == 0 || room == 0) {
             if let Some(metrics) = &self.metrics {
-                metrics.vantage_repair_budget_deferred_total.inc();
+                // Count the REQUESTS deferred, not the deferral events. Per-event counting
+                // made the metric unreadable: "deferred 2/s" against "requested 92/s" could
+                // mean 2 requests held back or ~90, a 45x range, so the deferred FRACTION --
+                // the only thing the number is for -- was unknowable. `wanted` is what this
+                // round would have emitted before the truncate.
+                metrics
+                    .vantage_repair_budget_deferred_total
+                    .inc_by(wanted as u64);
             }
             return; // try again next tick; state and queue entry are intact
         }
@@ -558,6 +565,22 @@ impl Repairer {
             // nobody new, every peer has already been asked, so jump straight to full
             // coverage -- that is what retires the digest in `retry_requests` instead of
             // leaving it queued forever emitting nothing.
+            // `emitted == 0` here means the fill loop found nobody new, i.e. every peer has
+            // already been asked -- so jump to full coverage, which is what retires the digest
+            // in `retry_requests` instead of leaving it queued forever emitting nothing.
+            //
+            // Believed unreachable: `asked` always equals |requested INTERSECT (.,h)|, and
+            // all-peers-asked forces the `entry.asked >= n` early return above. Asserted
+            // rather than trusted because if it IS reachable the silent jump inflates the
+            // later `in_flight_asks` release into a window that quietly WIDENS -- a bug that
+            // would present as excess inbound, nowhere near this line.
+            debug_assert!(
+                emitted > 0,
+                "fan_out emitted nothing while asked ({}) < n ({}): `asked` has drifted from \
+                 the `requested` set",
+                entry.asked,
+                n
+            );
             entry.asked = if emitted == 0 {
                 n
             } else {
@@ -565,6 +588,14 @@ impl Repairer {
             };
             entry.in_flight_asks += emitted;
             entry.asked_at = now_tick;
+            // Widen for the NEXT round -- here, where a round actually went out, and never
+            // on a deferred one. Doubling before the budget/window truncate above meant a
+            // digest starved through k ticks jumped to ~FANOUT_FIRST * 2^k the instant room
+            // opened, so the staged escalation this whole mechanism exists to provide was
+            // erased exactly when recovering from congestion -- the moment a wide fan-out is
+            // least affordable. `saturating_mul` keeps the arithmetic safe; `width_cap` and
+            // `n` bound what is actually asked.
+            entry.next_width = entry.next_width.saturating_mul(2);
         }
     }
 
@@ -744,7 +775,13 @@ impl Repairer {
     /// Peers that have confirmed holding `author`'s lane at or above `height`, capped at
     /// `want`. Ordered by descending confirmed height, so the peers furthest ahead -- and
     /// therefore least likely to have pruned the block -- are asked first.
-    fn likely_holders(&self, author: &PublicKey, height: Height, want: usize) -> Vec<PublicKey> {
+    fn likely_holders(
+        &self,
+        author: &PublicKey,
+        height: Height,
+        want: usize,
+        h: &Digest,
+    ) -> Vec<PublicKey> {
         let Some(by_peer) = self.holders.get(author) else {
             return Vec::new();
         };
@@ -753,10 +790,33 @@ impl Repairer {
             .filter(|(_, &h)| h >= height)
             .map(|(p, &h)| (h, *p))
             .collect();
-        // Descending height, then by key so the order is deterministic across nodes and
-        // runs (a HashMap iteration order would not be).
-        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        // Descending height, then by a PER-DIGEST permutation of the key so the order is
+        // deterministic across nodes and runs (a HashMap iteration order would not be)
+        // WITHOUT being the same order for every digest.
+        //
+        // A plain key sort reintroduced exactly the pathology `fanout_start` exists to
+        // prevent: equal-height holders are the common case (every caught-up peer reports the
+        // same tip), so a global key order made the lowest-keyed peers absorb the committee's
+        // entire first-round serve load while the highest-keyed served none. Mixing the
+        // digest in spreads that per digest at identical cost and keeps full determinism --
+        // every node computes the same order for the same digest.
+        candidates.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| Self::holder_rank(&a.1, h).cmp(&Self::holder_rank(&b.1, h)))
+        });
         candidates.into_iter().take(want).map(|(_, p)| p).collect()
+    }
+
+    /// A per-digest ordering key for a holder, so equal-height holders are not ranked the
+    /// same way for every digest. Both inputs are already hashes, so mixing eight bytes of
+    /// each is enough -- no re-hashing, and identical on every node for a given (peer,
+    /// digest) pair, which is what keeps the fan-out reproducible.
+    fn holder_rank(peer: &PublicKey, h: &Digest) -> u64 {
+        let mut pk = [0u8; 8];
+        let mut dg = [0u8; 8];
+        pk.copy_from_slice(&peer.0[..8]);
+        dg.copy_from_slice(&h.0[..8]);
+        u64::from_le_bytes(pk) ^ u64::from_le_bytes(dg)
     }
 
     /// Where in `peers` a digest's fan-out starts. Spreading by digest matters at n=100:
