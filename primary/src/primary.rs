@@ -15,6 +15,10 @@ use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use crate::vantage::agb::{Echo, Ready, ViewProposal};
+use crate::vantage::sequence::{
+    SequenceAnnouncement, SequenceDeltaChunk, SequenceDeltaRequest, SequenceOutcomeRequest,
+    SequenceOutcomeServe, SequenceRecordChunk, SequenceRequest, SequenceUnavailable,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, Protocol, WorkerId};
@@ -229,6 +233,23 @@ pub enum PrimaryMessage {
         bool,      /* clamped */
         PublicKey, /* sender */
     ),
+
+    // --- SEQUENCE-CHECKPOINT-SYNC-PLAN.md section 6, Phase B. APPENDED, never
+    // reordered: bincode encodes an enum by its variant INDEX, so inserting anywhere
+    // above would silently reinterpret every existing message on a mixed-version fleet.
+    //
+    // Announcements are first-hand only and are never forwarded as evidence -- the
+    // receiver derives the authoritative sender from the authenticated connection and
+    // rejects a payload whose encoded sender differs. None of these carry a live-view
+    // vote, availability acknowledgment, or resolution stance.
+    VantageSequenceAnnounce(SequenceAnnouncement),
+    VantageSequenceRequest(SequenceRequest),
+    VantageSequenceRecords(SequenceRecordChunk),
+    VantageSequenceDeltaRequest(SequenceDeltaRequest),
+    VantageSequenceDelta(SequenceDeltaChunk),
+    VantageSequenceOutcomeRequest(SequenceOutcomeRequest),
+    VantageSequenceOutcome(SequenceOutcomeServe),
+    VantageSequenceUnavailable(SequenceUnavailable),
 }
 
 impl PrimaryMessage {
@@ -292,6 +313,14 @@ impl PrimaryMessage {
             // `vantage::wire`'s resume task) -- `Done` is a `PrimaryMessage` in its
             // own right, never a raw `Bytes` chunk.
             PrimaryMessage::VantageReplayDone(..) => "VantageReplayDone",
+            PrimaryMessage::VantageSequenceAnnounce(..) => "VantageSequenceAnnounce",
+            PrimaryMessage::VantageSequenceRequest(..) => "VantageSequenceRequest",
+            PrimaryMessage::VantageSequenceRecords(..) => "VantageSequenceRecords",
+            PrimaryMessage::VantageSequenceDeltaRequest(..) => "VantageSequenceDeltaRequest",
+            PrimaryMessage::VantageSequenceDelta(..) => "VantageSequenceDelta",
+            PrimaryMessage::VantageSequenceOutcomeRequest(..) => "VantageSequenceOutcomeRequest",
+            PrimaryMessage::VantageSequenceOutcome(..) => "VantageSequenceOutcome",
+            PrimaryMessage::VantageSequenceUnavailable(..) => "VantageSequenceUnavailable",
         }
     }
 }

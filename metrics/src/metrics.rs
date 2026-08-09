@@ -719,6 +719,28 @@ pub struct Metrics {
     /// and is a Phase A release blocker.
     pub vantage_sequence_record_rejected_total: IntCounter,
 
+    // Phase B counters. Announcements are cheap and frequent, so these are counters
+    // rather than per-peer vectors -- per-sender detail lives in the equivocator gauge.
+    /// Announcements this node broadcast.
+    pub vantage_sequence_announced_total: IntCounter,
+    /// First-hand announcements that counted toward some (view, head).
+    pub vantage_sequence_announce_counted_total: IntCounter,
+    /// Announcements refused: forged sender, non-member, duplicate, equivocation, or
+    /// too far ahead. Sustained growth means a peer is misbehaving or badly out of date.
+    pub vantage_sequence_announce_ignored_total: IntCounter,
+    /// Targets that reached f+1 matching first-hand announcements.
+    pub vantage_sequence_certified_total: IntCounter,
+    /// Highest certified checkpoint view.
+    pub vantage_sequence_certified_view: IntGauge,
+    /// Distinct senders caught announcing two different heads for one view.
+    pub vantage_sequence_equivocators: IntGauge,
+    /// State-sync frames served to peers.
+    pub vantage_sequence_sync_served_total: IntCounter,
+    /// Responses arriving with no active transfer. Phase B never installs, so every
+    /// response is unsolicited by construction and this tracks peer chatter; once the
+    /// requester exists a nonzero rate means late or duplicated answers.
+    pub vantage_sequence_sync_unsolicited_total: IntCounter,
+
     /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
     /// addressed to a peer we have not managed to connect to yet. Best-effort sends
     /// are allowed to vanish, but they must not vanish SILENTLY: this is the only
@@ -1574,6 +1596,54 @@ impl Metrics {
                 "vantage_sequence_boundary_head",
                 "Checkpoint boundary head (hex label), valued by its boundary view",
                 &["sid", "head"],
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_announced_total: register_int_counter_with_registry!(
+                "vantage_sequence_announced_total",
+                "Checkpoint announcements broadcast by this node",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_announce_counted_total: register_int_counter_with_registry!(
+                "vantage_sequence_announce_counted_total",
+                "First-hand checkpoint announcements that counted",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_announce_ignored_total: register_int_counter_with_registry!(
+                "vantage_sequence_announce_ignored_total",
+                "Checkpoint announcements refused",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_certified_total: register_int_counter_with_registry!(
+                "vantage_sequence_certified_total",
+                "Checkpoint targets that reached f+1 matching announcements",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_certified_view: register_int_gauge_with_registry!(
+                "vantage_sequence_certified_view",
+                "Highest certified checkpoint view",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_equivocators: register_int_gauge_with_registry!(
+                "vantage_sequence_equivocators",
+                "Distinct senders caught announcing two heads for one view",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_served_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_served_total",
+                "State-sync frames served to peers",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_unsolicited_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_unsolicited_total",
+                "State-sync responses arriving with no active transfer",
                 registry,
             )
             .unwrap(),

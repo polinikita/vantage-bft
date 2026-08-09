@@ -12,6 +12,12 @@ use crate::vantage::agb::{
 };
 use crate::vantage::block::{self, BlockRef};
 use crate::vantage::control::{ControlLog, ControlProposal, Round};
+/// Retained candidate checkpoint boundaries (plan section 7.1). Not configurable: the
+/// requester only ever wants the HIGHEST certified target above its local head, so older
+/// candidates are dead weight, and this exists purely to bound memory against a peer
+/// announcing arbitrary future boundaries.
+const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
+
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
 use crate::vantage::lanes::{
@@ -27,7 +33,11 @@ use crate::vantage::resume::{
     in_flight_state, InFlightEntry, InFlightState, NudgeMemo, ReplayEpisodes, ResumeServe,
     ResumeTrigger, ServeBudget,
 };
-use crate::vantage::sequence::{head_hex, head_prefix_i64, SequenceOutcome, SequenceStore};
+use crate::vantage::sequence::{
+    head_hex, head_prefix_i64, CheckpointCollector, SequenceAnnouncement, SequenceDeltaChunk,
+    SequenceDeltaRequest, SequenceOutcome, SequenceOutcomeRequest, SequenceOutcomeServe,
+    SequenceRecordChunk, SequenceRequest, SequenceStore, SequenceUnavailable, SEQUENCE_VERSION,
+};
 use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
 use async_trait::async_trait;
@@ -157,6 +167,18 @@ pub enum Inbound {
     ResumeHello(View, PublicKey),
     /// A peer's `VantageReplayDone(end_key, complete, clamped, sender)`.
     ReplayDone(View, bool, bool, PublicKey),
+
+    // --- SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase B. Every variant carries the
+    // AUTHENTICATED sender alongside the payload: the payload's own encoded sender is
+    // decoration and is checked against this, never trusted in its place.
+    SequenceAnnounce(SequenceAnnouncement, PublicKey),
+    SequenceRequest(SequenceRequest, PublicKey),
+    SequenceRecords(SequenceRecordChunk, PublicKey),
+    SequenceDeltaRequest(SequenceDeltaRequest, PublicKey),
+    SequenceDelta(SequenceDeltaChunk, PublicKey),
+    SequenceOutcomeRequest(SequenceOutcomeRequest, PublicKey),
+    SequenceOutcome(SequenceOutcomeServe, PublicKey),
+    SequenceUnavailable(SequenceUnavailable, PublicKey),
 }
 
 impl Inbound {
@@ -325,6 +347,40 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageReplayDone(end_key, complete, clamped, sender) => {
                 Inbound::ReplayDone(end_key, complete, clamped, sender)
             }
+            // Phase B. `a.sender` below is the payload's CLAIM; the authoritative
+            // identity is resolved at dispatch against the connection.
+            PrimaryMessage::VantageSequenceAnnounce(a) => {
+                let claimed = a.sender;
+                Inbound::SequenceAnnounce(a, claimed)
+            }
+            PrimaryMessage::VantageSequenceRequest(r) => {
+                let claimed = r.requester;
+                Inbound::SequenceRequest(r, claimed)
+            }
+            PrimaryMessage::VantageSequenceRecords(c) => {
+                let claimed = c.sender;
+                Inbound::SequenceRecords(c, claimed)
+            }
+            PrimaryMessage::VantageSequenceDeltaRequest(r) => {
+                let claimed = r.requester;
+                Inbound::SequenceDeltaRequest(r, claimed)
+            }
+            PrimaryMessage::VantageSequenceDelta(c) => {
+                let claimed = c.sender;
+                Inbound::SequenceDelta(c, claimed)
+            }
+            PrimaryMessage::VantageSequenceOutcomeRequest(r) => {
+                let claimed = r.requester;
+                Inbound::SequenceOutcomeRequest(r, claimed)
+            }
+            PrimaryMessage::VantageSequenceOutcome(o) => {
+                let claimed = o.sender;
+                Inbound::SequenceOutcome(o, claimed)
+            }
+            PrimaryMessage::VantageSequenceUnavailable(u) => {
+                let claimed = u.sender;
+                Inbound::SequenceUnavailable(u, claimed)
+            }
             // Autobahn-only variants never reach the Vantage assembly's port; ignore
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
@@ -375,6 +431,14 @@ pub struct VantageCore {
     /// `None` when `Parameters::sequence_checkpoints` is off, which is the default until
     /// cross-node head determinism is proved on a real run (§14 Phase A).
     sequence: Option<SequenceStore>,
+    /// Phase B: the f+1 first-hand head collector. `Some` exactly when `sequence` is.
+    sequence_sync: Option<CheckpointCollector>,
+    sequence_chunk_records: usize,
+    sequence_chunk_digests: usize,
+    sequence_announce_period_ms: u64,
+    sequence_announce_repeat_ms: u64,
+    /// Last (boundary, instant) we announced, for the repeat rule above.
+    last_announced: Option<(View, Instant)>,
     pacemaker: Pacemaker,
     resolver: Resolver,
     control: ControlLog,
@@ -682,6 +746,19 @@ impl VantageCore {
         let sequence = parameters.sequence_checkpoints.then(|| {
             SequenceStore::new(sid.clone(), parameters.sequence_checkpoint_interval_views)
         });
+        // f+1 for n = 3f+1, derived from the committee here so `CheckpointCollector`
+        // stays free of committee plumbing.
+        let sequence_sync = parameters.sequence_checkpoints.then(|| {
+            let n = committee.size();
+            let f = n.saturating_sub(1) / 3;
+            CheckpointCollector::new(
+                f + 1,
+                SEQUENCE_CANDIDATE_WINDOWS,
+                parameters
+                    .sequence_checkpoint_interval_views
+                    .saturating_mul(16),
+            )
+        });
         let control = ControlLog::new(name, committee.clone(), sid, parameters.delta_ms);
 
         let other_primaries: Vec<(PublicKey, SocketAddr)> = committee
@@ -786,6 +863,12 @@ impl VantageCore {
             frontier,
             cursor,
             sequence,
+            sequence_sync,
+            sequence_chunk_records: parameters.sequence_sync_chunk_records,
+            sequence_chunk_digests: parameters.sequence_sync_chunk_digests,
+            sequence_announce_period_ms: parameters.sequence_announce_period_ms,
+            sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
+            last_announced: None,
             pacemaker,
             resolver,
             control,
@@ -970,6 +1053,15 @@ impl VantageCore {
             tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
         resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase B: the announcement tick, constructed
+        // only when checkpoints are on (same Option-guarded-select idiom as `avail_tick`).
+        let mut announce_tick = self.sequence.as_ref().map(|_| {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(self.sequence_announce_period_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
+
         loop {
             // P4-3, amended by Fable perf audit item 4: bound `cancel_handlers`'
             // otherwise-unbounded growth under sustained honest traffic, but without
@@ -1091,6 +1183,15 @@ impl VantageCore {
                             .broadcast_message(PrimaryMessage::VantageAvail(entries, self.name))
                             .await;
                     }
+                }
+
+                () = async {
+                    match announce_tick.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if announce_tick.is_some() => {
+                    self.announce_checkpoint().await;
                 }
 
                 // Mechanism A (design doc step 2): every author besides ourselves,
@@ -2122,6 +2223,202 @@ impl VantageCore {
         }
     }
 
+    /// Phase B: broadcast our highest checkpoint boundary, if we have one.
+    ///
+    /// Re-sent on an unchanged boundary every `sequence_announce_repeat_ms`, not only
+    /// when it advances. Repetition is REQUIRED, not an optimization: a node that starts
+    /// late must still be able to collect `f+1` announcements for a boundary the fleet
+    /// passed before it existed, and a strictly edge-triggered announcement would never
+    /// reach it -- the recovering node is exactly the one that missed the edge.
+    ///
+    /// Announced only from `latest_boundary`, which the store populates after the record
+    /// AND its outcome/delta are retained, so we never advertise a head we cannot serve
+    /// (section 9's correctness rule).
+    async fn announce_checkpoint(&mut self) {
+        let Some((view, head)) = self
+            .sequence
+            .as_ref()
+            .and_then(|s| s.latest_boundary().map(|(v, h)| (v, h.clone())))
+        else {
+            return;
+        };
+        let now = Instant::now();
+        let repeat = Duration::from_millis(self.sequence_announce_repeat_ms);
+        let due = match self.last_announced {
+            Some((last_view, at)) => last_view != view || now.duration_since(at) >= repeat,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_announced = Some((view, now));
+        let serve_floor = self
+            .sequence
+            .as_ref()
+            .map(|s| s.serve_floor())
+            .unwrap_or(view);
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_sequence_announced_total.inc();
+        }
+        self.wire
+            .broadcast_message(PrimaryMessage::VantageSequenceAnnounce(
+                SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view,
+                    head,
+                    serve_floor,
+                    sender: self.name,
+                },
+            ))
+            .await;
+    }
+
+    /// Phase B: count one first-hand checkpoint announcement.
+    ///
+    /// Never forwarded and never turned into a live-view vote, availability
+    /// acknowledgment, or resolution stance -- adopting finalized history must not
+    /// interfere with agreement on new views (plan section 5, non-interference).
+    fn on_sequence_announce(&mut self, announcement: &SequenceAnnouncement, sender: &PublicKey) {
+        let Some(collector) = self.sequence_sync.as_mut() else {
+            return;
+        };
+        let is_member = self.members.contains(sender);
+        let local = self.cursor.next_view();
+        let outcome = collector.on_announcement(announcement, sender, is_member, local);
+        if let Some(metrics) = &self.metrics {
+            match outcome {
+                crate::vantage::sequence::AnnouncementOutcome::Counted { newly_certified } => {
+                    metrics.vantage_sequence_announce_counted_total.inc();
+                    if newly_certified {
+                        metrics.vantage_sequence_certified_total.inc();
+                        metrics
+                            .vantage_sequence_certified_view
+                            .set(announcement.view as i64);
+                    }
+                }
+                crate::vantage::sequence::AnnouncementOutcome::Ignored(_) => {
+                    metrics.vantage_sequence_announce_ignored_total.inc();
+                }
+            }
+            metrics
+                .vantage_sequence_equivocators
+                .set(collector.equivocator_count() as i64);
+        }
+    }
+
+    /// Serve a contiguous record range, or say plainly that we cannot.
+    ///
+    /// Section 9: never silently clamp a request below the serve floor and present it as
+    /// complete -- the requester would treat a short answer as the whole range and
+    /// verify a chain that cannot reach the target. An explicit
+    /// `SequenceUnavailable` with the authoritative floor lets it try another matching
+    /// announcer instead.
+    async fn serve_sequence_records(&mut self, request: &SequenceRequest, to: &PublicKey) {
+        let Some(store) = &self.sequence else {
+            return;
+        };
+        let floor = store.serve_floor();
+        let max = self
+            .sequence_chunk_records
+            .min(request.max_records as usize);
+        let records = if request.from_view < floor {
+            Vec::new()
+        } else {
+            store.records_from(request.from_view, max)
+        };
+        let message = if records.is_empty() {
+            PrimaryMessage::VantageSequenceUnavailable(SequenceUnavailable {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                serve_floor: floor,
+                sender: self.name,
+            })
+        } else {
+            PrimaryMessage::VantageSequenceRecords(SequenceRecordChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                records,
+                serve_floor: floor,
+                sender: self.name,
+            })
+        };
+        self.send_sequence(to, message).await;
+    }
+
+    async fn serve_sequence_delta(&mut self, request: &SequenceDeltaRequest, to: &PublicKey) {
+        let Some(store) = &self.sequence else {
+            return;
+        };
+        let floor = store.serve_floor();
+        let max = self.sequence_chunk_digests.min(request.max_items as usize);
+        let message = match store.delta_chunk(request.view, request.start_index, max) {
+            Some((items, complete)) => PrimaryMessage::VantageSequenceDelta(SequenceDeltaChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                view: request.view,
+                start_index: request.start_index,
+                items,
+                complete,
+                sender: self.name,
+            }),
+            None => PrimaryMessage::VantageSequenceUnavailable(SequenceUnavailable {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                serve_floor: floor,
+                sender: self.name,
+            }),
+        };
+        self.send_sequence(to, message).await;
+    }
+
+    async fn serve_sequence_outcome(&mut self, request: &SequenceOutcomeRequest, to: &PublicKey) {
+        let Some(store) = &self.sequence else {
+            return;
+        };
+        let floor = store.serve_floor();
+        let message = match store.outcome_for(request.view).cloned() {
+            Some(outcome) => PrimaryMessage::VantageSequenceOutcome(SequenceOutcomeServe {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                view: request.view,
+                outcome,
+                sender: self.name,
+            }),
+            None => PrimaryMessage::VantageSequenceUnavailable(SequenceUnavailable {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                serve_floor: floor,
+                sender: self.name,
+            }),
+        };
+        self.send_sequence(to, message).await;
+    }
+
+    /// One state-sync frame to one peer.
+    ///
+    /// Deliberately NOT `broadcast_recorded`: state-sync traffic must not enter the
+    /// outbox or the replay accounting, because it is not live-protocol history and
+    /// re-delivering it after a reconnect would be pure waste.
+    ///
+    /// DEVIATION, tracked in the plan: this rides the MAIN primary sender, not the
+    /// dedicated bounded transport section 6.1 requires. Serving frames are small
+    /// (24-32 KB) and `sequence_checkpoints` is off by default, so nothing in a default
+    /// build is affected -- but the whole point of the mechanism is to relieve a node
+    /// whose main queue is already saturated, so this MUST move to the dedicated sender
+    /// before the feature is enabled anywhere it matters.
+    async fn send_sequence(&mut self, to: &PublicKey, message: PrimaryMessage) {
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_sequence_sync_served_total.inc();
+        }
+        self.wire.send_message(*to, message).await;
+    }
+
     /// PHASE5-SPEC.md §3: execute a formal `Effect::Enter(view)` as `AgbEngine::enter`
     /// + `Frontier::enter`, in that order -- `Frontier::enter`'s W5(c) floor can newly
     ///   activate further views (its own contiguous-advance loop, on top of `view`
@@ -2494,6 +2791,44 @@ impl VantageCore {
                         "vantage node: resume hello ignored: reconnect replay disabled, sender={}",
                         sender
                     );
+                }
+                Vec::new()
+            }
+            // --- SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase B.
+            //
+            // NOTE on "authenticated": vantage's transport is signature-free, so the
+            // authoritative identity here is the DECLARED sender already
+            // membership-checked by this function's centralized gate -- the same D4
+            // discipline every other first-hand rule uses (Wish, Echo, LaneResume's
+            // requester). The f+1 argument therefore rests on the network layer not
+            // permitting spoofing, exactly as those rules do; it is not a stronger
+            // cryptographic binding, and the plan's proof must say so.
+            Inbound::SequenceAnnounce(announcement, sender) => {
+                self.on_sequence_announce(&announcement, &sender);
+                Vec::new()
+            }
+            Inbound::SequenceRequest(request, sender) => {
+                self.serve_sequence_records(&request, &sender).await;
+                Vec::new()
+            }
+            Inbound::SequenceDeltaRequest(request, sender) => {
+                self.serve_sequence_delta(&request, &sender).await;
+                Vec::new()
+            }
+            Inbound::SequenceOutcomeRequest(request, sender) => {
+                self.serve_sequence_outcome(&request, &sender).await;
+                Vec::new()
+            }
+            // Requester-side responses. Phase B verifies but never installs; with no
+            // active transfer they are unsolicited and changing state on them would be
+            // exactly the "answers a pair we never asked for" hazard section 7.3 warns
+            // about, so they are counted and dropped.
+            Inbound::SequenceRecords(..)
+            | Inbound::SequenceDelta(..)
+            | Inbound::SequenceOutcome(..)
+            | Inbound::SequenceUnavailable(..) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_sync_unsolicited_total.inc();
                 }
                 Vec::new()
             }

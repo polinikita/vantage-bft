@@ -89,6 +89,16 @@ impl DeclaredSender for Inbound {
             Inbound::Ready(r) => Some(r.sender()),
             Inbound::NoReady(_, s, _) => Some(*s),
             Inbound::Wish(_, s) => Some(*s),
+            // Phase B: the framework compares this against the authenticated
+            // connection, which is what makes the f+1 announcement rule first-hand.
+            Inbound::SequenceAnnounce(_, s) => Some(*s),
+            Inbound::SequenceRequest(_, s) => Some(*s),
+            Inbound::SequenceRecords(_, s) => Some(*s),
+            Inbound::SequenceDeltaRequest(_, s) => Some(*s),
+            Inbound::SequenceDelta(_, s) => Some(*s),
+            Inbound::SequenceOutcomeRequest(_, s) => Some(*s),
+            Inbound::SequenceOutcome(_, s) => Some(*s),
+            Inbound::SequenceUnavailable(_, s) => Some(*s),
             Inbound::CompReport(_, _, s) => Some(*s),
             Inbound::ControlEcho(s, _) => Some(*s),
             Inbound::ControlReady(s, _) => Some(*s),

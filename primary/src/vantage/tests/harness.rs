@@ -282,6 +282,18 @@ impl Node {
             return Vec::new();
         }
         match inbound {
+            // SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase B. The deterministic harness runs
+            // no SequenceStore or collector, so state-sync traffic is inert here by
+            // construction -- the protocol tests keep asserting on output, and this
+            // arm makes it explicit that checkpoints add no path into consensus.
+            Inbound::SequenceAnnounce(..)
+            | Inbound::SequenceRequest(..)
+            | Inbound::SequenceRecords(..)
+            | Inbound::SequenceDeltaRequest(..)
+            | Inbound::SequenceDelta(..)
+            | Inbound::SequenceOutcomeRequest(..)
+            | Inbound::SequenceOutcome(..)
+            | Inbound::SequenceUnavailable(..) => Vec::new(),
             Inbound::Publish(sender, header) => self.lm.process_publish(sender, header).await,
             Inbound::Serve(header) => self.rep.on_serve(header),
             Inbound::HeadersRequest(digests, requestor) => {

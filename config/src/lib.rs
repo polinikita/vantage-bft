@@ -361,6 +361,48 @@ pub struct Parameters {
     #[serde(default = "default_sequence_checkpoint_interval_views")]
     pub sequence_checkpoint_interval_views: u64,
 
+    /// Phase B (plan section 6.2). How often the announce timer fires. An announcement
+    /// is sent when the local boundary has advanced, or when
+    /// `sequence_announce_repeat_ms` has elapsed for the current one.
+    #[serde(default = "default_sequence_announce_period_ms")]
+    pub sequence_announce_period_ms: u64,
+
+    /// Re-send interval for an UNCHANGED boundary. Repetition is required, not an
+    /// optimization: a node that starts late must still be able to collect `f+1`
+    /// announcements for a boundary the fleet passed before it existed, and a strictly
+    /// edge-triggered announcement would never reach it.
+    #[serde(default = "default_sequence_announce_repeat_ms")]
+    pub sequence_announce_repeat_ms: u64,
+
+    /// Records per served chunk. Chunked by ITEM COUNT rather than bytes because records
+    /// are fixed-width, so an item cap is already an exact byte cap.
+    #[serde(default = "default_sequence_sync_chunk_records")]
+    pub sequence_sync_chunk_records: usize,
+
+    /// Delta digests per served chunk (32 B each).
+    #[serde(default = "default_sequence_sync_chunk_digests")]
+    pub sequence_sync_chunk_digests: usize,
+
+    /// Matching announcers queried concurrently for one outstanding chunk. Up to `f` of
+    /// the `f+1` may withhold every response, so SERIAL failover would multiply
+    /// worst-case recovery time by `f`; concurrency bounds it by the one correct
+    /// announcer's latency at a bandwidth cost of at most this factor.
+    #[serde(default = "default_sequence_sync_max_sources")]
+    pub sequence_sync_max_sources: usize,
+
+    /// Per-request deadline before failing over to the NEXT source.
+    #[serde(default = "default_sequence_sync_request_timeout_ms")]
+    pub sequence_sync_request_timeout_ms: u64,
+
+    /// Bounded ingress for state-sync responses, in frames. Separate from the main
+    /// Vantage inbound queue by design: this mechanism exists to relieve a node whose
+    /// main queue is ALREADY saturated, so sharing that queue would deepen the exact
+    /// congestion it is meant to drain. Overflow drops the newest frame -- responses are
+    /// idempotent and re-requestable, so a drop costs one retry while blocking would
+    /// propagate backpressure into the transport and stall live consensus.
+    #[serde(default = "default_sequence_sync_inbound_capacity")]
+    pub sequence_sync_inbound_capacity: usize,
+
     /// AVAIL-ECHO-SPEC.md: carry availability acknowledgments POSITIONALLY on the AGB
     /// echo -- a bit per lane against the echoed proposal's own reference vector --
     /// instead of `VantageAvail`'s explicit `(a,k,h)` tuples.
@@ -738,6 +780,37 @@ fn default_sequence_checkpoint_interval_views() -> u64 {
     100
 }
 
+fn default_sequence_announce_period_ms() -> u64 {
+    2_000
+}
+
+fn default_sequence_announce_repeat_ms() -> u64 {
+    10_000
+}
+
+/// 256 records is ~24 KB at 96 B/record.
+fn default_sequence_sync_chunk_records() -> usize {
+    256
+}
+
+/// 1024 digests is 32 KB, comfortably below the 64 KB frame norm.
+fn default_sequence_sync_chunk_digests() -> usize {
+    1_024
+}
+
+/// `f+1` at the smallest committee this targets.
+fn default_sequence_sync_max_sources() -> usize {
+    3
+}
+
+fn default_sequence_sync_request_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_sequence_sync_inbound_capacity() -> usize {
+    256
+}
+
 fn default_batch_max_bytes() -> usize {
     65_536
 }
@@ -1061,6 +1134,13 @@ impl Default for Parameters {
             digest_statements: default_digest_statements(),
             sequence_checkpoints: default_sequence_checkpoints(),
             sequence_checkpoint_interval_views: default_sequence_checkpoint_interval_views(),
+            sequence_announce_period_ms: default_sequence_announce_period_ms(),
+            sequence_announce_repeat_ms: default_sequence_announce_repeat_ms(),
+            sequence_sync_chunk_records: default_sequence_sync_chunk_records(),
+            sequence_sync_chunk_digests: default_sequence_sync_chunk_digests(),
+            sequence_sync_max_sources: default_sequence_sync_max_sources(),
+            sequence_sync_request_timeout_ms: default_sequence_sync_request_timeout_ms(),
+            sequence_sync_inbound_capacity: default_sequence_sync_inbound_capacity(),
             // AVAIL-ECHO-SPEC.md: off by default, so `Parameters::default()` and every
             // config predating the field keep the explicit-tuple `VantageAvail` path.
             echo_avail_claims: false,
