@@ -1170,3 +1170,50 @@ fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
         .expect("duplicate delta must not be an error");
     assert_eq!(t.next_sources(3).len(), 2, "still no source penalized");
 }
+
+/// An honest server serves a contiguous run from its OWN chain and does not stop at our
+/// target, so a chunk routinely overshoots. Rejecting that as PastTarget retires honest
+/// sources: measured live as 15 transfers started, 0 verified, 14 exhausted.
+#[test]
+fn records_past_the_target_are_trimmed_not_rejected() {
+    let (store, sid) = populated_store(20);
+    let keys = authors();
+    let (source, _) = keys[0];
+    // Target is view 6, but the server has 20 and serves all of them.
+    let head_at_6 = {
+        let mut partial = SequenceStore::new(sid.clone(), 4);
+        for view in 1..=6u64 {
+            let outcome = store.outcome_for(view).unwrap().clone();
+            let (items, _) = store.delta_chunk(view, 0, 64).unwrap();
+            partial.record(view, &outcome, &items).unwrap();
+        }
+        partial.head().clone()
+    };
+    let mut t = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        6,
+        head_at_6,
+        vec![source],
+    );
+    t.on_records(
+        &SequenceRecordChunk {
+            version: SEQUENCE_VERSION,
+            transfer_id: 7,
+            target_head: t.target().1.clone(),
+            records: store.records_from(1, 20),
+            serve_floor: 1,
+            sender: source,
+        },
+        &source,
+    )
+    .expect("an overshooting honest chunk must verify, not be rejected");
+    assert_eq!(t.state(), TransferState::FetchingOutcomes);
+    assert_eq!(
+        t.next_sources(3).len(),
+        1,
+        "the source must not be penalized"
+    );
+}

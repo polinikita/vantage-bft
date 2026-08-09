@@ -1105,11 +1105,18 @@ impl SequenceTransfer {
         // before verifying: without this the second and third copies present as
         // `UnexpectedView`, get charged as corrupt, and retire every honest source --
         // measured on a live cluster as 29 transfers started, 0 verified, 28 exhausted.
+        // Trim BOTH ends. A server serves a contiguous run from its own chain and does
+        // not stop at our target, so an honest chunk routinely runs past it -- rejecting
+        // that as PastTarget retired honest sources and exhausted the transfer (measured:
+        // 15 started, 0 verified, 14 exhausted, even after the duplicate fix). Records
+        // below `already` are duplicates from a concurrent source; records above the
+        // target are simply more than we asked for. Neither is misbehaviour.
         let already = self.chain.next_view();
+        let target = self.target_view;
         let fresh: Vec<SequenceRecord> = chunk
             .records
             .iter()
-            .filter(|r| r.view >= already)
+            .filter(|r| r.view >= already && r.view <= target)
             .cloned()
             .collect();
         if fresh.is_empty() {
