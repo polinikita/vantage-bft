@@ -122,7 +122,11 @@ def main():
         med = statistics.median(finals.values())
         for i in sorted(finals):
             gap = finals[i] - med
-            flag = "  <-- LAGGING" if gap < -2 else ""
+            # 2 views is inside the normal spread between nodes that are all keeping
+            # up (with an even committee the median sits between two of them, so a
+            # healthy node is routinely a few views off it). Flag only a gap big
+            # enough to mean a node is genuinely not tracking the fleet.
+            flag = "  <-- LAGGING" if gap < -max(20, 0.01 * med) else ""
             print(f"  node {i:>2}: {finals[i]:>8.0f}  ({gap:+.0f} vs median){flag}")
         spread = max(finals.values()) - min(finals.values())
         print(f"  spread {spread:.0f} views across {len(finals)} node(s)")
