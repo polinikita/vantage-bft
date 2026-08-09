@@ -1897,6 +1897,17 @@ impl VantageCore {
         metrics
             .vantage_cursor_next_view
             .set(self.cursor.next_view() as i64);
+        // Sampled HERE, beside the cursor gauge, not at record time. The two are exactly
+        // one apart by construction (`head_view == next_view - 1`), but only if they are
+        // read at the same instant: setting the head on every record while the cursor
+        // gauge refreshes on this periodic tick made the difference transiently negative
+        // -- measured -14 views at n=20 -- which would either raise false alarms or force
+        // the invariant to be weakened into something that checks nothing.
+        if let Some(store) = &self.sequence {
+            metrics
+                .vantage_sequence_head_view
+                .set(store.head_view() as i64);
+        }
         metrics
             .vantage_control_round
             .set(self.control.curr_round() as i64);
@@ -2063,10 +2074,8 @@ impl VantageCore {
         };
         match store.record(view, outcome, output_delta) {
             Ok(_) => {
-                let head_view = store.head_view();
                 let boundary = store.latest_boundary().map(|(v, h)| (v, h.clone()));
                 if let Some(metrics) = &self.metrics {
-                    metrics.vantage_sequence_head_view.set(head_view as i64);
                     metrics
                         .vantage_sequence_delta_digests_total
                         .inc_by(output_delta.len() as u64);

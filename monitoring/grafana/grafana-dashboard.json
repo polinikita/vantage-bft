@@ -2571,7 +2571,7 @@
           },
           "refId": "A",
           "legendFormat": "{{node}} lag",
-          "expr": "(vantage_cursor_next_view{node=~\"$node\"} - 1) - vantage_sequence_head_view{node=~\"$node\"}"
+          "expr": "(vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"} - 1) - vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"}"
         },
         {
           "datasource": {
@@ -2580,12 +2580,12 @@
           },
           "refId": "B",
           "legendFormat": "worst lag",
-          "expr": "max((vantage_cursor_next_view{node=~\"$node\"} - 1) - vantage_sequence_head_view{node=~\"$node\"})"
+          "expr": "max((vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"} - 1) - vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"})"
         }
       ],
       "title": "Sequence head lag behind the cursor (must be 0)",
       "type": "timeseries",
-      "description": "The sequence log covers every TERMINALLY processed view, and the cursor's next_view is the lowest view NOT yet advanced past -- so head_view == cursor_next_view - 1 exactly, and this plots the difference, which must sit at 0. Plotting the two raw series against each other would show a permanent off-by-one and hide a real one-view lag inside it. A persistent nonzero value means views are advancing without being recorded. Empty unless `sequence_checkpoints` is on."
+      "description": "The sequence log covers every TERMINALLY processed view, and the cursor's next_view is the lowest view NOT yet advanced past -- so head_view == cursor_next_view - 1 exactly, and this plots the difference, which must sit at 0. Plotting the two raw series against each other would show a permanent off-by-one and hide a real one-view lag inside it. A persistent nonzero value means views are advancing without being recorded. Empty unless `sequence_checkpoints` is on. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
     },
     {
       "datasource": {
@@ -2627,7 +2627,7 @@
           },
           "refId": "A",
           "legendFormat": "distinct heads at the fleet's highest boundary",
-          "expr": "count(count by (head) (vantage_sequence_boundary_head{node=~\"$node\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\"}))))"
+          "expr": "count(count by (head) (vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"}))))"
         },
         {
           "datasource": {
@@ -2636,12 +2636,12 @@
           },
           "refId": "B",
           "legendFormat": "nodes at that boundary",
-          "expr": "count(vantage_sequence_boundary_head{node=~\"$node\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\"})))"
+          "expr": "count(vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"})))"
         }
       ],
       "title": "Checkpoint head agreement (DIVERGENCE if > 1)",
       "type": "timeseries",
-      "description": "THE Phase A gate. Series A counts how many DISTINCT heads are reported by the nodes that have reached the fleet's highest boundary. Correct parties that terminally processed the same views must derive the identical head, so this must be exactly 1; 2 or more means two nodes at the SAME height committed different output, which is a release blocker and must be reduced to the first divergent view before anything is announced. Comparing boundary VIEWS cannot detect this -- divergent nodes are at identical heights by construction. Series B is the sample size: series A is only meaningful once B covers most of the committee."
+      "description": "THE Phase A gate. Series A counts how many DISTINCT heads are reported by the nodes that have reached the fleet's highest boundary. Correct parties that terminally processed the same views must derive the identical head, so this must be exactly 1; 2 or more means two nodes at the SAME height committed different output, which is a release blocker and must be reduced to the first divergent view before anything is announced. Comparing boundary VIEWS cannot detect this -- divergent nodes are at identical heights by construction. Series B is the sample size: series A is only meaningful once B covers most of the committee. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
     },
     {
       "datasource": {
@@ -2683,12 +2683,12 @@
           },
           "refId": "A",
           "legendFormat": "{{node}}",
-          "expr": "vantage_sequence_boundary_head_lo{node=~\"$node\"}"
+          "expr": "vantage_sequence_boundary_head_lo{node=~\"$node\",node=~\".*-primary$\"}"
         }
       ],
       "title": "Boundary head per validator (leading 8 bytes)",
       "type": "timeseries",
-      "description": "The same heads as a plottable number, so divergence is visible as a line that separates from the others while boundary views still match. Lossy (8 of 32 bytes) and NOT authoritative -- `docker-bench/sequence_check.py` compares full hex heads and is what decides the gate. Steps whenever a node passes a new boundary; all validators should step to the same value at the same boundary."
+      "description": "The same heads as a plottable number, so divergence is visible as a line that separates from the others while boundary views still match. Lossy (8 of 32 bytes) and NOT authoritative -- `docker-bench/sequence_check.py` compares full hex heads and is what decides the gate. Steps whenever a node passes a new boundary; all validators should step to the same value at the same boundary. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
     },
     {
       "datasource": {
@@ -2730,7 +2730,7 @@
           },
           "refId": "A",
           "legendFormat": "records/s",
-          "expr": "sum(rate(vantage_sequence_records_total{node=~\"$node\"}[1m]))"
+          "expr": "sum(rate(vantage_sequence_records_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
           "datasource": {
@@ -2739,7 +2739,7 @@
           },
           "refId": "B",
           "legendFormat": "cursor views/s",
-          "expr": "sum(deriv(vantage_cursor_next_view{node=~\"$node\"}[1m]))"
+          "expr": "sum(deriv(vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
           "datasource": {
@@ -2748,7 +2748,7 @@
           },
           "refId": "C",
           "legendFormat": "delta blocks/s",
-          "expr": "sum(rate(vantage_sequence_delta_digests_total{node=~\"$node\"}[1m]))"
+          "expr": "sum(rate(vantage_sequence_delta_digests_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
           "datasource": {
@@ -2757,12 +2757,12 @@
           },
           "refId": "D",
           "legendFormat": "rejected (total)",
-          "expr": "sum(vantage_sequence_record_rejected_total{node=~\"$node\"})"
+          "expr": "sum(vantage_sequence_record_rejected_total{node=~\"$node\",node=~\".*-primary$\"})"
         }
       ],
       "title": "Sequence record rate and rejections",
       "type": "timeseries",
-      "description": "Records/s must equal the cursor's own view-advance rate -- one record per terminally processed view, including Skip. Delta blocks/s is the committed BLOCK rate as the sequence log sees it; it is deliberately not compared against committed_transactions, which counts TRANSACTIONS in a different process and differs by the batch fan-out factor. Rejections count a LOCAL invariant violation (a view finalized out of order), never remote input; any nonzero value invalidates this node's head and blocks the phase."
+      "description": "Records/s must equal the cursor's own view-advance rate -- one record per terminally processed view, including Skip. Delta blocks/s is the committed BLOCK rate as the sequence log sees it; it is deliberately not compared against committed_transactions, which counts TRANSACTIONS in a different process and differs by the batch fan-out factor. Rejections count a LOCAL invariant violation (a view finalized out of order), never remote input; any nonzero value invalidates this node's head and blocks the phase. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
     }
   ],
   "preload": false,
