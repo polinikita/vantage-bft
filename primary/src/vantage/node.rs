@@ -2546,7 +2546,20 @@ impl VantageCore {
         }
         let blocks = self.rep.blocks();
         let pending = self.rep.pending_settle_len();
+        // Ordinary dissemination never stopped while the transfer ran, so the cursor may
+        // have moved since the target's base view. Dropping the overtaken prefix keeps a
+        // still-useful suffix installable and stops fetching blocks for views already
+        // committed; if it overtook the target outright, the target is retired here.
+        let local_view = self.cursor.next_view().saturating_sub(1);
         let install = self.sequence_install.as_mut().expect("present");
+        if !install.rebase(local_view) {
+            log::info!(
+                "vantage sequence install: ordinary execution reached view={local_view}; \
+                 target retired without installing"
+            );
+            self.sequence_install = None;
+            return Vec::new();
+        }
         install.refresh(&blocks);
         let refs = install.admit(pending);
 
@@ -2651,6 +2664,13 @@ impl VantageCore {
                         .vantage_sequence_install_completed_view
                         .set(target as i64);
                 }
+                // Every view at or below the target is now terminally decided. Until the
+                // resolver is told, it keeps targeting recovery at a range whose outcome is
+                // already committed, and -- since the GC floor is derived from its
+                // watermark -- the AGB, control, frontier, digest-statement and timer state
+                // for every view skipped over is retained. On the straggler this mechanism
+                // exists to rescue, that retained state is the cost that matters.
+                self.resolver.note_installed_through(target);
                 // Left in place, NOT cleared: the finalize effects this pass produced still
                 // have to reach `record_sequence`, and the head comparison there is what
                 // proves the installed state matches what was verified. That comparison

@@ -124,6 +124,26 @@ impl SequenceInstall {
         (self.target_view, &self.target_head)
     }
 
+    /// Drop the views ordinary execution reached while the blocks were still being fetched.
+    ///
+    /// `base_view` is where the local chain stood when the TRANSFER started, and a node
+    /// that is merely slow rather than stuck keeps committing the whole time. Without this
+    /// the first `Cursor::install` would be `OutOfOrder` against a cursor that has moved
+    /// on, and a target still perfectly good above the new position would be abandoned.
+    /// The remaining suffix is unaffected: the verified chain is per-view, so dropping a
+    /// prefix of it weakens nothing about what is left.
+    ///
+    /// Returns `true` while the target still has something to contribute. `false` means
+    /// ordinary dissemination won outright and the target is entirely stale.
+    pub fn rebase(&mut self, local_view: View) -> bool {
+        while self.next_install <= local_view && self.next_install <= self.target_view {
+            self.views.remove(&self.next_install);
+            self.next_install += 1;
+        }
+        self.next_admit = self.next_admit.max(self.next_install);
+        self.next_install <= self.target_view
+    }
+
     pub fn base_view(&self) -> View {
         self.base_view
     }

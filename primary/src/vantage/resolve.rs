@@ -132,6 +132,29 @@ impl Resolver {
         self.resolved_watermark.saturating_sub(gc_window).max(1)
     }
 
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10: verified checkpoint state has been installed
+    /// through `view`, so every view at or below it is terminally decided.
+    ///
+    /// That is the same fact `decide_head`'s scan establishes one view at a time, reached
+    /// directly instead. Stating it matters twice over. It stops the resolver proposing
+    /// recovery for a range whose outcome is already committed -- `decide_head` starts its
+    /// scan at the watermark, so an un-advanced watermark would keep targeting installed
+    /// views forever, since their AGB state was pruned and `resolved(u)` can no longer be
+    /// witnessed. And because the GC floor IS `resolved_watermark - window`, this is what
+    /// lets that range's AGB, control, frontier, digest-statement and timer state be
+    /// discarded at all: an installed node that never advanced its watermark would keep
+    /// every view it skipped over, which on the straggler this mechanism exists to rescue
+    /// is precisely the state it cannot afford.
+    ///
+    /// Monotonic, so a stale or overlapping install cannot undo resolution progress made
+    /// while its blocks were being fetched.
+    pub fn note_installed_through(&mut self, view: View) {
+        let next = view.saturating_add(1);
+        if next > self.resolved_watermark {
+            self.resolved_watermark = next;
+        }
+    }
+
     pub fn gc_below(&mut self, floor: View) {
         self.candidate_pointer = self.candidate_pointer.split_off(&floor);
         self.in_flight = self.in_flight.split_off(&floor);

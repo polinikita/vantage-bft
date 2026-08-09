@@ -262,3 +262,57 @@ fn views_already_held_are_never_fetched() {
     assert_eq!(install.blocks_awaited(&blocks), 0);
     assert_eq!(install.installable(), Some(1));
 }
+
+/// Ordinary dissemination never stops while a transfer runs, so by the time the blocks
+/// arrive the cursor may already be past part of the target. The overtaken prefix is
+/// dropped and the still-useful suffix survives -- abandoning the whole target here would
+/// throw away exactly the catch-up the node asked for.
+#[test]
+fn a_cursor_that_advanced_during_the_fetch_rebases_the_target() {
+    let (mut install, headers) = install_of(10, 8, 4096);
+    let blocks = empty_cache();
+
+    assert!(install.rebase(4), "views 5..10 are still worth installing");
+    assert_eq!(install.views_total(), 6);
+    assert_eq!(
+        install.installable(),
+        None,
+        "view 5 has no blocks yet, and view 4 is gone rather than stale"
+    );
+
+    cache_insert(&blocks, &headers);
+    install.admit(0);
+    install.refresh(&blocks);
+    assert_eq!(
+        install.installable(),
+        Some(5),
+        "installation resumes at the first view the cursor did NOT reach"
+    );
+}
+
+/// The other side of the same race: ordinary dissemination reached the target outright, so
+/// there is nothing left to install and the target must retire rather than linger.
+#[test]
+fn a_target_overtaken_outright_is_retired() {
+    let (mut install, _) = install_of(6, 8, 4096);
+
+    assert!(!install.rebase(6), "the cursor reached the target itself");
+    assert_eq!(install.views_total(), 0);
+    assert!(install.is_done());
+
+    let (mut ahead, _) = install_of(6, 8, 4096);
+    assert!(!ahead.rebase(99), "and past it");
+}
+
+/// Rebasing must not leave the fetch window admitting views that no longer exist.
+#[test]
+fn rebase_moves_the_admission_point_too() {
+    let (mut install, _) = install_of(10, 3, 4096);
+    install.admit(0); // admits views 1..3
+    assert!(install.rebase(6));
+
+    let refs = install.admit(0);
+    assert_eq!(refs.len(), 3, "admission resumes at view 7, not view 4");
+    assert_eq!(install.views_in_flight(), 3);
+    assert_eq!(install.views_total(), 4);
+}

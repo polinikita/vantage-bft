@@ -713,13 +713,31 @@ Implementation order, smallest safe increment first:
      that turned 60,262 received blocks into 612M settle calls.
    - Still installs nothing. Reaching "every view locally held" is observable
      (`vantage_sequence_install_ready_total`) and is the precondition the next step needs.
-2. **Atomic cursor installation.** Prefix-check any locally emitted partial view, deliver
-   missing blocks exactly once in sequence order, and move the cursor's watermarks, output
-   set, open delta, sequence head and `next_view` together.
-3. **Discard obsolete consensus work** at or below the installed view, preserving every
-   future-view message.
-4. **Race handling:** ordinary dissemination winning aborts the sync; a partially advanced
-   cursor forces abort or rebase; a stale or incompatible target is never installed.
+2. **Atomic cursor installation -- IMPLEMENTED.** `Cursor::install` applies one verified
+   view. Every refusal runs before any state is touched, so a rejected install leaves the
+   cursor byte-identical; a half-applied view is a hole no later execution can repair.
+   `OutOfOrder`, `PrefixMismatch` (the locally emitted partial delta is not a prefix of the
+   verified one -- impossible between correct parties, which is why it is worth checking),
+   `BlocksMissing` (`emit` resolves headers by cache lookup and silently omits what it
+   cannot find, so this would be silent output loss rather than a stall), `AlreadyOutput`.
+   Success runs through the ORDINARY `finalize` path, so the head advances through the same
+   code as locally executed views and the verified-vs-local comparison fires on the
+   installed result. Per-author watermarks move to the manifest tips. Gated off by
+   `sequence_install_enabled` (default false), bounded at
+   `sequence_install_views_per_tick`.
+3. **Discard obsolete consensus work -- IMPLEMENTED.** Installing through `V` establishes
+   that every view at or below it is terminally decided, so `Resolver::
+   note_installed_through` raises the resolved watermark directly. That single fact does
+   both jobs: it stops the resolver targeting recovery at a committed range (whose AGB state
+   was pruned, so `resolved(u)` can never again be witnessed), and -- since the GC floor IS
+   `resolved_watermark - window` -- it releases the AGB, control, frontier, digest-statement
+   and timer state for the whole skipped range through the existing GC pass. Future views
+   are preserved by construction, since it is a floor. No new pruning code.
+4. **Race handling -- IMPLEMENTED.** Ordinary dissemination never stops while a transfer
+   runs, so `SequenceInstall::rebase` drops the overtaken prefix each pass and keeps the
+   still-useful suffix installable; a target overtaken outright retires without installing.
+   `Cursor::install`'s `OutOfOrder` is the backstop for a stale target, and the verified
+   head comparison retires a target ordinary execution reached under its own power.
 
 Then:
 
