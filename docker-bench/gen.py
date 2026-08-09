@@ -259,6 +259,11 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "ack_watermarks": not args.no_ack_watermarks,
         "ack_watermark_period_ms": args.ack_watermark_period_ms,
         "digest_statements": not args.no_digest_statements,
+        # SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase A: record-only. Off by default in
+        # the node, so the local harness must be able to turn it on or the gate
+        # cannot be scored at all.
+        "sequence_checkpoints": args.sequence_checkpoints,
+        "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         # Explicit Some(0), not absent/null, REGARDLESS of --no-latency: real one-way
         # delay (when enabled) comes from tc netem, not from this process, so the
         # in-process aws_rtt default (`node run`'s own fallback whenever this key is
@@ -508,6 +513,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--no-ack-watermarks", action="store_true",
                help="disable periodic availability watermarks (ON by default)")
     p.add_argument("--ack-watermark-period-ms", type=int, default=50)
+    p.add_argument("--sequence-checkpoints", action="store_true",
+                   help="build the local sequence chain and boundary heads "
+                        "(record-only; score with sequence_check.py)")
+    p.add_argument("--sequence-checkpoint-interval", type=int, default=100,
+                   help="checkpoint boundary interval K in views; must be small "
+                        "enough that the run crosses several boundaries on 2+ nodes")
     p.add_argument("--no-digest-statements", action="store_true",
                help="disable digest-named AGB statements (ON by default)")
     p.add_argument("--no-reconnect-replay", action="store_true",
