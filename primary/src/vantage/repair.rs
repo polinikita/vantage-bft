@@ -1187,6 +1187,14 @@ impl Repairer {
     /// `VantageCore::sample_metrics`. See that gauge's doc comment for why this is the
     /// number to watch: it is the `P` in `on_block_available`'s O(P) per-block sweep,
     /// and nothing GCs it.
+    /// The shared cache, for callers that need to test digest PRESENCE without going
+    /// through the walk (`vantage::install` asks whether a verified delta has fully
+    /// arrived). Handing out the `Arc` rather than a per-digest predicate keeps the lock
+    /// held once per sweep instead of once per digest.
+    pub fn blocks(&self) -> SharedBlocks {
+        self.blocks.clone()
+    }
+
     pub fn pending_settle_len(&self) -> usize {
         self.pending_settle.len()
     }

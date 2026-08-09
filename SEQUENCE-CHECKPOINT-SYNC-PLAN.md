@@ -689,6 +689,40 @@ replaces that wait with an install.
 
 ### Phase C: guarded installation
 
+Implementation order, smallest safe increment first:
+
+1. **Staging and block fetch -- IMPLEMENTED.** A verified target names block *digests*, not
+   blocks, so nothing can be installed until those blocks are local. `vantage::install`
+   turns each view's outcome manifests into work for the existing `Repairer` and reports
+   when a view's whole delta is in the cache.
+   - The fetch instruction is the OUTCOME's manifests, not the delta: a `Manifest` entry is
+     exactly a `BlockRef`, and `Repairer::authorize` already walks the named lane's prefix
+     with bounded fan-out, a congestion window, and worker-payload sync on arrival. This is
+     §16 decision 4's conservative choice -- reuse block repair, add no new bulk transport.
+   - The delta is the completion test instead, checked against the block cache, so blocks
+     arriving by ordinary dissemination count and nothing is fetched twice.
+   - Announcers of the certified target seed repair's holder index (`note_holder`), which
+     is the "checkpoint-source preference" half of that decision. Repair otherwise learns
+     holders only from traffic it has already seen -- on a node that just fell behind,
+     precisely the traffic it missed. One entry per lane, not per manifest entry.
+   - Pacing: at most `sequence_install_window_views` (8) views in flight, and nothing
+     admitted while `Repairer::pending_settle_len()` exceeds
+     `sequence_install_settle_ceiling` (2048). The second gate matters more than the first.
+     This mechanism runs on nodes that are already behind, which is exactly when repair is
+     already loaded, so an installer indifferent to that backlog would recreate the regime
+     that turned 60,262 received blocks into 612M settle calls.
+   - Still installs nothing. Reaching "every view locally held" is observable
+     (`vantage_sequence_install_ready_total`) and is the precondition the next step needs.
+2. **Atomic cursor installation.** Prefix-check any locally emitted partial view, deliver
+   missing blocks exactly once in sequence order, and move the cursor's watermarks, output
+   set, open delta, sequence head and `next_view` together.
+3. **Discard obsolete consensus work** at or below the installed view, preserving every
+   future-view message.
+4. **Race handling:** ordinary dissemination winning aborts the sync; a partially advanced
+   cursor forces abort or rebase; a stale or incompatible target is never installed.
+
+Then:
+
 - enable installation only on deliberately delayed/restarted nodes;
 - run deterministic in-process tests, then Docker without latency, mimic latency, and
   netem latency;

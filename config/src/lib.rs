@@ -413,6 +413,22 @@ pub struct Parameters {
     #[serde(default = "default_sequence_sync_inbound_capacity")]
     pub sequence_sync_inbound_capacity: usize,
 
+    /// Views of a verified target admitted into the block-fetch window at once.
+    ///
+    /// Installation applies views in order, so fetching far ahead of the install point
+    /// buys nothing; the window exists only so that one slow lane does not serialize the
+    /// whole range behind it.
+    #[serde(default = "default_sequence_install_window_views")]
+    pub sequence_install_window_views: usize,
+
+    /// `Repairer::pending_settle_len()` above which the install fetch admits no further
+    /// view. Unsettled refs are the set whose unbounded growth turned 60,262 received
+    /// blocks into 612M settle calls on the 2026-08-07 n=100 run, so an installer that
+    /// ignored repair's backlog would recreate that regime on exactly the nodes least able
+    /// to absorb it.
+    #[serde(default = "default_sequence_install_settle_ceiling")]
+    pub sequence_install_settle_ceiling: usize,
+
     /// AVAIL-ECHO-SPEC.md: carry availability acknowledgments POSITIONALLY on the AGB
     /// echo -- a bit per lane against the echoed proposal's own reference vector --
     /// instead of `VantageAvail`'s explicit `(a,k,h)` tuples.
@@ -830,6 +846,19 @@ fn default_sequence_sync_inbound_capacity() -> usize {
     256
 }
 
+/// Mirrors `vantage::install::DEFAULT_WINDOW_VIEWS` (that crate depends on this one, not
+/// the other way round). Eight views overlaps progress across a slow lane while keeping
+/// the authorized set on the order of `8 * n` refs rather than `range * n`.
+fn default_sequence_install_window_views() -> usize {
+    8
+}
+
+/// Mirrors `vantage::install::DEFAULT_SETTLE_CEILING`. Well below the 4,967 unsettled refs
+/// measured on a straggler, so installation backs off before reaching that regime.
+fn default_sequence_install_settle_ceiling() -> usize {
+    2_048
+}
+
 fn default_batch_max_bytes() -> usize {
     65_536
 }
@@ -1162,6 +1191,8 @@ impl Default for Parameters {
             sequence_sync_max_sources: default_sequence_sync_max_sources(),
             sequence_sync_request_timeout_ms: default_sequence_sync_request_timeout_ms(),
             sequence_sync_inbound_capacity: default_sequence_sync_inbound_capacity(),
+            sequence_install_window_views: default_sequence_install_window_views(),
+            sequence_install_settle_ceiling: default_sequence_install_settle_ceiling(),
             // AVAIL-ECHO-SPEC.md: off by default, so `Parameters::default()` and every
             // config predating the field keep the explicit-tuple `VantageAvail` path.
             echo_avail_claims: false,

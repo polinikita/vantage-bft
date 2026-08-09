@@ -775,6 +775,27 @@ pub struct Metrics {
     /// installation unsafe, so this is Phase C's release blocker.
     pub vantage_sequence_verify_mismatch_total: IntCounter,
 
+    // Phase C staging: turning a verified target into blocks this node actually holds.
+    /// Verified targets accepted for staging. A verified target that is NOT staged was
+    /// refused as non-contiguous; see `vantage_sequence_install_rejected_total`.
+    pub vantage_sequence_install_staged_total: IntCounter,
+    /// Verified targets refused because their per-view output was not contiguous above the
+    /// local head. A verified chain cannot have a hole, so nonzero means the outcome/delta
+    /// maps disagree with the chain that was verified -- an internal inconsistency, not
+    /// remote misbehaviour.
+    pub vantage_sequence_install_rejected_total: IntCounter,
+    /// Views in the target being staged.
+    pub vantage_sequence_install_views: IntGauge,
+    /// Staged views whose whole verified delta is now in the local block cache.
+    pub vantage_sequence_install_views_ready: IntGauge,
+    /// Staged views admitted to the fetch window and still waiting on blocks. Bounded by
+    /// `sequence_install_window_views`; pinned at that bound means repair, not the window,
+    /// is the limiter.
+    pub vantage_sequence_install_views_in_flight: IntGauge,
+    /// Targets whose every view became locally held. The precondition for installing:
+    /// until this fires there is nothing to install, only something to fetch.
+    pub vantage_sequence_install_ready_total: IntCounter,
+
     /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
     /// addressed to a peer we have not managed to connect to yet. Best-effort sends
     /// are allowed to vanish, but they must not vanish SILENTLY: this is the only
@@ -1744,6 +1765,42 @@ impl Metrics {
             vantage_sequence_verify_mismatch_total: register_int_counter_with_registry!(
                 "vantage_sequence_verify_mismatch_total",
                 "Verified checkpoint heads that DISAGREED with local execution -- must stay 0",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_staged_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_staged_total",
+                "Verified targets accepted for install staging",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_rejected_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_rejected_total",
+                "Verified targets refused as non-contiguous above the local head",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_views: register_int_gauge_with_registry!(
+                "vantage_sequence_install_views",
+                "Views in the target being staged for install",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_views_ready: register_int_gauge_with_registry!(
+                "vantage_sequence_install_views_ready",
+                "Staged views whose whole verified delta is locally held",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_views_in_flight: register_int_gauge_with_registry!(
+                "vantage_sequence_install_views_in_flight",
+                "Staged views admitted to the fetch window and still awaiting blocks",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_ready_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_ready_total",
+                "Targets whose every view became locally held",
                 registry,
             )
             .unwrap(),

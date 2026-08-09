@@ -20,6 +20,7 @@ const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
 
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
+use crate::vantage::install::SequenceInstall;
 use crate::vantage::lanes::{
     AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager, SharedAckAggregator,
     SharedBlocks,
@@ -453,6 +454,16 @@ pub struct VantageCore {
     /// does not move the cursor, no newer transfer starts until ordinary dissemination
     /// reaches this target. Phase C replaces that wait by installing the verified state.
     sequence_verified_target: Option<(View, Digest)>,
+    /// Phase C staging: the verified target being turned into locally held blocks. At most
+    /// one at a time, for the same reason as `sequence_transfer` -- the cursor advances
+    /// through a single sequence, so a second concurrent target could only be a target this
+    /// one supersedes.
+    sequence_install: Option<SequenceInstall>,
+    sequence_install_window_views: usize,
+    sequence_install_settle_ceiling: usize,
+    /// "Every view is locally held" is a level, not an edge, and the drive runs every
+    /// announce tick -- without this the line would repeat until the target retires.
+    sequence_install_ready_logged: bool,
     /// When the outstanding request was issued, for the failover deadline.
     sequence_request_at: Option<Instant>,
     /// What the last emitted request asked for. A response only re-emits when the WANT
@@ -896,6 +907,10 @@ impl VantageCore {
             sequence_transfer: None,
             sequence_transfer_seq: 0,
             sequence_verified_target: None,
+            sequence_install: None,
+            sequence_install_window_views: parameters.sequence_install_window_views,
+            sequence_install_settle_ceiling: parameters.sequence_install_settle_ceiling,
+            sequence_install_ready_logged: false,
             sequence_request_at: None,
             sequence_last_want: None,
             sequence_request_timeout_ms: parameters.sequence_sync_request_timeout_ms,
@@ -1226,6 +1241,14 @@ impl VantageCore {
                 }, if announce_tick.is_some() => {
                     self.announce_checkpoint().await;
                     self.drive_sequence_sync();
+                    // The staging fetch rides this tick rather than a dedicated one: it is
+                    // paced by its own window and by repair's backlog, so its cadence only
+                    // has to be coarse and bounded, and this tick already exists exactly
+                    // when checkpoints are enabled.
+                    let install_effects = self.drive_sequence_install();
+                    if !install_effects.is_empty() {
+                        self.execute(install_effects, Instant::now()).await;
+                    }
                 }
 
                 // Mechanism A (design doc step 2): every author besides ourselves,
@@ -2263,6 +2286,11 @@ impl VantageCore {
                     // and leaving it set would keep `drive_sequence_sync`'s "wait for the
                     // cursor to catch up" gate closed against every later target.
                     self.sequence_verified_target = None;
+                    // Ordinary execution reached the target under its own power, so the
+                    // staged fetch has nothing left to contribute. Dropping it here is what
+                    // keeps a node that never actually fell behind from carrying install
+                    // state for the rest of the run.
+                    self.sequence_install = None;
                     let matched = expected == local_head;
                     if let Some(metrics) = &self.metrics {
                         if matched {
@@ -2325,13 +2353,71 @@ impl VantageCore {
         // Retire a finished transfer before considering a new target.
         match self.sequence_transfer.as_ref().map(|t| t.state()) {
             Some(TransferState::Verified) => {
-                let views = self
-                    .sequence_transfer
-                    .as_ref()
-                    .and_then(|t| t.verified_output().map(|o| o.len()))
-                    .unwrap_or(0);
-                let (view, head) = self.sequence_transfer.as_ref().expect("present").target();
+                // Copied out while the transfer is still alive: `verified_output` borrows
+                // it, and the transfer is retired immediately below.
+                let transfer = self.sequence_transfer.as_ref().expect("present");
+                let staged: Vec<(View, SequenceOutcome, Vec<Digest>)> = transfer
+                    .verified_output()
+                    .map(|o| {
+                        o.into_iter()
+                            .map(|(v, outcome, delta)| (v, outcome.clone(), delta.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let views = staged.len();
+                let (view, head) = transfer.target();
+                let (view, head) = (view, head.clone());
                 self.sequence_verified_target = Some((view, head.clone()));
+
+                // Phase C staging. Built even though installation is still gated, because
+                // the fetch it drives is what makes a later install cheap: by the time the
+                // cursor could apply these views the blocks are already local.
+                let install = SequenceInstall::new(
+                    local_view,
+                    view,
+                    head,
+                    staged,
+                    self.sequence_install_window_views,
+                    self.sequence_install_settle_ceiling,
+                );
+                if install.is_contiguous() {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.vantage_sequence_install_staged_total.inc();
+                        metrics
+                            .vantage_sequence_install_views
+                            .set(install.views_total() as i64);
+                    }
+                    // Checkpoint-source preference (plan §16 decision 4): the parties that
+                    // announced this target necessarily held the blocks its manifests name,
+                    // so seed repair's holder index with them before any request goes out.
+                    // Repair otherwise learns holders only from traffic it has already
+                    // seen, which on a node that just fell behind is precisely the traffic
+                    // it missed.
+                    let tips = install.lane_tips();
+                    let announcers = self
+                        .sequence_sync
+                        .as_ref()
+                        .map(|c| c.announcers(view, install.target().1))
+                        .unwrap_or_default();
+                    for (author, height) in tips {
+                        for peer in &announcers {
+                            self.rep.note_holder(*peer, author, height);
+                        }
+                    }
+                    self.sequence_install = Some(install);
+                    self.sequence_install_ready_logged = false;
+                } else {
+                    // A verified chain cannot have a hole -- `ChainVerifier` links every
+                    // record to its predecessor -- so this means the outcome/delta maps
+                    // disagree with the chain. Refuse rather than install a gap.
+                    if let Some(metrics) = &self.metrics {
+                        metrics.vantage_sequence_install_rejected_total.inc();
+                    }
+                    log::error!(
+                        "vantage sequence install: verified target view={view} is not \
+                         contiguous above local view={local_view}; refusing to stage"
+                    );
+                }
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_sequence_sync_verified_total.inc();
                     metrics.vantage_sequence_sync_verified_view.set(view as i64);
@@ -2437,6 +2523,60 @@ impl VantageCore {
             }
         }
         self.emit_sequence_requests();
+    }
+
+    /// Phase C staging drive: admit views of the verified target into the fetch window and
+    /// hand their manifest refs to the repairer.
+    ///
+    /// Returns effects instead of executing them -- `Repairer::authorize` emits ordinary
+    /// request effects, and they go through `execute` like every other.
+    ///
+    /// Pacing lives in `SequenceInstall::admit`: at most `window_views` views outstanding,
+    /// and nothing new admitted while repair's own unsettled backlog is above the ceiling.
+    /// The second gate matters more than the first. This mechanism runs on nodes that are
+    /// already behind, which is exactly when repair is already loaded, so an installer that
+    /// admitted work regardless of that backlog would add load precisely where it hurts.
+    fn drive_sequence_install(&mut self) -> Vec<Effect> {
+        if self.sequence_install.is_none() {
+            return Vec::new();
+        }
+        let blocks = self.rep.blocks();
+        let pending = self.rep.pending_settle_len();
+        let install = self.sequence_install.as_mut().expect("present");
+        install.refresh(&blocks);
+        let refs = install.admit(pending);
+
+        let (complete, total, in_flight) = (
+            install.views_complete(),
+            install.views_total(),
+            install.views_in_flight(),
+        );
+        let staged_ready = complete == total;
+        let target = install.target().0;
+
+        let mut effects = Vec::new();
+        for r in refs {
+            effects.extend(self.rep.authorize(r));
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .vantage_sequence_install_views_ready
+                .set(complete as i64);
+            metrics
+                .vantage_sequence_install_views_in_flight
+                .set(in_flight as i64);
+        }
+        if staged_ready && !self.sequence_install_ready_logged {
+            self.sequence_install_ready_logged = true;
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_sequence_install_ready_total.inc();
+            }
+            log::info!(
+                "vantage sequence install: all {total} views of target view={target} are \
+                 locally held"
+            );
+        }
+        effects
     }
 
     /// Ask every selected source for the same thing CONCURRENTLY; the first valid copy

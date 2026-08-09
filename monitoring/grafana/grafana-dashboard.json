@@ -3043,6 +3043,107 @@
       "title": "Phase B closing check: verified head vs local execution (MISMATCH must be 0)",
       "type": "timeseries",
       "description": "The gate for Phase C. A transfer verifying only proves the served chain hashes to the head f+1 peers announced -- a chain that is internally consistent but WRONG verifies perfectly, because the hash chain is self-referential and cannot know what the views contained. This panel compares that head against the one the receiving node derives ITSELF once ordinary execution reaches the same view, which is the difference between 'the peers agreed with each other' and 'the peers were right'. MISMATCH must be 0: nonzero means either more than f announcers agreed on a head no correct party derives, or correct parties disagree. Either forbids installation. 'verified view' leading 'local head view' is normal and is exactly the lag Phase C exists to close by installing instead of waiting."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 149
+      },
+      "id": 9214,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "staged (total)",
+          "expr": "sum(vantage_sequence_install_staged_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "views in target",
+          "expr": "max(vantage_sequence_install_views{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "C",
+          "legendFormat": "views held locally",
+          "expr": "max(vantage_sequence_install_views_ready{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "D",
+          "legendFormat": "views in flight",
+          "expr": "max(vantage_sequence_install_views_in_flight{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "E",
+          "legendFormat": "targets fully held",
+          "expr": "sum(vantage_sequence_install_ready_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "F",
+          "legendFormat": "rejected (total)",
+          "expr": "sum(vantage_sequence_install_rejected_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "G",
+          "legendFormat": "repair pending settle",
+          "expr": "max(vantage_pending_settle_len{node=~\"$node\",node=~\".*-primary$\"})"
+        }
+      ],
+      "title": "Install staging: verified target -> locally held blocks",
+      "type": "timeseries",
+      "description": "A verified target names block DIGESTS, not blocks. This panel tracks turning those names into blocks the node actually holds, which is the precondition for installing anything. 'views held locally' should climb toward 'views in target'; a flat line with 'views in flight' pinned at the window bound (default 8) means repair, not the window, is the limiter -- check 'repair pending settle' against the 2048 ceiling, above which no further view is admitted at all. That gate is deliberate: this mechanism runs on nodes that are already behind, which is exactly when repair is already loaded. 'rejected' counts verified targets whose per-view output was not contiguous above the local head; a verified chain cannot have a hole, so nonzero is an internal inconsistency, not peer misbehaviour."
     }
   ],
   "preload": false,
