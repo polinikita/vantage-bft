@@ -689,7 +689,13 @@ pub struct Metrics {
     pub vantage_sequence_head_view: IntGauge,
     /// Highest checkpoint boundary this node has passed.
     pub vantage_sequence_boundary_view: IntGauge,
-    /// The boundary HEAD itself, as `{head="<hex>"} = boundary_view`.
+    /// The boundary HEAD itself, as `{sid, head="<hex>"} = boundary_view`.
+    ///
+    /// `sid` is part of the identity because heads are domain-separated by session:
+    /// two different committees derive different heads for the same view BY DESIGN.
+    /// A monitor retained across runs (docker-bench keeps Prometheus up on purpose)
+    /// otherwise makes consecutive runs look like a head divergence, since node labels
+    /// repeat across runs.
     ///
     /// Exporting only the boundary VIEW makes the one failure Phase A exists to catch --
     /// two nodes at the same height with different heads -- completely invisible, since
@@ -1567,7 +1573,7 @@ impl Metrics {
             vantage_sequence_boundary_head: register_int_gauge_vec_with_registry!(
                 "vantage_sequence_boundary_head",
                 "Checkpoint boundary head (hex label), valued by its boundary view",
-                &["head"],
+                &["sid", "head"],
                 registry,
             )
             .unwrap(),

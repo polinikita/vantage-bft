@@ -55,27 +55,50 @@ def main():
         print("      Is `sequence_checkpoints` enabled? It defaults OFF.", file=sys.stderr)
         return 1
 
-    # (boundary view) -> head hex -> set of nodes.
+    # (sid, boundary view) -> head hex -> set of nodes.
     #
     # The metric's VALUE is the boundary view and its `head` LABEL is that boundary's
     # head, so one sample is a complete (node, boundary, head) claim. A node re-exports
     # the same pair on every scrape until it passes the next boundary; collapsing to sets
     # makes the result independent of scrape cadence and of how long a node sat there.
+    #
+    # KEYED BY SESSION, not just by view. Heads are domain-separated by session id, so two
+    # runs against different committees derive different heads for the same view BY
+    # DESIGN. docker-bench keeps Prometheus up across runs on purpose and node labels
+    # repeat, so a window spanning two runs otherwise reports a spurious divergence --
+    # observed doing exactly that. Sessions are scored independently and a run is compared
+    # only against itself.
     claims = defaultdict(lambda: defaultdict(set))
+    skipped_no_sid = set()
     for s in series:
         node = s["metric"].get("node", s["metric"].get("instance", "?"))
         head = s["metric"].get("head")
+        sid = s["metric"].get("sid")
         if not head:
             continue
+        if not sid:
+            # Emitted by a binary predating the sid label. Such a series cannot be
+            # attributed to a session, and lumping several runs together under one
+            # placeholder manufactures exactly the divergence this gate looks for.
+            skipped_no_sid.add(node)
+            continue
         for _, value in s["values"]:
-            claims[int(float(value))][head].add(node)
+            claims[(sid, int(float(value)))][head].add(node)
 
     boundaries = sorted(claims)
     compared = [b for b in boundaries if sum(len(n) for n in claims[b].values()) > 1]
     diverged = [b for b in compared if len(claims[b]) > 1]
+    sessions = sorted({sid for sid, _ in boundaries})
 
-    print(f"boundaries observed: {len(boundaries)}"
-          f" (range {boundaries[0]}..{boundaries[-1]})" if boundaries else "none")
+    if skipped_no_sid:
+        print(f"skipped {len(skipped_no_sid)} unlabelled series from a pre-sid binary")
+    if not claims:
+        print("\nFAIL: every series lacked a sid label (pre-sid binary only).",
+              file=sys.stderr)
+        return 1
+    print(f"sessions in window: {len(sessions)}"
+          + ("  (scored independently)" if len(sessions) > 1 else ""))
+    print(f"boundaries observed: {len(boundaries)}")
     print(f"boundaries reached by 2+ nodes: {len(compared)}")
 
     if not compared:
@@ -89,7 +112,8 @@ def main():
         first = diverged[0]
         print(f"\nFAIL: {len(diverged)} boundary/-ies with more than one head.",
               file=sys.stderr)
-        print(f"      First divergent boundary: view {first}", file=sys.stderr)
+        print(f"      First divergent boundary: session {first[0][:16]}.. view {first[1]}",
+              file=sys.stderr)
         for head, nodes in sorted(claims[first].items()):
             print(f"        {head}  <- {sorted(nodes)}", file=sys.stderr)
         print("\n      Reduce to the first divergent VIEW: the heads are hash-chained,",
@@ -101,7 +125,7 @@ def main():
 
     widest = max(compared, key=lambda b: sum(len(n) for n in claims[b].values()))
     nodes = sum(len(n) for n in claims[widest].values())
-    print(f"widest agreement: boundary {widest} across {nodes} nodes, one head")
+    print(f"widest agreement: boundary {widest[1]} across {nodes} nodes, one head")
     print(f"\nPASS: every compared boundary had exactly one head "
           f"({len(compared)} boundaries).")
     return 0

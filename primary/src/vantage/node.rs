@@ -2069,6 +2069,8 @@ impl VantageCore {
     /// party derives, which is exactly the divergence this phase exists to detect. The
     /// store is left untouched so the first bad view stays identifiable.
     fn record_sequence(&mut self, view: View, outcome: &SequenceOutcome, output_delta: &[Digest]) {
+        // Taken before `self.sequence` is borrowed mutably below.
+        let sid_label = head_hex(self.agb.sid());
         let Some(store) = self.sequence.as_mut() else {
             return;
         };
@@ -2098,7 +2100,7 @@ impl VantageCore {
                             metrics.vantage_sequence_boundary_head.reset();
                             metrics
                                 .vantage_sequence_boundary_head
-                                .with_label_values(&[&head_hex(&head)])
+                                .with_label_values(&[&sid_label, &head_hex(&head)])
                                 .set(view as i64);
                             metrics
                                 .vantage_sequence_boundary_head_lo
