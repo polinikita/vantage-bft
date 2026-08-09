@@ -58,12 +58,14 @@ pub struct Receiver<Handler: MessageHandler> {
     /// logical message, `handler.dispatch` is called once per frame -- byte-identical
     /// to pre-batching behavior.
     batch: bool,
+    /// Stable listener-role label for current inbound connection gauges.
+    listener: &'static str,
 }
 
 impl<Handler: MessageHandler> Receiver<Handler> {
     /// Spawn a new network receiver handling connections from any incoming peer.
     pub fn spawn(address: SocketAddr, handler: Handler) {
-        Self::spawn_full(address, handler, None, false, false);
+        Self::spawn_full(address, handler, None, false, false, "unlabeled");
     }
 
     /// Same as `spawn`, plus a `bytes_received_total` observation for every frame this
@@ -73,19 +75,21 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         handler: Handler,
         metrics: Option<Arc<Metrics>>,
     ) {
-        Self::spawn_full(address, handler, metrics, false, false);
+        Self::spawn_full(address, handler, metrics, false, false, "unlabeled");
     }
 
     /// Full form: metrics handle + ack/batch flags. See `acks`/`batch`'s own doc
     /// comments for their exact contracts. `batch` must match what every peer's own
     /// sender is configured with (see `Parameters::batch_messages`'s doc on
-    /// committee-wide consistency).
+    /// committee-wide consistency). `listener` is a low-cardinality role label for
+    /// `network_connections`.
     pub fn spawn_full(
         address: SocketAddr,
         handler: Handler,
         metrics: Option<Arc<Metrics>>,
         acks: bool,
         batch: bool,
+        listener: &'static str,
     ) {
         tokio::spawn(async move {
             Self {
@@ -94,6 +98,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 metrics,
                 acks,
                 batch,
+                listener,
             }
             .run()
             .await;
@@ -128,6 +133,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 self.metrics.clone(),
                 self.acks,
                 self.batch,
+                self.listener,
             )
             .await;
         }
@@ -142,8 +148,10 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         metrics: Option<Arc<Metrics>>,
         acks: bool,
         batch: bool,
+        listener: &'static str,
     ) {
         tokio::spawn(async move {
+            let _connection = ConnectionMetricGuard::new(metrics.clone(), listener);
             let transport = Framed::new(socket, LengthDelimitedCodec::new());
             let (mut writer, mut reader) = transport.split();
             while let Some(frame) = reader.next().await {
@@ -198,5 +206,33 @@ impl<Handler: MessageHandler> Receiver<Handler> {
             }
             warn!("Connection closed by peer {}", peer);
         });
+    }
+}
+
+struct ConnectionMetricGuard {
+    metrics: Option<Arc<Metrics>>,
+    listener: &'static str,
+}
+
+impl ConnectionMetricGuard {
+    fn new(metrics: Option<Arc<Metrics>>, listener: &'static str) -> Self {
+        if let Some(metrics) = &metrics {
+            metrics
+                .network_connections
+                .with_label_values(&[listener])
+                .inc();
+        }
+        Self { metrics, listener }
+    }
+}
+
+impl Drop for ConnectionMetricGuard {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .network_connections
+                .with_label_values(&[self.listener])
+                .dec();
+        }
     }
 }

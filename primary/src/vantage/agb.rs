@@ -13,7 +13,7 @@ use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2893,12 +2893,18 @@ impl DigestStatements {
             avail,
             ..
         } = msg;
-        self.buffered_echo
-            .entry(view)
-            .or_default()
-            .entry(sender)
-            .or_insert_with(|| (digest.clone(), grade, origin, avail));
-        self.ensure_fetch(view, digest, now)
+        let inserted = match self.buffered_echo.entry(view).or_default().entry(sender) {
+            Entry::Vacant(entry) => {
+                entry.insert((digest.clone(), grade, origin, avail));
+                true
+            }
+            Entry::Occupied(_) => false,
+        };
+        if inserted {
+            self.ensure_fetch(view, digest, now)
+        } else {
+            Vec::new()
+        }
     }
 
     fn buffer_ready(
@@ -2909,12 +2915,18 @@ impl DigestStatements {
         grade: ReadyGrade,
         now: Instant,
     ) -> Vec<Effect> {
-        self.buffered_ready
-            .entry(view)
-            .or_default()
-            .entry(sender)
-            .or_insert_with(|| (digest.clone(), grade));
-        self.ensure_fetch(view, digest, now)
+        let inserted = match self.buffered_ready.entry(view).or_default().entry(sender) {
+            Entry::Vacant(entry) => {
+                entry.insert((digest.clone(), grade));
+                true
+            }
+            Entry::Occupied(_) => false,
+        };
+        if inserted {
+            self.ensure_fetch(view, digest, now)
+        } else {
+            Vec::new()
+        }
     }
 
     // ---------------------------------------------------------------- fetch/serve
@@ -2943,6 +2955,18 @@ impl DigestStatements {
             );
         }
         targets.into_iter().collect()
+    }
+
+    /// Does any still-buffered digest statement name this exact pair? This is the
+    /// durable authorization record for a late body response once active retries have
+    /// been capped and abandoned.
+    fn has_buffered_statement_for(&self, view: View, digest: &Digest) -> bool {
+        self.buffered_echo.get(&view).map_or(false, |senders| {
+            senders.values().any(|(d, _, _, _)| d == digest)
+        }) || self
+            .buffered_ready
+            .get(&view)
+            .map_or(false, |senders| senders.values().any(|(d, _)| d == digest))
     }
 
     /// Fan a `VantageBodyFetch` out to every currently-buffered author of `(view,
@@ -3167,8 +3191,9 @@ impl DigestStatements {
     }
 
     /// A peer's `VantageBodyServe(view, proposal)` response -- accept only a body
-    /// matching an outstanding fetch of OUR OWN for exactly `(view, digest(proposal))`
-    /// (the same "hash-matching a REQUESTED pair, not merely well-formed" discipline
+    /// matching either an outstanding fetch of OUR OWN or a still-buffered digest
+    /// statement for exactly `(view, digest(proposal))` (the same "hash-matching a
+    /// requested/relevant pair, not merely well-formed" discipline
     /// `control::ControlLog::on_control_serve`'s P6-2 fix applies -- an unsolicited or
     /// wrong-digest serve changes no state) AND well-formed (`formed`). On
     /// acceptance: memoizes it into `known_bodies` and drains every statement
@@ -3191,8 +3216,11 @@ impl DigestStatements {
             return Vec::new();
         }
         let digest = proposal.digest(agb.sid());
-        if !self.pending_fetch.contains_key(&(view, digest.clone())) {
-            return Vec::new(); // unsolicited, or answers a pair we never asked for
+        let key = (view, digest.clone());
+        let relevant =
+            self.pending_fetch.contains_key(&key) || self.has_buffered_statement_for(view, &digest);
+        if !relevant {
+            return Vec::new(); // unsolicited, or answers a pair no buffered statement needs
         }
         if !formed(
             agb.committee(),

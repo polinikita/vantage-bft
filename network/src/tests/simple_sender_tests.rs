@@ -19,6 +19,25 @@ async fn simple_send() {
 }
 
 #[tokio::test]
+async fn send_survives_startup_connect_refused() {
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    drop(socket);
+
+    let message = "queued before listener";
+    let mut sender = SimpleSender::new();
+    sender.send(address, Bytes::from(message)).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let handle = listener(address, message.to_string());
+
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn broadcast() {
     // Run 3 TCP servers.
     let message = "Hello, world!";

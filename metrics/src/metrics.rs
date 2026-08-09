@@ -675,6 +675,10 @@ pub struct Metrics {
     /// session death). Sustained growth against one peer means that peer cannot keep
     /// up with organic broadcast volume; zero is the healthy steady state.
     pub network_volatile_shed_total: IntCounter,
+    /// Currently-open inbound TCP connections, labeled by listener role. The
+    /// Prometheus target already separates primary and worker processes; this label
+    /// separates the listeners inside a process.
+    pub network_connections: IntGaugeVec,
 
     // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
     /// Transactions the worker's `BatchMaker` received from a client, before batching
@@ -1491,6 +1495,13 @@ impl Metrics {
                 "network_volatile_shed_total",
                 "Volatile sends shed at enqueue (outbound queue depth reached the soft \
                  cap); every shed key is min-merged into the drop map for replay",
+                registry,
+            )
+            .unwrap(),
+            network_connections: register_int_gauge_vec_with_registry!(
+                "network_connections",
+                "Currently-open inbound TCP connections by listener role",
+                &["listener"],
                 registry,
             )
             .unwrap(),

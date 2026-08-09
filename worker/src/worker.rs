@@ -268,6 +268,7 @@ impl Worker {
             /* acks */
             false,
             self.parameters.batch_messages,
+            "primary_to_worker",
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -337,6 +338,7 @@ impl Worker {
             // `self.parameters.batch_messages`.
             /* batch */
             false,
+            "transactions",
         );
 
         // Data-plane withholding fault injector, time-windowed variant: `BatchMaker`
@@ -446,6 +448,7 @@ impl Worker {
             /* acks */
             true,
             self.parameters.batch_messages,
+            "worker_to_worker",
         );
 
         // The `Helper` is dedicated to reply to batch requests from other workers.

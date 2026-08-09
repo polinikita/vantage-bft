@@ -801,3 +801,123 @@ async fn body_fetch_is_abandoned_after_the_cap_and_recreated_by_a_new_statement(
         "a fresh statement must revive the fetch"
     );
 }
+
+/// A correct body response can arrive after the active retry slot has been abandoned.
+/// That should stop further fetch spending, but it must not make an already-requested
+/// exact body unprocessable while buffered digest statements still need it.
+#[tokio::test]
+async fn late_body_serve_after_fetch_abandonment_drains_buffered_statements() {
+    let all = authors();
+    let proposal = sample_proposal(1);
+    let sid = test_sid();
+    let digest = proposal.digest(&sid);
+
+    let (name, _) = all[3];
+    let mut agb = new_agb_engine(name);
+    let mut rep = dummy_repairer(name, ".db_test_late_body_after_abandon");
+    let mut ds = DigestStatements::new(TEST_DELTA_MS);
+
+    let mut t = Instant::now();
+    for (sender, _) in all.iter().take(3) {
+        ds.on_ready_digest(
+            ReadyDigest {
+                view: 1,
+                digest: digest.clone(),
+                grade: ReadyGrade::One,
+                sender: *sender,
+                wish: 0,
+            },
+            t,
+            &mut agb,
+            &mut rep,
+        );
+    }
+    assert_eq!(ds.buffered_ready_count_for_test(1), 3);
+    assert_eq!(ds.pending_fetch_count_for_test(), 1);
+
+    for _ in 0..8 {
+        t += Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1);
+        ds.retry_fetches(t);
+    }
+    assert_eq!(
+        ds.pending_fetch_count_for_test(),
+        0,
+        "the active retry slot should be gone before the delayed serve is processed"
+    );
+
+    let effects = ds.on_body_serve(1, proposal.clone(), &mut agb, &mut rep);
+    assert_eq!(
+        completed_count(&effects),
+        1,
+        "the late exact body must still drain the buffered digest statements"
+    );
+    let sealed = sealed_effects(&effects);
+    assert_eq!(sealed.len(), 1);
+    assert!(matches!(&sealed[0], Outcome::Full(c, t) if *c == proposal.c && *t == proposal.t));
+    assert_eq!(ds.buffered_ready_count_for_test(1), 0);
+    assert!(ds.known_body_for_test(1, &digest));
+    assert!(
+        agb.fixed_proposal(1).is_none(),
+        "served bytes still must not create proposal provenance"
+    );
+}
+
+/// A sender's digest statement is one-shot. A later duplicate from that sender,
+/// even if it names a different digest, must not create a fetch for a digest that was
+/// not actually buffered.
+#[tokio::test]
+async fn duplicate_digest_statement_does_not_create_phantom_fetch() {
+    let all = authors();
+    let proposal = sample_proposal(1);
+    let sid = test_sid();
+    let digest = proposal.digest(&sid);
+    let wrong_proposal = ViewProposal {
+        view: 1,
+        c: vec![(all[1].0, 1, Digest([9u8; 32]))],
+        t: Vec::new(),
+        m: None,
+    };
+    let wrong_digest = wrong_proposal.digest(&sid);
+    assert_ne!(wrong_digest, digest);
+
+    let (name, _) = all[3];
+    let mut agb = new_agb_engine(name);
+    let mut rep = dummy_repairer(name, ".db_test_duplicate_digest_phantom_fetch");
+    let mut ds = DigestStatements::new(TEST_DELTA_MS);
+    let (sender, _) = all[0];
+    let t = Instant::now();
+
+    ds.on_ready_digest(
+        ReadyDigest {
+            view: 1,
+            digest: digest.clone(),
+            grade: ReadyGrade::One,
+            sender,
+            wish: 0,
+        },
+        t,
+        &mut agb,
+        &mut rep,
+    );
+    assert_eq!(ds.pending_fetch_count_for_test(), 1);
+    assert_eq!(ds.fetch_targets_len_for_test(1, &digest), 1);
+
+    ds.on_ready_digest(
+        ReadyDigest {
+            view: 1,
+            digest: wrong_digest.clone(),
+            grade: ReadyGrade::One,
+            sender,
+            wish: 0,
+        },
+        t + Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1),
+        &mut agb,
+        &mut rep,
+    );
+    assert_eq!(
+        ds.pending_fetch_count_for_test(),
+        1,
+        "the ignored duplicate must not create a pending fetch for its ignored digest"
+    );
+    assert_eq!(ds.fetch_targets_len_for_test(1, &wrong_digest), 0);
+}

@@ -24,6 +24,7 @@ PROMETHEUS_CONFIG_PATH="$SCRIPT_DIR/data/prometheus.yaml"
 MONITORING_NETWORK="vantage-bench_vantage_net"
 PROMETHEUS_CONTAINER_ID=""
 BENCHMARK_RUNNING=0
+READY_TIMEOUT=180
 
 NODES=4
 RATE=200
@@ -110,7 +111,7 @@ monitoring_compose up -d --force-recreate prometheus
 monitoring_compose up -d grafana
 PROMETHEUS_CONTAINER_ID="$(monitoring_compose ps -q prometheus)"
 
-echo "==> [5/7] waiting for validators and all $((NODES * 2)) Prometheus target(s) (timeout 60s)"
+echo "==> [5/7] waiting for validators and all $((NODES * 2)) Prometheus target(s) (timeout ${READY_TIMEOUT}s)"
 WAIT_START=$SECONDS
 until python3 - "$NODES" <<'PYEOF'
 import json, sys, urllib.request
@@ -128,7 +129,7 @@ for i in range(n):
 sys.exit(0 if ok == n else 1)
 PYEOF
 do
-    if [ $((SECONDS - WAIT_START)) -ge 60 ]; then
+    if [ $((SECONDS - WAIT_START)) -ge "$READY_TIMEOUT" ]; then
         echo "run.sh: timed out waiting for containers; check 'docker compose logs'" >&2
         down_benchmark || true
         exit 1
@@ -159,7 +160,7 @@ except Exception:
 sys.exit(0 if expected <= healthy and grafana.get("database") == "ok" else 1)
 PYEOF
 do
-    if [ $((SECONDS - WAIT_START)) -ge 60 ]; then
+    if [ $((SECONDS - WAIT_START)) -ge "$READY_TIMEOUT" ]; then
         echo "run.sh: timed out waiting for Grafana/Prometheus; check " \
              "'docker compose -f monitoring/docker-compose.yml logs'" >&2
         down_benchmark || true

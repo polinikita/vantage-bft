@@ -74,10 +74,10 @@ PORTS = {
 }
 HOST_PRIMARY_METRICS_BASE = 9000
 HOST_WORKER_METRICS_BASE = 9100
-MAX_NODES = 30  # owner constraint, raised from 20 on 2026-08-05 for the n=30
-                # local A/B sweep. Note the resource reality: colima has 12 CPUs,
-                # so 30 validators share ~0.4 core each and saturate far below the
-                # 8-vCPU-per-node AWS runs. Fine for A/B, not for absolute numbers.
+MAX_NODES = 40  # owner constraint, raised from 20 on 2026-08-05 for local A/B
+                # sweeps. Note the resource reality: colima has 12 CPUs, so large
+                # local committees share far less CPU than the 8-vCPU-per-node AWS
+                # runs. Fine for A/B, not for absolute numbers.
 
 # 10-region AWS RTT matrix (milliseconds), ported VERBATIM from
 # config/src/lib.rs::RTT_LATENCY_TABLE, itself ported verbatim from

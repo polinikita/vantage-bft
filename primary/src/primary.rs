@@ -508,6 +508,7 @@ impl Primary {
                     /* acks */
                     true,
                     parameters.batch_messages,
+                    "primary_to_primary",
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -536,6 +537,7 @@ impl Primary {
                     /* acks */
                     false,
                     parameters.batch_messages,
+                    "worker_to_primary",
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -599,6 +601,7 @@ impl Primary {
                     /* acks */
                     true,
                     parameters.batch_messages,
+                    "primary_to_primary",
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -627,6 +630,7 @@ impl Primary {
                     /* acks */
                     false,
                     parameters.batch_messages,
+                    "worker_to_primary",
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -670,6 +674,7 @@ impl Primary {
                     /* acks */
                     true,
                     parameters.batch_messages,
+                    "primary_to_primary",
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -695,6 +700,7 @@ impl Primary {
                     /* acks */
                     false,
                     parameters.batch_messages,
+                    "worker_to_primary",
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",

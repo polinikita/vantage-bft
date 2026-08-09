@@ -10,6 +10,7 @@ use metrics::Metrics;
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
+use std::cmp::min;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,6 +22,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[cfg(test)]
 #[path = "tests/simple_sender_tests.rs"]
 pub mod simple_sender_tests;
+
+const STARTUP_RETRY_DELAY_MS: u64 = 200;
+const STARTUP_RETRY_BACKOFF_MAX_MS: u64 = 2_000;
 
 /// We keep alive one TCP connection per peer, each connection is handled by a separate task (called `Connection`).
 /// We communicate with our 'connections' through a dedicated channel kept by the HashMap called `connections`.
@@ -201,7 +205,8 @@ impl Connection {
     /// audit item 6: dispatches to one of two loops depending on whether a
     /// per-destination latency is actually configured -- mirrors `ReliableSender::
     /// keep_alive`'s existing `extra_latency.is_zero()` split (`keep_alive_immediate`
-    /// vs. `keep_alive_delayed`).
+    /// vs. `keep_alive_delayed`). Startup connect failures are retried with capped
+    /// backoff so local/AWS launch skew does not discard the first queued frame.
     async fn run(&mut self) {
         if self.extra_latency.is_zero() {
             self.run_immediate().await
@@ -216,6 +221,33 @@ impl Connection {
         tokio::time::Instant::now() + self.extra_latency
     }
 
+    async fn connect(&mut self) -> Option<TcpStream> {
+        let mut delay = STARTUP_RETRY_DELAY_MS;
+        let mut retry = 0;
+        loop {
+            match TcpStream::connect(self.address).await {
+                Ok(stream) => {
+                    // Nagle + delayed-ACK stalls sub-MSS consensus frames by up to an
+                    // RTT on real WAN links (invisible on loopback); starfish sets
+                    // nodelay on both sides (network.rs:423,444). Best-effort, like
+                    // every other socket option here.
+                    let _ = stream.set_nodelay(true);
+                    info!("Outgoing connection established with {}", self.address);
+                    return Some(stream);
+                }
+                Err(e) => {
+                    warn!("{}", NetworkError::FailedToConnect(self.address, retry, e));
+                    if self.receiver.is_closed() {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    delay = min(2 * delay, STARTUP_RETRY_BACKOFF_MAX_MS);
+                    retry += 1;
+                }
+            }
+        }
+    }
+
     /// Fable perf audit item 6: the zero-latency fast path -- byte-identical to the
     /// pre-D7-3 loop (no delay queue, no `Instant::now()`/`sleep_until` bookkeeping at
     /// all), used whenever no artificial per-destination latency is configured (the
@@ -226,27 +258,13 @@ impl Connection {
     /// Batching (`self.batch.enabled`) coalesces arrivals into bundle frames before
     /// they ever reach `writer.send` -- best-effort, same as everything else here: if
     /// the connection drops mid-accumulation, whatever is still buffered is simply
-    /// dropped (SimpleSender never retries, on or off batching).
+    /// dropped (after a connection is established, SimpleSender still does not retry
+    /// mid-session failures, on or off batching).
     async fn run_immediate(&mut self) {
-        // Try to connect to the peer.
-        let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
-            Ok(stream) => {
-                // Nagle + delayed-ACK stalls sub-MSS consensus frames by up to an
-                // RTT on real WAN links (invisible on loopback); starfish sets
-                // nodelay on both sides (network.rs:423,444). Best-effort, like
-                // every other socket option here.
-                let _ = stream.set_nodelay(true);
-                Framed::new(stream, LengthDelimitedCodec::new()).split()
-            }
-            Err(e) => {
-                warn!(
-                    "{}",
-                    NetworkError::FailedToConnect(self.address, /* retry */ 0, e)
-                );
-                return;
-            }
+        let Some(stream) = self.connect().await else {
+            return;
         };
-        info!("Outgoing connection established with {}", self.address);
+        let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
 
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
@@ -321,25 +339,10 @@ impl Connection {
     /// single fresh "arrival" into `delay_queue` (one release time, one injected
     /// latency for the whole bundle), computed at flush time.
     async fn run_delayed(&mut self) {
-        // Try to connect to the peer.
-        let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
-            Ok(stream) => {
-                // Nagle + delayed-ACK stalls sub-MSS consensus frames by up to an
-                // RTT on real WAN links (invisible on loopback); starfish sets
-                // nodelay on both sides (network.rs:423,444). Best-effort, like
-                // every other socket option here.
-                let _ = stream.set_nodelay(true);
-                Framed::new(stream, LengthDelimitedCodec::new()).split()
-            }
-            Err(e) => {
-                warn!(
-                    "{}",
-                    NetworkError::FailedToConnect(self.address, /* retry */ 0, e)
-                );
-                return;
-            }
+        let Some(stream) = self.connect().await else {
+            return;
         };
-        info!("Outgoing connection established with {}", self.address);
+        let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
 
         // D7-3: a plain FIFO delay queue, same reasoning as `ReliableSender::
         // keep_alive_delayed` (every message on this link gets the identical fixed

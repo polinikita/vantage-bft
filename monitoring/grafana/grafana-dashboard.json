@@ -1842,6 +1842,54 @@
       },
       "fieldConfig": {
         "defaults": {
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 93
+      },
+      "id": 9003,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "network_connections{node=~\"$node\"}",
+          "legendFormat": "{{node}} {{listener}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Open inbound TCP connections by node / listener",
+      "type": "timeseries",
+      "description": "Live accepted inbound TCP sessions, labeled by listener role. The Prometheus `node` label separates primary and worker processes (for example node-7-primary vs node-7-worker-0), while `listener` separates primary_to_primary, worker_to_primary, primary_to_worker, transactions, worker_to_worker, and legacy unlabeled receivers."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
           "unit": "ops",
           "custom": {
             "stacking": {
@@ -1857,7 +1905,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 100
       },
       "id": 16,
       "options": {
@@ -2019,7 +2067,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 93
+        "y": 100
       },
       "id": 17,
       "options": {
@@ -2186,7 +2234,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 102
+        "y": 109
       },
       "id": 18,
       "options": {
@@ -2245,7 +2293,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 102
+        "y": 109
       },
       "id": 19,
       "options": {
@@ -2304,7 +2352,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 102
+        "y": 109
       },
       "id": 21,
       "options": {
@@ -2351,7 +2399,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 107
+        "y": 114
       },
       "id": 9100,
       "panels": [],
@@ -2373,7 +2421,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 108
+        "y": 115
       },
       "id": 9101,
       "options": {
@@ -2429,7 +2477,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 108
+        "y": 115
       },
       "id": 9102,
       "options": {
