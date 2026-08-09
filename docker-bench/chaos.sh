@@ -20,6 +20,14 @@
 #            node's netem on the way up. `-t 0` matters: plain `docker stop` waits
 #            up to 10s for SIGTERM to be honoured, which would silently swallow a
 #            10s outage window.
+#
+#            NOT A RESILIENCE TEST TODAY. Vantage has no state sync, so a restarted
+#            node cannot rejoin a committee that has moved on -- it re-enters the
+#            broadcast layer but its commit cursor never leaves view 1, and it is
+#            gone for good. Measured 2026-08-09: one restart permanently removes a
+#            validator, so at n=4 the second one takes the committee below quorum
+#            and everything stops. That is the missing feature, not a bug, and this
+#            mode only becomes meaningful once state sync exists. Use `pause`.
 #   pause -- `docker pause`/`unpause` (cgroup freezer). The process keeps its
 #            memory AND its established TCP connections; peers see a peer that has
 #            simply stopped reading. Models a long GC/scheduler stall, and isolates
@@ -31,9 +39,9 @@
 # Usage (against an ALREADY-RUNNING cluster -- start `run.sh` in another shell, or
 # use its --duration to outlive this script):
 #
-#   docker-bench/chaos.sh                                  # 6 x 10s stop, 30s settle
+#   docker-bench/chaos.sh                                  # 6 x 10s pause, 20s gaps
 #   docker-bench/chaos.sh --mode pause --outage 10
-#   docker-bench/chaos.sh --cycles 10 --outage 5 --gap 10 --seed 7
+#   docker-bench/chaos.sh --cycles 10 --outage 5 --gap 30 --seed 7
 #
 # Writes a timeline to data/chaos-timeline.json with epoch-millisecond stamps so
 # every outage can be lined up against Prometheus after the fact.
@@ -43,9 +51,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="$SCRIPT_DIR/data/manifest.json"
 TIMELINE="$SCRIPT_DIR/data/chaos-timeline.json"
 
-MODE=stop
+MODE=pause
 OUTAGE=10
-GAP=10
+# At least 20s between outages. A gap shorter than recovery lets the next victim go
+# down while the committee is still re-converging from the last one, so a failure at
+# cycle N is really a failure of N stacked partial recoveries and cannot be read as
+# "one node paused once". 20s is the floor, not a tuning knob.
+GAP=20
 CYCLES=6
 SETTLE=30
 SEED=""
@@ -56,9 +68,9 @@ usage() {
 usage: chaos.sh [--mode stop|pause|cut] [--outage S] [--gap S] [--cycles N]
                 [--settle S] [--seed N] [--exclude i,j,...]
 
-  --mode     what "down" means (default stop; see the header comment)
+  --mode     what "down" means (default pause; stop needs state sync, see header)
   --outage   seconds a victim stays down          (default 10)
-  --gap      seconds with everyone up between outages (default 10)
+  --gap      seconds with everyone up between outages (default 20, and >= 20)
   --cycles   number of outages                    (default 6)
   --settle   final all-up window, in seconds      (default 30)
   --seed     seed for victim selection, for a reproducible run
@@ -92,6 +104,12 @@ for pair in "outage:OUTAGE" "gap:GAP" "cycles:CYCLES" "settle:SETTLE"; do
 done
 [ "$CYCLES" -ge 1 ] || { echo "chaos.sh: --cycles must be >= 1" >&2; exit 2; }
 [ "$OUTAGE" -ge 1 ] || { echo "chaos.sh: --outage must be >= 1" >&2; exit 2; }
+# Enforced, not advisory: below this the run measures stacked partial recoveries
+# rather than the response to a single outage, and nothing about the result would
+# say so. See GAP's own comment.
+[ "$CYCLES" -eq 1 ] || [ "$GAP" -ge 20 ] || {
+    echo "chaos.sh: --gap must be >= 20 so the committee re-converges between" \
+         "outages (got $GAP)" >&2; exit 2; }
 [ -f "$MANIFEST" ] || { echo "chaos.sh: $MANIFEST not found -- run gen.py/run.sh first" >&2; exit 1; }
 
 NODES="$(python3 -c "import json;print(json.load(open('$MANIFEST'))['nodes'])")"
