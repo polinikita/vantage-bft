@@ -2206,11 +2206,22 @@ impl VantageCore {
     fn record_sequence(&mut self, view: View, outcome: &SequenceOutcome, output_delta: &[Digest]) {
         // Taken before `self.sequence` is borrowed mutably below.
         let sid_label = head_hex(self.agb.sid());
+        // Phase B's closing check: a target verified against `f+1` announcements is held
+        // until ordinary execution independently reaches the same view. Read here, before
+        // the store is recorded into, so the comparison uses the head this node derives on
+        // its own rather than anything the transfer supplied.
+        let awaited = match &self.sequence_verified_target {
+            Some((target_view, head)) if *target_view == view => Some(head.clone()),
+            _ => None,
+        };
         let Some(store) = self.sequence.as_mut() else {
             return;
         };
         match store.record(view, outcome, output_delta) {
-            Ok(_) => {
+            // Cloned rather than held: `record` returns a `&Digest` borrowed from the
+            // `&mut store` reborrow, which would block `latest_boundary()` below.
+            Ok(head) => {
+                let local_head = head.clone();
                 let boundary = store.latest_boundary().map(|(v, h)| (v, h.clone()));
                 if let Some(metrics) = &self.metrics {
                     metrics
@@ -2247,6 +2258,38 @@ impl VantageCore {
                         );
                     }
                 }
+                if let Some(expected) = awaited {
+                    // Consumed either way: one verified target is compared exactly once,
+                    // and leaving it set would keep `drive_sequence_sync`'s "wait for the
+                    // cursor to catch up" gate closed against every later target.
+                    self.sequence_verified_target = None;
+                    let matched = expected == local_head;
+                    if let Some(metrics) = &self.metrics {
+                        if matched {
+                            metrics.vantage_sequence_verify_match_total.inc();
+                        } else {
+                            metrics.vantage_sequence_verify_mismatch_total.inc();
+                        }
+                    }
+                    if matched {
+                        log::info!(
+                            "vantage sequence sync: MATCH at view={view} head={} \
+                             (remote-verified head equals local execution)",
+                            head_hex(&local_head)
+                        );
+                    } else {
+                        // Nothing is installed in Phase B, so this cannot corrupt state --
+                        // it is evidence, and the loudest kind. Either >f announcers
+                        // certified a head no correct party derives, or two correct
+                        // parties disagree; both forbid Phase C installation.
+                        log::error!(
+                            "vantage sequence sync: MISMATCH at view={view}: \
+                             verified={} local={}",
+                            head_hex(&expected),
+                            head_hex(&local_head)
+                        );
+                    }
+                }
             }
             Err(e) => {
                 if let Some(metrics) = &self.metrics {
@@ -2259,9 +2302,15 @@ impl VantageCore {
 
     /// Phase B: start or advance the single active transfer.
     ///
-    /// VERIFY ONLY. On reaching `Verified` the result is counted and DISCARDED -- Phase B
-    /// deliberately installs nothing, so the cursor, watermarks and output set are
+    /// VERIFY ONLY. On reaching `Verified` the downloaded output is counted and dropped --
+    /// Phase B deliberately installs nothing, so the cursor, watermarks and output set are
     /// untouched no matter what a peer serves. Installation is Phase C.
+    ///
+    /// The verified `(view, head)` IS retained, in `sequence_verified_target`, so that
+    /// `record_sequence` can compare it against the head ordinary execution derives for
+    /// the same view. That comparison is Phase B's actual deliverable: verifying a chain
+    /// against `f+1` announcements only proves the peers were self-consistent, whereas
+    /// matching it to an independently derived local head proves they were RIGHT.
     fn drive_sequence_sync(&mut self) {
         if self.sequence_sync.is_none() {
             return;
@@ -2289,7 +2338,7 @@ impl VantageCore {
                 }
                 log::info!(
                     "vantage sequence sync: VERIFIED target view={view} ({views} views); \
-                     Phase B installs nothing"
+                     installing nothing, awaiting local execution of view={view} to compare"
                 );
                 self.sequence_transfer = None;
                 self.sequence_request_at = None;

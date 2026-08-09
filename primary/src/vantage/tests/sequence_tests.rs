@@ -1278,3 +1278,36 @@ fn records_past_the_target_are_trimmed_not_rejected() {
         "the source must not be penalized"
     );
 }
+
+/// Phase B's closing check, at the level `VantageCore::record_sequence` performs it: a
+/// target downloaded from a peer and verified against `f+1` announcements must equal the
+/// head the receiving node derives ITSELF once ordinary execution reaches that view.
+///
+/// Verification alone cannot establish this. `ChainVerifier` only proves the served chain
+/// hashes to the certified head, so a chain that is internally consistent but WRONG
+/// verifies perfectly -- the hash chain is self-referential and cannot know what the views
+/// actually contained. Only replaying the same views locally and comparing heads
+/// distinguishes "the peers agreed with each other" from "the peers were right", which is
+/// the difference between a target that may be installed and one that may not.
+#[test]
+fn a_verified_target_equals_what_local_execution_derives() {
+    let (remote, sid) = populated_store(9);
+    let (source, _) = authors()[0];
+
+    let transfer = run_transfer(&remote, &sid, 9, vec![source], &source);
+    assert_eq!(transfer.state(), TransferState::Verified);
+    let (target_view, target_head) = transfer.target();
+    let (target_view, target_head) = (target_view, target_head.clone());
+
+    // The receiving node catching up on its own: same views, same deterministic
+    // execution, none of the transfer's bytes.
+    let (local, _) = populated_store(9);
+
+    assert_eq!(local.head_view(), target_view, "compared at the same view");
+    assert_eq!(
+        local.head(),
+        &target_head,
+        "a head certified by peers must equal the one local execution derives; \
+         a difference is what vantage_sequence_verify_mismatch_total counts"
+    );
+}

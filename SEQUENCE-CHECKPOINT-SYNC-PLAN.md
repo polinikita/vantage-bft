@@ -664,12 +664,28 @@ Phase A shipped a gate that could not actually be scored. Fixed here:
 Validation target: n=20 with one deliberately lagging validator is sufficient. The gate
 needs several boundaries crossed by 2+ nodes, not scale.
 
-### Phase B: announce and verify-only
+### Phase B: announce and verify-only -- IMPLEMENTED
 
 - broadcast/piggyback announcements and collect `f+1` heads;
 - download and fully verify records/outcomes/deltas in the background;
 - do not mutate cursor or output state;
 - compare the verified remote result to ordinary local replay/cursor output.
+
+The last bullet is the phase's actual deliverable and the gate for Phase C. Verifying a
+transfer proves only that the served chain hashes to the head `f+1` peers announced; the
+chain is self-referential, so one that is internally consistent but WRONG verifies
+perfectly. The verified `(view, head)` is therefore retained in `sequence_verified_target`
+and compared, in `record_sequence`, against the head ordinary execution derives for the
+same view. That comparison is what separates "the peers agreed with each other" from "the
+peers were right", and it is counted in
+`vantage_sequence_verify_{match,mismatch}_total`. Mismatch must be zero.
+
+A mismatch is deliberately non-fatal in Phase B: nothing is installed, so it cannot
+corrupt state, and the run's value is the evidence it produces. Phase C must treat the
+same signal as fatal to installation, since by then the bytes would be applied.
+
+While a verified target is awaiting its comparison, no new transfer starts. Phase C
+replaces that wait with an install.
 
 ### Phase C: guarded installation
 

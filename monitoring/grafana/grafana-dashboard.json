@@ -2763,6 +2763,286 @@
       "title": "Sequence record rate and rejections",
       "type": "timeseries",
       "description": "Records/s must equal the cursor's own view-advance rate -- one record per terminally processed view, including Skip. Delta blocks/s is the committed BLOCK rate as the sequence log sees it; it is deliberately not compared against committed_transactions, which counts TRANSACTIONS in a different process and differs by the batch fan-out factor. Rejections count a LOCAL invariant violation (a view finalized out of order), never remote input; any nonzero value invalidates this node's head and blocks the phase. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 140
+      },
+      "id": 9210,
+      "panels": [],
+      "title": "Sequence state sync (Phase B: announce, fetch, verify -- installs nothing)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 141
+      },
+      "id": 9211,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "announced/s",
+          "expr": "sum(rate(vantage_sequence_announced_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "counted first-hand/s",
+          "expr": "sum(rate(vantage_sequence_announce_counted_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "C",
+          "legendFormat": "ignored/s",
+          "expr": "sum(rate(vantage_sequence_announce_ignored_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "D",
+          "legendFormat": "certified (total)",
+          "expr": "sum(vantage_sequence_certified_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "E",
+          "legendFormat": "equivocators",
+          "expr": "sum(vantage_sequence_equivocators{node=~\"$node\",node=~\".*-primary$\"})"
+        }
+      ],
+      "title": "Checkpoint announce and certify",
+      "type": "timeseries",
+      "description": "Announcements are first-hand claims, never forwarded evidence: each node collects its own f+1 matching heads. counted/s should be roughly (n-1)x announced/s in a healthy fleet. ignored/s covers forged sender, non-member, duplicate, equivocation and too-far-ahead -- steady growth means a peer is misbehaving or badly out of date, not that the protocol is failing. equivocators must stay 0: a nonzero value names senders caught announcing two heads for one view, and their announcements are retracted from every candidate including already-certified ones."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 141
+      },
+      "id": 9212,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "started (total)",
+          "expr": "sum(vantage_sequence_sync_started_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "verified (total)",
+          "expr": "sum(vantage_sequence_sync_verified_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "C",
+          "legendFormat": "exhausted (total)",
+          "expr": "sum(vantage_sequence_sync_exhausted_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "D",
+          "legendFormat": "chunks/s",
+          "expr": "sum(rate(vantage_sequence_sync_chunks_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "E",
+          "legendFormat": "invalid/s",
+          "expr": "sum(rate(vantage_sequence_sync_invalid_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "F",
+          "legendFormat": "timeouts/s",
+          "expr": "sum(rate(vantage_sequence_sync_timeouts_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "G",
+          "legendFormat": "served frames/s",
+          "expr": "sum(rate(vantage_sequence_sync_served_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "H",
+          "legendFormat": "dropped frames/s",
+          "expr": "sum(rate(vantage_sequence_sync_dropped_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        }
+      ],
+      "title": "State-sync transfer lifecycle",
+      "type": "timeseries",
+      "description": "started should converge to verified. exhausted means every announcer of a certified target was dropped, i.e. the set that certified it could not serve it -- the one shape that breaks recovery liveness. invalid/s is NOT a fault by itself: up to f matching announcers may serve corrupt bytes by assumption and the requester fails over. dropped frames are the dedicated bounded egress refusing work; the requester recovers by timing out, which it must handle anyway. A chunks/s that dwarfs the target size is request amplification, the failure that once produced 5.4M chunks from a single 45s outage."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 149
+      },
+      "id": 9213,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "match (total)",
+          "expr": "sum(vantage_sequence_verify_match_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "MISMATCH (total)",
+          "expr": "sum(vantage_sequence_verify_mismatch_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "C",
+          "legendFormat": "verified view",
+          "expr": "max(vantage_sequence_sync_verified_view{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "D",
+          "legendFormat": "local head view",
+          "expr": "max(vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"})"
+        }
+      ],
+      "title": "Phase B closing check: verified head vs local execution (MISMATCH must be 0)",
+      "type": "timeseries",
+      "description": "The gate for Phase C. A transfer verifying only proves the served chain hashes to the head f+1 peers announced -- a chain that is internally consistent but WRONG verifies perfectly, because the hash chain is self-referential and cannot know what the views contained. This panel compares that head against the one the receiving node derives ITSELF once ordinary execution reaches the same view, which is the difference between 'the peers agreed with each other' and 'the peers were right'. MISMATCH must be 0: nonzero means either more than f announcers agreed on a head no correct party derives, or correct parties disagree. Either forbids installation. 'verified view' leading 'local head view' is normal and is exactly the lag Phase C exists to close by installing instead of waiting."
     }
   ],
   "preload": false,

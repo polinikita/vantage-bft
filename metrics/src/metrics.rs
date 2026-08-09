@@ -762,6 +762,18 @@ pub struct Metrics {
     /// response is unsolicited by construction and this tracks peer chatter; once the
     /// requester exists a nonzero rate means late or duplicated answers.
     pub vantage_sequence_sync_unsolicited_total: IntCounter,
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §14, Phase B's closing check: a verified target is
+    /// retained until ordinary execution reaches the same view, then the head this node
+    /// derived ITSELF is compared against the one downloaded from peers and verified
+    /// against `f+1` announcements. Nothing else exercises announce -> certify -> fetch ->
+    /// verify end to end against an independently derived answer, so this counter is the
+    /// evidence that a Phase C install would have installed the right bytes.
+    pub vantage_sequence_verify_match_total: IntCounter,
+    /// Verified targets whose head DISAGREED with local execution at the same view. Must
+    /// stay zero. Nonzero means either more than `f` announcers agreed on a head no
+    /// correct party derives, or correct parties derive different heads -- both make
+    /// installation unsafe, so this is Phase C's release blocker.
+    pub vantage_sequence_verify_mismatch_total: IntCounter,
 
     /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
     /// addressed to a peer we have not managed to connect to yet. Best-effort sends
@@ -1720,6 +1732,18 @@ impl Metrics {
             vantage_sequence_sync_unsolicited_total: register_int_counter_with_registry!(
                 "vantage_sequence_sync_unsolicited_total",
                 "State-sync responses arriving with no active transfer",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_verify_match_total: register_int_counter_with_registry!(
+                "vantage_sequence_verify_match_total",
+                "Verified checkpoint heads that matched local execution at the same view",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_verify_mismatch_total: register_int_counter_with_registry!(
+                "vantage_sequence_verify_mismatch_total",
+                "Verified checkpoint heads that DISAGREED with local execution -- must stay 0",
                 registry,
             )
             .unwrap(),
