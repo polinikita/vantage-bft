@@ -307,12 +307,12 @@ async fn install_applies_a_view_and_advances() {
     let finalized = effects.iter().find_map(|e| match e {
         crate::vantage::Effect::SequenceFinalized {
             view, output_delta, ..
-        } => Some((*view, output_delta.clone())),
+        } => Some((view, output_delta.clone())),
         _ => None,
     });
     assert_eq!(
         finalized,
-        Some((1, delta)),
+        Some((&1, delta)),
         "the finalized delta must be exactly what was verified -- that is what makes the \
          installed head comparable to the certified one"
     );

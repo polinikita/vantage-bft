@@ -10,9 +10,11 @@ use crate::vantage::Effect;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Why an install was refused. Every variant leaves the cursor unchanged.
+/// Why an install was refused. A prefix emitted by an earlier install step remains valid;
+/// the step that returns an error emits nothing further.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
     /// Not the view the cursor is waiting on.
@@ -65,6 +67,21 @@ struct ViewInput {
     sealed: Option<Outcome>,
 }
 
+/// Cursor-owned continuation for a chunked checkpoint install.
+///
+/// Owning the verified bytes matters for two reasons: callers cannot swap the target under
+/// a partially emitted view, and continuation never has to clone or re-scan the prefix it
+/// already checked. While this is present, ordinary `pump` work for the same view is parked.
+struct InstallProgress {
+    view: View,
+    outcome: SequenceOutcome,
+    verified: Arc<[Digest]>,
+    /// Local output that existed before installation started and still needs comparison
+    /// with the verified prefix. This advances once and is never re-scanned.
+    prefix_checked: usize,
+    prefix_len: usize,
+}
+
 /// §9's cursor: views processed in strictly increasing order; `output` = `D`, the set
 /// of block hashes already output (initialized `{genesis_digest}`).
 pub struct Cursor {
@@ -96,6 +113,7 @@ pub struct Cursor {
     /// wait for the seal, and those early core blocks belong to the same view's eventual
     /// delta (§3). Cleared only by the terminal advance in `finalize`.
     delta: Vec<Digest>,
+    installing: Option<InstallProgress>,
     pending: BTreeMap<View, ViewInput>,
     /// PHASE6-SPEC.md §9 gate amendment (D6-7, performance-only, deterministic-
     /// equivalent): per-author "last emitted" watermark (height + digest), replacing
@@ -128,6 +146,7 @@ impl Cursor {
             output_log: Vec::new(),
             core_emitted: BTreeSet::new(),
             delta: Vec::new(),
+            installing: None,
             pending: BTreeMap::new(),
             watermarks: HashMap::new(),
         }
@@ -174,6 +193,16 @@ impl Cursor {
     fn pump(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         while let Some(input) = self.pending.get(&self.next_view) {
+            // A checkpoint install owns this view until it finalizes or is explicitly
+            // abandoned. Ordinary Completed/Sealed inputs remain parked in `pending` so
+            // they cannot bypass the install's per-tick digest budget.
+            if self
+                .installing
+                .as_ref()
+                .is_some_and(|install| install.view == self.next_view)
+            {
+                break;
+            }
             // Check `sealed` BEFORE cloning `completed`. `completed` is an
             // `Option<(Manifest, Manifest)>` -- up to 2n `(PublicKey, Height, Digest)`
             // entries, ~14 KB at n=100 -- and `pump` is reached from `Cursor::retry` on
@@ -257,12 +286,11 @@ impl Cursor {
 
     /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10: apply one verified view, atomically.
     ///
-    /// Every check that can refuse runs BEFORE any state is touched, so a rejected install
-    /// leaves the cursor byte-identical to what it was. That is the whole contract: this is
-    /// the one place where output is produced from bytes another party derived, and a
-    /// half-applied view would be a hole no later execution can repair.
+    /// Refusals are checked before emitting the current chunk. A previously installed
+    /// canonical prefix may remain if a later chunk becomes unavailable; `abort_install`
+    /// releases ordinary execution, whose normal expansion deduplicates that prefix.
     ///
-    /// The three refusals, in the order they can bite:
+    /// The refusals, in the order they can bite:
     ///
     /// 1. `OutOfOrder` -- the cursor advances one view at a time and `finalize` is defined
     ///    against `next_view`, so installing anything else would silently skip or redo.
@@ -285,9 +313,10 @@ impl Cursor {
     /// sequence head advances through the same code as locally executed views and the
     /// verified-vs-local head comparison still fires at the target.
     ///
-    /// `budget` caps the digests emitted in this call. Returns `(effects, finalized)`;
-    /// `finalized == false` means the budget ran out and the view is still open, to be
-    /// resumed by calling again with the same arguments.
+    /// `budget` caps digests compared or emitted in this call. Returns
+    /// `(effects, finalized, digests_examined)`; `finalized == false` means the budget ran
+    /// out and the cursor-owned continuation must be resumed. Arguments after the first
+    /// call identify the view only; the cursor keeps the original outcome and delta.
     pub fn install(
         &mut self,
         view: View,
@@ -295,32 +324,82 @@ impl Cursor {
         delta: &[Digest],
         budget: usize,
     ) -> Result<(Vec<Effect>, bool), InstallError> {
+        self.install_budgeted(view, outcome, Arc::from(delta.to_vec()), budget)
+            .map(|(effects, finalized, _)| (effects, finalized))
+    }
+
+    pub fn install_budgeted(
+        &mut self,
+        view: View,
+        outcome: SequenceOutcome,
+        delta: Arc<[Digest]>,
+        budget: usize,
+    ) -> Result<(Vec<Effect>, bool, usize), InstallError> {
         if view != self.next_view {
             return Err(InstallError::OutOfOrder {
                 expected: self.next_view,
                 got: view,
             });
         }
-        if !delta.starts_with(&self.delta) {
-            return Err(InstallError::PrefixMismatch {
+        if self.installing.is_none() {
+            if delta.len() < self.delta.len() {
+                return Err(InstallError::PrefixMismatch {
+                    view,
+                    emitted: self.delta.len(),
+                    verified: delta.len(),
+                });
+            }
+            self.installing = Some(InstallProgress {
                 view,
-                emitted: self.delta.len(),
-                verified: delta.len(),
+                outcome,
+                verified: delta,
+                prefix_checked: 0,
+                prefix_len: self.delta.len(),
             });
         }
-        let remaining: Vec<Digest> = delta[self.delta.len()..].to_vec();
-        if let Some(d) = remaining.iter().find(|d| self.output.contains(*d)) {
+
+        let budget = budget.max(1);
+        let mut examined = 0usize;
+        if let Some(progress) = self.installing.as_ref() {
+            if progress.view != view {
+                return Err(InstallError::OutOfOrder {
+                    expected: progress.view,
+                    got: view,
+                });
+            }
+        }
+        let install = self.installing.as_mut().expect("initialized");
+
+        // Compare an already-emitted local prefix incrementally. Re-checking
+        // `starts_with(self.delta)` on every continuation made a large view quadratic.
+        while install.prefix_checked < install.prefix_len && examined < budget {
+            let index = install.prefix_checked;
+            if self.delta[index] != install.verified[index] {
+                return Err(InstallError::PrefixMismatch {
+                    view,
+                    emitted: install.prefix_len,
+                    verified: install.verified.len(),
+                });
+            }
+            install.prefix_checked += 1;
+            examined += 1;
+        }
+        if install.prefix_checked < install.prefix_len {
+            return Ok((Vec::new(), false, examined));
+        }
+
+        let start = self.delta.len();
+        let end = install.verified.len().min(start + (budget - examined));
+        let chunk = install.verified[start..end].to_vec();
+        if let Some(d) = chunk.iter().find(|d| self.output.contains(*d)) {
             return Err(InstallError::AlreadyOutput {
                 view,
                 digest: d.clone(),
             });
         }
-        // Checked over the WHOLE remainder even when only a chunk of it is emitted below:
-        // the decision to apply this view is all-or-nothing even though the emission is
-        // not, so a view is never half-delivered and then found to be unservable.
         {
             let blocks = self.blocks.lock();
-            if let Some(d) = remaining
+            if let Some(d) = chunk
                 .iter()
                 .find(|d| !blocks.get(d).is_some_and(|e| e.payload_ok))
             {
@@ -331,34 +410,27 @@ impl Cursor {
             }
         }
 
-        // Past every refusal. A view's delta is the whole accumulated lane suffix since the
-        // last emitted watermark, which after a multi-second gap at n=100 is thousands of
-        // headers -- emitting it in one turn on the single-threaded core is the starvation
-        // this mechanism exists to relieve. So emission is chunked, and a view that does not
-        // finish stays OPEN: `self.delta` keeps the partial, and the `starts_with` check at
-        // the top makes the next call resume exactly where this one stopped.
-        //
-        // Leaving a view open mid-install is safe against abandonment too. `expand`
-        // deduplicates against `D`, so if the target is dropped before the view finishes,
-        // ordinary sealing emits only the remainder -- and in canonical order, because the
-        // partial already emitted IS a canonical prefix.
-        let budget = budget.max(1);
-        let complete = remaining.len() <= budget;
-        let chunk = if complete {
-            remaining
-        } else {
-            remaining[..budget].to_vec()
-        };
+        let emitted = chunk.len();
+        let complete = end == install.verified.len();
         let mut effects = self.emit(chunk);
+        examined += emitted;
         if !complete {
-            return Ok((effects, false));
+            return Ok((effects, false, examined));
         }
-        self.apply_watermarks(&outcome);
-        effects.push(self.finalize(outcome));
-        // Views above the target may already be pending -- ordinary execution never stopped
-        // arriving while the transfer ran -- and nothing else would wake them.
-        effects.extend(self.pump());
-        Ok((effects, true))
+
+        let install = self.installing.take().expect("present until complete");
+        self.apply_watermarks(&install.outcome);
+        effects.push(self.finalize(install.outcome));
+        Ok((effects, true, examined))
+    }
+
+    /// Abandon a partial checkpoint view and release parked ordinary execution.
+    ///
+    /// Any already emitted prefix is canonical and remains in `D`; `pump` therefore emits
+    /// only the remainder when the ordinary outcome is available.
+    pub fn abort_install(&mut self) -> Vec<Effect> {
+        self.installing = None;
+        self.pump()
     }
 
     /// Advance each lane's watermark to the tip its manifest names.

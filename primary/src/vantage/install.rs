@@ -25,12 +25,14 @@
 // `RECOVERY_IN_FLIGHT_MAX` already applies to requests, so installation cannot outrun the
 // machinery it is driving.
 
+use crate::messages::Header;
 use crate::primary::{Height, View};
 use crate::vantage::block::BlockRef;
 use crate::vantage::lanes::{BlockCache, SharedBlocks};
 use crate::vantage::sequence::SequenceOutcome;
 use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Views admitted into the fetch window at once. Eight is enough that a single slow lane
 /// overlaps with progress on later views, and small enough that the authorized set stays
@@ -63,10 +65,13 @@ struct StagedView {
     outcome: SequenceOutcome,
     /// The verified output of this view, in emission order. Both the completion test and,
     /// in the install step, the delivery order.
-    delta: Vec<Digest>,
+    delta: Arc<[Digest]>,
     /// `outcome`'s manifest entries: what to hand `Repairer::authorize`.
     refs: Vec<BlockRef>,
     admitted: bool,
+    /// Number of consecutive deliverable digests already checked. Readiness validation is
+    /// resumed from here so a large view is never re-scanned from its first block.
+    ready_prefix: usize,
     /// Every digest in `delta` is cached. Latched: the cache only grows within a session
     /// for blocks this range needs, and re-checking a finished view every tick is the
     /// per-tick sweep this module exists to avoid.
@@ -126,9 +131,10 @@ impl SequenceInstall {
                 view,
                 StagedView {
                     outcome,
-                    delta,
+                    delta: delta.into(),
                     refs,
                     admitted: false,
+                    ready_prefix: 0,
                     complete,
                 },
             );
@@ -254,19 +260,62 @@ impl SequenceInstall {
             .count()
     }
 
-    /// Re-test admitted views against the cache and latch the ones whose whole delta can be
-    /// DELIVERED. Cheap by construction: only admitted-and-incomplete views are scanned,
-    /// and the window bounds that to `window_views`.
-    pub fn refresh(&mut self, blocks: &SharedBlocks) {
+    /// Return a bounded set of cached headers whose worker payload is still missing.
+    /// Payload readiness is monotonic, but the initial Synchronize can be lost; callers
+    /// use this to retry without requiring another header announcement.
+    pub fn payload_retry_headers(&self, blocks: &SharedBlocks, limit: usize) -> Vec<Header> {
         let cache = blocks.lock();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for staged in self.views.values().filter(|v| v.admitted && !v.complete) {
+            for digest in staged.delta.iter() {
+                if out.len() >= limit {
+                    return out;
+                }
+                if !seen.insert(digest.clone()) {
+                    continue;
+                }
+                let Some(entry) = cache.get(digest) else {
+                    continue;
+                };
+                if !entry.payload_ok {
+                    out.push(entry.block.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Re-test at most `budget` new digests and latch views whose whole delta can be
+    /// delivered. Each view resumes at its first unchecked digest, avoiding a full scan on
+    /// every tick while preserving strict prefix readiness.
+    pub fn refresh_budgeted(&mut self, blocks: &SharedBlocks, budget: usize) -> usize {
+        let cache = blocks.lock();
+        let mut examined = 0usize;
         for staged in self.views.values_mut() {
             if staged.complete || !staged.admitted {
                 continue;
             }
-            if staged.delta.iter().all(|d| deliverable(&cache, d)) {
+            while staged.ready_prefix < staged.delta.len() && examined < budget {
+                examined += 1;
+                if !deliverable(&cache, &staged.delta[staged.ready_prefix]) {
+                    break;
+                }
+                staged.ready_prefix += 1;
+            }
+            if staged.ready_prefix == staged.delta.len() {
                 staged.complete = true;
             }
+            if examined == budget {
+                break;
+            }
         }
+        examined
+    }
+
+    #[cfg(test)]
+    pub fn refresh(&mut self, blocks: &SharedBlocks) {
+        self.refresh_budgeted(blocks, usize::MAX);
     }
 
     /// Refs to hand `Repairer::authorize`, respecting both gates.
@@ -308,9 +357,9 @@ impl SequenceInstall {
     }
 
     /// The verified content of `view`, for the caller to apply.
-    pub fn view_output(&self, view: View) -> Option<(&SequenceOutcome, &[Digest])> {
+    pub fn view_output(&self, view: View) -> Option<(&SequenceOutcome, Arc<[Digest]>)> {
         let staged = self.views.get(&view)?;
-        Some((&staged.outcome, &staged.delta))
+        Some((&staged.outcome, Arc::clone(&staged.delta)))
     }
 
     /// Record that `view` has been applied. Panics only on a caller bug (installing out of

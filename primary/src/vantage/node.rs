@@ -1257,7 +1257,7 @@ impl VantageCore {
                     // paced by its own window and by repair's backlog, so its cadence only
                     // has to be coarse and bounded, and this tick already exists exactly
                     // when checkpoints are enabled.
-                    let install_effects = self.drive_sequence_install();
+                    let install_effects = self.drive_sequence_install().await;
                     if !install_effects.is_empty() {
                         self.execute(install_effects, Instant::now()).await;
                     }
@@ -2562,12 +2562,28 @@ impl VantageCore {
     /// The second gate matters more than the first. This mechanism runs on nodes that are
     /// already behind, which is exactly when repair is already loaded, so an installer that
     /// admitted work regardless of that backlog would add load precisely where it hurts.
-    fn drive_sequence_install(&mut self) -> Vec<Effect> {
+    async fn drive_sequence_install(&mut self) -> Vec<Effect> {
         if self.sequence_install.is_none() {
             return Vec::new();
         }
         let blocks = self.rep.blocks();
         let pending = self.rep.pending_settle_len();
+        let retry_headers = self
+            .sequence_install
+            .as_ref()
+            .map(|install| install.payload_retry_headers(&blocks, 64))
+            .unwrap_or_default();
+        let mut effects = Vec::new();
+        for header in retry_headers {
+            let missing = self.lm.missing_payload(&header).await;
+            if missing.is_empty() {
+                effects.extend(self.lm.set_payload_ready(&header.id));
+            } else {
+                self.payload
+                    .sync_batches(&mut self.wire, header.author, header.id.clone(), missing)
+                    .await;
+            }
+        }
         // Ordinary dissemination never stopped while the transfer ran, so the cursor may
         // have moved since the target's base view. Dropping the overtaken prefix keeps a
         // still-useful suffix installable and stops fetching blocks for views already
@@ -2575,8 +2591,9 @@ impl VantageCore {
         if !self.rebase_sequence_install() {
             return Vec::new();
         }
+        let validation_budget = self.sequence_install_digests_per_tick.max(1);
         let install = self.sequence_install.as_mut().expect("present");
-        install.refresh(&blocks);
+        let examined = install.refresh_budgeted(&blocks, validation_budget);
         let refs = install.admit(pending);
 
         let (complete, total, in_flight) = (
@@ -2587,7 +2604,6 @@ impl VantageCore {
         let staged_ready = complete == total;
         let target = install.target().0;
 
-        let mut effects = Vec::new();
         for r in refs {
             effects.extend(self.rep.authorize(r));
         }
@@ -2609,17 +2625,15 @@ impl VantageCore {
                  locally held"
             );
         }
-        effects.extend(self.apply_sequence_install());
+        effects.extend(self.apply_sequence_install(validation_budget - examined));
         effects
     }
 
     /// Re-align the staged target with where the cursor actually is, and revalidate.
     ///
-    /// Called before every admission pass AND before every applied view, not once per tick.
-    /// `Cursor::install` pumps on success, so a view whose ordinary inputs were already
-    /// parked can carry the cursor several views past the one just installed -- checking
-    /// only at the top of the pass would leave the installer asking for a view the cursor
-    /// has moved beyond, and `OutOfOrder` would abandon a target that is still good.
+    /// Called before every admission pass. The owner executes one returned effect batch
+    /// before this can run again, so the sequence head and cursor boundary observed here
+    /// always describe the same applied prefix.
     ///
     /// Returns `false` when the target is gone: either overtaken outright, or refused
     /// because the head local execution derived at the rebase boundary is not the one the
@@ -2642,6 +2656,7 @@ impl VantageCore {
                      target retired without installing"
                 );
                 self.sequence_install = None;
+                let _ = self.cursor.abort_install();
                 false
             }
             RebaseOutcome::Diverged {
@@ -2664,6 +2679,7 @@ impl VantageCore {
                 );
                 self.sequence_install = None;
                 self.sequence_verified_target = None;
+                let _ = self.cursor.abort_install();
                 false
             }
         }
@@ -2680,9 +2696,9 @@ impl VantageCore {
     /// Any refusal aborts the WHOLE target rather than skipping the view. `Cursor::install`
     /// only refuses on conditions that mean the target or the local state is not what this
     /// node believed, and continuing past that would install a hole.
-    fn apply_sequence_install(&mut self) -> Vec<Effect> {
+    fn apply_sequence_install(&mut self, digest_budget: usize) -> Vec<Effect> {
         let mut effects = Vec::new();
-        if !self.sequence_install_enabled {
+        if !self.sequence_install_enabled || digest_budget == 0 {
             return effects;
         }
         let mut applied = 0usize;
@@ -2691,13 +2707,8 @@ impl VantageCore {
         // put thousands of headers behind a single view. The digest budget is what actually
         // keeps a pass off the core, and `Cursor::install` honours it by leaving a view open
         // rather than by refusing it.
-        let mut digests_left = self.sequence_install_digests_per_tick.max(1);
+        let mut digests_left = digest_budget;
         while applied < self.sequence_install_views_per_tick && digests_left > 0 {
-            // Re-checked each iteration: the previous `install` pumped, which may have
-            // carried the cursor past views this target still stages.
-            if !self.rebase_sequence_install() {
-                return effects;
-            }
             let Some(install) = self.sequence_install.as_ref() else {
                 break;
             };
@@ -2707,10 +2718,17 @@ impl VantageCore {
             let Some((outcome, delta)) = install.view_output(view) else {
                 break;
             };
-            let (outcome, delta) = (outcome.clone(), delta.to_vec());
-            match self.cursor.install(view, outcome, &delta, digests_left) {
-                Ok((fx, finalized)) => {
+            let outcome = outcome.clone();
+            match self
+                .cursor
+                .install_budgeted(view, outcome, delta, digests_left)
+            {
+                Ok((fx, finalized, examined)) => {
                     effects.extend(fx);
+                    digests_left = digests_left.saturating_sub(examined);
+                    // Any installed prefix makes the eventual target comparison a
+                    // self-check, even if ordinary inputs finish this view later.
+                    self.sequence_target_installed = true;
                     if !finalized {
                         // Budget exhausted mid-view. The view stays open and resumes next
                         // pass from exactly where it stopped.
@@ -2719,8 +2737,6 @@ impl VantageCore {
                         }
                         break;
                     }
-                    digests_left = digests_left.saturating_sub(delta.len());
-                    self.sequence_target_installed = true;
                     self.sequence_install
                         .as_mut()
                         .expect("present")
@@ -2734,9 +2750,22 @@ impl VantageCore {
                     log::error!("vantage sequence install: {e}; abandoning target");
                     self.sequence_install = None;
                     self.sequence_verified_target = None;
+                    effects.extend(self.cursor.abort_install());
                     return effects;
                 }
             }
+        }
+        // Installation deliberately does not pump parked ordinary inputs between staged
+        // views. Release them only after the whole bounded batch is assembled, preserving
+        // FIFO ordering of SequenceFinalized effects and the SequenceStore heads they build.
+        if self.cursor.next_view()
+            > self
+                .sequence_install
+                .as_ref()
+                .map(|i| i.target().0)
+                .unwrap_or(View::MAX)
+        {
+            effects.extend(self.cursor.retry());
         }
         if applied > 0 {
             if let Some(metrics) = &self.metrics {
