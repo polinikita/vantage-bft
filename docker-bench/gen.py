@@ -266,6 +266,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
+        "sequence_install_enabled": args.sequence_install,
         # Explicit Some(0), not absent/null, REGARDLESS of --no-latency: real one-way
         # delay (when enabled) comes from tc netem, not from this process, so the
         # in-process aws_rtt default (`node run`'s own fallback whenever this key is
@@ -470,6 +471,7 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
+        "sequence_install_enabled": args.sequence_install,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -526,6 +528,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "enough that the run crosses several boundaries on 2+ nodes")
     p.add_argument("--sequence-sync-min-gap-views", type=int, default=50,
                    help="minimum certified cursor gap that starts state sync (default 50)")
+    p.add_argument("--sequence-install", action="store_true",
+                   help="APPLY verified checkpoint state to the cursor (Phase C). Implies "
+                        "--sequence-checkpoints. Off by default: this is the only path that "
+                        "produces committed output from bytes another party derived.")
     p.add_argument("--sequence-sync-chunk-outcomes", type=int, default=8,
                    help="terminal outcome bodies per state-sync response (default 8)")
     p.add_argument("--no-digest-statements", action="store_true",
@@ -565,6 +571,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--withhold must be between 0 and --nodes")
     if args.withhold_at is not None and args.withhold == 0:
         p.error("--withhold-at requires --withhold > 0")
+    if args.sequence_install and not args.sequence_checkpoints:
+        # Installing without announcing/verifying would leave nothing to install from.
+        args.sequence_checkpoints = True
     if args.sequence_checkpoint_interval < 1:
         p.error("--sequence-checkpoint-interval must be at least 1")
     if args.sequence_sync_min_gap_views < 0:
