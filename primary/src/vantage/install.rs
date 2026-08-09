@@ -263,17 +263,21 @@ impl SequenceInstall {
     /// Return a bounded set of cached headers whose worker payload is still missing.
     /// Payload readiness is monotonic, but the initial Synchronize can be lost; callers
     /// use this to retry without requiring another header announcement.
+    ///
+    /// Each view is scanned from `ready_prefix`, not from its first digest. Everything
+    /// below that index was already observed deliverable and `payload_ok` never goes back
+    /// to false, so re-examining it can only ever produce misses -- and this runs every
+    /// tick against up to `window_views` deltas that are each a whole lane suffix, which is
+    /// exactly the per-tick sweep over already-settled state this module exists to avoid.
     pub fn payload_retry_headers(&self, blocks: &SharedBlocks, limit: usize) -> Vec<Header> {
         let cache = blocks.lock();
-        let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for staged in self.views.values().filter(|v| v.admitted && !v.complete) {
-            for digest in staged.delta.iter() {
+            // Deltas are disjoint across views -- `expand` deduplicates against `D` before
+            // a digest is ever recorded -- so no cross-view dedup set is needed here.
+            for digest in staged.delta.iter().skip(staged.ready_prefix) {
                 if out.len() >= limit {
                     return out;
-                }
-                if !seen.insert(digest.clone()) {
-                    continue;
                 }
                 let Some(entry) = cache.get(digest) else {
                     continue;

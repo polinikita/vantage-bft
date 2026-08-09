@@ -412,3 +412,30 @@ fn rebase_refuses_a_boundary_whose_local_head_disagrees() {
         "nothing is dropped on a refused rebase"
     );
 }
+
+/// The initial Synchronize for a repaired header can be lost, and `payload_ok` would then
+/// never flip on its own -- the retry list is what breaks that deadlock. It must name only
+/// blocks that are actually stuck, and must not re-walk the part of a view already known
+/// deliverable: this runs every tick against deltas that are each a whole lane suffix.
+#[test]
+fn payload_retry_names_stuck_blocks_and_skips_the_ready_prefix() {
+    let (mut install, headers) = install_of(2, 8, 4096);
+    let blocks = empty_cache();
+    install.admit(0);
+
+    // View 1 deliverable, view 2 header-only: exactly one block is stuck.
+    cache_insert(&blocks, &headers[0..1]);
+    cache_insert_headers_only(&blocks, &headers[1..2]);
+    install.refresh(&blocks);
+    assert_eq!(install.views_complete(), 1, "only view 1 can be delivered");
+
+    let retry = install.payload_retry_headers(&blocks, 64);
+    assert_eq!(retry.len(), 1);
+    assert_eq!(retry[0].id, headers[1].id);
+
+    // Once its batches land nothing is stuck, and the completed view is not rescanned.
+    cache_insert(&blocks, &headers[1..2]);
+    install.refresh(&blocks);
+    assert!(install.payload_retry_headers(&blocks, 64).is_empty());
+    assert_eq!(install.views_complete(), 2);
+}
