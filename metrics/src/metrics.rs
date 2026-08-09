@@ -734,6 +734,24 @@ pub struct Metrics {
     pub vantage_sequence_certified_view: IntGauge,
     /// Distinct senders caught announcing two different heads for one view.
     pub vantage_sequence_equivocators: IntGauge,
+    /// Transfers whose whole target downloaded and verified against the certified head.
+    /// Phase B stops here and installs nothing; Phase C installs from this point.
+    pub vantage_sequence_sync_verified_total: IntCounter,
+    /// Highest target view fully verified.
+    pub vantage_sequence_sync_verified_view: IntGauge,
+    /// Transfers abandoned because every matching announcer was dropped. Nonzero means
+    /// the certified target could not be served by the set that certified it.
+    pub vantage_sequence_sync_exhausted_total: IntCounter,
+    pub vantage_sequence_sync_started_total: IntCounter,
+    /// Target view of the active transfer.
+    pub vantage_sequence_sync_target_view: IntGauge,
+    /// Requests that hit the deadline and failed over to another source.
+    pub vantage_sequence_sync_timeouts_total: IntCounter,
+    /// Response chunks accepted.
+    pub vantage_sequence_sync_chunks_total: IntCounter,
+    /// Response chunks that failed verification. Ordinary operation, not a fault: up to
+    /// f matching announcers may serve corrupt bytes by assumption.
+    pub vantage_sequence_sync_invalid_total: IntCounter,
     /// State-sync frames dropped because the dedicated bounded egress was full.
     /// Nonzero means a peer cannot keep up; the requester recovers by timing out and
     /// failing over, which it must handle anyway since up to `f` sources may withhold.
@@ -1636,6 +1654,54 @@ impl Metrics {
             vantage_sequence_equivocators: register_int_gauge_with_registry!(
                 "vantage_sequence_equivocators",
                 "Distinct senders caught announcing two heads for one view",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_verified_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_verified_total",
+                "Transfers fully downloaded and verified",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_verified_view: register_int_gauge_with_registry!(
+                "vantage_sequence_sync_verified_view",
+                "Highest fully verified target view",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_exhausted_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_exhausted_total",
+                "Transfers abandoned with no usable source left",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_started_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_started_total",
+                "State-sync transfers started",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_target_view: register_int_gauge_with_registry!(
+                "vantage_sequence_sync_target_view",
+                "Target view of the active transfer",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_timeouts_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_timeouts_total",
+                "Requests that timed out and failed over",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_chunks_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_chunks_total",
+                "State-sync response chunks accepted",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_invalid_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_invalid_total",
+                "State-sync response chunks that failed verification",
                 registry,
             )
             .unwrap(),

@@ -34,11 +34,20 @@ use crate::vantage::resume::{
     ResumeTrigger, ServeBudget,
 };
 use crate::vantage::sequence::{
-    head_hex, head_prefix_i64, CheckpointCollector, SequenceAnnouncement, SequenceDeltaChunk,
-    SequenceDeltaRequest, SequenceOutcome, SequenceOutcomeRequest, SequenceOutcomeServe,
-    SequenceRecordChunk, SequenceRequest, SequenceStore, SequenceUnavailable, SEQUENCE_VERSION,
+    genesis_head, head_hex, head_prefix_i64, CheckpointCollector, SequenceAnnouncement,
+    SequenceDeltaChunk, SequenceDeltaRequest, SequenceOutcome, SequenceOutcomeRequest,
+    SequenceOutcomeServe, SequenceRecordChunk, SequenceRequest, SequenceStore, SequenceTransfer,
+    SequenceUnavailable, SequenceWant, TransferState, SEQUENCE_VERSION,
 };
 use crate::vantage::wire::{self, Wire};
+
+/// One state-sync response, so the four inbound arms share a single handler.
+enum SequenceResponse {
+    Records(SequenceRecordChunk),
+    Outcome(SequenceOutcomeServe),
+    Delta(SequenceDeltaChunk),
+    Unavailable(SequenceUnavailable),
+}
 use crate::vantage::Effect;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -437,6 +446,13 @@ pub struct VantageCore {
     sequence_chunk_digests: usize,
     sequence_announce_period_ms: u64,
     sequence_announce_repeat_ms: u64,
+    /// Phase B: at most ONE installation target at a time (section 7).
+    sequence_transfer: Option<SequenceTransfer>,
+    sequence_transfer_seq: u64,
+    /// When the outstanding request was issued, for the failover deadline.
+    sequence_request_at: Option<Instant>,
+    sequence_request_timeout_ms: u64,
+    sequence_max_sources: usize,
     /// Last (boundary, instant) we announced, for the repeat rule above.
     last_announced: Option<(View, Instant)>,
     pacemaker: Pacemaker,
@@ -868,6 +884,11 @@ impl VantageCore {
             sequence_chunk_digests: parameters.sequence_sync_chunk_digests,
             sequence_announce_period_ms: parameters.sequence_announce_period_ms,
             sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
+            sequence_transfer: None,
+            sequence_transfer_seq: 0,
+            sequence_request_at: None,
+            sequence_request_timeout_ms: parameters.sequence_sync_request_timeout_ms,
+            sequence_max_sources: parameters.sequence_sync_max_sources,
             last_announced: None,
             pacemaker,
             resolver,
@@ -1193,6 +1214,7 @@ impl VantageCore {
                     }
                 }, if announce_tick.is_some() => {
                     self.announce_checkpoint().await;
+                    self.drive_sequence_sync();
                 }
 
                 // Mechanism A (design doc step 2): every author besides ourselves,
@@ -2224,6 +2246,192 @@ impl VantageCore {
         }
     }
 
+    /// Phase B: start or advance the single active transfer.
+    ///
+    /// VERIFY ONLY. On reaching `Verified` the result is counted and DISCARDED -- Phase B
+    /// deliberately installs nothing, so the cursor, watermarks and output set are
+    /// untouched no matter what a peer serves. Installation is Phase C.
+    fn drive_sequence_sync(&mut self) {
+        if self.sequence_sync.is_none() {
+            return;
+        }
+        let local_view = self.sequence.as_ref().map(|s| s.head_view()).unwrap_or(0);
+        let local_head = self
+            .sequence
+            .as_ref()
+            .map(|s| s.head().clone())
+            .unwrap_or_else(|| genesis_head(self.agb.sid()));
+
+        // Retire a finished transfer before considering a new target.
+        match self.sequence_transfer.as_ref().map(|t| t.state()) {
+            Some(TransferState::Verified) => {
+                let views = self
+                    .sequence_transfer
+                    .as_ref()
+                    .and_then(|t| t.verified_output().map(|o| o.len()))
+                    .unwrap_or(0);
+                let (view, _) = self.sequence_transfer.as_ref().expect("present").target();
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_sync_verified_total.inc();
+                    metrics.vantage_sequence_sync_verified_view.set(view as i64);
+                }
+                log::info!(
+                    "vantage sequence sync: VERIFIED target view={view} ({views} views); \
+                     Phase B installs nothing"
+                );
+                self.sequence_transfer = None;
+                self.sequence_request_at = None;
+            }
+            Some(TransferState::Exhausted) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_sync_exhausted_total.inc();
+                }
+                self.sequence_transfer = None;
+                self.sequence_request_at = None;
+            }
+            _ => {}
+        }
+
+        // Pick a target: the highest certified head strictly above what we hold.
+        if self.sequence_transfer.is_none() {
+            let Some(collector) = self.sequence_sync.as_ref() else {
+                return;
+            };
+            let Some((view, head)) = collector.certified_head(local_view) else {
+                return;
+            };
+            let sources = collector.announcers(view, &head);
+            if sources.is_empty() {
+                return;
+            }
+            self.sequence_transfer_seq += 1;
+            let id = self.sequence_transfer_seq;
+            self.sequence_transfer = Some(SequenceTransfer::new(
+                self.agb.sid().clone(),
+                id,
+                local_view,
+                local_head,
+                view,
+                head,
+                sources,
+            ));
+            self.sequence_request_at = None;
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_sequence_sync_started_total.inc();
+                metrics.vantage_sequence_sync_target_view.set(view as i64);
+            }
+        }
+
+        // Fail over on a stalled request rather than waiting forever on a silent peer.
+        let now = Instant::now();
+        let timed_out = self
+            .sequence_request_at
+            .map(|at| {
+                now.duration_since(at) >= Duration::from_millis(self.sequence_request_timeout_ms)
+            })
+            .unwrap_or(true);
+        if !timed_out {
+            return;
+        }
+        if self.sequence_request_at.is_some() {
+            if let Some(t) = self.sequence_transfer.as_mut() {
+                t.rotate();
+            }
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_sequence_sync_timeouts_total.inc();
+            }
+        }
+        self.emit_sequence_requests();
+    }
+
+    /// Ask every selected source for the same thing CONCURRENTLY; the first valid copy
+    /// wins and the rest are simply ignored when they arrive.
+    fn emit_sequence_requests(&mut self) {
+        let Some(transfer) = self.sequence_transfer.as_ref() else {
+            return;
+        };
+        let Some(want) = transfer.want() else {
+            return;
+        };
+        let (target_view, target_head) = transfer.target();
+        let (target_head, id) = (target_head.clone(), transfer.transfer_id());
+        let sources = transfer.next_sources(self.sequence_max_sources);
+        let records_cap = self.sequence_chunk_records as u32;
+        let digests_cap = self.sequence_chunk_digests as u32;
+        let me = self.name;
+        for peer in sources {
+            let message = match &want {
+                SequenceWant::Records { from_view } => {
+                    PrimaryMessage::VantageSequenceRequest(SequenceRequest {
+                        version: SEQUENCE_VERSION,
+                        transfer_id: id,
+                        target_view,
+                        target_head: target_head.clone(),
+                        from_view: *from_view,
+                        max_records: records_cap,
+                        requester: me,
+                    })
+                }
+                SequenceWant::Outcome { view } => {
+                    PrimaryMessage::VantageSequenceOutcomeRequest(SequenceOutcomeRequest {
+                        version: SEQUENCE_VERSION,
+                        transfer_id: id,
+                        target_head: target_head.clone(),
+                        view: *view,
+                        requester: me,
+                    })
+                }
+                SequenceWant::Delta { view, start_index } => {
+                    PrimaryMessage::VantageSequenceDeltaRequest(SequenceDeltaRequest {
+                        version: SEQUENCE_VERSION,
+                        transfer_id: id,
+                        target_head: target_head.clone(),
+                        view: *view,
+                        start_index: *start_index,
+                        max_items: digests_cap,
+                        requester: me,
+                    })
+                }
+            };
+            self.send_sequence(&peer, message);
+        }
+        self.sequence_request_at = Some(Instant::now());
+    }
+
+    /// Feed one response into the active transfer. An invalid one is counted and dropped:
+    /// up to `f` matching announcers may serve corrupt bytes, so this is ordinary
+    /// operation, never a fault.
+    fn on_sequence_response(&mut self, response: SequenceResponse, from: &PublicKey) {
+        let Some(transfer) = self.sequence_transfer.as_mut() else {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_sequence_sync_unsolicited_total.inc();
+            }
+            return;
+        };
+        let result = match &response {
+            SequenceResponse::Records(chunk) => transfer.on_records(chunk, from),
+            SequenceResponse::Outcome(serve) => transfer.on_outcome(serve, from),
+            SequenceResponse::Delta(chunk) => transfer.on_delta(chunk, from),
+            SequenceResponse::Unavailable(u) => {
+                transfer.on_unavailable(u, from);
+                Ok(())
+            }
+        };
+        if let Some(metrics) = &self.metrics {
+            match &result {
+                Ok(()) => metrics.vantage_sequence_sync_chunks_total.inc(),
+                Err(_) => metrics.vantage_sequence_sync_invalid_total.inc(),
+            }
+        }
+        if let Err(e) = result {
+            log::debug!("vantage sequence sync: invalid chunk from a source: {e:?}");
+        }
+        // A valid chunk unblocks the next request immediately rather than waiting out the
+        // timeout, so a healthy transfer runs at network speed, not at tick speed.
+        self.sequence_request_at = None;
+        self.drive_sequence_sync();
+    }
+
     /// Phase B: broadcast our highest checkpoint boundary, if we have one.
     ///
     /// Re-sent on an unchanged boundary every `sequence_announce_repeat_ms`, not only
@@ -2827,13 +3035,20 @@ impl VantageCore {
             // active transfer they are unsolicited and changing state on them would be
             // exactly the "answers a pair we never asked for" hazard section 7.3 warns
             // about, so they are counted and dropped.
-            Inbound::SequenceRecords(..)
-            | Inbound::SequenceDelta(..)
-            | Inbound::SequenceOutcome(..)
-            | Inbound::SequenceUnavailable(..) => {
-                if let Some(metrics) = &self.metrics {
-                    metrics.vantage_sequence_sync_unsolicited_total.inc();
-                }
+            Inbound::SequenceRecords(chunk, sender) => {
+                self.on_sequence_response(SequenceResponse::Records(chunk), &sender);
+                Vec::new()
+            }
+            Inbound::SequenceDelta(chunk, sender) => {
+                self.on_sequence_response(SequenceResponse::Delta(chunk), &sender);
+                Vec::new()
+            }
+            Inbound::SequenceOutcome(serve, sender) => {
+                self.on_sequence_response(SequenceResponse::Outcome(serve), &sender);
+                Vec::new()
+            }
+            Inbound::SequenceUnavailable(u, sender) => {
+                self.on_sequence_response(SequenceResponse::Unavailable(u), &sender);
                 Vec::new()
             }
             Inbound::ReplayDone(end_key, complete, clamped, sender) => {
