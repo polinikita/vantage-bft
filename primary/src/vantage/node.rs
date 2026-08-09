@@ -435,20 +435,24 @@ pub struct VantageCore {
     agb: AgbEngine,
     frontier: Frontier,
     cursor: Cursor,
-    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §9. PHASE A (record-only shadow mode): built
-    /// from every terminal cursor advance, never announced, fetched, or installed.
-    /// `None` when `Parameters::sequence_checkpoints` is off, which is the default until
-    /// cross-node head determinism is proved on a real run (§14 Phase A).
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §9: retained records, outcomes, and deltas.
+    /// Phase B announces and verifies these but never installs them.
     sequence: Option<SequenceStore>,
     /// Phase B: the f+1 first-hand head collector. `Some` exactly when `sequence` is.
     sequence_sync: Option<CheckpointCollector>,
     sequence_chunk_records: usize,
+    sequence_chunk_outcomes: usize,
     sequence_chunk_digests: usize,
+    sequence_sync_min_gap_views: View,
     sequence_announce_period_ms: u64,
     sequence_announce_repeat_ms: u64,
     /// Phase B: at most ONE installation target at a time (section 7).
     sequence_transfer: Option<SequenceTransfer>,
     sequence_transfer_seq: u64,
+    /// Highest remote target fully verified in Phase B. Since verify-only deliberately
+    /// does not move the cursor, no newer transfer starts until ordinary dissemination
+    /// reaches this target. Phase C replaces that wait by installing the verified state.
+    sequence_verified_target: Option<(View, Digest)>,
     /// When the outstanding request was issued, for the failover deadline.
     sequence_request_at: Option<Instant>,
     /// What the last emitted request asked for. A response only re-emits when the WANT
@@ -884,11 +888,14 @@ impl VantageCore {
             sequence,
             sequence_sync,
             sequence_chunk_records: parameters.sequence_sync_chunk_records,
+            sequence_chunk_outcomes: parameters.sequence_sync_chunk_outcomes,
             sequence_chunk_digests: parameters.sequence_sync_chunk_digests,
+            sequence_sync_min_gap_views: parameters.sequence_sync_min_gap_views,
             sequence_announce_period_ms: parameters.sequence_announce_period_ms,
             sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
             sequence_transfer: None,
             sequence_transfer_seq: 0,
+            sequence_verified_target: None,
             sequence_request_at: None,
             sequence_last_want: None,
             sequence_request_timeout_ms: parameters.sequence_sync_request_timeout_ms,
@@ -2274,7 +2281,8 @@ impl VantageCore {
                     .as_ref()
                     .and_then(|t| t.verified_output().map(|o| o.len()))
                     .unwrap_or(0);
-                let (view, _) = self.sequence_transfer.as_ref().expect("present").target();
+                let (view, head) = self.sequence_transfer.as_ref().expect("present").target();
+                self.sequence_verified_target = Some((view, head.clone()));
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_sequence_sync_verified_total.inc();
                     metrics.vantage_sequence_sync_verified_view.set(view as i64);
@@ -2298,14 +2306,45 @@ impl VantageCore {
             _ => {}
         }
 
+        // Ordinary dissemination won the race. The staged Phase B result is no longer
+        // useful and Phase C must never install a target the local cursor has passed.
+        if self
+            .sequence_transfer
+            .as_ref()
+            .map(|t| t.target().0 <= local_view)
+            .unwrap_or(false)
+        {
+            let target = self.sequence_transfer.as_ref().expect("present").target().0;
+            log::info!(
+                "vantage sequence sync: ordinary cursor passed target view={target}; aborting"
+            );
+            self.sequence_transfer = None;
+            self.sequence_request_at = None;
+            self.sequence_last_want = None;
+        }
+
         // Pick a target: the highest certified head strictly above what we hold.
         if self.sequence_transfer.is_none() {
             let Some(collector) = self.sequence_sync.as_ref() else {
                 return;
             };
+            let verified_view = self
+                .sequence_verified_target
+                .as_ref()
+                .map(|(view, _)| *view)
+                .unwrap_or(0);
+            // Verify-only must not chase every newer boundary while the ordinary cursor
+            // is still behind the result it just verified. Phase B waits until normal
+            // dissemination reaches that target; Phase C replaces this wait by install.
+            if verified_view > local_view {
+                return;
+            }
             let Some((view, head)) = collector.certified_head(local_view) else {
                 return;
             };
+            if view.saturating_sub(local_view) < self.sequence_sync_min_gap_views {
+                return;
+            }
             let sources = collector.announcers(view, &head);
             if sources.is_empty() {
                 return;
@@ -2364,6 +2403,7 @@ impl VantageCore {
         let (target_head, id) = (target_head.clone(), transfer.transfer_id());
         let sources = transfer.next_sources(self.sequence_max_sources);
         let records_cap = self.sequence_chunk_records as u32;
+        let outcomes_cap = self.sequence_chunk_outcomes as u32;
         let digests_cap = self.sequence_chunk_digests as u32;
         let me = self.name;
         for peer in sources {
@@ -2379,12 +2419,14 @@ impl VantageCore {
                         requester: me,
                     })
                 }
-                SequenceWant::Outcome { view } => {
+                SequenceWant::Outcomes { from_view } => {
                     PrimaryMessage::VantageSequenceOutcomeRequest(SequenceOutcomeRequest {
                         version: SEQUENCE_VERSION,
                         transfer_id: id,
                         target_head: target_head.clone(),
-                        view: *view,
+                        target_view,
+                        from_view: *from_view,
+                        max_outcomes: outcomes_cap,
                         requester: me,
                     })
                 }
@@ -2418,7 +2460,7 @@ impl VantageCore {
         };
         let result = match &response {
             SequenceResponse::Records(chunk) => transfer.on_records(chunk, from),
-            SequenceResponse::Outcome(serve) => transfer.on_outcome(serve, from),
+            SequenceResponse::Outcome(serve) => transfer.on_outcomes(serve, from),
             SequenceResponse::Delta(chunk) => transfer.on_delta(chunk, from),
             SequenceResponse::Unavailable(u) => {
                 transfer.on_unavailable(u, from);
@@ -2609,22 +2651,30 @@ impl VantageCore {
             return;
         };
         let floor = store.serve_floor();
-        let message = match store.outcome_for(request.view).cloned() {
-            Some(outcome) => PrimaryMessage::VantageSequenceOutcome(SequenceOutcomeServe {
-                version: SEQUENCE_VERSION,
-                transfer_id: request.transfer_id,
-                target_head: request.target_head.clone(),
-                view: request.view,
-                outcome,
-                sender: self.name,
-            }),
-            None => PrimaryMessage::VantageSequenceUnavailable(SequenceUnavailable {
+        let max = self
+            .sequence_chunk_outcomes
+            .min(request.max_outcomes as usize);
+        let outcomes = if request.from_view < floor {
+            Vec::new()
+        } else {
+            store.outcomes_from(request.from_view, request.target_view, max)
+        };
+        let message = if outcomes.is_empty() {
+            PrimaryMessage::VantageSequenceUnavailable(SequenceUnavailable {
                 version: SEQUENCE_VERSION,
                 transfer_id: request.transfer_id,
                 target_head: request.target_head.clone(),
                 serve_floor: floor,
                 sender: self.name,
-            }),
+            })
+        } else {
+            PrimaryMessage::VantageSequenceOutcome(SequenceOutcomeServe {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                outcomes,
+                sender: self.name,
+            })
         };
         self.send_sequence(to, message);
     }

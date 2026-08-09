@@ -341,14 +341,12 @@ pub struct Parameters {
     #[serde(default = "default_digest_statements")]
     pub digest_statements: bool,
 
-    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10. PHASE A (record-only shadow mode): build
-    /// the local hash-chained sequence log and its checkpoint-boundary heads. Nothing is
-    /// announced, fetched, or installed, and no live AGB rule changes -- the flag exists
-    /// so a run can be scored for cross-node head determinism (§14 Phase A) before any
-    /// of that is written.
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md. Build the local hash-chained sequence log and
+    /// checkpoint-boundary heads. Phase B also announces, certifies, downloads, and
+    /// verifies remote history; installation remains disabled until Phase C.
     ///
     /// `#[serde(default)]` = `false`. Off, the store is never constructed and the only
-    /// residue is one `Vec<Digest>` per open view inside `Cursor`, which the cursor
+    /// residue is one `Vec<Digest>` for the current cursor view, which the cursor
     /// accumulates unconditionally so its output rules cannot depend on configuration.
     #[serde(default = "default_sequence_checkpoints")]
     pub sequence_checkpoints: bool,
@@ -379,9 +377,21 @@ pub struct Parameters {
     #[serde(default = "default_sequence_sync_chunk_records")]
     pub sequence_sync_chunk_records: usize,
 
+    /// Consecutive terminal outcome bodies per served chunk. Outcomes contain manifests
+    /// and are therefore variable-sized; the conservative default keeps an n=100 Full
+    /// batch near the existing 64 KiB frame norm.
+    #[serde(default = "default_sequence_sync_chunk_outcomes")]
+    pub sequence_sync_chunk_outcomes: usize,
+
     /// Delta digests per served chunk (32 B each).
     #[serde(default = "default_sequence_sync_chunk_digests")]
     pub sequence_sync_chunk_digests: usize,
+
+    /// Start state sync only when a certified checkpoint is at least this many terminal
+    /// views beyond the local sequence cursor. Smaller gaps use normal dissemination and
+    /// parked-message recovery. 50 views is roughly 3--5 seconds in the n=100 runs.
+    #[serde(default = "default_sequence_sync_min_gap_views")]
+    pub sequence_sync_min_gap_views: u64,
 
     /// Matching announcers queried concurrently for one outstanding chunk. Up to `f` of
     /// the `f+1` may withhold every response, so SERIAL failover would multiply
@@ -767,7 +777,7 @@ fn default_digest_statements() -> bool {
     true
 }
 
-/// Off until cross-node head determinism is proved on a real run (§14 Phase A).
+/// Off until guarded installation and its adversarial audit complete (plan Phase C).
 fn default_sequence_checkpoints() -> bool {
     false
 }
@@ -793,9 +803,18 @@ fn default_sequence_sync_chunk_records() -> usize {
     256
 }
 
+/// A Full outcome at n=100 is roughly 7 KiB; eight stay near the 64 KiB frame norm.
+fn default_sequence_sync_chunk_outcomes() -> usize {
+    8
+}
+
 /// 1024 digests is 32 KB, comfortably below the 64 KB frame norm.
 fn default_sequence_sync_chunk_digests() -> usize {
     1_024
+}
+
+fn default_sequence_sync_min_gap_views() -> u64 {
+    50
 }
 
 /// `f+1` at the smallest committee this targets.
@@ -1137,7 +1156,9 @@ impl Default for Parameters {
             sequence_announce_period_ms: default_sequence_announce_period_ms(),
             sequence_announce_repeat_ms: default_sequence_announce_repeat_ms(),
             sequence_sync_chunk_records: default_sequence_sync_chunk_records(),
+            sequence_sync_chunk_outcomes: default_sequence_sync_chunk_outcomes(),
             sequence_sync_chunk_digests: default_sequence_sync_chunk_digests(),
+            sequence_sync_min_gap_views: default_sequence_sync_min_gap_views(),
             sequence_sync_max_sources: default_sequence_sync_max_sources(),
             sequence_sync_request_timeout_ms: default_sequence_sync_request_timeout_ms(),
             sequence_sync_inbound_capacity: default_sequence_sync_inbound_capacity(),

@@ -552,6 +552,33 @@ impl SequenceStore {
         self.outcomes.get(&view)
     }
 
+    /// A consecutive outcome range beginning at `from`, bounded by `max` and `through`.
+    /// Stops at the first retention gap; callers answer an empty range with
+    /// `SequenceUnavailable` rather than pretending the request completed.
+    pub fn outcomes_from(
+        &self,
+        from: View,
+        through: View,
+        max: usize,
+    ) -> Vec<SequenceOutcomeEntry> {
+        let mut outcomes = Vec::new();
+        let mut view = from;
+        while view <= through && outcomes.len() < max {
+            let Some(outcome) = self.outcomes.get(&view) else {
+                break;
+            };
+            outcomes.push(SequenceOutcomeEntry {
+                view,
+                outcome: outcome.clone(),
+            });
+            if view == through {
+                break;
+            }
+            view = view.saturating_add(1);
+        }
+        outcomes
+    }
+
     /// One delta chunk: up to `max` digests from `start`, plus whether it reaches the end.
     ///
     /// `None` when the view is not retained at all, which the caller answers with
@@ -621,8 +648,16 @@ pub struct SequenceOutcomeRequest {
     pub version: u16,
     pub transfer_id: u64,
     pub target_head: Digest,
-    pub view: View,
+    pub target_view: View,
+    pub from_view: View,
+    pub max_outcomes: u32,
     pub requester: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceOutcomeEntry {
+    pub view: View,
+    pub outcome: SequenceOutcome,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -630,8 +665,7 @@ pub struct SequenceOutcomeServe {
     pub version: u16,
     pub transfer_id: u64,
     pub target_head: Digest,
-    pub view: View,
-    pub outcome: SequenceOutcome,
+    pub outcomes: Vec<SequenceOutcomeEntry>,
     pub sender: PublicKey,
 }
 
@@ -889,7 +923,7 @@ impl DeltaVerifier {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SequenceWant {
     Records { from_view: View },
-    Outcome { view: View },
+    Outcomes { from_view: View },
     Delta { view: View, start_index: u64 },
 }
 
@@ -1024,7 +1058,7 @@ impl SequenceTransfer {
             }),
             TransferState::FetchingOutcomes => self
                 .first_missing_outcome()
-                .map(|view| SequenceWant::Outcome { view }),
+                .map(|from_view| SequenceWant::Outcomes { from_view }),
             TransferState::FetchingDeltas => match &self.delta_in_flight {
                 Some((view, verifier)) => Some(SequenceWant::Delta {
                     view: *view,
@@ -1137,7 +1171,7 @@ impl SequenceTransfer {
         }
     }
 
-    pub fn on_outcome(
+    pub fn on_outcomes(
         &mut self,
         serve: &SequenceOutcomeServe,
         from: &PublicKey,
@@ -1147,20 +1181,27 @@ impl SequenceTransfer {
         {
             return Ok(());
         }
-        match self.chain.check_outcome(serve.view, &serve.outcome) {
-            Ok(()) => {
-                self.outcomes.insert(serve.view, serve.outcome.clone());
-                if self.first_missing_outcome().is_none() {
-                    self.state = TransferState::FetchingDeltas;
-                    self.advance_if_done();
-                }
-                Ok(())
+        // Concurrent sources may return overlapping ranges after another source has
+        // already advanced us. Validate every still-useful body by its committed digest
+        // and ignore already-held/out-of-range entries. Framing overlap is not evidence
+        // of a bad source; only invalid content spends its source budget.
+        for entry in &serve.outcomes {
+            if self.outcomes.contains_key(&entry.view)
+                || self.chain.verified_record(entry.view).is_none()
+            {
+                continue;
             }
-            Err(e) => {
+            if let Err(e) = self.chain.check_outcome(entry.view, &entry.outcome) {
                 self.penalize(from);
-                Err(e)
+                return Err(e);
             }
+            self.outcomes.insert(entry.view, entry.outcome.clone());
         }
+        if self.first_missing_outcome().is_none() {
+            self.state = TransferState::FetchingDeltas;
+            self.advance_if_done();
+        }
+        Ok(())
     }
 
     pub fn on_delta(

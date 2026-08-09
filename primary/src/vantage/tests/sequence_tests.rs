@@ -791,19 +791,18 @@ fn run_transfer(
                 )
                 .expect("honest records verify");
             }
-            SequenceWant::Outcome { view } => {
-                t.on_outcome(
+            SequenceWant::Outcomes { from_view } => {
+                t.on_outcomes(
                     &SequenceOutcomeServe {
                         version: SEQUENCE_VERSION,
                         transfer_id: 7,
                         target_head: store.head().clone(),
-                        view,
-                        outcome: store.outcome_for(view).expect("retained").clone(),
+                        outcomes: store.outcomes_from(from_view, target_view, 3),
                         sender: *serve_from,
                     },
                     serve_from,
                 )
-                .expect("honest outcome verifies");
+                .expect("honest outcomes verify");
             }
             SequenceWant::Delta { view, start_index } => {
                 let (items, complete) = store.delta_chunk(view, start_index, 2).expect("retained");
@@ -855,6 +854,74 @@ fn a_transfer_downloads_and_verifies_a_whole_target() {
             assert_eq!(delta.len(), 3, "view {view} delta");
         }
     }
+}
+
+/// Outcome ranges are content-addressed, so harmless overlap from concurrent honest
+/// sources must advance the first missing view rather than being treated as bad framing.
+#[test]
+fn outcome_batches_accept_useful_overlap() {
+    let (store, sid) = populated_store(6);
+    let keys = authors();
+    let (a, _) = keys[0];
+    let (b, _) = keys[1];
+    let mut transfer = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        6,
+        store.head().clone(),
+        vec![a, b],
+    );
+    transfer
+        .on_records(
+            &SequenceRecordChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                records: store.records_from(1, 6),
+                serve_floor: 1,
+                sender: a,
+            },
+            &a,
+        )
+        .unwrap();
+
+    transfer
+        .on_outcomes(
+            &SequenceOutcomeServe {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                outcomes: store.outcomes_from(1, 3, 3),
+                sender: a,
+            },
+            &a,
+        )
+        .unwrap();
+    assert_eq!(
+        transfer.want(),
+        Some(SequenceWant::Outcomes { from_view: 4 })
+    );
+
+    transfer
+        .on_outcomes(
+            &SequenceOutcomeServe {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                outcomes: store.outcomes_from(2, 6, 5),
+                sender: b,
+            },
+            &b,
+        )
+        .expect("overlap is harmless");
+    assert_eq!(transfer.state(), TransferState::FetchingDeltas);
+    assert_eq!(
+        transfer.next_sources(3).len(),
+        2,
+        "neither source is retired"
+    );
 }
 
 /// The liveness property the concurrent-source design exists for: `f` matching announcers
@@ -1054,20 +1121,17 @@ fn a_corrupt_delta_chunk_restarts_that_view() {
         &source,
     )
     .unwrap();
-    for view in 1..=3u64 {
-        t.on_outcome(
-            &SequenceOutcomeServe {
-                version: SEQUENCE_VERSION,
-                transfer_id: 7,
-                target_head: store.head().clone(),
-                view,
-                outcome: store.outcome_for(view).unwrap().clone(),
-                sender: source,
-            },
-            &source,
-        )
-        .unwrap();
-    }
+    t.on_outcomes(
+        &SequenceOutcomeServe {
+            version: SEQUENCE_VERSION,
+            transfer_id: 7,
+            target_head: store.head().clone(),
+            outcomes: store.outcomes_from(1, 3, 3),
+            sender: source,
+        },
+        &source,
+    )
+    .unwrap();
     assert_eq!(t.state(), TransferState::FetchingDeltas);
 
     // A bad delta for view 1. It must be the FULL length: the item chain only commits
@@ -1140,20 +1204,17 @@ fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
     assert_ne!(t.state(), TransferState::Exhausted);
 
     // And duplicate deltas likewise.
-    for view in 1..=6u64 {
-        t.on_outcome(
-            &SequenceOutcomeServe {
-                version: SEQUENCE_VERSION,
-                transfer_id: 7,
-                target_head: store.head().clone(),
-                view,
-                outcome: store.outcome_for(view).unwrap().clone(),
-                sender: a,
-            },
-            &a,
-        )
-        .unwrap();
-    }
+    t.on_outcomes(
+        &SequenceOutcomeServe {
+            version: SEQUENCE_VERSION,
+            transfer_id: 7,
+            target_head: store.head().clone(),
+            outcomes: store.outcomes_from(1, 6, 6),
+            sender: a,
+        },
+        &a,
+    )
+    .unwrap();
     let (items, complete) = store.delta_chunk(1, 0, 8).unwrap();
     let delta = SequenceDeltaChunk {
         version: SEQUENCE_VERSION,
