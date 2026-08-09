@@ -111,6 +111,30 @@ pub fn genesis_head(sid: &Digest) -> Digest {
     block::domain_hash(TAG_GENESIS, sid, &[])
 }
 
+/// Full 64-character hex of a head.
+///
+/// NOT `Digest`'s `Display`, which is deliberately truncated to 16 base64 characters for
+/// log readability. A cross-node divergence check compares head IDENTITY, so it must see
+/// every byte -- a truncated head that happens to match would report agreement that does
+/// not exist.
+pub fn head_hex(head: &Digest) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in head.0 {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Leading 8 bytes of a head as a signed integer, so a dashboard can GRAPH divergence
+/// (a Prometheus label cannot be plotted). Lossy on purpose and never authoritative:
+/// `sequence_check.py` compares full hex.
+pub fn head_prefix_i64(head: &Digest) -> i64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&head.0[..8]);
+    i64::from_be_bytes(bytes)
+}
+
 /// §4.3: exactly one record per terminally processed view, including `Skip`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceRecord {

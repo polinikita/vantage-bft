@@ -27,7 +27,7 @@ use crate::vantage::resume::{
     in_flight_state, InFlightEntry, InFlightState, NudgeMemo, ReplayEpisodes, ResumeServe,
     ResumeTrigger, ServeBudget,
 };
-use crate::vantage::sequence::{SequenceOutcome, SequenceStore};
+use crate::vantage::sequence::{head_hex, head_prefix_i64, SequenceOutcome, SequenceStore};
 use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
 use async_trait::async_trait;
@@ -2079,8 +2079,26 @@ impl VantageCore {
                     if boundary_view == view {
                         if let Some(metrics) = &self.metrics {
                             metrics.vantage_sequence_boundary_view.set(view as i64);
+                            // The head must be in the SERIES IDENTITY, not just its
+                            // value: two nodes at the same boundary with different heads
+                            // is precisely the divergence Phase A hunts, and their
+                            // boundary views are identical by construction, so a
+                            // view-only export cannot show it. `reset` keeps one active
+                            // child per process while Prometheus retains the history the
+                            // cross-node comparison reads.
+                            metrics.vantage_sequence_boundary_head.reset();
+                            metrics
+                                .vantage_sequence_boundary_head
+                                .with_label_values(&[&head_hex(&head)])
+                                .set(view as i64);
+                            metrics
+                                .vantage_sequence_boundary_head_lo
+                                .set(head_prefix_i64(&head));
                         }
-                        log::info!("vantage sequence checkpoint: view={view} head={head}");
+                        log::info!(
+                            "vantage sequence checkpoint: view={view} head={}",
+                            head_hex(&head)
+                        );
                     }
                 }
             }

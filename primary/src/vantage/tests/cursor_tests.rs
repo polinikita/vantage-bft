@@ -174,3 +174,103 @@ async fn missing_prefix_wait_then_emit() {
     assert_eq!(cursor.output_log(), &[h1.id.clone(), h2.id.clone()]);
     assert_eq!(cursor.next_view(), 2);
 }
+
+/// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §13: "early core emission plus later full seal
+/// produces one final ordered delta".
+///
+/// The case that makes the per-view delta a `Cursor` FIELD rather than a local. A view
+/// that is completed-but-still-open emits its core prefix `K` immediately and then waits
+/// for the seal, so the view's output arrives across two separate `pump()` calls, split
+/// by an arbitrary amount of wall time. Both halves belong to the same view's delta, in
+/// emission order, and exactly one `SequenceFinalized` must be produced -- at the
+/// terminal advance, never at the earlier core emission.
+///
+/// Getting this wrong is invisible in ordinary output (the same blocks are emitted either
+/// way) but silently corrupts the sequence head: dropping the early core would commit a
+/// delta the fleet does not share, and emitting twice would record view `v` twice and
+/// desynchronize every head above it.
+#[tokio::test]
+async fn early_core_then_terminal_seal_yields_one_ordered_delta() {
+    use crate::vantage::sequence::SequenceOutcome;
+    use crate::vantage::Effect;
+
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (author_b, _) = authors()[1];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_early_core_delta");
+    let chain_a = direct_chain(&mut lm, author_a, 1).await;
+    let chain_b = direct_chain(&mut lm, author_b, 1).await;
+    let mut cursor = new_cursor(&lm);
+
+    let c = vec![block_ref(&chain_a[0])];
+    let t = sorted_manifest(vec![block_ref(&chain_a[0]), block_ref(&chain_b[0])]);
+
+    // Step 1: completed but NOT sealed -- the core prefix is emitted while the view is
+    // still open, and the view must not finalize.
+    let open = cursor.on_completed(1, c.clone(), t.clone());
+    assert!(
+        open.iter()
+            .any(|e| matches!(e, Effect::NotifyCommitted(..))),
+        "the core prefix must be emitted while the view is still open"
+    );
+    assert!(
+        !open
+            .iter()
+            .any(|e| matches!(e, Effect::SequenceFinalized { .. })),
+        "an open view must NOT finalize a sequence record"
+    );
+    assert_eq!(cursor.next_view(), 1, "an open view must not advance");
+    let after_core = cursor.output_log().to_vec();
+    assert_eq!(after_core, vec![chain_a[0].id.clone()]);
+
+    // Step 2: the terminal seal arrives later and contributes the rest of the view.
+    let sealed = cursor.on_sealed(1, Outcome::Full(c.clone(), t.clone()));
+    assert_eq!(cursor.next_view(), 2, "the terminal seal must advance");
+
+    let finals: Vec<_> = sealed
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SequenceFinalized {
+                view,
+                outcome,
+                output_delta,
+            } => Some((*view, outcome.clone(), output_delta.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finals.len(),
+        1,
+        "exactly one record per terminally processed view"
+    );
+    let (view, outcome, delta) = &finals[0];
+    assert_eq!(*view, 1);
+    assert_eq!(
+        *outcome,
+        SequenceOutcome::Full {
+            c: c.clone(),
+            t: t.clone()
+        }
+    );
+
+    // The delta is the WHOLE view's output in emission order -- the early core first,
+    // then what the seal added -- and matches the cursor's own committed log exactly.
+    assert_eq!(
+        delta.as_slice(),
+        cursor.output_log(),
+        "the delta must be the view's full ordered output, early core included"
+    );
+    assert_eq!(
+        delta[0], chain_a[0].id,
+        "the early core block leads the delta"
+    );
+    assert!(
+        delta.len() > after_core.len(),
+        "the seal must contribute blocks beyond the early core"
+    );
+    assert_eq!(
+        delta.iter().collect::<std::collections::HashSet<_>>().len(),
+        delta.len(),
+        "a block emitted while the view was open must not repeat after the seal"
+    );
+}

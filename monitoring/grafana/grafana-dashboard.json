@@ -2570,8 +2570,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "{{node}} sequence head",
-          "expr": "vantage_sequence_head_view{node=~\"$node\"}"
+          "legendFormat": "{{node}} lag",
+          "expr": "(vantage_cursor_next_view{node=~\"$node\"} - 1) - vantage_sequence_head_view{node=~\"$node\"}"
         },
         {
           "datasource": {
@@ -2579,13 +2579,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "{{node}} cursor",
-          "expr": "vantage_cursor_next_view{node=~\"$node\"}"
+          "legendFormat": "worst lag",
+          "expr": "max((vantage_cursor_next_view{node=~\"$node\"} - 1) - vantage_sequence_head_view{node=~\"$node\"})"
         }
       ],
-      "title": "Sequence head vs cursor, per validator",
+      "title": "Sequence head lag behind the cursor (must be 0)",
       "type": "timeseries",
-      "description": "Highest view covered by the local hash-chained sequence log, against the output cursor. The two must track each other: a record is written on every TERMINAL cursor advance, so a persistent gap means views are advancing without being recorded. Phase A is record-only -- nothing here is announced, fetched, or installed, and no live AGB rule is affected. Empty unless `sequence_checkpoints` is on (default off)."
+      "description": "The sequence log covers every TERMINALLY processed view, and the cursor's next_view is the lowest view NOT yet advanced past -- so head_view == cursor_next_view - 1 exactly, and this plots the difference, which must sit at 0. Plotting the two raw series against each other would show a permanent off-by-one and hide a real one-view lag inside it. A persistent nonzero value means views are advancing without being recorded. Empty unless `sequence_checkpoints` is on."
     },
     {
       "datasource": {
@@ -2626,8 +2626,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "highest boundary",
-          "expr": "max(vantage_sequence_boundary_view{node=~\"$node\"})"
+          "legendFormat": "distinct heads at the fleet's highest boundary",
+          "expr": "count(count by (head) (vantage_sequence_boundary_head{node=~\"$node\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\"}))))"
         },
         {
           "datasource": {
@@ -2635,22 +2635,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "lowest boundary",
-          "expr": "min(vantage_sequence_boundary_view{node=~\"$node\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "C",
-          "legendFormat": "spread (views)",
-          "expr": "max(vantage_sequence_boundary_view{node=~\"$node\"}) - min(vantage_sequence_boundary_view{node=~\"$node\"})"
+          "legendFormat": "nodes at that boundary",
+          "expr": "count(vantage_sequence_boundary_head{node=~\"$node\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\"})))"
         }
       ],
-      "title": "Checkpoint boundary spread across validators",
+      "title": "Checkpoint head agreement (DIVERGENCE if > 1)",
       "type": "timeseries",
-      "description": "How far apart validators are in checkpoint boundaries passed. Fixed boundaries every K views exist so that correct parties sitting a few views apart still announce IDENTICAL heads (plan 4.4); this panel shows whether K is small enough that a recovering node finds a recent common anchor, and large spread means stragglers would anchor far behind the fleet."
+      "description": "THE Phase A gate. Series A counts how many DISTINCT heads are reported by the nodes that have reached the fleet's highest boundary. Correct parties that terminally processed the same views must derive the identical head, so this must be exactly 1; 2 or more means two nodes at the SAME height committed different output, which is a release blocker and must be reduced to the first divergent view before anything is announced. Comparing boundary VIEWS cannot detect this -- divergent nodes are at identical heights by construction. Series B is the sample size: series A is only meaningful once B covers most of the committee."
     },
     {
       "datasource": {
@@ -2691,31 +2682,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "records/s",
-          "expr": "sum(rate(vantage_sequence_records_total{node=~\"$node\"}[1m]))"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "B",
-          "legendFormat": "delta digests/s",
-          "expr": "sum(rate(vantage_sequence_delta_digests_total{node=~\"$node\"}[1m]))"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "C",
-          "legendFormat": "committed blocks/s",
-          "expr": "sum(rate(committed_transactions{node=~\"$node\"}[1m]))"
+          "legendFormat": "{{node}}",
+          "expr": "vantage_sequence_boundary_head_lo{node=~\"$node\"}"
         }
       ],
-      "title": "Sequence record and delta rate",
+      "title": "Boundary head per validator (leading 8 bytes)",
       "type": "timeseries",
-      "description": "Records per second is the terminal view rate; delta digests per second is the block output rate as the sequence log sees it. The delta rate is the cross-check: it must match the committed block rate, because a delta is exactly what the cursor emitted while processing that view. A shortfall means blocks are being emitted outside a tracked view and the head would not be reproducible."
+      "description": "The same heads as a plottable number, so divergence is visible as a line that separates from the others while boundary views still match. Lossy (8 of 32 bytes) and NOT authoritative -- `docker-bench/sequence_check.py` compares full hex heads and is what decides the gate. Steps whenever a node passes a new boundary; all validators should step to the same value at the same boundary."
     },
     {
       "datasource": {
@@ -2756,13 +2729,40 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "{{node}} rejected",
-          "expr": "vantage_sequence_record_rejected_total{node=~\"$node\"}"
+          "legendFormat": "records/s",
+          "expr": "sum(rate(vantage_sequence_records_total{node=~\"$node\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "cursor views/s",
+          "expr": "sum(deriv(vantage_cursor_next_view{node=~\"$node\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "C",
+          "legendFormat": "delta blocks/s",
+          "expr": "sum(rate(vantage_sequence_delta_digests_total{node=~\"$node\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "D",
+          "legendFormat": "rejected (total)",
+          "expr": "sum(vantage_sequence_record_rejected_total{node=~\"$node\"})"
         }
       ],
-      "title": "Sequence record rejections (Phase A release blocker)",
+      "title": "Sequence record rate and rejections",
       "type": "timeseries",
-      "description": "Records refused because the cursor finalized a view out of order. This counts a LOCAL invariant violation, never remote input -- Phase A has no remote input at all. Any nonzero value invalidates this node's head and is a release blocker under the plan's Phase A gate: a gap produces a head no other correct party derives, so the run must be reduced to the first divergent view before anything is announced. Flat zero is the only acceptable reading."
+      "description": "Records/s must equal the cursor's own view-advance rate -- one record per terminally processed view, including Skip. Delta blocks/s is the committed BLOCK rate as the sequence log sees it; it is deliberately not compared against committed_transactions, which counts TRANSACTIONS in a different process and differs by the batch fan-out factor. Rejections count a LOCAL invariant violation (a view finalized out of order), never remote input; any nonzero value invalidates this node's head and blocks the phase."
     }
   ],
   "preload": false,

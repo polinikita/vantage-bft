@@ -689,6 +689,19 @@ pub struct Metrics {
     pub vantage_sequence_head_view: IntGauge,
     /// Highest checkpoint boundary this node has passed.
     pub vantage_sequence_boundary_view: IntGauge,
+    /// The boundary HEAD itself, as `{head="<hex>"} = boundary_view`.
+    ///
+    /// Exporting only the boundary VIEW makes the one failure Phase A exists to catch --
+    /// two nodes at the same height with different heads -- completely invisible, since
+    /// the heights match exactly. The head has to be in the series identity, so it goes
+    /// in a label. `reset()` before each set keeps exactly one active child per process,
+    /// while Prometheus retains the historical series that the cross-node comparison
+    /// needs; series churn is one per boundary passed, i.e. `views / K`.
+    pub vantage_sequence_boundary_head: IntGaugeVec,
+    /// The same head truncated to its leading 8 bytes as a signed integer, purely so a
+    /// dashboard can GRAPH divergence (a label cannot be plotted). Not authoritative --
+    /// `sequence_check.py` compares full hex heads; this is for eyeballing.
+    pub vantage_sequence_boundary_head_lo: IntGauge,
     /// Sequence records committed to the local chain -- one per terminally processed
     /// view, including `Skip`.
     pub vantage_sequence_records_total: IntCounter,
@@ -1548,6 +1561,19 @@ impl Metrics {
             vantage_sequence_boundary_view: register_int_gauge_with_registry!(
                 "vantage_sequence_boundary_view",
                 "Highest checkpoint boundary this node has passed",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_boundary_head: register_int_gauge_vec_with_registry!(
+                "vantage_sequence_boundary_head",
+                "Checkpoint boundary head (hex label), valued by its boundary view",
+                &["head"],
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_boundary_head_lo: register_int_gauge_with_registry!(
+                "vantage_sequence_boundary_head_lo",
+                "Leading 8 bytes of the boundary head as a signed integer, for graphing",
                 registry,
             )
             .unwrap(),
