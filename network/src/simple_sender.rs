@@ -221,6 +221,51 @@ impl Connection {
         tokio::time::Instant::now() + self.extra_latency
     }
 
+    /// Wait out `delay` between connect attempts, DRAINING (and discarding) anything
+    /// queued for a peer we are not connected to yet. Returns false if the channel is
+    /// closed and empty -- `SimpleSender` is gone, so this task should exit instead of
+    /// retrying forever.
+    ///
+    /// This is `ReliableSender::run`'s `'waiter` arm minus the durable/volatile split,
+    /// which `SimpleSender` has no concept of: every send here is best-effort by the
+    /// API's own contract ("Try (best-effort) to send"), so everything drained is
+    /// dropped rather than replayed.
+    ///
+    /// NOT OPTIONAL, and the reason is subtle. `self.receiver` stays alive for as long
+    /// as this task retries, so the 100_000-slot channel behind it stays OPEN rather
+    /// than closing the way it did when a failed connect returned outright. A plain
+    /// `sleep` here lets that queue fill; `SimpleSender::send`'s `tx.send(..).await`
+    /// then blocks on a FULL channel instead of failing fast, and since `broadcast`
+    /// walks its addresses sequentially, one unreachable peer stops delivery to every
+    /// other peer. Draining also keeps a reconnect from flushing a whole outage's
+    /// backlog in one burst at a peer that has just come back.
+    ///
+    /// Starfish reaches the same guarantee structurally instead of by draining:
+    /// `network.rs`'s `make_connection` mints fresh per-session channels, so a peer
+    /// that is down has no channel to accumulate into at all.
+    async fn drain_until(&mut self, delay: Duration) -> bool {
+        // `metrics` is cloned out first so the discard arm does not borrow `self`
+        // while `self.receiver.recv()` holds it mutably inside the `select!`.
+        let metrics = self.metrics.clone();
+        let timer = tokio::time::sleep(delay);
+        tokio::pin!(timer);
+        loop {
+            tokio::select! {
+                () = &mut timer => return true,
+                message = self.receiver.recv() => match message {
+                    Some(_discarded) => {
+                        if let Some(metrics) = &metrics {
+                            metrics.network_connect_wait_discarded_total.inc();
+                        }
+                    }
+                    // Closed AND drained: `recv` yields buffered messages first and
+                    // only then `None`, so this cannot cut a pending queue short.
+                    None => return false,
+                },
+            }
+        }
+    }
+
     async fn connect(&mut self) -> Option<TcpStream> {
         let mut delay = STARTUP_RETRY_DELAY_MS;
         let mut retry = 0;
@@ -237,10 +282,9 @@ impl Connection {
                 }
                 Err(e) => {
                     warn!("{}", NetworkError::FailedToConnect(self.address, retry, e));
-                    if self.receiver.is_closed() {
+                    if !self.drain_until(Duration::from_millis(delay)).await {
                         return None;
                     }
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
                     delay = min(2 * delay, STARTUP_RETRY_BACKOFF_MAX_MS);
                     retry += 1;
                 }

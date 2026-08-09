@@ -679,6 +679,13 @@ pub struct Metrics {
     /// Prometheus target already separates primary and worker processes; this label
     /// separates the listeners inside a process.
     pub network_connections: IntGaugeVec,
+    /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
+    /// addressed to a peer we have not managed to connect to yet. Best-effort sends
+    /// are allowed to vanish, but they must not vanish SILENTLY: this is the only
+    /// signal distinguishing "the link is down and we are shedding" from "the link is
+    /// fine and the peer is ignoring us". Sustained growth against one peer means that
+    /// peer has been unreachable for a while.
+    pub network_connect_wait_discarded_total: IntCounter,
 
     // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
     /// Transactions the worker's `BatchMaker` received from a client, before batching
@@ -1502,6 +1509,12 @@ impl Metrics {
                 "network_connections",
                 "Currently-open inbound TCP connections by listener role",
                 &["listener"],
+                registry,
+            )
+            .unwrap(),
+            network_connect_wait_discarded_total: register_int_counter_with_registry!(
+                "network_connect_wait_discarded_total",
+                "SimpleSender frames discarded while waiting out a connect backoff",
                 registry,
             )
             .unwrap(),
