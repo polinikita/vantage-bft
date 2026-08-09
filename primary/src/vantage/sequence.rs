@@ -1100,7 +1100,22 @@ impl SequenceTransfer {
         {
             return Ok(());
         }
-        match self.chain.absorb_records(&chunk.records) {
+        // Concurrent sources answer the SAME request, so duplicate valid chunks are
+        // normal and MUST be idempotent (section 6). Trim what we already absorbed
+        // before verifying: without this the second and third copies present as
+        // `UnexpectedView`, get charged as corrupt, and retire every honest source --
+        // measured on a live cluster as 29 transfers started, 0 verified, 28 exhausted.
+        let already = self.chain.next_view();
+        let fresh: Vec<SequenceRecord> = chunk
+            .records
+            .iter()
+            .filter(|r| r.view >= already)
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        match self.chain.absorb_records(&fresh) {
             Ok(complete) => {
                 if complete {
                     self.state = TransferState::FetchingOutcomes;
@@ -1156,6 +1171,17 @@ impl SequenceTransfer {
             // corrupt chain, just unsolicited -- ignore without penalty.
             return Ok(());
         };
+        // Same idempotence rule as records: a duplicate copy of a view we already
+        // finished, or of a chunk already absorbed, is a normal consequence of asking
+        // several sources at once and must not be charged as invalid.
+        if self.deltas.contains_key(&chunk.view) {
+            return Ok(());
+        }
+        if let Some((view, verifier)) = self.delta_in_flight.as_ref() {
+            if *view == chunk.view && chunk.start_index < verifier.next_index() {
+                return Ok(());
+            }
+        }
         if self.delta_in_flight.as_ref().map(|(v, _)| *v) != Some(chunk.view) {
             self.delta_in_flight = Some((
                 chunk.view,

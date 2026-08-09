@@ -1099,3 +1099,74 @@ fn a_corrupt_delta_chunk_restarts_that_view() {
         "a poisoned delta must restart at index 0, not resume mid-stream"
     );
 }
+
+/// Concurrent sources answer the SAME request, so duplicate valid responses are normal
+/// and must be idempotent. Charging them as corrupt retires every honest source: measured
+/// live as 29 transfers started, 0 verified, 28 exhausted.
+#[test]
+fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
+    let (store, sid) = populated_store(6);
+    let keys = authors();
+    let (a, _) = keys[0];
+    let (b, _) = keys[1];
+    let mut t = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        6,
+        store.head().clone(),
+        vec![a, b],
+    );
+    let chunk = SequenceRecordChunk {
+        version: SEQUENCE_VERSION,
+        transfer_id: 7,
+        target_head: store.head().clone(),
+        records: store.records_from(1, 6),
+        serve_floor: 1,
+        sender: a,
+    };
+    t.on_records(&chunk, &a).expect("first copy verifies");
+    assert_eq!(t.state(), TransferState::FetchingOutcomes);
+
+    // The other source's identical copy must be a no-op, not an invalid chunk.
+    t.on_records(&chunk, &b)
+        .expect("the duplicate must not be an error");
+    assert_eq!(
+        t.next_sources(3).len(),
+        2,
+        "no source may be penalized for a duplicate"
+    );
+    assert_ne!(t.state(), TransferState::Exhausted);
+
+    // And duplicate deltas likewise.
+    for view in 1..=6u64 {
+        t.on_outcome(
+            &SequenceOutcomeServe {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                view,
+                outcome: store.outcome_for(view).unwrap().clone(),
+                sender: a,
+            },
+            &a,
+        )
+        .unwrap();
+    }
+    let (items, complete) = store.delta_chunk(1, 0, 8).unwrap();
+    let delta = SequenceDeltaChunk {
+        version: SEQUENCE_VERSION,
+        transfer_id: 7,
+        target_head: store.head().clone(),
+        view: 1,
+        start_index: 0,
+        items,
+        complete,
+        sender: a,
+    };
+    t.on_delta(&delta, &a).expect("first copy");
+    t.on_delta(&delta, &b)
+        .expect("duplicate delta must not be an error");
+    assert_eq!(t.next_sources(3).len(), 2, "still no source penalized");
+}
