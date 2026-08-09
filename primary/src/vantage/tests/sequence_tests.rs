@@ -268,3 +268,252 @@ fn zero_interval_makes_every_view_a_boundary() {
     store.record(1, &SequenceOutcome::Skip, &[]).unwrap();
     assert!(store.boundary(1).is_some());
 }
+
+// ------------------------------------------------------------ f+1 checkpoint collector
+
+fn announcement(view: u64, head: Digest, sender: crypto::PublicKey) -> SequenceAnnouncement {
+    SequenceAnnouncement {
+        version: SEQUENCE_VERSION,
+        view,
+        head,
+        serve_floor: 1,
+        sender,
+    }
+}
+
+fn counted(outcome: AnnouncementOutcome) -> bool {
+    matches!(outcome, AnnouncementOutcome::Counted { .. })
+}
+
+fn certified(outcome: AnnouncementOutcome) -> bool {
+    matches!(
+        outcome,
+        AnnouncementOutcome::Counted {
+            newly_certified: true
+        }
+    )
+}
+
+/// The core of the safety argument: `f+1` distinct first-hand senders certify, `f` do
+/// not. For n = 3f+1 any f+1 parties contain a correct one; at f the set can be entirely
+/// Byzantine and the head may name output no correct party ever produced.
+#[test]
+fn exactly_f_plus_one_matching_announcements_certify() {
+    let keys = authors();
+    let head = digest(1);
+    let mut collector = CheckpointCollector::new(3, 16, 1000); // f+1 = 3
+
+    for (index, (sender, _)) in keys.iter().take(2).enumerate() {
+        let outcome =
+            collector.on_announcement(&announcement(100, head.clone(), *sender), sender, true, 100);
+        assert!(counted(outcome), "announcement {index} must count");
+        assert!(!certified(outcome), "f announcements must NOT certify");
+    }
+    assert_eq!(collector.support(100, &head), 2);
+    assert_eq!(collector.certified_head(0), None, "f must not certify");
+
+    let (third, _) = keys[2];
+    assert!(
+        certified(collector.on_announcement(
+            &announcement(100, head.clone(), third),
+            &third,
+            true,
+            100
+        )),
+        "the f+1'th distinct sender must certify"
+    );
+    assert_eq!(collector.certified_head(0), Some((100, head.clone())));
+    assert_eq!(collector.support(100, &head), 3);
+
+    // Certification fires exactly once for a (view, head).
+    let (fourth, _) = keys[3];
+    let again = collector.on_announcement(&announcement(100, head, fourth), &fourth, true, 100);
+    assert!(counted(again));
+    assert!(!certified(again), "certification must be reported once");
+}
+
+/// The payload's `sender` field is decoration; the connection is authoritative. If a
+/// forged `sender` were honoured, one Byzantine peer could mint all f+1 announcements by
+/// itself and the whole rule collapses.
+#[test]
+fn a_forged_sender_field_never_counts() {
+    let keys = authors();
+    let (real, _) = keys[0];
+    let (claimed, _) = keys[1];
+    let mut collector = CheckpointCollector::new(1, 16, 1000);
+
+    let forged = announcement(100, digest(1), claimed);
+    assert_eq!(
+        collector.on_announcement(&forged, &real, true, 100),
+        AnnouncementOutcome::Ignored(IgnoreReason::SenderMismatch)
+    );
+    assert_eq!(collector.certified_head(0), None);
+
+    let outsider = announcement(100, digest(1), real);
+    assert_eq!(
+        collector.on_announcement(&outsider, &real, false, 100),
+        AnnouncementOutcome::Ignored(IgnoreReason::NotAMember),
+        "a non-member cannot be one of the f+1"
+    );
+}
+
+/// One sender must never supply two of the `f+1`. Repeating the SAME claim is harmless
+/// and counts once; announcing a DIFFERENT head for the same view discards both, since we
+/// cannot tell which (if either) is honest.
+#[test]
+fn duplicates_count_once_and_equivocation_counts_never() {
+    let keys = authors();
+    let (a, _) = keys[0];
+    let (b, _) = keys[1];
+    let mut collector = CheckpointCollector::new(2, 16, 1000);
+
+    assert!(counted(collector.on_announcement(
+        &announcement(100, digest(1), a),
+        &a,
+        true,
+        100
+    )));
+    assert_eq!(
+        collector.on_announcement(&announcement(100, digest(1), a), &a, true, 100),
+        AnnouncementOutcome::Ignored(IgnoreReason::Duplicate)
+    );
+    assert_eq!(
+        collector.support(100, &digest(1)),
+        1,
+        "a repeat must not add support"
+    );
+    assert_eq!(
+        collector.certified_head(0),
+        None,
+        "a duplicate must not certify"
+    );
+
+    // Same sender, different head for the same view.
+    assert_eq!(
+        collector.on_announcement(&announcement(100, digest(2), a), &a, true, 100),
+        AnnouncementOutcome::Ignored(IgnoreReason::Equivocation)
+    );
+    assert_eq!(collector.equivocator_count(), 1);
+    assert_eq!(
+        collector.support(100, &digest(1)),
+        0,
+        "an equivocator's earlier vote must be retracted, not left standing"
+    );
+    // Anything further from that sender is dead, including a later honest-looking claim.
+    assert_eq!(
+        collector.on_announcement(&announcement(101, digest(1), a), &a, true, 101),
+        AnnouncementOutcome::Ignored(IgnoreReason::Equivocation)
+    );
+    // An honest sender is unaffected.
+    assert!(counted(collector.on_announcement(
+        &announcement(100, digest(1), b),
+        &b,
+        true,
+        100
+    )));
+    assert_eq!(collector.support(100, &digest(1)), 1);
+}
+
+/// An equivocation discovered AFTER a head reached the threshold must take certification
+/// back: the head would otherwise rest on f+1 senders one of which supplied a second,
+/// contradictory claim, so the "at least one correct" guarantee no longer holds.
+#[test]
+fn equivocation_after_certification_retracts_it() {
+    let keys = authors();
+    let (a, _) = keys[0];
+    let (b, _) = keys[1];
+    let mut collector = CheckpointCollector::new(2, 16, 1000);
+
+    collector.on_announcement(&announcement(100, digest(1), a), &a, true, 100);
+    assert!(certified(collector.on_announcement(
+        &announcement(100, digest(1), b),
+        &b,
+        true,
+        100
+    )));
+    assert_eq!(collector.certified_head(0), Some((100, digest(1))));
+
+    collector.on_announcement(&announcement(100, digest(9), b), &b, true, 100);
+    assert_eq!(
+        collector.certified_head(0),
+        None,
+        "certification must not survive its supporter equivocating"
+    );
+}
+
+/// Competing heads for one view must be counted separately -- f Byzantine parties
+/// announcing a fabricated head must never reach the threshold on it while the correct
+/// nodes announce another.
+#[test]
+fn a_minority_head_never_certifies_alongside_the_real_one() {
+    // The test committee is n=4, so f=1 and the threshold is f+1=2.
+    let keys = authors();
+    let mut collector = CheckpointCollector::new(2, 16, 1000);
+    let (real, fake) = (digest(1), digest(2));
+
+    // The f = 1 Byzantine party pushes a fabricated head.
+    let (liar, _) = keys[0];
+    collector.on_announcement(&announcement(100, fake.clone(), liar), &liar, true, 100);
+    // The remaining correct parties announce the real one.
+    for (sender, _) in keys.iter().skip(1) {
+        collector.on_announcement(&announcement(100, real.clone(), *sender), sender, true, 100);
+    }
+    assert_eq!(collector.support(100, &fake), 1, "the fake stays below f+1");
+    assert_eq!(collector.support(100, &real), 3);
+    assert_eq!(collector.certified_head(0), Some((100, real)));
+}
+
+/// Byzantine peers must not be able to grow memory without bound by announcing arbitrary
+/// future boundaries.
+#[test]
+fn future_views_and_candidate_count_are_bounded() {
+    let keys = authors();
+    let (a, _) = keys[0];
+    let mut collector = CheckpointCollector::new(2, 4, 500);
+
+    assert_eq!(
+        collector.on_announcement(&announcement(10_000, digest(1), a), &a, true, 100),
+        AnnouncementOutcome::Ignored(IgnoreReason::TooFarAhead)
+    );
+
+    for view in 1..=20u64 {
+        collector.on_announcement(&announcement(view, digest(view as u8), a), &a, true, 100);
+    }
+    assert!(
+        collector.candidate_view_count() <= 4,
+        "retained candidate boundaries must respect the cap, got {}",
+        collector.candidate_view_count()
+    );
+}
+
+/// The requester needs the matching announcer set as its source list, and picks the
+/// highest certified target above what it already holds.
+#[test]
+fn announcers_and_highest_target_above_local() {
+    let keys = authors();
+    let mut collector = CheckpointCollector::new(2, 16, 1000);
+    for view in [100u64, 200] {
+        for (sender, _) in keys.iter().take(2) {
+            collector.on_announcement(
+                &announcement(view, digest(view as u8), *sender),
+                sender,
+                true,
+                250,
+            );
+        }
+    }
+    assert_eq!(
+        collector.certified_head(0),
+        Some((200, digest(200u64 as u8)))
+    );
+    assert_eq!(
+        collector.certified_head(200),
+        None,
+        "a target must be strictly above the local head"
+    );
+    let mut sources = collector.announcers(100, &digest(100u64 as u8));
+    sources.sort();
+    let mut expected: Vec<_> = keys.iter().take(2).map(|(k, _)| *k).collect();
+    expected.sort();
+    assert_eq!(sources, expected);
+}

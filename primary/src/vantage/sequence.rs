@@ -16,9 +16,9 @@
 use crate::primary::View;
 use crate::vantage::agb::{Manifest, Outcome};
 use crate::vantage::block;
-use crypto::Digest;
+use crypto::{Digest, PublicKey};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Wire/format version of every object in this module. Bumped as a unit: a record's
 /// version is covered by its own hash, so two versions can never collide into the same
@@ -275,5 +275,229 @@ impl SequenceStore {
             self.boundaries.insert(view, self.head.clone());
         }
         Ok(&self.head)
+    }
+}
+
+// ---------------------------------------------------------------- checkpoint collector
+
+/// §4.4: a first-hand claim that the sender's own terminal output through `view` has head
+/// `head`, and that it can serve state back to `serve_floor`.
+///
+/// NOT a certificate and never forwarded as evidence. It counts only when received
+/// first-hand over an authenticated channel from its encoded sender, so a third party
+/// must collect its own `f+1`. `serve_floor` is informational and cannot strengthen the
+/// claim -- a lying floor costs the requester one failed transfer, not safety.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceAnnouncement {
+    pub version: u16,
+    pub view: View,
+    pub head: Digest,
+    pub serve_floor: View,
+    pub sender: PublicKey,
+}
+
+/// Why an announcement did not count. Every variant is remote input, so all of them are
+/// ordinary operation rather than local invariant violations -- none may panic or abort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IgnoreReason {
+    /// The encoded `sender` differs from the authenticated connection's identity. The
+    /// authoritative identity is ALWAYS the connection, exactly as on Vantage's other
+    /// first-hand paths; accepting the payload's own claim would make announcements
+    /// forgeable and destroy the `f+1` argument outright.
+    SenderMismatch,
+    /// Not a committee member, so it cannot be one of the `f+1`.
+    NotAMember,
+    /// Unknown object version.
+    Version,
+    /// Same `(view, head)` from a sender already counted for that view. Counted once.
+    Duplicate,
+    /// A DIFFERENT head from a sender that already announced this view. Recorded and
+    /// never counted -- for either head. A Byzantine party that could have both of its
+    /// announcements counted would need only `(f+1)/2` accomplices.
+    Equivocation,
+    /// Too far above anything the fleet is plausibly at; bounds unbounded future-view
+    /// memory from a Byzantine peer.
+    TooFarAhead,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnouncementOutcome {
+    /// Counted toward `(view, head)`. `newly_certified` is true on the announcement that
+    /// pushed it to `f+1` -- exactly once per `(view, head)`.
+    Counted {
+        newly_certified: bool,
+    },
+    Ignored(IgnoreReason),
+}
+
+/// §7.1's head collector: the `f+1` matching first-hand rule.
+///
+/// For `n = 3f+1`, any `f+1` distinct parties contain at least one correct party. A
+/// correct party announces `(v, H_v)` only for output it actually, terminally sequenced
+/// and can still serve, so `f+1` identical first-hand announcements mean at least one
+/// correct party holds exactly that prefix. The rule is LOCAL: these messages are not a
+/// transferable certificate.
+pub struct CheckpointCollector {
+    threshold: usize,
+    max_candidate_views: usize,
+    future_view_slack: View,
+    /// view -> head -> distinct senders that announced it first-hand.
+    candidates: BTreeMap<View, BTreeMap<Digest, BTreeSet<PublicKey>>>,
+    /// (view, sender) -> the FIRST head that sender announced for that view.
+    first_claim: BTreeMap<(View, PublicKey), Digest>,
+    equivocators: BTreeSet<PublicKey>,
+    certified: BTreeMap<View, Digest>,
+}
+
+impl CheckpointCollector {
+    /// `threshold` is `f+1`. Derived by the caller from the committee so this type stays
+    /// free of committee plumbing and is trivially testable at any `f`.
+    pub fn new(threshold: usize, max_candidate_views: usize, future_view_slack: View) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            max_candidate_views: max_candidate_views.max(1),
+            future_view_slack,
+            candidates: BTreeMap::new(),
+            first_claim: BTreeMap::new(),
+            equivocators: BTreeSet::new(),
+            certified: BTreeMap::new(),
+        }
+    }
+
+    /// Count one announcement.
+    ///
+    /// `authenticated_sender` comes from the connection, never from the payload.
+    /// `local_view` is roughly where this node believes the fleet is; it only bounds
+    /// future-view memory and can be stale without affecting safety.
+    pub fn on_announcement(
+        &mut self,
+        announcement: &SequenceAnnouncement,
+        authenticated_sender: &PublicKey,
+        is_member: bool,
+        local_view: View,
+    ) -> AnnouncementOutcome {
+        if announcement.version != SEQUENCE_VERSION {
+            return AnnouncementOutcome::Ignored(IgnoreReason::Version);
+        }
+        if &announcement.sender != authenticated_sender {
+            return AnnouncementOutcome::Ignored(IgnoreReason::SenderMismatch);
+        }
+        if !is_member {
+            return AnnouncementOutcome::Ignored(IgnoreReason::NotAMember);
+        }
+        if announcement.view > local_view.saturating_add(self.future_view_slack) {
+            return AnnouncementOutcome::Ignored(IgnoreReason::TooFarAhead);
+        }
+
+        let key = (announcement.view, *authenticated_sender);
+        match self.first_claim.get(&key) {
+            Some(previous) if previous == &announcement.head => {
+                return AnnouncementOutcome::Ignored(IgnoreReason::Duplicate);
+            }
+            Some(_) => {
+                // A second, different head for the same view from the same sender. Both
+                // are now worthless: we cannot tell which (if either) is honest, and
+                // counting either would let one Byzantine party supply two of the f+1.
+                self.equivocators.insert(*authenticated_sender);
+                self.retract(announcement.view, authenticated_sender);
+                return AnnouncementOutcome::Ignored(IgnoreReason::Equivocation);
+            }
+            None => {}
+        }
+        if self.equivocators.contains(authenticated_sender) {
+            return AnnouncementOutcome::Ignored(IgnoreReason::Equivocation);
+        }
+
+        self.first_claim.insert(key, announcement.head.clone());
+        let senders = self
+            .candidates
+            .entry(announcement.view)
+            .or_default()
+            .entry(announcement.head.clone())
+            .or_default();
+        senders.insert(*authenticated_sender);
+        let reached = senders.len() >= self.threshold;
+        self.evict_if_needed();
+
+        let newly_certified = reached
+            && self
+                .certified
+                .insert(announcement.view, announcement.head.clone())
+                .is_none();
+        AnnouncementOutcome::Counted { newly_certified }
+    }
+
+    /// Remove an equivocator's vote for `view` from every head it may have reached.
+    ///
+    /// Retraction can take a candidate back BELOW threshold, but a `(view, head)` already
+    /// promoted to `certified` is deliberately left alone: it was certified by `f+1`
+    /// DISTINCT senders, so even discounting this one entirely, `f` remain and at least
+    /// one of those was correct only if the threshold still holds. Certification is
+    /// therefore re-derived rather than assumed -- see `certified_head`.
+    fn retract(&mut self, view: View, sender: &PublicKey) {
+        if let Some(heads) = self.candidates.get_mut(&view) {
+            for senders in heads.values_mut() {
+                senders.remove(sender);
+            }
+            heads.retain(|_, senders| !senders.is_empty());
+        }
+        if let Some(head) = self.certified.get(&view).cloned() {
+            let still = self
+                .candidates
+                .get(&view)
+                .and_then(|heads| heads.get(&head))
+                .map(|senders| senders.len())
+                .unwrap_or(0);
+            if still < self.threshold {
+                self.certified.remove(&view);
+            }
+        }
+    }
+
+    /// Bound retained candidate boundaries. Evicts the LOWEST views: the target is always
+    /// the highest certified head above the local one, so old candidates are dead weight.
+    fn evict_if_needed(&mut self) {
+        while self.candidates.len() > self.max_candidate_views {
+            let Some((&lowest, _)) = self.candidates.iter().next() else {
+                break;
+            };
+            self.candidates.remove(&lowest);
+            self.first_claim.retain(|(view, _), _| *view != lowest);
+        }
+    }
+
+    /// The highest certified `(view, head)` strictly above `above`, if any.
+    pub fn certified_head(&self, above: View) -> Option<(View, Digest)> {
+        self.certified
+            .iter()
+            .rev()
+            .find(|(view, _)| **view > above)
+            .map(|(view, head)| (*view, head.clone()))
+    }
+
+    /// Distinct senders that announced this exact `(view, head)` first-hand.
+    pub fn support(&self, view: View, head: &Digest) -> usize {
+        self.candidates
+            .get(&view)
+            .and_then(|heads| heads.get(head))
+            .map(|senders| senders.len())
+            .unwrap_or(0)
+    }
+
+    /// Matching announcers for a certified target -- the source set §7.2 requests from.
+    pub fn announcers(&self, view: View, head: &Digest) -> Vec<PublicKey> {
+        self.candidates
+            .get(&view)
+            .and_then(|heads| heads.get(head))
+            .map(|senders| senders.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn equivocator_count(&self) -> usize {
+        self.equivocators.len()
+    }
+
+    pub fn candidate_view_count(&self) -> usize {
+        self.candidates.len()
     }
 }
