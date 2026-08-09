@@ -754,3 +754,348 @@ fn records_from_stops_at_a_gap() {
     assert!(store.records_from(9, 4).is_empty());
     assert_eq!(store.records_from(1, 2).len(), 2, "max is respected");
 }
+
+// ------------------------------------------------------------------ requester transfers
+
+/// Drive a transfer to completion against an honest store, the way `VantageCore` will.
+fn run_transfer(
+    store: &SequenceStore,
+    sid: &Digest,
+    target_view: u64,
+    sources: Vec<crypto::PublicKey>,
+    serve_from: &crypto::PublicKey,
+) -> SequenceTransfer {
+    let mut t = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(sid),
+        target_view,
+        store.head().clone(),
+        sources,
+    );
+    for _ in 0..1000 {
+        let Some(want) = t.want() else { break };
+        match want {
+            SequenceWant::Records { from_view } => {
+                t.on_records(
+                    &SequenceRecordChunk {
+                        version: SEQUENCE_VERSION,
+                        transfer_id: 7,
+                        target_head: store.head().clone(),
+                        records: store.records_from(from_view, 3),
+                        serve_floor: store.serve_floor(),
+                        sender: *serve_from,
+                    },
+                    serve_from,
+                )
+                .expect("honest records verify");
+            }
+            SequenceWant::Outcome { view } => {
+                t.on_outcome(
+                    &SequenceOutcomeServe {
+                        version: SEQUENCE_VERSION,
+                        transfer_id: 7,
+                        target_head: store.head().clone(),
+                        view,
+                        outcome: store.outcome_for(view).expect("retained").clone(),
+                        sender: *serve_from,
+                    },
+                    serve_from,
+                )
+                .expect("honest outcome verifies");
+            }
+            SequenceWant::Delta { view, start_index } => {
+                let (items, complete) = store.delta_chunk(view, start_index, 2).expect("retained");
+                t.on_delta(
+                    &SequenceDeltaChunk {
+                        version: SEQUENCE_VERSION,
+                        transfer_id: 7,
+                        target_head: store.head().clone(),
+                        view,
+                        start_index,
+                        items,
+                        complete,
+                        sender: *serve_from,
+                    },
+                    serve_from,
+                )
+                .expect("honest delta verifies");
+            }
+        }
+    }
+    t
+}
+
+/// The end-to-end Phase B path: records, then outcomes, then deltas, all verified
+/// against the certified head, ending at Verified and never installing.
+#[test]
+fn a_transfer_downloads_and_verifies_a_whole_target() {
+    let (store, sid) = populated_store(9);
+    let keys = authors();
+    let (source, _) = keys[0];
+
+    let t = run_transfer(&store, &sid, 9, vec![source], &source);
+    assert_eq!(t.state(), TransferState::Verified);
+
+    let output = t.verified_output().expect("verified");
+    assert_eq!(
+        output.len(),
+        9,
+        "every view in the target range is verified"
+    );
+    // Views 3, 6 and 9 are Skips in the fixture and must carry no output.
+    for (view, outcome, delta) in output {
+        if matches!(outcome, SequenceOutcome::Skip) {
+            assert!(
+                delta.is_empty(),
+                "view {view} is a Skip and must have no delta"
+            );
+        } else {
+            assert_eq!(delta.len(), 3, "view {view} delta");
+        }
+    }
+}
+
+/// The liveness property the concurrent-source design exists for: `f` matching announcers
+/// may corrupt or refuse everything, and the one correct announcer still completes it.
+#[test]
+fn f_byzantine_sources_cannot_stop_the_one_correct_one() {
+    let (store, sid) = populated_store(6);
+    let keys = authors();
+    let (liar, _) = keys[0];
+    let (silent, _) = keys[1];
+    let (honest, _) = keys[2];
+
+    let mut t = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        6,
+        store.head().clone(),
+        vec![liar, silent, honest],
+    );
+    assert_eq!(
+        t.next_sources(3).len(),
+        3,
+        "all matching announcers are asked at once"
+    );
+
+    // The liar serves a well-formed but wrong chain twice and spends its budget.
+    let mut fake = SequenceStore::new(sid.clone(), 4);
+    for view in 1..=6u64 {
+        fake.record(view, &SequenceOutcome::Skip, &[]).unwrap();
+    }
+    for _ in 0..2 {
+        let _ = t.on_records(
+            &SequenceRecordChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                records: fake.records_from(1, 6),
+                serve_floor: 1,
+                sender: liar,
+            },
+            &liar,
+        );
+    }
+    assert!(
+        !t.next_sources(3).contains(&liar),
+        "a twice-invalid source is dropped"
+    );
+
+    // The silent one simply never answers; it is rotated past on timeout.
+    t.rotate();
+
+    // The honest one completes the transfer.
+    let finished = run_transfer(&store, &sid, 6, vec![honest], &honest);
+    assert_eq!(finished.state(), TransferState::Verified);
+}
+
+/// A response must be bound to the transfer AND the target, or a stale answer from an
+/// earlier target could be folded into the current one.
+#[test]
+fn responses_not_bound_to_this_transfer_are_ignored() {
+    let (store, sid) = populated_store(4);
+    let keys = authors();
+    let (source, _) = keys[0];
+    let (stranger, _) = keys[3];
+
+    let mut t = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        4,
+        store.head().clone(),
+        vec![source],
+    );
+    let good = SequenceRecordChunk {
+        version: SEQUENCE_VERSION,
+        transfer_id: 7,
+        target_head: store.head().clone(),
+        records: store.records_from(1, 4),
+        serve_floor: 1,
+        sender: source,
+    };
+
+    // Wrong transfer id.
+    let mut wrong_id = good.clone();
+    wrong_id.transfer_id = 8;
+    t.on_records(&wrong_id, &source).unwrap();
+    assert_eq!(
+        t.want(),
+        Some(SequenceWant::Records { from_view: 1 }),
+        "ignored"
+    );
+
+    // Wrong target head.
+    let mut wrong_head = good.clone();
+    wrong_head.target_head = digest(0xEE);
+    t.on_records(&wrong_head, &source).unwrap();
+    assert_eq!(
+        t.want(),
+        Some(SequenceWant::Records { from_view: 1 }),
+        "ignored"
+    );
+
+    // A peer that is not a matching announcer.
+    t.on_records(&good, &stranger).unwrap();
+    assert_eq!(
+        t.want(),
+        Some(SequenceWant::Records { from_view: 1 }),
+        "ignored"
+    );
+
+    // The real one is accepted.
+    t.on_records(&good, &source).unwrap();
+    assert_eq!(t.state(), TransferState::FetchingOutcomes);
+}
+
+/// Section 9: "cannot serve" is a fact about the SOURCE, not the target. Matching
+/// announcers legitimately sit at different serve floors.
+#[test]
+fn unavailable_drops_only_that_source() {
+    let (store, sid) = populated_store(4);
+    let keys = authors();
+    let (low, _) = keys[0];
+    let (ok, _) = keys[1];
+
+    let mut t = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        4,
+        store.head().clone(),
+        vec![low, ok],
+    );
+    t.on_unavailable(
+        &SequenceUnavailable {
+            version: SEQUENCE_VERSION,
+            transfer_id: 7,
+            target_head: store.head().clone(),
+            serve_floor: 900,
+            sender: low,
+        },
+        &low,
+    );
+    let sources = t.next_sources(3);
+    assert!(!sources.contains(&low));
+    assert!(
+        sources.contains(&ok),
+        "the transfer continues against the rest"
+    );
+    assert_ne!(t.state(), TransferState::Exhausted);
+
+    // When the last source goes too, the target is unreachable and says so rather than
+    // hanging forever.
+    t.on_unavailable(
+        &SequenceUnavailable {
+            version: SEQUENCE_VERSION,
+            transfer_id: 7,
+            target_head: store.head().clone(),
+            serve_floor: 900,
+            sender: ok,
+        },
+        &ok,
+    );
+    assert_eq!(t.state(), TransferState::Exhausted);
+    assert_eq!(t.want(), None);
+}
+
+/// A corrupt delta chunk must not strand its view at a poisoned offset: the next source
+/// restarts that delta from index 0.
+#[test]
+fn a_corrupt_delta_chunk_restarts_that_view() {
+    let (store, sid) = populated_store(3);
+    let keys = authors();
+    let (source, _) = keys[0];
+    let mut t = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        3,
+        store.head().clone(),
+        vec![source],
+    );
+    // Records then outcomes.
+    t.on_records(
+        &SequenceRecordChunk {
+            version: SEQUENCE_VERSION,
+            transfer_id: 7,
+            target_head: store.head().clone(),
+            records: store.records_from(1, 3),
+            serve_floor: 1,
+            sender: source,
+        },
+        &source,
+    )
+    .unwrap();
+    for view in 1..=3u64 {
+        t.on_outcome(
+            &SequenceOutcomeServe {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                view,
+                outcome: store.outcome_for(view).unwrap().clone(),
+                sender: source,
+            },
+            &source,
+        )
+        .unwrap();
+    }
+    assert_eq!(t.state(), TransferState::FetchingDeltas);
+
+    // A bad delta for view 1. It must be the FULL length: the item chain only commits
+    // at its end, so a short chunk of wrong content is indistinguishable from an honest
+    // partial one until the delta completes. That is inherent to streaming verification
+    // -- the cost is bounded by delta_len, and the head still catches it.
+    let bad: Vec<Digest> = (0..3).map(|i| digest(240 + i)).collect();
+    assert!(t
+        .on_delta(
+            &SequenceDeltaChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                view: 1,
+                start_index: 0,
+                items: bad,
+                complete: true,
+                sender: source,
+            },
+            &source
+        )
+        .is_err());
+    assert_eq!(
+        t.want(),
+        Some(SequenceWant::Delta {
+            view: 1,
+            start_index: 0
+        }),
+        "a poisoned delta must restart at index 0, not resume mid-stream"
+    );
+}

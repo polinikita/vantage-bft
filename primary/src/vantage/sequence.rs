@@ -881,3 +881,328 @@ impl DeltaVerifier {
         Ok(complete)
     }
 }
+
+// ------------------------------------------------------------------ requester (7.1-7.3)
+
+/// What the requester wants next. `VantageCore` turns one of these into a wire message
+/// per source; the transfer itself never touches the network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SequenceWant {
+    Records { from_view: View },
+    Outcome { view: View },
+    Delta { view: View, start_index: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferState {
+    FetchingRecords,
+    FetchingOutcomes,
+    FetchingDeltas,
+    /// Phase B's terminal state: the whole target is downloaded and verified. Phase C
+    /// installs from here; Phase B deliberately stops.
+    Verified,
+    /// Every matching announcer was dropped. The target cannot be completed from this
+    /// source set; the collector must certify a newer one.
+    Exhausted,
+}
+
+/// Two invalid responses for one target and a source is done: `f` of the `f+1` matching
+/// announcers may be Byzantine, so a source that has now twice failed to produce
+/// verifying bytes is not worth further requests. One is tolerated because a single
+/// mismatch can also be a stale or truncated honest answer.
+const MAX_INVALID_PER_SOURCE: usize = 2;
+
+/// Section 7: one installation target at a time, downloaded and verified from the set of
+/// matching announcers.
+pub struct SequenceTransfer {
+    sid: Digest,
+    transfer_id: u64,
+    target_view: View,
+    target_head: Digest,
+    /// Matching announcers still worth asking.
+    sources: Vec<PublicKey>,
+    /// Rotates so a timeout fails over to the NEXT source, never the same one.
+    cursor: usize,
+    invalid: BTreeMap<PublicKey, usize>,
+    chain: ChainVerifier,
+    outcomes: BTreeMap<View, SequenceOutcome>,
+    deltas: BTreeMap<View, Vec<Digest>>,
+    delta_in_flight: Option<(View, DeltaVerifier)>,
+    state: TransferState,
+}
+
+impl SequenceTransfer {
+    pub fn new(
+        sid: Digest,
+        transfer_id: u64,
+        base_view: View,
+        base_head: Digest,
+        target_view: View,
+        target_head: Digest,
+        sources: Vec<PublicKey>,
+    ) -> Self {
+        let chain = ChainVerifier::new(
+            sid.clone(),
+            base_view,
+            base_head,
+            target_view,
+            target_head.clone(),
+        );
+        let state = if sources.is_empty() {
+            TransferState::Exhausted
+        } else {
+            TransferState::FetchingRecords
+        };
+        Self {
+            sid,
+            transfer_id,
+            target_view,
+            target_head,
+            sources,
+            cursor: 0,
+            invalid: BTreeMap::new(),
+            chain,
+            outcomes: BTreeMap::new(),
+            deltas: BTreeMap::new(),
+            delta_in_flight: None,
+            state,
+        }
+    }
+
+    pub fn state(&self) -> TransferState {
+        self.state
+    }
+
+    pub fn transfer_id(&self) -> u64 {
+        self.transfer_id
+    }
+
+    pub fn target(&self) -> (View, &Digest) {
+        (self.target_view, &self.target_head)
+    }
+
+    pub fn is_verified(&self) -> bool {
+        self.state == TransferState::Verified
+    }
+
+    /// The verified result, only once everything checks out. Phase C's input.
+    pub fn verified_output(&self) -> Option<Vec<(View, &SequenceOutcome, &Vec<Digest>)>> {
+        if !self.is_verified() {
+            return None;
+        }
+        Some(
+            self.outcomes
+                .iter()
+                .filter_map(|(view, outcome)| {
+                    self.deltas.get(view).map(|delta| (*view, outcome, delta))
+                })
+                .collect(),
+        )
+    }
+
+    /// Up to `max` sources to send the next request to, CONCURRENTLY.
+    ///
+    /// Serial failover would multiply worst-case recovery by `f`, since up to `f` of the
+    /// `f+1` matching announcers may withhold every response. Asking several at once
+    /// bounds it by the one correct announcer's latency, at a bandwidth cost of at most
+    /// `max`x -- and the first valid copy cancels the rest.
+    pub fn next_sources(&self, max: usize) -> Vec<PublicKey> {
+        if self.sources.is_empty() {
+            return Vec::new();
+        }
+        let take = max.max(1).min(self.sources.len());
+        (0..take)
+            .map(|i| self.sources[(self.cursor + i) % self.sources.len()])
+            .collect()
+    }
+
+    /// What to request next, or `None` when verified or exhausted.
+    pub fn want(&self) -> Option<SequenceWant> {
+        match self.state {
+            TransferState::FetchingRecords => Some(SequenceWant::Records {
+                from_view: self.chain.next_view(),
+            }),
+            TransferState::FetchingOutcomes => self
+                .first_missing_outcome()
+                .map(|view| SequenceWant::Outcome { view }),
+            TransferState::FetchingDeltas => match &self.delta_in_flight {
+                Some((view, verifier)) => Some(SequenceWant::Delta {
+                    view: *view,
+                    start_index: verifier.next_index(),
+                }),
+                None => self.first_missing_delta().map(|view| SequenceWant::Delta {
+                    view,
+                    start_index: 0,
+                }),
+            },
+            TransferState::Verified | TransferState::Exhausted => None,
+        }
+    }
+
+    fn first_missing_outcome(&self) -> Option<View> {
+        (1..=self.target_view)
+            .filter(|v| self.chain.verified_record(*v).is_some())
+            .find(|v| !self.outcomes.contains_key(v))
+    }
+
+    fn first_missing_delta(&self) -> Option<View> {
+        (1..=self.target_view)
+            .filter(|v| self.chain.verified_record(*v).is_some())
+            .find(|v| !self.deltas.contains_key(v))
+    }
+
+    /// A response only counts from a source still in the matching set, and only when its
+    /// transfer id and target head match. Section 6: anything else is ignored -- this is
+    /// the "answers a pair we never asked for" discipline.
+    fn accepts(&self, from: &PublicKey, transfer_id: u64, head: &Digest) -> bool {
+        transfer_id == self.transfer_id && head == &self.target_head && self.sources.contains(from)
+    }
+
+    /// Charge a source for an invalid response and drop it once it has spent its budget.
+    fn penalize(&mut self, from: &PublicKey) {
+        let count = self.invalid.entry(*from).or_insert(0);
+        *count += 1;
+        if *count >= MAX_INVALID_PER_SOURCE {
+            self.drop_source(from);
+        }
+    }
+
+    /// Remove a source. Keeps `cursor` in range without rotating past an untried peer.
+    pub fn drop_source(&mut self, from: &PublicKey) {
+        if let Some(index) = self.sources.iter().position(|s| s == from) {
+            self.sources.remove(index);
+            if index < self.cursor {
+                self.cursor -= 1;
+            }
+        }
+        if self.sources.is_empty() {
+            self.state = TransferState::Exhausted;
+        } else {
+            self.cursor %= self.sources.len();
+        }
+    }
+
+    /// Rotate to the next source. Called on a request timeout, so a silent peer costs one
+    /// timeout rather than the whole transfer.
+    pub fn rotate(&mut self) {
+        if !self.sources.is_empty() {
+            self.cursor = (self.cursor + 1) % self.sources.len();
+        }
+    }
+
+    pub fn on_records(
+        &mut self,
+        chunk: &SequenceRecordChunk,
+        from: &PublicKey,
+    ) -> Result<(), ChainError> {
+        if self.state != TransferState::FetchingRecords
+            || !self.accepts(from, chunk.transfer_id, &chunk.target_head)
+        {
+            return Ok(());
+        }
+        match self.chain.absorb_records(&chunk.records) {
+            Ok(complete) => {
+                if complete {
+                    self.state = TransferState::FetchingOutcomes;
+                    self.advance_if_done();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.penalize(from);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn on_outcome(
+        &mut self,
+        serve: &SequenceOutcomeServe,
+        from: &PublicKey,
+    ) -> Result<(), ChainError> {
+        if self.state != TransferState::FetchingOutcomes
+            || !self.accepts(from, serve.transfer_id, &serve.target_head)
+        {
+            return Ok(());
+        }
+        match self.chain.check_outcome(serve.view, &serve.outcome) {
+            Ok(()) => {
+                self.outcomes.insert(serve.view, serve.outcome.clone());
+                if self.first_missing_outcome().is_none() {
+                    self.state = TransferState::FetchingDeltas;
+                    self.advance_if_done();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.penalize(from);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn on_delta(
+        &mut self,
+        chunk: &SequenceDeltaChunk,
+        from: &PublicKey,
+    ) -> Result<(), ChainError> {
+        if self.state != TransferState::FetchingDeltas
+            || !self.accepts(from, chunk.transfer_id, &chunk.target_head)
+        {
+            return Ok(());
+        }
+        let Some(record) = self.chain.verified_record(chunk.view).cloned() else {
+            // A delta for a view whose record we never verified. Not attributable to a
+            // corrupt chain, just unsolicited -- ignore without penalty.
+            return Ok(());
+        };
+        if self.delta_in_flight.as_ref().map(|(v, _)| *v) != Some(chunk.view) {
+            self.delta_in_flight = Some((
+                chunk.view,
+                DeltaVerifier::new(self.sid.clone(), chunk.view, &record),
+            ));
+        }
+        let Some((_, verifier)) = self.delta_in_flight.as_mut() else {
+            return Ok(());
+        };
+        match verifier.absorb(chunk.start_index, &chunk.items) {
+            Ok(complete) => {
+                if complete {
+                    let (view, verifier) = self.delta_in_flight.take().expect("in flight");
+                    let items = verifier.take_items().expect("complete");
+                    self.deltas.insert(view, items);
+                    self.advance_if_done();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Drop the partial verifier so a corrupt chunk cannot strand this view at
+                // a poisoned offset; the next source restarts it from index 0.
+                self.delta_in_flight = None;
+                self.penalize(from);
+                Err(e)
+            }
+        }
+    }
+
+    /// Section 9: an explicit "cannot serve" is a SOURCE fact, not a target fact. The
+    /// source is dropped and the transfer continues against the rest -- exactly the case
+    /// where matching announcers sit at different serve floors.
+    pub fn on_unavailable(&mut self, unavailable: &SequenceUnavailable, from: &PublicKey) {
+        if unavailable.transfer_id != self.transfer_id
+            || unavailable.target_head != self.target_head
+        {
+            return;
+        }
+        self.drop_source(from);
+    }
+
+    fn advance_if_done(&mut self) {
+        if self.chain.is_complete()
+            && self.first_missing_outcome().is_none()
+            && self.first_missing_delta().is_none()
+        {
+            self.state = TransferState::Verified;
+        }
+    }
+}
