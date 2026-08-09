@@ -451,6 +451,9 @@ pub struct VantageCore {
     sequence_transfer_seq: u64,
     /// When the outstanding request was issued, for the failover deadline.
     sequence_request_at: Option<Instant>,
+    /// What the last emitted request asked for. A response only re-emits when the WANT
+    /// actually changed; see `on_sequence_response`.
+    sequence_last_want: Option<SequenceWant>,
     sequence_request_timeout_ms: u64,
     sequence_max_sources: usize,
     /// Last (boundary, instant) we announced, for the repeat rule above.
@@ -887,6 +890,7 @@ impl VantageCore {
             sequence_transfer: None,
             sequence_transfer_seq: 0,
             sequence_request_at: None,
+            sequence_last_want: None,
             sequence_request_timeout_ms: parameters.sequence_sync_request_timeout_ms,
             sequence_max_sources: parameters.sequence_sync_max_sources,
             last_announced: None,
@@ -2281,6 +2285,7 @@ impl VantageCore {
                 );
                 self.sequence_transfer = None;
                 self.sequence_request_at = None;
+                self.sequence_last_want = None;
             }
             Some(TransferState::Exhausted) => {
                 if let Some(metrics) = &self.metrics {
@@ -2288,6 +2293,7 @@ impl VantageCore {
                 }
                 self.sequence_transfer = None;
                 self.sequence_request_at = None;
+                self.sequence_last_want = None;
             }
             _ => {}
         }
@@ -2316,6 +2322,7 @@ impl VantageCore {
                 sources,
             ));
             self.sequence_request_at = None;
+            self.sequence_last_want = None;
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_sequence_sync_started_total.inc();
                 metrics.vantage_sequence_sync_target_view.set(view as i64);
@@ -2396,6 +2403,7 @@ impl VantageCore {
             self.send_sequence(&peer, message);
         }
         self.sequence_request_at = Some(Instant::now());
+        self.sequence_last_want = Some(want);
     }
 
     /// Feed one response into the active transfer. An invalid one is counted and dropped:
@@ -2426,10 +2434,22 @@ impl VantageCore {
         if let Err(e) = result {
             log::debug!("vantage sequence sync: invalid chunk from a source: {e:?}");
         }
-        // A valid chunk unblocks the next request immediately rather than waiting out the
-        // timeout, so a healthy transfer runs at network speed, not at tick speed.
-        self.sequence_request_at = None;
-        self.drive_sequence_sync();
+        // A valid chunk unblocks the next request immediately rather than waiting out
+        // the timeout, so a healthy transfer runs at network speed rather than tick
+        // speed -- but ONLY when the want actually advanced.
+        //
+        // Re-emitting unconditionally is a request amplification bomb: one request goes
+        // to `max_sources` peers, each response re-emits to `max_sources` again, and the
+        // fan-out squares per round. Measured on a live n=4 cluster as 5.4 MILLION chunks
+        // accepted and 22 MILLION frames served for a target of a few dozen views, with
+        // zero invalid chunks -- the transfer was not broken, it was screaming. Gating on
+        // a changed want makes the duplicate responses from concurrent sources inert,
+        // which is exactly what they should be.
+        let want = self.sequence_transfer.as_ref().and_then(|t| t.want());
+        if want != self.sequence_last_want {
+            self.sequence_request_at = None;
+            self.drive_sequence_sync();
+        }
     }
 
     /// Phase B: broadcast our highest checkpoint boundary, if we have one.
