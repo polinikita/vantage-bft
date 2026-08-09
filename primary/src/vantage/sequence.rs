@@ -1034,6 +1034,27 @@ impl SequenceTransfer {
         )
     }
 
+    /// The verified chain's head at every view in the target range.
+    ///
+    /// Phase C's rebase needs these: when ordinary execution overtakes part of a target,
+    /// the head it derived at that boundary must be checked against what the chain says
+    /// before the prefix is dropped, or a correct suffix could be spliced onto a divergent
+    /// history.
+    pub fn verified_heads(&self) -> Option<Vec<(View, Digest)>> {
+        if !self.is_verified() {
+            return None;
+        }
+        Some(
+            (1..=self.target_view)
+                .filter_map(|view| {
+                    self.chain
+                        .verified_record(view)
+                        .map(|record| (view, record.head(&self.sid)))
+                })
+                .collect(),
+        )
+    }
+
     /// Up to `max` sources to send the next request to, CONCURRENTLY.
     ///
     /// Serial failover would multiply worst-case recovery by `f`, since up to `f` of the

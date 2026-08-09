@@ -3026,6 +3026,15 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
+          "refId": "H",
+          "legendFormat": "self-check only (installed)",
+          "expr": "sum(vantage_sequence_install_selfcheck_match_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
           "refId": "C",
           "legendFormat": "verified view",
           "expr": "max(vantage_sequence_sync_verified_view{node=~\"$node\",node=~\".*-primary$\"})"
@@ -3042,7 +3051,7 @@
       ],
       "title": "Phase B closing check: verified head vs local execution (MISMATCH must be 0)",
       "type": "timeseries",
-      "description": "The gate for Phase C. A transfer verifying only proves the served chain hashes to the head f+1 peers announced -- a chain that is internally consistent but WRONG verifies perfectly, because the hash chain is self-referential and cannot know what the views contained. This panel compares that head against the one the receiving node derives ITSELF once ordinary execution reaches the same view, which is the difference between 'the peers agreed with each other' and 'the peers were right'. MISMATCH must be 0: nonzero means either more than f announcers agreed on a head no correct party derives, or correct parties disagree. Either forbids installation. 'verified view' leading 'local head view' is normal and is exactly the lag Phase C exists to close by installing instead of waiting."
+      "description": "The gate for Phase C. A transfer verifying only proves the served chain hashes to the head f+1 peers announced -- a chain that is internally consistent but WRONG verifies perfectly, because the hash chain is self-referential and cannot know what the views contained. This panel compares that head against the one the receiving node derives ITSELF once ordinary execution reaches the same view, which is the difference between 'the peers agreed with each other' and 'the peers were right'. MISMATCH must be 0: nonzero means either more than f announcers agreed on a head no correct party derives, or correct parties disagree. Either forbids installation. 'verified view' leading 'local head view' is normal and is exactly the lag Phase C exists to close by installing instead of waiting. NOTE: 'match' counts only comparisons where the local head was derived by ORDINARY EXECUTION. With sequence_install_enabled=true the installed view carries the transfer's own outcome and delta into the comparison, so both sides share a source and it degenerates into a self-check -- counted separately as 'self-check only (installed)'. Score the Phase C gate on a run with installation DISABLED, where 'match' is the independent number."
     },
     {
       "datasource": {

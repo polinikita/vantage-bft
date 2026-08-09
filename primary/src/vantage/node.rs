@@ -20,7 +20,7 @@ const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
 
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
-use crate::vantage::install::SequenceInstall;
+use crate::vantage::install::{RebaseOutcome, SequenceInstall};
 use crate::vantage::lanes::{
     AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager, SharedAckAggregator,
     SharedBlocks,
@@ -463,9 +463,15 @@ pub struct VantageCore {
     sequence_install_settle_ceiling: usize,
     sequence_install_enabled: bool,
     sequence_install_views_per_tick: usize,
+    sequence_install_digests_per_tick: usize,
     /// "Every view is locally held" is a level, not an edge, and the drive runs every
     /// announce tick -- without this the line would repeat until the target retires.
     sequence_install_ready_logged: bool,
+    /// Whether any view of the target now awaiting comparison was INSTALLED rather than
+    /// executed locally. Decides which match counter the comparison lands in: an installed
+    /// view carries the transfer's own outcome and delta into `record_sequence`, so the
+    /// comparison no longer has two independent sides.
+    sequence_target_installed: bool,
     /// When the outstanding request was issued, for the failover deadline.
     sequence_request_at: Option<Instant>,
     /// What the last emitted request asked for. A response only re-emits when the WANT
@@ -914,7 +920,9 @@ impl VantageCore {
             sequence_install_settle_ceiling: parameters.sequence_install_settle_ceiling,
             sequence_install_enabled: parameters.sequence_install_enabled,
             sequence_install_views_per_tick: parameters.sequence_install_views_per_tick,
+            sequence_install_digests_per_tick: parameters.sequence_install_digests_per_tick,
             sequence_install_ready_logged: false,
+            sequence_target_installed: false,
             sequence_request_at: None,
             sequence_last_want: None,
             sequence_request_timeout_ms: parameters.sequence_sync_request_timeout_ms,
@@ -2296,17 +2304,28 @@ impl VantageCore {
                     // state for the rest of the run.
                     self.sequence_install = None;
                     let matched = expected == local_head;
+                    let installed = std::mem::take(&mut self.sequence_target_installed);
                     if let Some(metrics) = &self.metrics {
-                        if matched {
-                            metrics.vantage_sequence_verify_match_total.inc();
-                        } else {
+                        if !matched {
                             metrics.vantage_sequence_verify_mismatch_total.inc();
+                        } else if installed {
+                            // The head compared was derived from the transfer's own
+                            // outcomes and deltas, so this is self-consistency, not an
+                            // independent agreement. Counted apart so the Phase C gate
+                            // cannot be read off a run that installed.
+                            metrics.vantage_sequence_install_selfcheck_match_total.inc();
+                        } else {
+                            metrics.vantage_sequence_verify_match_total.inc();
                         }
                     }
                     if matched {
+                        let basis = if installed {
+                            "installed -- self-consistency only"
+                        } else {
+                            "independently executed locally"
+                        };
                         log::info!(
-                            "vantage sequence sync: MATCH at view={view} head={} \
-                             (remote-verified head equals local execution)",
+                            "vantage sequence sync: MATCH at view={view} head={} ({basis})",
                             head_hex(&local_head)
                         );
                     } else {
@@ -2368,6 +2387,7 @@ impl VantageCore {
                             .collect()
                     })
                     .unwrap_or_default();
+                let heads = transfer.verified_heads().unwrap_or_default();
                 let views = staged.len();
                 let (view, head) = transfer.target();
                 let (view, head) = (view, head.clone());
@@ -2381,6 +2401,7 @@ impl VantageCore {
                     view,
                     head,
                     staged,
+                    heads,
                     self.sequence_install_window_views,
                     self.sequence_install_settle_ceiling,
                 );
@@ -2410,6 +2431,7 @@ impl VantageCore {
                     }
                     self.sequence_install = Some(install);
                     self.sequence_install_ready_logged = false;
+                    self.sequence_target_installed = false;
                 } else {
                     // A verified chain cannot have a hole -- `ChainVerifier` links every
                     // record to its predecessor -- so this means the outcome/delta maps
@@ -2550,16 +2572,10 @@ impl VantageCore {
         // have moved since the target's base view. Dropping the overtaken prefix keeps a
         // still-useful suffix installable and stops fetching blocks for views already
         // committed; if it overtook the target outright, the target is retired here.
-        let local_view = self.cursor.next_view().saturating_sub(1);
-        let install = self.sequence_install.as_mut().expect("present");
-        if !install.rebase(local_view) {
-            log::info!(
-                "vantage sequence install: ordinary execution reached view={local_view}; \
-                 target retired without installing"
-            );
-            self.sequence_install = None;
+        if !self.rebase_sequence_install() {
             return Vec::new();
         }
+        let install = self.sequence_install.as_mut().expect("present");
         install.refresh(&blocks);
         let refs = install.admit(pending);
 
@@ -2597,6 +2613,62 @@ impl VantageCore {
         effects
     }
 
+    /// Re-align the staged target with where the cursor actually is, and revalidate.
+    ///
+    /// Called before every admission pass AND before every applied view, not once per tick.
+    /// `Cursor::install` pumps on success, so a view whose ordinary inputs were already
+    /// parked can carry the cursor several views past the one just installed -- checking
+    /// only at the top of the pass would leave the installer asking for a view the cursor
+    /// has moved beyond, and `OutOfOrder` would abandon a target that is still good.
+    ///
+    /// Returns `false` when the target is gone: either overtaken outright, or refused
+    /// because the head local execution derived at the rebase boundary is not the one the
+    /// verified chain records.
+    fn rebase_sequence_install(&mut self) -> bool {
+        let local_view = self.cursor.next_view().saturating_sub(1);
+        let local_head = self
+            .sequence
+            .as_ref()
+            .map(|s| s.head().clone())
+            .unwrap_or_else(|| genesis_head(self.agb.sid()));
+        let Some(install) = self.sequence_install.as_mut() else {
+            return false;
+        };
+        match install.rebase(local_view, &local_head) {
+            RebaseOutcome::Continue => true,
+            RebaseOutcome::Overtaken => {
+                log::info!(
+                    "vantage sequence install: ordinary execution reached view={local_view}; \
+                     target retired without installing"
+                );
+                self.sequence_install = None;
+                false
+            }
+            RebaseOutcome::Diverged {
+                view,
+                expected,
+                local,
+            } => {
+                // The same fact `vantage_sequence_verify_mismatch_total` reports, caught on
+                // the install path instead: a correct suffix spliced onto a divergent
+                // prefix is still divergent.
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_install_failed_total.inc();
+                    metrics.vantage_sequence_verify_mismatch_total.inc();
+                }
+                log::error!(
+                    "vantage sequence install: MISMATCH at rebase view={view}: \
+                     verified={} local={}; abandoning target",
+                    head_hex(&expected),
+                    head_hex(&local)
+                );
+                self.sequence_install = None;
+                self.sequence_verified_target = None;
+                false
+            }
+        }
+    }
+
     /// Apply as many staged views as the per-pass budget allows.
     ///
     /// This is the only path in the system that turns bytes another party derived into
@@ -2614,7 +2686,18 @@ impl VantageCore {
             return effects;
         }
         let mut applied = 0usize;
-        while applied < self.sequence_install_views_per_tick {
+        // Views alone do not bound the work: one view's delta is the entire accumulated
+        // lane suffix since the last emitted watermark, so a multi-second gap at n=100 can
+        // put thousands of headers behind a single view. The digest budget is what actually
+        // keeps a pass off the core, and `Cursor::install` honours it by leaving a view open
+        // rather than by refusing it.
+        let mut digests_left = self.sequence_install_digests_per_tick.max(1);
+        while applied < self.sequence_install_views_per_tick && digests_left > 0 {
+            // Re-checked each iteration: the previous `install` pumped, which may have
+            // carried the cursor past views this target still stages.
+            if !self.rebase_sequence_install() {
+                return effects;
+            }
             let Some(install) = self.sequence_install.as_ref() else {
                 break;
             };
@@ -2625,9 +2708,19 @@ impl VantageCore {
                 break;
             };
             let (outcome, delta) = (outcome.clone(), delta.to_vec());
-            match self.cursor.install(view, outcome, &delta) {
-                Ok(fx) => {
+            match self.cursor.install(view, outcome, &delta, digests_left) {
+                Ok((fx, finalized)) => {
                     effects.extend(fx);
+                    if !finalized {
+                        // Budget exhausted mid-view. The view stays open and resumes next
+                        // pass from exactly where it stopped.
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_sequence_install_partial_views_total.inc();
+                        }
+                        break;
+                    }
+                    digests_left = digests_left.saturating_sub(delta.len());
+                    self.sequence_target_installed = true;
                     self.sequence_install
                         .as_mut()
                         .expect("present")

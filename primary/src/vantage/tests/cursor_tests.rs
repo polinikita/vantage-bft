@@ -297,9 +297,10 @@ async fn install_applies_a_view_and_advances() {
 
     let c = vec![block_ref(&chain_a[2])];
     let delta: Vec<Digest> = chain_a.iter().map(|h| h.id.clone()).collect();
-    let effects = cursor
-        .install(1, SequenceOutcome::Core { c }, &delta)
+    let (effects, finalized) = cursor
+        .install(1, SequenceOutcome::Core { c }, &delta, usize::MAX)
         .expect("a fresh cursor at view 1 installs cleanly");
+    assert!(finalized, "the whole delta fits in the budget");
 
     assert_eq!(cursor.next_view(), 2);
     assert_eq!(cursor.output_log(), delta.as_slice());
@@ -336,7 +337,7 @@ async fn install_over_an_emitted_core_prefix_emits_only_the_remainder() {
     let t = vec![block_ref(&chain_a[2])];
     let delta: Vec<Digest> = chain_a.iter().map(|h| h.id.clone()).collect();
     cursor
-        .install(1, SequenceOutcome::Full { c, t }, &delta)
+        .install(1, SequenceOutcome::Full { c, t }, &delta, usize::MAX)
         .expect("the emitted prefix matches");
 
     assert_eq!(cursor.next_view(), 2);
@@ -364,7 +365,7 @@ async fn install_refuses_a_local_partial_that_is_not_a_prefix() {
     // Verified delta that does NOT start with the locally emitted block.
     let divergent = vec![chain_a[1].id.clone(), chain_a[2].id.clone()];
     let err = cursor
-        .install(1, SequenceOutcome::Core { c }, &divergent)
+        .install(1, SequenceOutcome::Core { c }, &divergent, usize::MAX)
         .expect_err("a non-prefix local partial must be refused");
 
     assert!(matches!(err, InstallError::PrefixMismatch { view: 1, .. }));
@@ -393,6 +394,7 @@ async fn install_refuses_a_delta_whose_blocks_are_not_held() {
                 c: vec![block_ref(&chain_a[1])],
             },
             &delta,
+            usize::MAX,
         )
         .expect_err("a delta naming an unheld block must be refused");
 
@@ -425,6 +427,7 @@ async fn install_refuses_a_view_the_cursor_is_not_waiting_on() {
                 c: vec![block_ref(&chain_a[0])],
             },
             &[chain_a[0].id.clone()],
+            usize::MAX,
         )
         .expect_err("view 7 is not view 1");
 
@@ -462,6 +465,7 @@ async fn install_advances_the_per_author_watermarks() {
                 c: vec![tip.clone()],
             },
             &delta,
+            usize::MAX,
         )
         .expect("installs");
     assert_eq!(cursor.next_view(), 2);
@@ -482,4 +486,110 @@ async fn install_advances_the_per_author_watermarks() {
         delta.as_slice(),
         "nothing re-output by the second view"
     );
+}
+
+/// A view's delta is the whole accumulated lane suffix since the last emitted watermark,
+/// so after a multi-second gap at n=100 it is thousands of headers. Emitting that in one
+/// core turn is the starvation this mechanism exists to relieve, so the budget leaves the
+/// view OPEN and the next call resumes exactly where it stopped.
+#[tokio::test]
+async fn install_chunks_a_large_delta_and_resumes() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_chunked");
+    let chain_a = direct_chain(&mut lm, author_a, 6).await;
+    let mut cursor = new_cursor(&lm);
+
+    let outcome = SequenceOutcome::Core {
+        c: vec![block_ref(&chain_a[5])],
+    };
+    let delta: Vec<Digest> = chain_a.iter().map(|h| h.id.clone()).collect();
+
+    let (_, finalized) = cursor
+        .install(1, outcome.clone(), &delta, 2)
+        .expect("installs a chunk");
+    assert!(!finalized, "the budget ran out mid-view");
+    assert_eq!(cursor.next_view(), 1, "the view stays open");
+    assert_eq!(cursor.open_delta(), &delta[..2]);
+    assert_eq!(cursor.output_log(), &delta[..2]);
+
+    let (_, finalized) = cursor
+        .install(1, outcome.clone(), &delta, 2)
+        .expect("resumes from the same point");
+    assert!(!finalized);
+    assert_eq!(cursor.open_delta(), &delta[..4]);
+
+    let (_, finalized) = cursor
+        .install(1, outcome, &delta, 999)
+        .expect("finishes the view");
+    assert!(finalized);
+    assert_eq!(cursor.next_view(), 2);
+    assert_eq!(
+        cursor.output_log(),
+        delta.as_slice(),
+        "chunking changes when blocks are emitted, never which or in what order"
+    );
+}
+
+/// A header whose worker batches have not been synced is present but not deliverable.
+/// `emit` would resolve its `Header` and `notify_committed` would send `Committed` for
+/// batch digests the worker does not hold.
+///
+/// The undeliverable block is minted here rather than taken from `direct_chain`, because
+/// `payload_ok` is monotonic by design -- `upsert` OR-merges it and `set_payload_ok` only
+/// ever sets it true -- so a block that was ever published directly cannot be walked back
+/// into the repaired-but-unsynced state this checks.
+#[tokio::test]
+async fn install_refuses_a_block_whose_payload_is_not_materialized() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_payload");
+    let chain_a = direct_chain(&mut lm, author_a, 1).await;
+    let blocks = lm.blocks_handle();
+    let mut cursor = new_cursor(&lm);
+
+    // Exactly what `Repairer::on_serve` leaves behind: chain-verified, payload not synced.
+    let repaired = tagged_header(author_a, 2, chain_a[0].id.clone(), lm.sid().clone(), 0xC1);
+    blocks
+        .lock()
+        .upsert(repaired.clone(), false, true, false, true);
+
+    let delta = vec![chain_a[0].id.clone(), repaired.id.clone()];
+    let err = cursor
+        .install(
+            1,
+            SequenceOutcome::Core {
+                c: vec![block_ref(&repaired)],
+            },
+            &delta,
+            usize::MAX,
+        )
+        .expect_err("a block without its payload cannot be delivered");
+
+    assert_eq!(
+        err,
+        InstallError::BlocksMissing {
+            view: 1,
+            digest: repaired.id.clone()
+        }
+    );
+    assert!(
+        cursor.output_log().is_empty(),
+        "the deliverable block must not be emitted either -- the decision is all-or-nothing"
+    );
+
+    // Once the batches land the same view installs.
+    blocks.lock().set_payload_ok(&repaired.id, true);
+    let (_, finalized) = cursor
+        .install(
+            1,
+            SequenceOutcome::Core {
+                c: vec![block_ref(&repaired)],
+            },
+            &delta,
+            usize::MAX,
+        )
+        .expect("deliverable now");
+    assert!(finalized);
+    assert_eq!(cursor.output_log(), delta.as_slice());
 }

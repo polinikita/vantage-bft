@@ -284,12 +284,17 @@ impl Cursor {
     /// On success the view is finalized through the ORDINARY `finalize` path, so the
     /// sequence head advances through the same code as locally executed views and the
     /// verified-vs-local head comparison still fires at the target.
+    ///
+    /// `budget` caps the digests emitted in this call. Returns `(effects, finalized)`;
+    /// `finalized == false` means the budget ran out and the view is still open, to be
+    /// resumed by calling again with the same arguments.
     pub fn install(
         &mut self,
         view: View,
         outcome: SequenceOutcome,
         delta: &[Digest],
-    ) -> Result<Vec<Effect>, InstallError> {
+        budget: usize,
+    ) -> Result<(Vec<Effect>, bool), InstallError> {
         if view != self.next_view {
             return Err(InstallError::OutOfOrder {
                 expected: self.next_view,
@@ -303,16 +308,22 @@ impl Cursor {
                 verified: delta.len(),
             });
         }
-        let fresh: Vec<Digest> = delta[self.delta.len()..].to_vec();
-        if let Some(d) = fresh.iter().find(|d| self.output.contains(*d)) {
+        let remaining: Vec<Digest> = delta[self.delta.len()..].to_vec();
+        if let Some(d) = remaining.iter().find(|d| self.output.contains(*d)) {
             return Err(InstallError::AlreadyOutput {
                 view,
                 digest: d.clone(),
             });
         }
+        // Checked over the WHOLE remainder even when only a chunk of it is emitted below:
+        // the decision to apply this view is all-or-nothing even though the emission is
+        // not, so a view is never half-delivered and then found to be unservable.
         {
             let blocks = self.blocks.lock();
-            if let Some(d) = fresh.iter().find(|d| !blocks.contains(d)) {
+            if let Some(d) = remaining
+                .iter()
+                .find(|d| !blocks.get(d).is_some_and(|e| e.payload_ok))
+            {
                 return Err(InstallError::BlocksMissing {
                     view,
                     digest: d.clone(),
@@ -320,14 +331,34 @@ impl Cursor {
             }
         }
 
-        // Past every refusal: from here the view is applied in full.
-        let mut effects = self.emit(fresh);
+        // Past every refusal. A view's delta is the whole accumulated lane suffix since the
+        // last emitted watermark, which after a multi-second gap at n=100 is thousands of
+        // headers -- emitting it in one turn on the single-threaded core is the starvation
+        // this mechanism exists to relieve. So emission is chunked, and a view that does not
+        // finish stays OPEN: `self.delta` keeps the partial, and the `starts_with` check at
+        // the top makes the next call resume exactly where this one stopped.
+        //
+        // Leaving a view open mid-install is safe against abandonment too. `expand`
+        // deduplicates against `D`, so if the target is dropped before the view finishes,
+        // ordinary sealing emits only the remainder -- and in canonical order, because the
+        // partial already emitted IS a canonical prefix.
+        let budget = budget.max(1);
+        let complete = remaining.len() <= budget;
+        let chunk = if complete {
+            remaining
+        } else {
+            remaining[..budget].to_vec()
+        };
+        let mut effects = self.emit(chunk);
+        if !complete {
+            return Ok((effects, false));
+        }
         self.apply_watermarks(&outcome);
         effects.push(self.finalize(outcome));
         // Views above the target may already be pending -- ordinary execution never stopped
         // arriving while the transfer ran -- and nothing else would wake them.
         effects.extend(self.pump());
-        Ok(effects)
+        Ok((effects, true))
     }
 
     /// Advance each lane's watermark to the tip its manifest names.

@@ -446,6 +446,16 @@ pub struct Parameters {
     #[serde(default = "default_sequence_install_views_per_tick")]
     pub sequence_install_views_per_tick: usize,
 
+    /// Block digests emitted per install pass.
+    ///
+    /// The real bound. A view's delta is the whole accumulated lane suffix since the last
+    /// emitted watermark, so a multi-second gap at n=100 puts thousands of headers behind a
+    /// single view and a views-only cap would still hand the core an unbounded turn.
+    /// `Cursor::install` honours this by leaving a view OPEN when the budget runs out, so
+    /// the bound costs latency, never correctness.
+    #[serde(default = "default_sequence_install_digests_per_tick")]
+    pub sequence_install_digests_per_tick: usize,
+
     /// AVAIL-ECHO-SPEC.md: carry availability acknowledgments POSITIONALLY on the AGB
     /// echo -- a bit per lane against the echoed proposal's own reference vector --
     /// instead of `VantageAvail`'s explicit `(a,k,h)` tuples.
@@ -884,6 +894,12 @@ fn default_sequence_install_views_per_tick() -> usize {
     16
 }
 
+/// Roughly one second of fleet output at the n=100 rates this mechanism targets (~2,000
+/// blocks/s), so a pass costs about as much as one tick of ordinary committing.
+fn default_sequence_install_digests_per_tick() -> usize {
+    2_048
+}
+
 fn default_batch_max_bytes() -> usize {
     65_536
 }
@@ -1220,6 +1236,7 @@ impl Default for Parameters {
             sequence_install_settle_ceiling: default_sequence_install_settle_ceiling(),
             sequence_install_enabled: default_sequence_install_enabled(),
             sequence_install_views_per_tick: default_sequence_install_views_per_tick(),
+            sequence_install_digests_per_tick: default_sequence_install_digests_per_tick(),
             // AVAIL-ECHO-SPEC.md: off by default, so `Parameters::default()` and every
             // config predating the field keep the explicit-tuple `VantageAvail` path.
             echo_avail_claims: false,

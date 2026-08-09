@@ -10,7 +10,7 @@ use super::common::{authors, tagged_header, test_sid};
 use crate::messages::Header;
 use crate::primary::{Height, View};
 use crate::vantage::agb::Manifest;
-use crate::vantage::install::SequenceInstall;
+use crate::vantage::install::{RebaseOutcome, SequenceInstall};
 use crate::vantage::lanes::{BlockCache, SharedBlocks};
 use crate::vantage::sequence::SequenceOutcome;
 use crypto::{Digest, PublicKey};
@@ -24,10 +24,21 @@ fn empty_cache() -> SharedBlocks {
     Arc::new(Mutex::new(BlockCache::new()))
 }
 
+/// Headers WITH their worker payloads materialized -- the state a block must reach before
+/// it can be delivered.
 fn cache_insert(blocks: &SharedBlocks, headers: &[Header]) {
     let mut cache = blocks.lock();
     for h in headers {
         cache.upsert(h.clone(), false, true, true, true);
+    }
+}
+
+/// Headers exactly as `Repairer::on_serve` leaves them: chain-verified, payload NOT yet
+/// synced. Presence without deliverability.
+fn cache_insert_headers_only(blocks: &SharedBlocks, headers: &[Header]) {
+    let mut cache = blocks.lock();
+    for h in headers {
+        cache.upsert(h.clone(), false, true, false, true);
     }
 }
 
@@ -60,10 +71,29 @@ fn linear_target(views: View) -> (Staged, Vec<Header>) {
     (staged, headers)
 }
 
+/// Distinct per-view heads, standing in for the verified chain's own. Only their
+/// EQUALITY matters to rebase, so a deterministic function of the view is enough.
+fn heads_for(views: View) -> Vec<(View, Digest)> {
+    (1..=views).map(|v| (v, Digest([v as u8; 32]))).collect()
+}
+
 fn install_of(views: View, window: usize, ceiling: usize) -> (SequenceInstall, Vec<Header>) {
     let (staged, headers) = linear_target(views);
-    let install = SequenceInstall::new(0, views, Digest::default(), staged, window, ceiling);
+    let install = SequenceInstall::new(
+        0,
+        views,
+        Digest::default(),
+        staged,
+        heads_for(views),
+        window,
+        ceiling,
+    );
     (install, headers)
+}
+
+/// The head the verified chain records at `view`, matching `heads_for`.
+fn head_at(view: View) -> Digest {
+    Digest([view as u8; 32])
 }
 
 /// The window is the whole point: a target spanning hundreds of views must not authorize
@@ -120,7 +150,7 @@ fn skip_views_complete_without_a_fetch() {
         (2, SequenceOutcome::Skip, Vec::new()),
         (3, SequenceOutcome::Skip, Vec::new()),
     ];
-    let mut install = SequenceInstall::new(0, 3, Digest::default(), staged, 2, 4096);
+    let mut install = SequenceInstall::new(0, 3, Digest::default(), staged, heads_for(3), 2, 4096);
 
     assert!(
         install.admit(0).is_empty(),
@@ -195,7 +225,7 @@ fn lane_tips_are_the_per_lane_maximum() {
             vec![d(4)],
         ),
     ];
-    let install = SequenceInstall::new(0, 3, Digest::default(), staged, 8, 4096);
+    let install = SequenceInstall::new(0, 3, Digest::default(), staged, heads_for(3), 8, 4096);
 
     let tips: Vec<(PublicKey, Height)> = install.lane_tips();
     assert_eq!(tips.len(), 2, "one entry per lane, not per manifest entry");
@@ -211,13 +241,15 @@ fn lane_tips_are_the_per_lane_maximum() {
 fn a_hole_in_the_verified_output_is_refused() {
     let (mut staged, _) = linear_target(5);
     staged.retain(|(view, _, _)| *view != 3);
-    let install = SequenceInstall::new(0, 5, Digest::default(), staged, 8, 4096);
+    let install = SequenceInstall::new(0, 5, Digest::default(), staged, heads_for(5), 8, 4096);
 
     assert!(!install.is_contiguous());
     assert_eq!(install.views_total(), 4);
 
     let (whole, _) = linear_target(5);
-    assert!(SequenceInstall::new(0, 5, Digest::default(), whole, 8, 4096).is_contiguous());
+    assert!(
+        SequenceInstall::new(0, 5, Digest::default(), whole, heads_for(5), 8, 4096).is_contiguous()
+    );
 }
 
 /// `Full` names both the core `c` and the terminal `t`, and the delta is the expansion of
@@ -238,7 +270,7 @@ fn full_outcomes_authorize_both_manifests() {
         },
         vec![d(1), d(2)],
     )];
-    let mut install = SequenceInstall::new(0, 1, Digest::default(), staged, 8, 4096);
+    let mut install = SequenceInstall::new(0, 1, Digest::default(), staged, heads_for(1), 8, 4096);
 
     let refs = install.admit(0);
     assert_eq!(refs.len(), 2, "both manifests are fetch instructions");
@@ -272,7 +304,11 @@ fn a_cursor_that_advanced_during_the_fetch_rebases_the_target() {
     let (mut install, headers) = install_of(10, 8, 4096);
     let blocks = empty_cache();
 
-    assert!(install.rebase(4), "views 5..10 are still worth installing");
+    assert_eq!(
+        install.rebase(4, &head_at(4)),
+        RebaseOutcome::Continue,
+        "views 5..10 are still worth installing"
+    );
     assert_eq!(install.views_total(), 6);
     assert_eq!(
         install.installable(),
@@ -296,12 +332,20 @@ fn a_cursor_that_advanced_during_the_fetch_rebases_the_target() {
 fn a_target_overtaken_outright_is_retired() {
     let (mut install, _) = install_of(6, 8, 4096);
 
-    assert!(!install.rebase(6), "the cursor reached the target itself");
+    assert_eq!(
+        install.rebase(6, &head_at(6)),
+        RebaseOutcome::Overtaken,
+        "the cursor reached the target itself"
+    );
     assert_eq!(install.views_total(), 0);
     assert!(install.is_done());
 
     let (mut ahead, _) = install_of(6, 8, 4096);
-    assert!(!ahead.rebase(99), "and past it");
+    assert_eq!(
+        ahead.rebase(99, &Digest([0xEE; 32])),
+        RebaseOutcome::Overtaken,
+        "past the target, where the chain has no head to check against"
+    );
 }
 
 /// Rebasing must not leave the fetch window admitting views that no longer exist.
@@ -309,10 +353,62 @@ fn a_target_overtaken_outright_is_retired() {
 fn rebase_moves_the_admission_point_too() {
     let (mut install, _) = install_of(10, 3, 4096);
     install.admit(0); // admits views 1..3
-    assert!(install.rebase(6));
+    assert_eq!(install.rebase(6, &head_at(6)), RebaseOutcome::Continue);
 
     let refs = install.admit(0);
     assert_eq!(refs.len(), 3, "admission resumes at view 7, not view 4");
     assert_eq!(install.views_in_flight(), 3);
     assert_eq!(install.views_total(), 4);
+}
+
+/// A repaired header enters the cache with `payload_ok = false` on purpose -- repair is a
+/// chain-authenticity concern, not a payload-possession one -- and `collect_verified_suffix`
+/// checks only `block_ok_verified`. So a view can be fully present and still undeliverable:
+/// `notify_committed` would send `Committed` for batch digests the worker does not hold.
+#[test]
+fn headers_without_payloads_are_not_ready_to_install() {
+    let (mut install, headers) = install_of(3, 8, 4096);
+    let blocks = empty_cache();
+    install.admit(0);
+
+    cache_insert_headers_only(&blocks, &headers);
+    install.refresh(&blocks);
+    assert_eq!(
+        install.views_complete(),
+        0,
+        "every header is cached and chain-verified, and none of it can be delivered"
+    );
+    assert_eq!(install.installable(), None);
+    assert_eq!(install.blocks_awaited(&blocks), 3);
+
+    // The batches land; the same headers now count.
+    cache_insert(&blocks, &headers);
+    install.refresh(&blocks);
+    assert_eq!(install.views_complete(), 3);
+    assert_eq!(install.blocks_awaited(&blocks), 0);
+    assert_eq!(install.installable(), Some(1));
+}
+
+/// Rebase drops a prefix on the strength of the local head at that boundary. If that head
+/// is not the one the verified chain records, the suffix would be spliced onto a history
+/// no correct party shares -- the one way this mechanism could install a correct suffix and
+/// still diverge.
+#[test]
+fn rebase_refuses_a_boundary_whose_local_head_disagrees() {
+    let (mut install, _) = install_of(10, 8, 4096);
+
+    let outcome = install.rebase(4, &Digest([0xFF; 32]));
+    assert_eq!(
+        outcome,
+        RebaseOutcome::Diverged {
+            view: 4,
+            expected: head_at(4),
+            local: Digest([0xFF; 32]),
+        }
+    );
+    assert_eq!(
+        install.views_total(),
+        10,
+        "nothing is dropped on a refused rebase"
+    );
 }

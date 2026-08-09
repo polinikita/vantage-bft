@@ -768,7 +768,25 @@ pub struct Metrics {
     /// against `f+1` announcements. Nothing else exercises announce -> certify -> fetch ->
     /// verify end to end against an independently derived answer, so this counter is the
     /// evidence that a Phase C install would have installed the right bytes.
+    ///
+    /// INDEPENDENT ONLY WHEN NOTHING WAS INSTALLED, which is why it is counted separately
+    /// from `vantage_sequence_install_selfcheck_match_total`. An installed view reaches
+    /// `record_sequence` through the same `finalize` path carrying the outcome and delta
+    /// the TRANSFER supplied, so with installation enabled the two sides of the comparison
+    /// share a source and it degenerates into a self-consistency check. The Phase C gate
+    /// must therefore be scored on a run with `sequence_install_enabled = false`.
     pub vantage_sequence_verify_match_total: IntCounter,
+    /// The same comparison, but over a target this node INSTALLED rather than executed.
+    ///
+    /// Not an independent determinism check and must not be read as one: the head compared
+    /// was derived from the transferred outcomes and deltas. It still has value -- it
+    /// catches install-path bugs (wrong delta order, a dropped digest, a watermark left
+    /// stale) -- but it cannot detect divergence between correct parties, because there is
+    /// no second derivation to disagree with. It is also necessarily after the fact: the
+    /// install emits `NotifyCommitted` before `finalize` reaches the comparison, so a
+    /// mismatch here reports output that has already gone to the workers. The pre-checks
+    /// in `Cursor::install` are what actually guard that boundary.
+    pub vantage_sequence_install_selfcheck_match_total: IntCounter,
     /// Verified targets whose head DISAGREED with local execution at the same view. Must
     /// stay zero. Nonzero means either more than `f` announcers agreed on a head no
     /// correct party derives, or correct parties derive different heads -- both make
@@ -802,6 +820,10 @@ pub struct Metrics {
     /// not what this node believed -- see the log line for which of the four conditions
     /// fired; `PrefixMismatch` in particular is impossible between correct parties.
     pub vantage_sequence_install_failed_total: IntCounter,
+    /// Passes that ran out of digest budget mid-view and left it open. Ordinary under a
+    /// large backlog -- it is the bound working -- but a rate that never falls means the
+    /// budget is too small for the gap being closed.
+    pub vantage_sequence_install_partial_views_total: IntCounter,
     /// Targets applied in full.
     pub vantage_sequence_install_completed_total: IntCounter,
     /// Highest view installed from verified checkpoint state.
@@ -1773,6 +1795,12 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_sequence_install_selfcheck_match_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_selfcheck_match_total",
+                "Head comparisons over an INSTALLED target -- self-consistency, not independent",
+                registry,
+            )
+            .unwrap(),
             vantage_sequence_verify_mismatch_total: register_int_counter_with_registry!(
                 "vantage_sequence_verify_mismatch_total",
                 "Verified checkpoint heads that DISAGREED with local execution -- must stay 0",
@@ -1824,6 +1852,12 @@ impl Metrics {
             vantage_sequence_install_failed_total: register_int_counter_with_registry!(
                 "vantage_sequence_install_failed_total",
                 "Installs refused by the cursor -- cursor unchanged, target abandoned",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_partial_views_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_partial_views_total",
+                "Install passes that exhausted the digest budget mid-view",
                 registry,
             )
             .unwrap(),

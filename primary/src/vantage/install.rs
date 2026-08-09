@@ -27,7 +27,7 @@
 
 use crate::primary::{Height, View};
 use crate::vantage::block::BlockRef;
-use crate::vantage::lanes::SharedBlocks;
+use crate::vantage::lanes::{BlockCache, SharedBlocks};
 use crate::vantage::sequence::SequenceOutcome;
 use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
@@ -41,6 +41,22 @@ pub const DEFAULT_WINDOW_VIEWS: usize = 8;
 /// below the 4,967 unsettled refs measured on a straggler, so installation backs off
 /// before it reaches the regime that pinned the core.
 pub const DEFAULT_SETTLE_CEILING: usize = 2_048;
+
+/// What a rebase concluded about a target after the cursor moved under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebaseOutcome {
+    /// The target still has an installable suffix.
+    Continue,
+    /// Ordinary dissemination reached the target on its own; nothing left to install.
+    Overtaken,
+    /// The head local execution derived at the rebase boundary is not the one the verified
+    /// chain records. Installing the suffix would splice it onto a divergent history.
+    Diverged {
+        view: View,
+        expected: Digest,
+        local: Digest,
+    },
+}
 
 #[derive(Debug)]
 struct StagedView {
@@ -69,6 +85,10 @@ pub struct SequenceInstall {
     target_view: View,
     target_head: Digest,
     views: BTreeMap<View, StagedView>,
+    /// The verified chain's head at each view in the range, kept after the view itself is
+    /// installed or dropped. `rebase` needs the head at a boundary the staged views no
+    /// longer cover, so this deliberately outlives `views`.
+    heads: BTreeMap<View, Digest>,
     /// Next view to admit into the fetch window.
     next_admit: View,
     /// Next view to install. Never runs ahead of `next_admit`.
@@ -85,9 +105,14 @@ impl SequenceInstall {
         target_view: View,
         target_head: Digest,
         staged: Vec<(View, SequenceOutcome, Vec<Digest>)>,
+        heads: Vec<(View, Digest)>,
         window_views: usize,
         settle_ceiling: usize,
     ) -> Self {
+        let heads: BTreeMap<View, Digest> = heads
+            .into_iter()
+            .filter(|(view, _)| *view > base_view && *view <= target_view)
+            .collect();
         let mut views = BTreeMap::new();
         for (view, outcome, delta) in staged {
             if view <= base_view || view > target_view {
@@ -113,6 +138,7 @@ impl SequenceInstall {
             target_view,
             target_head,
             views,
+            heads,
             next_admit: base_view + 1,
             next_install: base_view + 1,
             window_views: window_views.max(1),
@@ -130,18 +156,41 @@ impl SequenceInstall {
     /// that is merely slow rather than stuck keeps committing the whole time. Without this
     /// the first `Cursor::install` would be `OutOfOrder` against a cursor that has moved
     /// on, and a target still perfectly good above the new position would be abandoned.
-    /// The remaining suffix is unaffected: the verified chain is per-view, so dropping a
-    /// prefix of it weakens nothing about what is left.
     ///
-    /// Returns `true` while the target still has something to contribute. `false` means
-    /// ordinary dissemination won outright and the target is entirely stale.
-    pub fn rebase(&mut self, local_view: View) -> bool {
+    /// `local_head` is the head the local chain derived at `local_view`, and it is
+    /// REVALIDATED against the verified chain before any prefix is dropped. Skipping that
+    /// check would be the one way this mechanism could install a correct suffix onto a
+    /// divergent prefix: the verified chain says what the head at `local_view` must be, and
+    /// if the locally derived one differs then everything above it is being spliced onto a
+    /// history no correct party shares. The remaining suffix is otherwise unaffected -- the
+    /// chain is per-view, so dropping a REVALIDATED prefix weakens nothing.
+    ///
+    /// A boundary outside the target's range cannot be checked and is not treated as
+    /// agreement: below `base_view` the chain says nothing, and at or above `target_view`
+    /// the target is spent anyway.
+    pub fn rebase(&mut self, local_view: View, local_head: &Digest) -> RebaseOutcome {
+        if local_view >= self.next_install {
+            // Only meaningful where the verified chain has an opinion.
+            if let Some(expected) = self.heads.get(&local_view) {
+                if expected != local_head {
+                    return RebaseOutcome::Diverged {
+                        view: local_view,
+                        expected: expected.clone(),
+                        local: local_head.clone(),
+                    };
+                }
+            }
+        }
         while self.next_install <= local_view && self.next_install <= self.target_view {
             self.views.remove(&self.next_install);
             self.next_install += 1;
         }
         self.next_admit = self.next_admit.max(self.next_install);
-        self.next_install <= self.target_view
+        if self.next_install > self.target_view {
+            RebaseOutcome::Overtaken
+        } else {
+            RebaseOutcome::Continue
+        }
     }
 
     pub fn base_view(&self) -> View {
@@ -193,28 +242,28 @@ impl SequenceInstall {
             .count()
     }
 
-    /// Digests this target still needs and does not have. Diagnostic only -- an install
-    /// that stops making progress is otherwise indistinguishable from a slow one.
+    /// Digests this target still needs and cannot yet deliver. Diagnostic only -- an
+    /// install that stops making progress is otherwise indistinguishable from a slow one.
     pub fn blocks_awaited(&self, blocks: &SharedBlocks) -> usize {
         let cache = blocks.lock();
         self.views
             .values()
             .filter(|v| !v.complete)
             .flat_map(|v| v.delta.iter())
-            .filter(|d| !cache.contains(d))
+            .filter(|d| !deliverable(&cache, d))
             .count()
     }
 
-    /// Re-test admitted views against the cache and latch the ones whose whole delta has
-    /// arrived. Cheap by construction: only admitted-and-incomplete views are scanned, and
-    /// the window bounds that to `window_views`.
+    /// Re-test admitted views against the cache and latch the ones whose whole delta can be
+    /// DELIVERED. Cheap by construction: only admitted-and-incomplete views are scanned,
+    /// and the window bounds that to `window_views`.
     pub fn refresh(&mut self, blocks: &SharedBlocks) {
         let cache = blocks.lock();
         for staged in self.views.values_mut() {
             if staged.complete || !staged.admitted {
                 continue;
             }
-            if staged.delta.iter().all(|d| cache.contains(d)) {
+            if staged.delta.iter().all(|d| deliverable(&cache, d)) {
                 staged.complete = true;
             }
         }
@@ -278,6 +327,26 @@ impl SequenceInstall {
     pub fn is_done(&self) -> bool {
         self.next_install > self.target_view
     }
+}
+
+/// Can this block actually be handed to the executor?
+///
+/// Presence is NOT enough. `Repairer::on_serve` upserts repaired headers with
+/// `payload_ok = false` on purpose -- repair is a chain-authenticity concern (D1 clause
+/// ii), not a payload-possession one (clause iii) -- and `collect_verified_suffix` checks
+/// only `block_ok_verified`. So a header can be cached, chain-verified and still have none
+/// of its worker batches locally. `Cursor::emit` would resolve its `Header` fine and
+/// `notify_committed` would send `PrimaryWorkerMessage::Committed` for batch digests the
+/// worker does not hold.
+///
+/// The ordinary path has the same shape but not the same exposure: blocks arrive roughly
+/// in real time, and the `SyncBatches` emitted on arrival usually resolves before the
+/// cursor reaches them. An install pulls a whole backlog at once, so the window is wide and
+/// systematic rather than incidental -- thousands of headers whose payloads are all still
+/// in flight. Waiting for `payload_ok` costs a stalled view, which `rebase` and the fetch
+/// window already handle; not waiting costs committed output the node cannot produce.
+fn deliverable(cache: &BlockCache, digest: &Digest) -> bool {
+    cache.get(digest).is_some_and(|entry| entry.payload_ok)
 }
 
 /// A view's fetch instruction: every manifest entry named by its outcome.

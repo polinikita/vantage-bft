@@ -680,6 +680,17 @@ same view. That comparison is what separates "the peers agreed with each other" 
 peers were right", and it is counted in
 `vantage_sequence_verify_{match,mismatch}_total`. Mismatch must be zero.
 
+**The match counter is an independent gate only when nothing was installed.** An installed
+view reaches `record_sequence` through the same `finalize` path carrying the outcome and
+delta the TRANSFER supplied, so with `sequence_install_enabled = true` both sides of the
+comparison come from one source and it degenerates into a self-consistency check --
+counted separately as `vantage_sequence_install_selfcheck_match_total` so the two can
+never be confused. That self-check still earns its keep (it catches a wrong delta order, a
+dropped digest, a stale watermark) but it cannot detect divergence between correct
+parties, and it is necessarily after the fact: the install emits `NotifyCommitted` before
+`finalize` reaches the comparison. `Cursor::install`'s pre-checks are what guard that
+boundary. **Score the Phase C gate on a run with installation disabled.**
+
 A mismatch is deliberately non-fatal in Phase B: nothing is installed, so it cannot
 corrupt state, and the run's value is the evidence it produces. Phase C must treat the
 same signal as fatal to installation, since by then the bytes would be applied.
@@ -724,7 +735,23 @@ Implementation order, smallest safe increment first:
    code as locally executed views and the verified-vs-local comparison fires on the
    installed result. Per-author watermarks move to the manifest tips. Gated off by
    `sequence_install_enabled` (default false), bounded at
-   `sequence_install_views_per_tick`.
+   `sequence_install_views_per_tick` AND `sequence_install_digests_per_tick`. The digest
+   budget is the one that binds: a view's delta is the whole accumulated lane suffix since
+   the last emitted watermark, so a multi-second gap at n=100 puts thousands of headers
+   behind a single view and a views-only cap would still hand the core an unbounded turn.
+   A view that exhausts the budget stays OPEN and resumes next pass -- the `starts_with`
+   prefix check makes that exact, and abandoning a half-emitted view is safe because
+   `expand` deduplicates against `D`, so ordinary sealing emits only the remainder and in
+   canonical order.
+
+   Readiness is `payload_ok`, not cache presence. `Repairer::on_serve` upserts repaired
+   headers with `payload_ok = false` by design -- repair is a chain-authenticity concern,
+   not a payload-possession one -- and `collect_verified_suffix` checks only
+   `block_ok_verified`, so a view can be entirely present and entirely undeliverable.
+   `notify_committed` would then send `Committed` for batch digests the worker does not
+   hold. The ordinary path has the same shape but not the same exposure: blocks arrive in
+   real time and the `SyncBatches` emitted on arrival usually resolves first, whereas an
+   install pulls a whole backlog whose payloads are all in flight at once.
 3. **Discard obsolete consensus work -- IMPLEMENTED.** Installing through `V` establishes
    that every view at or below it is terminally decided, so `Resolver::
    note_installed_through` raises the resolved watermark directly. That single fact does
@@ -734,10 +761,19 @@ Implementation order, smallest safe increment first:
    and timer state for the whole skipped range through the existing GC pass. Future views
    are preserved by construction, since it is a floor. No new pruning code.
 4. **Race handling -- IMPLEMENTED.** Ordinary dissemination never stops while a transfer
-   runs, so `SequenceInstall::rebase` drops the overtaken prefix each pass and keeps the
-   still-useful suffix installable; a target overtaken outright retires without installing.
-   `Cursor::install`'s `OutOfOrder` is the backstop for a stale target, and the verified
-   head comparison retires a target ordinary execution reached under its own power.
+   runs, so `SequenceInstall::rebase` drops the overtaken prefix and keeps the still-useful
+   suffix installable; a target overtaken outright retires without installing.
+
+   Rebase REVALIDATES: the head local execution derived at the boundary is checked against
+   the verified chain's head for that view before any prefix is dropped. Skipping that is
+   the one way this mechanism could install a correct suffix onto a divergent prefix, and
+   a failure is reported as a mismatch, not as a retry.
+
+   Rebase runs before every applied view, not once per pass. `Cursor::install` pumps on
+   success, so a view whose ordinary inputs were already parked can carry the cursor
+   several views past the one just installed; checking only at the top of the pass would
+   leave the installer asking for a view the cursor had moved beyond, and `OutOfOrder`
+   would abandon a target that was still good.
 
 Then:
 
