@@ -559,6 +559,7 @@ impl SimpleItCore {
                 },
                 resume_lane_tx: resume_senders.lane,
                 replay_tx: resume_senders.replay,
+                sequence_tx: resume_senders.sequence,
                 replay_generation: resume_senders.generation,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,

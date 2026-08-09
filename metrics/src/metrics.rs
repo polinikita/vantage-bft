@@ -734,6 +734,10 @@ pub struct Metrics {
     pub vantage_sequence_certified_view: IntGauge,
     /// Distinct senders caught announcing two different heads for one view.
     pub vantage_sequence_equivocators: IntGauge,
+    /// State-sync frames dropped because the dedicated bounded egress was full.
+    /// Nonzero means a peer cannot keep up; the requester recovers by timing out and
+    /// failing over, which it must handle anyway since up to `f` sources may withhold.
+    pub vantage_sequence_sync_dropped_total: IntCounter,
     /// State-sync frames served to peers.
     pub vantage_sequence_sync_served_total: IntCounter,
     /// Responses arriving with no active transfer. Phase B never installs, so every
@@ -1632,6 +1636,12 @@ impl Metrics {
             vantage_sequence_equivocators: register_int_gauge_with_registry!(
                 "vantage_sequence_equivocators",
                 "Distinct senders caught announcing two heads for one view",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_dropped_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_dropped_total",
+                "State-sync frames dropped because the bounded egress was full",
                 registry,
             )
             .unwrap(),

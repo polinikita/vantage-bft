@@ -921,6 +921,7 @@ impl VantageCore {
                 },
                 resume_lane_tx: resume_senders.lane,
                 replay_tx: resume_senders.replay,
+                sequence_tx: resume_senders.sequence,
                 replay_generation: resume_senders.generation,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
@@ -2313,7 +2314,7 @@ impl VantageCore {
     /// verify a chain that cannot reach the target. An explicit
     /// `SequenceUnavailable` with the authoritative floor lets it try another matching
     /// announcer instead.
-    async fn serve_sequence_records(&mut self, request: &SequenceRequest, to: &PublicKey) {
+    fn serve_sequence_records(&mut self, request: &SequenceRequest, to: &PublicKey) {
         let Some(store) = &self.sequence else {
             return;
         };
@@ -2344,10 +2345,10 @@ impl VantageCore {
                 sender: self.name,
             })
         };
-        self.send_sequence(to, message).await;
+        self.send_sequence(to, message);
     }
 
-    async fn serve_sequence_delta(&mut self, request: &SequenceDeltaRequest, to: &PublicKey) {
+    fn serve_sequence_delta(&mut self, request: &SequenceDeltaRequest, to: &PublicKey) {
         let Some(store) = &self.sequence else {
             return;
         };
@@ -2372,10 +2373,10 @@ impl VantageCore {
                 sender: self.name,
             }),
         };
-        self.send_sequence(to, message).await;
+        self.send_sequence(to, message);
     }
 
-    async fn serve_sequence_outcome(&mut self, request: &SequenceOutcomeRequest, to: &PublicKey) {
+    fn serve_sequence_outcome(&mut self, request: &SequenceOutcomeRequest, to: &PublicKey) {
         let Some(store) = &self.sequence else {
             return;
         };
@@ -2397,7 +2398,7 @@ impl VantageCore {
                 sender: self.name,
             }),
         };
-        self.send_sequence(to, message).await;
+        self.send_sequence(to, message);
     }
 
     /// One state-sync frame to one peer.
@@ -2406,17 +2407,20 @@ impl VantageCore {
     /// outbox or the replay accounting, because it is not live-protocol history and
     /// re-delivering it after a reconnect would be pure waste.
     ///
-    /// DEVIATION, tracked in the plan: this rides the MAIN primary sender, not the
-    /// dedicated bounded transport section 6.1 requires. Serving frames are small
-    /// (24-32 KB) and `sequence_checkpoints` is off by default, so nothing in a default
-    /// build is affected -- but the whole point of the mechanism is to relieve a node
-    /// whose main queue is already saturated, so this MUST move to the dedicated sender
-    /// before the feature is enabled anywhere it matters.
-    async fn send_sequence(&mut self, to: &PublicKey, message: PrimaryMessage) {
+    /// Rides the DEDICATED state-sync sender (section 6.1), not the main pool: this
+    /// mechanism exists to relieve a node whose main path is already saturated, so
+    /// serving through that path would deepen the congestion it is meant to drain.
+    ///
+    /// Not `async` and never awaited -- a full egress drops the frame and counts it.
+    fn send_sequence(&mut self, to: &PublicKey, message: PrimaryMessage) {
+        let sent = self.wire.try_send_sequence(to, message);
         if let Some(metrics) = &self.metrics {
-            metrics.vantage_sequence_sync_served_total.inc();
+            if sent {
+                metrics.vantage_sequence_sync_served_total.inc();
+            } else {
+                metrics.vantage_sequence_sync_dropped_total.inc();
+            }
         }
-        self.wire.send_message(*to, message).await;
     }
 
     /// PHASE5-SPEC.md §3: execute a formal `Effect::Enter(view)` as `AgbEngine::enter`
@@ -2808,15 +2812,15 @@ impl VantageCore {
                 Vec::new()
             }
             Inbound::SequenceRequest(request, sender) => {
-                self.serve_sequence_records(&request, &sender).await;
+                self.serve_sequence_records(&request, &sender);
                 Vec::new()
             }
             Inbound::SequenceDeltaRequest(request, sender) => {
-                self.serve_sequence_delta(&request, &sender).await;
+                self.serve_sequence_delta(&request, &sender);
                 Vec::new()
             }
             Inbound::SequenceOutcomeRequest(request, sender) => {
-                self.serve_sequence_outcome(&request, &sender).await;
+                self.serve_sequence_outcome(&request, &sender);
                 Vec::new()
             }
             // Requester-side responses. Phase B verifies but never installs; with no

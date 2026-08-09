@@ -185,6 +185,10 @@ pub struct Wire {
     /// stream's complete logical byte footprint before admission and retains that
     /// reservation while the stream is queued or active.
     pub(crate) replay_tx: ReplaySender,
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md section 6.1: state-sync egress. Same
+    /// never-awaited discipline as `resume_lane_tx` -- the run loop `try_send`s and moves
+    /// on, so a peer that cannot keep up costs dropped frames, never loop progress.
+    pub(crate) sequence_tx: mpsc::Sender<SequenceSend>,
     /// Unique stream generation source. Generations make task-side completion and
     /// enqueue-failure cleanup conditional on the exact stream they refer to.
     pub(crate) replay_generation: AtomicU64,
@@ -432,6 +436,28 @@ impl Wire {
         self.cancel_handlers.extend(handlers);
     }
 
+    /// Hand one state-sync frame to the dedicated sender. Returns false when the frame
+    /// was dropped because the bounded egress is full.
+    ///
+    /// NEVER awaited: state-sync must not be able to stall the run loop it exists to
+    /// unblock. Dropping is safe because every state-sync message is idempotent and
+    /// re-requestable -- a lost response costs the requester one timeout and a failover
+    /// to another matching announcer, which the design already requires it to handle
+    /// because up to `f` of them may withhold entirely.
+    pub(crate) fn try_send_sequence(&self, peer: &PublicKey, message: PrimaryMessage) -> bool {
+        let Some(addr) = self
+            .other_primaries
+            .iter()
+            .find(|(pk, _)| pk == peer)
+            .map(|(_, a)| *a)
+        else {
+            return false;
+        };
+        self.sequence_tx
+            .try_send(SequenceSend(addr, message))
+            .is_ok()
+    }
+
     /// Unicasts `payload` verbatim to a single peer.
     async fn send_to(&mut self, peer: PublicKey, payload: Vec<u8>, msg_type: &'static str) {
         let Some(addr) = self
@@ -596,6 +622,11 @@ impl Wire {
 #[derive(Debug)]
 pub(crate) struct LaneSend(SocketAddr, PrimaryMessage);
 
+/// SEQUENCE-CHECKPOINT-SYNC-PLAN.md section 6.1: one state-sync frame for the dedicated
+/// sender task. Same shape as `LaneSend`, deliberately a distinct type so state-sync
+/// traffic can never be enqueued onto lane/replay capacity by mistake.
+pub(crate) struct SequenceSend(pub(crate) SocketAddr, pub(crate) PrimaryMessage);
+
 /// One independently admitted durable replay stream. `reserved_bytes` is populated
 /// by `ReplaySender::try_send` and remains reserved across both queued and active
 /// states, until all replay frames and `done` have been handed to `ReliableSender`.
@@ -709,12 +740,17 @@ impl From<ReplaySend> for ReplayStream {
 /// message, which Mechanism A's own end-to-end retry (`resume::ResumeTrigger`'s
 /// backoff-driven resend, `resume::ResumeServe`'s dedup covering a redundant
 /// re-serve) recovers on a later attempt.
+/// Section 6.1's `sequence_sync_inbound_capacity` sibling on the EGRESS side. Small on
+/// purpose: a peer that cannot keep up must cost us dropped frames, never loop progress.
+const SEQUENCE_SEND_CHANNEL_CAPACITY: usize = 256;
+
 const RESUME_LANE_CHANNEL_CAPACITY: usize = 4096;
 const REPLAY_SEND_CHANNEL_CAPACITY: usize = 64;
 
 pub(crate) struct ResumeSenders {
     pub(crate) lane: mpsc::Sender<LaneSend>,
     pub(crate) replay: ReplaySender,
+    pub(crate) sequence: mpsc::Sender<SequenceSend>,
     pub(crate) generation: AtomicU64,
 }
 
@@ -781,6 +817,10 @@ pub(crate) fn spawn_resume_sender(
     let (lane_tx, lane_rx) = mpsc::channel(RESUME_LANE_CHANNEL_CAPACITY);
     let max_reserved_bytes = replay_serve_max_bytes.saturating_mul(2).max(1);
     let (replay_tx, replay_rx) = ReplaySender::channel(max_reserved_bytes);
+    // Cloned up front: `latency_map`/`metrics` are moved into the lane and replay
+    // senders below.
+    let sequence_latency = latency_map.clone();
+    let sequence_metrics = metrics.clone();
     let mut messages = SimpleSender::new()
         .with_latency(latency_map.clone())
         .with_batching(batch);
@@ -802,15 +842,44 @@ pub(crate) fn spawn_resume_sender(
         chunk_bytes.max(1),
         chunk_interval,
     ));
+    // Section 6.1: bounded ingress, its own connection pool. Capacity is small on
+    // purpose -- overflow DROPS the newest frame rather than blocking, because
+    // state-sync responses are idempotent and re-requestable, so a drop costs one retry
+    // while blocking would propagate backpressure into the transport and stall live
+    // consensus. This is the same best-effort discipline the lane sender uses.
+    let (sequence_tx, sequence_rx) = mpsc::channel(SEQUENCE_SEND_CHANNEL_CAPACITY);
+    let mut sequence_messages = SimpleSender::new()
+        .with_latency(sequence_latency)
+        .with_batching(batch);
+    if let Some(m) = sequence_metrics {
+        sequence_messages = sequence_messages.with_metrics(m);
+    }
+    tokio::spawn(run_sequence_sender(sequence_rx, sequence_messages));
     ResumeSenders {
         lane: lane_tx,
         replay: replay_tx,
+        sequence: sequence_tx,
         generation: AtomicU64::new(1),
     }
 }
 
 /// Mechanism A's isolated best-effort sender. Closing the ingress drains every item
 /// already accepted by the bounded channel, then exits naturally.
+/// The dedicated state-sync sender.
+///
+/// Owns its OWN `SimpleSender`, i.e. a connection pool separate from `Wire::network`.
+/// This is a correctness requirement of the design, not tuning: the mechanism exists to
+/// relieve a node whose MAIN inbound/outbound path is already saturated, so serving
+/// recovery traffic through that same path would deepen the exact congestion it is meant
+/// to drain, and a 32 KB chunk would sit ahead of live consensus frames.
+async fn run_sequence_sender(mut rx: mpsc::Receiver<SequenceSend>, mut messages: SimpleSender) {
+    while let Some(SequenceSend(to, message)) = rx.recv().await {
+        let msg_type = message.type_name();
+        let bytes = bincode::serialize(&message).expect("serializes");
+        messages.send_typed(to, Bytes::from(bytes), msg_type).await;
+    }
+}
+
 async fn run_lane_sender(mut rx: mpsc::Receiver<LaneSend>, mut messages: SimpleSender) {
     while let Some(LaneSend(to, message)) = rx.recv().await {
         let msg_type = message.type_name();
