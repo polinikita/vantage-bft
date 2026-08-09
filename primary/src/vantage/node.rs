@@ -461,6 +461,8 @@ pub struct VantageCore {
     sequence_install: Option<SequenceInstall>,
     sequence_install_window_views: usize,
     sequence_install_settle_ceiling: usize,
+    sequence_install_enabled: bool,
+    sequence_install_views_per_tick: usize,
     /// "Every view is locally held" is a level, not an edge, and the drive runs every
     /// announce tick -- without this the line would repeat until the target retires.
     sequence_install_ready_logged: bool,
@@ -910,6 +912,8 @@ impl VantageCore {
             sequence_install: None,
             sequence_install_window_views: parameters.sequence_install_window_views,
             sequence_install_settle_ceiling: parameters.sequence_install_settle_ceiling,
+            sequence_install_enabled: parameters.sequence_install_enabled,
+            sequence_install_views_per_tick: parameters.sequence_install_views_per_tick,
             sequence_install_ready_logged: false,
             sequence_request_at: None,
             sequence_last_want: None,
@@ -2575,6 +2579,84 @@ impl VantageCore {
                 "vantage sequence install: all {total} views of target view={target} are \
                  locally held"
             );
+        }
+        effects.extend(self.apply_sequence_install());
+        effects
+    }
+
+    /// Apply as many staged views as the per-pass budget allows.
+    ///
+    /// This is the only path in the system that turns bytes another party derived into
+    /// committed output, so it is off unless `sequence_install_enabled` says otherwise, and
+    /// bounded at `sequence_install_views_per_tick` per pass -- the loop it runs on is the
+    /// same single-threaded core that serves consensus, and a target spanning hundreds of
+    /// views would otherwise stall everything else while it drained.
+    ///
+    /// Any refusal aborts the WHOLE target rather than skipping the view. `Cursor::install`
+    /// only refuses on conditions that mean the target or the local state is not what this
+    /// node believed, and continuing past that would install a hole.
+    fn apply_sequence_install(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if !self.sequence_install_enabled {
+            return effects;
+        }
+        let mut applied = 0usize;
+        while applied < self.sequence_install_views_per_tick {
+            let Some(install) = self.sequence_install.as_ref() else {
+                break;
+            };
+            let Some(view) = install.installable() else {
+                break;
+            };
+            let Some((outcome, delta)) = install.view_output(view) else {
+                break;
+            };
+            let (outcome, delta) = (outcome.clone(), delta.to_vec());
+            match self.cursor.install(view, outcome, &delta) {
+                Ok(fx) => {
+                    effects.extend(fx);
+                    self.sequence_install
+                        .as_mut()
+                        .expect("present")
+                        .mark_installed(view);
+                    applied += 1;
+                }
+                Err(e) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.vantage_sequence_install_failed_total.inc();
+                    }
+                    log::error!("vantage sequence install: {e}; abandoning target");
+                    self.sequence_install = None;
+                    self.sequence_verified_target = None;
+                    return effects;
+                }
+            }
+        }
+        if applied > 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_sequence_install_views_applied_total
+                    .inc_by(applied as u64);
+            }
+            let done = self
+                .sequence_install
+                .as_ref()
+                .map(|i| i.is_done())
+                .unwrap_or(false);
+            if done {
+                let target = self.sequence_install.as_ref().expect("present").target().0;
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_install_completed_total.inc();
+                    metrics
+                        .vantage_sequence_install_completed_view
+                        .set(target as i64);
+                }
+                // Left in place, NOT cleared: the finalize effects this pass produced still
+                // have to reach `record_sequence`, and the head comparison there is what
+                // proves the installed state matches what was verified. That comparison
+                // clears it.
+                log::info!("vantage sequence install: applied through view={target}");
+            }
         }
         effects
     }

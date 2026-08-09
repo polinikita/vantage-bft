@@ -274,3 +274,212 @@ async fn early_core_then_terminal_seal_yields_one_ordered_delta() {
         "a block emitted while the view was open must not repeat after the seal"
     );
 }
+
+// -------------------------------------------------- SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10
+//
+// `Cursor::install`: the one path that turns bytes another party derived into committed
+// output. Every test here is about a refusal leaving the cursor EXACTLY as it was, because
+// a half-applied view is a hole no later execution can repair.
+
+use crate::vantage::cursor::InstallError;
+use crate::vantage::sequence::SequenceOutcome;
+use crypto::Digest;
+
+/// The ordinary case: a view this node never executed is applied whole, and the delta it
+/// finalizes is the one that was verified.
+#[tokio::test]
+async fn install_applies_a_view_and_advances() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_applies");
+    let chain_a = direct_chain(&mut lm, author_a, 3).await;
+    let mut cursor = new_cursor(&lm);
+
+    let c = vec![block_ref(&chain_a[2])];
+    let delta: Vec<Digest> = chain_a.iter().map(|h| h.id.clone()).collect();
+    let effects = cursor
+        .install(1, SequenceOutcome::Core { c }, &delta)
+        .expect("a fresh cursor at view 1 installs cleanly");
+
+    assert_eq!(cursor.next_view(), 2);
+    assert_eq!(cursor.output_log(), delta.as_slice());
+    let finalized = effects.iter().find_map(|e| match e {
+        crate::vantage::Effect::SequenceFinalized {
+            view, output_delta, ..
+        } => Some((*view, output_delta.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        finalized,
+        Some((1, delta)),
+        "the finalized delta must be exactly what was verified -- that is what makes the \
+         installed head comparable to the certified one"
+    );
+}
+
+/// A completed-but-open view has already emitted its core prefix `K`. Installing over it
+/// must deliver only the remainder, or blocks get output twice.
+#[tokio::test]
+async fn install_over_an_emitted_core_prefix_emits_only_the_remainder() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_prefix");
+    let chain_a = direct_chain(&mut lm, author_a, 3).await;
+    let mut cursor = new_cursor(&lm);
+
+    // Completed, not sealed: K is emitted and the view stays open.
+    let c = vec![block_ref(&chain_a[0])];
+    cursor.on_completed(1, c.clone(), Vec::new());
+    assert_eq!(cursor.open_delta(), &[chain_a[0].id.clone()]);
+    assert_eq!(cursor.next_view(), 1, "still open");
+
+    let t = vec![block_ref(&chain_a[2])];
+    let delta: Vec<Digest> = chain_a.iter().map(|h| h.id.clone()).collect();
+    cursor
+        .install(1, SequenceOutcome::Full { c, t }, &delta)
+        .expect("the emitted prefix matches");
+
+    assert_eq!(cursor.next_view(), 2);
+    assert_eq!(
+        cursor.output_log(),
+        delta.as_slice(),
+        "every block output exactly once, in verified order"
+    );
+}
+
+/// The refusal that can only fire on a real divergence: this node already output blocks
+/// for the view in an order the verified delta contradicts.
+#[tokio::test]
+async fn install_refuses_a_local_partial_that_is_not_a_prefix() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_mismatch");
+    let chain_a = direct_chain(&mut lm, author_a, 3).await;
+    let mut cursor = new_cursor(&lm);
+
+    let c = vec![block_ref(&chain_a[0])];
+    cursor.on_completed(1, c.clone(), Vec::new());
+    let before = cursor.output_log().to_vec();
+
+    // Verified delta that does NOT start with the locally emitted block.
+    let divergent = vec![chain_a[1].id.clone(), chain_a[2].id.clone()];
+    let err = cursor
+        .install(1, SequenceOutcome::Core { c }, &divergent)
+        .expect_err("a non-prefix local partial must be refused");
+
+    assert!(matches!(err, InstallError::PrefixMismatch { view: 1, .. }));
+    assert_eq!(cursor.next_view(), 1, "cursor unchanged");
+    assert_eq!(cursor.open_delta(), &[chain_a[0].id.clone()]);
+    assert_eq!(cursor.output_log(), before.as_slice());
+}
+
+/// `emit` resolves headers by cache lookup and silently omits what it cannot find, so an
+/// install over a partial cache would advance the view while dropping output. Caught
+/// before anything is touched.
+#[tokio::test]
+async fn install_refuses_a_delta_whose_blocks_are_not_held() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_missing");
+    let chain_a = direct_chain(&mut lm, author_a, 2).await;
+    let mut cursor = new_cursor(&lm);
+
+    let absent = Digest([0x5a; 32]);
+    let delta = vec![chain_a[0].id.clone(), absent.clone()];
+    let err = cursor
+        .install(
+            1,
+            SequenceOutcome::Core {
+                c: vec![block_ref(&chain_a[1])],
+            },
+            &delta,
+        )
+        .expect_err("a delta naming an unheld block must be refused");
+
+    assert_eq!(
+        err,
+        InstallError::BlocksMissing {
+            view: 1,
+            digest: absent
+        }
+    );
+    assert_eq!(cursor.next_view(), 1);
+    assert!(
+        cursor.output_log().is_empty(),
+        "the block that WAS held must not have been emitted either -- install is atomic"
+    );
+}
+
+#[tokio::test]
+async fn install_refuses_a_view_the_cursor_is_not_waiting_on() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_order");
+    let chain_a = direct_chain(&mut lm, author_a, 1).await;
+    let mut cursor = new_cursor(&lm);
+
+    let err = cursor
+        .install(
+            7,
+            SequenceOutcome::Core {
+                c: vec![block_ref(&chain_a[0])],
+            },
+            &[chain_a[0].id.clone()],
+        )
+        .expect_err("view 7 is not view 1");
+
+    assert_eq!(
+        err,
+        InstallError::OutOfOrder {
+            expected: 1,
+            got: 7
+        }
+    );
+    assert_eq!(cursor.next_view(), 1);
+    assert!(cursor.output_log().is_empty());
+}
+
+/// An install that delivered blocks without moving the per-author watermarks would leave
+/// the next ordinary seal walking from a stale point across a prefix the node may no
+/// longer hold -- the genesis-anew walk the watermark index exists to remove. Forced here
+/// by evicting the installed prefix: with the watermark advanced the seal short-circuits,
+/// without it the walk cannot complete and the cursor wedges.
+#[tokio::test]
+async fn install_advances_the_per_author_watermarks() {
+    let (name, _) = authors()[3];
+    let (author_a, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_watermark");
+    let chain_a = direct_chain(&mut lm, author_a, 3).await;
+    let blocks = lm.blocks_handle();
+    let mut cursor = new_cursor(&lm);
+
+    let tip = block_ref(&chain_a[2]);
+    let delta: Vec<Digest> = chain_a.iter().map(|h| h.id.clone()).collect();
+    cursor
+        .install(
+            1,
+            SequenceOutcome::Core {
+                c: vec![tip.clone()],
+            },
+            &delta,
+        )
+        .expect("installs");
+    assert_eq!(cursor.next_view(), 2);
+
+    // The installed prefix is gone from the cache; only the tip remains.
+    blocks.lock().evict_author_below(&author_a, 3);
+
+    // View 2 names the same tip. The watermark makes this a no-op instead of a walk.
+    cursor.on_sealed(2, Outcome::Core(vec![tip]));
+    assert_eq!(
+        cursor.next_view(),
+        3,
+        "a stale watermark would force a genesis-anew walk across the evicted prefix, \
+         return None, and leave the cursor stuck at view 2"
+    );
+    assert_eq!(
+        cursor.output_log(),
+        delta.as_slice(),
+        "nothing re-output by the second view"
+    );
+}

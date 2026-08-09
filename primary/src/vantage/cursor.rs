@@ -12,6 +12,53 @@ use crypto::{Digest, PublicKey};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Why an install was refused. Every variant leaves the cursor unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallError {
+    /// Not the view the cursor is waiting on.
+    OutOfOrder { expected: View, got: View },
+    /// This node already emitted output for `view` that the verified delta contradicts.
+    /// Impossible between correct parties under Phase A determinism.
+    PrefixMismatch {
+        view: View,
+        emitted: usize,
+        verified: usize,
+    },
+    /// A digest the delta wants delivered is already in `D`.
+    AlreadyOutput { view: View, digest: Digest },
+    /// A digest in the delta is not in the block cache, so its header could not be
+    /// resolved and its payload would be silently dropped.
+    BlocksMissing { view: View, digest: Digest },
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfOrder { expected, got } => {
+                write!(
+                    f,
+                    "install out of order: expected view {expected}, got {got}"
+                )
+            }
+            Self::PrefixMismatch {
+                view,
+                emitted,
+                verified,
+            } => write!(
+                f,
+                "install prefix mismatch at view {view}: {emitted} digests already emitted \
+                 locally are not a prefix of the {verified} verified"
+            ),
+            Self::AlreadyOutput { view, digest } => {
+                write!(f, "install at view {view} would re-output {digest}")
+            }
+            Self::BlocksMissing { view, digest } => {
+                write!(f, "install at view {view} is missing block {digest}")
+            }
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct ViewInput {
     completed: Option<(Manifest, Manifest)>,
@@ -196,6 +243,117 @@ impl Cursor {
             }
         }
         effects
+    }
+
+    /// The delta already emitted for the currently open view, in emission order.
+    ///
+    /// Exposed for the install prefix check: a view can be half-emitted (a completed-but-
+    /// open view emits its core prefix `K` and then waits for the seal), and installing a
+    /// verified delta over that partial output is only sound if the partial output is a
+    /// prefix of it.
+    pub fn open_delta(&self) -> &[Digest] {
+        &self.delta
+    }
+
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10: apply one verified view, atomically.
+    ///
+    /// Every check that can refuse runs BEFORE any state is touched, so a rejected install
+    /// leaves the cursor byte-identical to what it was. That is the whole contract: this is
+    /// the one place where output is produced from bytes another party derived, and a
+    /// half-applied view would be a hole no later execution can repair.
+    ///
+    /// The three refusals, in the order they can bite:
+    ///
+    /// 1. `OutOfOrder` -- the cursor advances one view at a time and `finalize` is defined
+    ///    against `next_view`, so installing anything else would silently skip or redo.
+    /// 2. `PrefixMismatch` -- the locally emitted partial delta is not a prefix of the
+    ///    verified one, i.e. this node already output blocks in an order the target
+    ///    contradicts. Installing would duplicate or reorder committed output. Under Phase
+    ///    A determinism this is impossible between correct parties, which is exactly why it
+    ///    is worth checking: it can only fire on a real divergence.
+    /// 3. `BlocksMissing` -- a digest in the delta is not cached. `emit` resolves headers
+    ///    by cache lookup and silently omits what it cannot find, so an unchecked install
+    ///    over a partial cache would advance the view while dropping the blocks it was
+    ///    supposed to deliver. Silent output loss, not a stall.
+    ///
+    /// Also refuses `AlreadyOutput`: a fresh digest that is already in `D`. Between correct
+    /// parties this cannot happen -- the source's own `expand` deduplicated against an
+    /// output set identical to ours, since the heads agree -- so it is the cheap
+    /// double-delivery backstop for the case where that assumption is wrong.
+    ///
+    /// On success the view is finalized through the ORDINARY `finalize` path, so the
+    /// sequence head advances through the same code as locally executed views and the
+    /// verified-vs-local head comparison still fires at the target.
+    pub fn install(
+        &mut self,
+        view: View,
+        outcome: SequenceOutcome,
+        delta: &[Digest],
+    ) -> Result<Vec<Effect>, InstallError> {
+        if view != self.next_view {
+            return Err(InstallError::OutOfOrder {
+                expected: self.next_view,
+                got: view,
+            });
+        }
+        if !delta.starts_with(&self.delta) {
+            return Err(InstallError::PrefixMismatch {
+                view,
+                emitted: self.delta.len(),
+                verified: delta.len(),
+            });
+        }
+        let fresh: Vec<Digest> = delta[self.delta.len()..].to_vec();
+        if let Some(d) = fresh.iter().find(|d| self.output.contains(*d)) {
+            return Err(InstallError::AlreadyOutput {
+                view,
+                digest: d.clone(),
+            });
+        }
+        {
+            let blocks = self.blocks.lock();
+            if let Some(d) = fresh.iter().find(|d| !blocks.contains(d)) {
+                return Err(InstallError::BlocksMissing {
+                    view,
+                    digest: d.clone(),
+                });
+            }
+        }
+
+        // Past every refusal: from here the view is applied in full.
+        let mut effects = self.emit(fresh);
+        self.apply_watermarks(&outcome);
+        effects.push(self.finalize(outcome));
+        // Views above the target may already be pending -- ordinary execution never stopped
+        // arriving while the transfer ran -- and nothing else would wake them.
+        effects.extend(self.pump());
+        Ok(effects)
+    }
+
+    /// Advance each lane's watermark to the tip its manifest names.
+    ///
+    /// `expand` maintains these so an ordinary seal walks only the NEW suffix instead of
+    /// re-walking from genesis. An install that delivered blocks without moving them would
+    /// leave the next ordinary `expand` walking from a stale point across a prefix it may
+    /// no longer hold in full -- correct output (`D` still deduplicates) reached by the
+    /// pathological path this index exists to remove.
+    fn apply_watermarks(&mut self, outcome: &SequenceOutcome) {
+        let manifests: [&Manifest; 2] = match outcome {
+            SequenceOutcome::Full { c, t } => [c, t],
+            SequenceOutcome::Core { c } => [c, c],
+            SequenceOutcome::Skip => return,
+        };
+        for manifest in manifests {
+            for (author, height, digest) in manifest {
+                let entry = self
+                    .watermarks
+                    .entry(*author)
+                    .or_insert((0, digest.clone()));
+                if *height >= entry.0 {
+                    *entry = (*height, digest.clone());
+                }
+            }
+        }
     }
 
     /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §8: the terminal advance past `next_view`.

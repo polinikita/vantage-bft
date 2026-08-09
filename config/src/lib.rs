@@ -429,6 +429,23 @@ pub struct Parameters {
     #[serde(default = "default_sequence_install_settle_ceiling")]
     pub sequence_install_settle_ceiling: usize,
 
+    /// Apply verified checkpoint state to the cursor, rather than only fetching and
+    /// verifying it.
+    ///
+    /// OFF by default and separate from `sequence_checkpoints` on purpose: staging is
+    /// observation and costs a node nothing it would not otherwise spend on repair, while
+    /// installation is the only path in the system that produces committed output from
+    /// bytes another party derived. The plan enables it first on deliberately
+    /// delayed/restarted nodes, not fleet-wide.
+    #[serde(default = "default_sequence_install_enabled")]
+    pub sequence_install_enabled: bool,
+
+    /// Views applied per install pass, so a large target cannot monopolize the core loop.
+    /// Each view costs a header lookup per delivered block plus one `NotifyCommitted`, and
+    /// the loop it runs on is the same single-threaded core that serves consensus.
+    #[serde(default = "default_sequence_install_views_per_tick")]
+    pub sequence_install_views_per_tick: usize,
+
     /// AVAIL-ECHO-SPEC.md: carry availability acknowledgments POSITIONALLY on the AGB
     /// echo -- a bit per lane against the echoed proposal's own reference vector --
     /// instead of `VantageAvail`'s explicit `(a,k,h)` tuples.
@@ -859,6 +876,14 @@ fn default_sequence_install_settle_ceiling() -> usize {
     2_048
 }
 
+fn default_sequence_install_enabled() -> bool {
+    false
+}
+
+fn default_sequence_install_views_per_tick() -> usize {
+    16
+}
+
 fn default_batch_max_bytes() -> usize {
     65_536
 }
@@ -1193,6 +1218,8 @@ impl Default for Parameters {
             sequence_sync_inbound_capacity: default_sequence_sync_inbound_capacity(),
             sequence_install_window_views: default_sequence_install_window_views(),
             sequence_install_settle_ceiling: default_sequence_install_settle_ceiling(),
+            sequence_install_enabled: default_sequence_install_enabled(),
+            sequence_install_views_per_tick: default_sequence_install_views_per_tick(),
             // AVAIL-ECHO-SPEC.md: off by default, so `Parameters::default()` and every
             // config predating the field keep the explicit-tuple `VantageAvail` path.
             echo_avail_claims: false,

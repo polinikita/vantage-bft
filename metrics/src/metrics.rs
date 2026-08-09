@@ -795,6 +795,17 @@ pub struct Metrics {
     /// Targets whose every view became locally held. The precondition for installing:
     /// until this fires there is nothing to install, only something to fetch.
     pub vantage_sequence_install_ready_total: IntCounter,
+    /// Views applied to the cursor from verified checkpoint state.
+    pub vantage_sequence_install_views_applied_total: IntCounter,
+    /// Installs refused by `Cursor::install`. Every refusal leaves the cursor unchanged and
+    /// abandons the whole target. Nonzero means the verified target or the local cursor is
+    /// not what this node believed -- see the log line for which of the four conditions
+    /// fired; `PrefixMismatch` in particular is impossible between correct parties.
+    pub vantage_sequence_install_failed_total: IntCounter,
+    /// Targets applied in full.
+    pub vantage_sequence_install_completed_total: IntCounter,
+    /// Highest view installed from verified checkpoint state.
+    pub vantage_sequence_install_completed_view: IntGauge,
 
     /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
     /// addressed to a peer we have not managed to connect to yet. Best-effort sends
@@ -1801,6 +1812,30 @@ impl Metrics {
             vantage_sequence_install_ready_total: register_int_counter_with_registry!(
                 "vantage_sequence_install_ready_total",
                 "Targets whose every view became locally held",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_views_applied_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_views_applied_total",
+                "Views applied to the cursor from verified checkpoint state",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_failed_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_failed_total",
+                "Installs refused by the cursor -- cursor unchanged, target abandoned",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_completed_total: register_int_counter_with_registry!(
+                "vantage_sequence_install_completed_total",
+                "Verified targets applied to the cursor in full",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_install_completed_view: register_int_gauge_with_registry!(
+                "vantage_sequence_install_completed_view",
+                "Highest view installed from verified checkpoint state",
                 registry,
             )
             .unwrap(),
