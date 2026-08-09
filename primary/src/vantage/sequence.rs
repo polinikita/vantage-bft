@@ -189,6 +189,16 @@ pub struct SequenceStore {
     records: BTreeMap<View, SequenceRecord>,
     /// Boundary view -> head at that boundary. A later phase announces from here.
     boundaries: BTreeMap<View, Digest>,
+    /// Terminal outcome bodies, and the ordered per-view output deltas.
+    ///
+    /// Retained because section 9's correctness rule is that a party never announces a
+    /// checkpoint whose state it cannot actually serve. Holding the record alone would
+    /// let this node advertise a head and then fail every transfer against it, which
+    /// costs a requester its whole recovery -- the `f+1` argument guarantees one correct
+    /// announcer EXISTS, so a correct announcer that cannot serve is a liveness bug.
+    /// Version 1 retains indefinitely (section 16); bounded GC needs its own proof.
+    outcomes: BTreeMap<View, SequenceOutcome>,
+    deltas: BTreeMap<View, Vec<Digest>>,
 }
 
 impl SequenceStore {
@@ -202,6 +212,8 @@ impl SequenceStore {
             next_view: 1,
             records: BTreeMap::new(),
             boundaries: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+            deltas: BTreeMap::new(),
         }
     }
 
@@ -270,6 +282,8 @@ impl SequenceStore {
         };
         self.head = record.head(&self.sid);
         self.records.insert(view, record);
+        self.outcomes.insert(view, outcome.clone());
+        self.deltas.insert(view, output_delta.to_vec());
         self.next_view = view + 1;
         if self.is_boundary(view) {
             self.boundaries.insert(view, self.head.clone());
@@ -499,5 +513,371 @@ impl CheckpointCollector {
 
     pub fn candidate_view_count(&self) -> usize {
         self.candidates.len()
+    }
+}
+
+// -------------------------------------------------------------------------- serving
+
+impl SequenceStore {
+    /// Lowest view this node can fully serve. Version 1 retains indefinitely, so this is
+    /// the lowest recorded view (or `next_view` when empty, i.e. "nothing serveable").
+    pub fn serve_floor(&self) -> View {
+        self.records
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(self.next_view)
+    }
+
+    /// Consecutive records starting at `from`, capped at `max`.
+    ///
+    /// Returns only a CONTIGUOUS run: a requester verifies records by chaining
+    /// `previous_head`, so a response with a hole is worthless to it and silently
+    /// skipping the hole would look like a chain that does not link. Stops at the first
+    /// gap and lets the requester see a short answer.
+    pub fn records_from(&self, from: View, max: usize) -> Vec<SequenceRecord> {
+        let mut out = Vec::new();
+        let mut view = from;
+        while out.len() < max {
+            let Some(record) = self.records.get(&view) else {
+                break;
+            };
+            out.push(record.clone());
+            view += 1;
+        }
+        out
+    }
+
+    pub fn outcome_for(&self, view: View) -> Option<&SequenceOutcome> {
+        self.outcomes.get(&view)
+    }
+
+    /// One delta chunk: up to `max` digests from `start`, plus whether it reaches the end.
+    ///
+    /// `None` when the view is not retained at all, which the caller answers with
+    /// `SequenceUnavailable` and its authoritative floor rather than an empty chunk --
+    /// section 9 forbids silently clamping a request and calling the transfer complete.
+    pub fn delta_chunk(&self, view: View, start: u64, max: usize) -> Option<(Vec<Digest>, bool)> {
+        let delta = self.deltas.get(&view)?;
+        let start = start as usize;
+        if start > delta.len() {
+            return None;
+        }
+        let end = delta.len().min(start.saturating_add(max));
+        Some((delta[start..end].to_vec(), end == delta.len()))
+    }
+}
+
+// ------------------------------------------------------------------------ wire types
+
+/// Sections 6/7.2: ask a matching announcer for the record range that links our local head
+/// to a certified target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceRequest {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_view: View,
+    pub target_head: Digest,
+    pub from_view: View,
+    pub max_records: u32,
+    pub requester: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceRecordChunk {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub records: Vec<SequenceRecord>,
+    pub serve_floor: View,
+    pub sender: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceDeltaRequest {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub view: View,
+    pub start_index: u64,
+    pub max_items: u32,
+    pub requester: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceDeltaChunk {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub view: View,
+    pub start_index: u64,
+    pub items: Vec<Digest>,
+    pub complete: bool,
+    pub sender: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceOutcomeRequest {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub view: View,
+    pub requester: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceOutcomeServe {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub view: View,
+    pub outcome: SequenceOutcome,
+    pub sender: PublicKey,
+}
+
+/// Section 9: an explicit "I cannot serve that" carrying the authoritative floor, so the
+/// requester can try another matching announcer or a newer checkpoint. Never a silent
+/// truncation presented as success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceUnavailable {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub serve_floor: View,
+    pub sender: PublicKey,
+}
+
+// ----------------------------------------------------------------------- verification
+
+/// Why downloaded state was rejected. All of these are ordinary remote input: up to `f`
+/// of the matching announcers may withhold or corrupt every byte, so none may panic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainError {
+    Version,
+    /// Not the record we are waiting for. Chunks must arrive in view order because each
+    /// record is verified against the running head.
+    UnexpectedView {
+        expected: View,
+        got: View,
+    },
+    /// `previous_head` does not match the head we have built. The core content binding:
+    /// a plausible-looking prefix from a Byzantine peer dies here unless it can complete
+    /// the chain to the certified head, which it cannot without a hash collision.
+    BrokenLink {
+        view: View,
+    },
+    /// The chain reached the target view but not the certified head.
+    HeadMismatch {
+        view: View,
+    },
+    /// More records than the target view calls for.
+    PastTarget {
+        target: View,
+    },
+    UnexpectedIndex {
+        expected: u64,
+        got: u64,
+    },
+    /// The delta produced a different commitment than its record promised.
+    DeltaMismatch {
+        view: View,
+    },
+    /// More delta items than `delta_len`.
+    DeltaTooLong {
+        view: View,
+    },
+    /// A `Skip` must have an empty delta (section 7.3 step 3).
+    SkipWithDelta {
+        view: View,
+    },
+    /// The served outcome does not hash to the record's `outcome_digest`.
+    OutcomeMismatch {
+        view: View,
+    },
+}
+
+/// Section 7.2: verify a record range links our local head to the certified target.
+///
+/// Verification is incremental and strictly ordered so an arbitrarily long range streams
+/// without buffering, and so a corrupt chunk is rejected at the point it breaks rather
+/// than after a whole range has been accepted.
+pub struct ChainVerifier {
+    sid: Digest,
+    target_view: View,
+    target_head: Digest,
+    next_view: View,
+    head: Digest,
+    verified: BTreeMap<View, SequenceRecord>,
+    complete: bool,
+}
+
+impl ChainVerifier {
+    /// `base_view`/`base_head` are what the requester already holds and trusts -- its own
+    /// installed head, or genesis.
+    pub fn new(
+        sid: Digest,
+        base_view: View,
+        base_head: Digest,
+        target_view: View,
+        target_head: Digest,
+    ) -> Self {
+        Self {
+            sid,
+            target_view,
+            target_head,
+            next_view: base_view + 1,
+            head: base_head,
+            verified: BTreeMap::new(),
+            complete: false,
+        }
+    }
+
+    pub fn next_view(&self) -> View {
+        self.next_view
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn verified_record(&self, view: View) -> Option<&SequenceRecord> {
+        self.verified.get(&view)
+    }
+
+    pub fn verified_len(&self) -> usize {
+        self.verified.len()
+    }
+
+    /// Absorb one chunk of consecutive records. `Ok(true)` once the chain reaches the
+    /// certified head.
+    ///
+    /// A rejected chunk leaves the verifier UNCHANGED, so a Byzantine source cannot
+    /// poison the running head and force the requester to restart: the next source's
+    /// copy of the same chunk is still accepted.
+    pub fn absorb_records(&mut self, records: &[SequenceRecord]) -> Result<bool, ChainError> {
+        let mut view = self.next_view;
+        let mut head = self.head.clone();
+        let mut staged = Vec::with_capacity(records.len());
+        for record in records {
+            if record.version != SEQUENCE_VERSION {
+                return Err(ChainError::Version);
+            }
+            if view > self.target_view {
+                return Err(ChainError::PastTarget {
+                    target: self.target_view,
+                });
+            }
+            if record.view != view {
+                return Err(ChainError::UnexpectedView {
+                    expected: view,
+                    got: record.view,
+                });
+            }
+            if record.previous_head != head {
+                return Err(ChainError::BrokenLink { view });
+            }
+            head = record.head(&self.sid);
+            staged.push(record.clone());
+            view += 1;
+        }
+        // Only at the target may the head be compared: an intermediate head is expected
+        // to differ from the target.
+        let reached = view > self.target_view;
+        if reached && head != self.target_head {
+            return Err(ChainError::HeadMismatch {
+                view: self.target_view,
+            });
+        }
+        for record in staged {
+            self.verified.insert(record.view, record);
+        }
+        self.next_view = view;
+        self.head = head;
+        self.complete = reached;
+        Ok(reached)
+    }
+
+    /// Section 7.3 steps 1 and 3: a served outcome must hash to the verified record's
+    /// commitment, and a `Skip` must carry an empty delta.
+    pub fn check_outcome(&self, view: View, outcome: &SequenceOutcome) -> Result<(), ChainError> {
+        let record = self.verified.get(&view).ok_or(ChainError::UnexpectedView {
+            expected: self.next_view,
+            got: view,
+        })?;
+        if outcome.digest(&self.sid, view) != record.outcome_digest {
+            return Err(ChainError::OutcomeMismatch { view });
+        }
+        if matches!(outcome, SequenceOutcome::Skip) && record.delta_len != 0 {
+            return Err(ChainError::SkipWithDelta { view });
+        }
+        Ok(())
+    }
+}
+
+/// Section 7.3 step 2: stream one view's output digests and verify them against the
+/// `(delta_len, delta_head)` its verified record committed to.
+pub struct DeltaVerifier {
+    sid: Digest,
+    view: View,
+    expected_len: u64,
+    expected_head: Digest,
+    next_index: u64,
+    running: Digest,
+    items: Vec<Digest>,
+}
+
+impl DeltaVerifier {
+    pub fn new(sid: Digest, view: View, record: &SequenceRecord) -> Self {
+        Self {
+            running: delta_seed(&sid, view),
+            sid,
+            view,
+            expected_len: record.delta_len,
+            expected_head: record.delta_head.clone(),
+            next_index: 0,
+            items: Vec::new(),
+        }
+    }
+
+    pub fn next_index(&self) -> u64 {
+        self.next_index
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.next_index == self.expected_len
+    }
+
+    /// The verified digests, only once the whole delta checks out.
+    pub fn take_items(self) -> Option<Vec<Digest>> {
+        self.is_complete().then_some(self.items)
+    }
+
+    /// Absorb consecutive items at `start_index`. `Ok(true)` when the delta is complete
+    /// AND its head matches. Rejects gaps, wrong offsets, and overlong deltas; leaves the
+    /// verifier unchanged on error.
+    pub fn absorb(&mut self, start_index: u64, items: &[Digest]) -> Result<bool, ChainError> {
+        if start_index != self.next_index {
+            return Err(ChainError::UnexpectedIndex {
+                expected: self.next_index,
+                got: start_index,
+            });
+        }
+        if self.next_index + items.len() as u64 > self.expected_len {
+            return Err(ChainError::DeltaTooLong { view: self.view });
+        }
+        let mut running = self.running.clone();
+        let mut index = self.next_index;
+        for item in items {
+            running = delta_step(&self.sid, self.view, index, &running, item);
+            index += 1;
+        }
+        let complete = index == self.expected_len;
+        if complete && running != self.expected_head {
+            return Err(ChainError::DeltaMismatch { view: self.view });
+        }
+        self.running = running;
+        self.next_index = index;
+        self.items.extend_from_slice(items);
+        Ok(complete)
     }
 }

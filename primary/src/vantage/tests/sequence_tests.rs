@@ -517,3 +517,240 @@ fn announcers_and_highest_target_above_local() {
     expected.sort();
     assert_eq!(sources, expected);
 }
+
+// ------------------------------------------------------------- serving and verification
+
+/// Build a real chain in a store, then verify it back the way a requester would. This is
+/// the round trip Phase B exists to prove: what a correct party serves is exactly what a
+/// recovering party can validate against a certified head.
+fn populated_store(views: u64) -> (SequenceStore, Digest) {
+    let sid = test_sid();
+    let mut store = SequenceStore::new(sid.clone(), 4);
+    for view in 1..=views {
+        let outcome = if view % 3 == 0 {
+            SequenceOutcome::Skip
+        } else {
+            SequenceOutcome::Core {
+                c: manifest(view as u8),
+            }
+        };
+        let delta: Vec<Digest> = if matches!(outcome, SequenceOutcome::Skip) {
+            Vec::new()
+        } else {
+            (0..3).map(|i| digest((view * 10 + i) as u8)).collect()
+        };
+        store.record(view, &outcome, &delta).unwrap();
+    }
+    (store, sid)
+}
+
+#[test]
+fn a_served_chain_verifies_against_the_certified_head() {
+    let (store, sid) = populated_store(12);
+    let target_view = 12;
+    let target_head = store.head().clone();
+
+    let mut verifier =
+        ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), target_view, target_head);
+    // Served in small chunks, exactly as the transport will.
+    let mut from = 1;
+    let mut complete = false;
+    while !complete {
+        let chunk = store.records_from(from, 5);
+        assert!(!chunk.is_empty(), "the store must serve a contiguous range");
+        from += chunk.len() as u64;
+        complete = verifier
+            .absorb_records(&chunk)
+            .expect("a served chain must verify");
+    }
+    assert!(verifier.is_complete());
+    assert_eq!(verifier.verified_len(), 12);
+
+    // Every outcome and delta the store serves must check against the verified records.
+    for view in 1..=12u64 {
+        let record = verifier
+            .verified_record(view)
+            .expect("record verified")
+            .clone();
+        let outcome = store.outcome_for(view).expect("outcome retained");
+        verifier
+            .check_outcome(view, outcome)
+            .expect("outcome must match its record");
+
+        let mut deltas = DeltaVerifier::new(sid.clone(), view, &record);
+        let mut start = 0u64;
+        loop {
+            let (items, last) = store.delta_chunk(view, start, 2).expect("delta retained");
+            let done = deltas.absorb(start, &items).expect("delta must verify");
+            start += items.len() as u64;
+            if last {
+                assert!(done, "the last chunk must complete the delta");
+                break;
+            }
+        }
+        assert_eq!(
+            deltas.take_items().expect("complete").len(),
+            record.delta_len as usize
+        );
+    }
+}
+
+/// The content binding. A Byzantine source may serve a perfectly well-formed chain -- it
+/// just cannot make one that reaches the certified head.
+#[test]
+fn a_forged_chain_cannot_reach_the_certified_head() {
+    let (store, sid) = populated_store(6);
+    let honest_head = store.head().clone();
+
+    // A parallel history built by a liar: same shape, different content.
+    let (fake_store, _) = {
+        let mut fake = SequenceStore::new(sid.clone(), 4);
+        for view in 1..=6u64 {
+            fake.record(view, &SequenceOutcome::Skip, &[]).unwrap();
+        }
+        (fake, ())
+    };
+    let forged = fake_store.records_from(1, 16);
+    assert_eq!(forged.len(), 6, "the forged chain is internally consistent");
+
+    let mut verifier = ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), 6, honest_head);
+    assert_eq!(
+        verifier.absorb_records(&forged),
+        Err(ChainError::HeadMismatch { view: 6 }),
+        "an internally valid but different history must fail at the certified head"
+    );
+    assert_eq!(
+        verifier.verified_len(),
+        0,
+        "a rejected chunk must change nothing"
+    );
+}
+
+/// A rejected chunk must leave the verifier untouched, so one bad source cannot force a
+/// restart -- with f Byzantine matching announcers, that would otherwise be f restarts.
+#[test]
+fn a_corrupt_chunk_leaves_the_verifier_usable() {
+    let (store, sid) = populated_store(8);
+    let target_head = store.head().clone();
+    let mut verifier = ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), 8, target_head);
+
+    let good = store.records_from(1, 4);
+    verifier.absorb_records(&good).unwrap();
+    assert_eq!(verifier.next_view(), 5);
+
+    // A source tampers with one field. Any of them breaks the link or the final head.
+    let mut tampered = store.records_from(5, 4);
+    tampered[1].delta_len += 1;
+    assert!(verifier.absorb_records(&tampered).is_err());
+    assert_eq!(
+        verifier.next_view(),
+        5,
+        "state must not move on a rejected chunk"
+    );
+    assert_eq!(verifier.verified_len(), 4);
+
+    // The honest copy of the same range still completes the transfer.
+    let honest = store.records_from(5, 4);
+    assert!(verifier
+        .absorb_records(&honest)
+        .expect("honest chunk verifies"));
+    assert!(verifier.is_complete());
+}
+
+#[test]
+fn out_of_order_and_past_target_records_are_rejected() {
+    let (store, sid) = populated_store(6);
+    let head = store.head().clone();
+
+    let mut v = ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), 6, head.clone());
+    assert_eq!(
+        v.absorb_records(&store.records_from(2, 2)),
+        Err(ChainError::UnexpectedView {
+            expected: 1,
+            got: 2
+        }),
+        "records must arrive in view order"
+    );
+
+    let mut v = ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), 3, head);
+    assert_eq!(
+        v.absorb_records(&store.records_from(1, 6)),
+        Err(ChainError::PastTarget { target: 3 }),
+        "a source must not push past the target view"
+    );
+}
+
+#[test]
+fn delta_chunks_reject_gaps_overruns_and_wrong_content() {
+    let (store, sid) = populated_store(4);
+    let record = store.record_for(1).expect("view 1").clone();
+    assert_eq!(record.delta_len, 3);
+
+    let mut v = DeltaVerifier::new(sid.clone(), 1, &record);
+    let (items, _) = store.delta_chunk(1, 0, 3).unwrap();
+
+    // Wrong offset.
+    assert_eq!(
+        v.absorb(1, &items),
+        Err(ChainError::UnexpectedIndex {
+            expected: 0,
+            got: 1
+        })
+    );
+    // Overlong.
+    let too_many: Vec<Digest> = (0..5).map(digest).collect();
+    assert_eq!(
+        v.absorb(0, &too_many),
+        Err(ChainError::DeltaTooLong { view: 1 })
+    );
+    // Right length, wrong content -- caught only at the final head comparison.
+    let wrong: Vec<Digest> = (0..3).map(|i| digest(200 + i)).collect();
+    assert_eq!(
+        v.absorb(0, &wrong),
+        Err(ChainError::DeltaMismatch { view: 1 })
+    );
+    // And the honest items still verify afterwards.
+    assert!(v.absorb(0, &items).expect("honest delta verifies"));
+    assert!(v.is_complete());
+}
+
+/// Section 7.3 step 3, and section 9's rule against silent clamping.
+#[test]
+fn skip_deltas_are_empty_and_unretained_views_are_not_faked() {
+    let (store, sid) = populated_store(6);
+    // View 3 is a Skip in the fixture.
+    let record = store.record_for(3).expect("view 3").clone();
+    assert_eq!(record.delta_len, 0);
+    let (items, last) = store
+        .delta_chunk(3, 0, 8)
+        .expect("a Skip still has a delta entry");
+    assert!(items.is_empty() && last);
+
+    let head = store.head().clone();
+    let mut verifier = ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), 6, head);
+    verifier.absorb_records(&store.records_from(1, 6)).unwrap();
+    // A liar claims the Skip carried output.
+    assert_eq!(
+        verifier.check_outcome(3, &SequenceOutcome::Core { c: manifest(1) }),
+        Err(ChainError::OutcomeMismatch { view: 3 })
+    );
+    verifier
+        .check_outcome(3, &SequenceOutcome::Skip)
+        .expect("the honest Skip matches");
+
+    // A view the store never had is reported as absent, never as an empty success.
+    assert!(store.delta_chunk(99, 0, 8).is_none());
+    assert!(store.outcome_for(99).is_none());
+    assert_eq!(store.serve_floor(), 1);
+}
+
+/// A gap must truncate the answer rather than be skipped: the requester chains
+/// `previous_head`, so a response that jumps a view cannot link and looks like corruption.
+#[test]
+fn records_from_stops_at_a_gap() {
+    let (store, _) = populated_store(5);
+    assert_eq!(store.records_from(1, 100).len(), 5);
+    assert_eq!(store.records_from(3, 100).len(), 3);
+    assert!(store.records_from(9, 4).is_empty());
+    assert_eq!(store.records_from(1, 2).len(), 2, "max is respected");
+}
