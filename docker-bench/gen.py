@@ -259,14 +259,13 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "ack_watermarks": not args.no_ack_watermarks,
         "ack_watermark_period_ms": args.ack_watermark_period_ms,
         "digest_statements": not args.no_digest_statements,
-        # SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase A: record-only. Off by default in
-        # the node, so the local harness must be able to turn it on or the gate
-        # cannot be scored at all.
-        "sequence_checkpoints": args.sequence_checkpoints,
+        # SEQUENCE-CHECKPOINT-SYNC-PLAN.md: default-on state sync. `--no-state-sync`
+        # disables both the checkpoint log and install path for control runs.
+        "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
-        "sequence_install_enabled": args.sequence_install,
+        "sequence_install_enabled": not args.no_state_sync,
         # Explicit Some(0), not absent/null, REGARDLESS of --no-latency: real one-way
         # delay (when enabled) comes from tc netem, not from this process, so the
         # in-process aws_rtt default (`node run`'s own fallback whenever this key is
@@ -467,11 +466,11 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
         "tx_size": args.tx_size,
         "mode": args.mode,
         "latency": args.latency,
-        "sequence_checkpoints": args.sequence_checkpoints,
+        "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
-        "sequence_install_enabled": args.sequence_install,
+        "sequence_install_enabled": not args.no_state_sync,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -521,17 +520,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--no-ack-watermarks", action="store_true",
                help="disable periodic availability watermarks (ON by default)")
     p.add_argument("--ack-watermark-period-ms", type=int, default=50)
-    p.add_argument("--sequence-checkpoints", action="store_true",
-                   help="build/announce sequence checkpoints and run verify-only sync")
+    p.add_argument("--no-state-sync", action="store_true",
+                   help="disable sequence checkpoint state sync and installation")
     p.add_argument("--sequence-checkpoint-interval", type=int, default=100,
                    help="checkpoint boundary interval K in views; must be small "
                         "enough that the run crosses several boundaries on 2+ nodes")
     p.add_argument("--sequence-sync-min-gap-views", type=int, default=50,
                    help="minimum certified cursor gap that starts state sync (default 50)")
-    p.add_argument("--sequence-install", action="store_true",
-                   help="APPLY verified checkpoint state to the cursor (Phase C). Implies "
-                        "--sequence-checkpoints. Off by default: this is the only path that "
-                        "produces committed output from bytes another party derived.")
     p.add_argument("--sequence-sync-chunk-outcomes", type=int, default=8,
                    help="terminal outcome bodies per state-sync response (default 8)")
     p.add_argument("--no-digest-statements", action="store_true",
@@ -571,9 +566,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--withhold must be between 0 and --nodes")
     if args.withhold_at is not None and args.withhold == 0:
         p.error("--withhold-at requires --withhold > 0")
-    if args.sequence_install and not args.sequence_checkpoints:
-        # Installing without announcing/verifying would leave nothing to install from.
-        args.sequence_checkpoints = True
     if args.sequence_checkpoint_interval < 1:
         p.error("--sequence-checkpoint-interval must be at least 1")
     if args.sequence_sync_min_gap_views < 0:

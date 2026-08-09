@@ -804,22 +804,22 @@ fn run_transfer(
                 )
                 .expect("honest outcomes verify");
             }
-            SequenceWant::Delta { view, start_index } => {
-                let (items, complete) = store.delta_chunk(view, start_index, 2).expect("retained");
-                t.on_delta(
-                    &SequenceDeltaChunk {
+            SequenceWant::Deltas {
+                from_view,
+                start_index,
+            } => {
+                let entries = store.delta_entries_from(from_view, start_index, target_view, 3, 2);
+                t.on_delta_range(
+                    &SequenceDeltaRangeChunk {
                         version: SEQUENCE_VERSION,
                         transfer_id: 7,
                         target_head: store.head().clone(),
-                        view,
-                        start_index,
-                        items,
-                        complete,
+                        entries,
                         sender: *serve_from,
                     },
                     serve_from,
                 )
-                .expect("honest delta verifies");
+                .expect("honest deltas verify");
             }
         }
     }
@@ -1156,8 +1156,8 @@ fn a_corrupt_delta_chunk_restarts_that_view() {
         .is_err());
     assert_eq!(
         t.want(),
-        Some(SequenceWant::Delta {
-            view: 1,
+        Some(SequenceWant::Deltas {
+            from_view: 1,
             start_index: 0
         }),
         "a poisoned delta must restart at index 0, not resume mid-stream"

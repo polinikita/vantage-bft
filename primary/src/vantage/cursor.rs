@@ -299,10 +299,10 @@ impl Cursor {
     ///    contradicts. Installing would duplicate or reorder committed output. Under Phase
     ///    A determinism this is impossible between correct parties, which is exactly why it
     ///    is worth checking: it can only fire on a real divergence.
-    /// 3. `BlocksMissing` -- a digest in the delta is not cached. `emit` resolves headers
-    ///    by cache lookup and silently omits what it cannot find, so an unchecked install
-    ///    over a partial cache would advance the view while dropping the blocks it was
-    ///    supposed to deliver. Silent output loss, not a stall.
+    /// 3. `BlocksMissing` -- a digest in the delta is not cached and block-verified.
+    ///    `emit` resolves headers by cache lookup and silently omits what it cannot find,
+    ///    so an unchecked install over a partial cache would advance the view while
+    ///    dropping the blocks it was supposed to deliver. Silent output loss, not a stall.
     ///
     /// Also refuses `AlreadyOutput`: a fresh digest that is already in `D`. Between correct
     /// parties this cannot happen -- the source's own `expand` deduplicated against an
@@ -401,7 +401,7 @@ impl Cursor {
             let blocks = self.blocks.lock();
             if let Some(d) = chunk
                 .iter()
-                .find(|d| !blocks.get(d).is_some_and(|e| e.payload_ok))
+                .find(|d| !blocks.get(d).is_some_and(|e| e.block_ok_verified))
             {
                 return Err(InstallError::BlocksMissing {
                     view,

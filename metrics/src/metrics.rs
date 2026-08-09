@@ -756,6 +756,10 @@ pub struct Metrics {
     /// Nonzero means a peer cannot keep up; the requester recovers by timing out and
     /// failing over, which it must handle anyway since up to `f` sources may withhold.
     pub vantage_sequence_sync_dropped_total: IntCounter,
+    /// State-sync frames dropped because this node's dedicated inbound sequence queue was
+    /// full. Dropped announcements repeat; dropped replies are recovered by requester
+    /// timeouts.
+    pub vantage_sequence_sync_inbound_dropped_total: IntCounter,
     /// State-sync frames served to peers.
     pub vantage_sequence_sync_served_total: IntCounter,
     /// Responses arriving with no active transfer. Phase B never installs, so every
@@ -810,6 +814,9 @@ pub struct Metrics {
     /// `sequence_install_window_views`; pinned at that bound means repair, not the window,
     /// is the limiter.
     pub vantage_sequence_install_views_in_flight: IntGauge,
+    /// Verified output digests in the staged install whose headers/payloads are not yet
+    /// deliverable. This is the direct "what is the installer waiting for?" gauge.
+    pub vantage_sequence_install_blocks_awaited: IntGauge,
     /// Targets whose every view became locally held. The precondition for installing:
     /// until this fires there is nothing to install, only something to fetch.
     pub vantage_sequence_install_ready_total: IntCounter,
@@ -828,6 +835,9 @@ pub struct Metrics {
     pub vantage_sequence_install_completed_total: IntCounter,
     /// Highest view installed from verified checkpoint state.
     pub vantage_sequence_install_completed_view: IntGauge,
+    /// Consensus/control/service messages discarded because a large active sequence-sync
+    /// gap or staged install makes parking them stale work.
+    pub vantage_sequence_install_obsolete_inbound_dropped_total: IntCounter,
 
     /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
     /// addressed to a peer we have not managed to connect to yet. Best-effort sends
@@ -1777,6 +1787,12 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_sequence_sync_inbound_dropped_total: register_int_counter_with_registry!(
+                "vantage_sequence_sync_inbound_dropped_total",
+                "State-sync frames dropped because the dedicated inbound sequence queue was full",
+                registry,
+            )
+            .unwrap(),
             vantage_sequence_sync_served_total: register_int_counter_with_registry!(
                 "vantage_sequence_sync_served_total",
                 "State-sync frames served to peers",
@@ -1837,6 +1853,12 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_sequence_install_blocks_awaited: register_int_gauge_with_registry!(
+                "vantage_sequence_install_blocks_awaited",
+                "Verified output digests in the staged install not yet deliverable",
+                registry,
+            )
+            .unwrap(),
             vantage_sequence_install_ready_total: register_int_counter_with_registry!(
                 "vantage_sequence_install_ready_total",
                 "Targets whose every view became locally held",
@@ -1873,6 +1895,13 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_sequence_install_obsolete_inbound_dropped_total:
+                register_int_counter_with_registry!(
+                    "vantage_sequence_install_obsolete_inbound_dropped_total",
+                    "Consensus/control/service messages discarded while a sequence install makes them stale",
+                    registry,
+                )
+                .unwrap(),
             vantage_sequence_boundary_head_lo: register_int_gauge_with_registry!(
                 "vantage_sequence_boundary_head_lo",
                 "Leading 8 bytes of the boundary head as a signed integer, for graphing",

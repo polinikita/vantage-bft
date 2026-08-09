@@ -1,29 +1,29 @@
 // SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10 -- Phase C staging: turn a VERIFIED sequence
-// target into blocks this node actually holds.
+// target into verified headers this node can sequence.
 //
 // A verified transfer yields per-view `(outcome, delta)`, where the delta is a list of
 // block DIGESTS -- the identities of the blocks the target says were output, not the
-// blocks themselves. Nothing can be installed until those blocks are in the local cache,
-// so this module is the bridge: it turns each view's outcome manifests into fetch work for
-// the existing `Repairer`, and reports when a view's whole delta is finally in hand.
+// blocks themselves. Nothing can be installed until those headers are in the local cache
+// and chain-verified, so this module is the bridge: it turns each view's outcome
+// manifests into fetch work for the existing `Repairer`, and reports when a view's whole
+// delta is finally sequence-ready.
 //
 // The fetch instruction is the OUTCOME's manifests, not the delta. A `Manifest` entry is
 // exactly a `BlockRef`, and `Repairer::authorize` already walks the named lane's prefix,
 // requesting every missing ancestor with bounded fan-out, a congestion window and worker-
 // payload sync on arrival. The delta is the completion test instead: it is the
-// authoritative list of what this view must deliver, and checking it against the cache
-// works no matter how the blocks arrived, so ordinary dissemination beating repair to them
-// costs nothing.
+// authoritative list of what this view must sequence, and checking it against the cache
+// works no matter how the headers arrived, so ordinary dissemination beating repair to
+// them costs nothing. Worker payload materialization is deliberately not part of this
+// readiness gate: the commit notification carries batch digests to the worker
+// synchronizer, which is the layer responsible for fetching transaction bytes.
 //
 // PACING. A target can span hundreds of views across n lanes, and authorizing all of it at
-// once grows `Repairer::pending_settle` without bound -- the exact set whose unbounded
-// growth produced 612,424,724 settle calls against 60,262 blocks on the 2026-08-07 n=100
-// run (repair.rs's `on_block_available` doc comment). So views are admitted in install
-// order behind two gates: at most `window_views` in flight, and nothing new admitted while
-// repair's own pending set is above `settle_ceiling`. The window keeps one slow lane from
-// serializing the whole range; the settle gate is the same feedback idiom
-// `RECOVERY_IN_FLIGHT_MAX` already applies to requests, so installation cannot outrun the
-// machinery it is driving.
+// once grows repair's authorized suffix without bound. So views are admitted in install
+// order behind a hard window: at most `window_views` views in flight. An earlier version
+// also vetoed admission while `Repairer::pending_settle_len()` was high, but that signal
+// is high precisely because the node is behind. Keying rescue on it made the installer
+// stop in the condition it exists to clear.
 
 use crate::messages::Header;
 use crate::primary::{Height, View};
@@ -34,14 +34,15 @@ use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Views admitted into the fetch window at once. Eight is enough that a single slow lane
-/// overlaps with progress on later views, and small enough that the authorized set stays
-/// on the order of `8 * n` refs rather than `range * n`.
-pub const DEFAULT_WINDOW_VIEWS: usize = 8;
+/// Views admitted into the fetch window at once. The installer applies views in order,
+/// but fetch must run farther ahead: a late joiner otherwise waits on one slow repaired
+/// header inside an eight-view window while hundreds of later headers could already be in
+/// flight. 64 keeps the authorized set bounded (`64 * n` refs) while giving repair enough
+/// runway to overlap WAN delay.
+pub const DEFAULT_WINDOW_VIEWS: usize = 64;
 
-/// `Repairer::pending_settle_len()` above which no further view is admitted. Set well
-/// below the 4,967 unsettled refs measured on a straggler, so installation backs off
-/// before it reaches the regime that pinned the core.
+/// Retained for config compatibility. Admission is now bounded by `DEFAULT_WINDOW_VIEWS`
+/// only; repair backlog is an outcome of lag and must not veto state sync.
 pub const DEFAULT_SETTLE_CEILING: usize = 2_048;
 
 /// What a rebase concluded about a target after the cursor moved under it.
@@ -72,9 +73,9 @@ struct StagedView {
     /// Number of consecutive deliverable digests already checked. Readiness validation is
     /// resumed from here so a large view is never re-scanned from its first block.
     ready_prefix: usize,
-    /// Every digest in `delta` is cached. Latched: the cache only grows within a session
-    /// for blocks this range needs, and re-checking a finished view every tick is the
-    /// per-tick sweep this module exists to avoid.
+    /// Every digest in `delta` is cached and block-verified. Latched: the cache only
+    /// grows within a session for blocks this range needs, and re-checking a finished
+    /// view every tick is the per-tick sweep this module exists to avoid.
     complete: bool,
 }
 
@@ -99,7 +100,6 @@ pub struct SequenceInstall {
     /// Next view to install. Never runs ahead of `next_admit`.
     next_install: View,
     window_views: usize,
-    settle_ceiling: usize,
 }
 
 impl SequenceInstall {
@@ -112,7 +112,7 @@ impl SequenceInstall {
         staged: Vec<(View, SequenceOutcome, Vec<Digest>)>,
         heads: Vec<(View, Digest)>,
         window_views: usize,
-        settle_ceiling: usize,
+        _settle_ceiling: usize,
     ) -> Self {
         let heads: BTreeMap<View, Digest> = heads
             .into_iter()
@@ -148,7 +148,6 @@ impl SequenceInstall {
             next_admit: base_view + 1,
             next_install: base_view + 1,
             window_views: window_views.max(1),
-            settle_ceiling,
         }
     }
 
@@ -248,13 +247,15 @@ impl SequenceInstall {
             .count()
     }
 
-    /// Digests this target still needs and cannot yet deliver. Diagnostic only -- an
-    /// install that stops making progress is otherwise indistinguishable from a slow one.
+    /// Digests admitted into the fetch window whose headers are still not sequence-ready.
+    /// Diagnostic only -- an install that stops making progress is otherwise
+    /// indistinguishable from a slow one. Deliberately bounded to admitted views so the
+    /// gauge cannot scan a thousand-view target on every tick.
     pub fn blocks_awaited(&self, blocks: &SharedBlocks) -> usize {
         let cache = blocks.lock();
         self.views
             .values()
-            .filter(|v| !v.complete)
+            .filter(|v| v.admitted && !v.complete)
             .flat_map(|v| v.delta.iter())
             .filter(|d| !deliverable(&cache, d))
             .count()
@@ -291,7 +292,7 @@ impl SequenceInstall {
     }
 
     /// Re-test at most `budget` new digests and latch views whose whole delta can be
-    /// delivered. Each view resumes at its first unchecked digest, avoiding a full scan on
+    /// sequenced. Each view resumes at its first unchecked digest, avoiding a full scan on
     /// every tick while preserving strict prefix readiness.
     pub fn refresh_budgeted(&mut self, blocks: &SharedBlocks, budget: usize) -> usize {
         let cache = blocks.lock();
@@ -322,15 +323,14 @@ impl SequenceInstall {
         self.refresh_budgeted(blocks, usize::MAX);
     }
 
-    /// Refs to hand `Repairer::authorize`, respecting both gates.
+    /// Refs to hand `Repairer::authorize`, respecting the install window.
     ///
-    /// Returns empty when the window is full, when repair is already congested, or when
-    /// the target is fully staged -- all three are ordinary, not errors.
-    pub fn admit(&mut self, pending_settle_len: usize) -> Vec<BlockRef> {
+    /// Returns empty when the window is full or the target is fully staged; both are
+    /// ordinary, not errors. The `pending_settle_len` parameter is kept so older call
+    /// sites/tests using the pre-window-only API still compile, but it deliberately does
+    /// not gate admission.
+    pub fn admit(&mut self, _pending_settle_len: usize) -> Vec<BlockRef> {
         let mut out = Vec::new();
-        if pending_settle_len >= self.settle_ceiling {
-            return out;
-        }
         while self.next_admit <= self.target_view && self.views_in_flight() < self.window_views {
             let view = self.next_admit;
             let Some(staged) = self.views.get_mut(&view) else {
@@ -349,7 +349,7 @@ impl SequenceInstall {
         out
     }
 
-    /// The next view ready to apply, or `None` while its blocks are still missing.
+    /// The next view ready to apply, or `None` while its headers are still missing.
     /// Strictly in order: a later complete view is never installed ahead of an earlier
     /// incomplete one.
     pub fn installable(&self) -> Option<View> {
@@ -382,24 +382,17 @@ impl SequenceInstall {
     }
 }
 
-/// Can this block actually be handed to the executor?
+/// Can this block be sequenced by the consensus cursor?
 ///
-/// Presence is NOT enough. `Repairer::on_serve` upserts repaired headers with
-/// `payload_ok = false` on purpose -- repair is a chain-authenticity concern (D1 clause
-/// ii), not a payload-possession one (clause iii) -- and `collect_verified_suffix` checks
-/// only `block_ok_verified`. So a header can be cached, chain-verified and still have none
-/// of its worker batches locally. `Cursor::emit` would resolve its `Header` fine and
-/// `notify_committed` would send `PrimaryWorkerMessage::Committed` for batch digests the
-/// worker does not hold.
-///
-/// The ordinary path has the same shape but not the same exposure: blocks arrive roughly
-/// in real time, and the `SyncBatches` emitted on arrival usually resolves before the
-/// cursor reaches them. An install pulls a whole backlog at once, so the window is wide and
-/// systematic rather than incidental -- thousands of headers whose payloads are all still
-/// in flight. Waiting for `payload_ok` costs a stalled view, which `rebase` and the fetch
-/// window already handle; not waiting costs committed output the node cannot produce.
+/// Presence is NOT enough: a cached header must also have passed `block_ok`, otherwise a
+/// checkpoint transfer could make the cursor emit an unauthenticated lane suffix. Worker
+/// payload possession is intentionally not required here. `Cursor::emit` sends the header's
+/// batch digests to the worker, and the worker synchronizer is responsible for downloading
+/// any transaction bytes it missed while the primary catches up consensus state.
 fn deliverable(cache: &BlockCache, digest: &Digest) -> bool {
-    cache.get(digest).is_some_and(|entry| entry.payload_ok)
+    cache
+        .get(digest)
+        .is_some_and(|entry| entry.block_ok_verified)
 }
 
 /// A view's fetch instruction: every manifest entry named by its outcome.

@@ -24,8 +24,7 @@ fn empty_cache() -> SharedBlocks {
     Arc::new(Mutex::new(BlockCache::new()))
 }
 
-/// Headers WITH their worker payloads materialized -- the state a block must reach before
-/// it can be delivered.
+/// Headers WITH their worker payloads materialized -- the ordinary direct-publish state.
 fn cache_insert(blocks: &SharedBlocks, headers: &[Header]) {
     let mut cache = blocks.lock();
     for h in headers {
@@ -34,7 +33,8 @@ fn cache_insert(blocks: &SharedBlocks, headers: &[Header]) {
 }
 
 /// Headers exactly as `Repairer::on_serve` leaves them: chain-verified, payload NOT yet
-/// synced. Presence without deliverability.
+/// synced. This is enough for consensus sequence install; worker sync materializes the
+/// payload bytes after commit notification.
 fn cache_insert_headers_only(blocks: &SharedBlocks, headers: &[Header]) {
     let mut cache = blocks.lock();
     for h in headers {
@@ -122,22 +122,17 @@ fn the_fetch_window_bounds_views_in_flight() {
     assert_eq!(install.views_in_flight(), 3);
 }
 
-/// The gate that matters more than the window. This mechanism runs on nodes that are
-/// already behind, which is exactly when repair's backlog is already deep, so admitting
-/// work regardless of that backlog would add load precisely where it hurts.
+/// Repair backlog is high exactly when a node is behind. It must not veto the bounded
+/// state-sync window, or the rescue path disables itself in the condition it should clear.
 #[test]
-fn a_congested_repairer_admits_nothing() {
+fn repair_backlog_does_not_veto_admission() {
     let (mut install, _) = install_of(10, 8, 100);
 
-    assert!(
-        install.admit(100).is_empty(),
-        "at the ceiling, no view is admitted"
+    assert_eq!(
+        install.admit(4096).len(),
+        8,
+        "only the install window gates admission"
     );
-    assert!(install.admit(4096).is_empty(), "far above it, still none");
-    assert_eq!(install.views_in_flight(), 0);
-
-    // Backlog drains: admission resumes from where it left off, having skipped nothing.
-    assert_eq!(install.admit(99).len(), 8);
     assert_eq!(install.views_in_flight(), 8);
 }
 
@@ -362,11 +357,11 @@ fn rebase_moves_the_admission_point_too() {
 }
 
 /// A repaired header enters the cache with `payload_ok = false` on purpose -- repair is a
-/// chain-authenticity concern, not a payload-possession one -- and `collect_verified_suffix`
-/// checks only `block_ok_verified`. So a view can be fully present and still undeliverable:
-/// `notify_committed` would send `Committed` for batch digests the worker does not hold.
+/// chain-authenticity concern, not a payload-possession one. Sequence install follows the
+/// same split: once the header is chain-verified, the cursor may advance and the worker
+/// synchronizer is responsible for materializing any missing batches.
 #[test]
-fn headers_without_payloads_are_not_ready_to_install() {
+fn headers_without_payloads_are_ready_to_install() {
     let (mut install, headers) = install_of(3, 8, 4096);
     let blocks = empty_cache();
     install.admit(0);
@@ -375,16 +370,9 @@ fn headers_without_payloads_are_not_ready_to_install() {
     install.refresh(&blocks);
     assert_eq!(
         install.views_complete(),
-        0,
-        "every header is cached and chain-verified, and none of it can be delivered"
+        3,
+        "chain-verified headers are sequence-ready even before worker payloads land"
     );
-    assert_eq!(install.installable(), None);
-    assert_eq!(install.blocks_awaited(&blocks), 3);
-
-    // The batches land; the same headers now count.
-    cache_insert(&blocks, &headers);
-    install.refresh(&blocks);
-    assert_eq!(install.views_complete(), 3);
     assert_eq!(install.blocks_awaited(&blocks), 0);
     assert_eq!(install.installable(), Some(1));
 }
@@ -413,29 +401,29 @@ fn rebase_refuses_a_boundary_whose_local_head_disagrees() {
     );
 }
 
-/// The initial Synchronize for a repaired header can be lost, and `payload_ok` would then
-/// never flip on its own -- the retry list is what breaks that deadlock. It must name only
-/// blocks that are actually stuck, and must not re-walk the part of a view already known
-/// deliverable: this runs every tick against deltas that are each a whole lane suffix.
+/// Before the next refresh/install tick marks a header-only view complete, the retry list
+/// can still re-emit worker payload sync for headers whose initial `Synchronize` was lost.
+/// Once the view is sequence-ready, commit notification takes over and the install no
+/// longer scans it for payload retries.
 #[test]
 fn payload_retry_names_stuck_blocks_and_skips_the_ready_prefix() {
     let (mut install, headers) = install_of(2, 8, 4096);
     let blocks = empty_cache();
     install.admit(0);
 
-    // View 1 deliverable, view 2 header-only: exactly one block is stuck.
+    // View 1 payload-ready, view 2 header-only: before refresh, exactly one block still
+    // needs a worker payload retry.
     cache_insert(&blocks, &headers[0..1]);
     cache_insert_headers_only(&blocks, &headers[1..2]);
-    install.refresh(&blocks);
-    assert_eq!(install.views_complete(), 1, "only view 1 can be delivered");
-
     let retry = install.payload_retry_headers(&blocks, 64);
     assert_eq!(retry.len(), 1);
     assert_eq!(retry[0].id, headers[1].id);
 
-    // Once its batches land nothing is stuck, and the completed view is not rescanned.
-    cache_insert(&blocks, &headers[1..2]);
     install.refresh(&blocks);
-    assert!(install.payload_retry_headers(&blocks, 64).is_empty());
-    assert_eq!(install.views_complete(), 2);
+    assert_eq!(install.views_complete(), 2, "both views are sequence-ready");
+
+    assert!(
+        install.payload_retry_headers(&blocks, 64).is_empty(),
+        "completed views are not rescanned for payload retries"
+    );
 }

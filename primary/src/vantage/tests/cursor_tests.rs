@@ -531,16 +531,16 @@ async fn install_chunks_a_large_delta_and_resumes() {
     );
 }
 
-/// A header whose worker batches have not been synced is present but not deliverable.
-/// `emit` would resolve its `Header` and `notify_committed` would send `Committed` for
-/// batch digests the worker does not hold.
+/// A repaired header whose worker batches have not been synced is still sequence-ready.
+/// `emit` resolves its `Header` and `notify_committed` hands the batch digests to the
+/// worker synchronizer, which owns payload materialization.
 ///
 /// The undeliverable block is minted here rather than taken from `direct_chain`, because
 /// `payload_ok` is monotonic by design -- `upsert` OR-merges it and `set_payload_ok` only
 /// ever sets it true -- so a block that was ever published directly cannot be walked back
 /// into the repaired-but-unsynced state this checks.
 #[tokio::test]
-async fn install_refuses_a_block_whose_payload_is_not_materialized() {
+async fn install_accepts_a_block_whose_payload_is_not_materialized() {
     let (name, _) = authors()[3];
     let (author_a, _) = authors()[0];
     let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_install_payload");
@@ -555,7 +555,7 @@ async fn install_refuses_a_block_whose_payload_is_not_materialized() {
         .upsert(repaired.clone(), false, true, false, true);
 
     let delta = vec![chain_a[0].id.clone(), repaired.id.clone()];
-    let err = cursor
+    let (effects, finalized) = cursor
         .install(
             1,
             SequenceOutcome::Core {
@@ -564,32 +564,17 @@ async fn install_refuses_a_block_whose_payload_is_not_materialized() {
             &delta,
             usize::MAX,
         )
-        .expect_err("a block without its payload cannot be delivered");
-
-    assert_eq!(
-        err,
-        InstallError::BlocksMissing {
-            view: 1,
-            digest: repaired.id.clone()
-        }
-    );
-    assert!(
-        cursor.output_log().is_empty(),
-        "the deliverable block must not be emitted either -- the decision is all-or-nothing"
-    );
-
-    // Once the batches land the same view installs.
-    blocks.lock().set_payload_ok(&repaired.id, true);
-    let (_, finalized) = cursor
-        .install(
-            1,
-            SequenceOutcome::Core {
-                c: vec![block_ref(&repaired)],
-            },
-            &delta,
-            usize::MAX,
-        )
-        .expect("deliverable now");
+        .expect("chain-verified headers are sequence-ready");
     assert!(finalized);
     assert_eq!(cursor.output_log(), delta.as_slice());
+    assert!(
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::vantage::Effect::NotifyCommitted(_, _, headers)
+                    if headers.iter().any(|h| h.id == repaired.id)
+            )
+        }),
+        "the worker learns about the repaired header through commit notification"
+    );
 }

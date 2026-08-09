@@ -64,10 +64,19 @@ def main():
     started = last(q(a.prom, f"vantage_sequence_sync_started_total{sel}", start, end))
     verified = last(q(a.prom, f"vantage_sequence_sync_verified_total{sel}", start, end))
     exhausted = last(q(a.prom, f"vantage_sequence_sync_exhausted_total{sel}", start, end))
+    inbound_dropped = last(
+        q(a.prom, f"vantage_sequence_sync_inbound_dropped_total{sel}", start, end)
+    )
     mismatch = last(q(a.prom, f"vantage_sequence_verify_mismatch_total{sel}", start, end))
     selfcheck = last(q(a.prom, f"vantage_sequence_install_selfcheck_match_total{sel}", start, end))
     awaited = last(q(a.prom, f"vantage_sequence_install_views_ready{sel}", start, end))
     total_v = last(q(a.prom, f"vantage_sequence_install_views{sel}", start, end))
+    awaited_blocks = last(
+        q(a.prom, f"vantage_sequence_install_blocks_awaited{sel}", start, end)
+    )
+    obsolete = last(
+        q(a.prom, f"vantage_sequence_install_obsolete_inbound_dropped_total{sel}", start, end)
+    )
 
     j = lambda d: int(d.get(a.joiner, 0))
     lag = median - joiner
@@ -78,9 +87,12 @@ def main():
     print(f"{'transfers started':<28} {j(started):>10}")
     print(f"{'transfers verified':<28} {j(verified):>10}")
     print(f"{'transfers exhausted':<28} {j(exhausted):>10}")
+    print(f"{'sequence inbound drops':<28} {j(inbound_dropped):>10}")
     print(f"{'views staged in target':<28} {j(total_v):>10}")
     print(f"{'views locally held':<28} {j(awaited):>10}")
+    print(f"{'blocks awaited in window':<28} {j(awaited_blocks):>10}")
     print(f"{'VIEWS INSTALLED':<28} {j(applied):>10}")
+    print(f"{'stale sync-gap drops':<28} {j(obsolete):>10}")
     print(f"{'targets installed in full':<28} {j(completed):>10}")
     print(f"{'installs refused':<28} {j(failed):>10}")
     print(f"{'head self-check matches':<28} {j(selfcheck):>10}")

@@ -29,15 +29,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 JOINER="vantage-node-$((NODES - 1))"
-# Warm-up before the outage + the outage itself + time to sync afterwards.
-DURATION=$((30 + DOWN + SETTLE))
+# Warm-up before the outage + the outage itself + time to sync afterwards. The clients
+# start when Compose starts, while run.sh's visible timeline starts only after the killed
+# joiner comes back and every target is healthy. Add margin so the client workload is
+# still alive during the recovery window instead of expiring during readiness.
+DURATION=$((30 + DOWN + SETTLE + 90))
 
 echo "==> late joiner: n=$NODES, $JOINER down for ${DOWN}s, ${SETTLE}s to catch up"
 
 ./run.sh --nodes "$NODES" --rate "$RATE" --duration "$DURATION" \
-    --sequence-checkpoints --sequence-install \
-    --sequence-checkpoint-interval "$INTERVAL" \
-    --sequence-sync-min-gap-views 5 &
+    --sequence-checkpoint-interval "$INTERVAL" &
 RUN_PID=$!
 
 # Wait for the joiner to exist, then kill it before it can learn anything useful.

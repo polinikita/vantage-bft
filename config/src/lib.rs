@@ -342,10 +342,10 @@ pub struct Parameters {
     pub digest_statements: bool,
 
     /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md. Build the local hash-chained sequence log and
-    /// checkpoint-boundary heads. Phase B also announces, certifies, downloads, and
-    /// verifies remote history; installation remains disabled until Phase C.
+    /// checkpoint-boundary heads. State sync also announces, certifies, downloads,
+    /// verifies, and, when `sequence_install_enabled` is true, installs remote history.
     ///
-    /// `#[serde(default)]` = `false`. Off, the store is never constructed and the only
+    /// `#[serde(default)]` = `true`. Off, the store is never constructed and the only
     /// residue is one `Vec<Digest>` for the current cursor view, which the cursor
     /// accumulates unconditionally so its output rules cannot depend on configuration.
     #[serde(default = "default_sequence_checkpoints")]
@@ -421,22 +421,21 @@ pub struct Parameters {
     #[serde(default = "default_sequence_install_window_views")]
     pub sequence_install_window_views: usize,
 
-    /// `Repairer::pending_settle_len()` above which the install fetch admits no further
-    /// view. Unsettled refs are the set whose unbounded growth turned 60,262 received
-    /// blocks into 612M settle calls on the 2026-08-07 n=100 run, so an installer that
-    /// ignored repair's backlog would recreate that regime on exactly the nodes least able
-    /// to absorb it.
+    /// Retained for config compatibility with earlier Phase C builds.
+    ///
+    /// Install admission is now bounded by `sequence_install_window_views`, not by
+    /// `Repairer::pending_settle_len()`: repair backlog is high precisely because a node
+    /// is behind, so using it as a veto disabled the rescue path in the cases it exists to
+    /// handle.
     #[serde(default = "default_sequence_install_settle_ceiling")]
     pub sequence_install_settle_ceiling: usize,
 
     /// Apply verified checkpoint state to the cursor, rather than only fetching and
     /// verifying it.
     ///
-    /// OFF by default and separate from `sequence_checkpoints` on purpose: staging is
-    /// observation and costs a node nothing it would not otherwise spend on repair, while
-    /// installation is the only path in the system that produces committed output from
-    /// bytes another party derived. The plan enables it first on deliberately
-    /// delayed/restarted nodes, not fleet-wide.
+    /// ON by default and separate from `sequence_checkpoints` on purpose: control runs
+    /// can keep the checkpoint log/announcements while disabling the only path that
+    /// produces committed output from bytes another party derived.
     #[serde(default = "default_sequence_install_enabled")]
     pub sequence_install_enabled: bool,
 
@@ -820,9 +819,9 @@ fn default_digest_statements() -> bool {
     true
 }
 
-/// Off until guarded installation and its adversarial audit complete (plan Phase C).
+/// On by default: sequence checkpoints/state sync is now the normal Vantage recovery path.
 fn default_sequence_checkpoints() -> bool {
-    false
+    true
 }
 
 /// 100 views. Frequent enough that a straggler's recovery anchor is never far behind,
@@ -874,10 +873,11 @@ fn default_sequence_sync_inbound_capacity() -> usize {
 }
 
 /// Mirrors `vantage::install::DEFAULT_WINDOW_VIEWS` (that crate depends on this one, not
-/// the other way round). Eight views overlaps progress across a slow lane while keeping
-/// the authorized set on the order of `8 * n` refs rather than `range * n`.
+/// the other way round). 64 views overlaps repaired-header fetches across WAN delay while
+/// keeping the authorized set bounded at `64 * n` refs rather than the whole missing
+/// range.
 fn default_sequence_install_window_views() -> usize {
-    8
+    64
 }
 
 /// Mirrors `vantage::install::DEFAULT_SETTLE_CEILING`. Well below the 4,967 unsettled refs
@@ -887,7 +887,7 @@ fn default_sequence_install_settle_ceiling() -> usize {
 }
 
 fn default_sequence_install_enabled() -> bool {
-    false
+    true
 }
 
 fn default_sequence_install_views_per_tick() -> usize {

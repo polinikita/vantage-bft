@@ -17,6 +17,10 @@ use crate::vantage::control::{ControlLog, ControlProposal, Round};
 /// candidates are dead weight, and this exists purely to bound memory against a peer
 /// announcing arbitrary future boundaries.
 const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
+/// Delta views requested in one state-sync range frame. The byte bound is still
+/// `sequence_sync_chunk_digests`; this only limits the number of tiny/empty views a
+/// single response can advance across.
+const SEQUENCE_DELTA_RANGE_VIEWS: usize = 256;
 
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
@@ -36,9 +40,10 @@ use crate::vantage::resume::{
 };
 use crate::vantage::sequence::{
     genesis_head, head_hex, head_prefix_i64, CheckpointCollector, SequenceAnnouncement,
-    SequenceDeltaChunk, SequenceDeltaRequest, SequenceOutcome, SequenceOutcomeRequest,
-    SequenceOutcomeServe, SequenceRecordChunk, SequenceRequest, SequenceStore, SequenceTransfer,
-    SequenceUnavailable, SequenceWant, TransferState, SEQUENCE_VERSION,
+    SequenceDeltaChunk, SequenceDeltaRangeChunk, SequenceDeltaRangeRequest, SequenceDeltaRequest,
+    SequenceOutcome, SequenceOutcomeRequest, SequenceOutcomeServe, SequenceRecordChunk,
+    SequenceRequest, SequenceStore, SequenceTransfer, SequenceUnavailable, SequenceWant,
+    TransferState, SEQUENCE_VERSION,
 };
 use crate::vantage::wire::{self, Wire};
 
@@ -47,6 +52,7 @@ enum SequenceResponse {
     Records(SequenceRecordChunk),
     Outcome(SequenceOutcomeServe),
     Delta(SequenceDeltaChunk),
+    DeltaRange(SequenceDeltaRangeChunk),
     Unavailable(SequenceUnavailable),
 }
 use crate::vantage::Effect;
@@ -62,6 +68,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use store::Store;
@@ -186,6 +193,8 @@ pub enum Inbound {
     SequenceRecords(SequenceRecordChunk, PublicKey),
     SequenceDeltaRequest(SequenceDeltaRequest, PublicKey),
     SequenceDelta(SequenceDeltaChunk, PublicKey),
+    SequenceDeltaRangeRequest(SequenceDeltaRangeRequest, PublicKey),
+    SequenceDeltaRange(SequenceDeltaRangeChunk, PublicKey),
     SequenceOutcomeRequest(SequenceOutcomeRequest, PublicKey),
     SequenceOutcome(SequenceOutcomeServe, PublicKey),
     SequenceUnavailable(SequenceUnavailable, PublicKey),
@@ -232,6 +241,69 @@ impl Inbound {
                 | Inbound::ResumeHello(_, _)
         )
     }
+
+    fn is_sequence_sync(&self) -> bool {
+        matches!(
+            self,
+            Inbound::SequenceAnnounce(_, _)
+                | Inbound::SequenceRequest(_, _)
+                | Inbound::SequenceRecords(_, _)
+                | Inbound::SequenceDeltaRequest(_, _)
+                | Inbound::SequenceDelta(_, _)
+                | Inbound::SequenceDeltaRangeRequest(_, _)
+                | Inbound::SequenceDeltaRange(_, _)
+                | Inbound::SequenceOutcomeRequest(_, _)
+                | Inbound::SequenceOutcome(_, _)
+                | Inbound::SequenceUnavailable(_, _)
+        )
+    }
+
+    /// Frames worth processing while a large sequence install is active. Everything else
+    /// would only build AGB/control/replay/availability state for views the verified
+    /// install is about to replace, or spend work serving peers while this node is the
+    /// one being rescued. Live header publishes are deliberately excluded: the install
+    /// materializes its verified delta through explicit header serves (`Header(_, true)`),
+    /// and ordinary publishes can otherwise fill the main queue before the tail is small
+    /// enough for normal parking to be useful again.
+    fn keep_during_large_sequence_sync(&self) -> bool {
+        matches!(
+            self,
+            Inbound::Serve(_)
+                | Inbound::SequenceAnnounce(_, _)
+                | Inbound::SequenceRecords(_, _)
+                | Inbound::SequenceDelta(_, _)
+                | Inbound::SequenceDeltaRange(_, _)
+                | Inbound::SequenceOutcome(_, _)
+                | Inbound::SequenceUnavailable(_, _)
+        )
+    }
+
+    /// View-scoped consensus/control input whose historical work is replaced by a
+    /// verified sequence install. Messages without a view stay on the ordinary path when
+    /// the install is nearly caught up; while the gap is still large,
+    /// `keep_during_large_sequence_sync` applies a stricter policy.
+    fn install_obsolete_view(&self) -> Option<View> {
+        match self {
+            Inbound::Propose(p) => Some(p.view()),
+            Inbound::Echo(e) => Some(e.proposal_view()),
+            Inbound::EchoSkip(view, _, _) => Some(*view),
+            Inbound::Ready(r) => Some(r.proposal_view()),
+            Inbound::NoReady(view, _, _) => Some(*view),
+            Inbound::Wish(view, _) => Some(*view),
+            Inbound::CompReport(view, _, _) => Some(*view),
+            Inbound::ControlInit(proposal, _) => proposal.value.as_ref().map(|(view, _)| *view),
+            Inbound::ControlEcho(_, proposal) => proposal.value.as_ref().map(|(view, _)| *view),
+            Inbound::ControlReady(_, proposal) => proposal.value.as_ref().map(|(view, _)| *view),
+            Inbound::ControlFetch(view, _, _) => Some(*view),
+            Inbound::ControlServe(view, _) => Some(*view),
+            Inbound::SkipVote(view, _) => Some(*view),
+            Inbound::EchoDigest(msg) => Some(msg.view),
+            Inbound::ReadyDigest(msg) => Some(msg.view),
+            Inbound::BodyFetch(view, _, _) => Some(*view),
+            Inbound::BodyServe(view, _) => Some(*view),
+            _ => None,
+        }
+    }
 }
 
 /// Network receiver handler for the Vantage assembly's `primary_to_primary` port.
@@ -256,6 +328,13 @@ pub struct VantageReceiverHandler {
     /// stall the reader, which is sound because every message routed here is
     /// re-requestable by construction (a resume/serve/fetch response).
     pub tx_bulk: Sender<Inbound>,
+    /// Dedicated queue for checkpoint state-sync frames. These are precisely the frames
+    /// a late node needs while its main consensus queue is full of historical traffic.
+    pub tx_sequence: Sender<Inbound>,
+    /// Set by `VantageCore` while a large active sequence-sync gap is being installed.
+    /// The receiver uses it to discard stale consensus/control/service frames before
+    /// they occupy the main core queue.
+    pub sequence_large_gap_drop: Arc<AtomicBool>,
     pub ack_aggregator: SharedAckAggregator,
     /// METRICS-DASHBOARD-SPEC.md §1: `None` only in tests that construct this handler
     /// directly without wiring metrics (matches `VantageCore`'s own optional-handle
@@ -379,6 +458,14 @@ impl MessageHandler for VantageReceiverHandler {
                 let claimed = c.sender;
                 Inbound::SequenceDelta(c, claimed)
             }
+            PrimaryMessage::VantageSequenceDeltaRangeRequest(r) => {
+                let claimed = r.requester;
+                Inbound::SequenceDeltaRangeRequest(r, claimed)
+            }
+            PrimaryMessage::VantageSequenceDeltaRange(c) => {
+                let claimed = c.sender;
+                Inbound::SequenceDeltaRange(c, claimed)
+            }
             PrimaryMessage::VantageSequenceOutcomeRequest(r) => {
                 let claimed = r.requester;
                 Inbound::SequenceOutcomeRequest(r, claimed)
@@ -395,11 +482,30 @@ impl MessageHandler for VantageReceiverHandler {
             // rather than panic (defense in depth against a misrouted message).
             _ => return Ok(()),
         };
+        if self.sequence_large_gap_drop.load(Ordering::Relaxed)
+            && !inbound.keep_during_large_sequence_sync()
+        {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_sequence_install_obsolete_inbound_dropped_total
+                    .inc();
+            }
+            return Ok(());
+        }
+
         // Bulk recovery traffic goes to its own queue, non-blocking: a full bulk
         // channel drops the message rather than stalling this receiver task, and the
         // requester re-asks on its next resume tick. Consensus traffic keeps the
         // original awaiting send on its own channel, so nothing about its delivery
         // guarantees changes -- it simply no longer queues behind re-served payload.
+        if inbound.is_sequence_sync() {
+            if self.tx_sequence.try_send(inbound).is_err() {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_sync_inbound_dropped_total.inc();
+                }
+            }
+            return Ok(());
+        }
         if inbound.is_bulk() {
             if self.tx_bulk.try_send(inbound).is_err() {
                 if let Some(metrics) = &self.metrics {
@@ -408,10 +514,27 @@ impl MessageHandler for VantageReceiverHandler {
             }
             return Ok(());
         }
-        self.tx
-            .send(inbound)
+        // Do not hand a decoded stale frame to the main queue just because this receiver
+        // task started waiting before sequence sync raised the large-gap flag. Reserve a
+        // slot first, then re-check the policy at the actual enqueue point; otherwise a
+        // full queue drains one stale item only to be refilled by an already-blocked
+        // sender task with another stale item.
+        let permit = self
+            .tx
+            .reserve()
             .await
-            .expect("Failed to send vantage message");
+            .expect("Failed to reserve vantage message slot");
+        if self.sequence_large_gap_drop.load(Ordering::Relaxed)
+            && !inbound.keep_during_large_sequence_sync()
+        {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_sequence_install_obsolete_inbound_dropped_total
+                    .inc();
+            }
+            return Ok(());
+        }
+        permit.send(inbound);
         Ok(())
     }
 }
@@ -445,6 +568,7 @@ pub struct VantageCore {
     sequence_chunk_outcomes: usize,
     sequence_chunk_digests: usize,
     sequence_sync_min_gap_views: View,
+    sequence_large_gap_drop: Arc<AtomicBool>,
     sequence_announce_period_ms: u64,
     sequence_announce_repeat_ms: u64,
     /// Phase B: at most ONE installation target at a time (section 7).
@@ -679,10 +803,14 @@ type BuildOutput = (
     Receiver<Inbound>,
     // Bulk recovery queue -- see `VantageReceiverHandler::tx_bulk`.
     Receiver<Inbound>,
+    // Checkpoint state-sync queue -- see `VantageReceiverHandler::tx_sequence`.
+    Receiver<Inbound>,
     Receiver<(Digest, Digest, WorkerId)>,
     Sender<Inbound>,
     Sender<Inbound>,
+    Sender<Inbound>,
     SharedAckAggregator,
+    Arc<AtomicBool>,
     Receiver<SocketAddr>,
 );
 
@@ -697,25 +825,41 @@ impl VantageCore {
         metrics: Option<Arc<Metrics>>,
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
-    ) -> (Sender<Inbound>, Sender<Inbound>, SharedAckAggregator) {
+    ) -> (
+        Sender<Inbound>,
+        Sender<Inbound>,
+        Sender<Inbound>,
+        SharedAckAggregator,
+        Arc<AtomicBool>,
+    ) {
         let (
             core,
             rx_vantage,
             rx_bulk,
+            rx_sequence,
             rx_payload_ready,
             tx_vantage,
             tx_bulk,
+            tx_sequence,
             ack_aggregator,
+            sequence_large_gap_drop,
             reconnect_rx,
         ) = Self::build(name, committee, parameters, store, metrics, tx_output);
         tokio::spawn(core.run(
             rx_vantage,
             rx_bulk,
+            rx_sequence,
             rx_our_digests,
             rx_payload_ready,
             reconnect_rx,
         ));
-        (tx_vantage, tx_bulk, ack_aggregator)
+        (
+            tx_vantage,
+            tx_bulk,
+            tx_sequence,
+            ack_aggregator,
+            sequence_large_gap_drop,
+        )
     }
 
     /// Everything `spawn` used to do up through constructing `core`, split out purely
@@ -737,7 +881,10 @@ impl VantageCore {
         // core at once. Oversizing it would just recreate the shared-budget problem it
         // exists to remove (see `VantageReceiverHandler::tx_bulk`).
         let (tx_bulk, rx_bulk) = channel(BULK_CHANNEL_CAPACITY);
+        let sequence_capacity = parameters.sequence_sync_inbound_capacity.max(1);
+        let (tx_sequence, rx_sequence) = channel(sequence_capacity);
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
+        let sequence_large_gap_drop = Arc::new(AtomicBool::new(false));
 
         // SECURITY (Fable audit): captured before `committee` is consumed below building
         // the sub-engines -- the single source of truth `dispatch_inbound` checks every
@@ -793,13 +940,13 @@ impl VantageCore {
         let sequence_sync = parameters.sequence_checkpoints.then(|| {
             let n = committee.size();
             let f = n.saturating_sub(1) / 3;
-            CheckpointCollector::new(
-                f + 1,
-                SEQUENCE_CANDIDATE_WINDOWS,
-                parameters
-                    .sequence_checkpoint_interval_views
-                    .saturating_mul(16),
-            )
+            // A restarted/late node is, by definition, far behind the fleet. Bounding
+            // checkpoint announcements by `local_cursor + K` makes it ignore the very
+            // anchors it needs to escape. Memory is already bounded by
+            // `SEQUENCE_CANDIDATE_WINDOWS`, and certification still needs f+1 matching
+            // authenticated senders, so production accepts any future boundary and lets
+            // the bounded candidate map evict low-value ones.
+            CheckpointCollector::new(f + 1, SEQUENCE_CANDIDATE_WINDOWS, View::MAX)
         });
         let control = ControlLog::new(name, committee.clone(), sid, parameters.delta_ms);
 
@@ -910,6 +1057,7 @@ impl VantageCore {
             sequence_chunk_outcomes: parameters.sequence_sync_chunk_outcomes,
             sequence_chunk_digests: parameters.sequence_sync_chunk_digests,
             sequence_sync_min_gap_views: parameters.sequence_sync_min_gap_views,
+            sequence_large_gap_drop: sequence_large_gap_drop.clone(),
             sequence_announce_period_ms: parameters.sequence_announce_period_ms,
             sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
             sequence_transfer: None,
@@ -1052,10 +1200,13 @@ impl VantageCore {
             core,
             rx_vantage,
             rx_bulk,
+            rx_sequence,
             rx_payload_ready,
             tx_vantage,
             tx_bulk,
+            tx_sequence,
             ack_aggregator,
+            sequence_large_gap_drop,
             reconnect_rx,
         )
     }
@@ -1064,6 +1215,7 @@ impl VantageCore {
         mut self,
         mut rx_vantage: Receiver<Inbound>,
         mut rx_bulk: Receiver<Inbound>,
+        mut rx_sequence: Receiver<Inbound>,
         mut rx_our_digests: Receiver<(Digest, WorkerId)>,
         mut rx_payload_ready: Receiver<(Digest, Digest, WorkerId)>,
         mut reconnect_rx: Receiver<SocketAddr>,
@@ -1123,6 +1275,8 @@ impl VantageCore {
         });
 
         loop {
+            self.refresh_sequence_large_gap_drop();
+
             // P4-3, amended by Fable perf audit item 4: bound `cancel_handlers`'
             // otherwise-unbounded growth under sustained honest traffic, but without
             // the O(n) `retain_mut` scan on every single inbound message -- see
@@ -1184,6 +1338,18 @@ impl VantageCore {
                 // saturated bulk queue now costs consensus roughly half the core's
                 // attention instead of ~95% of it.
                 Some(inbound) = rx_bulk.recv() => {
+                    let now = Instant::now();
+                    let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
+                    let effects = self.dispatch_inbound(inbound, now).await;
+                    drop(dispatch_timer);
+                    self.execute(effects, now).await;
+                }
+
+                // Checkpoint state-sync traffic must not sit behind the ordinary queue it
+                // is trying to bypass for a late node. The queue is bounded and fed with
+                // try_send at the receiver; loss is handled by repeated announcements and
+                // requester timeouts, same as sequence egress loss.
+                Some(inbound) = rx_sequence.recv() => {
                     let now = Instant::now();
                     let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
                     let effects = self.dispatch_inbound(inbound, now).await;
@@ -2448,9 +2614,14 @@ impl VantageCore {
                     metrics.vantage_sequence_sync_verified_total.inc();
                     metrics.vantage_sequence_sync_verified_view.set(view as i64);
                 }
+                let install_mode = if self.sequence_install_enabled {
+                    "staged for install"
+                } else {
+                    "install disabled; awaiting local execution"
+                };
                 log::info!(
                     "vantage sequence sync: VERIFIED target view={view} ({views} views); \
-                     installing nothing, awaiting local execution of view={view} to compare"
+                     {install_mode}"
                 );
                 self.sequence_transfer = None;
                 self.sequence_request_at = None;
@@ -2482,6 +2653,42 @@ impl VantageCore {
             self.sequence_transfer = None;
             self.sequence_request_at = None;
             self.sequence_last_want = None;
+        }
+
+        // A late joiner may certify boundary 100 first and then learn 200, 300, ...
+        // while still downloading or installing 100. Retarget to the newest certified
+        // boundary above the current local head; the cursor validates any already
+        // emitted prefix when the replacement install advances.
+        if let Some((new_view, _)) = self
+            .sequence_sync
+            .as_ref()
+            .and_then(|collector| collector.certified_head(local_view))
+            .filter(|(view, _)| view.saturating_sub(local_view) >= self.sequence_sync_min_gap_views)
+        {
+            let active_transfer_target = self.sequence_transfer.as_ref().map(|t| t.target().0);
+            if active_transfer_target.is_some_and(|old| new_view > old) {
+                let old = active_transfer_target.expect("checked");
+                log::info!(
+                    "vantage sequence sync: retargeting active transfer from view={old} \
+                     to newer certified view={new_view}"
+                );
+                self.sequence_transfer = None;
+                self.sequence_request_at = None;
+                self.sequence_last_want = None;
+            }
+
+            let staged_target = self.sequence_install.as_ref().map(|i| i.target().0);
+            if staged_target.is_some_and(|old| new_view > old) {
+                let old = staged_target.expect("checked");
+                log::info!(
+                    "vantage sequence sync: retargeting staged install from view={old}; \
+                     newer certified view={new_view} is available"
+                );
+                self.sequence_install = None;
+                self.sequence_verified_target = None;
+                self.sequence_install_ready_logged = false;
+                self.sequence_target_installed = false;
+            }
         }
 
         // Pick a target: the highest certified head strictly above what we hold.
@@ -2557,17 +2764,15 @@ impl VantageCore {
     /// Returns effects instead of executing them -- `Repairer::authorize` emits ordinary
     /// request effects, and they go through `execute` like every other.
     ///
-    /// Pacing lives in `SequenceInstall::admit`: at most `window_views` views outstanding,
-    /// and nothing new admitted while repair's own unsettled backlog is above the ceiling.
-    /// The second gate matters more than the first. This mechanism runs on nodes that are
-    /// already behind, which is exactly when repair is already loaded, so an installer that
-    /// admitted work regardless of that backlog would add load precisely where it hurts.
+    /// Pacing lives in `SequenceInstall::admit`: at most `window_views` views outstanding.
+    /// Repair backlog is deliberately not a veto here; on a recovering node it is a
+    /// symptom of the gap, so using it as a gate disables the rescue path when it is most
+    /// needed.
     async fn drive_sequence_install(&mut self) -> Vec<Effect> {
         if self.sequence_install.is_none() {
             return Vec::new();
         }
         let blocks = self.rep.blocks();
-        let pending = self.rep.pending_settle_len();
         let retry_headers = self
             .sequence_install
             .as_ref()
@@ -2594,7 +2799,8 @@ impl VantageCore {
         let validation_budget = self.sequence_install_digests_per_tick.max(1);
         let install = self.sequence_install.as_mut().expect("present");
         let examined = install.refresh_budgeted(&blocks, validation_budget);
-        let refs = install.admit(pending);
+        let refs = install.admit(self.rep.pending_settle_len());
+        let blocks_awaited = install.blocks_awaited(&blocks);
 
         let (complete, total, in_flight) = (
             install.views_complete(),
@@ -2614,6 +2820,9 @@ impl VantageCore {
             metrics
                 .vantage_sequence_install_views_in_flight
                 .set(in_flight as i64);
+            metrics
+                .vantage_sequence_install_blocks_awaited
+                .set(blocks_awaited as i64);
         }
         if staged_ready && !self.sequence_install_ready_logged {
             self.sequence_install_ready_logged = true;
@@ -2843,17 +3052,20 @@ impl VantageCore {
                         requester: me,
                     })
                 }
-                SequenceWant::Delta { view, start_index } => {
-                    PrimaryMessage::VantageSequenceDeltaRequest(SequenceDeltaRequest {
-                        version: SEQUENCE_VERSION,
-                        transfer_id: id,
-                        target_head: target_head.clone(),
-                        view: *view,
-                        start_index: *start_index,
-                        max_items: digests_cap,
-                        requester: me,
-                    })
-                }
+                SequenceWant::Deltas {
+                    from_view,
+                    start_index,
+                } => PrimaryMessage::VantageSequenceDeltaRangeRequest(SequenceDeltaRangeRequest {
+                    version: SEQUENCE_VERSION,
+                    transfer_id: id,
+                    target_head: target_head.clone(),
+                    target_view,
+                    from_view: *from_view,
+                    start_index: *start_index,
+                    max_views: SEQUENCE_DELTA_RANGE_VIEWS as u32,
+                    max_items: digests_cap,
+                    requester: me,
+                }),
             };
             self.send_sequence(&peer, message);
         }
@@ -2875,6 +3087,7 @@ impl VantageCore {
             SequenceResponse::Records(chunk) => transfer.on_records(chunk, from),
             SequenceResponse::Outcome(serve) => transfer.on_outcomes(serve, from),
             SequenceResponse::Delta(chunk) => transfer.on_delta(chunk, from),
+            SequenceResponse::DeltaRange(chunk) => transfer.on_delta_range(chunk, from),
             SequenceResponse::Unavailable(u) => {
                 transfer.on_unavailable(u, from);
                 Ok(())
@@ -3059,6 +3272,47 @@ impl VantageCore {
         self.send_sequence(to, message);
     }
 
+    fn serve_sequence_delta_range(&mut self, request: &SequenceDeltaRangeRequest, to: &PublicKey) {
+        let Some(store) = &self.sequence else {
+            return;
+        };
+        let floor = store.serve_floor();
+        let max_views = (request.max_views as usize).max(1);
+        let max_items = self
+            .sequence_chunk_digests
+            .min(request.max_items as usize)
+            .max(1);
+        let entries = if request.from_view < floor {
+            Vec::new()
+        } else {
+            store.delta_entries_from(
+                request.from_view,
+                request.start_index,
+                request.target_view,
+                max_views,
+                max_items,
+            )
+        };
+        let message = if entries.is_empty() {
+            PrimaryMessage::VantageSequenceUnavailable(SequenceUnavailable {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                serve_floor: floor,
+                sender: self.name,
+            })
+        } else {
+            PrimaryMessage::VantageSequenceDeltaRange(SequenceDeltaRangeChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: request.transfer_id,
+                target_head: request.target_head.clone(),
+                entries,
+                sender: self.name,
+            })
+        };
+        self.send_sequence(to, message);
+    }
+
     fn serve_sequence_outcome(&mut self, request: &SequenceOutcomeRequest, to: &PublicKey) {
         let Some(store) = &self.sequence else {
             return;
@@ -3225,6 +3479,14 @@ impl VantageCore {
         if !wire::sender_is_member(&inbound, &self.members) {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_rejected_nonmember_total.inc();
+            }
+            return Vec::new();
+        }
+        if self.install_replaces_inbound(&inbound) {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_sequence_install_obsolete_inbound_dropped_total
+                    .inc();
             }
             return Vec::new();
         }
@@ -3510,6 +3772,10 @@ impl VantageCore {
                 self.serve_sequence_delta(&request, &sender);
                 Vec::new()
             }
+            Inbound::SequenceDeltaRangeRequest(request, sender) => {
+                self.serve_sequence_delta_range(&request, &sender);
+                Vec::new()
+            }
             Inbound::SequenceOutcomeRequest(request, sender) => {
                 self.serve_sequence_outcome(&request, &sender);
                 Vec::new()
@@ -3524,6 +3790,10 @@ impl VantageCore {
             }
             Inbound::SequenceDelta(chunk, sender) => {
                 self.on_sequence_response(SequenceResponse::Delta(chunk), &sender);
+                Vec::new()
+            }
+            Inbound::SequenceDeltaRange(chunk, sender) => {
+                self.on_sequence_response(SequenceResponse::DeltaRange(chunk), &sender);
                 Vec::new()
             }
             Inbound::SequenceOutcome(serve, sender) => {
@@ -3548,6 +3818,72 @@ impl VantageCore {
                 Vec::new()
             }
         }
+    }
+
+    /// Highest active sequence-sync target whose gap is still large enough that normal
+    /// dissemination should not try to park consensus/control state for it. This includes
+    /// in-progress transfers as well as staged installs: the memory storm starts before
+    /// verification if live traffic is allowed to accumulate against a node hundreds of
+    /// views behind.
+    fn large_sequence_sync_target(&self) -> Option<View> {
+        if !self.sequence_install_enabled {
+            return None;
+        }
+        let local = self
+            .sequence
+            .as_ref()
+            .map(|store| store.head_view())
+            .unwrap_or(0);
+        let target = [
+            self.sequence_transfer
+                .as_ref()
+                .map(|transfer| transfer.target().0),
+            self.sequence_verified_target
+                .as_ref()
+                .map(|(view, _)| *view),
+            self.sequence_install
+                .as_ref()
+                .map(|install| install.target().0),
+        ]
+        .into_iter()
+        .flatten()
+        .max()?;
+
+        (target.saturating_sub(local) >= self.sequence_sync_min_gap_views).then_some(target)
+    }
+
+    fn refresh_sequence_large_gap_drop(&self) {
+        self.sequence_large_gap_drop.store(
+            self.large_sequence_sync_target().is_some(),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Once sequence sync is active, consensus work for the covered history is redundant
+    /// with the install and harmful to the late node: it is the same replay storm that
+    /// filled the core queue in the local late-joiner run. While the gap is large, accept
+    /// only materialization and sequence-sync data. Near the tail, allow normal
+    /// dissemination again but keep dropping view-scoped messages at or below a staged
+    /// target the install will replace.
+    fn install_replaces_inbound(&self, inbound: &Inbound) -> bool {
+        if !self.sequence_install_enabled {
+            return false;
+        }
+
+        if self.large_sequence_sync_target().is_some() {
+            return !inbound.keep_during_large_sequence_sync();
+        }
+
+        let Some(target) = self
+            .sequence_install
+            .as_ref()
+            .map(|install| install.target().0)
+        else {
+            return false;
+        };
+        inbound
+            .install_obsolete_view()
+            .is_some_and(|view| view <= target)
     }
 
     async fn serve_effects(&mut self, header: Header) -> Vec<Effect> {
@@ -4086,10 +4422,13 @@ mod tests {
             core,
             _rx_vantage,
             _rx_bulk,
+            _rx_sequence,
             _rx_payload_ready,
             _tx_vantage,
             _tx_bulk,
+            _tx_sequence,
             _ack_aggregator,
+            _sequence_large_gap_drop,
             _reconnect_rx,
         ) = VantageCore::build(
             name,
@@ -4111,13 +4450,17 @@ mod tests {
         pk
     }
 
-    fn dummy_proposal() -> ViewProposal {
+    fn dummy_proposal_at(view: View) -> ViewProposal {
         ViewProposal {
-            view: 1,
+            view,
             c: Vec::new(),
             t: Vec::new(),
             m: None,
         }
+    }
+
+    fn dummy_proposal() -> ViewProposal {
+        dummy_proposal_at(1)
     }
 
     fn rejected_count(core: &VantageCore) -> u64 {
@@ -4156,6 +4499,111 @@ mod tests {
         effects
             .iter()
             .find(|effect| matches!(effect, Effect::SyncBatches(..)))
+    }
+
+    #[tokio::test]
+    async fn large_sequence_sync_drops_consensus_parking_until_gap_is_small() {
+        let mut core = test_core(0, "large_sequence_drop");
+        let (member, _) = crate::common::keys()[1];
+        let target = 100;
+        core.sequence_sync_min_gap_views = 50;
+        core.sequence_install = Some(SequenceInstall::new(
+            0,
+            target,
+            Digest::default(),
+            Vec::new(),
+            Vec::new(),
+            8,
+            4096,
+        ));
+
+        let future_echo = Inbound::Echo(EchoOut::Single(Echo {
+            proposal: dummy_proposal_at(target + 50),
+            grade: 0,
+            sender: member,
+            wish: 0,
+            origin: None,
+            avail: None,
+        }));
+        assert!(
+            core.install_replaces_inbound(&future_echo),
+            "large-gap install must not park future-view AGB traffic"
+        );
+
+        let control = Inbound::ControlEcho(
+            member,
+            ControlProposal {
+                round: 1,
+                parent: 0,
+                value: None,
+            },
+        );
+        assert!(
+            core.install_replaces_inbound(&control),
+            "large-gap install must not park viewless control-round traffic"
+        );
+
+        let sequence_request = Inbound::SequenceRequest(
+            SequenceRequest {
+                version: SEQUENCE_VERSION,
+                transfer_id: 1,
+                target_view: target,
+                target_head: Digest::default(),
+                from_view: 1,
+                max_records: 64,
+                requester: member,
+            },
+            member,
+        );
+        assert!(
+            core.install_replaces_inbound(&sequence_request),
+            "a syncing node should not serve other peers' state-sync requests"
+        );
+
+        let (header, _, _) = served_payload_header(&core, member);
+        assert!(
+            !core.install_replaces_inbound(&Inbound::Serve(header.clone())),
+            "served blocks are materialization traffic and must still be accepted"
+        );
+        assert!(
+            core.install_replaces_inbound(&Inbound::Publish(member, header)),
+            "live publishes are ordinary dissemination and should not fill the queue \
+             during a large sequence sync"
+        );
+
+        let announcement = Inbound::SequenceAnnounce(
+            SequenceAnnouncement {
+                version: SEQUENCE_VERSION,
+                view: target + 20,
+                head: Digest::default(),
+                serve_floor: 1,
+                sender: member,
+            },
+            member,
+        );
+        assert!(
+            !core.install_replaces_inbound(&announcement),
+            "checkpoint announcements must still be accepted so the node can retarget"
+        );
+
+        core.sequence_sync_min_gap_views = 200;
+        assert!(
+            !core.install_replaces_inbound(&future_echo),
+            "once the active gap is below the state-sync threshold, future traffic can park"
+        );
+
+        let covered_echo = Inbound::Echo(EchoOut::Single(Echo {
+            proposal: dummy_proposal_at(target),
+            grade: 0,
+            sender: member,
+            wish: 0,
+            origin: None,
+            avail: None,
+        }));
+        assert!(
+            core.install_replaces_inbound(&covered_echo),
+            "the staged target still replaces messages for views it covers"
+        );
     }
 
     #[tokio::test]
@@ -4412,9 +4860,12 @@ mod tests {
         // This test only exercises consensus-class inbound (an Ack), so the bulk queue
         // is never used -- but it must exist. Held so it is not dropped/closed.
         let (tx_bulk, _rx_bulk) = channel(4);
+        let (tx_sequence, _rx_sequence) = channel(4);
         let handler = VantageReceiverHandler {
             tx: tx_vantage,
             tx_bulk,
+            tx_sequence,
+            sequence_large_gap_drop: Arc::new(AtomicBool::new(false)),
             ack_aggregator,
             metrics: None,
         };

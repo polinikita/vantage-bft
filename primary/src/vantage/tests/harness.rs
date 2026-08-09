@@ -291,6 +291,8 @@ impl Node {
             | Inbound::SequenceRecords(..)
             | Inbound::SequenceDeltaRequest(..)
             | Inbound::SequenceDelta(..)
+            | Inbound::SequenceDeltaRangeRequest(..)
+            | Inbound::SequenceDeltaRange(..)
             | Inbound::SequenceOutcomeRequest(..)
             | Inbound::SequenceOutcome(..)
             | Inbound::SequenceUnavailable(..) => Vec::new(),

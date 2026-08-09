@@ -593,6 +593,53 @@ impl SequenceStore {
         let end = delta.len().min(start.saturating_add(max));
         Some((delta[start..end].to_vec(), end == delta.len()))
     }
+
+    /// Consecutive delta chunks beginning at `from_view`.
+    ///
+    /// The first view starts at `start_index`; later views always start at zero. The
+    /// response is bounded both by view count and by total digest count, so a catch-up
+    /// request can collapse many empty/small view deltas into one frame without allowing a
+    /// single response to grow with the checkpoint distance.
+    pub fn delta_entries_from(
+        &self,
+        from_view: View,
+        start_index: u64,
+        through: View,
+        max_views: usize,
+        max_items: usize,
+    ) -> Vec<SequenceDeltaEntry> {
+        let mut entries = Vec::new();
+        let mut view = from_view;
+        let mut remaining = max_items;
+        while view <= through && entries.len() < max_views && remaining > 0 {
+            let Some(delta) = self.deltas.get(&view) else {
+                break;
+            };
+            let start = if view == from_view {
+                start_index as usize
+            } else {
+                0
+            };
+            if start > delta.len() {
+                break;
+            }
+            let end = delta.len().min(start.saturating_add(remaining));
+            let items = delta[start..end].to_vec();
+            remaining = remaining.saturating_sub(items.len());
+            let complete = end == delta.len();
+            entries.push(SequenceDeltaEntry {
+                view,
+                start_index: start as u64,
+                items,
+                complete,
+            });
+            if !complete || view == through {
+                break;
+            }
+            view = view.saturating_add(1);
+        }
+        entries
+    }
 }
 
 // ------------------------------------------------------------------------ wire types
@@ -640,6 +687,36 @@ pub struct SequenceDeltaChunk {
     pub start_index: u64,
     pub items: Vec<Digest>,
     pub complete: bool,
+    pub sender: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceDeltaRangeRequest {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub target_view: View,
+    pub from_view: View,
+    pub start_index: u64,
+    pub max_views: u32,
+    pub max_items: u32,
+    pub requester: PublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceDeltaEntry {
+    pub view: View,
+    pub start_index: u64,
+    pub items: Vec<Digest>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceDeltaRangeChunk {
+    pub version: u16,
+    pub transfer_id: u64,
+    pub target_head: Digest,
+    pub entries: Vec<SequenceDeltaEntry>,
     pub sender: PublicKey,
 }
 
@@ -924,7 +1001,7 @@ impl DeltaVerifier {
 pub enum SequenceWant {
     Records { from_view: View },
     Outcomes { from_view: View },
-    Delta { view: View, start_index: u64 },
+    Deltas { from_view: View, start_index: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -961,7 +1038,7 @@ pub struct SequenceTransfer {
     chain: ChainVerifier,
     outcomes: BTreeMap<View, SequenceOutcome>,
     deltas: BTreeMap<View, Vec<Digest>>,
-    delta_in_flight: Option<(View, DeltaVerifier)>,
+    delta_in_flight: BTreeMap<View, DeltaVerifier>,
     state: TransferState,
 }
 
@@ -998,7 +1075,7 @@ impl SequenceTransfer {
             chain,
             outcomes: BTreeMap::new(),
             deltas: BTreeMap::new(),
-            delta_in_flight: None,
+            delta_in_flight: BTreeMap::new(),
             state,
         }
     }
@@ -1080,16 +1157,16 @@ impl SequenceTransfer {
             TransferState::FetchingOutcomes => self
                 .first_missing_outcome()
                 .map(|from_view| SequenceWant::Outcomes { from_view }),
-            TransferState::FetchingDeltas => match &self.delta_in_flight {
-                Some((view, verifier)) => Some(SequenceWant::Delta {
-                    view: *view,
-                    start_index: verifier.next_index(),
-                }),
-                None => self.first_missing_delta().map(|view| SequenceWant::Delta {
-                    view,
-                    start_index: 0,
-                }),
-            },
+            TransferState::FetchingDeltas => {
+                self.first_missing_delta().map(|view| SequenceWant::Deltas {
+                    from_view: view,
+                    start_index: self
+                        .delta_in_flight
+                        .get(&view)
+                        .map(|verifier| verifier.next_index())
+                        .unwrap_or(0),
+                })
+            }
             TransferState::Verified | TransferState::Exhausted => None,
         }
     }
@@ -1235,7 +1312,37 @@ impl SequenceTransfer {
         {
             return Ok(());
         }
-        let Some(record) = self.chain.verified_record(chunk.view).cloned() else {
+        let entry = SequenceDeltaEntry {
+            view: chunk.view,
+            start_index: chunk.start_index,
+            items: chunk.items.clone(),
+            complete: chunk.complete,
+        };
+        self.on_delta_entry(&entry, from)
+    }
+
+    pub fn on_delta_range(
+        &mut self,
+        chunk: &SequenceDeltaRangeChunk,
+        from: &PublicKey,
+    ) -> Result<(), ChainError> {
+        if self.state != TransferState::FetchingDeltas
+            || !self.accepts(from, chunk.transfer_id, &chunk.target_head)
+        {
+            return Ok(());
+        }
+        for entry in &chunk.entries {
+            self.on_delta_entry(entry, from)?;
+        }
+        Ok(())
+    }
+
+    fn on_delta_entry(
+        &mut self,
+        entry: &SequenceDeltaEntry,
+        from: &PublicKey,
+    ) -> Result<(), ChainError> {
+        let Some(record) = self.chain.verified_record(entry.view).cloned() else {
             // A delta for a view whose record we never verified. Not attributable to a
             // corrupt chain, just unsolicited -- ignore without penalty.
             return Ok(());
@@ -1243,29 +1350,26 @@ impl SequenceTransfer {
         // Same idempotence rule as records: a duplicate copy of a view we already
         // finished, or of a chunk already absorbed, is a normal consequence of asking
         // several sources at once and must not be charged as invalid.
-        if self.deltas.contains_key(&chunk.view) {
+        if self.deltas.contains_key(&entry.view) {
             return Ok(());
         }
-        if let Some((view, verifier)) = self.delta_in_flight.as_ref() {
-            if *view == chunk.view && chunk.start_index < verifier.next_index() {
-                return Ok(());
-            }
-        }
-        if self.delta_in_flight.as_ref().map(|(v, _)| *v) != Some(chunk.view) {
-            self.delta_in_flight = Some((
-                chunk.view,
-                DeltaVerifier::new(self.sid.clone(), chunk.view, &record),
-            ));
-        }
-        let Some((_, verifier)) = self.delta_in_flight.as_mut() else {
+        if self
+            .delta_in_flight
+            .get(&entry.view)
+            .is_some_and(|verifier| entry.start_index < verifier.next_index())
+        {
             return Ok(());
-        };
-        match verifier.absorb(chunk.start_index, &chunk.items) {
+        }
+        let verifier = self
+            .delta_in_flight
+            .entry(entry.view)
+            .or_insert_with(|| DeltaVerifier::new(self.sid.clone(), entry.view, &record));
+        match verifier.absorb(entry.start_index, &entry.items) {
             Ok(complete) => {
                 if complete {
-                    let (view, verifier) = self.delta_in_flight.take().expect("in flight");
+                    let verifier = self.delta_in_flight.remove(&entry.view).expect("in flight");
                     let items = verifier.take_items().expect("complete");
-                    self.deltas.insert(view, items);
+                    self.deltas.insert(entry.view, items);
                     self.advance_if_done();
                 }
                 Ok(())
@@ -1273,7 +1377,7 @@ impl SequenceTransfer {
             Err(e) => {
                 // Drop the partial verifier so a corrupt chunk cannot strand this view at
                 // a poisoned offset; the next source restarts it from index 0.
-                self.delta_in_flight = None;
+                self.delta_in_flight.remove(&entry.view);
                 self.penalize(from);
                 Err(e)
             }

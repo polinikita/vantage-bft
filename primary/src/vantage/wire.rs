@@ -96,6 +96,8 @@ impl DeclaredSender for Inbound {
             Inbound::SequenceRecords(_, s) => Some(*s),
             Inbound::SequenceDeltaRequest(_, s) => Some(*s),
             Inbound::SequenceDelta(_, s) => Some(*s),
+            Inbound::SequenceDeltaRangeRequest(_, s) => Some(*s),
+            Inbound::SequenceDeltaRange(_, s) => Some(*s),
             Inbound::SequenceOutcomeRequest(_, s) => Some(*s),
             Inbound::SequenceOutcome(_, s) => Some(*s),
             Inbound::SequenceUnavailable(_, s) => Some(*s),
