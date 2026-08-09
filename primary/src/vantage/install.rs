@@ -261,6 +261,28 @@ impl SequenceInstall {
             .count()
     }
 
+    /// Missing output digests in install order, restricted to the admitted window.
+    ///
+    /// The ordinary repairer walks from manifest tips and is the correctness fallback,
+    /// but it requests individual digests. State sync can ask the certified checkpoint
+    /// sources for these already-committed output identities in bounded batches. Deltas
+    /// are disjoint by cursor construction, so no cross-view dedup set is needed here.
+    pub fn missing_digests(&self, blocks: &SharedBlocks, limit: usize) -> Vec<Digest> {
+        let cache = blocks.lock();
+        let mut out = Vec::new();
+        for staged in self.views.values().filter(|v| v.admitted && !v.complete) {
+            for digest in staged.delta.iter().skip(staged.ready_prefix) {
+                if out.len() >= limit {
+                    return out;
+                }
+                if !deliverable(&cache, digest) {
+                    out.push(digest.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Return a bounded set of cached headers whose worker payload is still missing.
     /// Payload readiness is monotonic, but the initial Synchronize can be lost; callers
     /// use this to retry without requiring another header announcement.

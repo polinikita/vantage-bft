@@ -287,6 +287,7 @@ impl Node {
             // construction -- the protocol tests keep asserting on output, and this
             // arm makes it explicit that checkpoints add no path into consensus.
             Inbound::SequenceAnnounce(..)
+            | Inbound::SequenceAnnounceBatch(..)
             | Inbound::SequenceRequest(..)
             | Inbound::SequenceRecords(..)
             | Inbound::SequenceDeltaRequest(..)
@@ -295,7 +296,9 @@ impl Node {
             | Inbound::SequenceDeltaRange(..)
             | Inbound::SequenceOutcomeRequest(..)
             | Inbound::SequenceOutcome(..)
-            | Inbound::SequenceUnavailable(..) => Vec::new(),
+            | Inbound::SequenceUnavailable(..)
+            | Inbound::SequenceHeadersRequest(..)
+            | Inbound::SequenceHeaders(..) => Vec::new(),
             Inbound::Publish(sender, header) => self.lm.process_publish(sender, header).await,
             Inbound::Serve(header) => self.rep.on_serve(header),
             Inbound::HeadersRequest(digests, requestor) => {

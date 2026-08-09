@@ -556,7 +556,38 @@ impl BlockCache {
         stop_digest: &Digest,
         h: &Digest,
     ) -> Option<Vec<Digest>> {
-        let start = self.by_digest.get(h)?;
+        match self.classify_suffix(
+            _committee,
+            _sid,
+            _max_block_payload,
+            stop_height,
+            stop_digest,
+            h,
+        ) {
+            SuffixWalk::Ready(chain) => Some(chain),
+            SuffixWalk::Pending | SuffixWalk::Forked => None,
+        }
+    }
+
+    /// `collect_verified_suffix`, but separating the two reasons a walk can fail.
+    ///
+    /// Callers that can only wait (availability crediting, simpleit's cut expansion) use
+    /// the `Option` wrapper above and treat both as "not yet". `Cursor::expand` MUST NOT:
+    /// a `Forked` entry can never become walkable, so waiting on one wedges the output
+    /// cursor of every honest node forever -- measured 2026-08-09, one restart froze all
+    /// 21 cursors on a docker-bench fleet.
+    pub fn classify_suffix(
+        &self,
+        _committee: &Committee,
+        _sid: &Digest,
+        _max_block_payload: usize,
+        stop_height: Height,
+        stop_digest: &Digest,
+        h: &Digest,
+    ) -> SuffixWalk {
+        let Some(start) = self.by_digest.get(h) else {
+            return SuffixWalk::Pending;
+        };
         let author = start.block.author;
         let mut expected_height = start.block.height;
         let mut cur = h.clone();
@@ -564,26 +595,49 @@ impl BlockCache {
         loop {
             if expected_height == stop_height {
                 if &cur != stop_digest {
-                    return None; // fork below the watermark
+                    // The target descends through a DIFFERENT block at a height we have
+                    // already output. Irreconcilable, not slow.
+                    return SuffixWalk::Forked;
                 }
                 chain.reverse();
-                return Some(chain);
+                return SuffixWalk::Ready(chain);
             }
             if expected_height == 0 {
-                return None; // ran out of height before reaching the watermark
+                // Bottomed out at genesis without ever meeting the watermark: the
+                // target's history does not contain what we output. Also permanent.
+                return SuffixWalk::Forked;
             }
-            let entry = self.by_digest.get(&cur)?;
+            let Some(entry) = self.by_digest.get(&cur) else {
+                return SuffixWalk::Pending;
+            };
+            // Cross-author graft (§1 "one author index") or height gap. Deliberately
+            // NOT `Forked`: a structurally impossible entry means the cache is corrupt
+            // rather than the history contradictory, and dropping output on that basis
+            // is the more dangerous error.
             if !entry.pinned_at(author, expected_height) {
-                return None; // cross-author graft (§1 "one author index") or height gap
+                return SuffixWalk::Pending;
             }
             if !entry.block_ok_verified {
-                return None;
+                return SuffixWalk::Pending;
             }
             chain.push(cur.clone());
             cur = entry.block.parent_cert.header_digest.clone();
             expected_height -= 1;
         }
     }
+}
+
+/// The outcome of walking a lane suffix from a watermark to a named target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuffixWalk {
+    /// The verified suffix, in ascending height order.
+    Ready(Vec<Digest>),
+    /// A block on the path is missing or not yet chain-verified. Transient: retry on the
+    /// next `BlockCached` wakeup.
+    Pending,
+    /// The target's ancestry contradicts the watermark. No block that can ever arrive
+    /// makes this walk succeed.
+    Forked,
 }
 
 /// One entry of a periodic per-lane availability watermark (optional, flag-gated
@@ -907,6 +961,33 @@ pub struct LaneManager {
     wt_store_probe: Option<IntCounter>,
 }
 
+/// Store key for this party's own lane frontier.
+///
+/// A restart that forgets the frontier makes the node re-sign a DIFFERENT block at a
+/// height it already used -- it forks its own lane. That is not merely a local problem:
+/// peers walk a lane prefix from their per-author watermark toward the digest a manifest
+/// names (`Cursor::expand` -> `BlockCache::collect_verified_suffix`), and a forked block
+/// chains to genesis rather than to that watermark, so the walk can never connect.
+/// `expand` then returns `None` forever and `pump()` breaks, wedging the OUTPUT CURSOR OF
+/// EVERY HONEST NODE at the first view whose manifest names the forked block.
+///
+/// Measured 2026-08-09, docker-bench netem n=21: one `docker stop`/`docker start` froze
+/// all 21 cursors permanently (view 952) while AGB ran on past view 2181 and committed
+/// transactions went to zero. Reproduced with checkpoint state sync both on and off.
+///
+/// The key is 20 bytes, distinct in length from both the 32-byte digest keys and the
+/// 36-byte `[digest || worker_id]` payload keys, so it cannot collide with either.
+const OWN_FRONTIER_KEY: &[u8] = b"vantage/own_frontier";
+
+/// `OWN_FRONTIER_KEY`'s value. Carries the sid so a store surviving a committee change
+/// cannot be mistaken for this session's lane.
+#[derive(Serialize, Deserialize)]
+struct PersistedFrontier {
+    sid: Digest,
+    height: Height,
+    digest: Digest,
+}
+
 impl LaneManager {
     pub fn new(
         name: PublicKey,
@@ -1035,6 +1116,65 @@ impl LaneManager {
         self.store.clone()
     }
 
+    /// Persist the frontier we are about to build on. WRITE-AHEAD: this must complete
+    /// before the block that advances the frontier reaches the network, so a restart can
+    /// never observe a frontier lower than one a peer has already seen.
+    async fn persist_own_frontier(&mut self) {
+        let (height, digest) = self.own_frontier.clone();
+        let record = PersistedFrontier {
+            sid: self.sid.clone(),
+            height,
+            digest,
+        };
+        match bincode::serialize(&record) {
+            Ok(bytes) => self.store.write(OWN_FRONTIER_KEY.to_vec(), bytes).await,
+            // Not fatal on its own -- it costs durability of THIS height, and the next
+            // published block rewrites the key -- but it is never expected.
+            Err(e) => log::error!("vantage lanes: cannot serialize own lane frontier: {e}"),
+        }
+    }
+
+    /// Adopt the lane frontier a previous process left behind. MUST run before the core
+    /// loop can publish; see `OWN_FRONTIER_KEY` for what happens if it does not.
+    pub async fn restore_own_frontier(&mut self) {
+        let bytes = match self.store.read(OWN_FRONTIER_KEY.to_vec()).await {
+            Ok(Some(bytes)) => bytes,
+            // First boot of this store. Genesis is the correct frontier.
+            Ok(None) => return,
+            Err(e) => {
+                log::error!("vantage lanes: cannot read own lane frontier: {e}");
+                return;
+            }
+        };
+        let record: PersistedFrontier = match bincode::deserialize(&bytes) {
+            Ok(record) => record,
+            Err(e) => {
+                log::error!("vantage lanes: cannot decode own lane frontier: {e}");
+                return;
+            }
+        };
+        // A store carried across a committee change describes a lane in a different
+        // session: `Header::new_vantage` stamps the CURRENT sid, so chaining onto that
+        // digest would produce blocks whose prefix no peer in this session can walk.
+        // Starting from genesis is correct there -- the old lane is not ours to extend.
+        if record.sid != self.sid {
+            log::warn!(
+                "vantage lanes: persisted lane frontier belongs to another session; \
+                 starting this session's lane at genesis"
+            );
+            return;
+        }
+        if record.height <= self.own_frontier.0 {
+            return;
+        }
+        log::info!(
+            "vantage lanes: restored own lane frontier at height={} (was {})",
+            record.height,
+            self.own_frontier.0
+        );
+        self.own_frontier = (record.height, record.digest);
+    }
+
     /// N1: create and self-publish our own next block. Height advances immediately on
     /// self-creation -- lanes are ack-independent (no certificate wait, unlike
     /// Autobahn's `last_parent` gate at proposer.rs:241). Self-delivery counts: we
@@ -1048,6 +1188,9 @@ impl LaneManager {
         let next_height = height + 1;
         let header = Header::new_vantage(self.name, next_height, payload, prev, self.sid.clone());
         self.own_frontier = (next_height, header.id.clone());
+        // Before `process_publish_inner` and before the `BroadcastPublish` effect the
+        // caller executes -- the whole point is that the write precedes the send.
+        self.persist_own_frontier().await;
         if let Some(metrics) = &self.metrics {
             metrics.vantage_blocks_published.inc();
         }

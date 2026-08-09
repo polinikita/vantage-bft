@@ -265,6 +265,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
+        "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
         # Explicit Some(0), not absent/null, REGARDLESS of --no-latency: real one-way
         # delay (when enabled) comes from tc netem, not from this process, so the
@@ -470,6 +471,7 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
+        "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
@@ -522,13 +524,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--ack-watermark-period-ms", type=int, default=50)
     p.add_argument("--no-state-sync", action="store_true",
                    help="disable sequence checkpoint state sync and installation")
-    p.add_argument("--sequence-checkpoint-interval", type=int, default=100,
+    p.add_argument("--sequence-checkpoint-interval", type=int, default=20,
                    help="checkpoint boundary interval K in views; must be small "
                         "enough that the run crosses several boundaries on 2+ nodes")
     p.add_argument("--sequence-sync-min-gap-views", type=int, default=50,
                    help="minimum certified cursor gap that starts state sync (default 50)")
-    p.add_argument("--sequence-sync-chunk-outcomes", type=int, default=8,
-                   help="terminal outcome bodies per state-sync response (default 8)")
+    p.add_argument("--sequence-sync-chunk-outcomes", type=int, default=256,
+                   help="maximum outcome views per state-sync response (default 256)")
+    p.add_argument("--sequence-sync-chunk-outcome-items", type=int, default=1600,
+                   help="maximum manifest references per outcome response (default 1600)")
     p.add_argument("--no-digest-statements", action="store_true",
                help="disable digest-named AGB statements (ON by default)")
     p.add_argument("--no-reconnect-replay", action="store_true",
@@ -572,6 +576,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--sequence-sync-min-gap-views must be non-negative")
     if args.sequence_sync_chunk_outcomes < 1:
         p.error("--sequence-sync-chunk-outcomes must be at least 1")
+    if args.sequence_sync_chunk_outcome_items < 1:
+        p.error("--sequence-sync-chunk-outcome-items must be at least 1")
     if not re.fullmatch(r"\d{1,3}\.\d{1,3}", args.subnet_base):
         p.error("--subnet-base must look like 'A.B' (e.g. 172.28)")
     return args

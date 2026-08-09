@@ -327,6 +327,17 @@ impl Repairer {
         effects
     }
 
+    /// Admit a digest requested by the sequence-install batch fast path.
+    ///
+    /// The verified sequence delta commits the exact digest, so it does not need a
+    /// second `(author,height)` authorization just to accept the matching header body.
+    /// `on_serve` still applies `BlockOK` before caching it. This only opens its existing
+    /// requested-digest gate; manifest-tip authorization continues in parallel and is the
+    /// fallback that proves/walks lane ancestry when a checkpoint source withholds.
+    pub fn expect_sequence_digest(&mut self, digest: Digest) {
+        self.requested_hashes.insert(digest);
+    }
+
     /// PHASE6-SPEC.md §9 gate amendment, R1(a): record `r` in `authorized`, and in
     /// `pending_settle` too unless it's already `settled` (permanent membership there
     /// means it can never regress back to pending).

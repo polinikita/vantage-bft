@@ -3175,11 +3175,38 @@
           "refId": "I",
           "legendFormat": "stale sync-gap inputs dropped/s",
           "expr": "sum(rate(vantage_sequence_install_obsolete_inbound_dropped_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "J",
+          "legendFormat": "batched headers in flight",
+          "expr": "max(vantage_sequence_install_header_requests_in_flight{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "K",
+          "legendFormat": "batched headers requested/s",
+          "expr": "sum(rate(vantage_sequence_install_headers_requested_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "L",
+          "legendFormat": "batched headers received/s",
+          "expr": "sum(rate(vantage_sequence_install_headers_received_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         }
       ],
       "title": "Install staging: verified target -> locally held blocks",
       "type": "timeseries",
-      "description": "A verified target names block DIGESTS, not blocks. This panel tracks turning those names into blocks the node actually holds, which is the precondition for installing anything. 'views held locally' should climb toward 'views in target'; a flat line with 'views in flight' pinned at the window bound (default 8) means repair is the limiter. 'blocks awaited' is the active fetch-window backlog. 'stale sync-gap inputs dropped/s' rises when an active large-gap install discards consensus/control/service traffic that would otherwise park stale state; data needed to materialize the install still passes. 'rejected' counts verified targets whose per-view output was not contiguous above the local head; a verified chain cannot have a hole, so nonzero is an internal inconsistency, not peer misbehaviour."
+      "description": "A verified target names block DIGESTS, not blocks. This panel tracks turning those names into blocks the node actually holds, which is the precondition for installing anything. 'views held locally' should climb toward 'views in target'; a flat line with 'views in flight' pinned at the window bound (default 64) means fetching is the limiter. 'blocks awaited' is the active fetch-window backlog. The batched-header series show the checkpoint-source fast path separately from generic repair. 'stale sync-gap inputs dropped/s' rises when an active large-gap install discards consensus/control/service traffic that would otherwise park stale state; data needed to materialize the install still passes. 'rejected' counts verified targets whose per-view output was not contiguous above the local head; a verified chain cannot have a hole, so nonzero is an internal inconsistency, not peer misbehaviour."
     }
   ],
   "preload": false,

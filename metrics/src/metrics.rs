@@ -506,6 +506,10 @@ pub struct Metrics {
     pub vantage_frontier_a_i: IntGauge,
     /// `Cursor::next_view` -- the lowest view the output cursor has not yet advanced past.
     pub vantage_cursor_next_view: IntGauge,
+    /// Non-zero means some author's lane contradicts output this node already delivered.
+    /// Before this existed the cursor waited on such an entry forever, which wedged the
+    /// OUTPUT of every honest node -- see `lanes::SuffixWalk::Forked`.
+    pub vantage_cursor_forked_entries_dropped: IntGauge,
     /// `ControlLog::curr_round` -- the resolution pipeline's current Simple-IT round.
     pub vantage_control_round: IntGauge,
     /// `ControlLog::delivered_log.len()` -- total (view, digest) pairs RB-delivered into
@@ -817,6 +821,13 @@ pub struct Metrics {
     /// Verified output digests in the staged install whose headers/payloads are not yet
     /// deliverable. This is the direct "what is the installer waiting for?" gauge.
     pub vantage_sequence_install_blocks_awaited: IntGauge,
+    /// Verified-output header digests currently requested from checkpoint sources by the
+    /// batched install fast path.
+    pub vantage_sequence_install_header_requests_in_flight: IntGauge,
+    /// Header digest asks sent by the batched install fast path, including timeout retries.
+    pub vantage_sequence_install_headers_requested_total: IntCounter,
+    /// Requested state-sync headers accepted after `BlockOK` validation.
+    pub vantage_sequence_install_headers_received_total: IntCounter,
     /// Targets whose every view became locally held. The precondition for installing:
     /// until this fires there is nothing to install, only something to fetch.
     pub vantage_sequence_install_ready_total: IntCounter,
@@ -1460,6 +1471,14 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_cursor_forked_entries_dropped: register_int_gauge_with_registry!(
+                "vantage_cursor_forked_entries_dropped",
+                "Cursor: manifest entries dropped because their ancestry contradicts \
+                 delivered output (a forked lane -- restart that lost its frontier, or \
+                 a Byzantine author)",
+                registry,
+            )
+            .unwrap(),
             vantage_control_round: register_int_gauge_with_registry!(
                 "vantage_control_round",
                 "ControlLog: current Simple-IT resolution round",
@@ -1859,6 +1878,27 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_sequence_install_header_requests_in_flight:
+                register_int_gauge_with_registry!(
+                    "vantage_sequence_install_header_requests_in_flight",
+                    "Verified-output headers currently requested from checkpoint sources",
+                    registry,
+                )
+                .unwrap(),
+            vantage_sequence_install_headers_requested_total:
+                register_int_counter_with_registry!(
+                    "vantage_sequence_install_headers_requested_total",
+                    "Header digest asks sent by the batched sequence-install fast path",
+                    registry,
+                )
+                .unwrap(),
+            vantage_sequence_install_headers_received_total:
+                register_int_counter_with_registry!(
+                    "vantage_sequence_install_headers_received_total",
+                    "Requested sequence-install headers accepted after validation",
+                    registry,
+                )
+                .unwrap(),
             vantage_sequence_install_ready_total: register_int_counter_with_registry!(
                 "vantage_sequence_install_ready_total",
                 "Targets whose every view became locally held",

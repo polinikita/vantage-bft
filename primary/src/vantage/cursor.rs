@@ -4,7 +4,7 @@
 use crate::messages::Header;
 use crate::primary::{Height, View};
 use crate::vantage::agb::{Manifest, Outcome};
-use crate::vantage::lanes::SharedBlocks;
+use crate::vantage::lanes::{SharedBlocks, SuffixWalk};
 use crate::vantage::sequence::SequenceOutcome;
 use crate::vantage::Effect;
 use config::{Committee, WorkerId};
@@ -93,6 +93,18 @@ pub struct Cursor {
 
     /// The lowest view not yet fully advanced past.
     next_view: View,
+    /// The view the "cursor waiting" warning was last emitted for, so a wedged cursor
+    /// logs the offending manifest entry once rather than on every `retry()` (which
+    /// fires per received block).
+    stall_logged_for: Option<View>,
+    /// Authors already reported as forked. A forked lane yields a dropped entry per view
+    /// for as long as its author keeps building on it -- at ~10 blocks/s, keying this on
+    /// anything finer than the author turns one condition into a log flood. The lane is
+    /// the event; the running count lives in `forked_dropped`.
+    forked_reported: HashSet<PublicKey>,
+    /// Manifest entries dropped because their ancestry contradicts delivered output.
+    /// Read by `VantageCore`'s metrics tick -- `Cursor` holds no metrics handle.
+    forked_dropped: u64,
     output: HashSet<Digest>,
     /// The committed block log in emission order, kept ONLY for tests (cross-node log
     /// equality assertions in `byzantine_tests`/`crash_fault_tests`/`integration_tests`).
@@ -141,6 +153,9 @@ impl Cursor {
             max_block_payload,
             blocks,
             next_view: 1,
+            stall_logged_for: None,
+            forked_reported: HashSet::new(),
+            forked_dropped: 0,
             output,
             #[cfg(test)]
             output_log: Vec::new(),
@@ -159,6 +174,12 @@ impl Cursor {
 
     pub fn next_view(&self) -> View {
         self.next_view
+    }
+
+    /// Manifest entries dropped for contradicting delivered output. Non-zero means some
+    /// author forked its lane -- a restart that lost its frontier, or a Byzantine party.
+    pub fn forked_dropped(&self) -> u64 {
+        self.forked_dropped
     }
 
     /// R4's `complete(v) -> B`: the core becomes irrevocable at a still-`gopen` view.
@@ -551,14 +572,54 @@ impl Cursor {
             if *height <= stop_height {
                 continue; // already emitted (or older) through this author's watermark
             }
-            let suffix = blocks.collect_verified_suffix(
+            let suffix = match blocks.classify_suffix(
                 &self.committee,
                 &self.sid,
                 self.max_block_payload,
                 stop_height,
                 &stop_digest,
                 digest,
-            )?;
+            ) {
+                SuffixWalk::Ready(suffix) => suffix,
+                // Missing or unverified somewhere on the path. Wait -- `retry()` re-runs
+                // this on every `BlockCached`.
+                SuffixWalk::Pending => {
+                    // One line per wedged view -- `retry()` runs per received block, so
+                    // an unthrottled log here would be one line per block.
+                    if self.stall_logged_for != Some(self.next_view) {
+                        self.stall_logged_for = Some(self.next_view);
+                        log::warn!(
+                            "vantage cursor: waiting at view={} on author={author} \
+                             height={height} (watermark height={}) target={digest}",
+                            self.next_view,
+                            stop_height,
+                        );
+                    }
+                    return None;
+                }
+                // The author's lane contradicts output we have already delivered. This
+                // can never resolve, so waiting means never advancing again. Drop the
+                // entry: this author contributes nothing to this view.
+                //
+                // SAFE FOR AGREEMENT because the decision is a function of committed
+                // state alone. `stop_height`/`stop_digest` come from `watermarks`, which
+                // every correct node derives from the same delivered output, and the
+                // manifest is identical everywhere, so every correct node drops exactly
+                // the same entry at exactly the same view.
+                SuffixWalk::Forked => {
+                    if self.forked_reported.insert(*author) {
+                        log::warn!(
+                            "vantage cursor: dropping FORKED manifest entry at view={} \
+                             author={author} height={height} (watermark height={}); \
+                             its ancestry contradicts delivered output",
+                            self.next_view,
+                            stop_height,
+                        );
+                    }
+                    self.forked_dropped += 1;
+                    continue;
+                }
+            };
             suffixes.push((*author, *height, suffix));
         }
         drop(blocks);

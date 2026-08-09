@@ -92,6 +92,7 @@ impl DeclaredSender for Inbound {
             // Phase B: the framework compares this against the authenticated
             // connection, which is what makes the f+1 announcement rule first-hand.
             Inbound::SequenceAnnounce(_, s) => Some(*s),
+            Inbound::SequenceAnnounceBatch(_, s) => Some(*s),
             Inbound::SequenceRequest(_, s) => Some(*s),
             Inbound::SequenceRecords(_, s) => Some(*s),
             Inbound::SequenceDeltaRequest(_, s) => Some(*s),
@@ -101,6 +102,8 @@ impl DeclaredSender for Inbound {
             Inbound::SequenceOutcomeRequest(_, s) => Some(*s),
             Inbound::SequenceOutcome(_, s) => Some(*s),
             Inbound::SequenceUnavailable(_, s) => Some(*s),
+            Inbound::SequenceHeadersRequest(_, s) => Some(*s),
+            Inbound::SequenceHeaders(_, s) => Some(*s),
             Inbound::CompReport(_, _, s) => Some(*s),
             Inbound::ControlEcho(s, _) => Some(*s),
             Inbound::ControlReady(s, _) => Some(*s),

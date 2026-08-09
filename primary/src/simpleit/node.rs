@@ -626,6 +626,11 @@ impl SimpleItCore {
         mut rx_our_digests: Receiver<(Digest, WorkerId)>,
         mut rx_payload_ready: Receiver<(Digest, Digest, WorkerId)>,
     ) {
+        // BEFORE anything can publish, for the same reason `VantageCore::run` does it:
+        // a process that restarts without its lane frontier re-signs a different block
+        // at a height it already used, forking its own lane. See
+        // `lanes::OWN_FRONTIER_KEY`.
+        self.lm.restore_own_frontier().await;
         // Boot: the round-1 leader proposes, and every party (leader included, in
         // case IT then stalls after its own proposal) arms round 1's own fallback
         // timeout -- see `CutEngine::schedule_cut_timer`'s doc comment for why round 1

@@ -17,10 +17,30 @@ use crate::vantage::control::{ControlLog, ControlProposal, Round};
 /// candidates are dead weight, and this exists purely to bound memory against a peer
 /// announcing arbitrary future boundaries.
 const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
+/// Recent fixed boundaries carried by one announcement frame. At the default 20-view
+/// interval this covers 160 views, comfortably beyond normal healthy cursor spread.
+const SEQUENCE_ANNOUNCE_BOUNDARIES: usize = 8;
 /// Delta views requested in one state-sync range frame. The byte bound is still
 /// `sequence_sync_chunk_digests`; this only limits the number of tiny/empty views a
 /// single response can advance across.
 const SEQUENCE_DELTA_RANGE_VIEWS: usize = 256;
+/// Digests per checkpoint-source header request. Responses are separately capped into
+/// bounded header batches, so this limits requester and source work per inbound frame.
+const SEQUENCE_BLOCK_REQUEST_BATCH: usize = 256;
+/// Headers per dedicated sequence response. Header sizes vary with payload manifests;
+/// 64 keeps a response near the existing frame norm while amortizing ingress dispatch.
+const SEQUENCE_BLOCK_SERVE_BATCH: usize = 64;
+/// Unique state-sync header digests outstanding at once. Larger than repair's generic
+/// 512-ask cap because each digest goes to one certified source, not a widening fan-out.
+const SEQUENCE_BLOCK_MAX_IN_FLIGHT: usize = 2_048;
+/// Refill in batches after half the window drains. Topping up one digest per response
+/// would turn the batch path back into one-request-per-header traffic.
+const SEQUENCE_BLOCK_REFILL_AT: usize = SEQUENCE_BLOCK_MAX_IN_FLIGHT / 2;
+/// Installation is latency-sensitive once a target is verified: driving it on the
+/// 2-second announcement cadence capped a late joiner at eight views/second with the
+/// default 16-view budget. A dedicated tick keeps each core turn bounded while allowing
+/// enough turns to overtake the live view rate.
+const SEQUENCE_INSTALL_DRIVE_PERIOD_MS: u64 = 100;
 
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
@@ -54,6 +74,12 @@ enum SequenceResponse {
     Delta(SequenceDeltaChunk),
     DeltaRange(SequenceDeltaRangeChunk),
     Unavailable(SequenceUnavailable),
+}
+
+#[derive(Clone, Copy)]
+struct SequenceBlockRequestState {
+    requested_at: Instant,
+    source_cursor: usize,
 }
 use crate::vantage::Effect;
 use async_trait::async_trait;
@@ -189,6 +215,7 @@ pub enum Inbound {
     // AUTHENTICATED sender alongside the payload: the payload's own encoded sender is
     // decoration and is checked against this, never trusted in its place.
     SequenceAnnounce(SequenceAnnouncement, PublicKey),
+    SequenceAnnounceBatch(Vec<SequenceAnnouncement>, PublicKey),
     SequenceRequest(SequenceRequest, PublicKey),
     SequenceRecords(SequenceRecordChunk, PublicKey),
     SequenceDeltaRequest(SequenceDeltaRequest, PublicKey),
@@ -198,6 +225,8 @@ pub enum Inbound {
     SequenceOutcomeRequest(SequenceOutcomeRequest, PublicKey),
     SequenceOutcome(SequenceOutcomeServe, PublicKey),
     SequenceUnavailable(SequenceUnavailable, PublicKey),
+    SequenceHeadersRequest(Vec<Digest>, PublicKey),
+    SequenceHeaders(Vec<Header>, PublicKey),
 }
 
 impl Inbound {
@@ -246,6 +275,7 @@ impl Inbound {
         matches!(
             self,
             Inbound::SequenceAnnounce(_, _)
+                | Inbound::SequenceAnnounceBatch(_, _)
                 | Inbound::SequenceRequest(_, _)
                 | Inbound::SequenceRecords(_, _)
                 | Inbound::SequenceDeltaRequest(_, _)
@@ -255,6 +285,8 @@ impl Inbound {
                 | Inbound::SequenceOutcomeRequest(_, _)
                 | Inbound::SequenceOutcome(_, _)
                 | Inbound::SequenceUnavailable(_, _)
+                | Inbound::SequenceHeadersRequest(_, _)
+                | Inbound::SequenceHeaders(_, _)
         )
     }
 
@@ -262,19 +294,20 @@ impl Inbound {
     /// would only build AGB/control/replay/availability state for views the verified
     /// install is about to replace, or spend work serving peers while this node is the
     /// one being rescued. Live header publishes are deliberately excluded: the install
-    /// materializes its verified delta through explicit header serves (`Header(_, true)`),
-    /// and ordinary publishes can otherwise fill the main queue before the tail is small
-    /// enough for normal parking to be useful again.
+    /// materializes its verified delta through dedicated `SequenceHeaders` frames, and
+    /// ordinary `Publish`/`Serve` traffic can otherwise fill the main queue before the
+    /// tail is small enough for normal parking to be useful again.
     fn keep_during_large_sequence_sync(&self) -> bool {
         matches!(
             self,
-            Inbound::Serve(_)
-                | Inbound::SequenceAnnounce(_, _)
+            Inbound::SequenceAnnounce(_, _)
+                | Inbound::SequenceAnnounceBatch(_, _)
                 | Inbound::SequenceRecords(_, _)
                 | Inbound::SequenceDelta(_, _)
                 | Inbound::SequenceDeltaRange(_, _)
                 | Inbound::SequenceOutcome(_, _)
                 | Inbound::SequenceUnavailable(_, _)
+                | Inbound::SequenceHeaders(_, _)
         )
     }
 
@@ -442,6 +475,9 @@ impl MessageHandler for VantageReceiverHandler {
                 let claimed = a.sender;
                 Inbound::SequenceAnnounce(a, claimed)
             }
+            PrimaryMessage::VantageSequenceAnnounceBatch(announcements, sender) => {
+                Inbound::SequenceAnnounceBatch(announcements, sender)
+            }
             PrimaryMessage::VantageSequenceRequest(r) => {
                 let claimed = r.requester;
                 Inbound::SequenceRequest(r, claimed)
@@ -477,6 +513,12 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageSequenceUnavailable(u) => {
                 let claimed = u.sender;
                 Inbound::SequenceUnavailable(u, claimed)
+            }
+            PrimaryMessage::VantageSequenceHeadersRequest(digests, requester) => {
+                Inbound::SequenceHeadersRequest(digests, requester)
+            }
+            PrimaryMessage::VantageSequenceHeaders(headers, sender) => {
+                Inbound::SequenceHeaders(headers, sender)
             }
             // Autobahn-only variants never reach the Vantage assembly's port; ignore
             // rather than panic (defense in depth against a misrouted message).
@@ -566,14 +608,23 @@ pub struct VantageCore {
     sequence_sync: Option<CheckpointCollector>,
     sequence_chunk_records: usize,
     sequence_chunk_outcomes: usize,
+    sequence_chunk_outcome_items: usize,
     sequence_chunk_digests: usize,
     sequence_sync_min_gap_views: View,
     sequence_large_gap_drop: Arc<AtomicBool>,
+    /// Hysteresis for late-joiner recovery. Enter only at the configured gap, then keep
+    /// verifying/installing certified tail checkpoints until the cursor reaches the
+    /// newest one. Ordinary future messages are allowed to park once that newest gap is
+    /// below the threshold; this flag controls target selection, not ingress shedding.
+    sequence_sync_recovery_active: bool,
     sequence_announce_period_ms: u64,
     sequence_announce_repeat_ms: u64,
     /// Phase B: at most ONE installation target at a time (section 7).
     sequence_transfer: Option<SequenceTransfer>,
     sequence_transfer_seq: u64,
+    /// Missing verified-output headers requested in batches from certified checkpoint
+    /// sources. Target-bound by `sequence_install` and pruned as blocks arrive/install.
+    sequence_block_requests: HashMap<Digest, SequenceBlockRequestState>,
     /// Highest remote target fully verified in Phase B. Since verify-only deliberately
     /// does not move the cursor, no newer transfer starts until ordinary dissemination
     /// reaches this target. Phase C replaces that wait by installing the verified state.
@@ -1055,13 +1106,16 @@ impl VantageCore {
             sequence_sync,
             sequence_chunk_records: parameters.sequence_sync_chunk_records,
             sequence_chunk_outcomes: parameters.sequence_sync_chunk_outcomes,
+            sequence_chunk_outcome_items: parameters.sequence_sync_chunk_outcome_items,
             sequence_chunk_digests: parameters.sequence_sync_chunk_digests,
             sequence_sync_min_gap_views: parameters.sequence_sync_min_gap_views,
             sequence_large_gap_drop: sequence_large_gap_drop.clone(),
+            sequence_sync_recovery_active: false,
             sequence_announce_period_ms: parameters.sequence_announce_period_ms,
             sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
             sequence_transfer: None,
             sequence_transfer_seq: 0,
+            sequence_block_requests: HashMap::new(),
             sequence_verified_target: None,
             sequence_install: None,
             sequence_install_window_views: parameters.sequence_install_window_views,
@@ -1221,6 +1275,10 @@ impl VantageCore {
         mut reconnect_rx: Receiver<SocketAddr>,
     ) {
         let boot = Instant::now();
+        // BEFORE anything can publish. A process that restarts without its lane frontier
+        // re-signs a different block at a height it already used, and every honest node's
+        // output cursor wedges on the fork -- see `lanes::OWN_FRONTIER_KEY`.
+        self.lm.restore_own_frontier().await;
         // Genesis bootstrap (§4/PHASE5-SPEC.md W1): every party enters view 1 at boot,
         // then the WISH pacemaker sets its own wish to 2 and broadcasts it.
         let mut effects = self.enter_view_effects(1, boot);
@@ -1270,6 +1328,12 @@ impl VantageCore {
         let mut announce_tick = self.sequence.as_ref().map(|_| {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(self.sequence_announce_period_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
+        let mut sequence_install_tick = self.sequence.as_ref().map(|_| {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(SEQUENCE_INSTALL_DRIVE_PERIOD_MS));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval
         });
@@ -1417,12 +1481,20 @@ impl VantageCore {
                         None => std::future::pending::<()>().await,
                     }
                 }, if announce_tick.is_some() => {
-                    self.announce_checkpoint().await;
+                    self.announce_checkpoint();
                     self.drive_sequence_sync();
-                    // The staging fetch rides this tick rather than a dedicated one: it is
-                    // paced by its own window and by repair's backlog, so its cadence only
-                    // has to be coarse and bounded, and this tick already exists exactly
-                    // when checkpoints are enabled.
+                }
+
+                () = async {
+                    match sequence_install_tick.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if sequence_install_tick.is_some() => {
+                    // Fetch and application have their own view/digest/in-flight budgets.
+                    // Keep this independent of checkpoint announcements: a verified late
+                    // joiner must apply faster than the fleet advances, rather than in a
+                    // 16-view burst every two seconds.
                     let install_effects = self.drive_sequence_install().await;
                     if !install_effects.is_empty() {
                         self.execute(install_effects, Instant::now()).await;
@@ -2233,6 +2305,9 @@ impl VantageCore {
         metrics
             .vantage_cursor_next_view
             .set(self.cursor.next_view() as i64);
+        metrics
+            .vantage_cursor_forked_entries_dropped
+            .set(self.cursor.forked_dropped() as i64);
         // Sampled HERE, beside the cursor gauge, not at record time. The two are exactly
         // one apart by construction (`head_view == next_view - 1`), but only if they are
         // read at the same instant: setting the head on every record while the cursor
@@ -2595,6 +2670,7 @@ impl VantageCore {
                             self.rep.note_holder(*peer, author, height);
                         }
                     }
+                    self.sequence_block_requests.clear();
                     self.sequence_install = Some(install);
                     self.sequence_install_ready_logged = false;
                     self.sequence_target_installed = false;
@@ -2655,41 +2731,12 @@ impl VantageCore {
             self.sequence_last_want = None;
         }
 
-        // A late joiner may certify boundary 100 first and then learn 200, 300, ...
-        // while still downloading or installing 100. Retarget to the newest certified
-        // boundary above the current local head; the cursor validates any already
-        // emitted prefix when the replacement install advances.
-        if let Some((new_view, _)) = self
-            .sequence_sync
-            .as_ref()
-            .and_then(|collector| collector.certified_head(local_view))
-            .filter(|(view, _)| view.saturating_sub(local_view) >= self.sequence_sync_min_gap_views)
-        {
-            let active_transfer_target = self.sequence_transfer.as_ref().map(|t| t.target().0);
-            if active_transfer_target.is_some_and(|old| new_view > old) {
-                let old = active_transfer_target.expect("checked");
-                log::info!(
-                    "vantage sequence sync: retargeting active transfer from view={old} \
-                     to newer certified view={new_view}"
-                );
-                self.sequence_transfer = None;
-                self.sequence_request_at = None;
-                self.sequence_last_want = None;
-            }
-
-            let staged_target = self.sequence_install.as_ref().map(|i| i.target().0);
-            if staged_target.is_some_and(|old| new_view > old) {
-                let old = staged_target.expect("checked");
-                log::info!(
-                    "vantage sequence sync: retargeting staged install from view={old}; \
-                     newer certified view={new_view} is available"
-                );
-                self.sequence_install = None;
-                self.sequence_verified_target = None;
-                self.sequence_install_ready_logged = false;
-                self.sequence_target_installed = false;
-            }
-        }
+        // Active transfers and staged installs are deliberately STICKY. Checkpoint
+        // announcements arrive every few seconds; abandoning target 100 for 200, then
+        // 300, discarded all verified bytes faster than a stop-and-wait transfer could
+        // finish. The collector still remembers newer certified heads. Once this target
+        // verifies and installs (or exhausts), the normal target selection below picks
+        // the newest one above the now-advanced local head.
 
         // Pick a target: the highest certified head strictly above what we hold.
         if self.sequence_transfer.is_none() {
@@ -2710,7 +2757,9 @@ impl VantageCore {
             let Some((view, head)) = collector.certified_head(local_view) else {
                 return;
             };
-            if view.saturating_sub(local_view) < self.sequence_sync_min_gap_views {
+            if !self.sequence_sync_recovery_active
+                && view.saturating_sub(local_view) < self.sequence_sync_min_gap_views
+            {
                 return;
             }
             let sources = collector.announcers(view, &head);
@@ -2770,6 +2819,12 @@ impl VantageCore {
     /// needed.
     async fn drive_sequence_install(&mut self) -> Vec<Effect> {
         if self.sequence_install.is_none() {
+            self.sequence_block_requests.clear();
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_sequence_install_header_requests_in_flight
+                    .set(0);
+            }
             return Vec::new();
         }
         let blocks = self.rep.blocks();
@@ -2835,7 +2890,120 @@ impl VantageCore {
             );
         }
         effects.extend(self.apply_sequence_install(validation_budget - examined));
+        self.drive_sequence_block_fetch(Instant::now()).await;
         effects
+    }
+
+    /// Batch missing verified-output headers across certified checkpoint sources.
+    ///
+    /// Sequence records/outcomes/deltas identify every output digest up front. Feeding
+    /// only manifest tips to generic repair is correct but expensive: each requested
+    /// body is a separate frame and parent discovery can serialize on WAN RTT. This path
+    /// requests the already-committed digest set in 256-item batches, partitions work
+    /// across announcers, and rotates an unanswered digest after the ordinary sequence
+    /// timeout. Returned headers still pass `Repairer::on_serve`'s `BlockOK` gate.
+    async fn drive_sequence_block_fetch(&mut self, now: Instant) {
+        let Some((target_view, target_head)) = self
+            .sequence_install
+            .as_ref()
+            .map(|install| (install.target().0, install.target().1.clone()))
+        else {
+            self.sequence_block_requests.clear();
+            return;
+        };
+        let Some(collector) = self.sequence_sync.as_ref() else {
+            return;
+        };
+        let sources = collector.announcers(target_view, &target_head);
+        if sources.is_empty() {
+            return;
+        }
+
+        let blocks = self.rep.blocks();
+        let missing = self
+            .sequence_install
+            .as_ref()
+            .expect("checked")
+            .missing_digests(&blocks, usize::MAX);
+        let missing_set: HashSet<Digest> = missing.iter().cloned().collect();
+        self.sequence_block_requests
+            .retain(|digest, _| missing_set.contains(digest));
+
+        let timeout = Duration::from_millis(self.sequence_request_timeout_ms);
+        let mut by_source: HashMap<PublicKey, Vec<Digest>> = HashMap::new();
+        let mut scheduled = 0usize;
+
+        // Retry timed-out work first, rotating to the next certified source. This runs
+        // even while the in-flight window is full; otherwise one withholding source can
+        // pin every slot forever.
+        for digest in &missing {
+            if scheduled >= SEQUENCE_BLOCK_MAX_IN_FLIGHT {
+                break;
+            }
+            let Some(state) = self.sequence_block_requests.get_mut(digest) else {
+                continue;
+            };
+            if now.duration_since(state.requested_at) < timeout {
+                continue;
+            }
+            state.source_cursor = (state.source_cursor + 1) % sources.len();
+            state.requested_at = now;
+            by_source
+                .entry(sources[state.source_cursor])
+                .or_default()
+                .push(digest.clone());
+            scheduled += 1;
+        }
+
+        // Refill only after a substantial part of the window drained, preserving real
+        // batches instead of emitting one new request for each arriving header.
+        if self.sequence_block_requests.len() <= SEQUENCE_BLOCK_REFILL_AT {
+            let room =
+                SEQUENCE_BLOCK_MAX_IN_FLIGHT.saturating_sub(self.sequence_block_requests.len());
+            let mut added = 0usize;
+            for digest in missing {
+                if added >= room {
+                    break;
+                }
+                if self.sequence_block_requests.contains_key(&digest) {
+                    continue;
+                }
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&digest.0[..8]);
+                let source_cursor = (u64::from_le_bytes(prefix) as usize) % sources.len();
+                self.sequence_block_requests.insert(
+                    digest.clone(),
+                    SequenceBlockRequestState {
+                        requested_at: now,
+                        source_cursor,
+                    },
+                );
+                self.rep.expect_sequence_digest(digest.clone());
+                by_source
+                    .entry(sources[source_cursor])
+                    .or_default()
+                    .push(digest);
+                scheduled += 1;
+                added += 1;
+            }
+        }
+
+        for (source, digests) in by_source {
+            for chunk in digests.chunks(SEQUENCE_BLOCK_REQUEST_BATCH) {
+                self.send_sequence(
+                    &source,
+                    PrimaryMessage::VantageSequenceHeadersRequest(chunk.to_vec(), self.name),
+                );
+            }
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .vantage_sequence_install_headers_requested_total
+                .inc_by(scheduled as u64);
+            metrics
+                .vantage_sequence_install_header_requests_in_flight
+                .set(self.sequence_block_requests.len() as i64);
+        }
     }
 
     /// Re-align the staged target with where the cursor actually is, and revalidate.
@@ -2898,9 +3066,9 @@ impl VantageCore {
     ///
     /// This is the only path in the system that turns bytes another party derived into
     /// committed output, so it is off unless `sequence_install_enabled` says otherwise, and
-    /// bounded at `sequence_install_views_per_tick` per pass -- the loop it runs on is the
-    /// same single-threaded core that serves consensus, and a target spanning hundreds of
-    /// views would otherwise stall everything else while it drained.
+    /// bounded at `sequence_install_views_per_tick` per pass on a dedicated 100 ms tick --
+    /// the loop runs on the same single-threaded core that serves consensus, and a target
+    /// spanning hundreds of views would otherwise stall everything else while it drained.
     ///
     /// Any refusal aborts the WHOLE target rather than skipping the view. `Cursor::install`
     /// only refuses on conditions that mean the target or the local state is not what this
@@ -3026,6 +3194,7 @@ impl VantageCore {
         let sources = transfer.next_sources(self.sequence_max_sources);
         let records_cap = self.sequence_chunk_records as u32;
         let outcomes_cap = self.sequence_chunk_outcomes as u32;
+        let outcome_items_cap = self.sequence_chunk_outcome_items as u32;
         let digests_cap = self.sequence_chunk_digests as u32;
         let me = self.name;
         for peer in sources {
@@ -3048,7 +3217,8 @@ impl VantageCore {
                         target_head: target_head.clone(),
                         target_view,
                         from_view: *from_view,
-                        max_outcomes: outcomes_cap,
+                        max_views: outcomes_cap,
+                        max_items: outcome_items_cap,
                         requester: me,
                     })
                 }
@@ -3120,7 +3290,7 @@ impl VantageCore {
         }
     }
 
-    /// Phase B: broadcast our highest checkpoint boundary, if we have one.
+    /// Phase B: broadcast a bounded suffix of checkpoint boundaries, if any exist.
     ///
     /// Re-sent on an unchanged boundary every `sequence_announce_repeat_ms`, not only
     /// when it advances. Repetition is REQUIRED, not an optimization: a node that starts
@@ -3128,15 +3298,16 @@ impl VantageCore {
     /// passed before it existed, and a strictly edge-triggered announcement would never
     /// reach it -- the recovering node is exactly the one that missed the edge.
     ///
-    /// Announced only from `latest_boundary`, which the store populates after the record
-    /// AND its outcome/delta are retained, so we never advertise a head we cannot serve
-    /// (section 9's correctness rule).
-    async fn announce_checkpoint(&mut self) {
-        let Some((view, head)) = self
-            .sequence
-            .as_ref()
-            .and_then(|s| s.latest_boundary().map(|(v, h)| (v, h.clone())))
-        else {
+    /// Boundaries come from the store only after each record AND its outcome/delta are
+    /// retained, so we never advertise a head we cannot serve (section 9's correctness
+    /// rule). Sending recent boundaries together is required once the interval is below
+    /// healthy cursor spread: latest-only announcements from adjacent boundaries never
+    /// form an exact f+1 match even though every head agrees.
+    fn announce_checkpoint(&mut self) {
+        let Some(store) = self.sequence.as_ref() else {
+            return;
+        };
+        let Some((view, _)) = store.latest_boundary() else {
             return;
         };
         let now = Instant::now();
@@ -3149,25 +3320,40 @@ impl VantageCore {
             return;
         }
         self.last_announced = Some((view, now));
-        let serve_floor = self
-            .sequence
-            .as_ref()
-            .map(|s| s.serve_floor())
-            .unwrap_or(view);
+        let serve_floor = store.serve_floor();
+        let announcements: Vec<_> = store
+            .recent_boundaries(SEQUENCE_ANNOUNCE_BOUNDARIES)
+            .into_iter()
+            .map(|(view, head)| SequenceAnnouncement {
+                version: SEQUENCE_VERSION,
+                view,
+                head,
+                serve_floor,
+                sender: self.name,
+            })
+            .collect();
         if let Some(metrics) = &self.metrics {
-            metrics.vantage_sequence_announced_total.inc();
+            metrics
+                .vantage_sequence_announced_total
+                .inc_by(announcements.len() as u64);
         }
-        self.wire
-            .broadcast_message(PrimaryMessage::VantageSequenceAnnounce(
-                SequenceAnnouncement {
-                    version: SEQUENCE_VERSION,
-                    view,
-                    head,
-                    serve_floor,
-                    sender: self.name,
-                },
-            ))
-            .await;
+        // Periodic announcements supersede older ones. Sending them through the durable
+        // main pool queued a minute of stale boundary batches for a stopped joiner; the
+        // bounded collector then evicted each view before f+1 sender streams aligned.
+        // Best-effort sequence egress plus the repeat timer gives the intended latest-
+        // state behavior and shares no queue with live consensus.
+        let peers: Vec<_> = self
+            .members
+            .iter()
+            .copied()
+            .filter(|peer| peer != &self.name)
+            .collect();
+        for peer in peers {
+            self.send_sequence(
+                &peer,
+                PrimaryMessage::VantageSequenceAnnounceBatch(announcements.clone(), self.name),
+            );
+        }
     }
 
     /// Phase B: count one first-hand checkpoint announcement.
@@ -3318,13 +3504,18 @@ impl VantageCore {
             return;
         };
         let floor = store.serve_floor();
-        let max = self
+        let max_views = self
             .sequence_chunk_outcomes
-            .min(request.max_outcomes as usize);
+            .min(request.max_views as usize)
+            .max(1);
+        let max_items = self
+            .sequence_chunk_outcome_items
+            .min(request.max_items as usize)
+            .max(1);
         let outcomes = if request.from_view < floor {
             Vec::new()
         } else {
-            store.outcomes_from(request.from_view, request.target_view, max)
+            store.outcomes_from(request.from_view, request.target_view, max_views, max_items)
         };
         let message = if outcomes.is_empty() {
             PrimaryMessage::VantageSequenceUnavailable(SequenceUnavailable {
@@ -3344,6 +3535,31 @@ impl VantageCore {
             })
         };
         self.send_sequence(to, message);
+    }
+
+    /// Serve cached, block-verified committed headers in bounded response frames on
+    /// the dedicated sequence transport. The ordinary `HeadersRequest` path responds
+    /// with one `Header(_, true)` per digest on the main transport; using it here made a
+    /// late joiner refill its own 1000-slot consensus queue with state-sync data.
+    fn serve_sequence_headers(&mut self, digests: &[Digest], to: &PublicKey) {
+        let blocks = self.rep.blocks();
+        let headers: Vec<Header> = {
+            let cache = blocks.lock();
+            digests
+                .iter()
+                .filter_map(|digest| {
+                    cache
+                        .get(digest)
+                        .and_then(|entry| entry.block_ok_verified.then(|| entry.block.clone()))
+                })
+                .collect()
+        };
+        for chunk in headers.chunks(SEQUENCE_BLOCK_SERVE_BATCH) {
+            self.send_sequence(
+                to,
+                PrimaryMessage::VantageSequenceHeaders(chunk.to_vec(), self.name),
+            );
+        }
     }
 
     /// One state-sync frame to one peer.
@@ -3510,7 +3726,30 @@ impl VantageCore {
                 }
                 effects
             }
-            Inbound::Serve(header) => self.serve_effects(header).await,
+            Inbound::Serve(header) => {
+                let digest = header.id.clone();
+                let effects = self.serve_effects(header).await;
+                let accepted = effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::BlockCached(d) if d == &digest));
+                if accepted && self.sequence_block_requests.remove(&digest).is_some() {
+                    if let Some(metrics) = &self.metrics {
+                        metrics
+                            .vantage_sequence_install_headers_received_total
+                            .inc();
+                        metrics
+                            .vantage_sequence_install_header_requests_in_flight
+                            .set(self.sequence_block_requests.len() as i64);
+                    }
+                    // Receipt-paced refill, but only after half the batch window drains.
+                    // Duplicate copies do not remove an entry and therefore cannot
+                    // amplify requests.
+                    if self.sequence_block_requests.len() <= SEQUENCE_BLOCK_REFILL_AT {
+                        self.drive_sequence_block_fetch(now).await;
+                    }
+                }
+                effects
+            }
             Inbound::HeadersRequest(digests, requestor) => {
                 let mut effects = Vec::new();
                 for d in digests {
@@ -3764,6 +4003,12 @@ impl VantageCore {
                 self.on_sequence_announce(&announcement, &sender);
                 Vec::new()
             }
+            Inbound::SequenceAnnounceBatch(announcements, sender) => {
+                for announcement in announcements.into_iter().take(SEQUENCE_ANNOUNCE_BOUNDARIES) {
+                    self.on_sequence_announce(&announcement, &sender);
+                }
+                Vec::new()
+            }
             Inbound::SequenceRequest(request, sender) => {
                 self.serve_sequence_records(&request, &sender);
                 Vec::new()
@@ -3778,6 +4023,10 @@ impl VantageCore {
             }
             Inbound::SequenceOutcomeRequest(request, sender) => {
                 self.serve_sequence_outcome(&request, &sender);
+                Vec::new()
+            }
+            Inbound::SequenceHeadersRequest(digests, sender) => {
+                self.serve_sequence_headers(&digests, &sender);
                 Vec::new()
             }
             // Requester-side responses. Phase B verifies but never installs; with no
@@ -3800,6 +4049,41 @@ impl VantageCore {
                 self.on_sequence_response(SequenceResponse::Outcome(serve), &sender);
                 Vec::new()
             }
+            Inbound::SequenceHeaders(headers, _) => {
+                let mut effects = Vec::new();
+                let mut accepted = 0u64;
+                for header in headers.into_iter().take(SEQUENCE_BLOCK_SERVE_BATCH) {
+                    let digest = header.id.clone();
+                    // Content-addressed replies need no transfer id, but they must still
+                    // name work in the active bounded install window. This also avoids
+                    // doing payload/store work for unsolicited historical headers.
+                    if !self.sequence_block_requests.contains_key(&digest) {
+                        continue;
+                    }
+                    let header_effects = self.serve_effects(header).await;
+                    let valid = header_effects
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::BlockCached(d) if d == &digest));
+                    effects.extend(header_effects);
+                    if valid && self.sequence_block_requests.remove(&digest).is_some() {
+                        accepted += 1;
+                    }
+                }
+                if accepted > 0 {
+                    if let Some(metrics) = &self.metrics {
+                        metrics
+                            .vantage_sequence_install_headers_received_total
+                            .inc_by(accepted);
+                        metrics
+                            .vantage_sequence_install_header_requests_in_flight
+                            .set(self.sequence_block_requests.len() as i64);
+                    }
+                    if self.sequence_block_requests.len() <= SEQUENCE_BLOCK_REFILL_AT {
+                        self.drive_sequence_block_fetch(now).await;
+                    }
+                }
+                effects
+            }
             Inbound::SequenceUnavailable(u, sender) => {
                 self.on_sequence_response(SequenceResponse::Unavailable(u), &sender);
                 Vec::new()
@@ -3820,12 +4104,11 @@ impl VantageCore {
         }
     }
 
-    /// Highest active sequence-sync target whose gap is still large enough that normal
-    /// dissemination should not try to park consensus/control state for it. This includes
-    /// in-progress transfers as well as staged installs: the memory storm starts before
+    /// Highest certified or active sequence-sync target. This includes certified future
+    /// work, in-progress transfers, and staged installs: the memory storm starts before
     /// verification if live traffic is allowed to accumulate against a node hundreds of
     /// views behind.
-    fn large_sequence_sync_target(&self) -> Option<View> {
+    fn highest_sequence_sync_target(&self) -> Option<View> {
         if !self.sequence_install_enabled {
             return None;
         }
@@ -3834,7 +4117,15 @@ impl VantageCore {
             .as_ref()
             .map(|store| store.head_view())
             .unwrap_or(0);
-        let target = [
+        [
+            // A sticky transfer may deliberately finish an older boundary while newer
+            // ones accumulate. Shedding must follow the REAL certified fleet gap, not
+            // just that older target, or it switches ordinary traffic back on halfway
+            // through the install and immediately repins the core queue.
+            self.sequence_sync
+                .as_ref()
+                .and_then(|collector| collector.certified_head(local))
+                .map(|(view, _)| view),
             self.sequence_transfer
                 .as_ref()
                 .map(|transfer| transfer.target().0),
@@ -3847,12 +4138,40 @@ impl VantageCore {
         ]
         .into_iter()
         .flatten()
-        .max()?;
+        .max()
+    }
+
+    /// Target that currently requires ordinary traffic to be shed. Once the newest
+    /// certified/selected target is within the configured gap, future messages may park
+    /// in the bounded main queue while view-scoped messages covered by the staged target
+    /// are still rejected by `install_replaces_inbound`.
+    fn large_sequence_sync_target(&self) -> Option<View> {
+        let local = self
+            .sequence
+            .as_ref()
+            .map(|store| store.head_view())
+            .unwrap_or(0);
+        let target = self.highest_sequence_sync_target()?;
 
         (target.saturating_sub(local) >= self.sequence_sync_min_gap_views).then_some(target)
     }
 
-    fn refresh_sequence_large_gap_drop(&self) {
+    fn refresh_sequence_large_gap_drop(&mut self) {
+        let local = self
+            .sequence
+            .as_ref()
+            .map(|store| store.head_view())
+            .unwrap_or(0);
+        let target = self.highest_sequence_sync_target();
+        self.sequence_sync_recovery_active = if !self.sequence_install_enabled {
+            false
+        } else if self.sequence_sync_recovery_active {
+            target.is_some_and(|target| target > local)
+        } else {
+            target.is_some_and(|target| {
+                target.saturating_sub(local) >= self.sequence_sync_min_gap_views
+            })
+        };
         self.sequence_large_gap_drop.store(
             self.large_sequence_sync_target().is_some(),
             Ordering::Relaxed,
@@ -4562,8 +4881,12 @@ mod tests {
 
         let (header, _, _) = served_payload_header(&core, member);
         assert!(
-            !core.install_replaces_inbound(&Inbound::Serve(header.clone())),
-            "served blocks are materialization traffic and must still be accepted"
+            core.install_replaces_inbound(&Inbound::Serve(header.clone())),
+            "ordinary repair replies are obsolete once committed headers use the dedicated sequence path"
+        );
+        assert!(
+            !core.install_replaces_inbound(&Inbound::SequenceHeaders(vec![header.clone()], member)),
+            "dedicated committed-header responses must remain admissible"
         );
         assert!(
             core.install_replaces_inbound(&Inbound::Publish(member, header)),
@@ -4583,7 +4906,7 @@ mod tests {
         );
         assert!(
             !core.install_replaces_inbound(&announcement),
-            "checkpoint announcements must still be accepted so the node can retarget"
+            "checkpoint announcements must still be accepted for the next sticky transfer"
         );
 
         core.sequence_sync_min_gap_views = 200;
@@ -4604,6 +4927,192 @@ mod tests {
             core.install_replaces_inbound(&covered_echo),
             "the staged target still replaces messages for views it covers"
         );
+    }
+
+    #[tokio::test]
+    async fn sequence_sync_hysteresis_keeps_target_while_tail_starts_parking() {
+        let mut core = test_core(0, "sequence_sync_hysteresis");
+        core.sequence_sync_min_gap_views = 50;
+        core.sequence_install = Some(SequenceInstall::new(
+            0,
+            100,
+            Digest::default(),
+            Vec::new(),
+            Vec::new(),
+            8,
+            4096,
+        ));
+
+        core.refresh_sequence_large_gap_drop();
+        assert!(core.sequence_sync_recovery_active);
+        assert!(core.sequence_large_gap_drop.load(Ordering::Relaxed));
+
+        for view in 1..=60 {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(
+            core.sequence_sync_recovery_active,
+            "the selected target remains sticky below the entry threshold"
+        );
+        assert!(
+            !core.sequence_large_gap_drop.load(Ordering::Relaxed),
+            "the last sub-threshold tail should park future messages while covered views are filtered by the staged target"
+        );
+
+        for view in 61..=100 {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.sequence_install = None;
+        core.refresh_sequence_large_gap_drop();
+        assert!(!core.sequence_sync_recovery_active);
+        assert!(!core.sequence_large_gap_drop.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn newer_checkpoint_does_not_discard_active_or_staged_progress() {
+        let mut core = test_core(0, "sticky_sequence_target");
+        let keys = crate::common::keys();
+        let first_source = keys[1].0;
+        let newer_head = Digest([0x22; 32]);
+        let local_head = core.sequence.as_ref().unwrap().head().clone();
+        core.sequence_transfer = Some(SequenceTransfer::new(
+            core.agb.sid().clone(),
+            7,
+            0,
+            local_head,
+            100,
+            Digest([0x11; 32]),
+            vec![first_source],
+        ));
+
+        for (sender, _) in keys.iter().skip(1).take(2) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 200,
+                    head: newer_head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        assert_eq!(
+            core.sequence_sync
+                .as_ref()
+                .unwrap()
+                .certified_head(0)
+                .map(|(view, _)| view),
+            Some(200)
+        );
+        for view in 1..=70 {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        assert_eq!(
+            core.large_sequence_sync_target(),
+            Some(200),
+            "shedding must follow the newest certified fleet gap while target 100 stays sticky"
+        );
+
+        core.drive_sequence_sync();
+        assert_eq!(
+            core.sequence_transfer.as_ref().unwrap().target().0,
+            100,
+            "a newer announcement must not reset downloaded transfer progress"
+        );
+
+        core.sequence_transfer = None;
+        core.sequence_request_at = None;
+        core.sequence_last_want = None;
+        core.sequence_verified_target = Some((100, Digest([0x11; 32])));
+        core.sequence_install = Some(SequenceInstall::new(
+            0,
+            100,
+            Digest([0x11; 32]),
+            Vec::new(),
+            Vec::new(),
+            8,
+            4096,
+        ));
+        core.drive_sequence_sync();
+        assert_eq!(
+            core.sequence_install.as_ref().unwrap().target().0,
+            100,
+            "a newer announcement must not reset staged install progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_install_batches_committed_header_digests_to_checkpoint_sources() {
+        let mut core = test_core(0, "sequence_block_batch");
+        let keys = crate::common::keys();
+        let sid = core.agb.sid().clone();
+        let genesis = core.lm.genesis().clone();
+        let first =
+            Header::new_vantage(keys[1].0, 1, BTreeMap::new(), genesis.clone(), sid.clone());
+        let second = Header::new_vantage(keys[2].0, 1, BTreeMap::new(), genesis, sid);
+        let target_head = Digest([0x44; 32]);
+        for (sender, _) in keys.iter().skip(1).take(2) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 1,
+                    head: target_head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        let outcome = SequenceOutcome::Core {
+            c: vec![
+                (first.author, first.height, first.id.clone()),
+                (second.author, second.height, second.id.clone()),
+            ],
+        };
+        let mut install = SequenceInstall::new(
+            0,
+            1,
+            target_head,
+            vec![(1, outcome, vec![first.id.clone(), second.id.clone()])],
+            Vec::new(),
+            8,
+            4096,
+        );
+        assert_eq!(install.admit(0).len(), 2);
+        core.sequence_install = Some(install);
+
+        core.drive_sequence_block_fetch(Instant::now()).await;
+        assert_eq!(
+            core.sequence_block_requests.len(),
+            2,
+            "both missing delta digests are batched without waiting for parent walks"
+        );
+
+        let effects = core
+            .dispatch_inbound(
+                Inbound::SequenceHeaders(vec![first.clone()], keys[1].0),
+                Instant::now(),
+            )
+            .await;
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BlockCached(d) if d == &first.id)));
+        assert_eq!(core.sequence_block_requests.len(), 1);
+        assert!(core.rep.blocks().lock().contains(&first.id));
     }
 
     #[tokio::test]

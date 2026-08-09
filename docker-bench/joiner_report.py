@@ -74,6 +74,15 @@ def main():
     awaited_blocks = last(
         q(a.prom, f"vantage_sequence_install_blocks_awaited{sel}", start, end)
     )
+    header_requests = last(
+        q(a.prom, f"vantage_sequence_install_headers_requested_total{sel}", start, end)
+    )
+    headers_received = last(
+        q(a.prom, f"vantage_sequence_install_headers_received_total{sel}", start, end)
+    )
+    header_in_flight = last(
+        q(a.prom, f"vantage_sequence_install_header_requests_in_flight{sel}", start, end)
+    )
     obsolete = last(
         q(a.prom, f"vantage_sequence_install_obsolete_inbound_dropped_total{sel}", start, end)
     )
@@ -91,6 +100,9 @@ def main():
     print(f"{'views staged in target':<28} {j(total_v):>10}")
     print(f"{'views locally held':<28} {j(awaited):>10}")
     print(f"{'blocks awaited in window':<28} {j(awaited_blocks):>10}")
+    print(f"{'batched headers requested':<28} {j(header_requests):>10}")
+    print(f"{'batched headers received':<28} {j(headers_received):>10}")
+    print(f"{'batched headers in flight':<28} {j(header_in_flight):>10}")
     print(f"{'VIEWS INSTALLED':<28} {j(applied):>10}")
     print(f"{'stale sync-gap drops':<28} {j(obsolete):>10}")
     print(f"{'targets installed in full':<28} {j(completed):>10}")

@@ -18,6 +18,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 NODES=21; RATE=1000; DOWN=60; SETTLE=90; INTERVAL=20; JOINER=""
+# Control arm. With state sync off this is the pre-Phase-C behaviour, which is the only
+# way to show that the install -- not ordinary dissemination -- is what recovers the node.
+EXTRA=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --nodes) NODES="$2"; shift 2;;
@@ -25,6 +28,7 @@ while [ $# -gt 0 ]; do
         --down) DOWN="$2"; shift 2;;
         --settle) SETTLE="$2"; shift 2;;
         --interval) INTERVAL="$2"; shift 2;;
+        --no-state-sync) EXTRA+=(--no-state-sync); shift;;
         *) echo "unknown flag: $1" >&2; exit 2;;
     esac
 done
@@ -38,7 +42,8 @@ DURATION=$((30 + DOWN + SETTLE + 90))
 echo "==> late joiner: n=$NODES, $JOINER down for ${DOWN}s, ${SETTLE}s to catch up"
 
 ./run.sh --nodes "$NODES" --rate "$RATE" --duration "$DURATION" \
-    --sequence-checkpoint-interval "$INTERVAL" &
+    --sequence-checkpoint-interval "$INTERVAL" \
+    ${EXTRA[@]+"${EXTRA[@]}"} &
 RUN_PID=$!
 
 # Wait for the joiner to exist, then kill it before it can learn anything useful.

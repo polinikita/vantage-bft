@@ -578,3 +578,66 @@ async fn install_accepts_a_block_whose_payload_is_not_materialized() {
         "the worker learns about the repaired header through commit notification"
     );
 }
+
+/// A lane that contradicts already-delivered output must not stop the cursor.
+///
+/// The forking author is dropped from that view and every other author still commits.
+/// Before this, `expand` waited on the unwalkable entry forever: measured on a 21-node
+/// docker-bench fleet, one restarted validator froze the output cursor of all 21 nodes
+/// permanently while AGB ran on more than a thousand views ahead.
+#[tokio::test]
+async fn forked_lane_does_not_wedge_the_cursor() {
+    let (name, _) = authors()[3];
+    let (forker, _) = authors()[0];
+    let (honest, _) = authors()[1];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_forked_lane");
+
+    // View 1 delivers the forker's height 1, which sets the cursor's watermark for it.
+    let original = direct_chain(&mut lm, forker, 1).await;
+    let honest_1 = direct_chain(&mut lm, honest, 1).await;
+    let mut cursor = new_cursor(&lm);
+    let c = vec![block_ref(&original[0])];
+    cursor.on_completed(1, c.clone(), Vec::new());
+    cursor.on_sealed(1, Outcome::Full(c, Vec::new()));
+    assert_eq!(cursor.next_view(), 2);
+    assert_eq!(cursor.forked_dropped(), 0);
+
+    // The fork: a DIFFERENT height-1 block for the same author, and a height-2 block
+    // built on it. This is exactly what a validator that restarts without its lane
+    // frontier publishes.
+    let sid = lm.sid().clone();
+    let sibling = tagged_header(forker, 1, lm.genesis().clone(), sid.clone(), 7);
+    let on_fork = tagged_header(forker, 2, sibling.id.clone(), sid, 9);
+    lm.process_publish(forker, sibling.clone()).await;
+    lm.process_publish(forker, on_fork.clone()).await;
+
+    // View 2 names the forked height 2 alongside an honest author's block.
+    let honest_2 = direct_chain(&mut lm, honest, 2).await;
+    let c2 = sorted_manifest(vec![block_ref(&on_fork), block_ref(&honest_2[1])]);
+    cursor.on_completed(2, c2.clone(), Vec::new());
+    cursor.on_sealed(2, Outcome::Full(c2, Vec::new()));
+
+    assert_eq!(
+        cursor.next_view(),
+        3,
+        "the cursor must advance past a view containing a forked lane"
+    );
+    assert_eq!(
+        cursor.forked_dropped(),
+        1,
+        "exactly the forking author's entry is dropped"
+    );
+    let log = cursor.output_log();
+    assert!(
+        log.contains(&honest_2[1].id),
+        "the honest author's block must still be delivered"
+    );
+    assert!(
+        !log.contains(&on_fork.id) && !log.contains(&sibling.id),
+        "no block from the forked branch may be delivered"
+    );
+    assert!(
+        log.contains(&original[0].id) && log.contains(&honest_1[0].id),
+        "view 1's output is untouched"
+    );
+}

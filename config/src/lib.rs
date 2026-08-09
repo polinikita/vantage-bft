@@ -377,11 +377,18 @@ pub struct Parameters {
     #[serde(default = "default_sequence_sync_chunk_records")]
     pub sequence_sync_chunk_records: usize,
 
-    /// Consecutive terminal outcome bodies per served chunk. Outcomes contain manifests
-    /// and are therefore variable-sized; the conservative default keeps an n=100 Full
-    /// batch near the existing 64 KiB frame norm.
+    /// Maximum terminal outcome VIEWS per served range. This bounds a run of tiny `Skip`
+    /// outcomes; `sequence_sync_chunk_outcome_items` is the primary size bound for
+    /// manifest-carrying outcomes.
     #[serde(default = "default_sequence_sync_chunk_outcomes")]
     pub sequence_sync_chunk_outcomes: usize,
+
+    /// Maximum total manifest references in one served outcome range. Unlike a fixed
+    /// view count, this self-adjusts to committee size and to `Full`/`Core`/`Skip`: the
+    /// default is the same worst-case reference count as the old n=100 eight-view batch,
+    /// while allowing substantially more views per round trip in smaller committees.
+    #[serde(default = "default_sequence_sync_chunk_outcome_items")]
+    pub sequence_sync_chunk_outcome_items: usize,
 
     /// Delta digests per served chunk (32 B each).
     #[serde(default = "default_sequence_sync_chunk_digests")]
@@ -824,20 +831,19 @@ fn default_sequence_checkpoints() -> bool {
     true
 }
 
-/// 100 views. Frequent enough that a straggler's recovery anchor is never far behind,
-/// rare enough that boundary bookkeeping is negligible next to per-view records. The
-/// plan defers a profiled value, so this is deliberately a round starting point rather
-/// than a tuned one.
+/// Keep the checkpoint interval below the default 50-view state-sync entry threshold.
+/// A larger interval can only certify a boundary that is already too stale for a clean
+/// handoff back to normal dissemination.
 fn default_sequence_checkpoint_interval_views() -> u64 {
-    100
+    20
 }
 
 fn default_sequence_announce_period_ms() -> u64 {
-    2_000
+    250
 }
 
 fn default_sequence_announce_repeat_ms() -> u64 {
-    10_000
+    1_000
 }
 
 /// 256 records is ~24 KB at 96 B/record.
@@ -845,9 +851,15 @@ fn default_sequence_sync_chunk_records() -> usize {
     256
 }
 
-/// A Full outcome at n=100 is roughly 7 KiB; eight stay near the 64 KiB frame norm.
+/// Secondary bound for long runs of `Skip` outcomes, which consume no manifest items.
 fn default_sequence_sync_chunk_outcomes() -> usize {
-    8
+    256
+}
+
+/// Eight n=100 `Full` outcomes contain at most 8 * 2 * 100 references. This preserves
+/// the previous worst-case frame bound while allowing ~38 `Full` outcomes at n=21.
+fn default_sequence_sync_chunk_outcome_items() -> usize {
+    1_600
 }
 
 /// 1024 digests is 32 KB, comfortably below the 64 KB frame norm.
@@ -1227,6 +1239,7 @@ impl Default for Parameters {
             sequence_announce_repeat_ms: default_sequence_announce_repeat_ms(),
             sequence_sync_chunk_records: default_sequence_sync_chunk_records(),
             sequence_sync_chunk_outcomes: default_sequence_sync_chunk_outcomes(),
+            sequence_sync_chunk_outcome_items: default_sequence_sync_chunk_outcome_items(),
             sequence_sync_chunk_digests: default_sequence_sync_chunk_digests(),
             sequence_sync_min_gap_views: default_sequence_sync_min_gap_views(),
             sequence_sync_max_sources: default_sequence_sync_max_sources(),

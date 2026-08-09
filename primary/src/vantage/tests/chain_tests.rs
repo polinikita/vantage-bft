@@ -200,3 +200,81 @@ async fn relay_then_authentic_upgrades() {
     assert!(lm.direct_pub(&r));
     assert!(is_acked(&effects));
 }
+
+/// A restart must CONTINUE this party's lane, not fork it.
+///
+/// Without a persisted frontier the second process re-signs height 1 with a different
+/// payload, and peers -- which walk a lane prefix from their per-author watermark toward
+/// the digest a manifest names -- can never reach the forked block from that watermark.
+/// `Cursor::expand` returns `None` forever and every honest node's output cursor wedges.
+/// Measured on docker-bench at n=21: one restart froze all 21 cursors permanently.
+#[tokio::test]
+async fn restart_continues_the_lane_instead_of_forking_it() {
+    let (author, _) = authors()[0];
+    let (mut lm, store) = new_lane_manager(author, ".db_test_vantage_restart_frontier");
+
+    let mut payload = BTreeMap::new();
+    payload.insert(Digest::default(), 0);
+    let (first, _) = lm.publish_own(payload).await;
+    assert_eq!(first.height, 1);
+
+    // The restart: a brand-new manager over the SAME store, exactly as a fresh process
+    // would see it.
+    let mut restarted = crate::vantage::lanes::LaneManager::new(
+        author,
+        test_committee(),
+        MAX_BLOCK_PAYLOAD,
+        store.clone(),
+    );
+    restarted.restore_own_frontier().await;
+    assert_eq!(
+        restarted.own_tip_height(),
+        1,
+        "restart must adopt the persisted lane frontier"
+    );
+
+    let (second, _) = restarted.publish_own(BTreeMap::new()).await;
+    assert_eq!(second.height, 2, "restart must not reuse a spent height");
+    assert_eq!(
+        second.parent_cert.header_digest, first.id,
+        "the post-restart block must chain onto the pre-restart tip, not genesis"
+    );
+}
+
+/// A store carried across a committee change describes a lane in a DIFFERENT session.
+/// Chaining onto it would produce blocks whose prefix no peer in the new session can
+/// walk, so the frontier is ignored and this session's lane starts at genesis.
+#[tokio::test]
+async fn restart_ignores_a_frontier_from_another_session() {
+    let (author, _) = authors()[0];
+    let (mut lm, store) = new_lane_manager(author, ".db_test_vantage_restart_other_sid");
+    let (first, _) = lm.publish_own(BTreeMap::new()).await;
+    assert_eq!(first.height, 1);
+
+    // A different membership yields a different sid (`block::session_id`).
+    let mut next_committee = test_committee();
+    let evicted = *next_committee
+        .authorities
+        .keys()
+        .last()
+        .expect("test committee is non-empty");
+    next_committee.authorities.remove(&evicted);
+    assert_ne!(
+        crate::vantage::block::session_id(&next_committee),
+        test_sid(),
+        "test fixture requires the two committees to differ in sid"
+    );
+
+    let mut other = crate::vantage::lanes::LaneManager::new(
+        author,
+        next_committee,
+        MAX_BLOCK_PAYLOAD,
+        store.clone(),
+    );
+    other.restore_own_frontier().await;
+    assert_eq!(
+        other.own_tip_height(),
+        0,
+        "a frontier from another session must not be adopted"
+    );
+}

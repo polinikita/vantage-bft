@@ -253,6 +253,12 @@ pub enum PrimaryMessage {
     VantageSequenceUnavailable(SequenceUnavailable),
     VantageSequenceDeltaRangeRequest(SequenceDeltaRangeRequest),
     VantageSequenceDeltaRange(SequenceDeltaRangeChunk),
+    // Phase C materialization. These are separate from `HeadersRequest`/`Header(_, true)`
+    // so a late joiner's committed-history responses stay on the dedicated sequence
+    // transport and ingress queue instead of refilling its saturated consensus queue.
+    VantageSequenceHeadersRequest(Vec<Digest>, /* requester */ PublicKey),
+    VantageSequenceHeaders(Vec<Header>, /* sender */ PublicKey),
+    VantageSequenceAnnounceBatch(Vec<SequenceAnnouncement>, /* sender */ PublicKey),
 }
 
 impl PrimaryMessage {
@@ -328,6 +334,9 @@ impl PrimaryMessage {
                 "VantageSequenceDeltaRangeRequest"
             }
             PrimaryMessage::VantageSequenceDeltaRange(..) => "VantageSequenceDeltaRange",
+            PrimaryMessage::VantageSequenceHeadersRequest(..) => "VantageSequenceHeadersRequest",
+            PrimaryMessage::VantageSequenceHeaders(..) => "VantageSequenceHeaders",
+            PrimaryMessage::VantageSequenceAnnounceBatch(..) => "VantageSequenceAnnounceBatch",
         }
     }
 }

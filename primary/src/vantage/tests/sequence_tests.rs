@@ -259,6 +259,15 @@ fn store_records_boundaries_at_the_interval() {
         store.head(),
         "the latest boundary is the current head"
     );
+    assert_eq!(
+        store
+            .recent_boundaries(2)
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect::<Vec<_>>(),
+        vec![4, 8],
+        "recent boundaries stay oldest-first on the wire"
+    );
 }
 
 /// A zero interval is a misconfiguration, not a reason to divide by zero.
@@ -545,6 +554,52 @@ fn populated_store(views: u64) -> (SequenceStore, Digest) {
 }
 
 #[test]
+fn outcome_ranges_use_a_shared_manifest_item_budget() {
+    let sid = test_sid();
+    let mut store = SequenceStore::new(sid, 4);
+    let item = manifest(1).pop().unwrap();
+    let outcomes = [
+        SequenceOutcome::Full {
+            c: vec![item.clone(); 4],
+            t: vec![item.clone(); 4],
+        },
+        SequenceOutcome::Core {
+            c: vec![item.clone(); 3],
+        },
+        SequenceOutcome::Skip,
+        SequenceOutcome::Core { c: vec![item; 2] },
+    ];
+    for (index, outcome) in outcomes.iter().enumerate() {
+        store.record(index as u64 + 1, outcome, &[]).unwrap();
+    }
+
+    let first = store.outcomes_from(1, 4, 256, 10);
+    assert_eq!(
+        first.iter().map(|entry| entry.view).collect::<Vec<_>>(),
+        vec![1],
+        "the next view must not push the shared item budget from 8 to 11"
+    );
+
+    let mixed = store.outcomes_from(2, 4, 256, 3);
+    assert_eq!(
+        mixed.iter().map(|entry| entry.view).collect::<Vec<_>>(),
+        vec![2, 3],
+        "a Skip consumes no manifest budget but the following Core does"
+    );
+
+    assert_eq!(
+        store.outcomes_from(1, 4, 256, 1).len(),
+        1,
+        "one oversized outcome must still be served so the transfer can progress"
+    );
+    assert_eq!(
+        store.outcomes_from(2, 4, 1, usize::MAX).len(),
+        1,
+        "the view cap independently bounds runs of small outcomes"
+    );
+}
+
+#[test]
 fn a_served_chain_verifies_against_the_certified_head() {
     let (store, sid) = populated_store(12);
     let target_view = 12;
@@ -797,7 +852,7 @@ fn run_transfer(
                         version: SEQUENCE_VERSION,
                         transfer_id: 7,
                         target_head: store.head().clone(),
-                        outcomes: store.outcomes_from(from_view, target_view, 3),
+                        outcomes: store.outcomes_from(from_view, target_view, 3, usize::MAX),
                         sender: *serve_from,
                     },
                     serve_from,
@@ -893,7 +948,7 @@ fn outcome_batches_accept_useful_overlap() {
                 version: SEQUENCE_VERSION,
                 transfer_id: 7,
                 target_head: store.head().clone(),
-                outcomes: store.outcomes_from(1, 3, 3),
+                outcomes: store.outcomes_from(1, 3, 3, usize::MAX),
                 sender: a,
             },
             &a,
@@ -910,7 +965,7 @@ fn outcome_batches_accept_useful_overlap() {
                 version: SEQUENCE_VERSION,
                 transfer_id: 7,
                 target_head: store.head().clone(),
-                outcomes: store.outcomes_from(2, 6, 5),
+                outcomes: store.outcomes_from(2, 6, 5, usize::MAX),
                 sender: b,
             },
             &b,
@@ -1126,7 +1181,7 @@ fn a_corrupt_delta_chunk_restarts_that_view() {
             version: SEQUENCE_VERSION,
             transfer_id: 7,
             target_head: store.head().clone(),
-            outcomes: store.outcomes_from(1, 3, 3),
+            outcomes: store.outcomes_from(1, 3, 3, usize::MAX),
             sender: source,
         },
         &source,
@@ -1209,7 +1264,7 @@ fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
             version: SEQUENCE_VERSION,
             transfer_id: 7,
             target_head: store.head().clone(),
-            outcomes: store.outcomes_from(1, 6, 6),
+            outcomes: store.outcomes_from(1, 6, 6, usize::MAX),
             sender: a,
         },
         &a,

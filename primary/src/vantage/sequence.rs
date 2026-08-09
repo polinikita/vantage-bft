@@ -57,6 +57,20 @@ impl SequenceOutcome {
         let bytes = bincode::serialize(&(view, self)).expect("SequenceOutcome serializes");
         block::domain_hash(TAG_OUTCOME, sid, &bytes)
     }
+
+    /// Number of variable-sized manifest references carried by this outcome.
+    ///
+    /// This is the useful frame-size unit for range serving: `Skip` is tiny, `Core`
+    /// carries one manifest, and `Full` carries two. Bounding only the number of views
+    /// wastes most of a frame for small committees and can still oversize one for a
+    /// large committee.
+    pub fn manifest_items(&self) -> usize {
+        match self {
+            Self::Full { c, t } => c.len().saturating_add(t.len()),
+            Self::Core { c } => c.len(),
+            Self::Skip => 0,
+        }
+    }
 }
 
 impl From<&Outcome> for SequenceOutcome {
@@ -247,6 +261,22 @@ impl SequenceStore {
 
     pub fn boundary(&self, view: View) -> Option<&Digest> {
         self.boundaries.get(&view)
+    }
+
+    /// Up to `limit` newest fixed checkpoint boundaries, returned oldest-first for
+    /// deterministic wire order. Announcing a short suffix rather than only the latest
+    /// lets validators whose cursors straddle adjacent boundaries contribute to the
+    /// same f+1 certificate.
+    pub fn recent_boundaries(&self, limit: usize) -> Vec<(View, Digest)> {
+        let mut boundaries: Vec<_> = self
+            .boundaries
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|(view, head)| (*view, head.clone()))
+            .collect();
+        boundaries.reverse();
+        boundaries
     }
 
     fn is_boundary(&self, view: View) -> bool {
@@ -552,25 +582,37 @@ impl SequenceStore {
         self.outcomes.get(&view)
     }
 
-    /// A consecutive outcome range beginning at `from`, bounded by `max` and `through`.
-    /// Stops at the first retention gap; callers answer an empty range with
-    /// `SequenceUnavailable` rather than pretending the request completed.
+    /// A consecutive outcome range beginning at `from`, bounded by view count, total
+    /// manifest references, and `through`.
+    ///
+    /// The manifest-reference budget self-adjusts to committee size and actual outcome
+    /// shape. Always serving the first retained outcome guarantees progress even when a
+    /// single outcome exceeds the requester's budget; `max_views` still bounds a run of
+    /// tiny `Skip` outcomes. Stops at the first retention gap; callers answer an empty
+    /// range with `SequenceUnavailable` rather than pretending the request completed.
     pub fn outcomes_from(
         &self,
         from: View,
         through: View,
-        max: usize,
+        max_views: usize,
+        max_items: usize,
     ) -> Vec<SequenceOutcomeEntry> {
         let mut outcomes = Vec::new();
         let mut view = from;
-        while view <= through && outcomes.len() < max {
+        let mut remaining = max_items;
+        while view <= through && outcomes.len() < max_views {
             let Some(outcome) = self.outcomes.get(&view) else {
                 break;
             };
+            let items = outcome.manifest_items();
+            if !outcomes.is_empty() && items > remaining {
+                break;
+            }
             outcomes.push(SequenceOutcomeEntry {
                 view,
                 outcome: outcome.clone(),
             });
+            remaining = remaining.saturating_sub(items);
             if view == through {
                 break;
             }
@@ -727,7 +769,11 @@ pub struct SequenceOutcomeRequest {
     pub target_head: Digest,
     pub target_view: View,
     pub from_view: View,
-    pub max_outcomes: u32,
+    /// Maximum number of outcome views. Bounds a long run of tiny `Skip` outcomes.
+    pub max_views: u32,
+    /// Maximum total manifest references across the response. This is the variable-size
+    /// byte proxy and therefore the primary frame bound.
+    pub max_items: u32,
     pub requester: PublicKey,
 }
 
