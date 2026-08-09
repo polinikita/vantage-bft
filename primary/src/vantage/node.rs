@@ -27,6 +27,7 @@ use crate::vantage::resume::{
     in_flight_state, InFlightEntry, InFlightState, NudgeMemo, ReplayEpisodes, ResumeServe,
     ResumeTrigger, ServeBudget,
 };
+use crate::vantage::sequence::{SequenceOutcome, SequenceStore};
 use crate::vantage::wire::{self, Wire};
 use crate::vantage::Effect;
 use async_trait::async_trait;
@@ -369,6 +370,11 @@ pub struct VantageCore {
     agb: AgbEngine,
     frontier: Frontier,
     cursor: Cursor,
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §9. PHASE A (record-only shadow mode): built
+    /// from every terminal cursor advance, never announced, fetched, or installed.
+    /// `None` when `Parameters::sequence_checkpoints` is off, which is the default until
+    /// cross-node head determinism is proved on a real run (§14 Phase A).
+    sequence: Option<SequenceStore>,
     pacemaker: Pacemaker,
     resolver: Resolver,
     control: ControlLog,
@@ -672,6 +678,10 @@ impl VantageCore {
         );
         let pacemaker = Pacemaker::new(name, &committee);
         let resolver = Resolver::new(committee.size(), parameters.delta_ms);
+        // Built BEFORE `sid` is moved into `ControlLog` below.
+        let sequence = parameters.sequence_checkpoints.then(|| {
+            SequenceStore::new(sid.clone(), parameters.sequence_checkpoint_interval_views)
+        });
         let control = ControlLog::new(name, committee.clone(), sid, parameters.delta_ms);
 
         let other_primaries: Vec<(PublicKey, SocketAddr)> = committee
@@ -775,6 +785,7 @@ impl VantageCore {
             agb,
             frontier,
             cursor,
+            sequence,
             pacemaker,
             resolver,
             control,
@@ -2037,6 +2048,51 @@ impl VantageCore {
         effects
     }
 
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §14 Phase A: fold one terminal cursor advance
+    /// into the local sequence chain. Record-only -- nothing here announces, fetches, or
+    /// installs, and no live AGB state is read or written.
+    ///
+    /// A rejected record is a LOCAL invariant violation (the cursor finalized a view out
+    /// of order), not remote input, so it is logged at error and counted rather than
+    /// silently skipped: skipping would leave a gap and produce a head no other correct
+    /// party derives, which is exactly the divergence this phase exists to detect. The
+    /// store is left untouched so the first bad view stays identifiable.
+    fn record_sequence(&mut self, view: View, outcome: &SequenceOutcome, output_delta: &[Digest]) {
+        let Some(store) = self.sequence.as_mut() else {
+            return;
+        };
+        match store.record(view, outcome, output_delta) {
+            Ok(_) => {
+                let head_view = store.head_view();
+                let boundary = store.latest_boundary().map(|(v, h)| (v, h.clone()));
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_head_view.set(head_view as i64);
+                    metrics
+                        .vantage_sequence_delta_digests_total
+                        .inc_by(output_delta.len() as u64);
+                    metrics.vantage_sequence_records_total.inc();
+                }
+                // Phase A's entire deliverable: a head that every correct node must
+                // agree on at the same boundary. Logged at info so a run can be compared
+                // across nodes without a metrics scrape.
+                if let Some((boundary_view, head)) = boundary {
+                    if boundary_view == view {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_sequence_boundary_view.set(view as i64);
+                        }
+                        log::info!("vantage sequence checkpoint: view={view} head={head}");
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_record_rejected_total.inc();
+                }
+                log::error!("vantage sequence: {e}");
+            }
+        }
+    }
+
     /// PHASE5-SPEC.md §3: execute a formal `Effect::Enter(view)` as `AgbEngine::enter`
     /// + `Frontier::enter`, in that order -- `Frontier::enter`'s W5(c) floor can newly
     ///   activate further views (its own contiguous-advance loop, on top of `view`
@@ -2692,6 +2748,13 @@ impl VantageCore {
                     }
                     Effect::RaiseWish(target) => {
                         queue.extend(self.pacemaker.raise_own_wish(target));
+                    }
+                    Effect::SequenceFinalized {
+                        view,
+                        outcome,
+                        output_delta,
+                    } => {
+                        self.record_sequence(view, &outcome, &output_delta);
                     }
 
                     // --- PHASE6-SPEC.md §5 (reports + control log) ---

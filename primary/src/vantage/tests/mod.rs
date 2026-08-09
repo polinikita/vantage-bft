@@ -10,6 +10,8 @@ mod metrics_tests;
 mod registers_tests;
 mod repair_tests;
 mod retention_tests;
+// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §13: canonical sequence objects and the local store.
+mod sequence_tests;
 
 // PHASE4-SPEC.md §12
 mod agb_echo_tests;

@@ -723,6 +723,10 @@ pub fn drain_local(
                     nodes[idx].timers.push((deadline, view, kind));
                 }
                 Effect::NotifyCommitted(..) => {}
+                // SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase A is record-only, and the
+                // harness runs no `SequenceStore`. Dropped here so the deterministic
+                // protocol tests keep asserting on output, not on shadow bookkeeping.
+                Effect::SequenceFinalized { .. } => {}
                 Effect::Enter(view) => {
                     queue.extend(nodes[idx].enter_view_effects(view, now));
                 }

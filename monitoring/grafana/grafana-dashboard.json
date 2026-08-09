@@ -2517,6 +2517,252 @@
       "title": "Store-actor staleness and panics (worst validator)",
       "type": "timeseries",
       "description": "Milliseconds since the store actor last COMPLETED a loop iteration, worst node. Its flush ticker fires unconditionally every 50 ms, so steady state is <50 ms at ANY load and this is load-independent: a large value is always a real stall, never just quiet. Together with the occupancy panel this separates the two failure modes -- a BLOCKED actor (RocksDB write stall) shows growing age with store occupancy pinned at 100, while a DEAD actor (task panic) shows growing age plus a nonzero panic count. Panics are otherwise invisible: nothing awaits a JoinHandle, so tokio drops a task panic silently and every unrelated counter keeps advancing."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 123
+      },
+      "id": 9200,
+      "panels": [],
+      "title": "Sequence checkpoints (SEQUENCE-CHECKPOINT-SYNC-PLAN.md, Phase A: record-only)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 124
+      },
+      "id": 9201,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "{{node}} sequence head",
+          "expr": "vantage_sequence_head_view{node=~\"$node\"}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "{{node}} cursor",
+          "expr": "vantage_cursor_next_view{node=~\"$node\"}"
+        }
+      ],
+      "title": "Sequence head vs cursor, per validator",
+      "type": "timeseries",
+      "description": "Highest view covered by the local hash-chained sequence log, against the output cursor. The two must track each other: a record is written on every TERMINAL cursor advance, so a persistent gap means views are advancing without being recorded. Phase A is record-only -- nothing here is announced, fetched, or installed, and no live AGB rule is affected. Empty unless `sequence_checkpoints` is on (default off)."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 124
+      },
+      "id": 9202,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "highest boundary",
+          "expr": "max(vantage_sequence_boundary_view{node=~\"$node\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "lowest boundary",
+          "expr": "min(vantage_sequence_boundary_view{node=~\"$node\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "C",
+          "legendFormat": "spread (views)",
+          "expr": "max(vantage_sequence_boundary_view{node=~\"$node\"}) - min(vantage_sequence_boundary_view{node=~\"$node\"})"
+        }
+      ],
+      "title": "Checkpoint boundary spread across validators",
+      "type": "timeseries",
+      "description": "How far apart validators are in checkpoint boundaries passed. Fixed boundaries every K views exist so that correct parties sitting a few views apart still announce IDENTICAL heads (plan 4.4); this panel shows whether K is small enough that a recovering node finds a recent common anchor, and large spread means stragglers would anchor far behind the fleet."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 132
+      },
+      "id": 9203,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "records/s",
+          "expr": "sum(rate(vantage_sequence_records_total{node=~\"$node\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "B",
+          "legendFormat": "delta digests/s",
+          "expr": "sum(rate(vantage_sequence_delta_digests_total{node=~\"$node\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "C",
+          "legendFormat": "committed blocks/s",
+          "expr": "sum(rate(committed_transactions{node=~\"$node\"}[1m]))"
+        }
+      ],
+      "title": "Sequence record and delta rate",
+      "type": "timeseries",
+      "description": "Records per second is the terminal view rate; delta digests per second is the block output rate as the sequence log sees it. The delta rate is the cross-check: it must match the committed block rate, because a delta is exactly what the cursor emitted while processing that view. A shortfall means blocks are being emitted outside a tracked view and the head would not be reproducible."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 132
+      },
+      "id": 9204,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "A",
+          "legendFormat": "{{node}} rejected",
+          "expr": "vantage_sequence_record_rejected_total{node=~\"$node\"}"
+        }
+      ],
+      "title": "Sequence record rejections (Phase A release blocker)",
+      "type": "timeseries",
+      "description": "Records refused because the cursor finalized a view out of order. This counts a LOCAL invariant violation, never remote input -- Phase A has no remote input at all. Any nonzero value invalidates this node's head and is a release blocker under the plan's Phase A gate: a gap produces a head no other correct party derives, so the run must be reduced to the first divergent view before anything is announced. Flat zero is the only acceptable reading."
     }
   ],
   "preload": false,

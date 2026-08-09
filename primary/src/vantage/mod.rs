@@ -21,6 +21,7 @@ pub mod payload;
 pub mod repair;
 pub mod resolve;
 pub mod resume;
+pub mod sequence;
 pub mod threshold;
 pub mod wire;
 
@@ -156,6 +157,21 @@ pub enum Effect {
     /// -- a necessary, minimal channel from `AgbEngine` to `Pacemaker::raise_own_wish`,
     /// documented as a deviation in PHASE5-NOTES.md.
     RaiseWish(View),
+
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §8: the cursor TERMINALLY advanced past `view`
+    /// (`Full`, `Core`, or `Skip`), carrying the exact ordered set of block digests it
+    /// emitted while processing that view, after cross- and within-view deduplication.
+    ///
+    /// Internal handoff only -- never a wire frame, and never one oversized chunk:
+    /// `SequenceStore` folds the vector into the incremental delta chain, and a later
+    /// phase serves it in bounded pieces. Emitted on every terminal advance regardless of
+    /// whether checkpoints are enabled, so the cursor has exactly one code path and
+    /// cannot derive a head that depends on configuration.
+    SequenceFinalized {
+        view: View,
+        outcome: sequence::SequenceOutcome,
+        output_delta: Vec<Digest>,
+    },
 
     // --- PHASE6-SPEC.md §5 (completion reports + control log) ---
     /// The FIRST genuine R4 completion for `view` with `M != None` -- a necessary,

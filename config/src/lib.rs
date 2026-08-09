@@ -341,6 +341,26 @@ pub struct Parameters {
     #[serde(default = "default_digest_statements")]
     pub digest_statements: bool,
 
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10. PHASE A (record-only shadow mode): build
+    /// the local hash-chained sequence log and its checkpoint-boundary heads. Nothing is
+    /// announced, fetched, or installed, and no live AGB rule changes -- the flag exists
+    /// so a run can be scored for cross-node head determinism (§14 Phase A) before any
+    /// of that is written.
+    ///
+    /// `#[serde(default)]` = `false`. Off, the store is never constructed and the only
+    /// residue is one `Vec<Digest>` per open view inside `Cursor`, which the cursor
+    /// accumulates unconditionally so its output rules cannot depend on configuration.
+    #[serde(default = "default_sequence_checkpoints")]
+    pub sequence_checkpoints: bool,
+
+    /// Checkpoint boundary interval `K` in terminally processed views.
+    ///
+    /// Fixed boundaries rather than "whatever head I hold": correct cursors sit a few
+    /// views apart at any instant, so announcing current heads would rarely produce the
+    /// `f+1` EXACT matches the recovery rule needs (§4.4). 0 is treated as 1.
+    #[serde(default = "default_sequence_checkpoint_interval_views")]
+    pub sequence_checkpoint_interval_views: u64,
+
     /// AVAIL-ECHO-SPEC.md: carry availability acknowledgments POSITIONALLY on the AGB
     /// echo -- a bit per lane against the echoed proposal's own reference vector --
     /// instead of `VantageAvail`'s explicit `(a,k,h)` tuples.
@@ -705,6 +725,19 @@ fn default_digest_statements() -> bool {
     true
 }
 
+/// Off until cross-node head determinism is proved on a real run (§14 Phase A).
+fn default_sequence_checkpoints() -> bool {
+    false
+}
+
+/// 100 views. Frequent enough that a straggler's recovery anchor is never far behind,
+/// rare enough that boundary bookkeeping is negligible next to per-view records. The
+/// plan defers a profiled value, so this is deliberately a round starting point rather
+/// than a tuned one.
+fn default_sequence_checkpoint_interval_views() -> u64 {
+    100
+}
+
 fn default_batch_max_bytes() -> usize {
     65_536
 }
@@ -1026,6 +1059,8 @@ impl Default for Parameters {
             ack_watermarks: default_ack_watermarks(),
             ack_watermark_period_ms: default_ack_watermark_period_ms(),
             digest_statements: default_digest_statements(),
+            sequence_checkpoints: default_sequence_checkpoints(),
+            sequence_checkpoint_interval_views: default_sequence_checkpoint_interval_views(),
             // AVAIL-ECHO-SPEC.md: off by default, so `Parameters::default()` and every
             // config predating the field keep the explicit-tuple `VantageAvail` path.
             echo_avail_claims: false,

@@ -1054,6 +1054,7 @@ impl SimpleItCore {
                 | Effect::BroadcastWish(_)
                 | Effect::Enter(_)
                 | Effect::RaiseWish(_)
+                | Effect::SequenceFinalized { .. }
                 | Effect::CompletionReportable(_, _)
                 | Effect::BroadcastCompReport(_, _)
                 | Effect::BroadcastControlInit(_, _)

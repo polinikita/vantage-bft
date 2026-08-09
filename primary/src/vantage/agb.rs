@@ -2961,12 +2961,13 @@ impl DigestStatements {
     /// durable authorization record for a late body response once active retries have
     /// been capped and abandoned.
     fn has_buffered_statement_for(&self, view: View, digest: &Digest) -> bool {
-        self.buffered_echo.get(&view).map_or(false, |senders| {
-            senders.values().any(|(d, _, _, _)| d == digest)
-        }) || self
-            .buffered_ready
+        self.buffered_echo
             .get(&view)
-            .map_or(false, |senders| senders.values().any(|(d, _)| d == digest))
+            .is_some_and(|senders| senders.values().any(|(d, _, _, _)| d == digest))
+            || self
+                .buffered_ready
+                .get(&view)
+                .is_some_and(|senders| senders.values().any(|(d, _)| d == digest))
     }
 
     /// Fan a `VantageBodyFetch` out to every currently-buffered author of `(view,

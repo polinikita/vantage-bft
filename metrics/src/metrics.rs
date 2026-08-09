@@ -679,6 +679,27 @@ pub struct Metrics {
     /// Prometheus target already separates primary and worker processes; this label
     /// separates the listeners inside a process.
     pub network_connections: IntGaugeVec,
+    // --- SEQUENCE-CHECKPOINT-SYNC-PLAN.md §11, PHASE A subset. Record-only: these
+    // describe the LOCAL sequence chain. Announcement/transfer/install metrics land with
+    // the phases that introduce those paths, so nothing here can imply a capability the
+    // build does not have.
+    /// Highest view covered by the local sequence chain. Phase A's primary signal:
+    /// across correct nodes this should track the cursor, and heads at a common boundary
+    /// must be identical.
+    pub vantage_sequence_head_view: IntGauge,
+    /// Highest checkpoint boundary this node has passed.
+    pub vantage_sequence_boundary_view: IntGauge,
+    /// Sequence records committed to the local chain -- one per terminally processed
+    /// view, including `Skip`.
+    pub vantage_sequence_records_total: IntCounter,
+    /// Block digests folded into per-view output deltas. Rate should equal the committed
+    /// block rate; a divergence means the cursor emitted outside a tracked view.
+    pub vantage_sequence_delta_digests_total: IntCounter,
+    /// Records refused because the cursor finalized a view out of order. A LOCAL
+    /// invariant violation, not remote input -- any nonzero value invalidates the head
+    /// and is a Phase A release blocker.
+    pub vantage_sequence_record_rejected_total: IntCounter,
+
     /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
     /// addressed to a peer we have not managed to connect to yet. Best-effort sends
     /// are allowed to vanish, but they must not vanish SILENTLY: this is the only
@@ -1515,6 +1536,36 @@ impl Metrics {
             network_connect_wait_discarded_total: register_int_counter_with_registry!(
                 "network_connect_wait_discarded_total",
                 "SimpleSender frames discarded while waiting out a connect backoff",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_head_view: register_int_gauge_with_registry!(
+                "vantage_sequence_head_view",
+                "Highest view covered by the local sequence chain",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_boundary_view: register_int_gauge_with_registry!(
+                "vantage_sequence_boundary_view",
+                "Highest checkpoint boundary this node has passed",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_records_total: register_int_counter_with_registry!(
+                "vantage_sequence_records_total",
+                "Sequence records committed to the local chain",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_delta_digests_total: register_int_counter_with_registry!(
+                "vantage_sequence_delta_digests_total",
+                "Block digests folded into per-view output deltas",
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_record_rejected_total: register_int_counter_with_registry!(
+                "vantage_sequence_record_rejected_total",
+                "Sequence records refused because a view was finalized out of order",
                 registry,
             )
             .unwrap(),

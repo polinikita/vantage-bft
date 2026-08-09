@@ -5,6 +5,7 @@ use crate::messages::Header;
 use crate::primary::{Height, View};
 use crate::vantage::agb::{Manifest, Outcome};
 use crate::vantage::lanes::SharedBlocks;
+use crate::vantage::sequence::SequenceOutcome;
 use crate::vantage::Effect;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -40,6 +41,14 @@ pub struct Cursor {
     /// Views whose core prefix `K` has already been emitted (either at a
     /// completed-but-open step, or inline while sealing).
     core_emitted: BTreeSet<View>,
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §8: digests emitted so far for `next_view`, in
+    /// emission order.
+    ///
+    /// A field rather than a local, because a view's delta is NOT produced in one
+    /// `pump()`: a completed-but-open view emits its core prefix `K` and then breaks to
+    /// wait for the seal, and those early core blocks belong to the same view's eventual
+    /// delta (§3). Cleared only by the terminal advance in `finalize`.
+    delta: Vec<Digest>,
     pending: BTreeMap<View, ViewInput>,
     /// PHASE6-SPEC.md §9 gate amendment (D6-7, performance-only, deterministic-
     /// equivalent): per-author "last emitted" watermark (height + digest), replacing
@@ -71,6 +80,7 @@ impl Cursor {
             #[cfg(test)]
             output_log: Vec::new(),
             core_emitted: BTreeSet::new(),
+            delta: Vec::new(),
             pending: BTreeMap::new(),
             watermarks: HashMap::new(),
         }
@@ -166,7 +176,7 @@ impl Cursor {
                         break;
                     };
                     effects.extend(self.emit(t_hashes));
-                    self.advance();
+                    effects.push(self.finalize(SequenceOutcome::Full { c, t }));
                 }
                 Outcome::Core(c) => {
                     if !self.core_emitted.contains(&self.next_view) {
@@ -176,16 +186,33 @@ impl Cursor {
                         self.core_emitted.insert(self.next_view);
                         effects.extend(self.emit(k_hashes));
                     }
-                    self.advance();
+                    effects.push(self.finalize(SequenceOutcome::Core { c }));
                 }
                 Outcome::Skip => {
                     // gskip: emit nothing, advance (arm implemented, unreachable in
                     // Phase 4 -- Direct-AGB never produces it).
-                    self.advance();
+                    effects.push(self.finalize(SequenceOutcome::Skip));
                 }
             }
         }
         effects
+    }
+
+    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §8: the terminal advance past `next_view`.
+    ///
+    /// The ONLY caller of `advance`, so a view's accumulated delta is handed over exactly
+    /// once and cleared at exactly the moment the view stops being open. The `break`
+    /// paths above deliberately do not reach here: a view whose prefix is still missing
+    /// keeps its partial delta for the next `pump`.
+    fn finalize(&mut self, outcome: SequenceOutcome) -> Effect {
+        let view = self.next_view;
+        let output_delta = std::mem::take(&mut self.delta);
+        self.advance();
+        Effect::SequenceFinalized {
+            view,
+            outcome,
+            output_delta,
+        }
     }
 
     fn advance(&mut self) {
@@ -200,6 +227,10 @@ impl Cursor {
         }
         for h in &hashes {
             self.output.insert(h.clone());
+            // Emission order IS the delta order -- `expand` already deduplicated against
+            // `output` and within the traversal, so this records exactly what the plan's
+            // `delta_v` names.
+            self.delta.push(h.clone());
             #[cfg(test)]
             self.output_log.push(h.clone());
             log::info!("Committed vantage block {}", h);
