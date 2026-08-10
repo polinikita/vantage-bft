@@ -233,3 +233,31 @@ fn raise_own_wish_never_broadcasts_and_is_a_no_op_below_current_watermark() {
     assert!(effects.is_empty());
     assert_eq!(pm.own_watermark(), 4);
 }
+
+#[test]
+fn installed_entry_fast_forward_skips_history_but_keeps_future_wish_entry_normal() {
+    let all = authors();
+    let (name, _) = all[3];
+    let (p1, _) = all[0];
+    let (p2, _) = all[1];
+    let mut pm = Pacemaker::new(name, &test_committee());
+    let _ = pm.genesis();
+
+    // A checkpoint install has already made views <= 5 terminal locally. The pacemaker
+    // must not later replay Enter(2)..Enter(5), but it should still behave normally for
+    // future wish quorums above that floor.
+    pm.fast_forward_installed_entry(6);
+    assert_eq!(pm.largest_entered_view_for_test(), 6);
+    assert_eq!(pm.entry_target(), 6);
+    assert_eq!(pm.own_watermark(), 6);
+    assert_eq!(pm.omega_of(name), 6);
+
+    assert!(pm.on_wish(p1, 8).is_empty());
+    let effects = pm.on_wish(p2, 8);
+    assert_eq!(broadcast_wish(&effects), Some(8));
+    assert_eq!(
+        entries(&effects),
+        vec![7, 8],
+        "only the post-install suffix should be entered by later WISH quorum"
+    );
+}

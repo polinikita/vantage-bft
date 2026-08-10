@@ -672,6 +672,12 @@ pub struct VantageCore {
     sequence_live_intake_floor: View,
     /// Previous shed state, for detecting the off-edge that stamps the floor above.
     sequence_shed_was_active: bool,
+    /// The leaving-recovery edge fired while an install was still staged, so the latch
+    /// is owed as soon as the install drains. Without this the latch is silently missed
+    /// forever -- run anchor3-n10: the node left recovery mid-install-stream, never
+    /// latched, and `sequence_sync_recovered` stayed 0 for the rest of the run even
+    /// though it was fully recovered. Cleared if recovery re-activates first.
+    sequence_latch_pending: bool,
     sequence_announce_period_ms: u64,
     sequence_announce_repeat_ms: u64,
     /// Phase B: at most ONE installation target at a time (section 7).
@@ -1174,6 +1180,7 @@ impl VantageCore {
             sequence_sync_recovered: false,
             sequence_live_intake_floor: 0,
             sequence_shed_was_active: false,
+            sequence_latch_pending: false,
             sequence_announce_period_ms: parameters.sequence_announce_period_ms,
             sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
             sequence_transfer: None,
@@ -1571,9 +1578,10 @@ impl VantageCore {
                     // Keep this independent of checkpoint announcements: a verified late
                     // joiner must apply faster than the fleet advances, rather than in a
                     // 16-view burst every two seconds.
-                    let install_effects = self.drive_sequence_install().await;
+                    let now = Instant::now();
+                    let install_effects = self.drive_sequence_install(now).await;
                     if !install_effects.is_empty() {
-                        self.execute(install_effects, Instant::now()).await;
+                        self.execute(install_effects, now).await;
                     }
                 }
 
@@ -2973,7 +2981,7 @@ impl VantageCore {
     /// Repair backlog is deliberately not a veto here; on a recovering node it is a
     /// symptom of the gap, so using it as a gate disables the rescue path when it is most
     /// needed.
-    async fn drive_sequence_install(&mut self) -> Vec<Effect> {
+    async fn drive_sequence_install(&mut self, now: Instant) -> Vec<Effect> {
         if self.sequence_install.is_none() {
             self.sequence_block_requests.clear();
             if let Some(metrics) = &self.metrics {
@@ -3045,8 +3053,8 @@ impl VantageCore {
                  locally held"
             );
         }
-        effects.extend(self.apply_sequence_install(validation_budget - examined));
-        self.drive_sequence_block_fetch(Instant::now()).await;
+        effects.extend(self.apply_sequence_install(validation_budget - examined, now));
+        self.drive_sequence_block_fetch(now).await;
         effects
     }
 
@@ -3229,7 +3237,7 @@ impl VantageCore {
     /// Any refusal aborts the WHOLE target rather than skipping the view. `Cursor::install`
     /// only refuses on conditions that mean the target or the local state is not what this
     /// node believed, and continuing past that would install a hole.
-    fn apply_sequence_install(&mut self, digest_budget: usize) -> Vec<Effect> {
+    fn apply_sequence_install(&mut self, digest_budget: usize, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
         if !self.sequence_install_enabled || digest_budget == 0 {
             return effects;
@@ -3328,16 +3336,18 @@ impl VantageCore {
                 self.resolver.note_installed_through(target);
                 // Move this node's CONSENSUS position to match its output position.
                 //
-                // Install advances the cursor and the resolver watermark, but nothing moved
-                // the AGB view: `enter_view_effects` is reachable only from boot and
-                // `Effect::Enter`, so the view advanced solely through the WISH pacemaker and
-                // stayed ~84 views behind. Proposer turns are per-view, so the node arrived
-                // at every turn far too late and peers skip-voted it -- measured 49 of 117
-                // turns committed, 0.42 against a peer's 1.00. Views at or below `target` are
-                // terminally decided here, so wishing past them is exactly what the pacemaker
-                // is for; this does not force entry, it declares where this node now is and
-                // lets the ordinary quorum rule carry it there.
-                effects.push(Effect::RaiseWish(target.saturating_add(1)));
+                // Install advances the cursor and resolver watermark, but WISH alone cannot
+                // move the live AGB/frontier view: one local `RaiseWish` updates only this
+                // party's omega slot and does not cross the `2f+1` entry statistic. The
+                // result was a joiner that was sequence-caught-up but still formally entered
+                // hundreds of views behind, so it reached its proposer turns too late and
+                // peers skip-voted them. Views at or below `target` are terminally decided
+                // here, so record those skipped entries in the pacemaker and enter exactly
+                // the first live view in AGB/frontier; do not replay one `Enter` per
+                // installed historical view.
+                let next_live = target.saturating_add(1);
+                self.pacemaker.fast_forward_installed_entry(next_live);
+                effects.extend(self.enter_view_effects(next_live, now));
                 // Left in place, NOT cleared: the finalize effects this pass produced still
                 // have to reach `record_sequence`, and the head comparison there is what
                 // proves the installed state matches what was verified. That comparison
@@ -4354,14 +4364,19 @@ impl VantageCore {
         // Stamp the live-intake floor on the shed OFF-edge, BEFORE recovery is
         // re-evaluated below (the floor is one of its inputs). `a_i` tracks view entry,
         // which the WISH pacemaker keeps advancing through a shed (Inbound::Wish is
-        // retained), so at this edge it is the best local estimate of the fleet's
-        // current view; the margin covers echo/ready waves already in flight, whose
-        // views can still seal from the messages that arrive after this instant.
-        // Monotone max: a later, lower stamp must never re-open an already-covered
-        // range.
+        // retained), but a rapidly installing node can leave shedding with a certified
+        // target ahead of that local entry estimate. All consensus traffic was dropped
+        // during the shed, including views just beyond the target being drained, so the
+        // floor must cover the freshest sync target too; otherwise the node can latch on
+        // a stale boundary and park one view later until the re-arm threshold. The margin
+        // covers echo/ready waves already in flight, whose views can still seal from the
+        // messages that arrive after this instant. Monotone max: a later, lower stamp
+        // must never re-open an already-covered range.
         let shed_active = self.large_sequence_sync_target().is_some();
         if self.sequence_shed_was_active && !shed_active {
-            let floor = (self.frontier.a_i() + 1).saturating_add(SEQUENCE_LIVE_INTAKE_MARGIN);
+            let intake_edge = self.frontier.a_i() + 1;
+            let covered_edge = target.unwrap_or(0).max(intake_edge);
+            let floor = covered_edge.saturating_add(SEQUENCE_LIVE_INTAKE_MARGIN);
             if floor > self.sequence_live_intake_floor {
                 self.sequence_live_intake_floor = floor;
                 log::info!(
@@ -4412,11 +4427,23 @@ impl VantageCore {
         // BOOT -- `recovery_active` is trivially false there and no install is staged -- which
         // disables state sync from birth and leaves a genuine joiner stuck at view 1 with zero
         // transfers. Measured exactly that: "RECOVERED at view=0" 59 ms after start.
-        if was_recovering
-            && !self.sequence_sync_recovery_active
+        //
+        // The edge ARMS the latch; a staged install only DEFERS it (`sequence_latch_pending`).
+        // Requiring `install.is_none()` at the edge itself silently lost the latch whenever
+        // the node left recovery mid-install-stream -- run anchor3-n10 never latched at all --
+        // because the edge never recurs. Re-entering recovery disarms the pending latch: the
+        // node is syncing again, so the edge that eventually leaves it will re-arm.
+        if was_recovering && !self.sequence_sync_recovery_active {
+            self.sequence_latch_pending = true;
+        }
+        if self.sequence_sync_recovery_active {
+            self.sequence_latch_pending = false;
+        }
+        if self.sequence_latch_pending
             && !self.sequence_sync_recovered
             && self.sequence_install.is_none()
         {
+            self.sequence_latch_pending = false;
             self.sequence_sync_recovered = true;
             log::info!(
                 "vantage sequence sync: RECOVERED at view={local} (live-intake floor {}); \
@@ -5256,7 +5283,7 @@ mod tests {
         // indefinitely) and never reached peer parity.
         let mut core = test_core(0, "sequence_sync_recovered_latch");
         core.sequence_sync_min_gap_views = 100;
-        core.sequence_sync_shed_gap_views = 300;
+        core.sequence_sync_shed_gap_views = 1_000;
         core.sequence_sync_rearm_gap_views = 400;
         let keys = crate::common::keys();
 
@@ -5410,7 +5437,10 @@ mod tests {
             core.sequence_sync_recovery_active,
             "recovery must keep installing until the head crosses the live-intake floor"
         );
-        assert!(!core.sequence_sync_recovered, "latching here strands the cursor");
+        assert!(
+            !core.sequence_sync_recovered,
+            "latching here strands the cursor"
+        );
 
         // The head crosses the floor: NOW leaving recovery is sound, and it latches.
         for view in 451..=520 + SEQUENCE_LIVE_INTAKE_MARGIN {
@@ -5423,6 +5453,176 @@ mod tests {
         core.refresh_sequence_large_gap_drop();
         assert!(!core.sequence_sync_recovery_active);
         assert!(core.sequence_sync_recovered);
+    }
+
+    #[tokio::test]
+    async fn shed_release_floor_covers_sync_target_ahead_of_entry_frontier() {
+        // Regression for the short late-joiner run: node-9 installed through the last
+        // verified target it was draining, but peers had already certified the next
+        // checkpoint. The shed off-edge stamped the floor from `a_i` only, undershot the
+        // dropped live range, latched at view 2150, and then parked at 2151 until the
+        // 800-view re-arm threshold fired.
+        let mut core = test_core(0, "sequence_sync_floor_target");
+        core.sequence_sync_min_gap_views = 100;
+        core.sequence_sync_shed_gap_views = 300;
+        core.sequence_sync_rearm_gap_views = 800;
+        let keys = crate::common::keys();
+
+        let head = Digest([0x61; 32]);
+        for (sender, _) in keys.iter().skip(1).take(3) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 500,
+                    head: head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(core.sequence_large_gap_drop.load(Ordering::Relaxed));
+
+        // WISH entry can lag the newest certified target on the recovering node.
+        core.frontier.enter(420);
+
+        // Local installation reduces the gap below the shed threshold. Shedding releases,
+        // but the floor must still cover target+margin, not just entry+margin.
+        for view in 1..=250 {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(!core.sequence_large_gap_drop.load(Ordering::Relaxed));
+        assert_eq!(
+            core.sequence_live_intake_floor,
+            500 + SEQUENCE_LIVE_INTAKE_MARGIN
+        );
+        assert!(
+            core.sequence_sync_recovery_active,
+            "recovery must not latch while the shed-dropped target suffix is uncovered"
+        );
+        assert!(!core.sequence_sync_recovered);
+    }
+
+    #[tokio::test]
+    async fn latch_deferred_by_a_staged_install_still_fires() {
+        // Leaving recovery while an install is still draining must DEFER the latch, not
+        // lose it: the edge never recurs, so requiring `install.is_none()` at the edge
+        // itself meant a node that left recovery mid-install-stream never latched at
+        // all (run anchor3-n10: recovered stayed 0 for the whole run).
+        let mut core = test_core(0, "sequence_sync_latch_deferred");
+        core.sequence_sync_min_gap_views = 100;
+        core.sequence_sync_shed_gap_views = 1_000;
+        core.sequence_sync_rearm_gap_views = 800;
+        let keys = crate::common::keys();
+
+        let head = Digest([0x41; 32]);
+        for (sender, _) in keys.iter().skip(1).take(3) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 500,
+                    head: head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(core.sequence_sync_recovery_active);
+
+        // Close the gap with an install still staged: the edge fires, the latch defers.
+        for view in 1..=450 {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.sequence_install = Some(SequenceInstall::new(
+            0,
+            500,
+            Digest::default(),
+            Vec::new(),
+            Vec::new(),
+            8,
+            4096,
+        ));
+        core.refresh_sequence_large_gap_drop();
+        assert!(!core.sequence_sync_recovery_active);
+        assert!(
+            !core.sequence_sync_recovered,
+            "the latch must wait for the staged install to drain"
+        );
+
+        // The install drains; the deferred latch fires on the next refresh.
+        core.sequence_install = None;
+        core.refresh_sequence_large_gap_drop();
+        assert!(core.sequence_sync_recovered, "the deferred latch must fire");
+    }
+
+    #[tokio::test]
+    async fn completed_install_enters_next_live_view_and_serves_owned_turn() {
+        // Installing a checkpoint advances the output cursor, but contribution requires
+        // the live AGB/frontier position to move too. A single local RaiseWish is not
+        // enough for that: it does not cross WISH's 2f+1 entry statistic. The first
+        // post-install live view must be entered directly, or an owned turn there is
+        // missed and peers seal it as Skip.
+        let mut core = test_core(0, "sequence_install_enters_live_view");
+        let next_live = (2..=32)
+            .find(|view| core.agb.proposer(*view) == core.name)
+            .expect("round-robin proposer repeats within the search window");
+        let target = next_live - 1;
+        core.sequence_install_views_per_tick = target as usize + 1;
+        core.sequence_install_digests_per_tick = target as usize + 1;
+        let staged = (1..=target)
+            .map(|view| (view, SequenceOutcome::Skip, Vec::new()))
+            .collect();
+        let heads = (1..=target)
+            .map(|view| (view, Digest([view as u8; 32])))
+            .collect();
+        core.sequence_install = Some(SequenceInstall::new(
+            0,
+            target,
+            Digest([0x77; 32]),
+            staged,
+            heads,
+            target as usize + 1,
+            4096,
+        ));
+
+        let effects = core.apply_sequence_install(target as usize + 1, Instant::now());
+
+        assert_eq!(
+            core.cursor.next_view(),
+            next_live,
+            "the install should advance the output cursor through target"
+        );
+        assert_eq!(
+            core.pacemaker.entered_view(),
+            next_live,
+            "the pacemaker must not think historical entries are still missing"
+        );
+        assert_eq!(core.pacemaker.own_watermark(), next_live);
+        assert_eq!(
+            core.frontier.a_i(),
+            target,
+            "frontier entry must be floored to the installed target"
+        );
+        assert!(core.frontier.is_active(next_live));
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::BroadcastPropose(proposal) if proposal.view() == next_live
+            )),
+            "an owned first-live view must be proposed immediately after install"
+        );
     }
 
     #[tokio::test]
@@ -5507,10 +5707,10 @@ mod tests {
             "below the shed threshold the node must stop dropping consensus traffic"
         );
 
-        // Gap 50: below the sync threshold. State sync stops -- the tail can only be
-        // closed by ordinary participation, because a transfer always lands one cycle
-        // behind a moving fleet. An in-flight transfer is dropped; a staged install is
-        // deliberately left to drain.
+        // Gap 50: below the sync threshold, but still below the floor stamped when
+        // shedding released. State sync must remain active: traffic for this range was
+        // dropped while the node was deaf, so ordinary participation may not have the
+        // evidence required to close it.
         core.sequence_transfer = Some(SequenceTransfer::new(
             core.agb.sid().clone(),
             9,
@@ -5529,8 +5729,27 @@ mod tests {
         }
         core.refresh_sequence_large_gap_drop();
         assert!(
+            core.sequence_sync_recovery_active,
+            "state sync must continue below the sync threshold until the live-intake \
+             floor is crossed"
+        );
+        assert!(!core.sequence_large_gap_drop.load(Ordering::Relaxed));
+
+        // Once the installed/executed head crosses the shed-covered floor, state sync
+        // stops. An in-flight transfer is dropped; a staged install is deliberately left
+        // to drain.
+        let floor = core.sequence_live_intake_floor;
+        for view in 351..=floor {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(
             !core.sequence_sync_recovery_active,
-            "state sync must stop inside the sync threshold"
+            "state sync must stop after the shed-covered floor is crossed"
         );
         assert!(!core.sequence_large_gap_drop.load(Ordering::Relaxed));
         assert!(

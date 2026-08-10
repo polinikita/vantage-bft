@@ -5,6 +5,7 @@ use super::common::*;
 use crate::vantage::agb::{self, formed, Echo, EchoOut, TimerKind, ViewProposal};
 use crate::vantage::Effect;
 use crypto::Digest;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// PHASE7: this file only ever drives `AgbEngine::on_propose`/`on_echo` (the
@@ -197,6 +198,45 @@ async fn tip_acked_but_not_held_blocks_gate() {
     let proposal = proposal_for(view, vec![c_ref], vec![t_ref]);
     let effects = agb.on_propose(sender, proposal, now, &mut lm, &mut rep);
     assert!(echo_effect(&effects).is_none());
+}
+
+#[tokio::test]
+async fn author_ok_uses_availability_before_direct_walk() {
+    // A late joiner can have a valid, availability-certified header whose payload was
+    // not received directly. `author_ok` should accept via f+1 availability without
+    // first doing a direct-prefix walk that is guaranteed to fail at the payload gate.
+    let (self_name, _) = authors()[3];
+    let (author_c, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(self_name, ".db_test_agb_author_ok_fast_avail");
+
+    let mut payload = BTreeMap::new();
+    payload.insert(Digest([55u8; 32]), 0);
+    let header = crate::messages::Header::new_vantage(
+        author_c,
+        1,
+        payload,
+        lm.genesis().clone(),
+        lm.sid().clone(),
+    );
+    lm.process_publish(author_c, header.clone()).await;
+    let r = block_ref(&header);
+    mark_validity_available(&mut lm, r.clone());
+
+    let before = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert!(lm.author_ok(&r));
+    let after = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert_eq!(
+        after, before,
+        "f+1 availability already satisfies author_ok; direct-prefix walks are wasted"
+    );
 }
 
 #[tokio::test]

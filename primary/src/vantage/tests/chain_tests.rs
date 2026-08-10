@@ -89,6 +89,85 @@ async fn rejects_wrong_predecessor() {
     assert!(!lm.holds_prefix(&r));
 }
 
+/// A direct, payload-ready descendant above a payload-missing ancestor cannot become
+/// `DirectPub` until that exact ancestor's payload arrives. The pending-direct retry
+/// loop should not re-walk the same blocked descendant on unrelated author refreshes;
+/// it should wake when the blocker becomes direct/payload-ready.
+#[tokio::test]
+async fn pending_direct_payload_blocker_sleeps_until_payload_ready() {
+    let (self_name, _) = authors()[3];
+    let (author, _) = authors()[0];
+    let (mut lm, mut store) = new_lane_manager(self_name, ".db_test_vantage_pending_blocker");
+    let sid = lm.sid().clone();
+    let genesis = lm.genesis().clone();
+
+    let payload_digest = Digest([91u8; 32]);
+    let mut payload = BTreeMap::new();
+    payload.insert(payload_digest.clone(), 0);
+    let h1 = Header::new_vantage(author, 1, payload, genesis, sid.clone());
+    let h1_effects = lm.process_publish(author, h1.clone()).await;
+    assert!(!is_acked(&h1_effects));
+    let after_h1 = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+
+    let h2 = Header::new_vantage(author, 2, BTreeMap::new(), h1.id.clone(), sid);
+    let h2_effects = lm.process_publish(author, h2.clone()).await;
+    assert!(
+        !is_acked(&h2_effects),
+        "h2 is direct and payload-ready, but h1's payload still blocks its direct prefix"
+    );
+    let after_block = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert_eq!(
+        after_block, after_h1,
+        "a direct child of a known payload-missing block should sleep without one walk"
+    );
+
+    let relay_effects = lm.process_publish(self_name, h2.clone()).await;
+    assert!(!is_acked(&relay_effects));
+    let after_relay = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert_eq!(
+        after_relay, after_block,
+        "a candidate already blocked on a specific payload hole must sleep, not re-walk"
+    );
+
+    let h3 = Header::new_vantage(author, 3, BTreeMap::new(), h2.id.clone(), lm.sid().clone());
+    let h3_effects = lm.process_publish(author, h3.clone()).await;
+    assert!(!is_acked(&h3_effects));
+    let after_inherited = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert_eq!(
+        after_inherited, after_relay,
+        "a new descendant of a blocked ref should inherit the blocker without one walk"
+    );
+
+    mark_payload_present(&mut store, &payload_digest, 0).await;
+    let wake_effects = lm.set_payload_ready(&h1.id);
+    let ack_count = wake_effects
+        .iter()
+        .filter(|e| matches!(e, Effect::BroadcastAck(_)))
+        .count();
+    assert_eq!(
+        ack_count, 3,
+        "payload readiness should ack the blocker first, then wake and ack descendants"
+    );
+    assert!(lm.direct_pub(&block_ref(&h3)));
+    assert!(lm.direct_pub(&block_ref(&h2)));
+}
+
 /// N1/N2: non-consecutive height (`parent_cert.height` not `height - 1`) fails
 /// `BlockOK` on the block alone -- rejected outright, never even cached.
 #[tokio::test]

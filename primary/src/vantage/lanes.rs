@@ -134,6 +134,18 @@ pub struct BlockCache {
     missing_parents: BTreeSet<BlockRef>,
 }
 
+enum DirectPrefixCheck {
+    Verified,
+    Gate(Digest),
+    Failed,
+}
+
+enum DirectPubCheck {
+    Confirmed,
+    BlockedOnGate(Digest),
+    Failed,
+}
+
 /// `missing_parents` cap -- distinct simultaneous holes, not a rate. One restart
 /// produces one hole (rarely a few, if the sender queue died deep); 64 covers every
 /// lane of a large committee restarting at once.
@@ -349,6 +361,12 @@ impl BlockCache {
         }
     }
 
+    fn direct_gate_ready(&self, h: &Digest) -> bool {
+        self.by_digest
+            .get(h)
+            .is_some_and(|entry| entry.direct && entry.payload_ok)
+    }
+
     /// Mechanism A (sender-side lane resume, `vantage::resume`): this author's own
     /// cached block at exactly `height`, if any. An author's own lane carries at
     /// most one digest per height absent a Byzantine fork (`upsert`'s own doc
@@ -419,11 +437,18 @@ impl BlockCache {
     /// pinning, height arithmetic, `direct && payload_ok`) is unchanged from the
     /// original per-visited-node semantics.
     pub fn direct_prefix_ok(&mut self, genesis: &Digest, h: &Digest) -> bool {
+        matches!(
+            self.direct_prefix_check(genesis, h),
+            DirectPrefixCheck::Verified
+        )
+    }
+
+    fn direct_prefix_check(&mut self, genesis: &Digest, h: &Digest) -> DirectPrefixCheck {
         let Some(start) = self.by_digest.get(h) else {
-            return false;
+            return DirectPrefixCheck::Failed;
         };
         if start.direct_prefix_verified {
-            return true;
+            return DirectPrefixCheck::Verified;
         }
         let author = start.block.author;
         let mut expected_height = start.block.height;
@@ -436,30 +461,30 @@ impl BlockCache {
                 if expected_height != 0 {
                     self.walk_steps_direct += steps;
                     self.walk_fail_direct[1] += 1;
-                    return false;
+                    return DirectPrefixCheck::Failed;
                 }
                 break;
             }
             if expected_height == 0 {
                 self.walk_steps_direct += steps;
                 self.walk_fail_direct[1] += 1;
-                return false; // ran out of height before reaching genesis
+                return DirectPrefixCheck::Failed; // ran out of height before reaching genesis
             }
             let Some(entry) = self.by_digest.get(&cur) else {
                 self.walk_steps_direct += steps;
                 self.walk_fail_direct[0] += 1;
                 self.note_missing_parent(author, expected_height, cur);
-                return false;
+                return DirectPrefixCheck::Failed;
             };
             if !entry.pinned_at(author, expected_height) {
                 self.walk_steps_direct += steps;
                 self.walk_fail_direct[1] += 1;
-                return false; // cross-author graft (§1 "one author index") or height gap
+                return DirectPrefixCheck::Failed; // cross-author graft (§1 "one author index") or height gap
             }
             if !(entry.direct && entry.payload_ok) {
                 self.walk_steps_direct += steps;
                 self.walk_fail_direct[2] += 1;
-                return false;
+                return DirectPrefixCheck::Gate(cur);
             }
             if entry.direct_prefix_verified {
                 break; // this ancestor (and everything below it) already verified
@@ -474,7 +499,7 @@ impl BlockCache {
                 e.direct_prefix_verified = true;
             }
         }
-        true
+        DirectPrefixCheck::Verified
     }
 
     /// A "valid lane prefix" (§1 last row): one author, consecutive heights, matching
@@ -983,6 +1008,14 @@ pub struct LaneManager {
     /// `DirectPub`. A missing parent/payload can make a descendant become valid later;
     /// this keeps retries to that monotone frontier instead of every cached block.
     pending_direct: BTreeSet<BlockRef>,
+    /// Pending direct tuples removed from the active scan because their most recent
+    /// `direct_pub` attempt found a specific ancestor whose D1 direct/payload gate was
+    /// still false. The tuple is woken when that exact blocker becomes gate-ready.
+    pending_direct_blocked_by: BTreeMap<BlockRef, Digest>,
+    pending_direct_waiters_by_blocker: HashMap<Digest, BTreeSet<BlockRef>>,
+    /// Digest-level mirror of `pending_direct_blocked_by`, used to let newly-arrived
+    /// descendants inherit a parent's known blocker without walking the prefix once.
+    direct_prefix_blocker_by_digest: HashMap<Digest, Digest>,
     /// Rotating start offset for `refresh_author`'s bounded scan, so a bounded budget still
     /// tests every pending ref over successive calls rather than starving the tail.
     refresh_scan_offset: usize,
@@ -1168,6 +1201,9 @@ impl LaneManager {
             ack_availability: HashMap::new(),
             acked: HashSet::new(),
             pending_direct: BTreeSet::new(),
+            pending_direct_blocked_by: BTreeMap::new(),
+            pending_direct_waiters_by_blocker: HashMap::new(),
+            direct_prefix_blocker_by_digest: HashMap::new(),
             refresh_scan_offset: 0,
             direct_pub_refs: BTreeSet::new(),
             quorum_direct_refs: BTreeSet::new(),
@@ -1393,6 +1429,104 @@ impl LaneManager {
         self.seeded_anchor.take()
     }
 
+    fn enqueue_pending_direct(&mut self, r: BlockRef) {
+        if self.acked.contains(&r) || self.pending_direct_blocked_by.contains_key(&r) {
+            return;
+        }
+        if let Some(blocker) = self.inherited_direct_prefix_blocker(&r) {
+            self.park_pending_direct_on(&r, blocker);
+            return;
+        }
+        self.pending_direct.insert(r);
+    }
+
+    fn block_pending_direct_on(&mut self, r: &BlockRef, blocker: Digest) {
+        self.pending_direct.remove(r);
+        self.park_pending_direct_on(r, blocker);
+    }
+
+    fn park_pending_direct_on(&mut self, r: &BlockRef, blocker: Digest) {
+        if self.acked.contains(r) {
+            return;
+        }
+        if let Some(old) = self
+            .pending_direct_blocked_by
+            .insert(r.clone(), blocker.clone())
+        {
+            let remove_old =
+                if let Some(waiters) = self.pending_direct_waiters_by_blocker.get_mut(&old) {
+                    waiters.remove(r);
+                    waiters.is_empty()
+                } else {
+                    false
+                };
+            if remove_old {
+                self.pending_direct_waiters_by_blocker.remove(&old);
+            }
+        }
+        self.pending_direct_waiters_by_blocker
+            .entry(blocker.clone())
+            .or_default()
+            .insert(r.clone());
+        self.direct_prefix_blocker_by_digest
+            .insert(r.2.clone(), blocker);
+    }
+
+    fn inherited_direct_prefix_blocker(&mut self, r: &BlockRef) -> Option<Digest> {
+        let blocks = self.blocks.lock();
+        let entry = blocks.get(&r.2)?;
+        let parent = entry.block.parent_cert.header_digest.clone();
+        let blocker = self.direct_prefix_blocker_by_digest.get(&parent).cloned()?;
+        if !blocks.direct_gate_ready(&blocker) {
+            return Some(blocker);
+        }
+        drop(blocks);
+        self.direct_prefix_blocker_by_digest.remove(&parent);
+        None
+    }
+
+    fn note_direct_prefix_self_blocker(&mut self, blocker: &Digest) {
+        self.direct_prefix_blocker_by_digest
+            .insert(blocker.clone(), blocker.clone());
+    }
+
+    fn clear_direct_prefix_blocker(&mut self, blocker: &Digest) {
+        if self
+            .direct_prefix_blocker_by_digest
+            .get(blocker)
+            .is_some_and(|mapped| mapped == blocker)
+        {
+            self.direct_prefix_blocker_by_digest.remove(blocker);
+        }
+    }
+
+    fn wake_pending_direct_blocker(&mut self, blocker: &Digest) -> BTreeSet<PublicKey> {
+        let mut authors = BTreeSet::new();
+        self.clear_direct_prefix_blocker(blocker);
+        let Some(waiters) = self.pending_direct_waiters_by_blocker.remove(blocker) else {
+            return authors;
+        };
+        for r in waiters {
+            if self.pending_direct_blocked_by.remove(&r).is_some() {
+                self.direct_prefix_blocker_by_digest.remove(&r.2);
+                if !self.acked.contains(&r) {
+                    authors.insert(r.0);
+                    self.pending_direct.insert(r);
+                }
+            }
+        }
+        authors
+    }
+
+    fn refresh_woken_pending_direct(&mut self, blocker: &Digest) -> Vec<Effect> {
+        let authors = self.wake_pending_direct_blocker(blocker);
+        let mut effects = Vec::new();
+        for author in authors {
+            effects.extend(self.refresh_author(author));
+        }
+        effects
+    }
+
     /// Drain missing-parent reports from failing prefix walks -- see
     /// `BlockCache::missing_parents`. The caller hands them to `Repairer::authorize`.
     pub fn take_missing_parents(&mut self, cap: usize) -> Vec<BlockRef> {
@@ -1447,11 +1581,12 @@ impl LaneManager {
         let payload_ok = missing_payload.is_empty();
         let digest = header.id.clone();
 
-        {
+        let gate_ready = {
             let mut blocks = self.blocks.lock();
             // `block_ok` just passed above for this exact header -- memoize it.
             blocks.upsert(header.clone(), direct, false, payload_ok, true);
-        }
+            blocks.direct_gate_ready(&digest)
+        };
         if direct && payload_ok {
             let r = (header.author, header.height, digest.clone());
             // Only track tuples we have NOT already acked. `refresh_author` removes a ref
@@ -1461,9 +1596,12 @@ impl LaneManager {
             // scanned on every `refresh_author`. That defeats this set's whole purpose
             // ("under steady honest traffic the pending set contains only the freshly-
             // arrived tip"), and `LaneManager` has no GC to mop it up.
-            if !self.acked.contains(&r) {
-                self.pending_direct.insert(r);
-            }
+            self.enqueue_pending_direct(r);
+        } else if direct {
+            // This exact block cannot be part of any descendant's direct prefix until
+            // its payload arrives. Mark it now so descendants can sleep immediately
+            // instead of each walking down to the same payload gate failure once.
+            self.note_direct_prefix_self_blocker(&digest);
         }
         effects.push(Effect::BlockCached(digest.clone()));
         if header.author != self.name {
@@ -1481,6 +1619,9 @@ impl LaneManager {
         }
 
         effects.extend(self.refresh_author(header.author));
+        if gate_ready {
+            effects.extend(self.refresh_woken_pending_direct(&digest));
+        }
         effects
     }
 
@@ -1532,23 +1673,31 @@ impl LaneManager {
     /// after `store.notify_read` resolves following a `SyncBatches` effect; tests:
     /// after writing the payload marker directly). Re-runs the N3 ack check.
     pub fn set_payload_ready(&mut self, digest: &Digest) -> Vec<Effect> {
-        let direct_ready = {
+        let (direct_ready, gate_ready) = {
             let mut blocks = self.blocks.lock();
             blocks.set_payload_ok(digest, true);
-            blocks.get(digest).and_then(|e| {
-                (e.direct && e.payload_ok).then(|| (e.block.author, e.block.height, digest.clone()))
-            })
+            (
+                blocks.get(digest).and_then(|e| {
+                    (e.direct && e.payload_ok)
+                        .then(|| (e.block.author, e.block.height, digest.clone()))
+                }),
+                blocks.direct_gate_ready(digest),
+            )
         };
+        let mut effects = Vec::new();
         match direct_ready {
             Some(r) => {
                 // Same already-acked guard as `process_publish` -- see its comment.
-                if !self.acked.contains(&r) {
-                    self.pending_direct.insert(r.clone());
-                }
-                self.refresh_author(r.0)
+                let author = r.0;
+                self.enqueue_pending_direct(r);
+                effects.extend(self.refresh_author(author));
             }
-            None => Vec::new(),
+            None => {}
         }
+        if gate_ready {
+            effects.extend(self.refresh_woken_pending_direct(digest));
+        }
+        effects
     }
 
     /// Re-run the N3 ack trigger over direct, payload-ready tuples of `author` that have
@@ -1591,11 +1740,21 @@ impl LaneManager {
         let budget = REFRESH_WALK_BUDGET.min(len);
         for i in 0..budget {
             let r = &refs[(start + i) % len];
-            if self.acked.contains(r) || !self.direct_pub(r) {
+            if self.acked.contains(r) {
+                self.pending_direct.remove(r);
                 continue;
+            }
+            match self.direct_pub_check(r) {
+                DirectPubCheck::Confirmed => {}
+                DirectPubCheck::BlockedOnGate(blocker) => {
+                    self.block_pending_direct_on(r, blocker);
+                    continue;
+                }
+                DirectPubCheck::Failed => continue,
             }
             self.pending_direct.remove(r);
             let r = r.clone();
+            self.direct_prefix_blocker_by_digest.remove(&r.2);
             self.on_direct_pub_confirmed(&r, &mut effects);
             registers_changed = true;
         }
@@ -1745,17 +1904,28 @@ impl LaneManager {
     /// `DirectPub_i(a,k,h)` (§1 D1 / §2 N1-N3): whole prefix is both chain-valid
     /// (`BlockOK` all through) and directly-published-with-payload all through.
     pub fn direct_pub(&self, r: &BlockRef) -> bool {
+        matches!(self.direct_pub_check(r), DirectPubCheck::Confirmed)
+    }
+
+    fn direct_pub_check(&self, r: &BlockRef) -> DirectPubCheck {
         if !self.exact_coordinate(r) {
-            return false;
+            return DirectPubCheck::Failed;
         }
         let mut blocks = self.blocks.lock();
-        blocks.verified_prefix_through_genesis(
+        if !blocks.verified_prefix_through_genesis(
             &self.committee,
             &self.sid,
             self.max_block_payload,
             &self.genesis,
             &r.2,
-        ) && blocks.direct_prefix_ok(&self.genesis, &r.2)
+        ) {
+            return DirectPubCheck::Failed;
+        }
+        match blocks.direct_prefix_check(&self.genesis, &r.2) {
+            DirectPrefixCheck::Verified => DirectPubCheck::Confirmed,
+            DirectPrefixCheck::Gate(blocker) => DirectPubCheck::BlockedOnGate(blocker),
+            DirectPrefixCheck::Failed => DirectPubCheck::Failed,
+        }
     }
 
     /// §4 query: `locally_available(ref)` = holds the valid lane prefix, or
@@ -1764,12 +1934,15 @@ impl LaneManager {
         self.holds_prefix(r) || self.is_q_available(r, self.committee.validity_threshold())
     }
 
-    /// §4 query: `author_ok(ref)` = `DirectPub_i` or (f+1)-available. `DirectPub_i`
-    /// already implies retention (N3 retains on the same transition that triggers the
-    /// ack, via `refresh_author`/`on_direct_pub_confirmed`), so unlike `holds_prefix`
-    /// this doesn't need its own retain-on-success side effect.
+    /// §4 query: `author_ok(ref)` = `DirectPub_i` or (f+1)-available. Check the
+    /// availability certificate first: it is an O(1) lookup and is enough on its own.
+    /// Late joiners can hold many repaired/certified refs that are not locally direct,
+    /// and walking their direct prefixes would just fail at D1's direct/payload gate.
+    /// `DirectPub_i` already implies retention (N3 retains on the same transition that
+    /// triggers the ack, via `refresh_author`/`on_direct_pub_confirmed`), so unlike
+    /// `holds_prefix` this doesn't need its own retain-on-success side effect.
     pub fn author_ok(&self, r: &BlockRef) -> bool {
-        self.direct_pub(r) || self.is_q_available(r, self.committee.validity_threshold())
+        self.is_q_available(r, self.committee.validity_threshold()) || self.direct_pub(r)
     }
 
     /// §4 query: `holds_prefix(ref)` -- we hold a verified (chain-valid) prefix through

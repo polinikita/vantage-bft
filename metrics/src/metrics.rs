@@ -1061,6 +1061,12 @@ pub struct Metrics {
     /// see 1.5M failing chain steps/s per peer in `vantage_walk_steps_total` but not
     /// WHICH branch failed, which decides the remedy (repair refill vs provenance).
     pub vantage_walk_failures_total: IntCounterVec,
+    /// Fresh repair request campaigns for a digest whose previous full-coverage
+    /// campaign went unanswered (`Repairer::refetch_at`). A steadily nonzero rate means
+    /// some block genuinely exists nowhere reachable -- e.g. a publish that never left
+    /// its author AND an author refusing to serve -- which is worth an alert; a small
+    /// burst around a node restart is the mechanism working.
+    pub vantage_repair_refetch_campaigns_total: IntCounter,
     /// Body-fetch pairs given up on after `MAX_FETCH_ATTEMPTS` rather than asked again.
     ///
     /// Abandoning is safe and re-creatable (see `MAX_FETCH_ATTEMPTS`), so a healthy rate
@@ -2153,6 +2159,12 @@ impl Metrics {
                 "vantage_walk_failures_total",
                 "Failed prefix walks by family and failure branch",
                 &["family", "branch"],
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_refetch_campaigns_total: register_int_counter_with_registry!(
+                "vantage_repair_refetch_campaigns_total",
+                "Fresh repair campaigns for digests whose full coverage went unanswered",
                 registry,
             )
             .unwrap(),

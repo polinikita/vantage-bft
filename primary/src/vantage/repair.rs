@@ -97,6 +97,13 @@ pub(crate) const ASK_TIMEOUT_TICKS: u64 = 4;
 /// guarantee is preserved because the cap lifts as soon as the node is no longer congested.
 pub(crate) const ESCALATE_WIDTH_MAX: usize = 8;
 
+/// Ticks (1 s each) a fully-covered-but-still-missing digest must wait before its
+/// request coverage is cleared and a fresh campaign runs -- see `Repairer::requested`.
+/// Bounds the retransmission rate at n-1 requests per digest per cooldown, which is
+/// negligible; what it buys is that a single lost serve is a delay, not a permanent
+/// lane hole.
+pub(crate) const REFETCH_COOLDOWN_TICKS: u64 = 10;
+
 /// Per-digest fan-out progress. See `fan_out` for why coverage is staged.
 struct FanoutState {
     /// The missing block's coordinate, kept so each round can re-consult `holders` for
@@ -168,6 +175,15 @@ pub struct Repairer {
     /// metrics handle (`metrics` is `None` in most unit tests).
     settle_calls: u64,
     /// N6: `(peer, h)` we have sent `request(h)` to, ever -- at most one, no retries.
+    ///
+    /// AMENDED 2026-08-10 (`refetch_at`): "ever" is one CAMPAIGN, not one process
+    /// lifetime. A single lost serve used to make a missing block permanent: node-9's
+    /// publish of height 307 never left the (install-churning) sender, every peer asked
+    /// its full coverage once, the author's one answer was lost too, and the hole then
+    /// cost each peer full-depth failing prefix walks per inbound message for the rest
+    /// of the run (measured 260k steps/s and climbing at n=10; freeze-grade at n=21).
+    /// A digest still in demand after full coverage gets its rows cleared and a fresh
+    /// campaign after `REFETCH_COOLDOWN_TICKS` -- see `settle`'s miss branch.
     requested: HashSet<(PublicKey, Digest)>,
     /// N6/P1-2: every hash we have ever requested (union of `requested`'s second
     /// component) -- gates `on_serve`, since the paper's serve clause fires only "for a
@@ -212,6 +228,11 @@ pub struct Repairer {
     /// Bounded O(n^2) -- 100 x 100 x 40 B = ~400 KB at n=100 -- and monotone per entry, so
     /// it needs no GC.
     holders: HashMap<PublicKey, HashMap<PublicKey, Height>>,
+    /// Earliest tick at which a fully-covered-but-still-missing digest may run a fresh
+    /// request campaign -- see `requested`'s doc comment. Entries are dropped when the
+    /// block arrives (`on_block_available`); bounded by the number of genuinely
+    /// unhealable-so-far holes, which is the same order as `fanout`.
+    refetch_at: HashMap<Digest, u64>,
     /// Requests still permitted this tick, refilled to `emit_ceiling` by `retry_requests`.
     /// Checked BEFORE `requested`/`requested_hashes` are written, never after: those two are
     /// permanent one-shot records, so denying a request after recording it would mean the
@@ -294,6 +315,7 @@ impl Repairer {
             settle_calls: 0,
             requested: HashSet::new(),
             requested_hashes: HashSet::new(),
+            refetch_at: HashMap::new(),
             fanout: HashMap::new(),
             fanout_queue: BTreeSet::new(),
             holders: HashMap::new(),
@@ -400,6 +422,7 @@ impl Repairer {
         if let Some(state) = self.fanout.remove(&digest) {
             self.in_flight = self.in_flight.saturating_sub(state.in_flight_asks);
         }
+        self.refetch_at.remove(&digest);
         let Some(waiting) = self.blocked_on.remove(&digest) else {
             return effects;
         };
@@ -1095,6 +1118,49 @@ impl Repairer {
                 if !self.requested_hashes.contains(&h) && !self.fanout.contains_key(&h) {
                     self.fanout_queue.insert((height, h.clone()));
                     self.begin_fanout(&h, author, height, effects);
+                } else if self.requested_hashes.contains(&h) && !self.fanout.contains_key(&h) {
+                    // The previous campaign covered everyone and the block still never
+                    // arrived (a lost serve, a peer that garbage-collected it, or a
+                    // publish that never left its author). This branch is only reached
+                    // while something still genuinely DEMANDS the block -- `settle` runs
+                    // on (re-)authorization, and failing prefix walks re-authorize
+                    // their missing parent every tick -- so re-ask, at a bounded
+                    // cooldown: clear this digest's one-shot coverage rows and start a
+                    // fresh campaign. Without this, one lost answer makes the hole
+                    // permanent (see `requested`'s doc comment).
+                    //
+                    // A digest that IS cached and block-verified but does not match this
+                    // coordinate is a different case: asking for the same content-addressed
+                    // digest again cannot produce a different `(author,height)`. Leave that
+                    // coordinate pending; a later authorize under the real coordinate will
+                    // consume the cached body without more network traffic.
+                    let missing_digest = {
+                        let blocks = self.blocks.lock();
+                        !blocks.get(&h).is_some_and(|entry| entry.block_ok_verified)
+                    };
+                    let now = self.ticks;
+                    let ready = self.refetch_at.get(&h).is_none_or(|&at| now >= at);
+                    if missing_digest && ready {
+                        self.refetch_at
+                            .insert(h.clone(), now + REFETCH_COOLDOWN_TICKS);
+                        let peers = self.peers.clone();
+                        for peer in peers {
+                            self.requested.remove(&(peer, h.clone()));
+                        }
+                        // Closes `on_serve`'s gate for the instant until `fan_out`
+                        // re-inserts it on the first emitted request -- a serve landing
+                        // in that window is refused and re-served by the new campaign.
+                        self.requested_hashes.remove(&h);
+                        if let Some(metrics) = &self.metrics {
+                            metrics.vantage_repair_refetch_campaigns_total.inc();
+                        }
+                        log::info!(
+                            "vantage repair: re-asking for missing block author={author} \
+                             height={height} (previous campaign exhausted unanswered)"
+                        );
+                        self.fanout_queue.insert((height, h.clone()));
+                        self.begin_fanout(&h, author, height, effects);
+                    }
                 }
                 // Index the blockage so `on_block_available(h)` wakes exactly these
                 // refs. `frames` holds every descendant this walk passed through on the
