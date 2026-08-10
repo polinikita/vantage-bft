@@ -2,6 +2,7 @@
 // Safety requires an available proposal and verified quorum messages.
 
 use crate::error::{DagError, DagResult};
+use crate::leader::RoundRobin;
 use crate::messages::Proposal;
 use crate::simpleit::aggregators::{
     mint_threshold, CutReadyAggregator, CutVoteAggregator, DecideAggregator,
@@ -11,6 +12,7 @@ use crate::simpleit::effects::{CutEffect, CutOut};
 use crate::simpleit::messages::{
     Cut, CutProposal, CutReady, CutRound, CutVote, Decide, Timeout, TimeoutAccept, TimeoutCert,
 };
+#[cfg(test)]
 use crate::vantage::agb;
 use config::{Committee, Stake};
 use crypto::{Digest, Hash as _, PublicKey};
@@ -57,6 +59,7 @@ pub enum Variant {
 pub struct CutEngine {
     name: PublicKey,
     committee: Committee,
+    leaders: RoundRobin,
     /// Relative delay used by `schedule_cut_timer`.
     timeout_delay: u64,
     /// Gates `process_cut_proposal` on f+1 tip availability when enabled.
@@ -120,9 +123,11 @@ pub struct CutEngine {
 
 impl CutEngine {
     pub fn new(name: PublicKey, committee: Committee, timeout_delay: u64) -> Self {
+        let leaders = RoundRobin::new(&committee);
         Self {
             name,
             committee,
+            leaders,
             timeout_delay,
             gate_tips: true,
             variant: Variant::default(),
@@ -195,7 +200,7 @@ impl CutEngine {
 
     /// Returns the committee leader for `round`.
     fn leader_for_round(&self, round: CutRound) -> PublicKey {
-        agb::proposer(&self.committee, round + 1)
+        self.leaders.one_based(round + 1)
     }
 
     /// Returns the current cut round.

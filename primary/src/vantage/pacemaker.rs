@@ -135,8 +135,8 @@ impl Pacemaker {
 
     /// Returns the one-based `k`th largest wish.
     fn kth_largest(&self, k: usize) -> View {
-        let mut sorted = self.omega.clone();
-        sorted.sort_unstable_by(|a, b| b.cmp(a));
-        sorted[k - 1]
+        let mut values = self.omega.clone();
+        let (_, value, _) = values.select_nth_unstable_by(k - 1, |a, b| b.cmp(a));
+        *value
     }
 }

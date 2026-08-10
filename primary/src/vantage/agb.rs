@@ -1,5 +1,6 @@
 // Direct-AGB wire types and the per-view state machine.
 
+use crate::leader::{one_based_authority, RoundRobin};
 use crate::primary::View;
 use crate::vantage::block::{self, BlockRef};
 use crate::vantage::lanes::LaneManager;
@@ -471,9 +472,9 @@ fn strictly_sorted_and_staked(committee: &Committee, m: &Manifest) -> bool {
 }
 
 fn distinct_hashes(m1: &Manifest, m2: &Manifest) -> bool {
-    let mut hashes = std::collections::HashSet::new();
+    let mut hashes = std::collections::HashSet::with_capacity(m1.len() + m2.len());
     for (_, _, h) in m1.iter().chain(m2.iter()) {
-        if !hashes.insert(h.clone()) {
+        if !hashes.insert(h) {
             return false;
         }
     }
@@ -482,24 +483,20 @@ fn distinct_hashes(m1: &Manifest, m2: &Manifest) -> bool {
 
 /// Returns manifests from non-skip resolution entries.
 /// These references are authorized with the carrying proposal.
-fn aux_refs_entries(entries: &[ResolutionEntry]) -> Vec<BlockRef> {
-    entries
-        .iter()
-        .flat_map(|entry| match entry {
-            ResolutionEntry::Full(_, c, t) | ResolutionEntry::Core(_, c, t) => {
-                c.iter().chain(t.iter()).cloned().collect::<Vec<_>>()
-            }
-            ResolutionEntry::Skip(_) => Vec::new(),
-        })
-        .collect()
+fn aux_refs_entries(entries: &[ResolutionEntry]) -> impl Iterator<Item = &BlockRef> {
+    entries.iter().flat_map(|entry| {
+        let (c, t): (&[BlockRef], &[BlockRef]) = match entry {
+            ResolutionEntry::Full(_, c, t) | ResolutionEntry::Core(_, c, t) => (c, t),
+            ResolutionEntry::Skip(_) => (&[], &[]),
+        };
+        c.iter().chain(t)
+    })
 }
 
 /// Returns the round-robin proposer using the committee's sorted authority order.
 pub fn proposer(committee: &Committee, view: View) -> PublicKey {
     debug_assert!(view >= 1, "proposer(v) is only defined for v >= 1");
-    let names: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
-    let n = names.len() as u64;
-    names[((view.saturating_sub(1)) % n) as usize]
+    one_based_authority(committee, view)
 }
 
 #[derive(Clone, Debug)]
@@ -520,7 +517,17 @@ struct EchoTally {
     proposal: Arc<ProposalOut>,
     grade_one: Stake,
     grade_zero: Stake,
+    grade_one_parties: usize,
+    grade_zero_parties: usize,
     origin_ones: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ReadyTally {
+    proposal: Arc<ProposalOut>,
+    any: Stake,
+    grade_one: Stake,
+    grade_zero: Stake,
 }
 
 #[derive(Clone, Debug)]
@@ -561,7 +568,11 @@ struct ViewState {
     first_proposal_instant: Option<Instant>,
     echo_statements: HashMap<PublicKey, EchoStatement>,
     echo_tallies: HashMap<Digest, EchoTally>,
+    echo_skip_parties: usize,
     ready_statements: HashMap<PublicKey, ReadyStatement>,
+    ready_tallies: HashMap<Digest, ReadyTally>,
+    ready_non_grade_one_parties: usize,
+    noready_parties: usize,
     lock: Option<Lock>,
     /// Caches canonical proposal bodies and digests by content within this view.
     digest_cache: Vec<(Arc<ProposalOut>, Digest)>,
@@ -590,7 +601,11 @@ impl Default for ViewState {
             first_proposal_instant: None,
             echo_statements: HashMap::new(),
             echo_tallies: HashMap::new(),
+            echo_skip_parties: 0,
             ready_statements: HashMap::new(),
+            ready_tallies: HashMap::new(),
+            ready_non_grade_one_parties: 0,
+            noready_parties: 0,
             lock: None,
             digest_cache: Vec::new(),
             stance: Stance::Free,
@@ -611,6 +626,7 @@ pub struct AgbEngine {
     /// Skip quorums count parties: `Q = 2f + 1`.
     two_f_plus_1_parties: usize,
     quorum: Stake,
+    proposers: RoundRobin,
     views: BTreeMap<View, ViewState>,
     pending_gate: BTreeSet<View>,
     recheck_cursor: View,
@@ -650,6 +666,7 @@ pub(crate) fn recheck_window(pending: &BTreeSet<View>, cursor: View, budget: usi
 impl AgbEngine {
     pub fn new(name: PublicKey, committee: Committee, sid: Digest, delta_ms: u64) -> Self {
         let n = committee.size();
+        let proposers = RoundRobin::new(&committee);
         let thresholds = Thresholds::from_party_count(n);
         let quorum = committee.quorum_threshold();
         Self {
@@ -661,6 +678,7 @@ impl AgbEngine {
             f_plus_1_parties: thresholds.f_plus_1_parties,
             two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
             quorum,
+            proposers,
             views: BTreeMap::new(),
             pending_gate: BTreeSet::new(),
             recheck_cursor: 1,
@@ -683,7 +701,7 @@ impl AgbEngine {
     }
 
     pub fn proposer(&self, view: View) -> PublicKey {
-        proposer(&self.committee, view)
+        self.proposers.one_based(view)
     }
 
     /// Computes the wish target immediately before an echo or ready broadcast.
@@ -754,21 +772,6 @@ impl AgbEngine {
         self.is_pruned(view) || self.views.contains_key(&view)
     }
 
-    fn echo_count(&self, view: View, pred: impl Fn(&EchoStatement) -> bool) -> usize {
-        self.views.get(&view).map_or(0, |s| {
-            s.echo_statements.values().filter(|stmt| pred(stmt)).count()
-        })
-    }
-
-    fn ready_count(&self, view: View, pred: impl Fn(&ReadyStatement) -> bool) -> usize {
-        self.views.get(&view).map_or(0, |s| {
-            s.ready_statements
-                .values()
-                .filter(|stmt| pred(stmt))
-                .count()
-        })
-    }
-
     /// Counts all ready-stage statements, including no-ready statements.
     pub fn ready_stage_total(&self, view: View) -> usize {
         self.views
@@ -778,29 +781,37 @@ impl AgbEngine {
 
     /// Counts no-ready, grade-0, and mixed ready statements.
     pub fn ready_stage_non_grade1_count(&self, view: View) -> usize {
-        self.ready_count(view, |stmt| {
-            !matches!(stmt, ReadyStatement::Graded(_, _, ReadyGrade::One))
-        })
+        self.views
+            .get(&view)
+            .map_or(0, |s| s.ready_non_grade_one_parties)
     }
 
     pub fn noready_count(&self, view: View) -> usize {
-        self.ready_count(view, |stmt| matches!(stmt, ReadyStatement::NoReady))
+        self.views.get(&view).map_or(0, |s| s.noready_parties)
     }
 
     /// Counts grade-1 echoes for the exact `(c, t)` payload.
     pub fn echo_grade1_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
-        self.echo_count(
-            view,
-            |stmt| matches!(stmt, EchoStatement::Graded(p, _, 1, _) if p.c() == c && p.t() == t),
-        )
+        self.views.get(&view).map_or(0, |state| {
+            state
+                .echo_tallies
+                .values()
+                .filter(|tally| tally.proposal.c() == c && tally.proposal.t() == t)
+                .map(|tally| tally.grade_one_parties)
+                .sum()
+        })
     }
 
     /// Counts echoes of any grade for the exact `(c, t)` payload.
     pub fn echo_any_grade_count_for(&self, view: View, c: &Manifest, t: &Manifest) -> usize {
-        self.echo_count(
-            view,
-            |stmt| matches!(stmt, EchoStatement::Graded(p, _, _, _) if p.c() == c && p.t() == t),
-        )
+        self.views.get(&view).map_or(0, |state| {
+            state
+                .echo_tallies
+                .values()
+                .filter(|tally| tally.proposal.c() == c && tally.proposal.t() == t)
+                .map(|tally| tally.grade_one_parties + tally.grade_zero_parties)
+                .sum()
+        })
     }
 
     pub fn candidate_payloads(&self, view: View) -> Vec<(Manifest, Manifest)> {
@@ -809,12 +820,10 @@ impl AgbEngine {
         };
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        for stmt in state.echo_statements.values() {
-            if let EchoStatement::Graded(p, _, _, _) = stmt {
-                let key = (p.c().clone(), p.t().clone());
-                if seen.insert(key.clone()) {
-                    out.push(key);
-                }
+        for tally in state.echo_tallies.values() {
+            let key = (tally.proposal.c().clone(), tally.proposal.t().clone());
+            if seen.insert(key.clone()) {
+                out.push(key);
             }
         }
         out
@@ -1042,7 +1051,7 @@ impl AgbEngine {
             .c()
             .iter()
             .chain(proposal.t().iter())
-            .chain(aux_refs_entries(proposal.entries()).iter())
+            .chain(aux_refs_entries(proposal.entries()))
         {
             effects.extend(rep.authorize(r.clone()));
         }
@@ -1315,7 +1324,7 @@ impl AgbEngine {
 
     /// Counts echo-skip responses toward the `2f + 1` skip-vote threshold.
     fn echo_skip_count(&self, view: View) -> usize {
-        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Skip))
+        self.views.get(&view).map_or(0, |s| s.echo_skip_parties)
     }
 
     fn recheck_skip_vote_trigger(&mut self, u: View) -> Vec<Effect> {
@@ -1571,40 +1580,54 @@ impl AgbEngine {
         if state.echo_statements.contains_key(&sender) {
             return false;
         }
-        if let EchoStatement::Graded(proposal, digest, grade, origin) = &statement {
-            let tally = state
-                .echo_tallies
-                .entry(digest.clone())
-                .or_insert_with(|| EchoTally {
-                    proposal: Arc::clone(proposal),
-                    grade_one: 0,
-                    grade_zero: 0,
-                    origin_ones: vec![0; proposal.entries().len()],
-                });
-            if *grade == 1 {
-                tally.grade_one += stake;
-            } else {
-                tally.grade_zero += stake;
-            }
-            for (i, bit) in origin.iter().enumerate() {
-                if *bit == Some(1) {
-                    tally.origin_ones[i] += 1;
+        match &statement {
+            EchoStatement::Graded(proposal, digest, grade, origin) => {
+                let tally = state
+                    .echo_tallies
+                    .entry(digest.clone())
+                    .or_insert_with(|| EchoTally {
+                        proposal: Arc::clone(proposal),
+                        grade_one: 0,
+                        grade_zero: 0,
+                        grade_one_parties: 0,
+                        grade_zero_parties: 0,
+                        origin_ones: vec![0; proposal.entries().len()],
+                    });
+                if *grade == 1 {
+                    tally.grade_one += stake;
+                    tally.grade_one_parties += 1;
+                } else {
+                    tally.grade_zero += stake;
+                    tally.grade_zero_parties += 1;
+                }
+                for (i, bit) in origin.iter().enumerate() {
+                    if *bit == Some(1) {
+                        tally.origin_ones[i] += 1;
+                    }
                 }
             }
+            EchoStatement::Skip => state.echo_skip_parties += 1,
         }
         state.echo_statements.insert(sender, statement);
         true
     }
 
     fn nonmatching_echo_count(&self, view: View, locked_digest: &Digest) -> usize {
-        self.echo_count(view, |stmt| match stmt {
-            EchoStatement::Graded(_, d, g, _) => !(*g == 1 && d == locked_digest),
-            EchoStatement::Skip => true,
-        })
+        let Some(state) = self.views.get(&view) else {
+            return 0;
+        };
+        let matching = state
+            .echo_tallies
+            .get(locked_digest)
+            .map_or(0, |tally| tally.grade_one_parties);
+        state.echo_statements.len().saturating_sub(matching)
     }
 
     fn matching_echo_count(&self, view: View, locked_digest: &Digest) -> usize {
-        self.echo_count(view, |stmt| matches!(stmt, EchoStatement::Graded(_, d, g, _) if *g == 1 && d == locked_digest))
+        self.views
+            .get(&view)
+            .and_then(|state| state.echo_tallies.get(locked_digest))
+            .map_or(0, |tally| tally.grade_one_parties)
     }
 
     /// Counts only the first ready-stage statement from each sender.
@@ -1617,9 +1640,36 @@ impl AgbEngine {
         if self.is_pruned(view) {
             return false;
         }
+        let stake = self.committee.stake(&sender);
         let state = self.state_mut(view);
         if state.ready_statements.contains_key(&sender) {
             return false;
+        }
+        match &statement {
+            ReadyStatement::Graded(proposal, digest, grade) => {
+                let tally = state
+                    .ready_tallies
+                    .entry(digest.clone())
+                    .or_insert_with(|| ReadyTally {
+                        proposal: Arc::clone(proposal),
+                        any: 0,
+                        grade_one: 0,
+                        grade_zero: 0,
+                    });
+                tally.any += stake;
+                match grade {
+                    ReadyGrade::One => tally.grade_one += stake,
+                    ReadyGrade::Zero => {
+                        tally.grade_zero += stake;
+                        state.ready_non_grade_one_parties += 1;
+                    }
+                    ReadyGrade::Mix => state.ready_non_grade_one_parties += 1,
+                }
+            }
+            ReadyStatement::NoReady => {
+                state.ready_non_grade_one_parties += 1;
+                state.noready_parties += 1;
+            }
         }
         state.ready_statements.insert(sender, statement);
         true
@@ -1665,6 +1715,7 @@ impl AgbEngine {
         if let Some((digest, proposal, grade)) = candidate {
             let name = self.name;
             self.state_mut(view).ready_sent = true;
+            let tally_digest = digest.clone();
             self.count_ready_statement(
                 view,
                 name,
@@ -1674,7 +1725,7 @@ impl AgbEngine {
             effects.push(Effect::BroadcastReady(
                 self.build_ready_out(&proposal, grade),
             ));
-            effects.extend(self.recheck_completion_and_direct(view, rep));
+            effects.extend(self.recheck_completion_and_direct(view, &tally_digest, rep));
         }
         effects
     }
@@ -1713,6 +1764,7 @@ impl AgbEngine {
         let sender = ready.sender();
         let grade = ready.grade();
         let (proposal, digest) = self.canonical_proposal(view, ready.into_proposal_out());
+        let tally_digest = digest.clone();
         if !self.count_ready_statement(
             view,
             sender,
@@ -1720,7 +1772,7 @@ impl AgbEngine {
         ) {
             return Vec::new();
         }
-        self.recheck_completion_and_direct(view, rep)
+        self.recheck_completion_and_direct(view, &tally_digest, rep)
     }
 
     pub fn on_noready(&mut self, view: View, sender: PublicKey) -> Vec<Effect> {
@@ -1731,52 +1783,52 @@ impl AgbEngine {
         Vec::new()
     }
 
-    fn recheck_completion_and_direct(&mut self, view: View, rep: &mut Repairer) -> Vec<Effect> {
+    fn recheck_completion_and_direct(
+        &mut self,
+        view: View,
+        digest: &Digest,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         if self.is_pruned(view) {
             return effects;
         }
-        let mut tallies: HashMap<Digest, (Arc<ProposalOut>, Stake, Stake, Stake)> = HashMap::new();
-        if let Some(state) = self.views.get(&view) {
-            for (sender, stmt) in &state.ready_statements {
-                if let ReadyStatement::Graded(proposal, digest, grade) = stmt {
-                    let stake = self.committee.stake(sender);
-                    let entry = tallies
-                        .entry(digest.clone())
-                        .or_insert_with(|| (Arc::clone(proposal), 0, 0, 0));
-                    entry.1 += stake;
-                    match grade {
-                        ReadyGrade::One => entry.2 += stake,
-                        ReadyGrade::Zero => entry.3 += stake,
-                        ReadyGrade::Mix => {}
-                    }
-                }
+        let Some((proposal, any_stake, g1_stake, g0_stake)) = self
+            .views
+            .get(&view)
+            .and_then(|state| state.ready_tallies.get(digest))
+            .map(|tally| {
+                (
+                    Arc::clone(&tally.proposal),
+                    tally.any,
+                    tally.grade_one,
+                    tally.grade_zero,
+                )
+            })
+        else {
+            return effects;
+        };
+        if any_stake >= self.quorum && self.state_mut(view).completed.is_none() {
+            let c = proposal.c().clone();
+            let t = proposal.t().clone();
+            self.state_mut(view).completed = Some((c.clone(), t.clone()));
+            for r in c.iter().chain(aux_refs_entries(proposal.entries())) {
+                effects.extend(rep.authorize(r.clone()));
             }
+            if !proposal.entries().is_empty() {
+                effects.push(Effect::CompletionReportable(view, (*proposal).clone()));
+            }
+            effects.push(Effect::Completed(view, c, t));
         }
-        for (_digest, (proposal, any_stake, g1_stake, g0_stake)) in tallies {
-            if any_stake >= self.quorum && self.state_mut(view).completed.is_none() {
-                let c = proposal.c().clone();
-                let t = proposal.t().clone();
-                self.state_mut(view).completed = Some((c.clone(), t.clone()));
-                for r in c.iter().chain(aux_refs_entries(proposal.entries()).iter()) {
-                    effects.extend(rep.authorize(r.clone()));
-                }
-                // Report nonempty resolution metadata only after completion.
-                if !proposal.entries().is_empty() {
-                    effects.push(Effect::CompletionReportable(view, (*proposal).clone()));
-                }
-                effects.push(Effect::Completed(view, c, t));
-            }
-            if self.state_mut(view).directed.is_none() {
-                if g1_stake >= self.quorum {
-                    let outcome = Outcome::Full(proposal.c().clone(), proposal.t().clone());
-                    self.state_mut(view).directed = Some(outcome.clone());
-                    self.try_seal(view, outcome, "direct_full", &mut effects);
-                } else if g0_stake >= self.quorum {
-                    let outcome = Outcome::Core(proposal.c().clone());
-                    self.state_mut(view).directed = Some(outcome.clone());
-                    self.try_seal(view, outcome, "direct_core", &mut effects);
-                }
+        if self.state_mut(view).directed.is_none() {
+            if g1_stake >= self.quorum {
+                let outcome = Outcome::Full(proposal.c().clone(), proposal.t().clone());
+                self.state_mut(view).directed = Some(outcome.clone());
+                self.try_seal(view, outcome, "direct_full", &mut effects);
+            } else if g0_stake >= self.quorum {
+                let outcome = Outcome::Core(proposal.c().clone());
+                self.state_mut(view).directed = Some(outcome.clone());
+                self.try_seal(view, outcome, "direct_core", &mut effects);
             }
         }
         effects

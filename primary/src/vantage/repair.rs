@@ -541,11 +541,11 @@ impl Repairer {
                 break true;
             }
 
-            let parent_digest = {
+            let (parent_digest, verified_present) = {
                 let blocks = self.blocks.lock();
-                blocks.get(&h).and_then(|entry| {
+                let entry = blocks.get(&h);
+                let parent = entry.and_then(|entry| {
                     let b = &entry.block;
-                    // Require the authorized coordinate and prior validation.
                     if b.author == author
                         && b.height == height
                         && b.id == h
@@ -555,7 +555,9 @@ impl Repairer {
                     } else {
                         None
                     }
-                })
+                });
+                let verified = entry.is_some_and(|entry| entry.block_ok_verified);
+                (parent, verified)
             };
 
             let Some(parent_h) = parent_digest else {
@@ -566,13 +568,9 @@ impl Repairer {
                     self.fanout_queue.insert((height, h.clone()));
                     self.begin_fanout(&h, author, height, effects);
                 } else if self.requested_hashes.contains(&h) && !self.fanout.contains_key(&h) {
-                    let missing_digest = {
-                        let blocks = self.blocks.lock();
-                        !blocks.get(&h).is_some_and(|entry| entry.block_ok_verified)
-                    };
                     let now = self.ticks;
                     let ready = self.refetch_at.get(&h).is_none_or(|&at| now >= at);
-                    if missing_digest && ready {
+                    if !verified_present && ready {
                         self.refetch_at
                             .insert(h.clone(), now + REFETCH_COOLDOWN_TICKS);
                         let peers = self.peers.clone();
@@ -624,11 +622,16 @@ impl Repairer {
 
     fn retain_and_serve(&mut self, r: &BlockRef, effects: &mut Vec<Effect>) {
         let h = r.2.clone();
-        {
+        let block = {
             let mut blocks = self.blocks.lock();
             blocks.mark_retained(&h);
+            blocks
+                .get(&h)
+                .and_then(|entry| entry.retained.then(|| entry.block.clone()))
+        };
+        if let Some(block) = block {
+            self.serve_pending(&h, block, effects);
         }
-        self.try_serve(&h, effects);
     }
 
     fn try_serve(&mut self, h: &Digest, effects: &mut Vec<Effect>) {
@@ -642,6 +645,10 @@ impl Repairer {
         let Some(block) = block else {
             return;
         };
+        self.serve_pending(h, block, effects);
+    }
+
+    fn serve_pending(&mut self, h: &Digest, block: Header, effects: &mut Vec<Effect>) {
         let pending: Vec<PublicKey> = self
             .pending_req
             .get(h)

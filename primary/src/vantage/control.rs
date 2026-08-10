@@ -1,3 +1,4 @@
+use crate::leader::{one_based_authority, RoundRobin};
 use crate::primary::View;
 use crate::vantage::agb::{Outcome, ProposalOut, ResolutionEntry};
 use crate::vantage::block::BlockRef;
@@ -20,9 +21,7 @@ pub struct ControlProposal {
 
 /// Selects leaders round-robin, with round one assigned to committee index zero.
 pub fn control_leader(committee: &Committee, round: Round) -> PublicKey {
-    let names: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
-    let n = names.len() as u64;
-    names[((round.saturating_sub(1)) % n) as usize]
+    one_based_authority(committee, round)
 }
 
 #[derive(Default)]
@@ -48,6 +47,7 @@ struct NotifRoundState {
 pub struct ControlLog {
     name: PublicKey,
     committee: Committee,
+    leaders: RoundRobin,
     sid: Digest,
     delta: Duration,
     f_plus_1_parties: usize,
@@ -94,9 +94,11 @@ impl ControlLog {
     pub fn new(name: PublicKey, committee: Committee, sid: Digest, delta_ms: u64) -> Self {
         let n = committee.size();
         let thresholds = Thresholds::from_party_count(n);
+        let leaders = RoundRobin::new(&committee);
         Self {
             name,
             committee,
+            leaders,
             sid,
             delta: Duration::from_millis(delta_ms),
             f_plus_1_parties: thresholds.f_plus_1_parties,
@@ -185,7 +187,7 @@ impl ControlLog {
     }
 
     pub fn control_leader(&self, round: Round) -> PublicKey {
-        control_leader(&self.committee, round)
+        self.leaders.one_based(round)
     }
 
     fn is_our_turn_to_lead(&self, round: Round) -> bool {

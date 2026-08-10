@@ -1,7 +1,6 @@
+use crate::leader::RoundRobin;
 use crate::primary::View;
-use crate::vantage::agb::{
-    formed, proposer, BatchViewProposal, Manifest, ResolutionEntry, ViewProposal,
-};
+use crate::vantage::agb::{formed, BatchViewProposal, Manifest, ResolutionEntry, ViewProposal};
 use crate::vantage::lanes::LaneManager;
 use config::Committee;
 use crypto::PublicKey;
@@ -11,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 pub struct Frontier {
     name: PublicKey,
     committee: Committee,
+    proposers: RoundRobin,
     a_i: View,
     active: BTreeSet<View>,
     fixed_well_formed: BTreeMap<View, bool>,
@@ -20,9 +20,11 @@ pub struct Frontier {
 
 impl Frontier {
     pub fn new(name: PublicKey, committee: Committee) -> Self {
+        let proposers = RoundRobin::new(&committee);
         Self {
             name,
             committee,
+            proposers,
             a_i: 0,
             active: BTreeSet::new(),
             fixed_well_formed: BTreeMap::new(),
@@ -108,6 +110,10 @@ impl Frontier {
         self.proposed.contains(&view)
     }
 
+    fn proposer(&self, view: View) -> PublicKey {
+        self.proposers.one_based(view)
+    }
+
     pub fn try_propose(
         &mut self,
         lm: &LaneManager,
@@ -129,7 +135,7 @@ impl Frontier {
         if self.proposed.contains(&view) {
             return None;
         }
-        if proposer(&self.committee, view) != self.name {
+        if self.proposer(view) != self.name {
             return None;
         }
         self.proposed.insert(view);
@@ -149,7 +155,7 @@ impl Frontier {
         if self.proposed.contains(&view) {
             return None;
         }
-        if proposer(&self.committee, view) != self.name {
+        if self.proposer(view) != self.name {
             return None;
         }
         self.proposed.insert(view);

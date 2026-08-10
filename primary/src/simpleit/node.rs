@@ -7,10 +7,10 @@ use crate::simpleit::engine::{self, CutEngine, TipOracle};
 use crate::simpleit::messages::{Cut, CutRound};
 use crate::vantage::block;
 use crate::vantage::lanes::{
-    AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager, SharedAckAggregator,
-    SharedBlocks,
+    aggregate_received_ack, AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager,
+    SharedAckAggregator, SharedBlocks,
 };
-use crate::vantage::payload::PayloadIo;
+use crate::vantage::payload::{append_missing_payload_sync, PayloadIo};
 use crate::vantage::repair::Repairer;
 use crate::vantage::resume::{ResumeServe, ResumeTrigger};
 use crate::vantage::wire::{self, DeclaredSender, Wire};
@@ -106,20 +106,9 @@ impl MessageHandler for SimpleItReceiverHandler {
                 Inbound::HeadersRequest(digests, requestor)
             }
             PrimaryMessage::VantageAck(a) => {
-                let result = {
-                    let mut aggregator = self.ack_aggregator.lock();
-                    aggregator.record_ack(a.sender, a.reference())
-                };
-                if !result.accepted {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.vantage_rejected_nonmember_total.inc();
-                    }
-                    return Ok(());
-                }
-                if let Some(metrics) = &self.metrics {
-                    metrics.vantage_acks_received.inc();
-                }
-                let Some(availability) = result.availability else {
+                let Some(availability) =
+                    aggregate_received_ack(&self.ack_aggregator, self.metrics.as_deref(), &a)
+                else {
                     return Ok(());
                 };
                 Inbound::AckAvailability(availability)
@@ -385,16 +374,7 @@ impl SimpleItCore {
                 dirty_map: Arc::new(Mutex::new(HashMap::new())),
                 in_flight,
             },
-            payload: PayloadIo {
-                pending_payload: HashMap::new(),
-                store,
-                tx_payload_ready,
-                tx_output,
-                last_synchronize: HashMap::new(),
-                last_retry_synchronize: HashMap::new(),
-                last_synchronize_pruned_at: Instant::now(),
-                metrics: core_metrics.clone(),
-            },
+            payload: PayloadIo::new(store, tx_payload_ready, tx_output, core_metrics.clone()),
             cut,
             pending_timers: FuturesUnordered::new(),
             header_size: parameters.header_size,
@@ -639,18 +619,8 @@ impl SimpleItCore {
     }
 
     async fn serve_effects(&mut self, header: Header) -> Vec<Effect> {
-        let digest = header.id.clone();
-        let author = header.author;
         let mut effects = self.rep.on_serve(header.clone());
-        let accepted = effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::BlockCached(d) if *d == digest));
-        if accepted {
-            let missing = self.lm.missing_payload(&header).await;
-            if !missing.is_empty() {
-                effects.push(Effect::SyncBatches(author, digest, missing));
-            }
-        }
+        append_missing_payload_sync(&mut self.lm, &header, &mut effects).await;
         effects
     }
 

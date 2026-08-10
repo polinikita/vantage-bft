@@ -1,6 +1,8 @@
 use crate::messages::Header;
 use crate::primary::PrimaryWorkerMessage;
+use crate::vantage::lanes::LaneManager;
 use crate::vantage::wire::Wire;
+use crate::vantage::Effect;
 use config::WorkerId;
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
@@ -86,7 +88,49 @@ pub(crate) fn decide_synchronize(
     }
 }
 
+pub(crate) fn block_was_cached(effects: &[Effect], digest: &Digest) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::BlockCached(cached) if cached == digest))
+}
+
+pub(crate) async fn append_missing_payload_sync(
+    lm: &mut LaneManager,
+    header: &Header,
+    effects: &mut Vec<Effect>,
+) {
+    if !block_was_cached(effects, &header.id) {
+        return;
+    }
+    let missing = lm.missing_payload(header).await;
+    if !missing.is_empty() {
+        effects.push(Effect::SyncBatches(
+            header.author,
+            header.id.clone(),
+            missing,
+        ));
+    }
+}
+
 impl PayloadIo {
+    pub(crate) fn new(
+        store: Store,
+        tx_payload_ready: Sender<(Digest, Digest, WorkerId)>,
+        tx_output: Sender<Header>,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Self {
+        Self {
+            pending_payload: HashMap::new(),
+            store,
+            tx_payload_ready,
+            tx_output,
+            last_synchronize: HashMap::new(),
+            last_retry_synchronize: HashMap::new(),
+            last_synchronize_pruned_at: Instant::now(),
+            metrics,
+        }
+    }
+
     fn prune_last_synchronize(&mut self, now: Instant) {
         if now.duration_since(self.last_synchronize_pruned_at) < SYNCHRONIZE_RESEND_MIN_INTERVAL {
             return;

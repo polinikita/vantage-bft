@@ -40,12 +40,12 @@ use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
 use crate::vantage::install::{RebaseOutcome, SequenceInstall};
 use crate::vantage::lanes::{
-    AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager, SharedAckAggregator,
-    SharedBlocks,
+    aggregate_received_ack, AckAggregator, AckAvailability, AvailEntry, BlockCache, LaneManager,
+    SharedAckAggregator, SharedBlocks,
 };
 use crate::vantage::outbox::Outbox;
 use crate::vantage::pacemaker::Pacemaker;
-use crate::vantage::payload::PayloadIo;
+use crate::vantage::payload::{append_missing_payload_sync, block_was_cached, PayloadIo};
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolve::Resolver;
 use crate::vantage::resume::{
@@ -294,20 +294,9 @@ impl MessageHandler for VantageReceiverHandler {
                 Inbound::HeadersRequest(digests, requestor)
             }
             PrimaryMessage::VantageAck(a) => {
-                let result = {
-                    let mut aggregator = self.ack_aggregator.lock();
-                    aggregator.record_ack(a.sender, a.reference())
-                };
-                if !result.accepted {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.vantage_rejected_nonmember_total.inc();
-                    }
-                    return Ok(());
-                }
-                if let Some(metrics) = &self.metrics {
-                    metrics.vantage_acks_received.inc();
-                }
-                let Some(availability) = result.availability else {
+                let Some(availability) =
+                    aggregate_received_ack(&self.ack_aggregator, self.metrics.as_deref(), &a)
+                else {
                     return Ok(());
                 };
                 Inbound::AckAvailability(availability)
@@ -945,16 +934,7 @@ impl VantageCore {
             replay_episode_max_ms: parameters.replay_episode_max_ms,
             timers: BinaryHeap::new(),
             control_timers: BinaryHeap::new(),
-            payload: PayloadIo {
-                pending_payload: HashMap::new(),
-                store,
-                tx_payload_ready,
-                tx_output,
-                last_synchronize: HashMap::new(),
-                last_retry_synchronize: HashMap::new(),
-                last_synchronize_pruned_at: Instant::now(),
-                metrics: core_metrics.clone(),
-            },
+            payload: PayloadIo::new(store, tx_payload_ready, tx_output, core_metrics.clone()),
 
             // Keep state for the current view when the window is zero.
             gc_window: parameters.vantage_gc_window_views.max(1),
@@ -1074,27 +1054,15 @@ impl VantageCore {
             // Check timers even while a queue is ready.
             tokio::select! {
                 Some(inbound) = rx_vantage.recv() => {
-                    let now = Instant::now();
-                    let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
-                    let effects = self.dispatch_inbound(inbound, now).await;
-                    drop(dispatch_timer);
-                    self.execute(effects, now).await;
+                    self.dispatch_and_execute(inbound).await;
                 }
 
                 Some(inbound) = rx_bulk.recv() => {
-                    let now = Instant::now();
-                    let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
-                    let effects = self.dispatch_inbound(inbound, now).await;
-                    drop(dispatch_timer);
-                    self.execute(effects, now).await;
+                    self.dispatch_and_execute(inbound).await;
                 }
 
                 Some(inbound) = rx_sequence.recv() => {
-                    let now = Instant::now();
-                    let dispatch_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_inbound_dispatch, "inbound_dispatch");
-                    let effects = self.dispatch_inbound(inbound, now).await;
-                    drop(dispatch_timer);
-                    self.execute(effects, now).await;
+                    self.dispatch_and_execute(inbound).await;
                 }
 
                 Some((header_digest, digest, worker_id)) = rx_payload_ready.recv() => {
@@ -1271,6 +1239,18 @@ impl VantageCore {
         let (_, effects) = self.lm.publish_own(payload).await;
 
         drop(seal_timer);
+        self.execute(effects, now).await;
+    }
+
+    async fn dispatch_and_execute(&mut self, inbound: Inbound) {
+        let now = Instant::now();
+        let dispatch_timer = Self::cached_utilization_timer(
+            &self.metrics,
+            &mut self.ut_inbound_dispatch,
+            "inbound_dispatch",
+        );
+        let effects = self.dispatch_inbound(inbound, now).await;
+        drop(dispatch_timer);
         self.execute(effects, now).await;
     }
 
@@ -2860,21 +2840,7 @@ impl VantageCore {
     }
 
     fn record_injected_ack(&mut self, ack: Ack, now: Instant) -> Vec<Effect> {
-        let result = {
-            let mut aggregator = self.ack_aggregator.lock();
-            aggregator.record_ack(ack.sender, ack.reference())
-        };
-        if !result.accepted {
-            if let Some(metrics) = &self.metrics {
-                metrics.vantage_rejected_nonmember_total.inc();
-            }
-            return Vec::new();
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics.vantage_acks_received.inc();
-        }
-        result
-            .availability
+        aggregate_received_ack(&self.ack_aggregator, self.metrics.as_deref(), &ack)
             .map(|availability| self.on_ack_availability(availability, now))
             .unwrap_or_default()
     }
@@ -2937,9 +2903,7 @@ impl VantageCore {
             Inbound::Serve(header) => {
                 let digest = header.id.clone();
                 let effects = self.serve_effects(header).await;
-                let accepted = effects
-                    .iter()
-                    .any(|effect| matches!(effect, Effect::BlockCached(d) if d == &digest));
+                let accepted = block_was_cached(&effects, &digest);
                 if accepted && self.sequence_block_requests.remove(&digest).is_some() {
                     if let Some(metrics) = &self.metrics {
                         metrics
@@ -3202,9 +3166,7 @@ impl VantageCore {
                         continue;
                     }
                     let header_effects = self.sequence_serve_effects(header).await;
-                    let valid = header_effects
-                        .iter()
-                        .any(|effect| matches!(effect, Effect::BlockCached(d) if d == &digest));
+                    let valid = block_was_cached(&header_effects, &digest);
                     effects.extend(header_effects);
                     if valid && self.sequence_block_requests.remove(&digest).is_some() {
                         accepted += 1;
@@ -3396,34 +3358,14 @@ impl VantageCore {
     }
 
     async fn serve_effects(&mut self, header: Header) -> Vec<Effect> {
-        let digest = header.id.clone();
-        let author = header.author;
         let mut effects = self.rep.on_serve(header.clone());
-        let accepted = effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::BlockCached(d) if *d == digest));
-        if accepted {
-            let missing = self.lm.missing_payload(&header).await;
-            if !missing.is_empty() {
-                effects.push(Effect::SyncBatches(author, digest, missing));
-            }
-        }
+        append_missing_payload_sync(&mut self.lm, &header, &mut effects).await;
         effects
     }
 
     async fn sequence_serve_effects(&mut self, header: Header) -> Vec<Effect> {
-        let digest = header.id.clone();
-        let author = header.author;
         let mut effects = self.rep.on_sequence_serve(header.clone());
-        let accepted = effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::BlockCached(d) if *d == digest));
-        if accepted {
-            let missing = self.lm.missing_payload(&header).await;
-            if !missing.is_empty() {
-                effects.push(Effect::SyncBatches(author, digest, missing));
-            }
-        }
+        append_missing_payload_sync(&mut self.lm, &header, &mut effects).await;
         effects
     }
 

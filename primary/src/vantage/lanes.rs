@@ -701,6 +701,24 @@ impl AckAggregator {
 
 pub type SharedAckAggregator = Arc<Mutex<AckAggregator>>;
 
+pub(crate) fn aggregate_received_ack(
+    aggregator: &SharedAckAggregator,
+    metrics: Option<&Metrics>,
+    ack: &Ack,
+) -> Option<AckAvailability> {
+    let result = aggregator.lock().record_ack(ack.sender, ack.reference());
+    if !result.accepted {
+        if let Some(metrics) = metrics {
+            metrics.vantage_rejected_nonmember_total.inc();
+        }
+        return None;
+    }
+    if let Some(metrics) = metrics {
+        metrics.vantage_acks_received.inc();
+    }
+    result.availability
+}
+
 pub struct LaneManager {
     name: PublicKey,
     committee: Committee,
@@ -1350,32 +1368,38 @@ impl LaneManager {
 
     /// Retains the verified prefix through `r`; retained prefixes are prefix-closed.
     fn retain_prefix(&mut self, r: &BlockRef) {
+        let newly_retained_bytes = {
+            let mut blocks = self.blocks.lock();
+            Self::retain_prefix_locked(&mut blocks, &self.genesis, r)
+        };
+        self.record_retained_bytes(newly_retained_bytes);
+    }
+
+    fn retain_prefix_locked(blocks: &mut BlockCache, genesis: &Digest, r: &BlockRef) -> u64 {
         let mut cur = r.2.clone();
         let mut expected_height = r.1;
         let mut newly_retained_bytes: u64 = 0;
-        {
-            let mut blocks = self.blocks.lock();
-            loop {
-                if cur == self.genesis || expected_height == 0 {
-                    break;
-                }
-                let Some(entry) = blocks.get(&cur) else {
-                    break;
-                };
-                if entry.block.height != expected_height {
-                    break;
-                }
-                if entry.retained {
-                    break;
-                }
-                let next = entry.block.parent_cert.header_digest.clone();
-                let size = bincode::serialized_size(&entry.block).unwrap_or(0);
-                blocks.mark_retained(&cur);
-                newly_retained_bytes += size;
-                cur = next;
-                expected_height -= 1;
+        loop {
+            if &cur == genesis || expected_height == 0 {
+                break;
             }
+            let Some(entry) = blocks.get(&cur) else {
+                break;
+            };
+            if entry.block.height != expected_height || entry.retained {
+                break;
+            }
+            let next = entry.block.parent_cert.header_digest.clone();
+            let size = bincode::serialized_size(&entry.block).unwrap_or(0);
+            blocks.mark_retained(&cur);
+            newly_retained_bytes += size;
+            cur = next;
+            expected_height -= 1;
         }
+        newly_retained_bytes
+    }
+
+    fn record_retained_bytes(&self, newly_retained_bytes: u64) {
         if newly_retained_bytes > 0 {
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_retained_bytes.inc_by(newly_retained_bytes);
@@ -1416,13 +1440,6 @@ impl LaneManager {
             Some(AckThreshold::Validity) => q <= self.committee.validity_threshold(),
             None => false,
         }
-    }
-
-    fn exact_coordinate(&self, r: &BlockRef) -> bool {
-        let blocks = self.blocks.lock();
-        blocks
-            .get(&r.2)
-            .is_some_and(|e| e.block.author == r.0 && e.block.height == r.1)
     }
 
     /// Requires an exact coordinate and a direct, payload-ready prefix through genesis.
@@ -1471,22 +1488,30 @@ impl LaneManager {
 
     /// Verifies and retains the exact reference's valid prefix when locally held.
     pub fn holds_prefix(&mut self, r: &BlockRef) -> bool {
-        if !self.exact_coordinate(r) {
-            return false;
-        }
-        let verified = {
+        let (verified, newly_retained_bytes) = {
             let mut blocks = self.blocks.lock();
-            blocks.verified_prefix_through_genesis(
-                &self.committee,
-                &self.sid,
-                self.max_block_payload,
-                &self.genesis,
-                &r.2,
-            )
+            let exact = blocks
+                .get(&r.2)
+                .is_some_and(|e| e.block.author == r.0 && e.block.height == r.1);
+            if !exact {
+                (false, 0)
+            } else {
+                let verified = blocks.verified_prefix_through_genesis(
+                    &self.committee,
+                    &self.sid,
+                    self.max_block_payload,
+                    &self.genesis,
+                    &r.2,
+                );
+                let retained = if verified {
+                    Self::retain_prefix_locked(&mut blocks, &self.genesis, r)
+                } else {
+                    0
+                };
+                (verified, retained)
+            }
         };
-        if verified {
-            self.retain_prefix(r);
-        }
+        self.record_retained_bytes(newly_retained_bytes);
         verified
     }
 
