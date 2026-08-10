@@ -3236,6 +3236,18 @@ impl VantageCore {
                 // for every view skipped over is retained. On the straggler this mechanism
                 // exists to rescue, that retained state is the cost that matters.
                 self.resolver.note_installed_through(target);
+                // Move this node's CONSENSUS position to match its output position.
+                //
+                // Install advances the cursor and the resolver watermark, but nothing moved
+                // the AGB view: `enter_view_effects` is reachable only from boot and
+                // `Effect::Enter`, so the view advanced solely through the WISH pacemaker and
+                // stayed ~84 views behind. Proposer turns are per-view, so the node arrived
+                // at every turn far too late and peers skip-voted it -- measured 49 of 117
+                // turns committed, 0.42 against a peer's 1.00. Views at or below `target` are
+                // terminally decided here, so wishing past them is exactly what the pacemaker
+                // is for; this does not force entry, it declares where this node now is and
+                // lets the ordinary quorum rule carry it there.
+                effects.push(Effect::RaiseWish(target.saturating_add(1)));
                 // Left in place, NOT cleared: the finalize effects this pass produced still
                 // have to reach `record_sequence`, and the head comparison there is what
                 // proves the installed state matches what was verified. That comparison

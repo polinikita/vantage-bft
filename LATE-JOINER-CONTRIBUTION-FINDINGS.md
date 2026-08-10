@@ -76,16 +76,52 @@ echoing views 2773–2815 while node-0 echoed 2795–2877.
 A one-line fix (retain `Inbound::Wish` while shedding) is committed but **UNVERIFIED** — the
 run that would have measured it was interrupted. That is the first thing to measure.
 
-### Candidate fixes, in the order I would try them
+### Two candidate fixes MEASURED AND REFUTED (latch9)
 
-1. **Verify the WISH retention fix** (already in the tree, unmeasured).
-2. **Jump the AGB view on install completion** — raise the pacemaker wish to the installed
-   target so consensus position follows output position instead of walking. This is the
-   structural fix; WISH retention only removes an obstacle to the existing mechanism.
-3. **Do not let a lagging node hold a proposer turn.** If a node cannot propose within the
-   view's timing budget, the turn is wasted for everyone (58 % of node-20's turns produced
-   Skip, which costs the whole fleet a view, not just the joiner). Consider yielding the
-   turn, or having the pacemaker refuse to enter a view whose proposer is known to be behind.
+Both are in the tree. Both are semantically right and neither helps; do not spend time
+re-deriving them.
+
+1. **Retain `Inbound::Wish` while shedding** — so the catcher keeps learning where the fleet
+   is instead of discarding the signal.
+2. **`RaiseWish(target + 1)` on install completion** — so consensus position follows output
+   position rather than walking behind it.
+
+Measured together against latch7's baseline:
+
+| | latch7 (neither) | latch9 (both) |
+|---|---|---|
+| proposals committed | 0.42 (49/117) | **0.40 (44/109)** |
+| median lag | 84 | 86 |
+
+Unchanged within noise. So the AGB view is **not** the binding constraint, and the catcher's
+own view is evidently not what makes its proposals unusable. Note it *does* propose for
+essentially all its turns (105 made / 109 turns), so this is not a timing-of-proposal problem
+in the naive sense either.
+
+### Where I would look next
+
+The failure is that peers do not ADOPT the catcher's proposal, not that it fails to send one.
+Since view position is ruled out, the remaining candidates concern proposal *content* and the
+catcher's own availability bookkeeping:
+
+1. **The catcher cannot vouch for its own lane.** Confirmed while chasing the CPU problem: its
+   own lane prefix is absent from `BlockCache` after restart, so `direct_pub` fails for its own
+   blocks indefinitely and `pending_direct` never drains for its own author. A proposal built
+   from `Frontier::try_propose`/`LaneManager` state under that condition may name a manifest
+   peers will not accept, or may be near-empty. This is the strongest remaining lead and it is
+   the same root cause as the `header_seal` blow-up.
+2. **Seed the cache with the node's own lane prefix from the store on restart.** Headers are
+   persisted; the cache is memory-only. This would fix (1) at the source, and would also let
+   `pending_direct` drain.
+3. **Do not let a lagging node hold a proposer turn.** Independently of the cause: 60 % of the
+   catcher's turns produce `Skip`, and a `Skip` costs the whole fleet a view, not just the
+   joiner. Yielding the turn is worth considering on its own merits.
+
+### What a Skip actually costs here
+
+Worth quantifying before optimising: at n=21 the catcher owns 1 view in 21, and loses ~60 % of
+those, so ~2.9 % of all views seal empty because of it. That is the fleet-level cost of one
+recovering node.
 
 ## 4. Why sync never stops (condition 1/2)
 
