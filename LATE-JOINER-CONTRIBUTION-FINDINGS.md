@@ -22,9 +22,10 @@ A validator that fell behind must, **after catching up**:
     --interval 50 --sequence-sync-min-gap-views 100 --sequence-sync-shed-gap-views 100
 ```
 
-Score with `check_latch.py <start> <end>` (in the session scratchpad; reproduced logic
-below). Five conditions, judged on the **last third** of the window — "never again" only
-means anything in the tail:
+Or, from `docker-bench/`: `./joiner_verify.sh <name>` to run it, then
+`./joiner_score.py <start HH:MM:SS> <end HH:MM:SS>` to score it (needs Prometheus up).
+Five conditions, judged on the **last third** of the window — "never again" only means
+anything in the tail:
 
 | # | condition | metric |
 |---|---|---|
