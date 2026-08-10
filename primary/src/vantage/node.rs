@@ -41,6 +41,14 @@ const SEQUENCE_BLOCK_REFILL_AT: usize = SEQUENCE_BLOCK_MAX_IN_FLIGHT / 2;
 /// default 16-view budget. A dedicated tick keeps each core turn bounded while allowing
 /// enough turns to overtake the live view rate.
 const SEQUENCE_INSTALL_DRIVE_PERIOD_MS: u64 = 100;
+/// Slack added above the entry frontier when stamping `sequence_live_intake_floor` at a
+/// shed off-edge. Views at the frontier itself are still mid-pipeline -- their echo/ready
+/// waves complete after the edge and remain sealable -- but views a wave-or-two below it
+/// may have sealed on the fleet just before intake resumed, with their evidence already
+/// lost. At the measured ~13 views/s a wave stays in flight for well under a second;
+/// 16 views is that horizon doubled. Overshoot only costs one or two more installed
+/// checkpoints before the latch; undershoot re-creates the dead-zone wedge.
+const SEQUENCE_LIVE_INTAKE_MARGIN: crate::primary::View = 16;
 
 use crate::vantage::cursor::Cursor;
 use crate::vantage::frontier::Frontier;
@@ -646,6 +654,24 @@ pub struct VantageCore {
     ///
     /// Re-arms solely on a gap so large it can only be a real outage, never on jitter.
     sequence_sync_recovered: bool,
+    /// The first view since which view-scoped intake has been UNINTERRUPTED -- stamped
+    /// from the entry frontier at every shed off-edge (wish/entry is retained while
+    /// shedding, so `a_i` tracks the fleet through an outage), plus a slack margin for
+    /// echo/ready waves already in flight at that edge.
+    ///
+    /// Why it exists (measured 2026-08-10, run anchor1): the latch used to fire the
+    /// moment the install caught up to within the sync gate, at local head 2252 -- but
+    /// the node had shed all consensus traffic up to ~view 2440, and views in
+    /// (2252, 2440] can never seal ordinarily: the evidence is gone, peers never re-send
+    /// old echoes/readys, and peers' resolvers never target views THEY already resolved.
+    /// The cursor wedged at 2253, the gap regrew past the shed gate, shedding resumed
+    /// while the latch held transfers off, and the node went dark (zombie: not syncing,
+    /// not participating). Recovery must therefore stay active -- and installs keep
+    /// landing -- until the local head crosses this floor, so the ordinary tail-close
+    /// the sync-gate comment below relies on is actually possible.
+    sequence_live_intake_floor: View,
+    /// Previous shed state, for detecting the off-edge that stamps the floor above.
+    sequence_shed_was_active: bool,
     sequence_announce_period_ms: u64,
     sequence_announce_repeat_ms: u64,
     /// Phase B: at most ONE installation target at a time (section 7).
@@ -1143,6 +1169,8 @@ impl VantageCore {
             sequence_large_gap_drop: sequence_large_gap_drop.clone(),
             sequence_sync_recovery_active: false,
             sequence_sync_recovered: false,
+            sequence_live_intake_floor: 0,
+            sequence_shed_was_active: false,
             sequence_announce_period_ms: parameters.sequence_announce_period_ms,
             sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
             sequence_transfer: None,
@@ -4238,6 +4266,16 @@ impl VantageCore {
     /// in the bounded main queue while view-scoped messages covered by the staged target
     /// are still rejected by `install_replaces_inbound`.
     fn large_sequence_sync_target(&self) -> Option<View> {
+        // A latched node NEVER sheds. Shedding is only sound while installs will replace
+        // the shed range, and the latch is precisely "no more installs" -- shedding while
+        // latched is the zombie state observed 2026-08-10 (run anchor1): the wedged node
+        // shed the very evidence it needed, went dark at view 2441, and sat with the gap
+        // pinned between the shed gate and the re-arm gap. If the gap genuinely reaches
+        // the re-arm threshold, the latch clears (drive_sequence_sync) and shedding and
+        // syncing resume TOGETHER.
+        if self.sequence_sync_recovered {
+            return None;
+        }
         let local = self
             .sequence
             .as_ref()
@@ -4265,6 +4303,26 @@ impl VantageCore {
             .map(|store| store.head_view())
             .unwrap_or(0);
         let target = self.highest_sequence_sync_target();
+        // Stamp the live-intake floor on the shed OFF-edge, BEFORE recovery is
+        // re-evaluated below (the floor is one of its inputs). `a_i` tracks view entry,
+        // which the WISH pacemaker keeps advancing through a shed (Inbound::Wish is
+        // retained), so at this edge it is the best local estimate of the fleet's
+        // current view; the margin covers echo/ready waves already in flight, whose
+        // views can still seal from the messages that arrive after this instant.
+        // Monotone max: a later, lower stamp must never re-open an already-covered
+        // range.
+        let shed_active = self.large_sequence_sync_target().is_some();
+        if self.sequence_shed_was_active && !shed_active {
+            let floor = (self.frontier.a_i() + 1).saturating_add(SEQUENCE_LIVE_INTAKE_MARGIN);
+            if floor > self.sequence_live_intake_floor {
+                self.sequence_live_intake_floor = floor;
+                log::info!(
+                    "vantage sequence sync: shed released; live-intake floor stamped at \
+                     view={floor}"
+                );
+            }
+        }
+        self.sequence_shed_was_active = shed_active;
         // SYNC threshold. State sync can only ever land one cycle behind a moving fleet --
         // each transfer targets a checkpoint that was current when it started, and the
         // fleet advances while it runs, so the residual lag is
@@ -4272,10 +4330,19 @@ impl VantageCore {
         // The tail therefore CANNOT be closed by syncing; it has to be closed by ordinary
         // participation, which is why recovery deactivates here instead of running until
         // the gap reaches zero.
+        //
+        // ...by ordinary participation OF VIEWS THE NODE HAS EVIDENCE FOR: every view
+        // below `sequence_live_intake_floor` was shed, its evidence will never be
+        // re-sent, and peers' resolvers never target views they already resolved -- so
+        // recovery must also stay active until the local head crosses that floor, or the
+        // latch strands the cursor in a dead zone it can never seal (the 2026-08-10
+        // zombie: latched at head 2252 with the floor effectively at ~2440, wedged at
+        // 2253 forever).
         let was_recovering = self.sequence_sync_recovery_active;
         self.sequence_sync_recovery_active = self.sequence_install_enabled
             && target.is_some_and(|target| {
                 target.saturating_sub(local) >= self.sequence_sync_min_gap_views
+                    || local < self.sequence_live_intake_floor
             });
         // Inside the sync threshold, stop FETCHING: a transfer competes for exactly the
         // queue and bandwidth the tail now needs for ordinary participation. A staged
@@ -4297,8 +4364,9 @@ impl VantageCore {
         {
             self.sequence_sync_recovered = true;
             log::info!(
-                "vantage sequence sync: RECOVERED at view={local}; state sync off until a gap \
-                 of {} views or more",
+                "vantage sequence sync: RECOVERED at view={local} (live-intake floor {}); \
+                 state sync off until a gap of {} views or more",
+                self.sequence_live_intake_floor,
                 self.sequence_sync_rearm_gap_views
             );
             if let Some(metrics) = &self.metrics {
@@ -5230,6 +5298,117 @@ mod tests {
             !core.sequence_sync_recovered,
             "a gap large enough to be an outage must re-arm state sync"
         );
+    }
+
+    #[tokio::test]
+    async fn latch_waits_for_the_live_intake_floor() {
+        // The 2026-08-10 zombie: the latch fired at the installed target (head 2252)
+        // while every view shed during recovery (up to ~2440) had no live evidence and
+        // could never seal ordinarily -- the cursor wedged one view past the latch,
+        // forever. Recovery must stay active until the head crosses the live-intake
+        // floor stamped when shedding released.
+        let mut core = test_core(0, "sequence_sync_live_floor");
+        core.sequence_sync_min_gap_views = 100;
+        core.sequence_sync_shed_gap_views = 300;
+        core.sequence_sync_rearm_gap_views = 800;
+        let keys = crate::common::keys();
+
+        // A certified boundary 500 ahead: recovery on, shedding on.
+        let head = Digest([0x21; 32]);
+        for (sender, _) in keys.iter().skip(1).take(3) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 500,
+                    head: head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(core.sequence_sync_recovery_active);
+        assert!(core.sequence_large_gap_drop.load(Ordering::Relaxed));
+
+        // Entry tracked the fleet through the shed (wish is retained while shedding).
+        core.frontier.enter(520);
+
+        // Installs catch up to 450: the gap (50) is inside BOTH gates, so shedding
+        // releases -- stamping the floor -- but recovery must NOT deactivate: the head
+        // is still below the floor and the views in between have no live evidence.
+        for view in 1..=450 {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(!core.sequence_large_gap_drop.load(Ordering::Relaxed));
+        assert_eq!(
+            core.sequence_live_intake_floor,
+            520 + SEQUENCE_LIVE_INTAKE_MARGIN,
+            "the shed off-edge must stamp the floor from the entry frontier"
+        );
+        assert!(
+            core.sequence_sync_recovery_active,
+            "recovery must keep installing until the head crosses the live-intake floor"
+        );
+        assert!(!core.sequence_sync_recovered, "latching here strands the cursor");
+
+        // The head crosses the floor: NOW leaving recovery is sound, and it latches.
+        for view in 451..=520 + SEQUENCE_LIVE_INTAKE_MARGIN {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(!core.sequence_sync_recovery_active);
+        assert!(core.sequence_sync_recovered);
+    }
+
+    #[tokio::test]
+    async fn recovered_node_never_sheds() {
+        // Shedding is only sound while installs will replace the shed range; the latch
+        // is precisely "no more installs". A latched node that sheds is the zombie of
+        // 2026-08-10: not syncing, not participating, dark until the run ended. Between
+        // the shed gate and the re-arm gap it must PARTICIPATE; at the re-arm gap the
+        // latch clears and shed+sync resume together.
+        let mut core = test_core(0, "sequence_sync_no_shed_latched");
+        core.sequence_sync_min_gap_views = 100;
+        core.sequence_sync_shed_gap_views = 300;
+        core.sequence_sync_rearm_gap_views = 800;
+        let keys = crate::common::keys();
+
+        let head = Digest([0x31; 32]);
+        for (sender, _) in keys.iter().skip(1).take(3) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 400,
+                    head: head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        assert!(
+            core.large_sequence_sync_target().is_some(),
+            "an unlatched node with a 400-view gap sheds"
+        );
+
+        core.sequence_sync_recovered = true;
+        assert!(
+            core.large_sequence_sync_target().is_none(),
+            "a latched node must never shed -- the gap is below the re-arm threshold, \
+             so it recovers this range by ordinary participation"
+        );
+        core.refresh_sequence_large_gap_drop();
+        assert!(!core.sequence_large_gap_drop.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
