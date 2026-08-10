@@ -641,3 +641,77 @@ async fn forked_lane_does_not_wedge_the_cursor() {
         "view 1's output is untouched"
     );
 }
+
+/// Install and ordinary execution must reach the SAME per-author watermark.
+///
+/// `expand` drops a `SuffixWalk::Forked` manifest entry and leaves that author's watermark
+/// alone. Watermarks derived from the manifest instead of from the delivered delta advanced
+/// past the forked tip, so an installing node could later walk forward from the forked
+/// branch and emit blocks an executing node drops -- two correct nodes, divergent committed
+/// logs, from identical verified input.
+#[tokio::test]
+async fn install_and_execution_agree_on_watermarks_across_a_fork() {
+    let (name, _) = authors()[3];
+    let (forker, _) = authors()[0];
+    let (honest, _) = authors()[1];
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_wm_fork");
+
+    let forked_a = direct_chain(&mut lm, forker, 1).await;
+    let honest_chain = direct_chain(&mut lm, honest, 3).await;
+
+    // The fork: a sibling of the forker's height 1, and two blocks built on it.
+    let sid = lm.sid().clone();
+    let b1 = tagged_header(forker, 1, lm.genesis().clone(), sid.clone(), 7);
+    let b2 = tagged_header(forker, 2, b1.id.clone(), sid.clone(), 8);
+    let b3 = tagged_header(forker, 3, b2.id.clone(), sid, 9);
+    for h in [&b1, &b2, &b3] {
+        lm.process_publish(forker, h.clone()).await;
+    }
+
+    // View 1 delivers the forker's ORIGINAL height 1 on both nodes.
+    let mut executing = new_cursor(&lm);
+    let mut installing = new_cursor(&lm);
+    let c1 = sorted_manifest(vec![block_ref(&forked_a[0]), block_ref(&honest_chain[0])]);
+    for cursor in [&mut executing, &mut installing] {
+        cursor.on_completed(1, c1.clone(), Vec::new());
+        cursor.on_sealed(1, Outcome::Full(c1.clone(), Vec::new()));
+    }
+
+    // View 2 names the FORKED height 2. Executing drops it; installing applies the same
+    // verified delta, which likewise contains no forked block.
+    let c2 = sorted_manifest(vec![block_ref(&b2), block_ref(&honest_chain[1])]);
+    executing.on_completed(2, c2.clone(), Vec::new());
+    executing.on_sealed(2, Outcome::Full(c2.clone(), Vec::new()));
+    let delta2 = vec![honest_chain[1].id.clone()];
+    installing
+        .install(
+            2,
+            SequenceOutcome::Full {
+                c: c2,
+                t: Vec::new(),
+            },
+            &delta2,
+            usize::MAX,
+        )
+        .expect("install view 2");
+
+    // View 3 names the forked height 3. Neither node may deliver it: both watermarks for
+    // the forker must still sit at the original height 1, so the walk stays `Forked`.
+    let c3 = sorted_manifest(vec![block_ref(&b3), block_ref(&honest_chain[2])]);
+    for cursor in [&mut executing, &mut installing] {
+        cursor.on_completed(3, c3.clone(), Vec::new());
+        cursor.on_sealed(3, Outcome::Full(c3.clone(), Vec::new()));
+    }
+
+    assert_eq!(
+        executing.output_log(),
+        installing.output_log(),
+        "an installing node and an executing node must deliver identical logs"
+    );
+    for (label, cursor) in [("executing", &executing), ("installing", &installing)] {
+        assert!(
+            !cursor.output_log().contains(&b3.id),
+            "{label} must not deliver a block on the forked branch"
+        );
+    }
+}

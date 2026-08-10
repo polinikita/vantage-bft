@@ -300,7 +300,14 @@ impl Inbound {
     fn keep_during_large_sequence_sync(&self) -> bool {
         matches!(
             self,
-            Inbound::SequenceAnnounce(_, _)
+            // WISH is how a node learns where the fleet actually is, and it is what advances
+            // its own AGB view -- nothing in the install path does (`enter_view_effects` is
+            // reached only from boot and `Effect::Enter`). Shedding it means the catcher
+            // keeps proposing for views the fleet has already left, so peers skip-vote its
+            // turns: measured 49 of 117 proposer turns committed, 0.42 against a peer 1.00.
+            // It is also two integers on the wire, so keeping it costs nothing.
+            Inbound::Wish(_, _)
+                | Inbound::SequenceAnnounce(_, _)
                 | Inbound::SequenceAnnounceBatch(_, _)
                 | Inbound::SequenceRecords(_, _)
                 | Inbound::SequenceDelta(_, _)
@@ -337,6 +344,13 @@ impl Inbound {
             _ => None,
         }
     }
+}
+
+/// Short, stable label for a committee member in per-author metrics. Uses the crate's own
+/// `Display`, which is the 16-character base64 prefix already used in every log line, so a
+/// label can be matched against logs directly. One series per committee member.
+fn author_label(author: &PublicKey) -> String {
+    author.to_string()
 }
 
 /// Network receiver handler for the Vantage assembly's `primary_to_primary` port.
@@ -611,12 +625,27 @@ pub struct VantageCore {
     sequence_chunk_outcome_items: usize,
     sequence_chunk_digests: usize,
     sequence_sync_min_gap_views: View,
+    sequence_sync_shed_gap_views: View,
+    sequence_sync_rearm_gap_views: View,
     sequence_large_gap_drop: Arc<AtomicBool>,
     /// Hysteresis for late-joiner recovery. Enter only at the configured gap, then keep
     /// verifying/installing certified tail checkpoints until the cursor reaches the
     /// newest one. Ordinary future messages are allowed to park once that newest gap is
     /// below the threshold; this flag controls target selection, not ingress shedding.
     sequence_sync_recovery_active: bool,
+    /// Latched once this node has recovered: state sync is a ONE-SHOT bulk operation, not a
+    /// steady-state mechanism, and without a latch it re-arms on every newly certified
+    /// boundary and never stops.
+    ///
+    /// Measured 2026-08-10 before this existed: a recovered joiner ran transfers forever
+    /// (0.12-0.36/s indefinitely) and never reached peer parity, because syncing is
+    /// self-sustaining -- a staged install makes `install_replaces_inbound` drop ordinary
+    /// view-scoped traffic and parks `pump`, so the node advances only at install speed,
+    /// drifts behind the fleet, and the next boundary starts another transfer. The
+    /// threshold comparison alone cannot break that loop; only a latch can.
+    ///
+    /// Re-arms solely on a gap so large it can only be a real outage, never on jitter.
+    sequence_sync_recovered: bool,
     sequence_announce_period_ms: u64,
     sequence_announce_repeat_ms: u64,
     /// Phase B: at most ONE installation target at a time (section 7).
@@ -1109,8 +1138,11 @@ impl VantageCore {
             sequence_chunk_outcome_items: parameters.sequence_sync_chunk_outcome_items,
             sequence_chunk_digests: parameters.sequence_sync_chunk_digests,
             sequence_sync_min_gap_views: parameters.sequence_sync_min_gap_views,
+            sequence_sync_shed_gap_views: parameters.sequence_sync_shed_gap_views,
+            sequence_sync_rearm_gap_views: parameters.sequence_sync_rearm_gap_views,
             sequence_large_gap_drop: sequence_large_gap_drop.clone(),
             sequence_sync_recovery_active: false,
+            sequence_sync_recovered: false,
             sequence_announce_period_ms: parameters.sequence_announce_period_ms,
             sequence_announce_repeat_ms: parameters.sequence_announce_repeat_ms,
             sequence_transfer: None,
@@ -2453,6 +2485,9 @@ impl VantageCore {
                     .map(ProposalOut::Batch),
             };
             if let Some(proposal) = proposal {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_own_proposals_made_total.inc();
+                }
                 effects.push(Effect::BroadcastPropose(proposal.clone()));
                 effects.extend(match proposal {
                     ProposalOut::Single(p) => {
@@ -2480,6 +2515,19 @@ impl VantageCore {
     /// party derives, which is exactly the divergence this phase exists to detect. The
     /// store is left untouched so the first bad view stays identifiable.
     fn record_sequence(&mut self, view: View, outcome: &SequenceOutcome, output_delta: &[Digest]) {
+        // Consensus contribution, as distinct from lane data blocks: data blocks carry client
+        // transactions and are committed by everyone, so they say nothing about whether this
+        // node is taking its turn in agreement. What matters is the round-robin PROPOSER turn
+        // -- a node that lags simply misses its turns, and the view then seals without its
+        // proposal (or skips), which is invisible in any data-block measure.
+        if self.agb.proposer(view) == self.name {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_own_proposer_turns_total.inc();
+                if !matches!(outcome, SequenceOutcome::Skip) {
+                    metrics.vantage_own_proposals_committed_total.inc();
+                }
+            }
+        }
         // Taken before `self.sequence` is borrowed mutably below.
         let sid_label = head_hex(self.agb.sid());
         // Phase B's closing check: a target verified against `f+1` announcements is held
@@ -2757,9 +2805,27 @@ impl VantageCore {
             let Some((view, head)) = collector.certified_head(local_view) else {
                 return;
             };
-            if !self.sequence_sync_recovery_active
-                && view.saturating_sub(local_view) < self.sequence_sync_min_gap_views
-            {
+            let gap = view.saturating_sub(local_view);
+            // Recovered nodes do not sync. Only a gap large enough to be an actual outage
+            // re-arms the mechanism; anything smaller is the fleet's ordinary jitter, and
+            // treating it as a reason to sync is what produced permanent recovery.
+            if self.sequence_sync_recovered {
+                if gap < self.sequence_sync_rearm_gap_views {
+                    return;
+                }
+                log::info!(
+                    "vantage sequence sync: re-arming after a {gap}-view gap (>= {})",
+                    self.sequence_sync_rearm_gap_views
+                );
+                self.sequence_sync_recovered = false;
+                // Must be cleared here too: latch3 reported recovered=1 while the node had
+                // already re-armed and was running transfers again, so the gauge asserted the
+                // exact opposite of what was happening.
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_sequence_sync_recovered.set(0);
+                }
+            }
+            if !self.sequence_sync_recovery_active && gap < self.sequence_sync_min_gap_views {
                 return;
             }
             let sources = collector.announcers(view, &head);
@@ -4153,7 +4219,17 @@ impl VantageCore {
             .unwrap_or(0);
         let target = self.highest_sequence_sync_target()?;
 
-        (target.saturating_sub(local) >= self.sequence_sync_min_gap_views).then_some(target)
+        // SHED threshold, deliberately far above the sync threshold. These are two
+        // independent controls -- back-pressure and mechanism selection -- and driving
+        // both from one number is what made a recovering node oscillate: crossing it
+        // flipped "drop consensus traffic" and "use sync instead of participation"
+        // together, so the node alternated between syncing fast while deaf and
+        // participating while falling behind. Measured 2026-08-09 at a single gate of 50:
+        // lag cycled 31 -> 66 -> 41 -> 60 -> 31 and never settled.
+        //
+        // Between the two thresholds the node BOTH participates and syncs, which is the
+        // regime that did not previously exist.
+        (target.saturating_sub(local) >= self.sequence_sync_shed_gap_views).then_some(target)
     }
 
     fn refresh_sequence_large_gap_drop(&mut self) {
@@ -4163,15 +4239,56 @@ impl VantageCore {
             .map(|store| store.head_view())
             .unwrap_or(0);
         let target = self.highest_sequence_sync_target();
-        self.sequence_sync_recovery_active = if !self.sequence_install_enabled {
-            false
-        } else if self.sequence_sync_recovery_active {
-            target.is_some_and(|target| target > local)
-        } else {
-            target.is_some_and(|target| {
+        // SYNC threshold. State sync can only ever land one cycle behind a moving fleet --
+        // each transfer targets a checkpoint that was current when it started, and the
+        // fleet advances while it runs, so the residual lag is
+        // `cycle_duration * view_rate` (measured 62 views at ~13 views/s ~= one cycle).
+        // The tail therefore CANNOT be closed by syncing; it has to be closed by ordinary
+        // participation, which is why recovery deactivates here instead of running until
+        // the gap reaches zero.
+        let was_recovering = self.sequence_sync_recovery_active;
+        self.sequence_sync_recovery_active = self.sequence_install_enabled
+            && target.is_some_and(|target| {
                 target.saturating_sub(local) >= self.sequence_sync_min_gap_views
-            })
-        };
+            });
+        // Inside the sync threshold, stop FETCHING: a transfer competes for exactly the
+        // queue and bandwidth the tail now needs for ordinary participation. A staged
+        // install is deliberately left to drain -- it applies already-verified state under
+        // its own per-tick budget, so it is strict progress, and abandoning it would throw
+        // away work the node would immediately have to redo.
+        // Latch "recovered" the moment the gap is inside the sync gate. This is the only
+        // exit from permanent recovery: the gate alone is re-evaluated against every newly
+        // certified boundary, so it re-arms forever, while the latch holds until a gap big
+        // enough to be a genuine outage appears.
+        // EDGE-triggered on leaving recovery, never a level check. A level check latches at
+        // BOOT -- `recovery_active` is trivially false there and no install is staged -- which
+        // disables state sync from birth and leaves a genuine joiner stuck at view 1 with zero
+        // transfers. Measured exactly that: "RECOVERED at view=0" 59 ms after start.
+        if was_recovering
+            && !self.sequence_sync_recovery_active
+            && !self.sequence_sync_recovered
+            && self.sequence_install.is_none()
+        {
+            self.sequence_sync_recovered = true;
+            log::info!(
+                "vantage sequence sync: RECOVERED at view={local}; state sync off until a gap \
+                 of {} views or more",
+                self.sequence_sync_rearm_gap_views
+            );
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_sequence_sync_recovered.set(1);
+            }
+        }
+        if !self.sequence_sync_recovery_active && self.sequence_transfer.is_some() {
+            log::info!(
+                "vantage sequence sync: within {} views of the target; stopping transfer \
+                 and recovering the tail by ordinary participation",
+                self.sequence_sync_min_gap_views
+            );
+            self.sequence_transfer = None;
+            self.sequence_request_at = None;
+            self.sequence_last_want = None;
+        }
         self.sequence_large_gap_drop.store(
             self.large_sequence_sync_target().is_some(),
             Ordering::Relaxed,
@@ -4191,6 +4308,22 @@ impl VantageCore {
 
         if self.large_sequence_sync_target().is_some() {
             return !inbound.keep_during_large_sequence_sync();
+        }
+
+        // Inside the sync threshold the install RELEASES its claim on the range.
+        //
+        // Dropping view-scoped traffic at or below the staged target is only sound while
+        // the install is actually going to deliver those views. Once the node is close
+        // enough that ordinary participation should finish the job, the same rule
+        // discards exactly the messages that would finish it -- and hands the range to a
+        // mechanism that structurally cannot close a tail, since every transfer lands one
+        // cycle behind a moving fleet. Measured with the claim held: ordinary
+        // participation contributed 42 of 7,181 views (0.6%).
+        //
+        // A staged install still drains underneath this; if ordinary progress overtakes
+        // it, `rebase` already handles the race (`RebaseOutcome::Overtaken`).
+        if !self.sequence_sync_recovery_active {
+            return false;
         }
 
         let Some(target) = self
@@ -4456,6 +4589,39 @@ impl VantageCore {
                         self.timers.push(Reverse((deadline, view, kind)));
                     }
                     Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
+                        // A recovering node that only CONSUMES output is still a fault from
+                        // the committee's point of view. Publishing is not the same as
+                        // contributing: a block counts only once it is committed, so this
+                        // counter -- against `vantage_blocks_published` -- is what says
+                        // whether a late joiner is actually carrying its share again.
+                        if let Some(metrics) = &self.metrics {
+                            let mut own = 0u64;
+                            let mut own_payload = 0u64;
+                            for header in headers.iter() {
+                                // Per-author attribution, so a caught-up peer can report how
+                                // much of a recovering node's output actually got committed.
+                                metrics
+                                    .vantage_committed_by_author
+                                    .with_label_values(&[&author_label(&header.author)])
+                                    .inc();
+                                if header.author != self.name {
+                                    continue;
+                                }
+                                own += 1;
+                                own_payload += header.payload.len() as u64;
+                            }
+                            if own > 0 {
+                                metrics.vantage_own_blocks_committed_total.inc_by(own);
+                                // Blocks alone understate contribution: a busy core loop
+                                // accumulates more digests before `header_size` is reached,
+                                // so a node under recovery load seals FEWER but LARGER
+                                // headers at an unchanged client rate. Payload entries are
+                                // the work actually carried.
+                                metrics
+                                    .vantage_own_payload_committed_total
+                                    .inc_by(own_payload);
+                            }
+                        }
                         self.payload
                             .notify_committed(&mut self.wire, commit_millis, by_worker, headers)
                             .await;
@@ -4826,6 +4992,7 @@ mod tests {
         let (member, _) = crate::common::keys()[1];
         let target = 100;
         core.sequence_sync_min_gap_views = 50;
+        core.sequence_sync_shed_gap_views = 50;
         core.sequence_install = Some(SequenceInstall::new(
             0,
             target,
@@ -4909,10 +5076,13 @@ mod tests {
             "checkpoint announcements must still be accepted for the next sticky transfer"
         );
 
-        core.sequence_sync_min_gap_views = 200;
+        core.sequence_sync_shed_gap_views = 200;
+        // The install only claims its range while recovery is active; below the sync
+        // threshold it releases the claim so parked traffic can close the tail.
+        core.sequence_sync_recovery_active = true;
         assert!(
             !core.install_replaces_inbound(&future_echo),
-            "once the active gap is below the state-sync threshold, future traffic can park"
+            "once the active gap is below the SHED threshold, future traffic can park"
         );
 
         let covered_echo = Inbound::Echo(EchoOut::Single(Echo {
@@ -4930,12 +5100,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequence_sync_hysteresis_keeps_target_while_tail_starts_parking() {
-        let mut core = test_core(0, "sequence_sync_hysteresis");
-        core.sequence_sync_min_gap_views = 50;
+    async fn recovered_node_does_not_resync_on_ordinary_jitter() {
+        // The invariant: once caught up, a node rejoins ordinary consensus and STAYS there.
+        // Before the latch, the sync gate was re-evaluated against every newly certified
+        // boundary, so a recovered joiner ran transfers forever (measured 0.12-0.36/s
+        // indefinitely) and never reached peer parity.
+        let mut core = test_core(0, "sequence_sync_recovered_latch");
+        core.sequence_sync_min_gap_views = 100;
+        core.sequence_sync_shed_gap_views = 300;
+        core.sequence_sync_rearm_gap_views = 400;
+        let keys = crate::common::keys();
+
+        let certify = |core: &mut VantageCore, view: View, tag: u8| {
+            let head = Digest([tag; 32]);
+            for (sender, _) in keys.iter().skip(1).take(3) {
+                core.on_sequence_announce(
+                    &SequenceAnnouncement {
+                        version: SEQUENCE_VERSION,
+                        view,
+                        head: head.clone(),
+                        serve_floor: 1,
+                        sender: *sender,
+                    },
+                    sender,
+                );
+            }
+        };
+
+        // A boot-time node is NOT recovered: latching on a level check here is what disabled
+        // state sync from birth and left a real joiner stuck at view 1.
+        core.refresh_sequence_large_gap_drop();
+        assert!(
+            !core.sequence_sync_recovered,
+            "a node that has never recovered must be able to sync"
+        );
+
+        // Enter recovery: a certified boundary 500 views ahead of a local head of 0.
+        certify(&mut core, 500, 0x11);
+        core.refresh_sequence_large_gap_drop();
+        assert!(
+            core.sequence_sync_recovery_active,
+            "a 500-view gap must engage recovery"
+        );
+        assert!(!core.sequence_sync_recovered);
+
+        // Close the gap to 50, inside the sync gate, with nothing staged. Leaving recovery
+        // is the EDGE that latches recovered.
+        for view in 1..=450 {
+            core.sequence
+                .as_mut()
+                .unwrap()
+                .record(view, &SequenceOutcome::Skip, &[])
+                .unwrap();
+        }
+        core.refresh_sequence_large_gap_drop();
+        assert!(
+            !core.sequence_sync_recovery_active,
+            "the gap is now inside the sync gate"
+        );
+        assert!(
+            core.sequence_sync_recovered,
+            "leaving recovery must latch recovered"
+        );
+
+        // Ordinary jitter: a boundary 150 views ahead. Above the sync gate (100) and so
+        // would have restarted a transfer, but far below the re-arm gap (400).
+        let jitter_head = Digest([0x44; 32]);
+        for (sender, _) in keys.iter().skip(1).take(8) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 650,
+                    head: jitter_head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        core.drive_sequence_sync();
+        assert!(
+            core.sequence_transfer.is_none(),
+            "ordinary jitter above the sync gate must NOT restart state sync"
+        );
+        assert!(core.sequence_sync_recovered);
+
+        // A genuine outage: 500 views ahead, past the re-arm gap.
+        let outage_head = Digest([0x55; 32]);
+        for (sender, _) in keys.iter().skip(1).take(8) {
+            core.on_sequence_announce(
+                &SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view: 1_000,
+                    head: outage_head.clone(),
+                    serve_floor: 1,
+                    sender: *sender,
+                },
+                sender,
+            );
+        }
+        core.drive_sequence_sync();
+        assert!(
+            !core.sequence_sync_recovered,
+            "a gap large enough to be an outage must re-arm state sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_sync_thresholds_are_independent_controls() {
+        // Three regimes, and the middle one is the point of the split: between the two
+        // thresholds the node BOTH participates and syncs. Driving shedding and mechanism
+        // selection from a single number is what made a recovering node oscillate.
+        let mut core = test_core(0, "sequence_sync_thresholds");
+        core.sequence_sync_min_gap_views = 100;
+        core.sequence_sync_shed_gap_views = 300;
         core.sequence_install = Some(SequenceInstall::new(
             0,
-            100,
+            400,
             Digest::default(),
             Vec::new(),
             Vec::new(),
@@ -4943,11 +5224,13 @@ mod tests {
             4096,
         ));
 
+        // Gap 400: above both. Sync runs and ordinary traffic is shed.
         core.refresh_sequence_large_gap_drop();
         assert!(core.sequence_sync_recovery_active);
         assert!(core.sequence_large_gap_drop.load(Ordering::Relaxed));
 
-        for view in 1..=60 {
+        // Gap 250: between the thresholds. Still syncing, no longer deaf.
+        for view in 1..=150 {
             core.sequence
                 .as_mut()
                 .unwrap()
@@ -4957,29 +5240,53 @@ mod tests {
         core.refresh_sequence_large_gap_drop();
         assert!(
             core.sequence_sync_recovery_active,
-            "the selected target remains sticky below the entry threshold"
+            "sync continues while the gap exceeds the sync threshold"
         );
         assert!(
             !core.sequence_large_gap_drop.load(Ordering::Relaxed),
-            "the last sub-threshold tail should park future messages while covered views are filtered by the staged target"
+            "below the shed threshold the node must stop dropping consensus traffic"
         );
 
-        for view in 61..=100 {
+        // Gap 50: below the sync threshold. State sync stops -- the tail can only be
+        // closed by ordinary participation, because a transfer always lands one cycle
+        // behind a moving fleet. An in-flight transfer is dropped; a staged install is
+        // deliberately left to drain.
+        core.sequence_transfer = Some(SequenceTransfer::new(
+            core.agb.sid().clone(),
+            9,
+            0,
+            core.sequence.as_ref().unwrap().head().clone(),
+            400,
+            Digest([0x33; 32]),
+            vec![crate::common::keys()[1].0],
+        ));
+        for view in 151..=350 {
             core.sequence
                 .as_mut()
                 .unwrap()
                 .record(view, &SequenceOutcome::Skip, &[])
                 .unwrap();
         }
-        core.sequence_install = None;
         core.refresh_sequence_large_gap_drop();
-        assert!(!core.sequence_sync_recovery_active);
+        assert!(
+            !core.sequence_sync_recovery_active,
+            "state sync must stop inside the sync threshold"
+        );
         assert!(!core.sequence_large_gap_drop.load(Ordering::Relaxed));
+        assert!(
+            core.sequence_transfer.is_none(),
+            "the in-flight transfer must be released to the tail"
+        );
+        assert!(
+            core.sequence_install.is_some(),
+            "a staged install still drains -- it applies already-verified state"
+        );
     }
 
     #[tokio::test]
     async fn newer_checkpoint_does_not_discard_active_or_staged_progress() {
         let mut core = test_core(0, "sticky_sequence_target");
+        core.sequence_sync_shed_gap_views = 50;
         let keys = crate::common::keys();
         let first_source = keys[1].0;
         let newer_head = Digest([0x22; 32]);

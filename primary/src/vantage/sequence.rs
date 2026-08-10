@@ -18,6 +18,7 @@ use crate::vantage::agb::{Manifest, Outcome};
 use crate::vantage::block;
 use crypto::{Digest, PublicKey};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Wire/format version of every object in this module. Bumped as a unit: a record's
@@ -1085,6 +1086,16 @@ pub struct SequenceTransfer {
     outcomes: BTreeMap<View, SequenceOutcome>,
     deltas: BTreeMap<View, Vec<Digest>>,
     delta_in_flight: BTreeMap<View, DeltaVerifier>,
+    /// Lowest view that can never again be reported missing -- it has a verified record AND
+    /// its body is present. Records are only added and the maps only grow, so this can only
+    /// advance, which is what lets the scan resume here instead of restarting at view 1.
+    ///
+    /// `advance_if_done` calls both scans on EVERY completed delta view, so restarting at 1
+    /// made verification bookkeeping O(gap^2) on the core loop: ~440 s of single-threaded
+    /// CPU at a 60-minute gap, on the node being rescued. `Cell` so `want(&self)` keeps its
+    /// signature.
+    outcome_scan_from: Cell<View>,
+    delta_scan_from: Cell<View>,
     state: TransferState,
 }
 
@@ -1122,6 +1133,8 @@ impl SequenceTransfer {
             outcomes: BTreeMap::new(),
             deltas: BTreeMap::new(),
             delta_in_flight: BTreeMap::new(),
+            outcome_scan_from: Cell::new(1),
+            delta_scan_from: Cell::new(1),
             state,
         }
     }
@@ -1218,15 +1231,38 @@ impl SequenceTransfer {
     }
 
     fn first_missing_outcome(&self) -> Option<View> {
-        (1..=self.target_view)
-            .filter(|v| self.chain.verified_record(*v).is_some())
-            .find(|v| !self.outcomes.contains_key(v))
+        self.first_missing(&self.outcome_scan_from, &self.outcomes)
     }
 
     fn first_missing_delta(&self) -> Option<View> {
-        (1..=self.target_view)
+        self.first_missing(&self.delta_scan_from, &self.deltas)
+    }
+
+    /// Lowest view with a verified record whose body `have` does not contain.
+    ///
+    /// The cursor advances only across the contiguous prefix of views that have BOTH a
+    /// verified record and a body -- such a view can never become missing again, so
+    /// skipping it is permanently safe. It deliberately does NOT advance past a view whose
+    /// record is still absent: that record may yet arrive and make the view missing.
+    /// Beyond the settled prefix this falls back to a forward scan, but from the cursor
+    /// rather than from view 1.
+    fn first_missing<T>(&self, cursor: &Cell<View>, have: &BTreeMap<View, T>) -> Option<View> {
+        loop {
+            let view = cursor.get();
+            if view > self.target_view {
+                break;
+            }
+            if self.chain.verified_record(view).is_none() {
+                break;
+            }
+            if !have.contains_key(&view) {
+                return Some(view);
+            }
+            cursor.set(view + 1);
+        }
+        (cursor.get()..=self.target_view)
             .filter(|v| self.chain.verified_record(*v).is_some())
-            .find(|v| !self.deltas.contains_key(v))
+            .find(|v| !have.contains_key(v))
     }
 
     /// A response only counts from a source still in the matching set, and only when its

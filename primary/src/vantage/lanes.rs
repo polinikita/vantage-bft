@@ -889,6 +889,9 @@ pub struct LaneManager {
     /// `DirectPub`. A missing parent/payload can make a descendant become valid later;
     /// this keeps retries to that monotone frontier instead of every cached block.
     pending_direct: BTreeSet<BlockRef>,
+    /// Rotating start offset for `refresh_author`'s bounded scan, so a bounded budget still
+    /// tests every pending ref over successive calls rather than starving the tail.
+    refresh_scan_offset: usize,
     /// Tuples already confirmed as `DirectPub`. Ordered by `(author, height, digest)` so
     /// N5's newest selection and GC can walk/prune by key rather than scanning all block
     /// cache entries.
@@ -979,6 +982,12 @@ pub struct LaneManager {
 /// 36-byte `[digest || worker_id]` payload keys, so it cannot collide with either.
 const OWN_FRONTIER_KEY: &[u8] = b"vantage/own_frontier";
 
+/// `direct_pub` walks toward genesis twice, and `refresh_author` runs on every publish, so
+/// the number of candidate refs re-tested per call must be bounded independently of how many
+/// are pending. 8 keeps a publish cheap while still draining a backlog within a few calls at
+/// the ~19 publishes/s a healthy node sustains.
+const REFRESH_WALK_BUDGET: usize = 8;
+
 /// `OWN_FRONTIER_KEY`'s value. Carries the sid so a store surviving a committee change
 /// cannot be mistaken for this session's lane.
 #[derive(Serialize, Deserialize)]
@@ -1033,6 +1042,7 @@ impl LaneManager {
             ack_availability: HashMap::new(),
             acked: HashSet::new(),
             pending_direct: BTreeSet::new(),
+            refresh_scan_offset: 0,
             direct_pub_refs: BTreeSet::new(),
             quorum_direct_refs: BTreeSet::new(),
             c_candidate: HashMap::new(),
@@ -1342,13 +1352,40 @@ impl LaneManager {
             .cloned()
             .collect();
         let mut registers_changed = false;
-        for r in refs {
-            if !self.acked.contains(&r) && self.direct_pub(&r) {
-                self.pending_direct.remove(&r);
-                self.on_direct_pub_confirmed(&r, &mut effects);
-                registers_changed = true;
+        // BOUNDED work per call, resuming where the last call stopped.
+        //
+        // `direct_pub` costs two walks toward genesis (`verified_prefix_through_genesis` and
+        // `direct_prefix_ok`), and this runs on every publish. A node that restarts has no
+        // cache entries for its OWN lane prefix -- the cache is memory-only -- so none of its
+        // blocks confirm until repair refills that prefix, `pending_direct` grows without
+        // bound, and testing all of it made this quadratic: measured on a recovering joiner,
+        // `header_seal` burned 478 ms of every second, 1,078x a healthy peer, worsening as
+        // the set grew.
+        //
+        // Do NOT "stop at the lowest blocked height" instead. Prefix failure is monotone in
+        // height on the canonical chain, but `pending_direct` can also hold refs from
+        // ABANDONED branches, which are permanently unconfirmable; one of those at a low
+        // height would then block every higher ref forever. Measured exactly that -- own
+        // blocks committed fell to zero. Rotation keeps the cost bounded while guaranteeing
+        // every ref is still tested.
+        let len = refs.len();
+        let start = if len > 0 {
+            self.refresh_scan_offset % len
+        } else {
+            0
+        };
+        let budget = REFRESH_WALK_BUDGET.min(len);
+        for i in 0..budget {
+            let r = &refs[(start + i) % len];
+            if self.acked.contains(r) || !self.direct_pub(r) {
+                continue;
             }
+            self.pending_direct.remove(r);
+            let r = r.clone();
+            self.on_direct_pub_confirmed(&r, &mut effects);
+            registers_changed = true;
         }
+        self.refresh_scan_offset = self.refresh_scan_offset.wrapping_add(budget);
         if registers_changed {
             self.refresh_registers(author);
         }

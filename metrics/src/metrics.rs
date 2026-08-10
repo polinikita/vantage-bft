@@ -335,6 +335,34 @@ pub struct Metrics {
     // `Protocol::Vantage` path, so they simply stay zero on the two Autobahn paths.
     /// Blocks this node published (self-authored, including our own).
     pub vantage_blocks_published: IntCounter,
+    /// Own blocks that reached COMMITTED output. Against `vantage_blocks_published` this is
+    /// the contribution ratio: a recovering node that publishes but whose blocks are never
+    /// committed is still, from the committee's point of view, a fault.
+    pub vantage_own_blocks_committed_total: IntCounter,
+    /// Own CONSENSUS proposals broadcast (round-robin proposer turns this node served).
+    pub vantage_own_proposals_made_total: IntCounter,
+    /// Views where this node was the round-robin proposer and the view reached a terminal
+    /// outcome locally -- the denominator for proposal success.
+    pub vantage_own_proposer_turns_total: IntCounter,
+    /// Of those turns, the ones that sealed with a real outcome rather than Skip: this
+    /// node's proposal was committed. A lagging validator misses its turns entirely, which
+    /// no data-block metric can reveal.
+    pub vantage_own_proposals_committed_total: IntCounter,
+    /// Committed blocks BY AUTHOR, as observed by this node.
+    ///
+    /// `vantage_own_blocks_committed_total` cannot answer "are a late joiner's proposals
+    /// being committed": it counts what the node locally observes, and a node that is behind
+    /// has not yet reached the views where its own blocks were committed, so it reads zero
+    /// whether or not they were. Reading this on a CAUGHT-UP PEER answers the question.
+    /// One series per committee member.
+    pub vantage_committed_by_author: IntCounterVec,
+    /// 1 once this node has recovered and state sync has latched off. A node stuck at 0
+    /// while running transfers indefinitely is in permanent recovery.
+    pub vantage_sequence_sync_recovered: IntGauge,
+    /// Payload entries in own committed blocks. Block COUNT understates contribution under
+    /// recovery load, because a busy core loop seals fewer but larger headers at an
+    /// unchanged client submission rate.
+    pub vantage_own_payload_committed_total: IntCounter,
     /// Blocks this node received (direct publish or relayed) and cached.
     pub vantage_blocks_received: IntCounter,
     /// N3 ack CONFIRMATIONS this node produced -- incremented in `LaneManager::
@@ -1281,6 +1309,49 @@ impl Metrics {
             vantage_blocks_published: register_int_counter_with_registry!(
                 "vantage_blocks_published",
                 "Vantage blocks this node published",
+                registry,
+            )
+            .unwrap(),
+            vantage_own_blocks_committed_total: register_int_counter_with_registry!(
+                "vantage_own_blocks_committed_total",
+                "Blocks authored by this node that reached committed output",
+                registry,
+            )
+            .unwrap(),
+            vantage_own_proposals_made_total: register_int_counter_with_registry!(
+                "vantage_own_proposals_made_total",
+                "Own consensus proposals broadcast",
+                registry,
+            )
+            .unwrap(),
+            vantage_own_proposer_turns_total: register_int_counter_with_registry!(
+                "vantage_own_proposer_turns_total",
+                "Views where this node was proposer and the view reached a terminal outcome",
+                registry,
+            )
+            .unwrap(),
+            vantage_own_proposals_committed_total: register_int_counter_with_registry!(
+                "vantage_own_proposals_committed_total",
+                "Own proposer turns that sealed with a committed outcome rather than Skip",
+                registry,
+            )
+            .unwrap(),
+            vantage_committed_by_author: register_int_counter_vec_with_registry!(
+                "vantage_committed_by_author",
+                "Committed blocks by authoring node, as observed by this node",
+                &["author"],
+                registry,
+            )
+            .unwrap(),
+            vantage_sequence_sync_recovered: register_int_gauge_with_registry!(
+                "vantage_sequence_sync_recovered",
+                "1 once state sync has latched off after recovery",
+                registry,
+            )
+            .unwrap(),
+            vantage_own_payload_committed_total: register_int_counter_with_registry!(
+                "vantage_own_payload_committed_total",
+                "Payload entries in blocks authored by this node that reached committed output",
                 registry,
             )
             .unwrap(),

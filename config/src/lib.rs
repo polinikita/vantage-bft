@@ -394,11 +394,28 @@ pub struct Parameters {
     #[serde(default = "default_sequence_sync_chunk_digests")]
     pub sequence_sync_chunk_digests: usize,
 
-    /// Start state sync only when a certified checkpoint is at least this many terminal
-    /// views beyond the local sequence cursor. Smaller gaps use normal dissemination and
-    /// parked-message recovery. 50 views is roughly 3--5 seconds in the n=100 runs.
+    /// SYNC threshold: run state sync only while a certified checkpoint is at least this
+    /// many terminal views beyond the local sequence cursor. Below it the transfer is
+    /// stopped and the tail is closed by normal dissemination and parked-message recovery
+    /// -- not an optimization but a necessity, since sync always lands one cycle behind a
+    /// moving fleet. A staged install is still allowed to drain.
     #[serde(default = "default_sequence_sync_min_gap_views")]
     pub sequence_sync_min_gap_views: u64,
+
+    /// SHED threshold: above this gap, ordinary consensus/control traffic is dropped
+    /// before it can occupy the core queue. Independent of the sync threshold on purpose
+    /// -- see `default_sequence_sync_shed_gap_views`. Between the two the node both
+    /// participates and syncs; below the sync threshold it only participates.
+    #[serde(default = "default_sequence_sync_shed_gap_views")]
+    pub sequence_sync_shed_gap_views: u64,
+
+    /// Gap at which a RECOVERED node re-arms state sync. State sync is a one-shot bulk
+    /// operation: once recovered, a node must rejoin ordinary consensus and stay there, so
+    /// only a gap large enough to be an actual outage may restart it. Without this latch the
+    /// sync gate is re-evaluated against every newly certified boundary and a recovered
+    /// joiner syncs forever, never reaching peer parity.
+    #[serde(default = "default_sequence_sync_rearm_gap_views")]
+    pub sequence_sync_rearm_gap_views: u64,
 
     /// Matching announcers queried concurrently for one outstanding chunk. Up to `f` of
     /// the `f+1` may withhold every response, so SERIAL failover would multiply
@@ -867,8 +884,27 @@ fn default_sequence_sync_chunk_digests() -> usize {
     1_024
 }
 
+/// Sync threshold. Below this the tail is closed by ordinary participation, because state
+/// sync structurally cannot close it: each transfer targets a checkpoint that was current
+/// when it started, so a node chasing a moving fleet settles at
+/// `cycle_duration * view_rate` behind it no matter how fast the transfer runs.
 fn default_sequence_sync_min_gap_views() -> u64 {
-    50
+    100
+}
+
+/// Shed threshold. Deliberately 3x the sync threshold: shedding is back-pressure and
+/// syncing is mechanism selection, and one number driving both is what made a recovering
+/// node oscillate (measured lag cycling 31-66 at a single gate of 50). Between the two,
+/// the node participates AND syncs.
+fn default_sequence_sync_shed_gap_views() -> u64 {
+    100
+}
+
+/// 800 views is ~60 s behind at the measured 13 views/s. Must sit well above the transient
+/// spikes a recovering node shows while an install applies and `pump` parks -- measured up to
+/// 288 views -- or a single sampled stall re-arms sync and recovery never latches.
+fn default_sequence_sync_rearm_gap_views() -> u64 {
+    800
 }
 
 /// `f+1` at the smallest committee this targets.
@@ -1242,6 +1278,8 @@ impl Default for Parameters {
             sequence_sync_chunk_outcome_items: default_sequence_sync_chunk_outcome_items(),
             sequence_sync_chunk_digests: default_sequence_sync_chunk_digests(),
             sequence_sync_min_gap_views: default_sequence_sync_min_gap_views(),
+            sequence_sync_shed_gap_views: default_sequence_sync_shed_gap_views(),
+            sequence_sync_rearm_gap_views: default_sequence_sync_rearm_gap_views(),
             sequence_sync_max_sources: default_sequence_sync_max_sources(),
             sequence_sync_request_timeout_ms: default_sequence_sync_request_timeout_ms(),
             sequence_sync_inbound_capacity: default_sequence_sync_inbound_capacity(),
