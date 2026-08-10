@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
-"""Decide SEQUENCE-CHECKPOINT-SYNC-PLAN.md's Phase A gate: do all correct nodes derive
-the same sequence head?
+"""Check that correct nodes expose the same sequence head at each boundary.
 
-Phase A's whole claim is that correct parties which terminally processed through view `v`
-derive the IDENTICAL `H_v`. That is the precondition for announcing anything: with `f+1`
-matching first-hand announcements a recovering party adopts a head as certified, so a
-head produced by divergent code would let honest parties certify a target no correct
-party can serve.
-
-The check compares FULL hex heads, per boundary, across nodes. It deliberately does not
-use `vantage_sequence_boundary_view` -- two nodes that diverge are at identical heights by
-construction, so heights can never reveal it. It also does not use
-`vantage_sequence_boundary_head_lo`, which is 8 of 32 bytes and exists only so a dashboard
-can draw a line.
+The check compares full hexadecimal heads across nodes.
 
     python3 docker-bench/sequence_check.py [--prom http://localhost:9095] [--window 3600]
 
-Exit status is the gate: 0 = every boundary observed by 2+ nodes had one head, 1 = a
-divergence (or nothing to check, which is not a pass).
+Exit status is zero when all shared boundaries agree.
 """
 
 import argparse
@@ -44,7 +32,7 @@ def query_range(prom, expr, start, end, step):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prom", default="http://localhost:9095")
-    ap.add_argument("--window", type=int, default=3600, help="seconds of history to scan")
+    ap.add_argument("--window", type=int, default=3600, help="Seconds to scan")
     ap.add_argument("--step", default="10s")
     a = ap.parse_args()
 

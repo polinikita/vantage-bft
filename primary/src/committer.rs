@@ -61,8 +61,7 @@ pub struct Committer {
     tx_output: Sender<Header>,
     synchronizer: Synchronizer,
     genesis: Vec<Certificate>,
-    /// Our own local workers' `primary_to_worker` addresses, keyed by id (benchmark-only:
-    /// used to notify a worker of the batches it just saw committed, PHASE2-SPEC.md #5).
+    /// Local worker `primary_to_worker` addresses, keyed by worker ID.
     #[cfg(feature = "benchmark")]
     worker_addresses: HashMap<WorkerId, SocketAddr>,
     #[cfg(feature = "benchmark")]
@@ -70,11 +69,7 @@ pub struct Committer {
 }
 
 impl Committer {
-    // clippy::too_many_arguments: this is a `::spawn` constructor for an audited,
-    // long-lived task -- every parameter is a distinct wired channel/dependency with
-    // no natural sub-grouping; bundling them into a params struct would only move the
-    // same argument list one level of indirection away and churn every call site
-    // (same call as `Core::spawn`/`VantageCore::spawn`'s existing allows).
+    // Each argument is a separate channel or task dependency.
     #[allow(clippy::too_many_arguments)]
     // `name`/`metrics` are only read under `#[cfg(feature = "benchmark")]` below
     // (worker-notification wiring), so they're unused on the default build;
@@ -93,7 +88,7 @@ impl Committer {
         rx_commit_message: Receiver<ConsensusMessage>,
         tx_output: Sender<Header>,
         synchronizer: Synchronizer,
-        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
@@ -102,9 +97,6 @@ impl Committer {
 
         let genesis = Certificate::genesis(&committee);
 
-        //special blocks from round >1 can also have genesis as parent!!! ==> Solution: Write genesis to store
-        //Alternatively, just store genesis digests and compare against
-        //let genesis_digests = genesis.clone().iter().map(|x| x.digest()).collect();
 
         #[cfg(feature = "benchmark")]
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
@@ -197,8 +189,7 @@ impl Committer {
                                     info!("Committed {} -> {:?}", header, digest);
                                 }
 
-                                // Commit instant (PHASE2-SPEC.md #5, amended): taken
-                                // once per header, right at the "Committed" log site,
+                                // Take the commit instant once per header at this log site,
                                 // and carried in the notification itself so the
                                 // worker's latency measurement is submission -> this
                                 // exact instant -- not submission -> whenever the
@@ -212,7 +203,7 @@ impl Committer {
                                 // Notify our own local worker(s), grouped by
                                 // WorkerId, of the batches just committed so they
                                 // can extract real transaction latency
-                                // (PHASE2-SPEC.md #5). Routed to *our* worker with
+                                // Route the notification to our worker with
                                 // the same id as the header author's -- batches are
                                 // gossiped worker-to-worker by matching id, so our
                                 // local worker likely holds a replica even for a

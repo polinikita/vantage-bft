@@ -12,9 +12,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep in lockstep with rust-toolchain.toml and the Dockerfile's builder
-  # image pin (rust:<RUST_VERSION>-bookworm) -- three independent places that
-  # must agree on the exact compiler version.
+  # Match rust-toolchain.toml and the Docker builder image.
   RUST_VERSION: "1.95.0"
 
 jobs:

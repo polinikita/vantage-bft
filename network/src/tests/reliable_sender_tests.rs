@@ -70,19 +70,13 @@ async fn retry() {
     assert!(handle.await.is_ok());
 }
 
-/// Adversarial-audit regression (FIX 1a): a message queued while the very first
-/// TCP connect is still failing (the `run()` reconnect-waiter loop, BEFORE any
-/// `Connection`-owned `Coalescer` exists) must still reach the wire bundle-framed
-/// when batching is on -- otherwise the peer's `decode_bundle` either silently
-/// mis-parses it (dropped message, sender still believes it was delivered) or
-/// drops the connection on a truncated frame (permanent retransmit stall).
+/// A message queued before the first connection uses bundle framing.
 #[tokio::test]
 async fn retry_with_batching_bundle_frames_the_reconnect_path_message() {
     let address = "127.0.0.1:5301".parse::<SocketAddr>().unwrap();
     let message = "Hello, world!";
 
-    // No listener running yet -- this send is queued via the reconnect-waiter loop
-    // (FIX 1a's exact code path), not the connected coalescer.
+    // Queue the message before a listener exists.
     let mut sender = ReliableSender::new().with_batching(BatchConfig {
         enabled: true,
         max_bytes: 65_536,
@@ -90,8 +84,7 @@ async fn retry_with_batching_bundle_frames_the_reconnect_path_message() {
     });
     let cancel_handler = sender.send(address, Bytes::from(message)).await;
 
-    // Bring the peer up; it expects the PROPERLY bundle-framed message (one
-    // sub-message), not the raw bytes.
+    // The peer expects a singleton bundle frame.
     sleep(Duration::from_millis(50)).await;
     let expected_frame = encode_bundle(&[Bytes::from(message)]);
     let handle = tokio::spawn(async move {
@@ -111,23 +104,14 @@ async fn retry_with_batching_bundle_frames_the_reconnect_path_message() {
     assert!(handle.await.is_ok());
 }
 
-/// Adversarial-audit regression (FIX 1b): a message still sitting UNFLUSHED in the
-/// connected `Coalescer` when the peer disappears mid-flight must be re-encoded as a
-/// bundle before it's requeued -- requeuing it raw would let a non-bundle-framed
-/// entry into `Connection::buffer` while batching is on, breaking the same
-/// "every buffered entry is bundle-framed" invariant FIX 1a restores for the
-/// reconnect-waiter path.
+/// An unflushed message is re-encoded before retry after a connection loss.
 #[tokio::test]
 async fn reconnect_after_mid_coalesce_peer_drop_preserves_bundle_framing() {
     let address = "127.0.0.1:5302".parse::<SocketAddr>().unwrap();
     let message = "Hello, world!";
     let expected_frame = encode_bundle(&[Bytes::from(message)]);
 
-    // A flaky peer: accepts once, waits long enough for the message to actually
-    // reach the connected `Coalescer` (well within its 2s flush window), then drops
-    // the connection without ever acking -- forcing `keep_alive_immediate` down its
-    // error path with the message still unflushed. It then accepts a SECOND time
-    // (the sender's reconnect) and expects the bundle-framed message there.
+    // Drop the first session before the coalescer flushes, then accept the retry.
     let handle = tokio::spawn(async move {
         let listener = TcpListener::bind(&address).await.unwrap();
         let (first, _) = listener.accept().await.unwrap();
@@ -145,8 +129,7 @@ async fn reconnect_after_mid_coalesce_peer_drop_preserves_bundle_framing() {
         }
     });
 
-    // A long flush delay so the message is still sitting in the coalescer (never
-    // auto-flushed) when the peer drops the first connection.
+    // Keep the message in the coalescer until the first session ends.
     let mut sender = ReliableSender::new().with_batching(BatchConfig {
         enabled: true,
         max_bytes: 65_536,
@@ -158,24 +141,13 @@ async fn reconnect_after_mid_coalesce_peer_drop_preserves_bundle_framing() {
     assert!(handle.await.is_ok());
 }
 
-/// reconnect-replay plan §14 A1 (MAJOR, adversarial audit-3): a volatile send has NO
-/// cancel handler at all (`ReplyTargets` empty). Before the fix, `all_closed` on an
-/// empty vec was vacuously `true`, so a handler-less entry reaching the pre-send skip
-/// (`keep_alive_immediate`'s main loop, the check right before `writer.send`) would
-/// have been silently discarded before it was ever transmitted. Exercised on a LIVE
-/// session (connect already up): the entry is queued, buffered by `on_arrival`, and
-/// must still reach the wire on the very next pop -- this is the site's only
-/// currently-reachable path post the waiter-arm fix below (a volatile arrival while
-/// disconnected is now dropped at the WAITER, never buffered at all -- see
-/// `volatile_arrival_while_disconnected_is_dropped_and_key_min_merged`), so this test
-/// no longer doubles as a waiter-path regression the way an earlier version of it did.
+/// A volatile entry with no reply target is still transmitted on a live session.
 #[tokio::test]
 async fn handler_less_volatile_entry_survives_pre_send_skip_on_a_live_session() {
     let address = "127.0.0.1:5303".parse::<SocketAddr>().unwrap();
     let handle = listener(address, "volatile".to_string());
 
-    // Listener already up -- this send reaches the wire over a live session, never
-    // touching the reconnect-waiter arm at all.
+    // Send over an established session.
     let mut sender = ReliableSender::new();
     sender
         .send_volatile(address, Bytes::from("volatile"), 42)
@@ -184,23 +156,14 @@ async fn handler_less_volatile_entry_survives_pre_send_skip_on_a_live_session() 
     assert!(handle.await.is_ok());
 }
 
-/// reconnect-replay plan §7 (the "reconnect-waiter drain" discard path, `run`'s
-/// `'waiter` loop) / audit-3 V-b ("mpsc-limbo items are either waiter-counted or
-/// next-session-delivered", blessing waiter-COUNTED here): a volatile arrival while
-/// the link is down is dropped immediately -- min-merged into the drop map, NEVER
-/// buffered -- so it cannot ride out an outage as part of an unpaced flush burst at
-/// the next reconnect. This is the fix for the exact defect the design's §2.2/§12
-/// A/B criterion (paced replay, no flush spike) depends on: buffering it instead (as
-/// an earlier version of this arm did) would have delivered the whole outage backlog
-/// of one-shots as a single unpaced transport flush on reconnect, resurrecting
-/// exactly the burst the outbox+replay mechanism exists to eliminate.
+/// Volatile messages queued while disconnected are dropped and their lowest key is
+/// recorded.
 #[tokio::test]
 async fn volatile_arrival_while_disconnected_is_dropped_and_key_min_merged() {
     let address = "127.0.0.1:5308".parse::<SocketAddr>().unwrap();
     let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
-    // No listener at all yet -- every send below is queued via the reconnect-waiter
-    // loop, never a live session.
+    // Queue messages while disconnected.
     let mut sender = ReliableSender::new().with_drop_map(drop_map.clone());
     sender
         .send_volatile(address, Bytes::from("dropped-1"), 55)
@@ -208,7 +171,7 @@ async fn volatile_arrival_while_disconnected_is_dropped_and_key_min_merged() {
     sender
         .send_volatile(address, Bytes::from("dropped-2"), 60)
         .await;
-    // Give the waiter arm time to actually drain and drop both arrivals.
+    // Allow the disconnected path to process both messages.
     sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -217,9 +180,7 @@ async fn volatile_arrival_while_disconnected_is_dropped_and_key_min_merged() {
         "both volatile arrivals must be dropped and min-merged (55, the smaller key)"
     );
 
-    // Bring a listener up (well within the sender's own capped 2s retry backoff)
-    // and confirm nothing arrives -- neither dropped message was ever buffered to
-    // resurrect on this later reconnect.
+    // A later connection must receive neither dropped message.
     let listener = TcpListener::bind(&address).await.unwrap();
     let (socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
         .await
@@ -233,9 +194,7 @@ async fn volatile_arrival_while_disconnected_is_dropped_and_key_min_merged() {
     );
 }
 
-/// reconnect-replay plan §14 A1: same regression, exercised against the delayed-path
-/// pop skip (`keep_alive_delayed`'s `due` arm, gated on `with_latency`) rather than
-/// the immediate path's pre-send skip.
+/// A volatile entry is also transmitted on the delayed path.
 #[tokio::test]
 async fn handler_less_volatile_entry_survives_delayed_pop_skip() {
     let address = "127.0.0.1:5304".parse::<SocketAddr>().unwrap();
@@ -251,22 +210,18 @@ async fn handler_less_volatile_entry_survives_delayed_pop_skip() {
     assert!(handle.await.is_ok());
 }
 
-/// reconnect-replay plan §2.3/§7: the `pending_replies` requeue tail discards a
-/// volatile entry (never requeues it) and reports its key as the min dropped key for
-/// this destination -- the exact accounting path the server-floored replay
-/// mechanism's `pending_low` depends on.
+/// A volatile entry awaiting acknowledgement is accounted when its session ends.
 #[tokio::test]
 async fn volatile_entry_dropped_at_session_death_is_reported_via_drop_map() {
     let address = "127.0.0.1:5305".parse::<SocketAddr>().unwrap();
     let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
-    // A peer that accepts, lets the message actually get WRITTEN (moving it into
-    // `pending_replies`), then drops the connection without ever acking.
+    // Accept one frame, then close without acknowledging it.
     let handle = tokio::spawn(async move {
         let listener = TcpListener::bind(&address).await.unwrap();
         let (socket, _) = listener.accept().await.unwrap();
         let (_writer, mut reader) = Framed::new(socket, LengthDelimitedCodec::new()).split();
-        // Read exactly one frame (the volatile send), then drop -- never ack.
+        // Read the frame and close without an acknowledgement.
         let _ = reader.next().await;
     });
 
@@ -276,18 +231,14 @@ async fn volatile_entry_dropped_at_session_death_is_reported_via_drop_map() {
         .await;
     assert!(handle.await.is_ok());
 
-    // Give `keep_alive_immediate`'s `FailedToReceiveAck` error path a moment to run
-    // its session-death tail after the peer vanishes.
+    // Allow the session cleanup to record the key.
     sleep(Duration::from_millis(200)).await;
 
     let map = drop_map.lock();
     assert_eq!(map.get(&address), Some(&99));
 }
 
-/// reconnect-replay plan §2.3/§7: a volatile message still sitting UNFLUSHED in the
-/// volatile coalescer when the peer disappears mid-flight is also discarded and
-/// accounted (mirrors `reconnect_after_mid_coalesce_peer_drop_preserves_bundle_
-/// framing`'s durable analog, but for the drop-map path instead of a requeue).
+/// An unflushed volatile message is accounted when its session ends.
 #[tokio::test]
 async fn volatile_entry_dropped_mid_coalesce_is_reported_via_drop_map() {
     let address = "127.0.0.1:5306".parse::<SocketAddr>().unwrap();
@@ -296,8 +247,7 @@ async fn volatile_entry_dropped_mid_coalesce_is_reported_via_drop_map() {
     let handle = tokio::spawn(async move {
         let listener = TcpListener::bind(&address).await.unwrap();
         let (first, _) = listener.accept().await.unwrap();
-        // Long enough for the volatile send to land in the connected coalescer
-        // (well within its 2s flush window) before the peer disappears.
+        // End the session before the coalescer flushes.
         sleep(Duration::from_millis(100)).await;
         drop(first);
     });
@@ -320,33 +270,31 @@ async fn volatile_entry_dropped_mid_coalesce_is_reported_via_drop_map() {
     assert_eq!(map.get(&address), Some(&13));
 }
 
-/// reconnect-replay plan §2.1/§7: the reconnect-event channel fires on
-/// re-establishment AFTER a failure, never on the connection's first-ever clean
-/// connect.
+/// Recovery notifications fire after failure, not on the first connection.
 #[tokio::test]
 async fn reconnect_event_fires_only_after_a_failure() {
     let address = "127.0.0.1:5307".parse::<SocketAddr>().unwrap();
     let (tx, mut rx) = mpsc::channel(8);
 
-    // First listener is already up -- the very FIRST connect succeeds cleanly.
+    // The first connection succeeds without a prior failure.
     let first_listener = TcpListener::bind(&address).await.unwrap();
     let mut sender = ReliableSender::new().with_reconnect_events(tx);
     let _cancel = sender.send(address, Bytes::from("hello")).await;
     let (first_socket, _) = first_listener.accept().await.unwrap();
 
-    // No event for the first-ever connect.
+    // No recovery event is sent for the first connection.
     let none_yet = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
     assert!(
         none_yet.is_err(),
         "the very first clean connect must not fire a reconnect event"
     );
 
-    // Kill the session -- the connection will retry and eventually re-establish.
+    // Force a reconnect.
     drop(first_socket);
     drop(first_listener);
     sleep(Duration::from_millis(100)).await;
     let second_listener = TcpListener::bind(&address).await.unwrap();
-    // Keep the sender alive (and retrying) while we wait for the reconnection.
+    // Keep the sender alive while it reconnects.
     let _cancel2 = sender.send(address, Bytes::from("again")).await;
 
     let event = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
@@ -357,19 +305,13 @@ async fn reconnect_event_fires_only_after_a_failure() {
     drop(second_listener);
 }
 
-/// reconnect-replay plan §7: today's (pre-existing, unchanged) behavior pinned
-/// against the reconnect-waiter arm's own class split -- a DURABLE arrival while
-/// disconnected is buffered (never dropped) and delivered once the connection
-/// re-establishes, exactly as `retry` already covers via the untyped `send` API;
-/// this pins it explicitly against the class-aware waiter arm this change
-/// introduces, so a future edit that accidentally routes durable arrivals through
-/// the volatile (drop) branch fails here first.
+/// Durable messages queued while disconnected are delivered after reconnect.
 #[tokio::test]
 async fn durable_arrival_while_disconnected_is_buffered_and_delivered_on_reconnect() {
     let address = "127.0.0.1:5309".parse::<SocketAddr>().unwrap();
     let message = "durable while disconnected";
 
-    // No listener yet -- queued via the reconnect-waiter loop.
+    // Queue a durable message while disconnected.
     let mut sender = ReliableSender::new();
     let cancel_handler = sender.send(address, Bytes::from(message)).await;
 
@@ -380,18 +322,15 @@ async fn durable_arrival_while_disconnected_is_buffered_and_delivered_on_reconne
     assert!(handle.await.is_ok());
 }
 
-/// reconnect-replay plan §7/§14 A1: interleaved durable and volatile arrivals while
-/// disconnected -- only the durable one survives to be buffered and delivered; the
-/// volatile one is dropped and its key min-merged into the drop map, never
-/// resurrected alongside the durable arrival on the later reconnect.
+/// When queued together while disconnected, durable messages survive and volatile
+/// messages are dropped.
 #[tokio::test]
 async fn interleaved_arrivals_while_disconnected_only_durable_survives() {
     let address = "127.0.0.1:5310".parse::<SocketAddr>().unwrap();
     let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let message = "durable-survivor";
 
-    // No listener yet -- both sends are queued via the reconnect-waiter loop, in
-    // this order: volatile, then durable.
+    // Queue volatile then durable messages while disconnected.
     let mut sender = ReliableSender::new().with_drop_map(drop_map.clone());
     sender
         .send_volatile(address, Bytes::from("volatile-casualty"), 77)
@@ -406,8 +345,7 @@ async fn interleaved_arrivals_while_disconnected_only_durable_survives() {
          connection ever succeeds"
     );
 
-    // The durable arrival must still be delivered once a listener comes up -- and
-    // it must be the ONLY frame the listener ever sees.
+    // The listener must receive only the durable frame.
     let handle = tokio::spawn(async move {
         let listener = TcpListener::bind(&address).await.unwrap();
         let (socket, _) = listener.accept().await.unwrap();
@@ -419,7 +357,7 @@ async fn interleaved_arrivals_while_disconnected_only_durable_survives() {
             }
             _ => panic!("the durable survivor never reached the wire"),
         }
-        // Confirm the volatile casualty never follows it as a second frame.
+        // Confirm that no second frame arrives.
         let second = tokio::time::timeout(Duration::from_millis(300), reader.next()).await;
         assert!(
             second.is_err(),
@@ -431,17 +369,9 @@ async fn interleaved_arrivals_while_disconnected_only_durable_survives() {
     assert!(handle.await.is_ok());
 }
 
-// --- Adversarial-audit FINDING 2 (BLOCKER): `SendClass::DurableDetached` /
-// `send_detached`/`send_detached_typed`. The suite above never caught the
-// underlying bug (every existing durable-send test holds its `CancelHandler` for
-// the test's own duration, which is exactly what made `all_closed` see it as
-// still-open) -- these tests specifically exercise the shape that DID break:
-// nothing at all retaining a handler between the send call and the frame
-// actually reaching the wire.
+// Detached durable sends have no reply target and must still be transmitted and retried.
 
-/// (a): `send_detached` never allocates a `CancelHandler` in the first place --
-/// unlike `send`, there is nothing for the caller to (accidentally) drop early.
-/// A frame sent this way must still reach the wire.
+/// A detached durable frame reaches the wire without a cancellation handler.
 #[tokio::test]
 async fn send_detached_has_no_handler_to_drop_and_still_transmits() {
     let address = "127.0.0.1:5311".parse::<SocketAddr>().unwrap();
@@ -454,11 +384,7 @@ async fn send_detached_has_no_handler_to_drop_and_still_transmits() {
     assert!(handle.await.is_ok());
 }
 
-/// (b): end-to-end, a `Done`-shaped frame sent via `send_detached_typed` -- the
-/// exact call `run_resume_sender` makes -- is received even after the sender-side
-/// call's own scope has fully ended. With `send`/`send_typed`, the returned
-/// `CancelHandler` would drop at the closing brace below; `send_detached_typed`
-/// never creates one, so there is nothing whose lifetime could matter.
+/// A typed detached durable frame survives the sending call's scope.
 #[tokio::test]
 async fn send_detached_typed_done_frame_survives_past_the_send_call_scope() {
     let address = "127.0.0.1:5312".parse::<SocketAddr>().unwrap();
@@ -470,7 +396,6 @@ async fn send_detached_typed_done_frame_survives_past_the_send_call_scope() {
         sender
             .send_detached_typed(address, Bytes::from(message), "VantageReplayDone")
             .await;
-        // The send call's own scope ends here.
     }
 
     assert!(
@@ -479,10 +404,7 @@ async fn send_detached_typed_done_frame_survives_past_the_send_call_scope() {
     );
 }
 
-/// (c) (mirrors the A1 regression `handler_less_volatile_entry_survives_pre_
-/// send_skip_on_a_live_session`): a detached-durable entry queued on a LIVE
-/// session survives the pre-send skip -- `all_closed` on its empty, never-
-/// populated `ReplyTargets` is always `false`, exactly like a volatile entry's.
+/// A detached durable entry survives the pre-send cancellation check.
 #[tokio::test]
 async fn detached_entry_survives_pre_send_skip_on_a_live_session() {
     let address = "127.0.0.1:5313".parse::<SocketAddr>().unwrap();
@@ -495,17 +417,13 @@ async fn detached_entry_survives_pre_send_skip_on_a_live_session() {
     assert!(handle.await.is_ok());
 }
 
-/// (c) (mirrors the A1 regression for the reconnect-waiter arm,
-/// `durable_arrival_while_disconnected_is_buffered_and_delivered_on_reconnect`):
-/// a detached-durable entry queued while DISCONNECTED survives the waiter's own
-/// retain sweep and is delivered once the connection re-establishes -- like an
-/// ordinary durable entry, never discarded like a volatile one.
+/// A detached durable entry queued while disconnected is delivered after reconnect.
 #[tokio::test]
 async fn detached_entry_survives_the_waiter_and_is_delivered_on_reconnect() {
     let address = "127.0.0.1:5314".parse::<SocketAddr>().unwrap();
     let message = "detached-waiter";
 
-    // No listener yet -- queued via the reconnect-waiter loop.
+    // Queue the message while disconnected.
     let mut sender = ReliableSender::new();
     sender.send_detached(address, Bytes::from(message)).await;
 
@@ -515,22 +433,9 @@ async fn detached_entry_survives_the_waiter_and_is_delivered_on_reconnect() {
     assert!(handle.await.is_ok());
 }
 
-// --- KNOB 2 (measurement ablation, `config::Parameters::retry_backoff_max_ms`).
-//
-// The reconnect-waiter's exponential backoff caps out after several real
-// reconnect attempts (200ms doubling to the ceiling) -- exercising that end-to-end
-// would need either real wall-clock waits (flaky, and this crate's own tests
-// elsewhere deliberately avoid that class of test) or paused-virtual-time
-// machinery this codebase doesn't otherwise use. Pinning the plumbed field
-// directly is the appropriate level of test here instead: it proves
-// `with_retry_backoff_max_ms` is honored on the sender (overriding the documented
-// default), which is the one thing `spawn_connection` forwards, unmodified, into
-// every `Connection` it spawns (`Connection::run`'s own `delay = min(2*delay,
-// self.retry_backoff_max_ms)` is the sole consumer).
+// Verify the configurable reconnect backoff limit.
 
-/// `ReliableSender::new()` defaults to `DEFAULT_RETRY_BACKOFF_MAX_MS` (2000ms,
-/// reproducing the cap this field replaced exactly), and `with_retry_backoff_max_ms`
-/// overrides it.
+/// The default backoff limit can be overridden.
 #[test]
 fn with_retry_backoff_max_ms_overrides_the_default() {
     let default_sender = ReliableSender::new();
@@ -544,10 +449,7 @@ fn with_retry_backoff_max_ms_overrides_the_default() {
     assert_eq!(overridden.retry_backoff_max_ms, 250);
 }
 
-/// (d): a detached-durable entry still awaiting an ack when the session dies is
-/// requeued (never discarded, unlike a volatile entry) -- the SAME `key = None`
-/// session-death treatment an ordinary durable entry gets -- and delivered once
-/// the connection re-establishes, unmodified.
+/// A detached durable entry awaiting acknowledgement is requeued after session loss.
 #[tokio::test]
 async fn detached_entry_is_requeued_across_a_session_death_like_any_durable_entry() {
     let address = "127.0.0.1:5315".parse::<SocketAddr>().unwrap();
@@ -557,9 +459,7 @@ async fn detached_entry_is_requeued_across_a_session_death_like_any_durable_entr
     let handle = tokio::spawn(async move {
         let listener = TcpListener::bind(&address).await.unwrap();
         let (first, _) = listener.accept().await.unwrap();
-        // Long enough for the detached send to actually reach the wire (moving
-        // it into `pending_replies`, awaiting an ack that never comes) before
-        // the peer disappears.
+        // Let the frame reach the peer before closing the session.
         sleep(Duration::from_millis(100)).await;
         drop(first);
 
@@ -580,11 +480,7 @@ async fn detached_entry_is_requeued_across_a_session_death_like_any_durable_entr
     assert!(handle.await.is_ok());
 }
 
-/// n=100 straggler fix (2026-08-08): a volatile send against a destination whose
-/// queue depth has reached `volatile_soft_cap` is shed -- min-merged into the drop
-/// map under the destination's address, exactly like a session-death discard --
-/// instead of enqueued or blocked on. The connection channel is injected directly
-/// (no `Connection` task ever drains it), so the observed depth is exact.
+/// A full volatile queue records the lowest shed key instead of blocking.
 #[tokio::test]
 async fn volatile_soft_cap_sheds_into_the_drop_map_instead_of_blocking() {
     let address = "127.0.0.1:5320".parse::<SocketAddr>().unwrap();
@@ -595,26 +491,23 @@ async fn volatile_soft_cap_sheds_into_the_drop_map_instead_of_blocking() {
     let (tx, _rx) = mpsc::channel(100);
     sender.connections.insert(address, tx);
 
-    // Depths 0 and 1 are below the cap: both enqueue, nothing is recorded.
+    // Messages below the cap are queued.
     sender.send_volatile(address, Bytes::from("a"), 9).await;
     sender.send_volatile(address, Bytes::from("b"), 8).await;
     assert!(drop_map.lock().is_empty());
 
-    // Depth 2 has reached the cap: shed, key recorded.
+    // At the cap, the message is shed and recorded.
     sender.send_volatile(address, Bytes::from("c"), 7).await;
     assert_eq!(drop_map.lock().get(&address), Some(&7));
 
-    // A lower key min-merges; a higher one leaves the recorded floor alone --
-    // `Connection::report_dropped`'s exact convention.
+    // Keys are recorded as a minimum.
     sender.send_volatile(address, Bytes::from("d"), 3).await;
     assert_eq!(drop_map.lock().get(&address), Some(&3));
     sender.send_volatile(address, Bytes::from("e"), 5).await;
     assert_eq!(drop_map.lock().get(&address), Some(&3));
 }
 
-/// A shed with no drop map attached is silently unaccounted (never a panic, never
-/// an enqueue) -- mirroring `report_dropped`'s own contract for a misconfigured
-/// pool.
+/// A shed without a drop map is not queued or recorded.
 #[tokio::test]
 async fn volatile_soft_cap_without_a_drop_map_sheds_silently() {
     let address = "127.0.0.1:5321".parse::<SocketAddr>().unwrap();
@@ -625,13 +518,12 @@ async fn volatile_soft_cap_without_a_drop_map_sheds_silently() {
     sender.send_volatile(address, Bytes::from("kept"), 1).await;
     sender.send_volatile(address, Bytes::from("shed"), 2).await;
 
-    // Exactly the first message was enqueued.
+    // Only the first message was queued.
     assert!(rx.try_recv().is_ok());
     assert!(rx.try_recv().is_err());
 }
 
-/// `volatile_soft_cap = 0` (the default) keeps the pre-existing enqueue behavior:
-/// no depth check, no shedding, every send lands on the channel.
+/// A zero soft cap queues every volatile message.
 #[tokio::test]
 async fn volatile_soft_cap_zero_never_sheds() {
     let address = "127.0.0.1:5322".parse::<SocketAddr>().unwrap();

@@ -11,13 +11,11 @@ use tokio::sync::mpsc::{Receiver, Sender};
 #[path = "tests/processor_tests.rs"]
 pub mod processor_tests;
 
-/// Indicates a serialized `WorkerMessage::Batch` message. Fable perf audit item 2/3:
-/// `Bytes` (refcounted) rather than `Vec<u8>` -- both `BatchMaker::seal` (our own
+/// Indicates a serialized `WorkerMessage::Batch` message.
+/// `Bytes` rather than `Vec<u8>` -- both `BatchMaker::seal` (our own
 /// batches) and `WorkerReceiverHandler::dispatch` (others' batches) already hold the
 /// wire bytes as a `Bytes` and can hand it here without copying. `Store::write` still
-/// needs an owned `Vec<u8>` (its fixed `Value = Vec<u8>` API, out of this audit's
-/// scope) -- that one unavoidable copy now happens right here, at the point a write
-/// actually needs `Vec`, instead of earlier on the sender's hot broadcast path.
+/// needs an owned `Vec<u8>` for storage.
 pub type SerializedBatchMessage = Bytes;
 
 /// Hashes and stores batches, it then outputs the batch's digest.
@@ -47,7 +45,6 @@ impl Processor {
                 // the one owned copy `batch: Bytes` truly can't avoid (see
                 // `SerializedBatchMessage`'s doc comment above).
                 store.write(digest.to_vec(), batch.to_vec()).await;
-                //store.write(digest.to_vec(), Vec::default()).await;
 
                 // Deliver the batch's digest.
                 let message = match own_digest {

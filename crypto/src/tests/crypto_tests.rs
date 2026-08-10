@@ -3,10 +3,7 @@ use super::*;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 
-// Test-only convenience hasher (arbitrary test messages -> Digest for signing/
-// verification tests below); not testing SHA-512 specifically, so this uses the
-// same Blake3Hasher as the rest of the codebase (F2, Phase 2 audit) rather than
-// keeping a second hash function around for one test helper.
+// Test-only convenience hasher for arbitrary messages.
 impl Hash for &[u8] {
     fn digest(&self) -> Digest {
         let mut hasher = Blake3Hasher::new();

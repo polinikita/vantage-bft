@@ -23,40 +23,23 @@ pub type Writer = SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>;
 
 #[async_trait]
 pub trait MessageHandler: Clone + Send + Sync + 'static {
-    /// Defines how to handle an incoming message. A typical usage is to define a `MessageHandler` with a
-    /// number of `Sender<T>` channels. Then implement `dispatch` to deserialize incoming messages and
-    /// forward them through the appropriate delivery channel. Then `writer` can be used to send back
-    /// responses or acknowledgements to the sender machine (see unit tests for examples).
+    /// Handles one decoded message and may write a response on `writer`.
     async fn dispatch(&self, writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>>;
 }
 
-/// For each incoming request, we spawn a new runner responsible to receive messages and forward them
-/// through the provided deliver channel.
+/// Accepts connections and dispatches their messages to a handler.
 pub struct Receiver<Handler: MessageHandler> {
     /// Address to listen to.
     address: SocketAddr,
     /// Struct responsible to define how to handle received messages.
     handler: Handler,
-    /// METRICS-DASHBOARD-SPEC.md §1: optional wire-metrics handle, `None` by default
-    /// (zero added cost -- `spawn` is the only entry point most callers use).
-    /// `bytes_received_total` is incremented once per received frame, length prefix
-    /// included, before the frame is handed to `handler.dispatch`.
+    /// Optional wire metrics. Received bytes include the four-byte frame length.
     metrics: Option<Arc<Metrics>>,
-    /// Whether THIS handler's peers ack every received frame -- matches, per
-    /// call-site, whatever the corresponding `MessageHandler::dispatch` impl used to
-    /// do itself (`writer.send(Bytes::from("Ack"))` as its first action) before the
-    /// batching design moved every acking handler's ack out of `dispatch` and in here
-    /// instead. Moving it here is what makes "exactly one ack per received FRAME"
-    /// achievable when several logical messages share a bundle frame -- `dispatch` is
-    /// called once per logical (sub-)message, so an ack inside `dispatch` would fire
-    /// once per sub-message instead of once per frame, desyncing `ReliableSender`'s
-    /// `pending_replies` FIFO. `false` (the default) never writes an ack at all,
-    /// matching every non-acking handler (e.g. `TxReceiverHandler`) exactly.
+    /// Whether to send one acknowledgement per received frame. This is frame-based so
+    /// a bundled frame produces one acknowledgement.
     acks: bool,
-    /// Whether frames from this handler's peers may be multi-message bundles (see
-    /// `network::batch`'s module doc). `false` (the default): a frame is exactly one
-    /// logical message, `handler.dispatch` is called once per frame -- byte-identical
-    /// to pre-batching behavior.
+    /// Whether incoming frames use the bundle format. When false, each frame is one
+    /// logical message.
     batch: bool,
     /// Stable listener-role label for current inbound connection gauges.
     listener: &'static str,
@@ -78,11 +61,8 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         Self::spawn_full(address, handler, metrics, false, false, "unlabeled");
     }
 
-    /// Full form: metrics handle + ack/batch flags. See `acks`/`batch`'s own doc
-    /// comments for their exact contracts. `batch` must match what every peer's own
-    /// sender is configured with (see `Parameters::batch_messages`'s doc on
-    /// committee-wide consistency). `listener` is a low-cardinality role label for
-    /// `network_connections`.
+    /// Full form with metrics, acknowledgement, batching, and listener settings.
+    /// `batch` must match the sender setting. `listener` labels inbound connections.
     pub fn spawn_full(
         address: SocketAddr,
         handler: Handler,
@@ -105,7 +85,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         });
     }
 
-    /// Main loop responsible to accept incoming connections and spawn a new runner to handle it.
+    /// Accept connections and spawn one runner per connection.
     async fn run(&self) {
         //println!("receiver address {}", self.address.clone().to_string());
         let listener = TcpListener::bind(&self.address)
@@ -121,9 +101,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                     continue;
                 }
             };
-            // Replies written back on this socket (ReliableSender acks) hit the
-            // same Nagle/delayed-ACK stall as the senders; starfish sets nodelay
-            // on the accept side too (network.rs:444).
+            // Disable Nagle buffering for small protocol frames and acknowledgements.
             let _ = socket.set_nodelay(true);
             info!("Incoming connection established with {}", peer);
             Self::spawn_runner(
@@ -164,14 +142,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                         }
                         let payload = message.freeze();
 
-                        // Exactly one ack per received FRAME (see `Receiver::acks`'s
-                        // doc comment), sent before dispatch -- identical relative
-                        // ordering to every acking handler's pre-batching behavior
-                        // (the ack was the very first statement inside `dispatch`,
-                        // before deserializing/routing; nothing observable happens
-                        // between "frame decoded" and "dispatch called" either way, so
-                        // moving the write here doesn't change the bytes or their
-                        // timing on the wire).
+                        // Send the frame acknowledgement before dispatch.
                         if acks {
                             let _ = writer.send(Bytes::from("Ack")).await;
                         }

@@ -1,11 +1,3 @@
-// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10: staging a verified target for installation.
-//
-// Everything here is about PACING and ORDER. Correctness of the target itself is
-// `sequence_tests`' job -- by the time a `SequenceInstall` exists the chain has already
-// verified against `f+1` announcements. What remains to get wrong is admitting more work
-// than repair can absorb (the failure that turned 60,262 blocks into 612M settle calls),
-// and applying views in an order the cursor cannot follow.
-
 use super::common::{authors, tagged_header, test_sid};
 use crate::messages::Header;
 use crate::primary::{Height, View};
@@ -17,14 +9,12 @@ use crypto::{Digest, PublicKey};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-/// A verified transfer's per-view output, exactly as `VantageCore` copies it out.
 type Staged = Vec<(View, SequenceOutcome, Vec<Digest>)>;
 
 fn empty_cache() -> SharedBlocks {
     Arc::new(Mutex::new(BlockCache::new()))
 }
 
-/// Headers WITH their worker payloads materialized -- the ordinary direct-publish state.
 fn cache_insert(blocks: &SharedBlocks, headers: &[Header]) {
     let mut cache = blocks.lock();
     for h in headers {
@@ -32,9 +22,6 @@ fn cache_insert(blocks: &SharedBlocks, headers: &[Header]) {
     }
 }
 
-/// Headers exactly as `Repairer::on_serve` leaves them: chain-verified, payload NOT yet
-/// synced. This is enough for consensus sequence install; worker sync materializes the
-/// payload bytes after commit notification.
 fn cache_insert_headers_only(blocks: &SharedBlocks, headers: &[Header]) {
     let mut cache = blocks.lock();
     for h in headers {
@@ -42,9 +29,6 @@ fn cache_insert_headers_only(blocks: &SharedBlocks, headers: &[Header]) {
     }
 }
 
-/// One lane, one new block per view: view `v` is `Core` over author A's block at height
-/// `v`, and that block is the view's whole delta. The smallest shape that still exercises
-/// "fetch instruction is the manifest, completion test is the delta".
 fn linear_target(views: View) -> (Staged, Vec<Header>) {
     let (author, _) = authors()[0];
     let sid = test_sid();
@@ -71,8 +55,6 @@ fn linear_target(views: View) -> (Staged, Vec<Header>) {
     (staged, headers)
 }
 
-/// Distinct per-view heads, standing in for the verified chain's own. Only their
-/// EQUALITY matters to rebase, so a deterministic function of the view is enough.
 fn heads_for(views: View) -> Vec<(View, Digest)> {
     (1..=views).map(|v| (v, Digest([v as u8; 32]))).collect()
 }
@@ -91,14 +73,10 @@ fn install_of(views: View, window: usize, ceiling: usize) -> (SequenceInstall, V
     (install, headers)
 }
 
-/// The head the verified chain records at `view`, matching `heads_for`.
 fn head_at(view: View) -> Digest {
     Digest([view as u8; 32])
 }
 
-/// The window is the whole point: a target spanning hundreds of views must not authorize
-/// hundreds of views' worth of refs at once, and a view only frees its slot once its
-/// blocks are actually in hand.
 #[test]
 fn the_fetch_window_bounds_views_in_flight() {
     let (mut install, headers) = install_of(10, 3, 4096);
@@ -113,7 +91,6 @@ fn the_fetch_window_bounds_views_in_flight() {
         "the window is full and nothing has arrived, so nothing more may be admitted"
     );
 
-    // View 1's block arrives; its slot frees and exactly one more view is admitted.
     cache_insert(&blocks, &headers[0..1]);
     install.refresh(&blocks);
     assert_eq!(install.views_complete(), 1);
@@ -122,8 +99,6 @@ fn the_fetch_window_bounds_views_in_flight() {
     assert_eq!(install.views_in_flight(), 3);
 }
 
-/// Repair backlog is high exactly when a node is behind. It must not veto the bounded
-/// state-sync window, or the rescue path disables itself in the condition it should clear.
 #[test]
 fn repair_backlog_does_not_veto_admission() {
     let (mut install, _) = install_of(10, 8, 100);
@@ -136,8 +111,6 @@ fn repair_backlog_does_not_veto_admission() {
     assert_eq!(install.views_in_flight(), 8);
 }
 
-/// A `Skip` names no manifest and outputs nothing, so it is finished on arrival. Letting
-/// one occupy a window slot would stall the fetch on a block that is never coming.
 #[test]
 fn skip_views_complete_without_a_fetch() {
     let staged = vec![
@@ -156,16 +129,12 @@ fn skip_views_complete_without_a_fetch() {
     assert_eq!(install.installable(), Some(1));
 }
 
-/// The cursor advances one view at a time, so a later view being ready buys nothing while
-/// an earlier one is missing. Installing it anyway would leave a hole no correct party's
-/// head can ever match.
 #[test]
 fn views_install_in_order_even_when_a_later_one_is_ready() {
     let (mut install, headers) = install_of(4, 4, 4096);
     let blocks = empty_cache();
     install.admit(0);
 
-    // Views 2..4 arrive; view 1 does not.
     cache_insert(&blocks, &headers[1..]);
     install.refresh(&blocks);
     assert_eq!(install.views_complete(), 3);
@@ -188,8 +157,6 @@ fn views_install_in_order_even_when_a_later_one_is_ready() {
     assert_eq!(install.installable(), None);
 }
 
-/// Repair's holder index keeps a maximum per lane, so seeding it needs one entry per
-/// author, not one per manifest entry -- `views * n` updates collapsed to `n`.
 #[test]
 fn lane_tips_are_the_per_lane_maximum() {
     let keys = authors();
@@ -227,11 +194,10 @@ fn lane_tips_are_the_per_lane_maximum() {
     let height_of = |k: PublicKey| tips.iter().find(|(p, _)| *p == k).map(|(_, h)| *h);
     assert_eq!(height_of(a), Some(5), "view 2's lower height must not win");
     assert_eq!(height_of(b), Some(9));
+    assert_eq!(install.lane_tip(&a), Some((a, 5, d(1))));
+    assert_eq!(install.lane_tip(&b), Some((b, 9, d(4))));
 }
 
-/// A verified chain cannot have a hole, so a gap means the outcome/delta maps disagree
-/// with the chain that verified. Refusing is the only safe answer: skipping the gap
-/// installs a sequence no correct party derives.
 #[test]
 fn a_hole_in_the_verified_output_is_refused() {
     let (mut staged, _) = linear_target(5);
@@ -247,9 +213,6 @@ fn a_hole_in_the_verified_output_is_refused() {
     );
 }
 
-/// `Full` names both the core `c` and the terminal `t`, and the delta is the expansion of
-/// both. Authorizing only `c` would leave every block reachable solely through `t`
-/// unrequested, and the view would never complete.
 #[test]
 fn full_outcomes_authorize_both_manifests() {
     let keys = authors();
@@ -273,15 +236,12 @@ fn full_outcomes_authorize_both_manifests() {
     assert!(refs.iter().any(|(p, _, _)| *p == b));
 }
 
-/// Blocks that ordinary dissemination already delivered are not re-fetched: the
-/// completion test is cache presence, not "did repair bring it".
 #[test]
 fn views_already_held_are_never_fetched() {
     let (mut install, headers) = install_of(4, 8, 4096);
     let blocks = empty_cache();
     cache_insert(&blocks, &headers);
 
-    // The first admission pass authorizes them, since nothing has been refreshed yet...
     install.admit(0);
     install.refresh(&blocks);
     assert_eq!(install.views_complete(), 4);
@@ -290,10 +250,17 @@ fn views_already_held_are_never_fetched() {
     assert_eq!(install.installable(), Some(1));
 }
 
-/// Ordinary dissemination never stops while a transfer runs, so by the time the blocks
-/// arrive the cursor may already be past part of the target. The overtaken prefix is
-/// dropped and the still-useful suffix survives -- abandoning the whole target here would
-/// throw away exactly the catch-up the node asked for.
+#[test]
+fn missing_header_scan_is_bounded_by_examined_positions() {
+    let (mut install, headers) = install_of(5, 8, 4096);
+    let blocks = empty_cache();
+    install.admit(0);
+    cache_insert(&blocks, &[headers[0].clone(), headers[2].clone()]);
+
+    let missing = install.missing_digests(&blocks, 3);
+    assert_eq!(missing, vec![headers[1].id.clone()]);
+}
+
 #[test]
 fn a_cursor_that_advanced_during_the_fetch_rebases_the_target() {
     let (mut install, headers) = install_of(10, 8, 4096);
@@ -321,8 +288,6 @@ fn a_cursor_that_advanced_during_the_fetch_rebases_the_target() {
     );
 }
 
-/// The other side of the same race: ordinary dissemination reached the target outright, so
-/// there is nothing left to install and the target must retire rather than linger.
 #[test]
 fn a_target_overtaken_outright_is_retired() {
     let (mut install, _) = install_of(6, 8, 4096);
@@ -343,11 +308,10 @@ fn a_target_overtaken_outright_is_retired() {
     );
 }
 
-/// Rebasing must not leave the fetch window admitting views that no longer exist.
 #[test]
 fn rebase_moves_the_admission_point_too() {
     let (mut install, _) = install_of(10, 3, 4096);
-    install.admit(0); // admits views 1..3
+    install.admit(0); // Admit views 1 through 3.
     assert_eq!(install.rebase(6, &head_at(6)), RebaseOutcome::Continue);
 
     let refs = install.admit(0);
@@ -356,10 +320,6 @@ fn rebase_moves_the_admission_point_too() {
     assert_eq!(install.views_total(), 4);
 }
 
-/// A repaired header enters the cache with `payload_ok = false` on purpose -- repair is a
-/// chain-authenticity concern, not a payload-possession one. Sequence install follows the
-/// same split: once the header is chain-verified, the cursor may advance and the worker
-/// synchronizer is responsible for materializing any missing batches.
 #[test]
 fn headers_without_payloads_are_ready_to_install() {
     let (mut install, headers) = install_of(3, 8, 4096);
@@ -377,10 +337,6 @@ fn headers_without_payloads_are_ready_to_install() {
     assert_eq!(install.installable(), Some(1));
 }
 
-/// Rebase drops a prefix on the strength of the local head at that boundary. If that head
-/// is not the one the verified chain records, the suffix would be spliced onto a history
-/// no correct party shares -- the one way this mechanism could install a correct suffix and
-/// still diverge.
 #[test]
 fn rebase_refuses_a_boundary_whose_local_head_disagrees() {
     let (mut install, _) = install_of(10, 8, 4096);
@@ -401,18 +357,12 @@ fn rebase_refuses_a_boundary_whose_local_head_disagrees() {
     );
 }
 
-/// Before the next refresh/install tick marks a header-only view complete, the retry list
-/// can still re-emit worker payload sync for headers whose initial `Synchronize` was lost.
-/// Once the view is sequence-ready, commit notification takes over and the install no
-/// longer scans it for payload retries.
 #[test]
 fn payload_retry_names_stuck_blocks_and_skips_the_ready_prefix() {
     let (mut install, headers) = install_of(2, 8, 4096);
     let blocks = empty_cache();
     install.admit(0);
 
-    // View 1 payload-ready, view 2 header-only: before refresh, exactly one block still
-    // needs a worker payload retry.
     cache_insert(&blocks, &headers[0..1]);
     cache_insert_headers_only(&blocks, &headers[1..2]);
     let retry = install.payload_retry_headers(&blocks, 64);

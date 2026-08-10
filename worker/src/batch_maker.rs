@@ -22,7 +22,7 @@ use tokio::time::{sleep, Duration, Instant};
 #[path = "tests/batch_maker_tests.rs"]
 pub mod batch_maker_tests;
 
-// The message type received by clients. Fable perf audit item 1: `Bytes` (refcounted),
+// The message type received by clients. `Bytes` (refcounted),
 // not `Vec<u8>` -- the network receiver already hands `TxReceiverHandler::dispatch` an
 // owned `Bytes` per transaction; keeping it as `Bytes` end-to-end through the batch
 // avoids one full memcpy per transaction that `message.to_vec()` used to perform.
@@ -39,47 +39,25 @@ pub struct BatchMaker {
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
 
-    //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_batch: Sender<SerializedBatchMessage>, // channel to forward batch digest to processor in order for primary to propose.
 
-    /// The network addresses of the other workers that share our worker id. UNFILTERED
-    /// -- always the full set, regardless of `--withhold`/`--withhold-at` (see
-    /// `withheld_workers_addresses` below for the filtered variant `seal` picks
-    /// between). Renamed-in-place from c35fc4a's own field of the same name, which
-    /// held an ALREADY-FILTERED list baked in once at spawn -- time-windowed
-    /// withholding needs the choice made dynamically, per seal, instead.
+    /// All worker addresses for this worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
-    /// Data-plane withholding fault injector (`Parameters::withhold_senders`):
-    /// `workers_addresses` above, with this authority's own blocked half already
-    /// removed (`config::withheld_destinations`, resolved once by `Worker::spawn`).
-    /// `None` -- the default, and always the case when `--withhold` is 0 -- means this
-    /// authority is not a withholding sender at all: `seal`'s address list is built
-    /// exactly as it was before this field existed (one cheap `match` discriminant,
-    /// no allocation). `Some(filtered)` is used ONLY when `withhold_window` (below)
-    /// says withholding is currently ACTIVE -- see `seal`'s own comment.
+    /// Worker addresses allowed by withholding configuration.
     withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
-    /// Data-plane withholding fault injector, TIME-WINDOWED variant
-    /// (`Parameters::withhold_window`): the shared, in-process "has the window opened
-    /// yet" cell -- consulted (via `config::withhold_active`) once per seal, ONLY when
-    /// `withheld_workers_addresses` is `Some` (see `seal`). `None` whenever
-    /// `withheld_workers_addresses` itself is already `None`, i.e. THIS authority
-    /// isn't a withholding sender at all -- irrelevant on that path.
+    /// Optional withholding time window.
     withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
-    /// Holds the current batch.
+    /// Current batch.
     current_batch: Batch,
-    /// Holds the size of the current batch (in bytes).
+    /// Current batch size in bytes.
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: SimpleSender,
-    /// METRICS-DASHBOARD-SPEC.md §2: worker-ingress goodput counters (`submitted_
+    /// worker-ingress goodput counters (`submitted_
     /// transactions`/`submitted_transactions_bytes`), observed as each client
     /// transaction arrives, before batching.
     metrics: Arc<Metrics>,
-    /// Fable perf audit item 1: counts `run`'s own loop iterations so the trailing
-    /// `yield_now` only actually yields every `YIELD_EVERY`-th iteration instead of
-    /// literally every one (every single received transaction/timer tick previously
-    /// yielded unconditionally) -- purely a scheduling-fairness knob, no protocol
-    /// effect either way.
+    /// Counts loop iterations to limit explicit scheduling yields.
     loop_ticks: u64,
 }
 
@@ -87,36 +65,21 @@ pub struct BatchMaker {
 const YIELD_EVERY: u64 = 32;
 
 impl BatchMaker {
-    // clippy::too_many_arguments: see primary/src/committer.rs's identical
-    // justification (Fable audit item 4's new `latency_map` param pushed this over the
-    // threshold).
+    // The constructor has more arguments than Clippy's default limit.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler
-        //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<SerializedBatchMessage>, // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
-        // Data-plane withholding fault injector: this authority's own filtered variant
-        // of `workers_addresses` above (resolved once by `Worker::spawn`'s own
-        // `handle_clients_transactions`, via `config::withheld_destinations`). `None`
-        // unless THIS authority is a withholding sender at all.
+        // Filtered worker addresses, if withholding is enabled.
         withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
-        // Data-plane withholding fault injector, time-windowed variant: this
-        // authority's own shared window cell (resolved once by `Worker::spawn`, a
-        // plain clone of `Parameters::withhold_window`). `None` whenever
-        // `--withhold-at` isn't given.
+        // Optional withholding time window.
         withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
-        // Fable audit item 4 (WAN latency injection): this authority's own
-        // per-destination artificial latency map (same contract as
-        // `Core::spawn`/`vantage::node::VantageCore::spawn`'s `latency_map` --
-        // resolved once by `Worker::spawn` via `Committee::latency_map`, empty ==
-        // current behavior). Applied to worker-to-worker batch broadcast, the
-        // dominant bandwidth path a WAN-shaped run previously left undelayed.
+        // Per-destination network latency.
         latency_map: HashMap<SocketAddr, Duration>,
-        // METRICS-DASHBOARD-SPEC.md §1/§2: appended last, same convention as
-        // primary-side `::spawn` functions.
+        // Metrics registry.
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
@@ -126,7 +89,6 @@ impl BatchMaker {
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
-                //tx_message, //previously forwarded batch to Quorum_waiter; now skipping this step.
                 tx_batch,
                 workers_addresses,
                 withheld_workers_addresses,
@@ -181,9 +143,7 @@ impl BatchMaker {
                 }
             }
 
-            // Give the chance to schedule other tasks, but not on literally every
-            // single loop iteration (Fable perf audit item 1) -- see
-            // `BatchMaker::loop_ticks`'s doc comment.
+            // Yield periodically under sustained load.
             self.loop_ticks = self.loop_ticks.wrapping_add(1);
             if self.loop_ticks.is_multiple_of(YIELD_EVERY) {
                 tokio::task::yield_now().await;
@@ -195,12 +155,12 @@ impl BatchMaker {
     async fn seal(&mut self) {
         let size = self.current_batch_size;
 
-        // METRICS-DASHBOARD-SPEC.md §3 addendum (starfish parity, adapted): our own
+        // our own
         // proposed transactions' total payload size, sealed into this batch. This
         // repo's headers/proposals never carry transaction bytes inline -- only
         // batch digests (`primary::messages::Header::payload:
         // BTreeMap<Digest, WorkerId>`) -- so the batch, not the header, is the
-        // closest analogue of starfish's per-block `proposed_transaction_size_bytes`
+        // closest analogue of reference's per-block `proposed_transaction_size_bytes`
         // observation (see that field's doc comment on `Metrics`). Own batches
         // only, matching `BatchMaker`'s scope: batches received from other workers
         // never pass through here (see `Processor`'s `own_batch` split in
@@ -221,7 +181,7 @@ impl BatchMaker {
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
-        // Fable perf audit item 2: wrap the freshly-serialized `Vec<u8>` into `Bytes`
+        // wrap the freshly-serialized `Vec<u8>` into `Bytes`
         // once (a cheap pointer/len/cap move, not a copy -- `Bytes::from(Vec<u8>)`
         // takes ownership of the existing allocation). Both consumers below then just
         // clone this `Bytes` handle (a refcount bump, not a memcpy) instead of the
@@ -231,13 +191,12 @@ impl BatchMaker {
 
         #[cfg(feature = "benchmark")]
         {
-            // NOTE: This is one extra hash that is only needed to print the following log entries.
+            // Hash the batch for benchmark logs.
             let mut hasher = Blake3Hasher::new();
             hasher.update(&bytes);
             let digest = Digest(hasher.finalize().into());
 
             for id in tx_ids {
-                // NOTE: This log entry is used to compute performance.
                 info!(
                     "Batch {:?} contains sample tx {}",
                     digest,
@@ -245,23 +204,11 @@ impl BatchMaker {
                 );
             }
 
-            // NOTE: This log entry is used to compute performance.
             info!("Batch {:?} contains {} B", digest, size);
         }
 
         // Broadcast the batch through the network.
-
-        //NEW:
-        //Best-effort broadcast only. Any failure is correlated with the primary operating this node (running on same machine)
-        // Data-plane withholding fault injector: `withheld_workers_addresses` is
-        // `None` unless THIS authority is a withholding sender at all (`--withhold`),
-        // so the guard on the `Some` arm below is never even evaluated on that
-        // (default) path -- one cheap `match` discriminant, no `Instant::now()` call,
-        // no perturbation. When it IS `Some`, the guard consults the shared window
-        // cell (`config::withhold_active`) to decide, per seal, whether withholding
-        // is currently ACTIVE -- `--withhold` without `--withhold-at`
-        // (`withhold_window: None`) is always active, reproducing c35fc4a's original
-        // whole-run behavior exactly.
+        // Apply withholding when the configured time window is active.
         let addresses: Vec<SocketAddr> = match &self.withheld_workers_addresses {
             Some(filtered)
                 if config::withhold_active(
@@ -286,19 +233,5 @@ impl BatchMaker {
             .await
             .expect("Failed to deliver batch");
 
-        //OLD:
-        //This uses reliable sender. The receiver worker will reply with an ack. The Reply Handler is passed to Quorum Waiter.
-        // let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
-        // let bytes = Bytes::from(serialized.clone());
-        // let handlers = self.network.broadcast(addresses, bytes).await;
-
-        // // Send the batch through the deliver channel for further processing.
-        // self.tx_message
-        //     .send(QuorumWaiterMessage {
-        //         batch: serialized,
-        //         handlers: names.into_iter().zip(handlers.into_iter()).collect(),
-        //     })
-        //     .await
-        //     .expect("Failed to deliver batch");
     }
 }

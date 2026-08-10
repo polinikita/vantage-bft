@@ -1,6 +1,3 @@
-// PHASE4-SPEC.md §12 "Cursor" -- the output cursor (§9), driven directly against
-// `Cursor`.
-
 use super::common::*;
 use crate::vantage::agb::Outcome;
 use crate::vantage::Cursor;
@@ -25,9 +22,6 @@ async fn expansion_order_and_cross_view_dedup() {
     let chain_b = direct_chain(&mut lm, author_b, 1).await;
     let mut cursor = new_cursor(&lm);
 
-    // View 1: C = author_a height 1, T = author_a height 2 + author_b height 1 (T's
-    // entries traversed in sorted-author order -- whichever of the two authors sorts
-    // first, not a fixed literal order).
     let c = vec![block_ref(&chain_a[0])];
     let t = sorted_manifest(vec![block_ref(&chain_a[1]), block_ref(&chain_b[0])]);
     let expected: Vec<_> = std::iter::once(chain_a[0].id.clone())
@@ -41,8 +35,6 @@ async fn expansion_order_and_cross_view_dedup() {
     assert_eq!(cursor.output_log(), expected.as_slice());
     assert_eq!(cursor.next_view(), 2);
 
-    // View 2 references author_a's height-2 block again (e.g. as its own C) -- already
-    // output in view 1, must never be re-output.
     let c2 = vec![block_ref(&chain_a[1])];
     cursor.on_sealed(2, Outcome::Core(c2));
     assert_eq!(cursor.output_log(), expected.as_slice());
@@ -60,13 +52,11 @@ async fn core_prefix_of_full_property() {
     let c = vec![block_ref(&chain_a[0])];
     let t = vec![block_ref(&chain_a[1])];
 
-    // Completed-but-open: emits exactly K, does not advance.
     cursor.on_completed(1, c.clone(), t.clone());
     let k_len = cursor.output_log().len();
     assert_eq!(cursor.output_log(), &[chain_a[0].id.clone()]);
     assert_eq!(cursor.next_view(), 1, "tip stays open until sealed");
 
-    // Sealing with gfull appends only T-hat -- K is a literal prefix, never re-emitted.
     cursor.on_sealed(1, Outcome::Full(c, t));
     assert_eq!(&cursor.output_log()[..k_len], &[chain_a[0].id.clone()]);
     assert_eq!(
@@ -86,14 +76,11 @@ async fn open_tip_blocks_later_views_payload() {
     let chain_b = direct_chain(&mut lm, author_b, 1).await;
     let mut cursor = new_cursor(&lm);
 
-    // View 2 seals *before* view 1 does -- no payload from it may cross view 1's still-
-    // open cursor position.
     let effects = cursor.on_sealed(2, Outcome::Core(vec![block_ref(&chain_b[0])]));
     assert!(effects.is_empty());
     assert!(cursor.output_log().is_empty());
     assert_eq!(cursor.next_view(), 1);
 
-    // Once view 1 seals, both views' outputs appear, in view order.
     let effects = cursor.on_sealed(1, Outcome::Core(vec![block_ref(&chain_a[0])]));
     assert!(!effects.is_empty());
     assert_eq!(
@@ -126,8 +113,6 @@ async fn idempotent_duplicate_seal() {
     cursor.on_sealed(1, outcome.clone());
     let after_first = cursor.output_log().to_vec();
     let next_view_after_first = cursor.next_view();
-    // A duplicate/late-compatible seal for the same (now-advanced-past) view must
-    // never reopen it or duplicate output.
     let effects = cursor.on_sealed(1, outcome);
     assert!(effects.is_empty());
     assert_eq!(cursor.output_log().to_vec(), after_first);
@@ -148,8 +133,6 @@ async fn missing_prefix_wait_then_emit() {
         genesis,
         sid.clone(),
     );
-    // h1 is *not* published yet -- h2 (the manifest's actual entry) references it but
-    // the prefix isn't obtainable.
     let h2 = crate::messages::Header::new_vantage(
         author_a,
         2,
@@ -166,7 +149,6 @@ async fn missing_prefix_wait_then_emit() {
     );
     assert_eq!(cursor.next_view(), 1);
 
-    // The prefix arrives (h1 then h2) -- a `BlockCached` wakeup re-attempts via retry().
     lm.process_publish(author_a, h1.clone()).await;
     lm.process_publish(author_a, h2.clone()).await;
     let effects = cursor.retry();
@@ -175,20 +157,6 @@ async fn missing_prefix_wait_then_emit() {
     assert_eq!(cursor.next_view(), 2);
 }
 
-/// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §13: "early core emission plus later full seal
-/// produces one final ordered delta".
-///
-/// The case that makes the per-view delta a `Cursor` FIELD rather than a local. A view
-/// that is completed-but-still-open emits its core prefix `K` immediately and then waits
-/// for the seal, so the view's output arrives across two separate `pump()` calls, split
-/// by an arbitrary amount of wall time. Both halves belong to the same view's delta, in
-/// emission order, and exactly one `SequenceFinalized` must be produced -- at the
-/// terminal advance, never at the earlier core emission.
-///
-/// Getting this wrong is invisible in ordinary output (the same blocks are emitted either
-/// way) but silently corrupts the sequence head: dropping the early core would commit a
-/// delta the fleet does not share, and emitting twice would record view `v` twice and
-/// desynchronize every head above it.
 #[tokio::test]
 async fn early_core_then_terminal_seal_yields_one_ordered_delta() {
     use crate::vantage::sequence::SequenceOutcome;
@@ -205,8 +173,6 @@ async fn early_core_then_terminal_seal_yields_one_ordered_delta() {
     let c = vec![block_ref(&chain_a[0])];
     let t = sorted_manifest(vec![block_ref(&chain_a[0]), block_ref(&chain_b[0])]);
 
-    // Step 1: completed but NOT sealed -- the core prefix is emitted while the view is
-    // still open, and the view must not finalize.
     let open = cursor.on_completed(1, c.clone(), t.clone());
     assert!(
         open.iter()
@@ -223,7 +189,6 @@ async fn early_core_then_terminal_seal_yields_one_ordered_delta() {
     let after_core = cursor.output_log().to_vec();
     assert_eq!(after_core, vec![chain_a[0].id.clone()]);
 
-    // Step 2: the terminal seal arrives later and contributes the rest of the view.
     let sealed = cursor.on_sealed(1, Outcome::Full(c.clone(), t.clone()));
     assert_eq!(cursor.next_view(), 2, "the terminal seal must advance");
 
@@ -253,8 +218,6 @@ async fn early_core_then_terminal_seal_yields_one_ordered_delta() {
         }
     );
 
-    // The delta is the WHOLE view's output in emission order -- the early core first,
-    // then what the seal added -- and matches the cursor's own committed log exactly.
     assert_eq!(
         delta.as_slice(),
         cursor.output_log(),
@@ -275,18 +238,10 @@ async fn early_core_then_terminal_seal_yields_one_ordered_delta() {
     );
 }
 
-// -------------------------------------------------- SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10
-//
-// `Cursor::install`: the one path that turns bytes another party derived into committed
-// output. Every test here is about a refusal leaving the cursor EXACTLY as it was, because
-// a half-applied view is a hole no later execution can repair.
-
 use crate::vantage::cursor::InstallError;
 use crate::vantage::sequence::SequenceOutcome;
 use crypto::Digest;
 
-/// The ordinary case: a view this node never executed is applied whole, and the delta it
-/// finalizes is the one that was verified.
 #[tokio::test]
 async fn install_applies_a_view_and_advances() {
     let (name, _) = authors()[3];
@@ -318,8 +273,6 @@ async fn install_applies_a_view_and_advances() {
     );
 }
 
-/// A completed-but-open view has already emitted its core prefix `K`. Installing over it
-/// must deliver only the remainder, or blocks get output twice.
 #[tokio::test]
 async fn install_over_an_emitted_core_prefix_emits_only_the_remainder() {
     let (name, _) = authors()[3];
@@ -328,7 +281,6 @@ async fn install_over_an_emitted_core_prefix_emits_only_the_remainder() {
     let chain_a = direct_chain(&mut lm, author_a, 3).await;
     let mut cursor = new_cursor(&lm);
 
-    // Completed, not sealed: K is emitted and the view stays open.
     let c = vec![block_ref(&chain_a[0])];
     cursor.on_completed(1, c.clone(), Vec::new());
     assert_eq!(cursor.open_delta(), &[chain_a[0].id.clone()]);
@@ -348,8 +300,6 @@ async fn install_over_an_emitted_core_prefix_emits_only_the_remainder() {
     );
 }
 
-/// The refusal that can only fire on a real divergence: this node already output blocks
-/// for the view in an order the verified delta contradicts.
 #[tokio::test]
 async fn install_refuses_a_local_partial_that_is_not_a_prefix() {
     let (name, _) = authors()[3];
@@ -362,7 +312,6 @@ async fn install_refuses_a_local_partial_that_is_not_a_prefix() {
     cursor.on_completed(1, c.clone(), Vec::new());
     let before = cursor.output_log().to_vec();
 
-    // Verified delta that does NOT start with the locally emitted block.
     let divergent = vec![chain_a[1].id.clone(), chain_a[2].id.clone()];
     let err = cursor
         .install(1, SequenceOutcome::Core { c }, &divergent, usize::MAX)
@@ -374,9 +323,6 @@ async fn install_refuses_a_local_partial_that_is_not_a_prefix() {
     assert_eq!(cursor.output_log(), before.as_slice());
 }
 
-/// `emit` resolves headers by cache lookup and silently omits what it cannot find, so an
-/// install over a partial cache would advance the view while dropping output. Caught
-/// before anything is touched.
 #[tokio::test]
 async fn install_refuses_a_delta_whose_blocks_are_not_held() {
     let (name, _) = authors()[3];
@@ -442,11 +388,6 @@ async fn install_refuses_a_view_the_cursor_is_not_waiting_on() {
     assert!(cursor.output_log().is_empty());
 }
 
-/// An install that delivered blocks without moving the per-author watermarks would leave
-/// the next ordinary seal walking from a stale point across a prefix the node may no
-/// longer hold -- the genesis-anew walk the watermark index exists to remove. Forced here
-/// by evicting the installed prefix: with the watermark advanced the seal short-circuits,
-/// without it the walk cannot complete and the cursor wedges.
 #[tokio::test]
 async fn install_advances_the_per_author_watermarks() {
     let (name, _) = authors()[3];
@@ -470,10 +411,8 @@ async fn install_advances_the_per_author_watermarks() {
         .expect("installs");
     assert_eq!(cursor.next_view(), 2);
 
-    // The installed prefix is gone from the cache; only the tip remains.
     blocks.lock().evict_author_below(&author_a, 3);
 
-    // View 2 names the same tip. The watermark makes this a no-op instead of a walk.
     cursor.on_sealed(2, Outcome::Core(vec![tip]));
     assert_eq!(
         cursor.next_view(),
@@ -488,10 +427,6 @@ async fn install_advances_the_per_author_watermarks() {
     );
 }
 
-/// A view's delta is the whole accumulated lane suffix since the last emitted watermark,
-/// so after a multi-second gap at n=100 it is thousands of headers. Emitting that in one
-/// core turn is the starvation this mechanism exists to relieve, so the budget leaves the
-/// view OPEN and the next call resumes exactly where it stopped.
 #[tokio::test]
 async fn install_chunks_a_large_delta_and_resumes() {
     let (name, _) = authors()[3];
@@ -531,14 +466,6 @@ async fn install_chunks_a_large_delta_and_resumes() {
     );
 }
 
-/// A repaired header whose worker batches have not been synced is still sequence-ready.
-/// `emit` resolves its `Header` and `notify_committed` hands the batch digests to the
-/// worker synchronizer, which owns payload materialization.
-///
-/// The undeliverable block is minted here rather than taken from `direct_chain`, because
-/// `payload_ok` is monotonic by design -- `upsert` OR-merges it and `set_payload_ok` only
-/// ever sets it true -- so a block that was ever published directly cannot be walked back
-/// into the repaired-but-unsynced state this checks.
 #[tokio::test]
 async fn install_accepts_a_block_whose_payload_is_not_materialized() {
     let (name, _) = authors()[3];
@@ -548,7 +475,6 @@ async fn install_accepts_a_block_whose_payload_is_not_materialized() {
     let blocks = lm.blocks_handle();
     let mut cursor = new_cursor(&lm);
 
-    // Exactly what `Repairer::on_serve` leaves behind: chain-verified, payload not synced.
     let repaired = tagged_header(author_a, 2, chain_a[0].id.clone(), lm.sid().clone(), 0xC1);
     blocks
         .lock()
@@ -579,12 +505,6 @@ async fn install_accepts_a_block_whose_payload_is_not_materialized() {
     );
 }
 
-/// A lane that contradicts already-delivered output must not stop the cursor.
-///
-/// The forking author is dropped from that view and every other author still commits.
-/// Before this, `expand` waited on the unwalkable entry forever: measured on a 21-node
-/// docker-bench fleet, one restarted validator froze the output cursor of all 21 nodes
-/// permanently while AGB ran on more than a thousand views ahead.
 #[tokio::test]
 async fn forked_lane_does_not_wedge_the_cursor() {
     let (name, _) = authors()[3];
@@ -592,7 +512,6 @@ async fn forked_lane_does_not_wedge_the_cursor() {
     let (honest, _) = authors()[1];
     let (mut lm, _store) = new_lane_manager(name, ".db_test_cursor_forked_lane");
 
-    // View 1 delivers the forker's height 1, which sets the cursor's watermark for it.
     let original = direct_chain(&mut lm, forker, 1).await;
     let honest_1 = direct_chain(&mut lm, honest, 1).await;
     let mut cursor = new_cursor(&lm);
@@ -602,16 +521,12 @@ async fn forked_lane_does_not_wedge_the_cursor() {
     assert_eq!(cursor.next_view(), 2);
     assert_eq!(cursor.forked_dropped(), 0);
 
-    // The fork: a DIFFERENT height-1 block for the same author, and a height-2 block
-    // built on it. This is exactly what a validator that restarts without its lane
-    // frontier publishes.
     let sid = lm.sid().clone();
     let sibling = tagged_header(forker, 1, lm.genesis().clone(), sid.clone(), 7);
     let on_fork = tagged_header(forker, 2, sibling.id.clone(), sid, 9);
     lm.process_publish(forker, sibling.clone()).await;
     lm.process_publish(forker, on_fork.clone()).await;
 
-    // View 2 names the forked height 2 alongside an honest author's block.
     let honest_2 = direct_chain(&mut lm, honest, 2).await;
     let c2 = sorted_manifest(vec![block_ref(&on_fork), block_ref(&honest_2[1])]);
     cursor.on_completed(2, c2.clone(), Vec::new());
@@ -642,13 +557,6 @@ async fn forked_lane_does_not_wedge_the_cursor() {
     );
 }
 
-/// Install and ordinary execution must reach the SAME per-author watermark.
-///
-/// `expand` drops a `SuffixWalk::Forked` manifest entry and leaves that author's watermark
-/// alone. Watermarks derived from the manifest instead of from the delivered delta advanced
-/// past the forked tip, so an installing node could later walk forward from the forked
-/// branch and emit blocks an executing node drops -- two correct nodes, divergent committed
-/// logs, from identical verified input.
 #[tokio::test]
 async fn install_and_execution_agree_on_watermarks_across_a_fork() {
     let (name, _) = authors()[3];
@@ -659,7 +567,6 @@ async fn install_and_execution_agree_on_watermarks_across_a_fork() {
     let forked_a = direct_chain(&mut lm, forker, 1).await;
     let honest_chain = direct_chain(&mut lm, honest, 3).await;
 
-    // The fork: a sibling of the forker's height 1, and two blocks built on it.
     let sid = lm.sid().clone();
     let b1 = tagged_header(forker, 1, lm.genesis().clone(), sid.clone(), 7);
     let b2 = tagged_header(forker, 2, b1.id.clone(), sid.clone(), 8);
@@ -668,7 +575,6 @@ async fn install_and_execution_agree_on_watermarks_across_a_fork() {
         lm.process_publish(forker, h.clone()).await;
     }
 
-    // View 1 delivers the forker's ORIGINAL height 1 on both nodes.
     let mut executing = new_cursor(&lm);
     let mut installing = new_cursor(&lm);
     let c1 = sorted_manifest(vec![block_ref(&forked_a[0]), block_ref(&honest_chain[0])]);
@@ -677,8 +583,6 @@ async fn install_and_execution_agree_on_watermarks_across_a_fork() {
         cursor.on_sealed(1, Outcome::Full(c1.clone(), Vec::new()));
     }
 
-    // View 2 names the FORKED height 2. Executing drops it; installing applies the same
-    // verified delta, which likewise contains no forked block.
     let c2 = sorted_manifest(vec![block_ref(&b2), block_ref(&honest_chain[1])]);
     executing.on_completed(2, c2.clone(), Vec::new());
     executing.on_sealed(2, Outcome::Full(c2.clone(), Vec::new()));
@@ -695,8 +599,6 @@ async fn install_and_execution_agree_on_watermarks_across_a_fork() {
         )
         .expect("install view 2");
 
-    // View 3 names the forked height 3. Neither node may deliver it: both watermarks for
-    // the forker must still sit at the original height 1, so the walk stays `Forked`.
     let c3 = sorted_manifest(vec![block_ref(&b3), block_ref(&honest_chain[2])]);
     for cursor in [&mut executing, &mut installing] {
         cursor.on_completed(3, c3.clone(), Vec::new());

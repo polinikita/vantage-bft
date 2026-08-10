@@ -24,11 +24,7 @@ class LogParser:
         assert isinstance(metrics, list) and all(isinstance(x, str) for x in metrics)
         assert duration is None or (isinstance(duration, (int, float)) and duration > 0)
 
-        # PREP FIX 3: the run's configured duration (bench_parameters.duration,
-        # e.g. 180 s for the campaign), used as the denominator for the
-        # prometheus-derived committed TPS below. `None` when unknown (e.g. the
-        # standalone `fab logs` re-parse), in which case that TPS falls back to
-        # the log-observed end-to-end window.
+        # Use the configured duration for Prometheus-derived committed TPS.
         self.configured_duration = duration
 
         self.faults = faults
@@ -70,9 +66,7 @@ class LogParser:
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
-        # Parse the saved metrics scrapes (PHASE2-SPEC.md #5): real transaction latency
-        # lives only in-process, so it's read from `metrics-worker-*.txt` snapshots
-        # (Prometheus text exposition), not from the logs above.
+        # Read real transaction latency from saved worker metric snapshots.
         self.expected_metrics_nodes = len(workers)
         parsed_metrics = [self._parse_worker_metrics(text) for text in metrics]
         self.real_latency = [x for x in parsed_metrics if x is not None]
@@ -171,11 +165,9 @@ class LogParser:
         return sizes, samples, ip
 
     def _parse_worker_metrics(self, text):
-        ''' Extract a worker's real-transaction-latency gauges/counters from a saved
-        Prometheus text-exposition scrape (PHASE2-SPEC.md #5). Plain regex against the
-        exposition format, same approach starfish's own orchestrator uses. Returns
-        `None` for an empty/failed scrape (the `transaction_committed_latency` gauge
-        is absent until the worker's first observation). '''
+        '''Extract latency gauges and counters from a Prometheus scrape.
+
+        Return `None` when the worker has not recorded a transaction.'''
         def gauge(name, label):
             m = search(name + r'\{v="' + label + r'"\} (\d+)', text, MULTILINE)
             return int(m.group(1)) if m else None
@@ -199,31 +191,10 @@ class LogParser:
         }
 
     def _real_transaction_latency(self):
-        ''' Cross-node aggregation, starfish-style (PHASE2-SPEC.md #5).
+        '''Aggregate latency metrics across workers.
 
-        Every node's committer processes the *entire* replicated commit sequence (not
-        a disjoint partition of it), so every worker's `Committed` notifications --
-        and hence its `count`/`sum`/`squared_sum` -- cover (approximately) the same
-        global set of transactions, not `1/n` of it. Confirmed against starfish's own
-        aggregator (`orchestrator/src/measurements.rs::aggregate_rate`), which reduces
-        the analogous `count` field across scrapers with MAX, not sum, for exactly
-        this reason.
-
-        `avg`/`stddev` are still computed from the *summed* count/sum/sum-of-squares:
-        because every node's triple scales by the same (near-)constant factor (each
-        observes the same set, modulo a lagging node not yet having caught up), the
-        ratios sum/count and squared_sum/count are unaffected by summing first -- this
-        is actually preferable to reading a single node, since it blends every node's
-        independent measurement of the same distribution. `count`/`misses` are *not*
-        summed (that would misreport an n-times-inflated transaction count); each is
-        the max across nodes, matching starfish's own convention -- the most complete
-        single-node reading of a value every node is trying to observe in full.
-
-        Percentiles are the median across nodes of each node's own exact percentile
-        (what starfish's orchestrator reports), since a global exact percentile would
-        need the raw per-transaction samples, not just each node's already-reduced
-        quantiles. Returns `None` if no node's scrape produced this metric (e.g. every
-        scrape failed, or nothing was ever committed). '''
+        Counts and misses use the maximum. Averages use summed moments, and
+        percentiles use the median of the worker values.'''
         if not self.real_latency:
             return None
 
@@ -252,18 +223,10 @@ class LogParser:
         }
 
     def _prometheus_committed_tps(self):
-        ''' PREP FIX 3: prometheus-derived committed TPS. Vantage doesn't emit the
-        Autobahn-format log lines `_consensus_throughput`/`_end_to_end_throughput`
-        parse (`Created`/`Committed B\\d+(...) -> ...=`), so those read 0 for a
-        Vantage run even though real work committed -- the scraped
-        `transaction_committed_latency` counter (already surfaced as `count` by
-        `_real_transaction_latency`) is the protocol-agnostic, VALID signal. TPS is
-        that committed-tx count divided by the run's actual duration: the
-        configured `duration` bench parameter (e.g. 180 s for the campaign) when
-        known, else the log-observed end-to-end window as a fallback (e.g. for a
-        standalone `fab logs` re-parse with no bench-parameters context). Returns
-        `None` if nothing was committed/scraped, or no duration is available
-        either way. '''
+        '''Return committed transactions per second from Prometheus metrics.
+
+        Use the configured duration, or the observed end-to-end window when
+        the configured duration is unavailable.'''
         real_latency = self._real_transaction_latency()
         if real_latency is None:
             return None
@@ -277,14 +240,7 @@ class LogParser:
         return real_latency['count'] / duration
 
     def committed_tps(self):
-        ''' Public accessor for the prometheus-derived committed TPS (see
-        `_prometheus_committed_tps`): the protocol-agnostic, VALID committed
-        throughput this run achieved, i.e. exactly the number `result()`
-        prints as "Real TPS (prometheus)". Added (CHANGE A) so `remote.py`'s
-        rate-sweep loop can read a run's committed TPS numerically right
-        after parsing it, without scraping/re-parsing the printed result
-        text. Returns `None` under the same conditions `_prometheus_committed_tps`
-        does (nothing committed/scraped, or no run duration available). '''
+        '''Return Prometheus-derived committed TPS, or `None` if unavailable.'''
         return self._prometheus_committed_tps()
 
     def _to_posix(self, string):
@@ -341,7 +297,6 @@ class LogParser:
 
     def result(self):
         protocol = self.configs[0]['protocol']
-        #timeout_delay = self.configs[0]['timeout_delay']
         header_size = self.configs[0]['header_size']
         max_header_delay = self.configs[0]['max_header_delay']
         gc_depth = self.configs[0]['gc_depth']

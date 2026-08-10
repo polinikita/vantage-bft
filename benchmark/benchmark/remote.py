@@ -28,10 +28,7 @@ from benchmark.logs import LogParser, ParseError
 from benchmark.instance import InstanceManager
 
 
-# METRICS-COLLECTOR-PREP: PromQL for each series the analysis needs off the
-# metrics-collector's Prometheus (see `Bench.fetch_collector_metrics`). Names
-# verified against metrics/src/metrics.rs's `Metrics::new` registrations, not
-# guessed -- see that module for the authoritative list.
+# PromQL queries used by `Bench.fetch_collector_metrics`.
 COLLECTOR_QUERIES = {
     'committed_transactions_total': 'sum(committed_transactions)',
     'committed_transactions_rate': 'sum(rate(committed_transactions[30s]))',
@@ -53,27 +50,9 @@ COLLECTOR_QUERIES = {
     'core_queue_peak': 'core_queue_peak',
     'protocol_info': 'protocol_info',
     'transaction_mode_info': 'transaction_mode_info',
-    # PER-RATE-POINT NIC-SATURATION CHECK: 'up' is scrape-health (which
-    # targets Prometheus could actually reach during the point -- a target
-    # missing from 'up' explains a series being silently absent from
-    # everything else here far better than a stale/empty result does).
-    # 'bytes_sent_rate_by_node'/'bytes_received_rate_by_node' are the
-    # per-node breakdown of the wire byte counters (metrics/src/metrics.rs's
-    # bytes_sent_total/bytes_received_total, already counted at the
-    # network layer -- see network/src/reliable_sender.rs and
-    # simple_sender.rs) that the module docstring's bytes_sent_total/
-    # bytes_received_total entries above only sum CLUSTER-wide; free via the
-    # scrape config's `node` label (config.generate_collector_scrape_config).
-    # 'committed_tps_by_node' is the same per-node breakdown for throughput,
-    # for correlating a NIC-saturated node against its own committed rate.
-    # 'bytes_sent_rate_by_host'/'bytes_received_rate_by_host' aggregate the
-    # SAME counters by the scrape config's `host` label instead (one series
-    # per physical instance/NIC, not per primary/worker process) -- with the
-    # campaign's `collocate: True`, an authority's primary and its worker
-    # share one instance and one NIC, so `by (node)` yields up to 2x as many
-    # series as there are hosts and a max over it understates/mislabels the
-    # actual per-NIC rate. `_report_nic_peak` reads the by-host series for
-    # exactly this reason; the by-node series stay for per-process detail.
+    # `up` reports scrape health.
+    # Node labels provide process-level rates; host labels provide NIC-level
+    # rates when a primary and worker share an instance.
     'up': 'up',
     'bytes_sent_rate_by_node': 'sum by (node) (rate(bytes_sent_total[30s]))',
     'bytes_received_rate_by_node': 'sum by (node) (rate(bytes_received_total[30s]))',
@@ -97,18 +76,7 @@ class ExecutionError(Exception):
 
 
 class Bench:
-    # --- Working-tree deploy (Phase 7 remote-harness repair) ---------------
-    # `git clone`/`git pull` (the original deploy mechanism) can only fetch
-    # code that's committed somewhere reachable by the hosts. The tree under
-    # test is routinely uncommitted (only the user commits, per their
-    # standing workflow), so `install`/`_update` instead rsync the local
-    # working tree straight to each host. This is intentionally scoped to
-    # these two methods and `_sync_tree`/`_repo_root`/`_ssh_opts` below --
-    # nothing else in the harness changes. The audited, citable paper
-    # campaign should still run from a tagged, committed revision (git
-    # clone), for provenance; this variant is for the smoke test and other
-    # pre-campaign runs against a dirty tree. See PHASE7-PREP-NOTES.md
-    # #remote.
+    # Exclude local build output and credentials from working-tree uploads.
     RSYNC_EXCLUDES = [
         '.git/',
         'target/',
@@ -124,12 +92,7 @@ class Bench:
     ]
 
     def __init__(self, ctx, source_build=False):
-        # Default (source_build=False): fetch the pre-built nightly binaries
-        # (docker.yml's release) instead of compiling remotely -- see
-        # `install`/`_update`. `--source-build` (wired through fabfile.py's
-        # `install`/`remote`/`campaign` tasks) restores the old rsync +
-        # `cargo build` deploy path, kept for debugging a change that isn't
-        # in a released binary yet.
+        # Fetch release binaries by default; `source_build` compiles on hosts.
         self.source_build = bool(source_build)
         self.manager = InstanceManager.make()
         self.settings = self.manager.settings
@@ -171,12 +134,7 @@ class Bench:
         ]
 
     def _sync_tree(self, ips):
-        ''' Working-tree deploy variant: rsync the local repo to each host
-        instead of `git clone`/`git pull` (see the class docstring above).
-        Incremental -- rsync only ships deltas on repeat runs -- and
-        excludes build artifacts, VCS metadata, prior run output, and
-        venv/scratch directories (RSYNC_EXCLUDES) so the transferred tree
-        stays small; hosts still compile from source as usual. '''
+        '''Upload the working tree, excluding build output and local data.'''
         assert isinstance(ips, list)
         root = self._repo_root()
         exclude_args = []
@@ -222,104 +180,11 @@ class Bench:
                 )
 
     def _nvme_mount_snippet(self):
-        ''' NVMe-INSTANCE-STORE: format + mount the local instance-store NVMe
-        disk at `PathMaker.REMOTE_STORE_BASE` ('/mnt/db') so the RocksDB store
-        (see `_run_single`'s `PathMaker.remote_db_path`) lands on fast local
-        disk instead of the EBS root volume -- root cause of the AWS
-        throughput collapse (16k tx/s vs 200k locally) on `c5.xlarge`: EBS-only,
-        so store I/O both is slow AND competes with the consensus NIC for the
-        same underlying bandwidth (EBS is network-attached). `c5d.xlarge` (same
-        4 vCPU/NIC) adds exactly one local NVMe SSD -- settings.json's validator
-        `instance_type` is `c5d.xlarge`, so this snippet's NVMe-detect loop
-        actually finds that disk and the `mkfs.ext4`/mount branch below is the
-        one that runs on every validator, not a dormant fallback.
+        '''Return a safe, best-effort NVMe mount snippet for validator stores.
 
-        Validators only -- `install()`'s `hosts` is `manager.hosts(flat=True)`,
-        which never includes the metrics-collector (see instance.py); the
-        collector stays on plain `c5.xlarge`/EBS and runs no node.
-
-        Idempotent and safe to re-run: guarded by `mountpoint -q /mnt/db` so
-        an already-mounted disk is never reformatted. The whole detect/format/
-        mount sequence is wrapped in a subshell ending in `true` (its exit
-        status is therefore always 0, but note there is no top-level `|| true`
-        after the closing paren -- see below) so a detection or format/mount
-        failure never aborts the `&&`-chained command list `install()` splices
-        this into. This snippet's own job is now best-effort (a failed mount
-        just leaves nothing at /mnt/db); provisioning /mnt/db itself as a
-        directory the ssh user can write to is a separate, REQUIRED step
-        `install()` runs immediately after this snippet (see its own comment
-        there) -- so a mount failure is no longer silently papered over, it
-        surfaces as that later step's `test -w` failing loudly.
-
-        On the `|| true` placement: a bare trailing `|| true` on this
-        snippet's own returned string, spliced into `' && '.join(cmd)`, would
-        do far more than make ITS OWN failure non-fatal. POSIX AND-OR lists
-        are left-associative with no precedence between `&&` and `||`, so
-        `A && B && (snippet) || true && D` parses as
-        `((((A && B) && (snippet)) || true) && D)` -- the `|| true` also
-        rescues A and B (e.g. a failing `sudo apt-get update`/`install`)
-        rather than just this snippet, and `install()` would then report
-        success on a testbed that never got its dependencies. Verified
-        empirically: `/bin/sh -c 'false && (echo B) || true && echo C'`
-        prints `C` and exits 0 even though the leading `false` failed. Ending
-        the subshell with `true` INSIDE the parens instead gives the
-        subshell its own always-0 exit status without any top-level `||`, so
-        a preceding command's failure still fails the whole chain.
-
-        Detection: the instance-store NVMe disk is whichever disk is NEITHER
-        the root device NOR already carrying a filesystem/mountpoint of its
-        own (its own OR any of its partitions' -- see the per-device check
-        below). The root device is resolved via `findmnt`/`lsblk -no PKNAME`
-        (the ACTUAL block device backing `/`, whatever its partition layout)
-        rather than assumed to be a fixed name like `nvme0n1`: on a
-        partitioned root (GPT/UEFI, e.g. a `nvme0n1p1` root partition on
-        `nvme0n1`), `lsblk -d`'s disk-level MOUNTPOINT column for `nvme0n1`
-        itself is EMPTY (only the partition is mounted) -- the per-device
-        check below, which inspects every row `lsblk` reports for a disk (not
-        just the disk's own row), catches this case on its own by seeing the
-        partition's mountpoint, but the root device is still excluded
-        explicitly here too, as a safety net that does not depend on that
-        reasoning holding for every AMI/partitioning scheme.
-
-        Per-device MOUNTPOINT/FSTYPE check, not a single 3-column `awk` pass:
-        `lsblk -o NAME,MOUNTPOINT,TYPE` with an empty MOUNTPOINT collapses
-        under awk's default (whitespace-run) field splitting -- an empty
-        middle column isn't an empty field, it's simply not there, so the row
-        has 2 tokens, not 3, and a `$3=="disk"` test never matches it (verified
-        empirically against real `awk`). Candidate disks are therefore probed
-        with separate single-column `lsblk` calls instead, each immune to that
-        collapse since there is only one column to (not) split -- and each run
-        WITHOUT `head -1`: `lsblk -n -o MOUNTPOINT "$d"`/`lsblk -n -o FSTYPE
-        "$d"` list one row per partition of `$d`, not just `$d` itself, and
-        `head -1` reads only the whole-disk row, whose MOUNTPOINT/FSTYPE are
-        empty on any partitioned disk regardless of whether its partitions are
-        in use -- so a non-root disk with mounted partitions (or one that
-        merely carries a filesystem, no partitions needed) would pass that
-        test as "free" and get `mkfs.ext4 -F`'d over live data. Rejecting a
-        candidate if `grep -q .` matches ANY row of either column closes that
-        hole: a disk is only a candidate if NOTHING on it -- itself or any
-        partition -- is mounted or formatted.
-
-        If found: mkfs.ext4 + mount at /mnt/db + chown to the ssh user. If not
-        found (e.g. `fab create` was pointed at a non-`d` instance type): do
-        nothing here -- `install()`'s own required step right after this
-        snippet still provisions /mnt/db as a plain EBS-root directory, so the
-        store path resolves either way.
-
-        KNOWN LIMITATION of the never-touch-a-formatted-disk rule above: an
-        instance store that THIS snippet already formatted on an earlier
-        `install()`, and which is no longer mounted (only reachable by
-        rebooting a validator -- the mount is not in /etc/fstab, and a
-        stop/start hands back a blank device instead), now carries ext4 and is
-        therefore rejected as a candidate. A re-`install()` in that state
-        silently falls back to the plain-EBS-root directory rather than
-        re-mounting (or re-formatting) the NVMe disk: store I/O quietly
-        returns to EBS speed. That is the deliberate trade: re-`mkfs.ext4 -F`
-        of any disk that already holds a filesystem is exactly the data-loss
-        hole this rule closes, and it is not worth reopening for a state that
-        also throws away the store's contents anyway. Recreate the testbed
-        (`fab destroy` + `fab create` + `fab install`) rather than rebooting a
-        validator if you need the NVMe store back. '''
+        The root disk and any disk with a filesystem or mount are excluded.
+        A mount failure leaves the required writable store directory check to
+        `install()`.'''
         base = PathMaker.REMOTE_STORE_BASE
         user = self.settings.username
         return (
@@ -348,13 +213,7 @@ class Bench:
         )
 
     def install(self):
-        ''' Prepare all machines to run the node/benchmark_client binaries.
-
-        Default (self.source_build == False): fetch-binary mode -- minimal
-        runtime dependencies only (no Rust toolchain, no source tree; the
-        binaries themselves are downloaded per-run by `_update`, see below).
-        `--source-build`: the original behavior -- full build toolchain, then
-        rsync the working tree so `_update` can compile remotely. '''
+        '''Install dependencies and prepare hosts for benchmark binaries.'''
         hosts = self.manager.hosts(flat=True)
         print(hosts)
 
@@ -562,47 +421,10 @@ class Bench:
     RELEASE_BINARIES = ('node', 'benchmark_client')
 
     def _check_binary_provenance(self, release_repo, allow_stale_binary):
-        ''' BINARY-PROVENANCE CHECK (fetch-binary deploy path only) --------
-        Why this exists: `_update`'s fetch-binary branch below downloads
-        `node`/`benchmark_client` from the `nightly` GitHub release tag, and
-        that tag is MUTABLE -- docker.yml's "Update nightly release" step
-        overwrites the same tag on every push to `main`. There is no
-        checksum on the download and no version/commit baked into either
-        binary (no GIT_SHA, no `git rev-parse`, no `--version`, no vergen
-        anywhere in this repo), and `curl -fL` only fails loudly on a
-        genuinely MISSING asset -- a STALE one (still the previous commit's
-        build, because docker.yml's ~12-minute build for the CURRENT commit
-        hasn't finished yet, or was never triggered for it) downloads and
-        `chmod +x`s without complaint. The campaign then silently measures
-        the wrong code.
+        '''Verify that the release commit matches the local checkout.
 
-        This is worse than an ordinary stale-binary risk because
-        `config::Parameters` (config/src/lib.rs) has no
-        `#[serde(deny_unknown_fields)]`: a stale binary does not error out
-        on a parameter it doesn't recognize, it just silently ignores it.
-        Concretely, `mimic_latency_ms` was added recently -- a stale binary
-        predating that field would run with NO latency injection while
-        .parameters.json says e.g. 100, and nothing would report the
-        discrepancy; the campaign's results would simply be wrong.
-
-        Mechanism: docker.yml also uploads a `commit.txt` asset (the
-        `${{ github.sha }}` that produced the binaries) to the SAME
-        `nightly` release. Fetched here with a LOCAL curl -- on the
-        coordinator, BEFORE anything is deployed to the instances, so a
-        mismatch is caught before it can taint a run -- and compared against
-        the local working tree's own HEAD commit (`git rev-parse HEAD`,
-        run in the repo root).
-
-          - Match: the release is current, proceed silently.
-          - Mismatch: hard failure (`BenchError`) naming both SHAs, UNLESS
-            `allow_stale_binary` is set, in which case it is downgraded to
-            a `Print.warn` -- the explicit, opt-in escape hatch for someone
-            who has already confirmed the drift doesn't matter for what
-            they're about to run.
-          - `commit.txt` missing/unfetchable (e.g. an older release
-            published before this check existed): NOT a hard failure --
-            `Print.warn` and continue. Provenance being unverifiable must
-            never break an otherwise-working deploy. '''
+        A mismatch raises `BenchError` unless `allow_stale_binary` is true.
+        An unavailable commit marker warns and continues.'''
         local_head = subprocess.run(
             ['git', 'rev-parse', 'HEAD'],
             cwd=self._repo_root(), capture_output=True, text=True,
@@ -690,10 +512,7 @@ class Bench:
                     )
                 )
 
-            # BINARY-PROVENANCE CHECK: verify the nightly release actually
-            # corresponds to this working tree's HEAD before deploying
-            # anything -- see `_check_binary_provenance`'s docstring for why
-            # (silent staleness would otherwise invalidate the measurement).
+            # Verify the release commit before deploying binaries.
             self._check_binary_provenance(release_repo, allow_stale_binary)
 
             repo_name = self.settings.repo_name
@@ -716,13 +535,7 @@ class Bench:
             g.run(' && '.join(cmd), hide=True)
 
     def _config(self, hosts, hosts_private, node_parameters, bench_parameters):
-        ''' `hosts`: PUBLIC IPs -- used only to reach each instance over SSH
-        (config upload below). `hosts_private`: PRIVATE (VPC-internal) IPs,
-        index-aligned with `hosts` (same `_select_hosts`/`_select_hosts_config`
-        selection, same order) -- these become the Committee's addresses,
-        i.e. what nodes and collocated clients actually dial each other on.
-        Same-region node<->node/client<->node traffic over public IPs is
-        billed cross-instance data transfer and collapses throughput. '''
+        '''Build and upload configuration using public SSH and private wire IPs.'''
         Print.info('Generating configuration files...')
 
         # Cleanup all local configuration files.
@@ -786,27 +599,10 @@ class Bench:
         return committee
 
     def deploy_monitoring(self, committee_json, faults=0):
-        ''' METRICS-COLLECTOR-PREP step 2: install + start Prometheus on the
-        dedicated metrics-collector instance (instance.py's COLLECTOR_NAME),
-        scraping every validator's primary+worker metrics endpoint over the
-        PRIVATE VPC ip at 1s intervals (see
-        `config.generate_collector_scrape_config`'s docstring for why PRIVATE,
-        not the committee's own public 'metrics' field).
+        '''Deploy Prometheus and Grafana on the metrics collector.
 
-        `committee_json`: the raw committee dict (`.committee.json`'s shape --
-        either loaded straight off disk or a live `Committee`'s `.json`
-        attribute); `faults`: same slice-out-the-faulty-nodes convention as
-        `_config`'s own upload step.
-
-        Docker (`apt-get install docker.io` + `prom/prometheus` image) rather
-        than the raw Prometheus binary: one apt package + one image pull, no
-        manual arch/version bookkeeping, and idempotent on redeploy (`docker rm
-        -f` tolerates a container that's already there) -- the same tradeoff
-        starfish's own monitoring/docker-compose.yml already makes locally.
-
-        No-op (with a warning) if no collector instance exists (`fab create`
-        predates this feature, or it's still booting) -- monitoring is
-        additive, never required for the benchmark itself. '''
+        Uses private validator metrics addresses. Missing collectors produce a
+        warning and do not stop the benchmark.'''
         collector = self.manager.collector_host()
         if collector is None:
             Print.warn(
@@ -834,28 +630,11 @@ class Bench:
         c.run(install_cmd, hide=True)
         c.put(local_path, 'prometheus.yml')
 
-        # User-defined bridge network shared by prometheus + grafana below:
-        # Docker's embedded DNS resolves sibling container NAMES on such a
-        # network (unlike the default bridge), which is what lets the
-        # checked-in monitoring/grafana/datasource.yaml's `url:
-        # http://prometheus:9090` work here completely unmodified -- see the
-        # Grafana section below. `|| true`: idempotent redeploy onto an
-        # already-running collector (e.g. between sweep points).
+        # Share a user-defined network so Grafana resolves Prometheus by name.
         c.run('sudo docker network create monitor-net || true', hide=True)
 
         run_cmd = ' && '.join([
-            # Idempotent: tolerates redeploying onto the same, already-running
-            # collector (e.g. between back-to-back campaigns against the same
-            # testbed). `docker rm -f` only removes the CONTAINER, never a
-            # named volume -- the TSDB itself lives in the `prometheus-data`
-            # named volume mounted at `/prometheus` (Prometheus's own default
-            # `--storage.tsdb.path`) below, so an earlier campaign's samples
-            # survive this redeploy and stay queryable (subject to
-            # `--storage.tsdb.retention.time=7d`) for the whole coordinator
-            # session -- this is what makes `_record_run_window`'s "still
-            # reconstructable from the collector, pre-`fab destroy`" recovery
-            # path actually hold across multiple `fab campaign` calls, not
-            # just within one.
+            # Keep the TSDB volume when replacing the Prometheus container.
             'sudo docker rm -f prometheus || true',
             'sudo docker run -d --name prometheus --restart unless-stopped '
             '--network monitor-net '
@@ -871,25 +650,7 @@ class Bench:
             f'(http://{collector_public_ip}:{InstanceManager.MONITOR_PORT})'
         )
 
-        # METRICS-COLLECTOR-STEP-GRAFANA: browse-able dashboard on the
-        # collector itself, no laptop-side docker-compose stack required.
-        # Reuses the repo's own local monitoring kit (monitoring/grafana/*)
-        # VERBATIM -- same datasource uid (Fixed-UID-vantage, load-bearing:
-        # every panel in grafana-dashboard.json hardcodes it, see
-        # datasource.yaml's own comment) and the same dashboard JSON the
-        # local docker-compose stack serves at localhost:3003. Its `url:
-        # http://prometheus:9090` already resolves correctly here: this
-        # collector's own "prometheus" container (started above) sits on
-        # the same `monitor-net` user-defined network, so no edit to the
-        # checked-in yaml is needed -- the identical file that targets the
-        # local compose stack's "prometheus" service targets this
-        # collector's own container, unmodified.
-        #
-        # Best-effort, wrapped separately from the Prometheus deploy above:
-        # a Grafana failure must not be reported as "monitoring deploy
-        # failed" when Prometheus (the metrics themselves) came up fine --
-        # see run()'s own best-effort wrapping of this whole method for the
-        # analogous reasoning one level up.
+        # Deploy the repository dashboard beside Prometheus.
         try:
             grafana_dir = join(self._repo_root(), 'monitoring', 'grafana')
             with open(join(grafana_dir, 'grafana-dashboard.json'), 'r') as f:
@@ -900,16 +661,7 @@ class Bench:
             c.put(join(grafana_dir, 'grafana-dashboard.json'), 'grafana-dashboard.json')
 
             home = f'/home/{self.settings.username}'
-            # GRAFANA-ADMIN-PASSWORD: instance.py opens GRAFANA_PORT to
-            # 0.0.0.0/0 and ::/0 -- world-open BY DESIGN, so anyone on the
-            # team can browse the dashboard straight from a laptop -- which
-            # means the image's own default admin/admin login would accept
-            # logins from the whole internet, and Grafana's datasource proxy
-            # is then an SSRF pivot into the VPC. A random password per
-            # deploy (never persisted, only printed below) closes that
-            # without narrowing the port itself. Sign-up is also disabled --
-            # irrelevant with anonymous Viewer access below, but a
-            # wrong-default worth closing explicitly.
+            # Use a random admin password because the dashboard port is public.
             grafana_admin_password = secrets.token_urlsafe(12)
             grafana_cmd = ' && '.join([
                 'sudo docker rm -f grafana || true',
@@ -942,39 +694,10 @@ class Bench:
         return collector_public_ip
 
     def fetch_collector_metrics(self, start=None, end=None, step='1s', subdir=None):
-        ''' METRICS-COLLECTOR-PREP step 3: pull the key series (COLLECTOR_QUERIES,
-        module-level above) off the metrics-collector's Prometheus HTTP API and
-        write each as JSON under PathMaker.collector_metrics_path()
-        ('collector-metrics/', a sibling of logs/ and results/ -- see that
-        method's docstring for why it must NOT live under logs/)/<name>.json,
-        so post-run analysis has the comprehensive metrics locally instead of
-        re-querying the (about to be `fab destroy`ed) collector.
+        '''Fetch collector series as JSON.
 
-        `start`/`end` (unix seconds, both or neither): give both for a
-        `query_range` covering the run window (e.g. one rate point's own
-        boot-to-kill window, or the whole campaign's) at `step` resolution;
-        omit both for an instant `query` (Prometheus's last-known value per
-        series). An instant query goes stale the moment more than
-        Prometheus's 5-minute lookback has elapsed since the series was last
-        scraped (e.g. the nodes it was scraping have since been killed) --
-        every value silently comes back `[]`, not an error -- so callers
-        that already know their window (the per-rate-point call and the
-        end-of-campaign call in `run()`, both below) MUST pass `start`/`end`
-        rather than rely on the instant-query fallback.
-
-        `subdir`: routes output to collector_metrics_path()/<subdir>/<name>.json
-        instead of the flat collector_metrics_path()/<name>.json -- see
-        `PathMaker.collector_metrics_dir`'s docstring. None (default) is the
-        flat layout, used by the standalone `fab fetch-metrics` task; `run()`
-        below passes a campaign-and-protocol-qualified subdir for BOTH the
-        per-rate-point call and its own end-of-campaign call, so neither a
-        later rate point nor a later campaign against the same testbed can
-        overwrite an earlier one's series files.
-
-        Best-effort per series -- one query failing (collector API briefly
-        unreachable, a series that was never observed into on this run, or a
-        non-JSON response body) prints a warning and continues rather than
-        aborting the whole export, same convention as `scrape_metrics`. '''
+        Pass `start` and `end` together for a range query. Without them, use
+        an instant query. A failed series warns and does not stop the export.'''
         collector = self.manager.collector_host()
         if collector is None:
             Print.warn('No metrics-collector instance found; nothing to fetch')
@@ -987,10 +710,7 @@ class Bench:
         for name, promql in COLLECTOR_QUERIES.items():
             try:
                 body = prometheus_query(base_url, promql, start=start, end=end, step=step)
-            # ValueError also covers json.JSONDecodeError (a subclass): a 200
-            # response with a non-JSON body must be skipped the same as a
-            # transport failure, not left to crash the remaining series of
-            # this fetch.
+            # Skip invalid responses and continue with the remaining series.
             except (URLError, OSError, ValueError) as e:
                 Print.warn(f'Failed to fetch {name!r} ({promql!r}) from {base_url}: {e}')
                 continue
@@ -999,34 +719,10 @@ class Bench:
         Print.heading(f'Wrote collector metrics to {out_dir}')
 
     def _report_nic_peak(self, subdir):
-        ''' PER-RATE-POINT NIC-SATURATION VERDICT: read back this point's
-        just-written bytes_sent_rate_by_host.json (a query_range response --
-        data.result[] each with .metric.host and .values == [[ts, "v"], ...],
-        "v" a string per Prometheus's own JSON encoding) and print the single
-        peak per-HOST send rate observed anywhere in the window, so whether
-        this point pegged the NIC is visible inline in the campaign log
-        without waiting for post-hoc analysis.
+        '''Report peak wire transmit rate per physical host.
 
-        Aggregated by `host` (one series per physical instance/NIC), NOT by
-        `node` (one series per primary/worker PROCESS): under the campaign's
-        `collocate: True`, an authority's primary and its worker are two
-        processes sharing one instance and one NIC, so a per-`node` max only
-        ever sees one of the two processes' share of that NIC's traffic and
-        understates the instance's actual total (see
-        `config.generate_collector_scrape_config`'s docstring for the
-        `node`-vs-`host` label distinction).
-
-        `self.settings.instance_type` (the c5/c5d.xlarge family this harness
-        currently uses, see settings.json) has a NIC baseline of ~1.25 Gbps
-        (~156 MB/s decimal) -- a peak near that is the signature of NIC
-        saturation, not a consensus/store bottleneck. `mb_s` uses the same
-        decimal (1e6) convention as that baseline, not the binary 1024*1024
-        MiB one, so the two numbers are directly comparable.
-
-        Missing/malformed file: `Print.warn`s and returns rather than
-        raising -- the caller (`run()`) also wraps this together with the
-        fetch itself in one best-effort try/except, so a bad read here never
-        breaks the sweep. '''
+        The metric file is Prometheus query-range JSON. Missing or malformed
+        data produces a warning and returns.'''
         path = PathMaker.collector_metrics_file('bytes_sent_rate_by_host', subdir)
         try:
             with open(path, 'r') as f:
@@ -1052,41 +748,10 @@ class Bench:
         )
 
     def _record_run_window(self, n, rate, protocol, campaign, start, end):
-        ''' RUN-WINDOWS LOG: append (or, on a rerun of the exact same point OF
-        THE SAME CAMPAIGN, update in place) this rate point's wall-clock
-        window to collector_metrics_path()/run-windows.json -- a flat JSON
-        list of {nodes, rate, protocol, campaign, start, end} entries, one
-        per rate point across the WHOLE coordinator session (read-modify-
-        write, not truncate-and-write, so two `fab campaign` calls back-to-
-        back against the same testbed both land in the same file).
+        '''Record a rate-point time window in `run-windows.json`.
 
-        `campaign`: the caller's own `campaign_subdir` tag (protocol +
-        campaign-start timestamp, see `run()`) -- included in the entry AND
-        folded into the in-place-update key alongside nodes/rate/protocol.
-        Without it, a SECOND campaign of the SAME protocol at the same
-        nodes/rate (e.g. two `vantage` campaigns run back-to-back for
-        comparison) would match the first campaign's entry on
-        (nodes, rate, protocol) alone and silently overwrite its window
-        bounds -- defeating the very recovery path this method exists for,
-        and exactly the collision `campaign_subdir` was introduced to
-        prevent for the per-point series files themselves (see
-        `fetch_collector_metrics`'s docstring). Two DIFFERENT protocols (or
-        the same protocol from two different campaigns) are therefore now
-        distinguished by `campaign` first and foremost, not by `protocol`
-        alone.
-
-        Purpose: even where the per-point `fetch_collector_metrics` call
-        above failed outright (collector briefly unreachable), the window
-        bounds are still on record, so a post-hoc `query_range` against the
-        collector (while it's still alive, pre-`fab destroy`) remains
-        reconstructable from this file alone -- this file lives under
-        `PathMaker.collector_metrics_path()` (a sibling of logs/, NOT nested
-        under it), so the local `rm -r logs` every rate point runs
-        (`_run_single`) never deletes it, and Prometheus's own TSDB now
-        survives a redeploy between campaigns via a named Docker volume (see
-        `deploy_monitoring`), so the window this file records for an earlier
-        campaign is still backed by live data when a later campaign's
-        `deploy_monitoring` call runs. '''
+        The run identifier distinguishes repeated points and supports later
+        range queries while the collector is available.'''
         path = join(PathMaker.collector_metrics_dir(), 'run-windows.json')
         windows = []
         if isfile(path):
@@ -1116,18 +781,11 @@ class Bench:
     def _run_single(self, rate, committee, bench_parameters, debug=False):
         faults = bench_parameters.faults
 
-        # Kill any potentially unfinished run and delete logs. SSH targets
-        # are the PUBLIC (physical-host) ips -- committee.ips() now returns
-        # the PRIVATE wire addresses, unreachable from the coordinator.
+        # Use public host addresses for SSH; committee addresses are private.
         hosts = committee.public_ips()
         self.kill(hosts=hosts, delete_logs=True)
 
-        # Clear stale LOCAL logs/metrics from a previous run now, not in
-        # `_logs()` after this run's `scrape_metrics()` calls below have
-        # already written this run's metrics-*.txt into the same directory
-        # (Phase 2 added those writes; `_logs()`'s cleanup predates them and
-        # otherwise deletes them again before `LogParser.process()` ever
-        # reads them, silently zeroing "real transaction latency" every run).
+        # Remove local logs before collecting this run's metric snapshots.
         cmd = CommandMaker.clean_logs()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
@@ -1193,7 +851,6 @@ class Bench:
         duration = bench_parameters.duration
         for i in progress_bar(range(20), prefix=f'Running benchmark ({duration} sec):'):
             tick_size = ceil(duration / 20)
-            #print(tick_size, i, bench_parameters.partition_start, bench_parameters.simulate_partition)
             if bench_parameters.simulate_partition and i*tick_size == bench_parameters.partition_start:
                 print('simulating partition')
                 self._simulate_partition(bench_parameters, committee, faults)
@@ -1204,8 +861,7 @@ class Bench:
 
             sleep(ceil(duration / 20))
 
-        # Scrape every node's Prometheus endpoint before killing it (PHASE2-SPEC.md #5)
-        # -- real transaction latency lives only in-process, not in the logs.
+        # Scrape metrics before stopping the nodes.
         Print.info('Scraping metrics...')
         for i, address in enumerate(committee.primary_metrics_addresses(faults)):
             scrape_metrics(address, PathMaker.metrics_primary_file(i))
@@ -1226,7 +882,6 @@ class Bench:
             if i < bench_parameters.partition_nodes:
                 print(i, address)
                 cmd = []
-                #cmd = ['sudo tc qdisc del dev ens4 root']
                 cmd.append('sudo tc qdisc add dev ens4 root handle 1: htb')
                 cmd.append('sudo tc class add dev ens4 parent 1: classid 1:1 htb rate 10gibps')
                 idx = 2
@@ -1243,24 +898,6 @@ class Bench:
                 g = Group(*ip, user=self.settings.username, connect_kwargs=self.connect)
                 g.run(' && '.join(cmd), hide=True)
         
-
-         
-        #hosts = committee.ips()
-        #cmd = ['sudo iptables -A OUTPUT -d ' + ip + ' -j DROP' for ip in partition_ips]
-        #cmd = ['sudo tc qdisc add dev ens4 root netem delay 5000ms']
-        
-        #g = Group(*partition_ips, user='neilgiridharan', connect_kwargs=self.connect)
-        #g.run(' && '.join(cmd), hide=True) 
-        
-        #for i, address in enumerate(committee.primary_addresses(faults)):
-        
-        #host = Committee.ip(address)
-        #for partition_ip in partition_ips:
-        #cmd = 'sudo iptables -A OUTPUT -d ' + partition_ip + '-j DROP'
-        
-        ##log_file = PathMaker.primary_log_file(i)
-        #self._background_run(host, cmd, log_file)
-    
     def _delete_partition(self, bench_parameters, committee, faults):
         # Same PUBLIC-for-SSH note as `_simulate_partition` above.
         primary_public_ips = committee.primary_public_ips(faults)
@@ -1270,19 +907,6 @@ class Bench:
                 cmd = ['sudo tc qdisc del dev ens4 root']
                 g = Group(*partition_ips, user=self.settings.username, connect_kwargs=self.connect)
                 g.run(' && '.join(cmd), hide=True)
-
-       
-        #hosts = committee.ips()
-        #cmd = ['sudo iptables -F']
-        #cmd = ['sudo tc qdisc del dev ens4 root']
-        #g = Group(*partition_ips, user='neilgiridharan', connect_kwargs=self.connect)
-        #g.run(' && '.join(cmd), hide=True) 
-        
-        #for i, address in enumerate(committee.primary_addresses(faults)):
-        #    host = Committee.ip(address)
-        #    cmd = 'sudo iptables -F'
-        #    log_file = PathMaker.primary_log_file(i)
-        #    self._background_run(host, cmd, log_file)
 
     def _logs(self, committee, faults, duration=None):
         # NOTE: local logs/metrics are cleared in `_run_single` now (before
@@ -1319,9 +943,7 @@ class Bench:
                 local=PathMaker.primary_log_file(i)
             )
 
-        # Parse logs and return the parser. `duration` (the campaign's
-        # configured run length) is the denominator for the prometheus-based
-        # committed TPS (PREP FIX 3) when given.
+        # Parse logs; `duration` is the TPS denominator when provided.
         Print.info('Parsing logs and computing performance...')
         return LogParser.process(
             PathMaker.logs_path(), faults=faults, duration=duration
@@ -1330,10 +952,7 @@ class Bench:
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
         Print.heading('Starting remote benchmark')
-        # CAMPAIGN WINDOW: wall-clock start of the whole campaign (epoch
-        # seconds, must line up with Prometheus's own timestamps) -- paired
-        # with `campaign_end` at the bottom of this method for the
-        # end-of-campaign `fetch_collector_metrics` call's query_range.
+        # Record the run window in Unix seconds for Prometheus range queries.
         campaign_start = time.time()
         try:
             bench_parameters = BenchParameters(bench_parameters_dict)
@@ -1341,18 +960,7 @@ class Bench:
         except ConfigError as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
-        # CAMPAIGN-METRICS DISCRIMINATOR: every collector export this `run()`
-        # call writes (per-rate-point AND its own end-of-campaign convenience
-        # export, both below) is namespaced under this subdirectory instead
-        # of a flat/point-only name, so a SECOND `Bench.run()` against the
-        # same testbed -- e.g. back-to-back campaigns run for comparison --
-        # can never silently overwrite the first campaign's JSON
-        # (`fetch_collector_metrics` opens every file with 'w'). Keyed on
-        # protocol + this campaign's own start time (UTC, second resolution)
-        # rather than protocol alone, so even two campaigns of the SAME
-        # protocol run back-to-back stay distinct. Also passed to
-        # `_record_run_window` below as its own `campaign` discriminator, for
-        # the same reason applied to run-windows.json's entries.
+        # Namespace collector exports by protocol and run start time.
         campaign_subdir = (
             f"{node_parameters.json.get('protocol', 'unknown')}-"
             f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(campaign_start))}"
@@ -1397,12 +1005,7 @@ class Bench:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to configure nodes', e)
 
-        # METRICS-COLLECTOR-PREP: deploy the dedicated metrics-collector's
-        # Prometheus (scraping every validator over its PRIVATE ip, see
-        # `deploy_monitoring`'s docstring). Best-effort/non-fatal -- an older
-        # testbed with no collector instance, or a transient SSH hiccup while
-        # installing Docker, must not abort the whole campaign: monitoring is
-        # additive, not required for the benchmark itself to run.
+        # Monitoring is best-effort and does not gate the benchmark.
         try:
             self.deploy_monitoring(committee.json, faults=bench_parameters.faults)
         except Exception as e:
@@ -1413,22 +1016,13 @@ class Bench:
             committee_copy = deepcopy(committee)
             committee_copy.remove_nodes(committee.size() - n)
 
-            # CHANGE A (rate-sweep early stop on committed-TPS turnover):
-            # running PEAK committed TPS seen so far in THIS node count's
-            # rate sweep (reset per `n`, since saturation is a function of
-            # committee size). `None` until the first rate point with a
-            # usable committed-TPS reading.
+            # Track the peak committed TPS for this node count.
             peak_committed_tps = None
 
             for r in bench_parameters.rate:
                 Print.heading(f'\nRunning {n} nodes (input rate: {r:,} tx/s)')
 
-                # PER-RATE-POINT PROMETHEUS WINDOW (kills the end-of-campaign
-                # staleness bug, see `fetch_collector_metrics`'s docstring):
-                # wall-clock bounds spanning this point's boot(s) through its
-                # final kill below, used for a query_range fetch scoped to
-                # exactly this point instead of the campaign-wide instant
-                # query the harness used to rely on.
+                # Query metrics over this rate point's wall-clock window.
                 point_start = time.time()
 
                 # Run the benchmark.
@@ -1453,13 +1047,7 @@ class Bench:
                             bench_parameters.tx_size,
                         ))
 
-                        # CHANGE A: this run's committed TPS (prometheus-
-                        # derived, see logs.py's `committed_tps`), for the
-                        # early-stop decision below. `None`/0 (nothing
-                        # committed/scraped, or no duration) is dropped, not
-                        # treated as a real 0 tx/s reading -- a run that
-                        # failed to produce a usable number must not look
-                        # like a genuine collapse to the peak-relative check.
+                        # Use committed TPS when available for early stopping.
                         tps = logger.committed_tps()
                         if tps is not None and tps > 0:
                             run_committed_tps.append(tps)
@@ -1472,21 +1060,7 @@ class Bench:
 
                 point_end = time.time()
 
-                # PER-RATE-POINT METRICS FETCH: query_range over exactly
-                # [point_start, point_end] (5s resolution -- fine enough for
-                # a 60-300s window without ballooning the JSON), into this
-                # point's own subdirectory (nested under this campaign's own
-                # `campaign_subdir`, see above) so per-point series never
-                # overwrite another point's, AND a same-named point from a
-                # different campaign against the same testbed never
-                # overwrites this one's (B2 fix). Best-effort, same
-                # non-fatal-to-the-sweep convention as `deploy_monitoring`'s
-                # own wrapping in this method -- one point's collector
-                # hiccup must not abort the remaining rate sweep. The NIC
-                # verdict read-back is folded into the same try/except: it
-                # depends on the fetch having just written that point's
-                # bytes_sent_rate_by_host.json, so a failed fetch already
-                # skips it via the exception.
+                # Fetch and report this point's collector metrics.
                 point_subdir = join(campaign_subdir, f'{n}nodes-{r}rate')
                 try:
                     self.fetch_collector_metrics(
@@ -1500,10 +1074,7 @@ class Bench:
                         f'for {n} nodes / rate={r:,}: {e}'
                     )
 
-                # RUN-WINDOWS LOG: record this point's window regardless of
-                # whether the fetch above succeeded (see
-                # `_record_run_window`'s docstring) -- separate try/except so
-                # a failure here never masks/duplicates the warning above.
+                # Record the window even when metric fetching fails.
                 try:
                     self._record_run_window(
                         n, r, node_parameters.json.get('protocol'), campaign_subdir,
@@ -1515,15 +1086,7 @@ class Bench:
                         f'rate={r:,}: {e}'
                     )
 
-                # CHANGE A: peak-relative early stop. This rate's
-                # representative committed TPS is the AVERAGE across its
-                # `runs` (documented choice -- smooths a single noisy run
-                # without discarding the others; with the campaign's default
-                # `runs=1` this is just that one run's number). Skipped
-                # entirely (no peak update, no stop check) if every run at
-                # this rate failed to parse or produced no usable committed-
-                # TPS reading -- a parse failure must never be read as a
-                # throughput collapse, and must never crash the sweep.
+                # Use the mean committed TPS across successful runs.
                 if run_committed_tps:
                     point_tps = mean(run_committed_tps)
                     if peak_committed_tps is None:
@@ -1542,25 +1105,9 @@ class Bench:
                         )
                         break
 
-        # METRICS-COLLECTOR-PREP step 3: pull the comprehensive metrics off the
-        # collector now, before `fab destroy` terminates it. `start`/`end`
-        # span the WHOLE campaign (not an instant query -- see
-        # `fetch_collector_metrics`'s docstring on why that goes stale) as a
-        # convenience full-campaign export layered on top of the
-        # per-rate-point fetches above (which already cover every point
-        # precisely); this is the belt to their suspenders, e.g. for a
-        # single query spanning point boundaries. `subdir=campaign_subdir`
-        # (same discriminator as the per-point fetches above, B2 fix): without
-        # it this call writes the FLAT collector-metrics/<name>.json, which a
-        # second campaign against the same testbed would silently overwrite.
-        # Best-effort/non-fatal for the same reason as the deploy step above.
+        # Fetch a run-wide metrics export before the collector is destroyed.
         campaign_end = time.time()
-        # Keep well under Prometheus's ~11,000-points-per-series query_range
-        # cap regardless of how long this campaign ran: at the default 1s
-        # step that cap is ~3h03m; widening the step for longer windows (10k
-        # points' worth) avoids a wholesale 422 on this convenience export
-        # without materially losing resolution (the per-point fetches above
-        # already cover every rate point at a fixed, fine 5s step).
+        # Widen the step for long runs to stay below Prometheus's point limit.
         campaign_step = max(1, ceil((campaign_end - campaign_start) / 10_000))
         try:
             self.fetch_collector_metrics(

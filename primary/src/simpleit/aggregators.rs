@@ -1,50 +1,6 @@
-// Simple-IT cut-consensus vote aggregators (stage 1 of a port from the upstream
-// `simpleit/Opt-Mempool-Simple-IT-Failure` branch's primary/src/aggregators.rs).
+// Vote and timeout aggregators for Simple-IT.
 //
-// Ported (exact upstream line ranges noted per aggregator below): `CutVoteAggregator`,
-// `DecideAggregator`, `TimeoutAggregator`, `TimeoutAcceptAggregator`. Everything else in
-// upstream aggregators.rs (`VoteAggregator`, `QCMaker`, `TCMaker`, ...) is Autobahn
-// residue or shared substrate and is intentionally left out -- see
-// primary/src/simpleit/mod.rs.
-//
-// Deviations from upstream beyond the module-wide ones documented in mod.rs:
-//
-//   - `impl Default` is added for all four aggregators (in terms of `new()`; zero
-//     behavior change). Upstream's `aggregators` module is private (`mod aggregators;`
-//     in that branch's primary/src/lib.rs), so these types are not part of its crate's
-//     public API and `clippy::new_without_default` never considers them. This module
-//     is `pub mod` end to end (a stage-1 requirement, so the not-yet-written state
-//     machine can reach every item without `#[allow(dead_code)]`), which makes these
-//     types genuinely public and brings them back into that lint's scope; implementing
-//     `Default` is the fix it asks for, not a suppression.
-//
-//   - `CutVoteAggregator::append` cannot call `committee.optimistic_threshold()`:
-//     this repo's `config::Committee` (config/src/lib.rs) carries no `f_num` field and
-//     has no `optimistic_threshold` method -- only `quorum_threshold`/
-//     `validity_threshold`/`fast_threshold`, each derived purely from total stake.
-//     Adding the method to `config::Committee` is out of scope (only
-//     `primary/src/lib.rs` may be touched among existing files), so `optimistic_threshold`
-//     is reproduced below as a private free function computing the identical formula,
-//     with `f` derived from total stake the same implicit way `quorum_threshold`/
-//     `validity_threshold` already do (`f = (n - 1) / 3`, i.e. `n = 3f + 1`). See its
-//     doc comment for the worked values and the (strictly more defined) handling of
-//     degenerate committee sizes.
-//
-//   - BRACHA VARIANT ADDITION (separate task, separate upstream branch):
-//     `CutReadyAggregator` is ported from a DIFFERENT upstream branch,
-//     `simpleit/Bracha-Mempool-Simple-IT` (fetched as the same `simpleit` remote,
-//     read-only, never checked out/merged/applied -- primary/src/aggregators.rs:59-65
-//     (struct), 138-182 (impl) there), not from Opt-Mempool-Simple-IT-Failure like
-//     every other type in this file. It backs `engine::Variant::Bracha`. This
-//     addition also gives `CutVoteAggregator::append` an explicit `threshold`
-//     parameter: upstream's two branches each hardcode ONE threshold into their own,
-//     separately-shaped `CutVoteAggregator` (`mint_threshold` on
-//     Opt-Mempool-Simple-IT-Failure; `quorum_threshold`, returning a bare `bool`, no
-//     witness list, on Bracha-Mempool-Simple-IT); this port unifies both variants
-//     into one binary and one `CutVoteAggregator` type, so the one thing that must
-//     still vary (which threshold) is supplied by the caller
-//     (`engine::CutEngine::process_cut_vote`) instead of being duplicated into a
-//     second struct.
+// Aggregators deduplicate authors and return a threshold crossing to the engine.
 
 use crate::error::{DagError, DagResult};
 use crate::simpleit::messages::{
@@ -54,32 +10,12 @@ use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use std::collections::HashSet;
 
-/// Aggregates cut votes for one proposed cut, counted strictly FIRST-HAND: every
-/// `append` call verifies and dedups one individual `CutVote` this party itself
-/// received, and once the accumulated weight reaches `mint_threshold` this returns the
-/// exact set of voters counted, for the caller (`CutEngine::process_cut_vote`) to mark
-/// the round `safe` locally -- see `engine.rs`'s module doc comment ("FIGURE-2
-/// REWRITE") for why this replaces the removed `CutCertificate`: a certificate would
-/// let a party accept ANOTHER party's relayed claim about who voted, which this
-/// signature-free protocol cannot authenticate. This aggregator never does that --
-/// each party runs its own, over votes it individually verified. Upstream
-/// primary/src/aggregators.rs:56-60 (struct), 170-198 (impl) minted a `CutCertificate`
-/// at this same point instead; the counting logic below is otherwise unchanged.
-///
-/// Threshold: caller-supplied (see `append`'s own doc comment) -- `mint_threshold`
-/// (`max(optimistic_threshold, quorum_threshold)`) for `engine::Variant::Opt`,
-/// `quorum_threshold` for `engine::Variant::Bracha`. At n=3f+1 the optimistic term
-/// dominates from f >= 3 onwards: 7 at n=10, 40 at n=50.
+/// Aggregates individually verified cut votes and returns the authors counted when
+/// the caller-supplied threshold is reached.
 pub struct CutVoteAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
-    /// Every distinct author counted so far towards `mint_threshold`, in arrival
-    /// order. Returned (not merely counted) once the threshold is crossed: this is
-    /// the fetch-target set `CutEngine::mark_cut_safe` hands to `ensure_cut_fetch`
-    /// when this round's own `CutProposal` is still unknown -- the closest available
-    /// analogue to the removed `CutCertificate::votes`, but never transmitted or
-    /// trusted from a peer; it is this party's own first-hand record of who it
-    /// received a vote from.
+    /// Distinct authors counted in arrival order. Returned when the threshold is met.
     voters: Vec<PublicKey>,
 }
 
@@ -98,13 +34,7 @@ impl CutVoteAggregator {
         }
     }
 
-    /// `threshold`: the crossing point this census must reach before returning the
-    /// accumulated witnesses. BRACHA VARIANT ADDITION: this parameter (upstream's own
-    /// two branches each hardcode ONE threshold instead -- see this file's own module
-    /// doc comment). The caller (`engine::CutEngine::process_cut_vote`) passes
-    /// `aggregators::mint_threshold(committee)` for `engine::Variant::Opt` (unchanged
-    /// behavior from before this parameter existed) and `committee.quorum_threshold()`
-    /// for `engine::Variant::Bracha`.
+    /// `threshold` is the weight required to return the counted authors.
     pub fn append(
         &mut self,
         vote: &CutVote,
@@ -123,47 +53,14 @@ impl CutVoteAggregator {
     }
 }
 
-/// The threshold at which `CutVoteAggregator` marks a round safe under
-/// `engine::Variant::Opt` (Fig. 2's Mark-safe step, evaluated locally by each party
-/// rather than via a relayed certificate): `max(optimistic_threshold,
-/// quorum_threshold)`. `pub(super)`: `engine.rs` (stage 2) computes this at its own
-/// call site, alongside `Variant::Bracha`'s own `committee.quorum_threshold()` -- see
-/// `CutVoteAggregator::append`'s `threshold` parameter.
-///
-/// AUDIT FIX (finding predates the Fig.-2 rewrite; still load-bearing under it).
-/// Upstream mints at `optimistic_threshold` alone, but upstream's own
-/// `CutCertificate::verify` required `quorum_threshold`. Since `optimistic_threshold =
-/// ceil((5f-1)/2)` and `quorum_threshold = 2f+1` at n=3f+1, the former is STRICTLY
-/// SMALLER for f <= 2, only catching up once f reaches 3 (`ceil((5f-1)/2)` first
-/// reaches `2f+1` exactly at f = 3). Under the old certificate design, at those sizes
-/// the minting party rejected the certificate it had just built, so
-/// `sent_decide_rounds` was never set, no party ever sent a `Decide`, and the round
-/// could never commit. Under this design there is no separate verify step at all --
-/// `mint_threshold` IS the only safety gate a round ever passes through -- so an
-/// unclamped threshold would be worse, not merely inert: it would let a round be
-/// marked `safe` on fewer than a quorum's worth of first-hand votes. Concretely
-/// would-be-broken (unclamped optimistic term alone) at n = 4, 5, 6, 8, 9, 12 -- and
-/// n=4 is `fab remote`'s default committee size. Upstream only ever benchmarked n=10
-/// and n=50, where the optimistic term already dominates.
-///
-/// Clamping to `quorum_threshold` is the minimal sound fix: marking a round safe on
-/// fewer than 2f+1 first-hand votes is not a quorum and could not be safely acted on
-/// anyway. It is provably a no-op at every size we benchmark -- n=10 (max(7,7) = 7) and
-/// n=50 (max(40,34) = 40) -- so it cannot move any measured number.
+/// Uses the maximum of the optimistic and quorum thresholds so safety always requires
+/// a quorum.
 pub(super) fn mint_threshold(committee: &Committee) -> Stake {
     optimistic_threshold(committee).max(committee.quorum_threshold())
 }
 
-/// `optimistic_threshold` = ceil((n + 2f - 2) / 2), where n is total stake and f is
-/// derived as `(n - 1) / 3` (i.e. n = 3f+1) -- see the module doc comment above for why
-/// this is a free function rather than `committee.optimistic_threshold()`. Worked
-/// values: n=10, f=3 -> ceil(14/2) = 7. n=50, f=16 -> ceil(80/2) = 40.
-///
-/// `f` and the numerator are computed in `i64` and the numerator is clamped at 0 before
-/// the (now non-negative) division, so a degenerate committee (n<2) returns 0 rather
-/// than panicking on subtraction underflow. Upstream's own `Stake` (`u32`) arithmetic
-/// carries the identical underflow risk at those sizes; this is strictly more defined
-/// and never produces a different answer for any committee with n>=2.
+/// Computes the optimistic threshold with signed intermediate arithmetic so degenerate
+/// committees do not underflow.
 fn optimistic_threshold(committee: &Committee) -> Stake {
     let total_stake: i64 = committee
         .authorities
@@ -175,34 +72,11 @@ fn optimistic_threshold(committee: &Committee) -> Stake {
     ((numerator + 1) / 2) as Stake
 }
 
-/// Aggregates `CutReady` messages for one (round, cut) pair, counted strictly
-/// FIRST-HAND exactly like `CutVoteAggregator` above -- Bracha variant only
-/// (`engine::Variant::Bracha`; see `engine::CutEngine::process_cut_ready`). Same
-/// shape as `CutVoteAggregator` (weight/used/voters, returns the exact witness set on
-/// crossing threshold) -- a separate type rather than a shared generic one, matching
-/// this module's existing house style of one small dedicated aggregator per message
-/// kind (`DecideAggregator`/`TimeoutAggregator`/`TimeoutAcceptAggregator` below are
-/// none of them unified either, despite similarly-shaped bodies).
-///
-/// Threshold: always `quorum_threshold` (2f+1 at n=3f+1) -- unlike `CutVoteAggregator`,
-/// never `mint_threshold`: `CutReady` is Bracha-RBC's own SECOND echo round (arXiv:
-/// 2606.14404 Table 1/2 + Corollary 5, variant S), which has no "optimistic" shortcut
-/// of its own to clamp against (only the Opt-RBC variant's first echo round does --
-/// see `mint_threshold`'s doc comment). Upstream (`Bracha-Mempool-Simple-IT` branch)
-/// primary/src/aggregators.rs:59-65 (struct), 138-182 (impl) minted a `CutCertificate`
-/// at this same crossing point instead -- not ported, for the identical Fig.-2-rewrite
-/// reason `CutVoteAggregator`'s own doc comment gives for the Opt variant: a
-/// certificate lets a party accept another party's relayed claim about who sent a
-/// `CutReady`, which this signature-free protocol cannot authenticate. Each party
-/// counts its own, over `CutReady`s it individually verified.
+/// Aggregates individually verified `CutReady` messages for the Bracha variant.
 pub struct CutReadyAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
-    /// Every distinct author counted so far towards `quorum_threshold`, in arrival
-    /// order -- mirrors `CutVoteAggregator::voters` exactly: this is the fetch-target
-    /// set `CutEngine::mark_cut_safe` hands to `ensure_cut_fetch` when this round's
-    /// own `CutProposal` is still unknown, this party's own first-hand record of who
-    /// it received a `CutReady` from.
+    /// Distinct authors counted in arrival order. Returned when quorum is met.
     voters: Vec<PublicKey>,
 }
 
@@ -238,10 +112,7 @@ impl CutReadyAggregator {
     }
 }
 
-/// Aggregates `Decide` messages for one (round, cut) pair into a certified decision.
-/// Upstream primary/src/aggregators.rs:62-103.
-///
-/// Threshold: `quorum_threshold` (2f+1 at n=3f+1).
+/// Aggregates `Decide` messages for one round and cut until quorum.
 pub struct DecideAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,

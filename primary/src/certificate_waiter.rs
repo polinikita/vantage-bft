@@ -9,7 +9,6 @@ use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Waits to receive all the ancestors of a certificate before looping it back to the `Core`
-/// for further processing. Autobahn-only (spawned from `Primary::spawn`'s
 /// `AutobahnOptimistic`/`AutobahnSeamless` arm).
 pub struct CertificateWaiter {
     /// The persistent storage.

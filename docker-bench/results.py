@@ -137,9 +137,7 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         s.p50 = gauge_by_label(samples, "transaction_committed_latency", "v", "p50")
         s.p90 = gauge_by_label(samples, "transaction_committed_latency", "v", "p90")
         s.p99 = gauge_by_label(samples, "transaction_committed_latency", "v", "p99")
-    # Same gauge family shape as above, one histogram later in the pipeline: stops
-    # the clock when the block's payload is locally in hand (the starfish-comparable
-    # series -- metrics/src/snapshot.rs's own doc comment).
+    # Stop the clock when the block's payload is locally in hand.
     if gauge_by_label(samples, "transaction_materialised_latency", "v", "count"):
         s.m50 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p50")
         s.m90 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p90")
@@ -222,7 +220,7 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     the nodes' own `MetricReporter` gauge refresh, so the appended latency fields
     are exactly one tick old, never mid-window noise; `node local-benchmark
     --timeline`'s in-process printer stays at 1 Hz, so the two formats share the
-    first three fields but are no longer byte-identical), then a SUMMARY computed
+    first three fields but are no longer identical), then a SUMMARY computed
     from THIS watch's own first and last samples -- self-baselined, so it is correct
     regardless of how long the cluster had already been running before this call
     started (unlike a one-shot cumulative-total/externally-given-duration division;

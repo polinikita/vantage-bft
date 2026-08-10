@@ -31,7 +31,7 @@ impl Helper {
         store: Store,
         rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
         rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
-        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
@@ -55,7 +55,6 @@ impl Helper {
         loop {
             tokio::select! {
                 Some((digests, origin)) = self.rx_primaries_certs.recv() => {
-                    // TODO [issue #195]: Do some accounting to prevent bad nodes from monopolizing our resources.
 
                     // get the requestors address.
                     let address = match self.committee.primary(&origin) {
@@ -70,7 +69,6 @@ impl Helper {
                     for digest in digests {
                         match self.store.read(digest.to_vec()).await {
                             Ok(Some(data)) => {
-                                // TODO: Remove this deserialization-serialization in the critical path.
                                 let certificate = bincode::deserialize(&data)
                                     .expect("Failed to deserialize our own certificate");
                                 let bytes = bincode::serialize(&PrimaryMessage::Certificate(certificate))
@@ -83,7 +81,6 @@ impl Helper {
                     }
                 },
                 Some((digests, origin)) = self.rx_primaries_headers.recv() => {
-                    // TODO [issue #195]: Do some accounting to prevent bad nodes from monopolizing our resources.
 
                     // get the requestors address.
                     let address = match self.committee.primary(&origin) {
@@ -98,7 +95,6 @@ impl Helper {
                     for digest in digests {
                         match self.store.read(digest.to_vec()).await {
                                 Ok(Some(data)) => {
-                                    //TODO: Remove this deserialization-serialization in the critical path.
                                     let header = bincode::deserialize(&data)
                                         .expect("Failed to deserialize our own certificate");
                                     let bytes = bincode::serialize(&PrimaryMessage::Header(header, true))  //sync = true

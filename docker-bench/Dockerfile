@@ -32,10 +32,10 @@
 #
 #      The 8 COPY+touch pairs are ordered dependencies-before-dependents (crypto,
 #      store, metrics, config, network, primary, worker, node) rather than
-#      alphabetically or arbitrarily. This is load-bearing, not cosmetic: Docker's
+#      alphabetically or arbitrarily. The dependency order
 #      layer cache is a strict linear chain within one stage, so once any one
 #      COPY+touch pair is invalidated, EVERY pair after it in the Dockerfile is also
-#      forced to re-run (confirmed empirically -- an unrelated, byte-identical file
+#      forced to re-run when an earlier crate layer changes.
 #      copied two instructions later still shows as a cache miss, not a hit), even
 #      though nothing about ITS OWN input changed. Ordering the crates topologically
 #      turns that forced-forward cascade into exactly "this crate plus its transitive
@@ -86,7 +86,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=vantage-cargo-registr
     cargo build --manifest-path node/Cargo.toml --release --locked --features benchmark
 
 # ---- real sources: COPY + touch per crate, dependencies before dependents (see
-# header comment for why the order is load-bearing) ----
+# header comment for the dependency order) ----
 COPY crypto/src crypto/src
 RUN find crypto/src -exec touch {} +
 COPY store/src store/src

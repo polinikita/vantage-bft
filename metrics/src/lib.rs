@@ -1,8 +1,4 @@
-//! Starfish-parity measurement substrate (PHASE2-SPEC.md #5), shared by `primary` and
-//! `worker`. Ported minimally from `~/code/starfish/crates/starfish-core/src/{stat,
-//! metrics,prometheus}.rs` -- see each module's header for exactly what was kept and
-//! what was deliberately trimmed or swapped for this workspace's own infrastructure.
-//! The Phase-3+ Vantage core reuses this crate rather than a new one.
+//! Shared metrics substrate for primary and worker processes.
 
 pub mod metrics;
 pub mod prometheus;

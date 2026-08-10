@@ -1,16 +1,4 @@
-// Ported (minimally) from starfish (`~/code/starfish/crates/starfish-core/src/metrics.rs`,
-// Apache-2.0) for Starfish-parity real transaction latency (PHASE2-SPEC.md #5).
-//
-// Only the transaction-commit-latency slice Phase 2 needs is ported -- starfish's
-// `Metrics` also carries dozens of DAG/BLS/shard-reconstruction fields with no Autobahn
-// or Vantage equivalent yet; Phase 3+ (the Vantage core) extends this same struct with
-// whatever counters it needs rather than starting a parallel one.
-//
-// Deviation from starfish: gauge reporting uses `std::sync::Mutex` instead of
-// `parking_lot::Mutex` (avoids adding a dependency for a single low-contention lock:
-// the only reader/writer is the 10s reporter task; producers never touch it, they only
-// push onto `HistogramSender`'s channel) and `log::info!`/`log::error!` instead of
-// `tracing` (this workspace's existing logging stack throughout primary/worker/node).
+// Transaction latency, protocol, queue, and utilization metrics.
 
 use std::{
     ops::AddAssign,
@@ -21,36 +9,24 @@ use std::{
     time::Duration,
 };
 
-/// Process-wide panic tally, owned by `Metrics::install_panic_hook`'s singleton hook
-/// rather than by any one `Metrics` instance -- `node local-benchmark` runs N nodes,
-/// and therefore N registries, inside one process and one hook.
+/// Process-wide panic tally owned by the singleton panic hook.
 static PROCESS_PANICS: AtomicU64 = AtomicU64::new(0);
 
-/// How often `spawn_queue_sampler` reads every probe. 10 Hz: fast enough that a queue
-/// which fills and drains inside one publish interval still registers in the peak, cheap
-/// enough to be irrelevant (a handful of atomic loads per tick).
+/// Queue sampling interval. The sampler runs at 10 Hz.
 const QUEUE_SAMPLE_INTERVAL_MS: u64 = 100;
 
-/// How often `spawn_queue_sampler` publishes, in sample ticks. 1 s, matching the other
-/// progress gauges, so a dashboard reads them all on one cadence.
+/// Number of samples between queue publications.
 const QUEUE_PUBLISH_EVERY: u32 = 10;
 
-/// Occupancy reader for one bounded channel, type-erased so probes over channels of
-/// different message types can be sampled by one task.
-///
-/// Occupancy is `Sender::max_capacity() - Sender::capacity()`, which needs no counter on
-/// the send path and no change to any producer -- these channels sit on the transaction hot
-/// path. NOTE it counts permits HELD, not messages queued; the two diverge exactly in the
-/// deadlock case, which is why `StoreProbe` also carries a drain counter.
+/// Type-erased occupancy reader for one bounded channel. Occupancy counts held permits,
+/// not queued messages.
 pub struct QueueProbe {
     pub stage: &'static str,
     /// Returns `(depth, capacity)`.
     pub occupancy: Box<dyn Fn() -> (usize, usize) + Send + Sync>,
 }
 
-/// The store actor's own channel plus the two liveness readings that disambiguate a full
-/// one. Separate from `QueueProbe` because those readings have no analogue for a plain
-/// channel.
+/// Store actor channel occupancy and liveness readers.
 pub struct StoreProbe {
     /// Returns `(depth, capacity)` of the actor's command channel.
     pub occupancy: Box<dyn Fn() -> (usize, usize) + Send + Sync>,
@@ -60,17 +36,9 @@ pub struct StoreProbe {
     pub commands_drained: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
-/// Publish bounded-queue occupancy and store-actor liveness until the process exits.
-///
-/// Lives here, taking closures rather than a `store::Store`, so BOTH the primary and the
-/// worker can use one implementation without `metrics` gaining a `store` dependency. The
-/// primary needs it too: it has its own store and its own per-key `notify_read` waiters,
-/// and until this was shared its store was entirely unobserved -- the same class of blind
-/// spot that made the worker wedge take a day to find. Pass an empty `probes` for a process
-/// with no pipeline channels of its own.
+/// Publishes bounded-queue occupancy and store-actor liveness until process exit.
 pub fn spawn_queue_sampler(probes: Vec<QueueProbe>, store: StoreProbe, metrics: Arc<Metrics>) {
-    // Write-once: bounds never change, and publishing them lets a dashboard show occupancy
-    // as a fraction without hard-coding each channel's constant.
+    // Queue capacities are fixed after construction.
     for p in &probes {
         let (_, capacity) = (p.occupancy)();
         metrics
@@ -89,8 +57,7 @@ pub fn spawn_queue_sampler(probes: Vec<QueueProbe>, store: StoreProbe, metrics: 
         let mut peaks: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
         let mut age_peak: u64 = 0;
-        // The store counter is monotonic and process-local; the Prometheus counter is
-        // advanced by the DELTA so it keeps counter semantics across restarts of neither.
+        // Publish only the new portion of the monotonic store counter.
         let mut drained_reported: u64 = 0;
         let mut ticks: u32 = 0;
         loop {
@@ -108,9 +75,7 @@ pub fn spawn_queue_sampler(probes: Vec<QueueProbe>, store: StoreProbe, metrics: 
                 let slot = peaks.entry(stage).or_insert(0);
                 *slot = (*slot).max(*depth);
             }
-            // Age, not the raw stamp, so the READER's clock defines "now" -- the actor's
-            // own clock could be the thing that is stuck. Saturating: a stamp from the
-            // future (clock step) reads 0 rather than wrapping.
+            // Saturate future timestamps instead of allowing unsigned underflow.
             let age = now_millis().saturating_sub((store.heartbeat_millis)());
             age_peak = age_peak.max(age);
 
@@ -147,7 +112,7 @@ pub fn spawn_queue_sampler(probes: Vec<QueueProbe>, store: StoreProbe, metrics: 
     });
 }
 
-/// Wall-clock epoch milliseconds; see `spawn_queue_sampler`'s use of it.
+/// Current wall-clock time in epoch milliseconds.
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -167,19 +132,7 @@ use tokio::time::Instant;
 /// Publishes `metrics_active_seconds`: how long this node's metrics-active window has
 /// been open, or 0 while it is closed / not configured.
 ///
-/// This is the starfish `benchmark_duration` idea (`crates/orchestrator/src/
-/// measurements.rs`): the VALIDATOR owns the clock that rates are divided by, so the
-/// harness never has to infer the window from its own wall clock. Dividing a committed
-/// delta by an orchestrator-chosen scrape interval understates TPS whenever the window
-/// opened partway through that interval -- the counter only accumulated for part of it.
-/// With this series the harness divides by `Δmetrics_active_seconds` instead, which is
-/// exactly the in-window time, so a warmup can no longer distort the rate and
-/// `--warmup` no longer has to be configured relative to the window budget.
-///
-/// A `Collector` rather than a periodically-ticked gauge on purpose: `collect` runs on
-/// every `/metrics` scrape, so the value is exact AT SCRAPE TIME. The 10s
-/// `MetricReporter` tick would otherwise quantise the denominator by up to 10s, ~8% of
-/// a 120s measurement window.
+/// The metrics-active duration in seconds. The collector computes it at scrape time.
 struct ActiveWindowCollector {
     active_from_millis: Arc<AtomicU64>,
     gauge: Gauge,
@@ -212,9 +165,7 @@ impl Collector for ActiveWindowCollector {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // 0 when ungated (from == 0) or before the window opens: the harness reads that
-        // as "no node-side clock" and falls back to its wall-clock window, which is
-        // byte-identical to the behaviour before this series existed.
+        // Zero means no active window or a window that has not opened.
         let seconds = if from == 0 || now <= from {
             0.0
         } else {
@@ -225,13 +176,7 @@ impl Collector for ActiveWindowCollector {
     }
 }
 
-/// METRICS-DASHBOARD-SPEC.md §3: starfish-style (`metrics.rs:1325-1376`) Drop-guard
-/// busy-time timer, ported minimally (only the `IntCounterVec`-labeled, owned variant
-/// -- `VantageCore` is a single long-lived task with no borrow-lifetime constraints
-/// that would need the borrowed `UtilizationTimer<'a>` starfish also defines). Adds
-/// its elapsed wall time (microseconds) to the labeled counter when dropped, whether
-/// via normal fall-through or an early `?`/`return` -- so a section's busy time is
-/// counted even on its error paths, same as starfish's own guarantee.
+/// Drop guard that records elapsed section time in microseconds.
 pub struct UtilizationTimer {
     metric: IntCounter,
     start: Instant,
@@ -244,14 +189,7 @@ impl Drop for UtilizationTimer {
 }
 
 impl UtilizationTimer {
-    /// Fable perf-audit item 7: construct directly from an already-resolved counter
-    /// handle. A caller that repeatedly times the SAME fixed label (e.g.
-    /// `VantageCore`'s handful of named sections) can resolve the `IntCounter` once
-    /// via `IntCounterVec::with_label_values` and reuse this constructor on every
-    /// subsequent call, skipping the vec's internal lookup entirely from then on.
-    /// Identical timing semantics to `UtilizationTimerVecExt::utilization_timer`
-    /// (same `Drop` impl, same elapsed-time accounting) -- this is purely an
-    /// alternate constructor, not a behavior change.
+    /// Constructs a timer from an already-resolved counter.
     pub fn from_counter(metric: IntCounter) -> Self {
         Self {
             metric,
@@ -277,10 +215,7 @@ impl UtilizationTimerVecExt for IntCounterVec {
 
 use crate::stat::{histogram, DivUsize, HistogramSender, PreciseHistogram};
 
-/// Phase-2 metrics: the real (submission-to-commit) transaction latency distribution,
-/// plus the counters needed to interpret it (how many transactions it covers, how many
-/// commit-side store lookups missed and were skipped rather than blocking on).
-/// Phase 3+ extends this struct in place.
+/// Transaction latency and protocol metrics.
 #[derive(Clone)]
 pub struct Metrics {
     /// Channel-fed observation point for a single transaction's (commit time - embedded
@@ -290,21 +225,7 @@ pub struct Metrics {
     /// paired with the histogram's `sum`/`count` gauges this gives the harness an exact
     /// global stddev: `sqrt(squared_sum/count - (sum/count)^2)`.
     pub transaction_committed_latency_squared_micros: IntCounter,
-    /// Perf-audit fix (measurement bug): submit -> ordered ∧ MATERIALISED latency --
-    /// `commit_millis` is when the primary ordered the batch, but a worker that
-    /// didn't yet hold the payload only learns the transactions' contents (and can
-    /// only observe them into this histogram) later, once the batch actually lands
-    /// locally via `SyncBatches`/worker-to-worker gossip. Observed at that later
-    /// instant minus the same embedded submission timestamp, from the exact same
-    /// loop iteration as `transaction_committed_latency` above -- so every
-    /// transaction contributes to both. Starfish-comparable: starfish's own
-    /// `transaction_committed_latency` is observed only once the block's
-    /// transactions are locally available in the first place (see
-    /// `RealCommitHandler::transaction_observer`), i.e. it measures this same
-    /// submit -> ordered ∧ materialised quantity, not submit -> ordered alone. For
-    /// an immediate hit the two histograms are nearly identical; for a deferred miss
-    /// (see `latency_misses`) the gap between them is exactly the payload-
-    /// availability cost.
+    /// Submit-to-materialized latency. It ends when the worker has the batch locally.
     pub transaction_materialised_latency: HistogramSender<Duration>,
     /// Mirrors `transaction_committed_latency_squared_micros` exactly (same batched
     /// accumulate-then-`inc_by` treatment), for `transaction_materialised_latency`.
@@ -313,68 +234,38 @@ pub struct Metrics {
     pub committed_transactions: IntCounter,
     /// Total bytes of transactions whose latency was successfully observed.
     pub committed_bytes: IntCounter,
-    /// Commit-time batch lookups that missed the local store and were DEFERRED for
-    /// retry, not dropped (perf-audit fix -- see
-    /// `worker::synchronizer::Synchronizer::observe_committed`'s doc comment for the
-    /// bug this replaced: a miss used to permanently mark the digest "observed",
-    /// silently undercounting `committed_transactions`/`committed_bytes` and the
-    /// latency histograms whenever the payload arrived after the commit
-    /// notification, which is the normal case for a remote author's batch). Every
-    /// deferral increments this counter exactly once, whether or not it later
-    /// resolves; `latency_misses_resolved` below tells the two apart.
+    /// Commit-time batch lookups deferred for retry because the payload is absent.
+    /// Each deferral increments this counter once.
     pub latency_misses: IntCounter,
-    /// Deferred misses (`latency_misses`) that later resolved when their batch
-    /// landed in the store and were counted. `latency_misses -
-    /// latency_misses_resolved` is the number still pending retry (mid-run) or
-    /// permanently unresolved (after the run has ended and any legitimately
-    /// in-flight sync has had time to finish).
+    /// Deferred misses later resolved and counted. The difference from
+    /// `latency_misses` is unresolved or pending work.
     pub latency_misses_resolved: IntCounter,
 
-    // --- Phase 3 (PHASE3-SPEC.md §6.4): vantage data-plane counters. Always
-    // registered (same pattern as the rest of this struct); only observed into on the
-    // `Protocol::Vantage` path, so they simply stay zero on the two Autobahn paths.
+    // --- Vantage data-plane counters.
     /// Blocks this node published (self-authored, including our own).
     pub vantage_blocks_published: IntCounter,
-    /// Own blocks that reached COMMITTED output. Against `vantage_blocks_published` this is
-    /// the contribution ratio: a recovering node that publishes but whose blocks are never
-    /// committed is still, from the committee's point of view, a fault.
+    /// Own blocks that reached committed output.
     pub vantage_own_blocks_committed_total: IntCounter,
-    /// Own CONSENSUS proposals broadcast (round-robin proposer turns this node served).
+    /// Own proposals broadcast.
     pub vantage_own_proposals_made_total: IntCounter,
-    /// Views where this node was the round-robin proposer and the view reached a terminal
-    /// outcome locally -- the denominator for proposal success.
+    /// Proposer turns that reached a terminal outcome locally.
     pub vantage_own_proposer_turns_total: IntCounter,
-    /// Of those turns, the ones that sealed with a real outcome rather than Skip: this
-    /// node's proposal was committed. A lagging validator misses its turns entirely, which
-    /// no data-block metric can reveal.
+    /// Proposer turns that sealed with a non-Skip outcome.
     pub vantage_own_proposals_committed_total: IntCounter,
-    /// Committed blocks BY AUTHOR, as observed by this node.
-    ///
-    /// `vantage_own_blocks_committed_total` cannot answer "are a late joiner's proposals
-    /// being committed": it counts what the node locally observes, and a node that is behind
-    /// has not yet reached the views where its own blocks were committed, so it reads zero
-    /// whether or not they were. Reading this on a CAUGHT-UP PEER answers the question.
-    /// One series per committee member.
+    /// Committed blocks by author, as observed by this node. One series per committee
+    /// member.
     pub vantage_committed_by_author: IntCounterVec,
-    /// 1 once this node has recovered and state sync has latched off. A node stuck at 0
-    /// while running transfers indefinitely is in permanent recovery.
+    /// Set to 1 after state sync completes recovery.
     pub vantage_sequence_sync_recovered: IntGauge,
-    /// Payload entries in own committed blocks. Block COUNT understates contribution under
-    /// recovery load, because a busy core loop seals fewer but larger headers at an
-    /// unchanged client submission rate.
+    /// Payload entries in own committed blocks.
     pub vantage_own_payload_committed_total: IntCounter,
     /// Blocks this node received (direct publish or relayed) and cached.
     pub vantage_blocks_received: IntCounter,
-    /// N3 ack CONFIRMATIONS this node produced -- incremented in `LaneManager::
-    /// on_direct_pub_confirmed`, which is deliberately unaware of
-    /// `Parameters::ack_watermarks`. Under `--ack-watermarks` the per-block
-    /// `VantageAck` wire broadcast is suppressed, so this keeps counting while
-    /// nothing is sent: it is a confirmation count, NOT a wire-send count. The
-    /// watermark front-end that replaces those sends is `vantage_avail_sent`.
+    /// Direct-publish confirmations produced by this node. This is not a wire-send
+    /// count; `vantage_avail_sent` counts watermark broadcasts.
     pub vantage_acks_sent: IntCounter,
-    /// Unsigned acks this node counted, first-hand (N4) -- WIRE-sourced only, so
-    /// this is structurally 0 under `--ack-watermarks` (see `vantage_acks_sent`);
-    /// the watermark equivalent is `vantage_avail_credited_refs`.
+    /// Wire acknowledgments counted first-hand. Watermark credits are counted by
+    /// `vantage_avail_credited_refs`.
     pub vantage_acks_received: IntCounter,
     /// `request(h)` messages this node sent (N6/D2).
     pub vantage_repairs_requested: IntCounter,
@@ -382,78 +273,32 @@ pub struct Metrics {
     pub vantage_repairs_served: IntCounter,
     /// Cumulative bincode-encoded size of every block this node has retained (N8).
     pub vantage_retained_bytes: IntCounter,
-    /// Fable-audit fix: inbound wire messages dropped by `VantageCore::dispatch_inbound`
-    /// because their declared sender is not a committee member. Always zero on the
-    /// honest-only path; a nonzero value means a Byzantine node is forging sender keys.
-    /// Reused as-is by `SimpleItCore::dispatch_inbound`'s own instance of the identical
-    /// gate (`vantage::wire::sender_is_member`) -- the two protocols are mutually
-    /// exclusive per node/run, so there is no ambiguity in practice about which
-    /// assembly a nonzero reading came from.
+    /// Inbound messages dropped because the declared sender is not a committee member.
     pub vantage_rejected_nonmember_total: IntCounter,
-    /// Bulk recovery messages dropped because the bulk inbound queue was full
-    /// (`vantage::node::VantageReceiverHandler::tx_bulk`). Every message counted here
-    /// is re-requestable -- served payload or a fetch/resume request -- so a nonzero
-    /// reading means the core is behind on recovery traffic, NOT that consensus data
-    /// was lost. Sustained growth is the signal that resume serving needs throttling;
-    /// zero is the healthy steady state.
+    /// Re-requestable recovery messages dropped because the bulk inbound queue was full.
     pub vantage_bulk_inbound_dropped_total: IntCounter,
-    /// Optional ack-watermark front-end (`Parameters::ack_watermarks`): periodic
-    /// per-lane availability broadcasts this node sent (one per period with a
-    /// nonempty flush -- see `vantage::lanes::LaneManager::take_avail_flush` --, not
-    /// one per author). Always zero when the flag is off (`VantageCore`/
-    /// `SimpleItCore::run` never even schedule the tick in that case).
+    /// Per-lane availability watermark broadcasts sent by this node.
     pub vantage_avail_sent: IntCounter,
-    /// `VantageAvail` messages this node received and routed to `LaneManager::
-    /// resolve_watermark`. Always zero when the flag is off (no peer ever sends one).
+    /// `VantageAvail` messages received and routed to `LaneManager::resolve_watermark`.
     pub vantage_avail_received: IntCounter,
-    /// `BlockRef`s actually credited into the shared `AckAggregator` via the
-    /// ack-watermark front-end (immediate resolution via `resolve_watermark` plus
-    /// later backfill via `retry_pending_avail`, combined) -- the watermark analogue
-    /// of `vantage_acks_received`. Always zero when the flag is off.
+    /// Block references credited through the availability-watermark path.
     pub vantage_avail_credited_refs: IntCounter,
-    /// `SimpleItCore`'s effect-execution loop received a `vantage::Effect` variant
-    /// that `LaneManager`/`Repairer` can never actually construct (every
-    /// AGB/pacemaker/control-log/anchor/cursor-output variant -- see that loop's own
-    /// doc comment for the full list). Always zero: the match arm that increments this
-    /// also fires a `debug_assert!(false, ..)`, so any nonzero reading in a debug build
-    /// is also an immediate panic during development; in a release build it is a
-    /// silent, observable drop instead of a validator crash.
+    /// Unexpected effect variants received by the Simple-IT effect loop.
     pub simpleit_unexpected_effect_total: IntCounter,
-    /// `SimpleItCore`'s commit-materialisation queue depth: committed rounds
-    /// (`CutEffect::Commit`) whose cut has not yet been fully emitted because at
-    /// least one author's block chain isn't locally verified all the way from its
-    /// watermark yet (a correct node can commit a round it hasn't voted on -- `2f+1`
-    /// peers acking a tip is not the same as holding it -- so this is expected to be
-    /// briefly nonzero under normal repair latency, not just under a fault). A
-    /// sustained/growing value means the drain is stuck: repair for some author's
-    /// lane is not making progress.
+    /// Committed Simple-IT rounds waiting for complete local block-chain verification.
     pub simpleit_commit_queue_len: IntGauge,
 
-    // --- Phase 6 (PHASE6-SPEC.md §9 gate amendment): per-view seal-route breakdown.
-    /// How each view got sealed/ordered, one label `"route"`, incremented exactly once
-    /// per view at the try-seal arbiter's FIRST-acceptance point (the submission that
-    /// wins is the route -- later compatible submissions for the same view never
-    /// count again). Routes: `fast_full` (all-n unanimous fast seal), `direct_full`
-    /// (grade-1 ready quorum), `direct_core` (grade-0 ready quorum), `anchor_full`,
-    /// `anchor_core`, `anchor_skip` (the apply-anchor adapter's three outcomes),
-    /// `vote_skip` (the grounded post-ready skip-vote quorum, signature-free.tex's
-    /// par:skip-seal). Different nodes can legitimately show different route
-    /// distributions for the same view (e.g. one node fast-seals while another only
-    /// reaches the anchor).
+    // --- Per-view seal-route breakdown.
+    /// View seal route, labeled by `route`, counted at first acceptance.
     pub vantage_seals: IntCounterVec,
 
-    // --- signature-free.tex's "Grounded post-ready skip" (par:skip-seal).
-    /// `SKIP-VOTE(u)` statements this node broadcast (one per target it voted on --
-    /// at most once per target, ever).
+    // --- Grounded post-ready skip.
+    /// `SKIP-VOTE(u)` statements broadcast by this node.
     pub vantage_skip_votes_sent: IntCounter,
-    /// `SKIP-VOTE(u)` statements this node counted first-hand from a peer (self-votes
-    /// are not counted here -- see `vantage_skip_votes_sent`).
+    /// `SKIP-VOTE(u)` statements counted first-hand from peers.
     pub vantage_skip_votes_received: IntCounter,
 
-    // --- signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
-    // digest_statements`). Always zero when the flag is off (no `VantageEchoDigest`/
-    // `VantageReadyDigest` is ever sent, so no digest statement is ever buffered, so
-    // no fetch is ever issued; nothing this counts is reachable without the flag).
+    // --- Digest-named AGB statements.
     /// `VantageBodyFetch` messages this node sent (one per target statement author,
     /// per outstanding (view, digest) pair, per retry attempt).
     pub vantage_body_fetches_sent: IntCounter,
@@ -461,67 +306,27 @@ pub struct Metrics {
     /// `VantageBodyFetch` with its own held, fixed `ViewProposal`.
     pub vantage_bodies_served: IntCounter,
 
-    // --- Mechanism A (sender-side lane resume, ack-census-gap-triggered -- see
-    // `vantage::resume`'s own module doc comment). Shared by both Vantage and
-    // Simple-IT (same `LaneManager`/`Wire` data plane). Always registered; expected
-    // to stay at/near zero on a fault-free run (a persistent gap never forms) and to
-    // recover dissemination after a windowed `--withhold` fault closes.
-    /// `VantageLaneResume` requests this node sent (one per (lane author, gap
-    /// height) the requester-side trigger actually fired for, after its two-tick
-    /// persistence check and backoff -- not one per tick).
+    // --- Lane resume.
+    /// `VantageLaneResume` requests sent by this node.
     pub vantage_lane_resume_requests_sent: IntCounter,
-    /// Own blocks this node served, as unicast `Header(_, false)`, answering a
-    /// peer's `VantageLaneResume` -- counted per block actually served, not per
-    /// request received.
+    /// Own blocks served in response to `VantageLaneResume`.
     pub vantage_lane_resume_blocks_served: IntCounter,
-    /// Fable perf audit (loop-starvation fix): resume traffic (`VantageLaneResume`
-    /// requests, and `Header(_, false)` resume-batch entries) `Wire::enqueue_resume`
-    /// failed to `try_send` onto the dedicated resume-sender task's channel --
-    /// either it was full (the task fell behind draining a backed-up destination)
-    /// or closed (the task panicked). Expected to stay at/near zero: Mechanism A's
-    /// own end-to-end retry (`vantage::resume::ResumeTrigger`'s backoff,
-    /// `vantage::resume::ResumeServe`'s dedup) recovers every drop this counts, so a
-    /// nonzero rate here is a liveness signal (the channel is genuinely saturated),
-    /// never a correctness bug on its own.
+    /// Resume messages rejected by the dedicated resume-sender queue.
     pub vantage_lane_resume_send_drops: IntCounter,
 
-    // --- reconnect-replay plan §10 (server-authoritative floor, v3): a SEPARATE
-    // mechanism from Mechanism A above (see `vantage::resume`'s own module doc
-    // comment) -- resumes one-shot AGB/consensus broadcasts lost to a volatile
-    // session death, rather than lane content. `network_messages_sent_total`/
-    // `network_bytes_sent_total`/`network_frames_sent_total` (labeled `"Replay"`/
-    // `"VantageResumeHello"`/`"VantageReplayDone"`) already cover raw send volume
-    // generically -- these four cover what those generic counters structurally
-    // cannot: WHY a send happened, or that one was dropped before ever reaching the
-    // wire. Always registered; expected to stay at/near zero on a fault-free run.
+    // --- Reconnect replay.
     /// `Wire::enqueue_replay`'s `try_send` onto the resume-sender task's channel
-    /// failed (full or closed) -- audit-3 A2's own Err arm: `pending_low` is left
+    /// failed (full or closed). `pending_low` is left
     /// untouched on this path, recovered by the next nudge/tick re-ask.
     pub vantage_replay_enqueue_drops_total: IntCounter,
-    /// `VantageReplayDone` sends where `outbox_floor` truncated the requested span
-    /// below what was actually asked for -- a recovered-with-gap signal (the
-    /// requester's episode still closes/continues correctly; this just means some
-    /// of what it asked for is permanently gone).
+    /// `VantageReplayDone` sends where `outbox_floor` truncated the requested span.
     pub vantage_replay_done_clamped_total: IntCounter,
-    /// Server-side nudge Hellos sent (`pending_low[X]` set, `X` not in-flight,
-    /// backoff elapsed since the last serve-or-nudge toward `X` -- audit-3 A3). The
-    /// backstop for a lost Hello/Done/reconnect-event: closes the asymmetric case
-    /// where the peer that's missing data never itself asks for it.
+    /// Server-side nudge Hellos sent for pending replay data.
     pub vantage_replay_pending_low_nudges_total: IntCounter,
-    /// In-flight-replay-stream entries found stale (older than `replay_episode_max_
-    /// ms`, audit-3 A6) and evicted -- expected near-zero; a sustained nonzero rate
-    /// means the resume task is falling behind draining what it already enqueued
-    /// (strict `Message`-priority scheduling does not guarantee replay throughput).
+    /// In-flight replay streams evicted after their TTL expired.
     pub vantage_replay_inflight_ttl_expired_total: IntCounter,
 
-    // --- Phase 7 prep (PHASE7-PREP-NOTES.md, Finding A diagnosis): always-on progress
-    // gauges, one flat value each (no labels), sampled once/sec by `VantageCore` itself
-    // (metrics-only addition -- no protocol-semantic effect, same "always registered,
-    // only observed into on the vantage path" pattern as the Phase-3 counters above).
-    // Together with `vantage_seals` these let `local-benchmark --timeline` reconstruct,
-    // second by second, where a stalled run's bottleneck actually sits: the WISH
-    // pacemaker's own entry frontier vs. the responsive-proposal frontier vs. the output
-    // cursor vs. the resolution control-log's round/log-consumption position.
+    // --- Progress gauges.
     /// `Pacemaker::entered_view` -- the largest view this party has formally entered (W5).
     pub vantage_entered_view: IntGauge,
     /// `Pacemaker::own_watermark` -- this party's own current wish.
@@ -534,9 +339,7 @@ pub struct Metrics {
     pub vantage_frontier_a_i: IntGauge,
     /// `Cursor::next_view` -- the lowest view the output cursor has not yet advanced past.
     pub vantage_cursor_next_view: IntGauge,
-    /// Non-zero means some author's lane contradicts output this node already delivered.
-    /// Before this existed the cursor waited on such an entry forever, which wedged the
-    /// OUTPUT of every honest node -- see `lanes::SuffixWalk::Forked`.
+    /// Entries dropped because an author's lane contradicted delivered output.
     pub vantage_cursor_forked_entries_dropped: IntGauge,
     /// `ControlLog::curr_round` -- the resolution pipeline's current Simple-IT round.
     pub vantage_control_round: IntGauge,
@@ -547,143 +350,56 @@ pub struct Metrics {
     /// (a persistent gap between this and `delivered_len` means every subsequent anchor
     /// is blocked on a still-missing `B_w`, not on delivery itself).
     pub vantage_control_consume_pos: IntGauge,
-    /// `AgbEngine::pending_gate.len()` -- views active+fixed but not yet echoed, i.e.
-    /// the population `recheck_all`'s budgeted scan rotates over. Near-zero on a
-    /// healthy node; growth tracking the node's view gap is the n=100 straggler
-    /// death-spiral signature (2026-08-08 investigation) this gauge exists to confirm.
-    /// MEASURED 0 on healthy AND straggling nodes alike, which is what eliminated
-    /// `recheck_all` as the n=100 cause and pointed at `Repairer` instead.
+    /// Active and fixed views waiting for an echo.
     pub vantage_pending_gate_len: IntGauge,
-    /// `DigestStatements::pending_fetch.len()` -- outstanding AGB body fetches. Was
-    /// observable only through a `#[cfg(test)]` accessor, which made the 2026-08-08
-    /// body-fetch storm impossible to characterise from a scrape: the fetch COUNT alone
-    /// cannot separate "many pending pairs, few targets each" from the reverse. Bounded
-    /// by `agb::MAX_PENDING_FETCH`; sitting at that ceiling means resolution has stalled.
+    /// Outstanding AGB body fetches. Bounded by `agb::MAX_PENDING_FETCH`.
     pub vantage_pending_body_fetch_len: IntGauge,
-    /// Body-fetch pairs dropped at `ensure_fetch` because `pending_fetch` was at its
-    /// ceiling. Nonzero means the node is accumulating views it cannot resolve; each
-    /// eviction is free (the pair is re-created from the retained statement on the next
-    /// arrival) and prevents quadratic retry growth.
+    /// Body-fetch pairs dropped when the pending-fetch limit was reached.
     pub vantage_body_fetch_evicted_total: IntCounter,
-    /// `Repairer::pending_settle.len()` -- authorized-but-unsettled refs. This is the
-    /// `P` in `on_block_available`'s O(P) re-sweep-per-cached-block, and it has no GC,
-    /// so a node that cannot obtain a block keeps its refs here forever. The n=100
-    /// analysis inferred P >= 1,920 indirectly (from `repairs_requested / (n-1)`);
-    /// this measures it directly.
+    /// Authorized but unsettled repair references.
     pub vantage_pending_settle_len: IntGauge,
-    /// Total `Repairer::settle` calls -- the actual work `on_block_available`'s sweep
-    /// generates, which no counter previously exposed. `settle_calls / blocks_received`
-    /// is the sweep amplification: ~1 is healthy, ~P means the sweep is the bottleneck
-    /// (the n=100 straggler estimate was ~91.6 MILLION calls).
+    /// Total `Repairer::settle` calls.
     pub vantage_repair_settle_calls_total: IntCounter,
-    /// Times `settle` entered its missing-block branch, i.e. how often the peer
-    /// fan-out was CONSIDERED. Compare against `vantage_repairs_requested`, which only
-    /// counts requests actually emitted: before the 2026-08-08 gate the ratio was the
-    /// pure-waste multiplier (every miss re-ran an n-1 loop that emitted nothing), and
-    /// it was invisible because only new `(peer, digest)` pairs ticked a counter. With
-    /// the gate the two should track each other at ~1/(n-1).
+    /// Times `settle` entered its missing-block branch.
     pub vantage_repair_fanout_loops_total: IntCounter,
-    /// Current adaptive per-tick ceiling on repair-request emission. AIMD on bulk-inbound
-    /// drops: halves on a dropping tick, doubles on a clean one. A node in recovery with no
-    /// congestion should climb to the maximum -- a fixed ceiling was a measured regression
-    /// (node 96 deferred 9,224 requests while reporting zero drops).
+    /// Adaptive per-tick repair-request ceiling. It decreases on bulk-inbound drops and
+    /// increases on clean ticks.
     pub vantage_repair_emit_ceiling: IntGauge,
-    /// Legacy/control counter for emit-ceiling halvings caused by core-queue pressure.
-    /// Registered but deliberately never incremented in the queue-backoff ablation, so it
-    /// stays a stable zero while preserving dashboard and time-series compatibility with the
-    /// baseline arm. A nonzero value therefore proves the wrong binary is running.
+    /// Repair-ceiling halvings caused by core-queue pressure.
     pub vantage_repair_ceiling_halved_by_queue: IntCounter,
-    /// Emit-ceiling halvings caused by NEW bulk-inbound drops since the previous tick; the
-    /// only active halving cause in the queue-backoff ablation.
+    /// Repair-ceiling halvings caused by new bulk-inbound drops.
     pub vantage_repair_ceiling_halved_by_drops: IntCounter,
-    /// Ticks on which `adapt_recovery_ceiling` ran and RAISED (or held at max) the ceiling.
-    /// The denominator: if the ceiling is pinned at the floor, this distinguishes "the
-    /// controller keeps choosing to halve" from "the controller stopped running and the
-    /// gauge is stale", which are opposite bugs with opposite fixes.
+    /// Ticks on which `adapt_recovery_ceiling` increased or held the ceiling.
     pub vantage_repair_ceiling_raised: IntCounter,
-    /// In-flight repair slots reclaimed by `ASK_TIMEOUT_TICKS` because a round went
-    /// unanswered. Nonzero means asks are being lost -- most likely the receiver's bulk
-    /// queue `try_send`-dropping `HeadersRequest`, which N6 makes unrecoverable without
-    /// this reclaim. Expected at/near zero on a healthy run; a rising value is the signal
-    /// that repair requests are being burned.
+    /// In-flight repair slots reclaimed after an unanswered request round timed out.
     pub vantage_repair_asks_reclaimed_total: IntCounter,
-    /// Availability credits skipped because the ref had already reached the terminal
-    /// `Quorum` threshold, so the credit could not change any output.
-    ///
-    /// This is the ack fan-in's waste, and it dominated core time at n=100: 190,292
-    /// credited refs/s per node, 96.3 per avail message (one watermark entry per author),
-    /// 48.1s of a 122.6s window at 2.06us each = 39% of one core against 49% total
-    /// `inbound_dispatch`. All n senders credit the same block; only the first 2f+1 matter.
-    /// Compare against `vantage_avail_credited_refs` for the fraction eliminated.
+    /// Availability credits skipped because the reference already reached quorum.
     pub vantage_avail_credit_skipped_total: IntCounter,
-    /// Repair requests outstanding (emitted, digest not yet in hand). Capped by
-    /// `RECOVERY_IN_FLIGHT_MAX`. This is what bounds INBOUND: an answer only arrives for
-    /// something we asked for. A rate limit alone does not -- the 2026-08-07 run had 3,420
-    /// digests asked of ~49 peers each, ~167k invited answers, which pinned
-    /// `core_queue_length` at its 1000-slot cap while `bulk_inbound_dropped` stayed 0.
+    /// Repair requests outstanding. Capped by `RECOVERY_IN_FLIGHT_MAX`.
     pub vantage_repair_in_flight: IntGauge,
-    /// Cached blocks evicted because every peer confirmed holding them. Zero means eviction
-    /// is not acting -- check `vantage_block_cache_evict_blocked` before concluding the cache
-    /// is simply small.
+    /// Cached blocks evicted after every peer confirmed holding them.
     pub vantage_block_cache_evicted_total: IntCounter,
-    /// Lanes whose eviction floor is unknown because some peer has not reported on that lane,
-    /// so their blocks are pinned in memory. Nonzero is safe but means memory keeps growing
-    /// for those lanes: a lagging peer pins its lane rather than authorising an unsafe drop.
+    /// Lanes pinned because a peer has not reported an eviction floor.
     pub vantage_block_cache_evict_blocked: IntGauge,
-    /// Times a repair request was deferred to the next tick because this tick's recovery
-    /// allowance (`RECOVERY_EMIT_PER_TICK`) was exhausted. Zero on a healthy node. Nonzero
-    /// means a node is recovering at the ceiling -- which is the intended behaviour, not an
-    /// error: the per-mechanism caps bound each mechanism, and this bounds their sum.
+    /// Repair requests deferred because the per-tick recovery allowance was exhausted.
     pub vantage_repair_budget_deferred_total: IntCounter,
-    /// `BlockCache` entries held. The cache has NO eviction ("every block this node has
-    /// ever obtained"), so this is monotone and is the leading suspect for the residual
-    /// ~2.8 MB/s/node RSS growth that `local-dryrun/rss-growth.sh` measures. Divide that
-    /// MB/s by this series' growth to get bytes-per-block.
+    /// Number of entries held by `BlockCache`.
     pub vantage_block_cache_len: IntGauge,
-    /// `AckAggregator::senders` size: refs whose first-hand ack set is still being
-    /// accumulated. Retired at `Quorum`, so this tracks refs still BELOW quorum and must
-    /// NOT grow with every block ever seen -- that growth was the dominant memory leak at
-    /// n=100 (13.43 MB/s per node, 1.19 -> 2.73 GiB over a 123s window, ~7 min to OOM on an
-    /// 8 GiB box). One `HashSet<PublicKey>` of ~97 entries is ~4.2 KB, held per block
-    /// forever.
+    /// References whose first-hand acknowledgment set is below quorum.
     pub vantage_ack_senders_tracked: IntGauge,
-    /// `AckAggregator::emitted` size: refs retired after reaching a threshold. ~73 B each
-    /// against `senders`' ~4.2 KB, so retirement is a ~59x cut -- but this map is still
-    /// unbounded (~0.8 GB/hour at n=100), and this is the series that shows it.
+    /// References retired after reaching an acknowledgment threshold.
     pub vantage_ack_refs_retired: IntGauge,
-    /// Digests whose peer fan-out is started but not yet complete (`Repairer::fanout`).
-    /// The n=100 recovery fix stages coverage instead of asking all n-1 peers at once, so
-    /// this is the outstanding-repair backlog: healthy nodes sit near zero, and a node in
-    /// recovery shows the real size of its gap (the 2026-08-07 run's stalled nodes were
-    /// missing 6,328-51,851 distinct digests, which no counter exposed at the time).
+    /// Digests with an active but incomplete repair fan-out.
     pub vantage_repair_fanout_pending: IntGauge,
-    /// Fan-out rounds beyond the first, i.e. how often the first `FANOUT_FIRST` peers
-    /// failed to answer and coverage had to widen. Near-zero means the bounded first round
-    /// is sufficient in practice; large means peers are not holding what we ask for.
+    /// Fan-out rounds beyond the first.
     pub vantage_repair_fanout_escalations_total: IntCounter,
 
-    // --- Metrics/dashboard expansion (METRICS-DASHBOARD-SPEC.md §1): wire-layer
-    // counters, hooked in the `network` crate itself so every protocol (Autobahn
-    // Optimistic/Seamless and Vantage) and every direction is covered by construction,
-    // not by remembering to instrument each call site separately. Untyped totals
-    // mirror starfish's own hook (`network.rs:614-691`) and include the 4-byte
-    // length-delimited-codec frame prefix; the typed vectors go beyond starfish
-    // (serialized length is already in hand at the same call sites) and are labeled
-    // with the wire variant name of every `PrimaryMessage`/`PrimaryWorkerMessage`/
-    // `WorkerPrimaryMessage`/`WorkerMessage` variant. No per-peer labels (starfish
-    // parity -- committee size is small).
-    /// Total bytes physically written to the wire across every outbound connection
-    /// this node's senders (`ReliableSender`/`SimpleSender`) own, length prefix
-    /// included. Zero-cost when no sender attaches a metrics handle (`with_metrics`
-    /// is never called, e.g. in any test harness that doesn't wire it up).
+    // --- Wire-layer counters.
+    /// Total bytes written across outbound connections, including length prefixes.
     pub bytes_sent_total: IntCounter,
-    /// Total bytes physically read off the wire by every inbound connection this
-    /// node's `network::Receiver`s own, length prefix included.
+    /// Total bytes read across inbound connections, including length prefixes.
     pub bytes_received_total: IntCounter,
-    /// Wire messages sent, by `type` (the wire variant name), counted at the
-    /// send/broadcast call site where the variant is known -- once per physical
-    /// unicast transmission (a broadcast to n peers increments this n times, same
-    /// convention as `bytes_sent_total`).
+    /// Wire messages sent by type, counted per physical unicast transmission.
     pub network_messages_sent_total: IntCounterVec,
     /// Wire messages received, by `type`, counted at receiver dispatch post-deserialize.
     pub network_messages_received_total: IntCounterVec,
@@ -691,74 +407,34 @@ pub struct Metrics {
     pub network_bytes_sent_total: IntCounterVec,
     /// Serialized (pre-frame-prefix) bytes received, by `type`.
     pub network_bytes_received_total: IntCounterVec,
-    /// Physical wire frames sent (length-prefix-delimited units), across every
-    /// connection this node's senders own -- NOT per-type. When transport-level
-    /// batching (`Parameters::batch_messages`) is off, every logical message is its
-    /// own frame, so this equals the sum of `network_messages_sent_total` across
-    /// types. When batching is on, several coalesced logical messages can share one
-    /// frame, so `network_messages_sent_total` (sum) / `network_frames_sent_total`
-    /// reads directly as the coalescing ratio.
+    /// Physical wire frames sent across outbound connections.
     pub network_frames_sent_total: IntCounter,
-    /// Volatile sends shed at enqueue because the destination's outbound queue depth
-    /// reached `ReliableSender`'s volatile soft cap -- each shed message's filing key
-    /// is min-merged into the drop map exactly like a session-death discard, so the
-    /// reconnect-replay nudge/Hello path recovers it (`n=100 straggler fix
-    /// 2026-08-08: a connected-but-slow peer now earns replay episodes without a
-    /// session death). Sustained growth against one peer means that peer cannot keep
-    /// up with organic broadcast volume; zero is the healthy steady state.
+    /// Volatile sends shed after the destination queue reaches its soft cap.
     pub network_volatile_shed_total: IntCounter,
     /// Currently-open inbound TCP connections, labeled by listener role. The
     /// Prometheus target already separates primary and worker processes; this label
     /// separates the listeners inside a process.
     pub network_connections: IntGaugeVec,
-    // --- SEQUENCE-CHECKPOINT-SYNC-PLAN.md §11, PHASE A subset. Record-only: these
-    // describe the LOCAL sequence chain. Announcement/transfer/install metrics land with
-    // the phases that introduce those paths, so nothing here can imply a capability the
-    // build does not have.
-    /// Highest view covered by the local sequence chain. Phase A's primary signal:
-    /// across correct nodes this should track the cursor, and heads at a common boundary
-    /// must be identical.
+    // --- Sequence-chain metrics.
+    /// Highest view covered by the local sequence chain.
     pub vantage_sequence_head_view: IntGauge,
     /// Highest checkpoint boundary this node has passed.
     pub vantage_sequence_boundary_view: IntGauge,
-    /// The boundary HEAD itself, as `{sid, head="<hex>"} = boundary_view`.
-    ///
-    /// `sid` is part of the identity because heads are domain-separated by session:
-    /// two different committees derive different heads for the same view BY DESIGN.
-    /// A monitor retained across runs (docker-bench keeps Prometheus up on purpose)
-    /// otherwise makes consecutive runs look like a head divergence, since node labels
-    /// repeat across runs.
-    ///
-    /// Exporting only the boundary VIEW makes the one failure Phase A exists to catch --
-    /// two nodes at the same height with different heads -- completely invisible, since
-    /// the heights match exactly. The head has to be in the series identity, so it goes
-    /// in a label. `reset()` before each set keeps exactly one active child per process,
-    /// while Prometheus retains the historical series that the cross-node comparison
-    /// needs; series churn is one per boundary passed, i.e. `views / K`.
+    /// Current checkpoint head, labeled by session and head digest.
     pub vantage_sequence_boundary_head: IntGaugeVec,
-    /// The same head truncated to its leading 8 bytes as a signed integer, purely so a
-    /// dashboard can GRAPH divergence (a label cannot be plotted). Not authoritative --
-    /// `sequence_check.py` compares full hex heads; this is for eyeballing.
-    pub vantage_sequence_boundary_head_lo: IntGauge,
-    /// Sequence records committed to the local chain -- one per terminally processed
-    /// view, including `Skip`.
+    /// Sequence records committed to the local chain.
     pub vantage_sequence_records_total: IntCounter,
-    /// Block digests folded into per-view output deltas. Rate should equal the committed
-    /// block rate; a divergence means the cursor emitted outside a tracked view.
+    /// Block digests folded into per-view output deltas.
     pub vantage_sequence_delta_digests_total: IntCounter,
-    /// Records refused because the cursor finalized a view out of order. A LOCAL
-    /// invariant violation, not remote input -- any nonzero value invalidates the head
-    /// and is a Phase A release blocker.
+    /// Records refused because the cursor finalized a view out of order.
     pub vantage_sequence_record_rejected_total: IntCounter,
 
-    // Phase B counters. Announcements are cheap and frequent, so these are counters
-    // rather than per-peer vectors -- per-sender detail lives in the equivocator gauge.
+    // --- Announcement counters.
     /// Announcements this node broadcast.
     pub vantage_sequence_announced_total: IntCounter,
     /// First-hand announcements that counted toward some (view, head).
     pub vantage_sequence_announce_counted_total: IntCounter,
-    /// Announcements refused: forged sender, non-member, duplicate, equivocation, or
-    /// too far ahead. Sustained growth means a peer is misbehaving or badly out of date.
+    /// Announcements refused for sender, duplication, equivocation, or range errors.
     pub vantage_sequence_announce_ignored_total: IntCounter,
     /// Targets that reached f+1 matching first-hand announcements.
     pub vantage_sequence_certified_total: IntCounter,
@@ -766,13 +442,11 @@ pub struct Metrics {
     pub vantage_sequence_certified_view: IntGauge,
     /// Distinct senders caught announcing two different heads for one view.
     pub vantage_sequence_equivocators: IntGauge,
-    /// Transfers whose whole target downloaded and verified against the certified head.
-    /// Phase B stops here and installs nothing; Phase C installs from this point.
+    /// Transfers whose targets were downloaded and verified against the certified head.
     pub vantage_sequence_sync_verified_total: IntCounter,
     /// Highest target view fully verified.
     pub vantage_sequence_sync_verified_view: IntGauge,
-    /// Transfers abandoned because every matching announcer was dropped. Nonzero means
-    /// the certified target could not be served by the set that certified it.
+    /// Transfers abandoned because all matching announcers were dropped.
     pub vantage_sequence_sync_exhausted_total: IntCounter,
     pub vantage_sequence_sync_started_total: IntCounter,
     /// Target view of the active transfer.
@@ -781,366 +455,134 @@ pub struct Metrics {
     pub vantage_sequence_sync_timeouts_total: IntCounter,
     /// Response chunks accepted.
     pub vantage_sequence_sync_chunks_total: IntCounter,
-    /// Response chunks that failed verification. Ordinary operation, not a fault: up to
-    /// f matching announcers may serve corrupt bytes by assumption.
+    /// Response chunks that failed verification.
     pub vantage_sequence_sync_invalid_total: IntCounter,
-    /// State-sync frames dropped because the dedicated bounded egress was full.
-    /// Nonzero means a peer cannot keep up; the requester recovers by timing out and
-    /// failing over, which it must handle anyway since up to `f` sources may withhold.
+    /// State-sync frames dropped because the dedicated egress was full.
     pub vantage_sequence_sync_dropped_total: IntCounter,
-    /// State-sync frames dropped because this node's dedicated inbound sequence queue was
-    /// full. Dropped announcements repeat; dropped replies are recovered by requester
-    /// timeouts.
+    /// State-sync frames dropped because the dedicated inbound queue was full.
     pub vantage_sequence_sync_inbound_dropped_total: IntCounter,
     /// State-sync frames served to peers.
     pub vantage_sequence_sync_served_total: IntCounter,
-    /// Responses arriving with no active transfer. Phase B never installs, so every
-    /// response is unsolicited by construction and this tracks peer chatter; once the
-    /// requester exists a nonzero rate means late or duplicated answers.
+    /// Responses received without an active transfer.
     pub vantage_sequence_sync_unsolicited_total: IntCounter,
-    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §14, Phase B's closing check: a verified target is
-    /// retained until ordinary execution reaches the same view, then the head this node
-    /// derived ITSELF is compared against the one downloaded from peers and verified
-    /// against `f+1` announcements. Nothing else exercises announce -> certify -> fetch ->
-    /// verify end to end against an independently derived answer, so this counter is the
-    /// evidence that a Phase C install would have installed the right bytes.
-    ///
-    /// INDEPENDENT ONLY WHEN NOTHING WAS INSTALLED, which is why it is counted separately
-    /// from `vantage_sequence_install_selfcheck_match_total`. An installed view reaches
-    /// `record_sequence` through the same `finalize` path carrying the outcome and delta
-    /// the TRANSFER supplied, so with installation enabled the two sides of the comparison
-    /// share a source and it degenerates into a self-consistency check. The Phase C gate
-    /// must therefore be scored on a run with `sequence_install_enabled = false`.
+    /// Verified targets whose head matched local execution at the same view.
     pub vantage_sequence_verify_match_total: IntCounter,
-    /// The same comparison, but over a target this node INSTALLED rather than executed.
-    ///
-    /// Not an independent determinism check and must not be read as one: the head compared
-    /// was derived from the transferred outcomes and deltas. It still has value -- it
-    /// catches install-path bugs (wrong delta order, a dropped digest, a watermark left
-    /// stale) -- but it cannot detect divergence between correct parties, because there is
-    /// no second derivation to disagree with. It is also necessarily after the fact: the
-    /// install emits `NotifyCommitted` before `finalize` reaches the comparison, so a
-    /// mismatch here reports output that has already gone to the workers. The pre-checks
-    /// in `Cursor::install` are what actually guard that boundary.
+    /// Installed targets whose head matched the local self-check.
     pub vantage_sequence_install_selfcheck_match_total: IntCounter,
-    /// Verified targets whose head DISAGREED with local execution at the same view. Must
-    /// stay zero. Nonzero means either more than `f` announcers agreed on a head no
-    /// correct party derives, or correct parties derive different heads -- both make
-    /// installation unsafe, so this is Phase C's release blocker.
+    /// Verified targets whose head disagreed with local execution. Must remain zero.
     pub vantage_sequence_verify_mismatch_total: IntCounter,
 
-    // Phase C staging: turning a verified target into blocks this node actually holds.
-    /// Verified targets accepted for staging. A verified target that is NOT staged was
-    /// refused as non-contiguous; see `vantage_sequence_install_rejected_total`.
+    // --- Installation staging.
+    /// Verified targets accepted for staging.
     pub vantage_sequence_install_staged_total: IntCounter,
-    /// Verified targets refused because their per-view output was not contiguous above the
-    /// local head. A verified chain cannot have a hole, so nonzero means the outcome/delta
-    /// maps disagree with the chain that was verified -- an internal inconsistency, not
-    /// remote misbehaviour.
+    /// Verified targets refused because output was not contiguous above the local head.
     pub vantage_sequence_install_rejected_total: IntCounter,
     /// Views in the target being staged.
     pub vantage_sequence_install_views: IntGauge,
     /// Staged views whose whole verified delta is now in the local block cache.
     pub vantage_sequence_install_views_ready: IntGauge,
-    /// Staged views admitted to the fetch window and still waiting on blocks. Bounded by
-    /// `sequence_install_window_views`; pinned at that bound means repair, not the window,
-    /// is the limiter.
+    /// Staged views in the fetch window that are waiting on blocks.
     pub vantage_sequence_install_views_in_flight: IntGauge,
-    /// Verified output digests in the staged install whose headers/payloads are not yet
-    /// deliverable. This is the direct "what is the installer waiting for?" gauge.
+    /// Verified output digests whose headers or payloads are not yet deliverable.
     pub vantage_sequence_install_blocks_awaited: IntGauge,
-    /// Verified-output header digests currently requested from checkpoint sources by the
-    /// batched install fast path.
+    /// Header digests currently requested from checkpoint sources.
     pub vantage_sequence_install_header_requests_in_flight: IntGauge,
-    /// Header digest asks sent by the batched install fast path, including timeout retries.
+    /// Header digest requests sent, including timeout retries.
     pub vantage_sequence_install_headers_requested_total: IntCounter,
     /// Requested state-sync headers accepted after `BlockOK` validation.
     pub vantage_sequence_install_headers_received_total: IntCounter,
-    /// Targets whose every view became locally held. The precondition for installing:
-    /// until this fires there is nothing to install, only something to fetch.
+    /// Targets whose views are locally held and ready to install.
     pub vantage_sequence_install_ready_total: IntCounter,
     /// Views applied to the cursor from verified checkpoint state.
     pub vantage_sequence_install_views_applied_total: IntCounter,
-    /// Installs refused by `Cursor::install`. Every refusal leaves the cursor unchanged and
-    /// abandons the whole target. Nonzero means the verified target or the local cursor is
-    /// not what this node believed -- see the log line for which of the four conditions
-    /// fired; `PrefixMismatch` in particular is impossible between correct parties.
+    /// Installs refused by `Cursor::install`; the cursor remains unchanged.
     pub vantage_sequence_install_failed_total: IntCounter,
-    /// Passes that ran out of digest budget mid-view and left it open. Ordinary under a
-    /// large backlog -- it is the bound working -- but a rate that never falls means the
-    /// budget is too small for the gap being closed.
+    /// Install passes that exhausted the digest budget while a view remained open.
     pub vantage_sequence_install_partial_views_total: IntCounter,
     /// Targets applied in full.
     pub vantage_sequence_install_completed_total: IntCounter,
     /// Highest view installed from verified checkpoint state.
     pub vantage_sequence_install_completed_view: IntGauge,
-    /// Consensus/control/service messages discarded because a large active sequence-sync
-    /// gap or staged install makes parking them stale work.
+    /// Consensus, control, and service messages discarded while sequence recovery is active.
     pub vantage_sequence_install_obsolete_inbound_dropped_total: IntCounter,
 
-    /// `SimpleSender` frames discarded while waiting out a connect backoff, i.e.
-    /// addressed to a peer we have not managed to connect to yet. Best-effort sends
-    /// are allowed to vanish, but they must not vanish SILENTLY: this is the only
-    /// signal distinguishing "the link is down and we are shedding" from "the link is
-    /// fine and the peer is ignoring us". Sustained growth against one peer means that
-    /// peer has been unreachable for a while.
+    /// `SimpleSender` frames discarded while waiting for a connection.
     pub network_connect_wait_discarded_total: IntCounter,
 
-    // --- METRICS-DASHBOARD-SPEC.md §2: goodput / pipeline counters (worker ingress).
-    /// Transactions the worker's `BatchMaker` received from a client, before batching
-    /// (the numerator for submission-side throughput; `committed_transactions` above
-    /// remains the sequenced-goodput denominator, unchanged).
+    // --- Goodput and pipeline counters (worker ingress).
+    /// Transactions received by the worker before batching.
     pub submitted_transactions: IntCounter,
     /// Bytes of transactions the worker's `BatchMaker` received from a client.
     pub submitted_transactions_bytes: IntCounter,
 
-    // --- METRICS-DASHBOARD-SPEC.md §3: consensus quality / utilization.
+    // --- Consensus quality and utilization.
     /// Vantage block serialized size at publish time (self-authored blocks only),
     /// reported via the same `HistogramReporter` pattern as
     /// `transaction_committed_latency`.
     pub proposed_block_size_bytes: HistogramSender<usize>,
-    /// Starfish parity: the proposed header/block's METADATA alone, serialized in
-    /// isolation from any payload -- at n=50 this is the metric that distinguishes
-    /// O(n^2) from O(n^3) metadata growth across protocols (a header whose own size
-    /// is O(n), e.g. an embedded vote list, times n headers/round times n peers/
-    /// broadcast). Self-authored proposals only, observed at the same publish call
-    /// site as `proposed_block_size_bytes` -- see `primary::core::Core::
-    /// process_own_header` (Autobahn, both optimistic and seamless) and
-    /// `vantage::wire::Wire::broadcast_message` (Vantage and Simple-IT, which reuses
-    /// Vantage's data plane verbatim). Identical value to `proposed_block_size_bytes`
-    /// on the two Vantage-family protocols today (their wire `Header` never carries
-    /// inline transactions, only payload digests -- see `proposed_transaction_size_
-    /// bytes`'s doc comment), computed as a separate serialization anyway so the two
-    /// metrics stay independently correct if that ever changes.
+    /// Serialized metadata size of self-authored proposals, excluding payloads.
     pub proposed_header_size_bytes: HistogramSender<usize>,
-    /// Starfish parity, adapted to this codebase's Narwhal-style architecture: this
-    /// repo's headers/proposals never carry transaction bytes inline (only batch
-    /// digests -- `primary::messages::Header::payload: BTreeMap<Digest, WorkerId>`),
-    /// unlike starfish's monolithic blocks, which do. The closest analogue of
-    /// starfish's per-block transaction-payload size is therefore observed one layer
-    /// down, at the point this node's own worker seals a batch of transactions for
-    /// inclusion (`worker::batch_maker::BatchMaker::seal`) -- own batches only,
-    /// matching every other `proposed_*` metric's self-authored-only scope. Lives on
-    /// the WORKER's own registry (a distinct scrape target from
-    /// `proposed_header_size_bytes`, which is primary-side), same split as
-    /// `submitted_transactions`/`committed_transactions`.
+    /// Serialized size of transactions in self-authored worker batches.
     pub proposed_transaction_size_bytes: HistogramSender<usize>,
-    /// Starfish-style (`metrics.rs:1325-1376`) busy-time accounting around
-    /// `VantageCore`'s own major sections, in accumulated microseconds, labeled by
-    /// `proc` (section name). A `Drop`-guard timer (see `stat::UtilizationTimer`)
-    /// adds its elapsed wall time to this counter when it goes out of scope, whether
-    /// via normal fall-through or an early return/`?`.
+    /// Accumulated section time in microseconds, labeled by `proc`.
     pub utilization_timer: IntCounterVec,
-    /// Fable perf audit (measurement gap): the WAITING subset of `utilization_timer`,
-    /// same `proc` labeling, same microsecond units, same `Drop`-guard mechanism.
-    /// `utilization_timer` records WALL time, so a section blocked on an `.await`
-    /// (notably the store actor's FIFO) is indistinguishable from one burning CPU.
-    /// Scopes opened against THIS counter mark regions whose cost is known to be
-    /// waiting rather than computing, so the dashboard can read
-    /// `utilization - wait ~= CPU` per section and tell a CPU-bound core apart from
-    /// one starved by a downstream queue. Deliberately NOT a partition of
-    /// `utilization_timer`'s labels: a wait scope nested inside a utilization scope
-    /// contributes to both (that is the point), and `proc` values need not match.
-    ///
-    /// Two caveats the dashboard has to respect. (a) The `store_probe` scope lives in
-    /// `LaneManager`, which Simple-IT also uses, whereas every `utilization_timer`
-    /// scope is in `vantage::node` -- so on a Simple-IT run this counter advances while
-    /// `utilization_timer` stays flat, and any panel computing `utilization - wait`
-    /// must filter to `protocol_info{protocol="vantage"}` or it renders negative.
-    /// (b) `utilization_timer`'s `avail_flush` / `resume_tick` / `inbound_dispatch` /
-    /// `effect_execution` sections also await the network with no matching wait scope,
-    /// so `utilization - wait` is an UPPER bound on CPU, not an equality.
+    /// Time spent waiting in instrumented sections, in microseconds. This overlaps
+    /// `utilization_timer`; it is not a partition. Uninstrumented waits remain in the
+    /// utilization total.
     pub core_wait_timer: IntCounterVec,
-    /// `VantageCore`'s own inbound-message channel depth, sampled the same way as
-    /// the Finding-A progress gauges (once/sec, in `VantageCore::run`'s own select
-    /// loop) -- `rx_vantage.len()` (a `tokio::sync::mpsc::Receiver` exposes this
-    /// cheaply without contorting the channel type). `0` on the two Autobahn paths.
+    /// `VantageCore` inbound-message channel depth, sampled once per second.
     pub core_queue_length: IntGauge,
-    /// Fable perf audit (measurement gap): the PEAK `rx_vantage.len()` observed since
-    /// the previous 1 Hz sample, reset each time it is published. `core_queue_length`
-    /// is sampled once/sec FROM the busy core thread, so it can only ever be read at
-    /// an instant when that thread is between select branches -- systematically
-    /// missing the sub-second bursts that matter (a core that is CPU-bound shows a
-    /// growing peak even while the instantaneous sample keeps returning ~0).
+    /// Peak inbound-message channel depth since the previous publication.
     pub core_queue_peak: IntGauge,
 
-    // --- Worker-process observability (2026-08-08 wedge post-mortem).
-    //
-    // Under n=50 @ 200k tx/s with real netem queues, 5-8/50 nodes stopped committing
-    // while their PRIMARIES stayed healthy -- cursor advancing, seal mix normal. The
-    // worker's `network_bytes_received{Batch}` delta was exactly 0 on those nodes,
-    // worker CPU 10s against 74s healthy, and the primary was sending its own worker
-    // ~600 `Synchronize`/s against ~11/s. Everything touching the worker's `Store`
-    // froze together and nothing else did.
-    //
-    // Diagnosing that took a raw-scrape review and four refuted hypotheses, for one
-    // structural reason: between `submitted_transactions` and
-    // `committed_transactions` -- two counters in two different processes -- the
-    // worker published NOTHING about its own internal pipeline. Every bounded channel
-    // between the two was invisible, so a wedge in any of them looked identical from
-    // the outside to a slow primary. These three families close that gap.
-    /// Occupancy of each bounded worker channel, sampled at 10 Hz by
-    /// `Worker::spawn`'s sampler task and published once a second. Labels are the
-    /// pipeline stages the channel feeds: `synchronizer` (primary -> worker
-    /// `Synchronize`, the path that carried the 600/s flood), `batch_maker` (client
-    /// transactions), `processor_own` (our sealed batches), `processor_peer` (batches
-    /// from other workers -- the path that read a flat zero), `helper` (peer batch
-    /// requests), `primary_connector` (worker -> primary digests), and `store` (the
-    /// store actor's own command channel).
-    ///
-    /// A wedge shows as one or more of these pinned at `worker_queue_capacity`; which
-    /// ones are pinned localises it to a stage without a debugger. Absent on the
-    /// primary process, which has no worker channels.
+    // --- Worker-process observability.
+    /// Current occupancy of each bounded worker channel. Labels identify the pipeline
+    /// stage: `synchronizer`, `batch_maker`, `processor_own`, `processor_peer`,
+    /// `helper`, `primary_connector`, and `store`.
     pub worker_queue_depth: IntGaugeVec,
-    /// Peak `worker_queue_depth` over the second preceding each publish, reset on
-    /// publish -- the same instantaneous-vs-burst argument as `core_queue_peak`. A
-    /// channel that is momentarily full 5 times a second reads ~0 on every 1 Hz
-    /// instantaneous sample.
+    /// Peak queue occupancy since the previous publication.
     pub worker_queue_peak: IntGaugeVec,
-    /// The bound each labeled channel was constructed with, so a dashboard plots
-    /// occupancy as a fraction without hard-coding `CHANNEL_CAPACITY` (1000) or the
-    /// store actor's own 100. Write-once at boot; same label set as the two above.
+    /// Capacity of each labeled worker channel.
     pub worker_queue_capacity: IntGaugeVec,
-    /// Milliseconds since the store actor last COMPLETED a `select!` iteration (see
-    /// `store::Store::heartbeat_millis`). Steady state is under
-    /// `FLUSH_INTERVAL_MS` (50) because the flush ticker fires unconditionally, so
-    /// this is load-independent and a large value is always a real stall.
-    ///
-    /// This is the reading that separates the two live hypotheses for the wedge, and
-    /// it does so remotely, from a scrape, with no thread dump: a **blocked** actor
-    /// (RocksDB write stall, cold `db.get`) shows a growing age with the channel
-    /// pinned full, whereas a **dead** actor (task panic) shows the same growing age
-    /// alongside a nonzero `process_panics_total`.
+    /// Milliseconds since the store actor completed a `select!` iteration.
     pub store_actor_heartbeat_age_ms: IntGauge,
-    /// Peak `store_actor_heartbeat_age_ms` over the second preceding each publish, reset
-    /// on publish. The instantaneous gauge above can only report the age at the moment of
-    /// a scrape, so a stall that started and ended between two scrapes -- a RocksDB write
-    /// stall, a cold `db.get` on a compacting LSM -- is invisible to it.
+    /// Peak store actor heartbeat age since the previous publication.
     pub store_actor_heartbeat_age_ms_peak: IntGauge,
-    /// Commands the store actor has DEQUEUED (see `store::Store::commands_drained`).
-    ///
-    /// The discriminator that `store_actor_heartbeat_age_ms` cannot provide on its own,
-    /// and the metric that would have prevented misreading the 2026-08-08 wedge as
-    /// saturation. `worker_queue_depth{queue="store"}` counts permits HELD, not messages
-    /// queued, so a full reading has two opposite causes:
-    ///
-    ///   full + this ADVANCING -> real saturation; the actor is the bottleneck.
-    ///   full + this FLAT + heartbeat fresh -> the queue is EMPTY and every permit sits in
-    ///       a `send()` future that will never be polled again. Actor idle, senders
-    ///       deadlocked against it. This is what actually happened.
+    /// Commands dequeued by the store actor.
     pub store_commands_drained_total: IntCounter,
-    /// Headers whose payload is still incomplete (`PayloadIo::pending_payload`). Unbounded
-    /// by design while a worker is not materialising, so its growth IS the symptom.
+    /// Headers with incomplete payloads.
     pub vantage_pending_payload_headers: IntGauge,
-    /// Total outstanding `(digest, worker_id)` keys across those headers -- the quantity
-    /// that actually scales with the backlog, since one header can miss many batches.
+    /// Outstanding `(digest, worker_id)` keys across pending headers.
     pub vantage_pending_payload_keys: IntGauge,
-    /// Size of `PayloadIo::last_synchronize`. Was insert-only (one entry per distinct
-    /// `(digest, worker_id)` ever synced, never removed) and so grew without bound for the
-    /// life of the process; now pruned, and this is how that stays true.
+    /// Size of `PayloadIo::last_synchronize`.
     pub vantage_last_synchronize_len: IntGauge,
-    /// Nodes visited by the three O(gap) prefix walks, by `family`:
-    /// `chain` (`verified_prefix_through_genesis`), `direct` (`direct_prefix_ok`),
-    /// `settle` (`Repairer::settle`'s descend).
-    ///
-    /// All three memoize SUCCESS only, so a cached suffix above a MISSING block is
-    /// re-walked in full on every call -- and all three are called per inbound message
-    /// (`recheck_all`) or per publish (`refresh_author`). This family exists to test that
-    /// as the cause of the 2026-08-08 n=100 straggler tail, where 10/100 nodes ran their
-    /// core at 97% busy on FEWER messages and FEWER settle calls than healthy nodes
-    /// (~99 us/message against ~39 us), which no volume-based explanation fits.
-    ///
-    /// Read as a ratio to `blocks_received`: bounded (order 1x) when every walk
-    /// short-circuits on a memo, orders of magnitude larger once a hole forces full
-    /// re-walks. A straggler whose walk-step rate is NOT elevated refutes the hypothesis.
+    /// Nodes visited by prefix walks, labeled by `family`.
     pub vantage_walk_steps_total: IntCounterVec,
-    /// Failed prefix walks by family (`chain`/`direct`) and failure branch (`missing` =
-    /// cache miss on an ancestor digest, `pinned` = author/height contradiction,
-    /// `gate` = the per-family predicate: `block_ok_verified` for chain,
-    /// `direct && payload_ok` for direct). The 2026-08-10 fleet-freeze forensics could
-    /// see 1.5M failing chain steps/s per peer in `vantage_walk_steps_total` but not
-    /// WHICH branch failed, which decides the remedy (repair refill vs provenance).
+    /// Failed prefix walks by family and failure branch.
     pub vantage_walk_failures_total: IntCounterVec,
-    /// Fresh repair request campaigns for a digest whose previous full-coverage
-    /// campaign went unanswered (`Repairer::refetch_at`). A steadily nonzero rate means
-    /// some block genuinely exists nowhere reachable -- e.g. a publish that never left
-    /// its author AND an author refusing to serve -- which is worth an alert; a small
-    /// burst around a node restart is the mechanism working.
+    /// Fresh repair campaigns after a full-coverage campaign went unanswered.
     pub vantage_repair_refetch_campaigns_total: IntCounter,
-    /// Body-fetch pairs given up on after `MAX_FETCH_ATTEMPTS` rather than asked again.
-    ///
-    /// Abandoning is safe and re-creatable (see `MAX_FETCH_ATTEMPTS`), so a healthy rate
-    /// here is not an error -- it is the mechanism working. What it bounds: a stalled node
-    /// sent 433,656 body fetches in 120s against 53 on a healthy peer, at a network-wide
-    /// answer rate of 7.8%, each send costing ~50us on the single consensus core.
+    /// Body-fetch pairs abandoned after `MAX_FETCH_ATTEMPTS`.
     pub vantage_body_fetch_abandoned_total: IntCounter,
-    /// Panics observed by this process's panic hook (`install_panic_hook`).
-    ///
-    /// tokio silently absorbs a panicking task: the panic travels in the `JoinHandle`,
-    /// and every task in this codebase is spawned fire-and-forget, so a dead subsystem
-    /// leaves the process alive, the metrics server answering, and every OTHER counter
-    /// still advancing. That is precisely what a wedged worker looked like from
-    /// outside. A nonzero value here turns "we cannot tell whether it parked or died"
-    /// into an answer, from a scrape.
-    ///
-    /// A GAUGE rather than a counter, deliberately: the hook is a process-global
-    /// singleton but `Metrics` is not (`node local-benchmark` builds one per in-process
-    /// node), so the value published is the process-wide running total written straight
-    /// from the hook. A counter's `inc_by` contract cannot express "mirror a global
-    /// that other registries also observe" without per-registry reconciliation state.
+    /// Panics observed by this process's panic hook.
     pub process_panics: IntGauge,
 
-    // --- METRICS-DASHBOARD-SPEC.md §8 addenda.
-    /// Write-once at boot: which protocol this node is running (starfish pattern --
-    /// `consensus_protocol_info`). Always exactly one label value set to `1`.
+    // --- Protocol and workload labels.
+    /// Protocol label written once at boot. One label value is set to `1`.
     pub protocol_info: IntGaugeVec,
-    /// Write-once (where known -- see `set_transaction_mode_info`'s doc): which
-    /// client transaction-payload mode this run uses.
+    /// Client transaction-payload mode label, when known.
     pub transaction_mode_info: IntGaugeVec,
 
-    // --- Perf-audit addendum: metrics-active window (starfish parity,
-    // `metrics.rs`'s own `metrics_active`/`transactions_generator.rs`'s early
-    // return in `RealCommitHandler::transaction_observer`).
-    /// True iff commit-time observations should feed the rate-relevant counters
-    /// (the two transaction-latency histograms and their squared-micros
-    /// accumulators, `committed_transactions`/`committed_bytes`, and
-    /// `latency_misses`/`latency_misses_resolved`) -- gated in
-    /// `worker::synchronizer::Synchronizer::observe_committed`/
-    /// `finish_deferred_retry`, mirroring starfish's identical early return in
-    /// `RealCommitHandler::transaction_observer`. Outside the active window (a
-    /// warmup before load generation starts, or a wind-down after it stops), a late
-    /// commit would otherwise skew TPS, the latency distribution, and the
-    /// bandwidth-efficiency denominator -- exactly starfish's own rationale.
-    /// Defaults to `true` (active): unlike starfish, nothing in this codebase's
-    /// benchmark harness currently flips this (see METRICS-NOTES.md/this change's
-    /// own report for what the equivalent hook would be), so every existing run's
-    /// numbers are unaffected until something does. `Arc`-wrapped (matching
-    /// starfish's own type exactly) so every clone of `Metrics` -- there is
-    /// currently one long-lived instance per primary/worker, but the struct is
-    /// `Clone` -- observes the same flag.
+    // --- Metrics-active window.
+    /// Whether commit-time observations contribute to rate and latency metrics.
+    /// The value is shared by all clones.
     pub metrics_active: Arc<AtomicBool>,
-    /// Absolute wall-clock instant (epoch milliseconds) from which an observation
-    /// counts; `0` means "no gate" (every observation counts, the pre-existing
-    /// behaviour). Set write-once at boot from `config::Parameters::
-    /// metrics_active_at_ms` -- see that field for why the window is an absolute
-    /// instant rather than a per-node uptime offset.
-    ///
-    /// This is the FINE-GRAINED companion to `metrics_active` above: that flag gates
-    /// a whole `observe_committed` call, whereas this compares each transaction's own
-    /// embedded submission timestamp, so a transaction submitted during warmup is
-    /// excluded even though it commits inside the active window. Exactness matters
-    /// here: the startup transient is precisely the population whose SUBMISSION was
-    /// early, and it is those transactions whose multi-second latencies dominated
-    /// p99 (measured 2026-08-06: a fixed ~7.4s submission window contributed ~5% of
-    /// all observations at every offered rate, pinning p99 near 3.5s while p95 stayed
-    /// under 600ms).
+    /// Epoch-millisecond start of the metrics-active window. Zero disables the gate.
+    /// Set from `config::Parameters::metrics_active_at_ms`.
     pub active_from_millis: Arc<AtomicU64>,
 }
 
-/// Owns the receiving half of the latency histogram and periodically drains + publishes
-/// it as labeled gauges. `Metrics` (the sender-side handles) is `Clone`+`Send`+`Sync` and
-/// can be shared freely; `MetricReporter` is not meant to be touched outside its own
-/// background task other than via `start`.
+/// Owns latency histogram receivers and publishes labeled gauges.
 pub struct MetricReporter {
     transaction_committed_latency: Mutex<HistogramReporter<Duration>>,
     transaction_materialised_latency: Mutex<HistogramReporter<Duration>>,
@@ -1149,9 +591,7 @@ pub struct MetricReporter {
     proposed_transaction_size_bytes: Mutex<HistogramReporter<usize>>,
 }
 
-/// Publishes a `PreciseHistogram<T>` as a `name{v="..."}` gauge vector: exact count, sum,
-/// max and the p25/p50/p75/p90/p95/p99 quantiles. This preserves starfish's exposition
-/// shape and adds p95 for the benchmark dashboard.
+/// Publishes exact histogram count, sum, maximum, and percentiles as gauges.
 pub struct HistogramReporter<T> {
     histogram: PreciseHistogram<T>,
     gauge: IntGaugeVec,
@@ -1184,7 +624,7 @@ impl<T: Ord + AddAssign + DivUsize + Copy + Default + AsPrometheusMetric> Histog
     }
 
     /// Publish the current exact quantiles. A no-op (leaves the gauge unset) until the
-    /// first observation arrives, so an idle `Metrics` (e.g. primary's in Phase 2, which
+    /// first observation arrives, so an idle `Metrics` (for example, a primary that
     /// registers this same shape but never observes into it) simply omits the metric
     /// from its scrape output rather than reporting a misleading zero.
     pub fn report(&mut self) {
@@ -1231,15 +671,11 @@ impl<T: Ord + AddAssign + DivUsize + Copy + Default + AsPrometheusMetric> Histog
 }
 
 impl Metrics {
-    /// Registers this phase's metrics into `registry` and returns the (sender-side,
+    /// Registers these metrics into `registry` and returns the (sender-side,
     /// reporter-side) pair. Both primary and worker call this on their own registry;
-    /// only worker's copy is ever observed into in Phase 2 (see PHASE2-NOTES.md).
+    /// the worker's copy is observed by the reporter.
     pub fn new(registry: &Registry) -> (Arc<Self>, Arc<MetricReporter>) {
-        // The node-side active-window clock the harness divides rates by. Created here
-        // so the collector and `Metrics::active_from_millis` share ONE Arc: arming the
-        // window via `set_active_from_millis` is then immediately visible to every
-        // subsequent scrape. Registration failure is non-fatal -- a duplicate registry
-        // (only tests build several) must not take a validator down over one series.
+        // Share the active-window clock with the scrape-time collector.
         let active_from_millis = Arc::new(AtomicU64::new(0));
         if let Err(e) = registry.register(Box::new(ActiveWindowCollector::new(
             active_from_millis.clone(),
@@ -2026,12 +1462,6 @@ impl Metrics {
                     registry,
                 )
                 .unwrap(),
-            vantage_sequence_boundary_head_lo: register_int_gauge_with_registry!(
-                "vantage_sequence_boundary_head_lo",
-                "Leading 8 bytes of the boundary head as a signed integer, for graphing",
-                registry,
-            )
-            .unwrap(),
             vantage_sequence_records_total: register_int_counter_with_registry!(
                 "vantage_sequence_records_total",
                 "Sequence records committed to the local chain",
@@ -2194,9 +1624,7 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
-            // Perf-audit addendum: defaults active (starfish parity for "preserves
-            // current behaviour when nothing sets it") -- see this field's own doc
-            // comment for what would need to set it false.
+            // Metrics are active until a start time is configured.
             metrics_active: Arc::new(AtomicBool::new(true)),
             active_from_millis,
         };
@@ -2204,26 +1632,13 @@ impl Metrics {
         (Arc::new(metrics), Arc::new(reporter))
     }
 
-    /// METRICS-DASHBOARD-SPEC.md §8: write-once at boot (`Primary::spawn`/
+    /// Writes the protocol label once at boot (`Primary::spawn`/
     /// `Worker::spawn`, both always know `parameters.protocol`).
     pub fn set_protocol_info(&self, protocol: &str) {
         self.protocol_info.with_label_values(&[protocol]).set(1);
     }
 
-    /// Make a task panic visible instead of silent: publish it to `process_panics` and
-    /// log it at `error` with payload, location, thread and backtrace.
-    ///
-    /// Installed once per process (`Once`), chaining to whatever hook was in place so
-    /// the default "thread panicked at ..." message is not lost. Both `Primary::spawn`
-    /// and `Worker::spawn` call this, and whichever runs first owns the gauge -- see
-    /// `process_panics`' doc for why that is the right trade rather than a limitation.
-    ///
-    /// Why this exists at all: nothing in this codebase awaits a `JoinHandle`, so tokio
-    /// has nowhere to report a panicking task and the panic is dropped on the floor. A
-    /// subsystem can die while the process stays up, the metrics server keeps serving,
-    /// and every unrelated counter keeps advancing -- indistinguishable from a healthy
-    /// node under load until you diff two scrapes and notice one delta is exactly zero.
-    /// That cost most of a day on 2026-08-08.
+    /// Installs a process-wide panic hook that records and logs task panics.
     pub fn install_panic_hook(metrics: Arc<Self>) {
         static INSTALLED: std::sync::Once = std::sync::Once::new();
         INSTALLED.call_once(move || {
@@ -2231,8 +1646,7 @@ impl Metrics {
             std::panic::set_hook(Box::new(move |info| {
                 let count = PROCESS_PANICS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 metrics.process_panics.set(count as i64);
-                // `PanicHookInfo::payload` is `&dyn Any`; the two shapes `panic!` ever
-                // produces are `&str` (literal) and `String` (formatted).
+                // Handle string and formatted panic payloads.
                 let payload = info
                     .payload()
                     .downcast_ref::<&str>()
@@ -2262,22 +1676,13 @@ impl Metrics {
         PROCESS_PANICS.load(AtomicOrdering::Relaxed)
     }
 
-    /// METRICS-DASHBOARD-SPEC.md §8: write-once, where the caller knows the client's
-    /// tx-generation mode. `node local-benchmark` (the in-process vehicle) has it in
-    /// scope directly. The standalone `node run primary`/`node run worker` path (what
-    /// `fab remote` and docker-bench exec) has no direct view of the separate
-    /// `benchmark_client` process's `--mode`, so it now reads the harness-supplied
-    /// `Parameters::tx_mode` instead -- set by the generators (docker-bench `gen.py`),
-    /// unset (`None`) for library/production callers, in which case this is not
-    /// called and the gauge family stays absent (not a misleading zero).
+    /// Writes the workload label when the transaction mode is known.
     pub fn set_transaction_mode_info(&self, mode: &str) {
         self.transaction_mode_info.with_label_values(&[mode]).set(1);
     }
 
-    /// Write-once at boot (same discipline as `set_protocol_info` above): open the
-    /// metrics-active window at an absolute epoch-millisecond instant. `None` leaves
-    /// the gate disabled, which is byte-identical to the behaviour before
-    /// `active_from_millis` existed.
+    /// Opens the metrics-active window at an epoch-millisecond instant. `None` leaves
+    /// the gate disabled.
     pub fn set_active_from_millis(&self, at_millis: Option<u64>) {
         if let Some(at) = at_millis {
             self.active_from_millis
@@ -2285,10 +1690,8 @@ impl Metrics {
         }
     }
 
-    /// True iff a transaction submitted at `submitted_millis` falls inside the
-    /// metrics-active window. Cheap and allocation-free -- called once per committed
-    /// transaction on the hot path (240k+ tx/s), hence `Relaxed`: the value is
-    /// written once at boot and never changes, so no ordering is needed.
+    /// Returns whether a transaction submitted at `submitted_millis` is in the active
+    /// metrics window.
     pub fn counts_toward_metrics(&self, submitted_millis: u64) -> bool {
         let from = self
             .active_from_millis
@@ -2313,14 +1716,7 @@ impl MetricReporter {
         }
     }
 
-    /// Drain the histogram and publish its current gauges immediately, instead of
-    /// waiting for the next periodic tick (up to `REPORT_INTERVAL` stale). Used by
-    /// `local-benchmark` (PHASE2-SPEC.md §8), which reads the registry in-process at
-    /// the exact end of the run and would otherwise miss up to 10s of the tail.
-    ///
-    /// Cumulative over the whole run (warm-up included), starfish-style: draining
-    /// without clearing means reported quantiles reflect every observation so far,
-    /// not just the last window (PHASE2-SPEC.md #5's semantics note).
+    /// Drains histogram receivers and publishes current gauges immediately.
     pub fn force_report(&self) {
         let mut latency = self.transaction_committed_latency.lock().unwrap();
         latency.receive_all();
@@ -2358,9 +1754,7 @@ mod tests {
 
     #[test]
     fn active_seconds_is_zero_until_the_window_is_armed() {
-        // Ungated runs must expose 0, which the harness reads as "no node-side clock"
-        // and falls back to its own wall-clock window -- identical to the behaviour
-        // before this series existed.
+        // An unconfigured window reports zero.
         let registry = Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         assert_eq!(active_seconds(&registry), Some(0.0));
@@ -2370,9 +1764,7 @@ mod tests {
 
     #[test]
     fn active_seconds_is_computed_at_scrape_time_not_on_a_tick() {
-        // The whole point of the Collector: no MetricReporter tick runs in this test, so
-        // a periodically-published gauge would stay at 0. Arming the window 5s in the
-        // past must therefore read ~5s on the very next gather.
+        // Scraping computes the duration without waiting for the reporter tick.
         let registry = Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         let now = std::time::SystemTime::now()
@@ -2385,16 +1777,14 @@ mod tests {
             (4.5..6.0).contains(&seconds),
             "expected ~5s of open window, got {seconds}"
         );
-        // A window that opens in the FUTURE is still closed, hence 0 -- never negative,
-        // which would poison a rate denominator.
+        // A future window is closed and reports zero.
         metrics.set_active_from_millis(Some(now + 60_000));
         assert_eq!(active_seconds(&registry), Some(0.0));
     }
 
     #[test]
     fn metrics_active_window_is_disabled_by_default() {
-        // Every parameters file predating `metrics_active_at_ms` must behave exactly
-        // as before: no gate, every observation counts, however old its timestamp.
+        // With no start time, every observation counts.
         let registry = Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         assert!(metrics.counts_toward_metrics(0));
@@ -2405,10 +1795,7 @@ mod tests {
 
     #[test]
     fn metrics_active_window_excludes_transactions_submitted_before_it_opens() {
-        // The gate keys off the transaction's own SUBMISSION instant, not its commit
-        // instant: the startup transient is precisely the population that was
-        // submitted while the committee was still forming, and a transaction
-        // submitted then still commits (late) inside the active window.
+        // The gate uses submission time rather than commit time.
         let registry = Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         let window_open = 1_770_000_012_500;
@@ -2452,24 +1839,13 @@ mod tests {
         assert_eq!(p95, Some(96));
     }
 
-    /// The hook counts a panic and publishes it, and installing it twice is a no-op.
-    ///
-    /// The point of the whole mechanism is that a panicking tokio task is otherwise
-    /// invisible (nothing awaits a `JoinHandle`), so "the hook is wired" has to be an
-    /// assertion rather than an assumption -- a `Once` used wrongly fails silently and
-    /// would leave the metric at a permanently reassuring 0.
-    ///
-    /// `catch_unwind` keeps the panic from failing the test; the chained default hook
-    /// writes to stderr, which cargo captures and shows only on failure. The
-    /// `Backtrace::force_capture()` in the hook is inside `log::error!`'s argument list
-    /// and no logger is installed in tests, so the macro's level check short-circuits
-    /// before evaluating it -- no backtrace is captured or printed here.
+    /// The hook records a panic and remains idempotent when installed twice.
     #[test]
     fn panic_hook_counts_and_publishes() {
         let registry = Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
         Metrics::install_panic_hook(metrics.clone());
-        // Second call must not chain a second hook (which would double-count).
+        // Installing twice must not chain a second hook.
         Metrics::install_panic_hook(metrics.clone());
 
         let before = Metrics::process_panic_count();
@@ -2477,12 +1853,9 @@ mod tests {
         assert!(caught.is_err(), "the closure was supposed to panic");
         let after = Metrics::process_panic_count();
 
-        // Exactly one, not two: proves the second `install_panic_hook` was inert. A
-        // delta rather than an absolute, because the tally is process-wide and other
-        // tests share this binary.
+        // Compare a delta because the tally is process-wide.
         assert_eq!(after - before, 1, "hook counted {} panics", after - before);
-        // The gauge tracks the same global. `>=` because another test in this binary may
-        // have panicked and bumped it between the two reads above.
+        // The gauge mirrors the process-wide tally.
         assert!(metrics.process_panics.get() >= 1);
     }
 }

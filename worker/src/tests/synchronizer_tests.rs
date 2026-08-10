@@ -51,11 +51,7 @@ async fn synchronize() {
     assert!(handle.await.is_ok());
 }
 
-// Task 1 (perf-audit followups): the measurement-bug fix in `observe_committed` --
-// a deferred miss must be retried and counted exactly once, attributing the
-// ORIGINAL commit instant to `transaction_committed_latency` and the LATER retry
-// instant to `transaction_materialised_latency`; the bounding logic must evict what
-// it claims to.
+// Deferred misses are retried once and stale entries are evicted.
 #[cfg(feature = "benchmark")]
 mod benchmark_metrics_tests {
     use super::*;

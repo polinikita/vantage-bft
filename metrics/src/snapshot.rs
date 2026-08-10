@@ -1,19 +1,9 @@
-//! In-process reading of a node's own `Registry` (PHASE2-SPEC.md §8): `local-benchmark`
-//! self-hosts every node in one process, so it can read each one's committed-transaction
-//! latency directly from its `Registry::gather()` output -- the same gauges/counters the
-//! HTTP endpoint serves, just read via the typed protobuf structs instead of an HTTP
-//! round-trip and text-format parse. Cross-node aggregation mirrors
-//! `benchmark/benchmark/logs.py`'s audited rules exactly (max for count/misses, since
-//! every node's committer processes the whole replicated commit stream; summed sum/
-//! sum-of-squares for the avg/stddev ratio, which is invariant to that same scaling;
-//! median across nodes for percentiles) so a `local-benchmark` run and a `fab remote` run
-//! report comparable numbers.
+//! In-process reads and aggregation of registry metrics.
 
 use prometheus::Registry;
 use std::collections::BTreeMap;
 
-/// One node's own view of the transaction-committed-latency metrics, read directly from
-/// its `Registry` (not summed with anyone else's yet).
+/// One node's transaction latency metrics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LatencySnapshot {
     pub count: u64,
@@ -30,37 +20,21 @@ pub struct LatencySnapshot {
     pub committed_bytes: u64,
 }
 
-/// Reads the current gauge/counter values from `registry`. Callers should call
-/// `MetricReporter::force_report` immediately beforehand so the histogram gauges reflect
-/// every observation up to that instant, not whatever the last periodic tick saw.
-/// Returns `None` if this node never observed a single committed transaction (the
-/// `transaction_committed_latency` gauge vector doesn't exist until the first
-/// observation -- see `HistogramReporter::report`).
+/// Reads the current latency gauges and counters. Callers should call
+/// `MetricReporter::force_report` first. Returns `None` before the first observation.
 pub fn read_latency_snapshot(registry: &Registry) -> Option<LatencySnapshot> {
     read_latency_snapshot_for(registry, "transaction_committed_latency")
 }
 
-/// The materialised-latency counterpart of `read_latency_snapshot`: same shape, read
-/// from `transaction_materialised_latency` instead.
+/// Reads the materialized latency snapshot.
 ///
-/// The two series differ by exactly the payload-availability cost. `transaction_
-/// committed_latency` stops at the primary's ordering decision (`commit_millis`, stamped
-/// at commit and carried to the worker); `transaction_materialised_latency` stops when
-/// the batch is actually read and deserialised locally, so a batch this node had to
-/// fetch contributes its ORIGINAL commit instant to the first series and its LATER
-/// arrival instant to the second. Only the second is comparable to starfish, whose
-/// `block_handler::transaction_observer` likewise stamps at the moment the block's
-/// transactions are in hand.
-///
-/// `misses`/`committed_transactions`/`committed_bytes` are shared, not per-series --
-/// both snapshots report the same underlying counters.
+/// Committed latency ends at ordering. Materialized latency ends when the worker has
+/// the batch locally. The shared counters are reported in both snapshots.
 pub fn read_materialised_latency_snapshot(registry: &Registry) -> Option<LatencySnapshot> {
     read_latency_snapshot_for(registry, "transaction_materialised_latency")
 }
 
-/// Shared body of the two readers above. `base` names the histogram-gauge family; the
-/// sum-of-squares counter is always `{base}_squared_micros` (see `Metrics`'s own
-/// registration of both pairs).
+/// Shared reader for the two latency gauge families.
 fn read_latency_snapshot_for(registry: &Registry, base: &str) -> Option<LatencySnapshot> {
     let families = registry.gather();
     let squared = format!("{base}_squared_micros");
@@ -107,8 +81,7 @@ fn read_latency_snapshot_for(registry: &Registry, base: &str) -> Option<LatencyS
     })
 }
 
-/// Cross-node aggregate, computed with the same rules `logs.py::_real_transaction_latency`
-/// uses (PHASE2-SPEC.md §5 amendments). `None` if no node ever observed a transaction.
+/// Cross-node latency aggregate. Returns `None` if no node observed a transaction.
 #[derive(Clone, Copy, Debug)]
 pub struct AggregatedLatency {
     pub avg_micros: f64,
@@ -119,8 +92,7 @@ pub struct AggregatedLatency {
     pub p90_micros: u64,
     pub p99_micros: u64,
     pub max_micros: u64,
-    /// Max across nodes -- every node counts (approximately) the same replicated
-    /// commit stream, not a disjoint partition of it.
+    /// Maximum count across nodes because each node observes the replicated stream.
     pub count: u64,
     pub misses: u64,
     pub nodes_reporting: usize,
@@ -159,12 +131,7 @@ pub fn aggregate_latency_snapshots(snapshots: &[LatencySnapshot]) -> Option<Aggr
     })
 }
 
-/// PHASE6-SPEC.md §9 gate amendment: reads the `vantage_seals` counter vector (labeled
-/// by `route`) from a PRIMARY's own registry (distinct from the worker registries
-/// `read_latency_snapshot` reads -- `vantage_seals` lives on `AgbEngine`, primary-side).
-/// Empty on the two Autobahn paths (nothing ever observes into it there) and before any
-/// view has sealed. Keyed by route name, in whatever order the registry reports them
-/// (`BTreeMap` for deterministic, alphabetical print order).
+/// Reads primary seal counts keyed by route. Returns an empty map when unavailable.
 pub fn read_seal_route_counts(registry: &Registry) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     let families = registry.gather();
@@ -183,10 +150,7 @@ pub fn read_seal_route_counts(registry: &Registry) -> BTreeMap<String, u64> {
     out
 }
 
-/// PHASE7-PREP-NOTES.md Finding A: one node's own progress-gauge snapshot, read from a
-/// PRIMARY's own registry (same registry `read_seal_route_counts` reads). Plain
-/// unlabeled `IntGauge`s, so each family has exactly one metric with no labels --
-/// unlike `read_latency_snapshot`'s `v`-labeled histogram gauges above.
+/// Reads one primary's progress gauges.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VantageProgress {
     pub entered_view: i64,
@@ -198,20 +162,11 @@ pub struct VantageProgress {
     pub own_watermark: i64,
     pub entry_target: i64,
     pub omega_q: i64,
-    /// `BlockCache` entries held. Included here because this is the ONLY reliable way to
-    /// read a vantage gauge under `local-benchmark`: its HTTP metrics endpoints serve a
-    /// registry the core never writes to (every gauge reads 0 there, including
-    /// `entered_view`, while this same registry shows thousands of views). The cache has no
-    /// eviction, so watching it here is how a leak gets attributed locally.
+    /// Number of retained `BlockCache` entries.
     pub block_cache_len: i64,
 }
 
-/// Reads the six Finding-A progress gauges. These `IntGauge`s are always registered
-/// (Phase-3-counter pattern: registered on every primary's registry, defaulting to 0),
-/// so this never returns `None` in practice -- the `Option` return only mirrors
-/// `read_latency_snapshot`'s shape for a family that could in principle be missing (a
-/// registry this crate didn't build, e.g. in a future caller). On the two Autobahn
-/// paths (no `VantageCore` ever constructed) the gauges simply stay at 0 forever.
+/// Reads the primary progress gauges. Returns `None` if a required gauge is absent.
 pub fn read_vantage_progress(registry: &Registry) -> Option<VantageProgress> {
     let families = registry.gather();
     let gauge = |metric: &str| -> Option<i64> {
@@ -235,9 +190,7 @@ pub fn read_vantage_progress(registry: &Registry) -> Option<VantageProgress> {
     })
 }
 
-/// METRICS-DASHBOARD-SPEC.md §2: reads a single unlabeled `IntCounter`'s current
-/// value from `registry`. `0` if the metric doesn't exist on this registry (e.g. a
-/// worker registry queried for a primary-only counter).
+/// Reads an unlabeled counter. Returns `0` if the metric is absent.
 pub fn read_counter(registry: &Registry, name: &str) -> u64 {
     registry
         .gather()
@@ -248,9 +201,7 @@ pub fn read_counter(registry: &Registry, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// METRICS-DASHBOARD-SPEC.md §1/§2: reads a labeled `IntCounterVec`'s current values
-/// from `registry`, keyed by the value of `label` (e.g. `type` or `proc`). Empty if
-/// the metric family doesn't exist on this registry.
+/// Reads a labeled counter family keyed by `label`. Returns an empty map if absent.
 pub fn read_counter_vec(registry: &Registry, name: &str, label: &str) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     let families = registry.gather();
@@ -266,8 +217,7 @@ pub fn read_counter_vec(registry: &Registry, name: &str, label: &str) -> BTreeMa
     out
 }
 
-/// Median of an unordered `u64` iterator (even-length: average of the two middle
-/// values, rounded down -- consistent with reporting in whole microseconds).
+/// Median of an unordered `u64` iterator. Even-length inputs round down.
 fn median(values: impl Iterator<Item = u64>) -> u64 {
     let mut values: Vec<u64> = values.collect();
     values.sort_unstable();

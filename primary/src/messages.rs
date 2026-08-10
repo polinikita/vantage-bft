@@ -10,10 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-#[cfg(test)]
-#[path = "tests/messages_tests.rs"]
-pub mod messages_tests;
-
 ///////////
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Proposal {
@@ -64,7 +60,6 @@ pub enum ConsensusType {
     Commit,
 }
 
-//TODO: Define identical Commit message
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CommitQC {
     pub slot: Slot,
@@ -91,12 +86,11 @@ impl CommitQC {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ConsensusMessage {
-    //TODO: Easier to re-factor into a single message type, and just add an enum for "type"?
     Prepare {
         slot: Slot,
         view: View,
         tc: Option<TC>, //TC for previous view; if None => must have ticket for previous slot
-        qc_ticket: Option<CommitQC>, //TODO: ADD qc ticket from slot s-k to bound instances. (For now: only issue this Prepare if have s-k Committed) => byz can open f more instances without tickets, but honest won't.
+        qc_ticket: Option<CommitQC>,
         proposals: HashMap<PublicKey, Proposal>,
     },
     Confirm {
@@ -133,7 +127,6 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
             let mut hasher = Blake3Hasher::new();
             hasher.update(&slot.to_le_bytes());
             hasher.update(&view.to_le_bytes());
-            //hasher.update(proposal_digest(consensus_message)); FIXME: ADD THIS AND DEBUG
             hasher.update(&0_u8.to_le_bytes());
             let prepare_id = Digest(hasher.finalize().into());
 
@@ -153,10 +146,7 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
                 qc.verify(committee).is_ok()
             } else {
                 //SlowQC only has 2f+1 Confirm Votes
-                //TODO: If Confirm hashes proposals instead of prepare_id we don't need the iterative hashing...
-
-                //TODO: Need to have digest of the confirm vote
-                // Confirm vote has digest =
+                // Confirm votes hash the derived prepare identifier.
                 let mut hasher = Blake3Hasher::new();
                 hasher.update(&slot.to_le_bytes());
                 hasher.update(&view.to_le_bytes());
@@ -180,21 +170,6 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
     }
 }
 
-//  //TODO: Check that ID of QC belongs to digest of Confirm.
-//                 //TODO: FIXME: Commit QC has to check that it's signatures for Confirm Votes.  / PrepareVotes for fast.
-//                 //I.e. re-construct id and check that QC.id = recon-ID
-//                 //re-con ID = Confirm(s, v, proposals).digest()   //FIXME: add proposal_digest to ConsensusMessage .digest
-//                 // For prepare QC check id = Prepare... + verify 3f+1 sigs.
-//                 let fast_size = self.committee.fast_threshold() as usize;
-//                 if qc.votes.len() == fast_size { //verify fast QC
-//                     let id = &ConsensusMessage::Prepare { slot: *slot, view: *view, tc: None, proposals: proposals.clone() }.digest();
-//                     //
-//                 }
-//                 else{
-//                     let id = ConsensusMessage::Confirm { slot: *slot, view: *view, qc: QC::default(), proposals: proposals.clone() }.digest();
-//                 }
-//                 true
-
 pub fn verify_confirm(consensus_message: &ConsensusMessage, committee: &Committee) -> bool {
     match consensus_message {
         ConsensusMessage::Confirm {
@@ -207,7 +182,6 @@ pub fn verify_confirm(consensus_message: &ConsensusMessage, committee: &Committe
             let mut hasher = Blake3Hasher::new();
             hasher.update(&slot.to_le_bytes());
             hasher.update(&view.to_le_bytes());
-            //hasher.update(proposal_digest(consensus_message)); FIXME: ADD THIS AND DEBUG
             hasher.update(&0_u8.to_le_bytes());
             let prepare_id = Digest(hasher.finalize().into());
 
@@ -273,7 +247,6 @@ impl Hash for ConsensusMessage {
             } => {
                 hasher.update(&slot.to_le_bytes());
                 hasher.update(&view.to_le_bytes());
-                //hasher.update(proposal_digest(self)); FIXME: ADD THIS AND DEBUG
                 //hasher.update(tc.digest().0);
                 // NOTE: Indicates a prepare message
                 hasher.update(&0_u8.to_le_bytes());
@@ -458,11 +431,11 @@ pub struct Header {
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parent_cert: Certificate,
     pub id: Digest,
-    // `None` on the vantage path (PHASE3-SPEC.md §3.1) -- vantage carries no
+    // `None` on the Vantage path; Vantage carries no
     // signatures anywhere. Autobahn constructors always set `Some(sig)`;
     // `Header::verify` (the only reader) requires presence.
     pub signature: Option<Signature>,
-    // Vantage only (PHASE3-SPEC.md §3.1/§6.1): `Some(sid)` binds a block to its
+    // Vantage only: `Some(sid)` binds a block to its
     // session; `None` on both Autobahn paths, where it is meaningless.
     pub sid: Option<Digest>,
 
@@ -505,7 +478,7 @@ impl Header {
         }
     }
 
-    /// Vantage constructor (PHASE3-SPEC.md §3.1): no signature service, no consensus
+    /// Vantage constructor without a signature service or consensus state.
     /// metadata, `parent_cert` is an empty-votes certificate acting as a pure predecessor
     /// pointer (never `Certificate::verify`d on this path -- N2's chain check is a plain
     /// height+digest match, see `vantage::block::block_ok`). `prev_digest` is the
@@ -655,18 +628,8 @@ impl Hash for Header {
         hasher.update(&self.parent_cert.header_digest.0); //Need to hash the chain parent(?)
                                                           //hasher.update(&self.parent_cert);
 
-        /*for info in &self.prepare_info_list {
-            hasher.update(&info.consensus_info.slot.to_le_bytes());
-            hasher.update(&info.consensus_info.view.to_le_bytes());
-        }*/
-
-        //TODO: Sign Consensus Messages too.
-        //     // for (dig, _) in &self.consensus_messages {
-        //     //     hasher.update(dig);
-        //     // }
-
-        // PHASE3-SPEC.md §3.1: fold the new `sid` Option injectively (presence byte then
-        // content when `Some`), appended after every pre-existing fold so Autobahn's
+        // Fold the new `sid` option injectively (presence byte, then content for `Some`)
+        // after the existing fields so Autobahn's
         // digest is unaffected in shape (only in value, since every Autobahn header now
         // also folds a `0` byte for `sid: None`). `signature` stays outside the digest,
         // as before.
@@ -710,7 +673,7 @@ impl fmt::Display for Header {
     }
 }
 
-/// Vantage-only (PHASE3-SPEC.md §3.1, wire variant §5): the paper's unsigned
+/// Vantage-only: the protocol's unsigned
 /// `⟨ack, a, k, h⟩`. `sender` is the acking party's declared identity -- trusted the same
 /// way `HeadersRequest`'s `requestor` already is (D4); first-hand counting keys on the
 /// *channel* sender at the receiving end (network dispatch), not this field alone, but
@@ -757,13 +720,6 @@ pub struct ConsensusRequest {
     pub author: PublicKey,
     pub message: ConsensusMessage,
     pub sig: Signature,
-    //TODO: Re-factor ConsensusMessage to be structured like this
-    // pub req_type: ConsensusType,
-    // pub slot: Slot,
-    // pub view: View,
-    // pub proposals: HashMap<PublicKey, Proposal>,
-    // pub qc: Option<QC>,
-    // pub tc: Option<TC>
 }
 impl ConsensusRequest {
     pub async fn new(
@@ -842,19 +798,6 @@ impl ConsensusVote {
     }
 }
 
-// impl Hash for ConsensusVote {
-//     fn digest(&self) -> Digest {
-//         let mut hasher = Sha512::new();
-//         // hasher.update(&self.id);
-//         // hasher.update(self.view.to_le_bytes());
-//         hasher.update(&self.id);
-//         hasher.update(self.height.to_le_bytes());
-//         //hasher.update(&self.origin);
-//         //hasher.update(self.special_valid.to_le_bytes());
-//         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-//     }
-// }
-
 impl fmt::Debug for ConsensusVote {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "CV{}({}, {})", self.digest, self.slot, self.author,)
@@ -869,8 +812,6 @@ pub struct Vote {
     pub author: PublicKey,
     pub signature: Signature,
     pub consensus_votes: Vec<(Slot, Digest, Signature)>,
-    //special loopback information. PURELY LOCAL HACK
-    //pub consensus_instance: Option<ConsensusMessage>,
 }
 
 impl Vote {
@@ -1019,7 +960,6 @@ impl Certificate {
             return Ok(());
         }
         // Check the embedded header.
-        //self.header_digest.verify(committee)?;
 
         // Ensure the certificate has a quorum.
         let mut weight = 0;
@@ -1038,27 +978,17 @@ impl Certificate {
 
         // Check the signatures.
 
-        //If all votes were special_valid or invalid ==> compute single vote digest and verify it (since it is the same for all)
+        // Verify each vote against its header digest.
         if false {
-            //matching_valids(&self.special_valids) {
-            //DEBUG
-            // //println!("verifiable digest: {:?}", &self.verifiable_digest());
-            // for (key, sig) in &self.votes {
-            //     //println!("vote signature: {:?}", sig);
-            //     //println!("vote author: {:?}", key);
-            // }
             Signature::verify_batch(&self.verifiable_digest(), &self.votes).map_err(DagError::from)
         } else {
-            //compute all the individual vote digests and verify them  (TODO: Since there are only 2 possible types, 0 and 1 ==> Could compute 2 digests, and then insert them in the correct order)
-            //E.g. could re-order Votes to be first all for 0, then all for 1. And call verify_batch separately twice
+            // Compute and verify each vote digest.
             let mut digests = Vec::new();
             for _ in self.votes.iter() {
                 digests.push({
                     let mut hasher = Blake3Hasher::new();
                     hasher.update(&self.header_digest.0);
                     hasher.update(&self.height().to_le_bytes());
-                    //hasher.update(&self.origin());
-                    //hasher.update(self.special_valids[i].to_le_bytes());
                     Digest(hasher.finalize().into())
                 })
                 //Check special valid.
@@ -1121,14 +1051,11 @@ pub fn matching_valids(vec: &[u8]) -> bool {
     vec.iter().min() == vec.iter().max()
 }
 
-//TODO: FIXME: Currently made it so special_valids is not part of the Cert hash ==> I consider them part of the signature information
-//Double check though if this is fine/safe
 impl Hash for Certificate {
     fn digest(&self) -> Digest {
         let mut hasher = Blake3Hasher::new();
         hasher.update(&self.header_digest.0);
         hasher.update(&self.height().to_le_bytes());
-        //hasher.update(&self.origin());
 
         Digest(hasher.finalize().into())
     }
@@ -1141,7 +1068,6 @@ impl fmt::Debug for Certificate {
             "{}: C{}({},,,, view: )",
             self.digest(),
             self.height(),
-            //self.origin(),
             self.header_digest,
             /*self.header
                 .parent_cert
@@ -1400,7 +1326,6 @@ impl QC {
             ConsensusError::QCRequiresQuorum
         );
 
-        //let verifiable_digest = self.digest();
         // Check the signatures.
         Signature::verify_batch(&self.id, &self.votes).map_err(ConsensusError::from)
     }
@@ -1425,7 +1350,6 @@ impl fmt::Debug for QC {
 impl PartialEq for QC {
     fn eq(&self, _other: &Self) -> bool {
         false
-        //self.hash == other.hash && self.view == other.view
     }
 }
 
@@ -1476,7 +1400,6 @@ impl Timeout {
 
         // Check the signature.
         self.signature.verify(&self.digest(), &self.author)?;
-        // TODO: If it would be winning QC then you need to verify
 
         //NOTE: When verifying TC, we have purged all vote contents besides the winner --> so this step is skipped. Verification is only necessary for the winning proposal
 
@@ -1542,7 +1465,6 @@ pub struct TC {
 
 impl PartialEq for TC {
     fn eq(&self, _other: &Self) -> bool {
-        //self.hash == other.hash && self.view == other.view
         //*self.winning_proposal == *other.winning_proposal
         true
     }
@@ -1621,7 +1543,7 @@ impl TC {
 
                         if *weight >= committee.validity_threshold() {
                             winning_view = *view;
-                            //Slightly imprecise: The f+1 prepares may have different views. FIXME: We should be using the f+1st smallest (If there is more than f+1 votes => keep upgrading view)
+                            // Keep the highest-view proposal set with sufficient weight.
                             winning_proposals = proposals.clone();
                         }
                     }
@@ -1713,7 +1635,6 @@ impl fmt::Debug for TC {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Committment {
-    //pub commit_round: Round,
     pub commit_view: View,
 }
 

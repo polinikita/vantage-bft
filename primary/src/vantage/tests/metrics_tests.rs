@@ -1,4 +1,3 @@
-// PHASE3-SPEC.md §6.4 -- vantage metrics counters actually observe, not just compile.
 use super::common::*;
 use crate::vantage::repair::Repairer;
 use crypto::Digest;
@@ -20,9 +19,6 @@ async fn lane_manager_counters_observe() {
     assert_eq!(metrics.vantage_acks_sent.get(), 1);
     assert!(metrics.vantage_retained_bytes.get() > 0);
 
-    // A relayed (non-self-authored) publish increments `blocks_received`. ACK receive
-    // counting now lives at the ACK-aggregation boundary, before the core consumes only
-    // availability marks.
     let (other, _) = authors()[1];
     let genesis = lm.genesis().clone();
     let sid = lm.sid().clone();
@@ -57,7 +53,7 @@ async fn repairer_counters_observe() {
     let block = crate::messages::Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
     let h = block.id.clone();
 
-    repairer.authorize((author, 1, Digest([1u8; 32]))); // unrelated digest -> pure request fan-out
+    repairer.authorize((author, 1, Digest([1u8; 32]))); // Request a missing unrelated digest.
     assert!(metrics.vantage_repairs_requested.get() > 0);
 
     repairer.on_request(requester, h.clone());

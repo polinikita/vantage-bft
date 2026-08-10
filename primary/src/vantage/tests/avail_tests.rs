@@ -1,15 +1,9 @@
-// Optional, flag-gated ack-watermark front-end (`Parameters::ack_watermarks`): a
-// periodic per-lane availability broadcast that replaces per-block acks --
-// `LaneManager::{take_avail_flush, resolve_watermark, retry_pending_avail}`.
 use super::common::*;
 use crate::messages::Header;
 use crate::vantage::lanes::{AckAggregator, AckAvailability, AckThreshold, AvailEntry};
 use crypto::Digest;
 use std::collections::BTreeMap;
 
-/// Own DIRECT-PREFIX watermark: advances incrementally as blocks are confirmed
-/// DirectPub, `take_avail_flush` is full-vector-when-dirty, and a second call with
-/// nothing new returns `None` (idempotent).
 #[tokio::test]
 async fn take_avail_flush_tracks_own_direct_pub_watermark() {
     let (author, _) = authors()[0];
@@ -29,13 +23,9 @@ async fn take_avail_flush_tracks_own_direct_pub_watermark() {
         }]
     );
 
-    // Idempotent: nothing new since the last flush.
     assert!(lm.take_avail_flush().is_none());
 }
 
-/// Watermark from peer `sender` credits exactly the resolvable refs (heights 1..=3);
-/// re-sending the identical vector afterwards yields zero new credits (monotone
-/// floor).
 #[tokio::test]
 async fn resolve_watermark_credits_full_resolvable_prefix_then_is_monotone() {
     let (watcher, _) = authors()[0];
@@ -64,10 +54,6 @@ async fn resolve_watermark_credits_full_resolvable_prefix_then_is_monotone() {
     );
 }
 
-/// Fork binding: two sibling branches at the same heights; a watermark naming branch
-/// A's head credits ONLY branch-A refs -- `collect_verified_suffix`'s own
-/// parent-pointer walk never crosses branches -- and branch B's counts in the shared
-/// `AckAggregator` are left completely untouched (zero, exactly as before).
 #[tokio::test]
 async fn resolve_watermark_binds_to_the_named_fork_only() {
     let (watcher, _) = authors()[0];
@@ -101,10 +87,6 @@ async fn resolve_watermark_binds_to_the_named_fork_only() {
     for r in refs_a {
         aggregator.record_ack(sender, r);
     }
-    // If crediting branch A had ALSO (wrongly) silently counted `sender` toward
-    // branch B's refs, then a single additional, genuinely distinct sender would
-    // already cross f+1 (2 senders) here. It must not: this call is the first-ever
-    // recording for branch B's own ref, so it stays below f+1.
     let (third, _) = authors()[3];
     let result = aggregator.record_ack(third, (author, 1, b1.id.clone()));
     assert!(
@@ -114,11 +96,6 @@ async fn resolve_watermark_binds_to_the_named_fork_only() {
     );
 }
 
-/// Behind-the-head: the watermark's head is not yet in the local cache -> the head
-/// ref alone is credited (attested, per the same trust model a direct ack already
-/// has), the floor is NOT advanced, and the entry is stashed pending. Once the
-/// missing blocks arrive and the retry hook fires, the intermediate refs are
-/// credited exactly once.
 #[tokio::test]
 async fn resolve_watermark_credits_head_alone_when_unresolvable_then_backfills_on_retry() {
     let (watcher, _) = authors()[0];
@@ -144,13 +121,10 @@ async fn resolve_watermark_credits_head_alone_when_unresolvable_then_backfills_o
         "head alone, credited by attestation, since the segment below it is unresolvable"
     );
 
-    // The missing blocks arrive (e.g. via publish/repair) ...
     lm.process_publish(author, h1.clone()).await;
     lm.process_publish(author, h2.clone()).await;
     lm.process_publish(author, h3.clone()).await;
 
-    // ... and the retry hook (a newly-cached block for this author) backfills the
-    // intermediate refs, exactly once.
     let backfilled = lm.retry_pending_avail(&h1.id);
     assert_eq!(
         backfilled,
@@ -166,9 +140,6 @@ async fn resolve_watermark_credits_head_alone_when_unresolvable_then_backfills_o
     );
 }
 
-/// Threshold equivalence: a ref reaching 2f+1 via watermark credits triggers the same
-/// `AckAvailability` marks (`is_q_available`) as it would via direct acks. n=4, f=1 =>
-/// f+1=2, 2f+1=3.
 #[tokio::test]
 async fn resolve_watermark_credits_reach_the_same_availability_marks_as_direct_acks() {
     let all = authors();
@@ -219,10 +190,6 @@ async fn resolve_watermark_credits_reach_the_same_availability_marks_as_direct_a
     );
 }
 
-/// n=100 straggler fix (2026-08-08): `retry_pending_avail` is indexed by author instead
-/// of scanning all of `pending_avail` on every newly cached block. The index must stay a
-/// strict mirror of the map's key set at every step -- a drifted index silently stops
-/// retrying a stashed entry, and that sender's watermark then never resolves.
 #[tokio::test]
 async fn pending_avail_index_mirrors_the_map_through_stash_and_resolve() {
     let (watcher, _) = authors()[0];
@@ -250,14 +217,12 @@ async fn pending_avail_index_mirrors_the_map_through_stash_and_resolve() {
     };
 
     check(&lm, "before anything");
-    // Unresolvable (nothing cached) -> both senders get stashed.
     lm.resolve_watermark(sender_a, std::slice::from_ref(&entry));
     check(&lm, "after the first stash");
     lm.resolve_watermark(sender_b, std::slice::from_ref(&entry));
     check(&lm, "after the second stash");
     assert_eq!(lm.pending_avail_keys_for_test().len(), 2);
 
-    // The chain arrives; the retry resolves both and must clear both index entries.
     lm.process_publish(author, h1.clone()).await;
     lm.process_publish(author, h2.clone()).await;
     let backfilled = lm.retry_pending_avail(&h1.id);
@@ -272,12 +237,6 @@ async fn pending_avail_index_mirrors_the_map_through_stash_and_resolve() {
     );
 }
 
-/// ACK FAN-IN (2026-08-07): a credit for a ref already at the terminal `Quorum` threshold
-/// must not be produced at all. `record_ack` already returns no availability for such a ref,
-/// so the work was pure waste -- and it dominated core time at n=100: 190,292 credited
-/// refs/s per node, 96.3 per avail message (one watermark entry per author), 48.1s of a
-/// 122.6s window at 2.06us each = 39% of one core against 49% total inbound_dispatch. All n
-/// senders credit the same block; only the first 2f+1 can change anything.
 #[tokio::test]
 async fn a_watermark_does_not_recredit_a_ref_already_at_quorum() {
     let all = authors();
@@ -288,7 +247,6 @@ async fn a_watermark_does_not_recredit_a_ref_already_at_quorum() {
     let head = chain.last().unwrap();
     let r = (author, 2u64, head.id.clone());
 
-    // Before quorum: the watermark yields the ref, as it must.
     let entry = AvailEntry {
         author,
         height: 2,
@@ -300,14 +258,11 @@ async fn a_watermark_does_not_recredit_a_ref_already_at_quorum() {
         "a ref below quorum must still be credited"
     );
 
-    // Mark it Quorum, exactly as `process_ack_availability` would on a real mark.
     lm.process_ack_availability(AckAvailability {
         reference: r.clone(),
         threshold: AckThreshold::Quorum,
     });
 
-    // A later sender's watermark covering the same height must now produce nothing for it:
-    // quorum is terminal, so this credit could not change any output.
     let later = lm.resolve_watermark(all[3].0, &[entry]);
     assert!(
         !later.iter().any(|x| x == &r),
@@ -315,10 +270,6 @@ async fn a_watermark_does_not_recredit_a_ref_already_at_quorum() {
     );
 }
 
-/// The at-quorum memo must stay BOUNDED. Its first version was a flat `HashSet<BlockRef>`
-/// that only ever grew: ~2,000 refs/s at n=100 x ~100 B is about 720 MB/hour per node -- a
-/// fresh instance of exactly the leak class this work exists to remove. Forgetting an entry
-/// is safe (it costs one redundant credit, never correctness), so it is pruned per author.
 #[tokio::test]
 async fn at_quorum_memo_is_bounded_per_author() {
     use crate::vantage::avail::{AvailResolver, AT_QUORUM_HEIGHTS};
@@ -347,7 +298,6 @@ async fn at_quorum_memo_is_bounded_per_author() {
         held <= AT_QUORUM_HEIGHTS,
         "at_quorum grew to {held}, cap is {AT_QUORUM_HEIGHTS}"
     );
-    // And it must keep the RECENT end -- that is where the redundant credits actually are.
     assert!(
         r.is_at_quorum_for_test(&(
             author,

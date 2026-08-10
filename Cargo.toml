@@ -2,6 +2,13 @@
 members = ["primary", "node", "store", "crypto", "worker", "network", "config", "metrics"]
 resolver = "2"
 
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/polinikita/vantage-bft"
+rust-version = "1.95"
+publish = false
+
 [workspace.dependencies]
 tokio = "1"
 tokio-util = "0.7"
@@ -23,10 +30,6 @@ blake3 = "1.5"
 rocksdb = { version = "0.23", features = ["lz4", "zstd"] }
 serial_test = "0.9"
 prometheus = { version = "0.13", features = ["process"] }
-# Already in the graph via prometheus (Cargo.lock pins 0.12.5), so making it direct
-# adds zero crates. Used for the consensus hot-path mutexes: cheaper uncontended
-# lock/unlock than std, and no poisoning check on a lock that cannot be poisoned
-# (every critical section is panic-free field access).
 parking_lot = "0.12"
 axum = "0.7"
 fdlimit = "0.3"

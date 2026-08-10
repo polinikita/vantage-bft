@@ -74,14 +74,10 @@ PORTS = {
 }
 HOST_PRIMARY_METRICS_BASE = 9000
 HOST_WORKER_METRICS_BASE = 9100
-MAX_NODES = 40  # owner constraint, raised from 20 on 2026-08-05 for local A/B
-                # sweeps. Note the resource reality: colima has 12 CPUs, so large
-                # local committees share far less CPU than the 8-vCPU-per-node AWS
-                # runs. Fine for A/B, not for absolute numbers.
+MAX_NODES = 40  # Local resource limit.
 
-# 10-region AWS RTT matrix (milliseconds), ported VERBATIM from
-# config/src/lib.rs::RTT_LATENCY_TABLE, itself ported verbatim from
-# ~/code/starfish/crates/starfish-core/src/network.rs. `node local-benchmark`'s
+# 10-region AWS RTT matrix (milliseconds), shared with
+# config/src/lib.rs::RTT_LATENCY_TABLE. `node local-benchmark`'s
 # `LatencyTable::aws_rtt` builds the identical table for the in-process harness;
 # docker-bench instead bakes it into real `tc netem` delay, so every node's
 # parameters.json below pins `mimic_latency_ms: 0` to disable the in-process
@@ -258,8 +254,11 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "simpleit_gc_window_rounds": 50,
         "ack_watermarks": not args.no_ack_watermarks,
         "ack_watermark_period_ms": args.ack_watermark_period_ms,
+        "echo_avail_claims": (
+            not args.no_ack_watermarks and not args.no_echo_avail_claims
+        ),
         "digest_statements": not args.no_digest_statements,
-        # SEQUENCE-CHECKPOINT-SYNC-PLAN.md: default-on state sync. `--no-state-sync`
+        # State sync is enabled by default. `--no-state-sync`
         # disables both the checkpoint log and install path for control runs.
         "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
@@ -283,9 +282,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "resume_check_period_ms": 1000,
         "resume_backoff_ms": 4000,
         "resume_batch": 64,
-        # Measurement ablation (KNOB 1/2): see --no-reconnect-replay/
-        # --retry-backoff-max-ms's own help text -- these two flags create three
-        # cleanly separable benchmark arms (true-before / cap-only / full).
+        # Configure replay recovery and its retry backoff.
         "reconnect_replay": not args.no_reconnect_replay,
         "retry_backoff_max_ms": args.retry_backoff_max_ms,
     }
@@ -348,15 +345,6 @@ def render_tc_script(i: int, n: int, iface_hint: str, enabled: bool) -> str:
         # SILENTLY -- no error, no log, and the loss lands inside the emulated WAN where
         # it reads as protocol packet loss. A delay qdisc must hold the whole
         # bandwidth-delay product: in-flight bytes per class = per-peer rate x one-way delay.
-        #
-        # HOW MUCH HEADROOM THE DEFAULT ACTUALLY HAS, measured rather than guessed (AWS
-        # n=50 @ 200k tx/s under netem): 102.66 MB/s per node across 49 peers = 2.10 MB/s
-        # per peer, ~4.2 MB/s bidirectional per link. At the worst region pair's 154 ms
-        # one-way that is 323,693 B in flight = ~216 packets at 1500 B MTU -- only 22% of
-        # netem's 1000-packet default, and with TSO/GSO the kernel queues large skbs so the
-        # real count is a handful. The default was therefore NOT being exceeded at that
-        # scale. An earlier version of this comment claimed ~1,400 packets and was wrong by
-        # roughly an order of magnitude.
         #
         # Set anyway, because the margin is finite and the failure is silent: 1000 packets
         # x 1500 B / 154 ms is ~9.7 MB/s per peer, so the default binds at about 4.6x this
@@ -475,6 +463,9 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
         "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
+        "echo_avail_claims": (
+            not args.no_ack_watermarks and not args.no_echo_avail_claims
+        ),
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -522,8 +513,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--batch-max-delay-ms", type=int, default=5)
     p.add_argument("--all-to-all", action="store_true")
     p.add_argument("--no-ack-watermarks", action="store_true",
-               help="disable periodic availability watermarks (ON by default)")
+               help="disable compressed availability claims and use per-block ACKs")
     p.add_argument("--ack-watermark-period-ms", type=int, default=50)
+    p.add_argument("--no-echo-avail-claims", action="store_true",
+                   help="use periodic VantageAvail watermarks instead of echo claims")
     p.add_argument("--no-state-sync", action="store_true",
                    help="disable sequence checkpoint state sync and installation")
     p.add_argument("--sequence-checkpoint-interval", type=int, default=20,

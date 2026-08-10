@@ -103,10 +103,6 @@ pub fn header() -> Header {
             .get(&author)
             .unwrap()
             .clone(),
-        /*parent_cert_digest: Certificate::genesis(&committee())
-        .iter()
-        .map(|x| x.digest())
-        .collect(),*/
         ..Header::default()
     };
     Header {
@@ -122,16 +118,11 @@ pub fn special_header(
     consensus_messages: HashMap<Digest, ConsensusMessage>,
 ) -> Header {
     let (author, secret) = keys().pop().unwrap();
-    //let par = vec![header().id];
-    //let par = vec![Header::default().id];
     let header = Header {
         author,
         height: parent_cert.height + 1,
         parent_cert,
         consensus_messages,
-        //parents: par.iter().cloned().collect(),
-
-        //defaults: payload, parent,
         ..Header::default()
     };
     Header {
@@ -153,9 +144,6 @@ pub fn headers() -> Vec<Header> {
                     .get(&author)
                     .unwrap()
                     .clone(),
-                /*.iter()
-                .map(|x| x.digest())
-                .collect(),*/
                 ..Header::default()
             };
             Header {
@@ -225,8 +213,6 @@ pub fn special_votes(header: &Header, consensus_digests: Vec<Digest>) -> Vec<Vot
                     .map(|x| (1, x.clone(), Signature::new(x, &secret)))
                     .collect(), //Give them all "slot 1" for testing
 
-                                //qc: None,
-                                //tc: None,
             };
             Vote {
                 signature: Signature::new(&vote.digest(), &secret),
@@ -250,18 +236,6 @@ pub fn certificate(header: &Header) -> Certificate {
 }
 
 // Fixture
-/*pub fn special_certificate(header: &Header) -> Certificate {
-    Certificate {
-        author: header.origin(),
-        header_digest: header.digest(),
-        height: header.height,
-        votes: special_votes(&header)
-            .into_iter()
-            .map(|x| (x.author, x.signature))
-            .collect(),
-    }
-}*/
-
 // Fixture
 pub fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
     tokio::spawn(async move {

@@ -1,8 +1,3 @@
-// signature-free.tex's "Grounded post-ready skip" (par:skip-seal) / the persistent
-// per-target resolution-stance paragraph / lem:skip-seal -- unconditional protocol
-// behavior (no flag): the stance trit, the vote rule, and the vote-quorum seal are
-// always active.
-
 use super::common::*;
 use super::harness::{advance_time, boot, drain_local, run_to_quiescence, Node};
 use crate::vantage::agb::{Echo, Outcome, ResolutionEntry, Stance, ViewProposal};
@@ -12,10 +7,6 @@ use config::Committee;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-// ============================================================ 1. Exclusivity, both orders
-
-/// A vote (z(1): Free -> SkipVoted) then a later non-skip carrier for the same
-/// target: the carrier must be refused.
 #[tokio::test]
 async fn exclusivity_vote_then_non_skip_carrier_is_refused() {
     let (self_name, _) = authors()[3];
@@ -26,10 +17,6 @@ async fn exclusivity_vote_then_non_skip_carrier_is_refused() {
     let mut agb = new_agb_engine(self_name);
     let now = Instant::now();
 
-    // u=1 is silent for this party: own E_i(1) via the absolute echo deadline (no
-    // proposal ever fixed for it), then a first-hand 2f+1=3 echo-skip census (our own
-    // plus two remote), then own R_i(1) via the absolute ready deadline -- which
-    // completes the vote gate and fires the vote.
     agb.enter(1, now, &mut lm, &mut rep);
     agb.on_echo_absolute_timer(1, &mut rep);
     let others: Vec<_> = authors()
@@ -47,10 +34,6 @@ async fn exclusivity_vote_then_non_skip_carrier_is_refused() {
     );
     assert_eq!(agb.stance_for_test(1), Stance::SkipVoted);
 
-    // A Full(1, c_ref, []) carrier now arrives, over LOCALLY AVAILABLE content
-    // (published directly into this party's own lm) -- absent the stance, this would
-    // pass every other MetaOK check (own R_i(1) = NoReady trivially satisfies the
-    // Full branch's own-ready check).
     let chain_c = direct_chain(&mut lm, author_c, 1).await;
     let c_ref = block_ref(&chain_c[0]);
     let chain_w = direct_chain(&mut lm, author_w, 1).await;
@@ -71,8 +54,6 @@ async fn exclusivity_vote_then_non_skip_carrier_is_refused() {
     );
 }
 
-/// A non-skip carrier endorsement (z(1): Free -> NonSkip) then an otherwise-complete
-/// vote gate: the vote must be refused.
 #[tokio::test]
 async fn exclusivity_endorse_then_vote_gate_refuses() {
     let (self_name, _) = authors()[3];
@@ -83,9 +64,6 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
     let mut agb = new_agb_engine(self_name);
     let now = Instant::now();
 
-    // u=1 silent for this party: own E_i(1) (echo-skip) then own R_i(1) (no-ready) --
-    // but the echo-skip quorum is not yet complete (only our own so far), so no vote
-    // fires yet.
     agb.enter(1, now, &mut lm, &mut rep);
     agb.on_echo_absolute_timer(1, &mut rep);
     let effects = agb.on_ready_timer(1);
@@ -93,8 +71,6 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
         .iter()
         .any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
 
-    // A Full(1, c_ref, []) carrier arrives and is accepted -- own R_i(1) = NoReady
-    // trivially satisfies the Full branch's own-ready check, and z(1) is still free.
     let chain_c = direct_chain(&mut lm, author_c, 1).await;
     let c_ref = block_ref(&chain_c[0]);
     let chain_w = direct_chain(&mut lm, author_w, 1).await;
@@ -115,8 +91,6 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
     );
     assert_eq!(agb.stance_for_test(1), Stance::NonSkip);
 
-    // NOW complete the echo-skip quorum -- the vote gate must refuse, since z(1) is
-    // no longer free.
     let others: Vec<_> = authors()
         .into_iter()
         .filter(|(pk, _)| *pk != self_name)
@@ -132,10 +106,6 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
     assert_eq!(agb.stance_for_test(1), Stance::NonSkip);
 }
 
-// ============================================================ 2. Vote gate conjuncts
-
-/// A complete echo-skip quorum alone, with our own ready-stage response still
-/// pending, must never fire the vote.
 #[tokio::test]
 async fn vote_gate_requires_own_noready_first() {
     let (self_name, _) = authors()[3];
@@ -162,8 +132,6 @@ async fn vote_gate_requires_own_noready_first() {
     );
 }
 
-/// Own no-ready alone, with the echo-skip census below quorum, must never fire the
-/// vote; completing the quorum then does.
 #[tokio::test]
 async fn vote_gate_requires_echo_skip_quorum() {
     let (self_name, _) = authors()[3];
@@ -195,8 +163,6 @@ async fn vote_gate_requires_echo_skip_quorum() {
     assert_eq!(agb.stance_for_test(1), Stance::SkipVoted);
 }
 
-/// At most one vote per target, ever: a 6th distinct echo-skip arriving after the
-/// 2f+1=5 quorum already fired the vote (n=7, f=2) must never fire a second one.
 #[tokio::test]
 async fn vote_sent_at_most_once_per_target() {
     let (committee, keys) = Committee::local_benchmark(7, 1, 9500);
@@ -224,11 +190,6 @@ async fn vote_sent_at_most_once_per_target() {
     );
 }
 
-// ============================================================ 3. Quorum seal
-
-/// 2f+1 first-hand `SkipVote` statements (first-per-author; a duplicate from an
-/// already-counted author is ignored) submit `gskip` to the try-seal arbiter; a
-/// later, compatible anchor submission for the same view is idempotent.
 #[tokio::test]
 async fn quorum_seal_via_votes_first_per_author_duplicates_ignored_idempotent_with_anchor() {
     let (self_name, _) = authors()[3];
@@ -266,7 +227,6 @@ async fn quorum_seal_via_votes_first_per_author_duplicates_ignored_idempotent_wi
         "the duplicate from others[0] must never have double-counted"
     );
 
-    // Idempotent with a later, compatible anchor submission for the same view.
     let after = agb.submit_anchor(1, Outcome::Skip);
     assert!(
         after.is_empty(),
@@ -274,11 +234,6 @@ async fn quorum_seal_via_votes_first_per_author_duplicates_ignored_idempotent_wi
     );
 }
 
-// ============================================================ 4. Skip entries bypass the stance
-
-/// A skip entry is accepted regardless of an existing `NonSkip` stance (own-noready
-/// holding is all it needs), and does not itself change the stance -- a later
-/// non-skip carrier may still reuse it.
 #[tokio::test]
 async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     let (self_name, _) = authors()[3];
@@ -289,7 +244,6 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     let mut agb = new_agb_engine(self_name);
     let now = Instant::now();
 
-    // u=1 silent for this party: own E_i(1) (echo-skip), own R_i(1) (no-ready).
     agb.enter(1, now, &mut lm, &mut rep);
     agb.on_echo_absolute_timer(1, &mut rep);
     agb.on_ready_timer(1);
@@ -299,7 +253,6 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     let chain_w = direct_chain(&mut lm, author_w, 1).await;
     let c_w = block_ref(&chain_w[0]);
 
-    // First: a Full(1, c_ref, []) carrier (view 4) passes -- z(1): Free -> NonSkip.
     agb.enter(4, now, &mut lm, &mut rep);
     let proposal4 = ViewProposal {
         view: 4,
@@ -316,8 +269,6 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     );
     assert_eq!(agb.stance_for_test(1), Stance::NonSkip);
 
-    // Second: a Skip(1) carrier (view 5) is ALSO accepted -- skip entries neither
-    // require nor change the stance.
     agb.enter(5, now, &mut lm, &mut rep);
     let proposal5 = ViewProposal {
         view: 5,
@@ -338,9 +289,6 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
         "a skip entry must not change the stance"
     );
 
-    // Third: another Full(1, c_ref, []) carrier (view 6) still passes -- z(1) is
-    // reused ("a later non-skip carrier may reuse that stance"), confirming the skip
-    // entry above never disturbed it.
     agb.enter(6, now, &mut lm, &mut rep);
     let proposal6 = ViewProposal {
         view: 6,
@@ -358,12 +306,6 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
     assert_eq!(agb.stance_for_test(1), Stance::NonSkip);
 }
 
-// ============================================================ 5. Structural completion-exclusion
-
-/// A party whose ready-stage response for u is a GRADED proposal-ready (own R_i(u)
-/// graded via a genuine completion) can never later have R_i(u) = NoReady, so the
-/// vote gate is structurally unsatisfiable for it, regardless of the echo-skip
-/// census.
 #[tokio::test]
 async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
     let (self_name, _) = authors()[3];
@@ -373,9 +315,6 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
     let mut agb = new_agb_engine(self_name);
     let now = Instant::now();
 
-    // Drive u=1 to a genuine completion: our own positive gate fires (grade-1 echo),
-    // then 2 more matching echoes complete the 2f+1=3 ready quorum -- own R_i(1)
-    // becomes a GRADED proposal-ready, never NoReady.
     let chain = direct_chain(&mut lm, author_c, 1).await;
     let c_ref = block_ref(&chain[0]);
     agb.enter(1, now, &mut lm, &mut rep);
@@ -415,13 +354,9 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
         "test setup: the 2f+1=3 echo quorum must fire our own (graded) proposal-ready"
     );
 
-    // `on_ready_timer` is now structurally a no-op (`ready_sent` already true) -- own
-    // R_i(1) can never become NoReady.
     let effects = agb.on_ready_timer(1);
     assert!(effects.is_empty());
 
-    // Even feeding a full 2f+1 echo-skip census for view 1 (contrived, but isolates
-    // the "own no-ready missing" conjunct specifically) must never produce a vote.
     for (sender, _) in others.iter().take(3) {
         let e = agb.on_echo_skip(1, *sender);
         assert!(
@@ -437,11 +372,6 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
     );
 }
 
-// ============================================================ 6. Integration
-
-/// A silent-proposer view seals `gskip` via the grounded vote quorum with ZERO
-/// control-log applications, and every live node converges on the identical
-/// committed output.
 #[tokio::test]
 async fn integration_silent_proposer_view_seals_via_votes_with_zero_control_log_applications() {
     let all = authors();

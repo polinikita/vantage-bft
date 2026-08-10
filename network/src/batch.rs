@@ -1,43 +1,22 @@
-// Transport-level per-peer outbound message batching (coalescing), protocol-
-// transparent: this module knows nothing about `PrimaryMessage`/`WorkerMessage`/etc,
-// it only ever sees already-serialized `Bytes`. Applies uniformly to every sender
-// (`ReliableSender`/`SimpleSender`) and is decoded uniformly by `network::Receiver`,
-// so all three protocols (vantage, autobahn-optimistic, autobahn-seamless) get it for
-// free.
-//
-// Off by default (`BatchConfig::default().enabled == false`): every batching branch
-// in `reliable_sender.rs`/`simple_sender.rs`/`receiver.rs` is gated on `enabled`, so
-// the flag-off path never builds a `Coalescer`, never calls `encode_bundle`/
-// `decode_bundle`, and the wire is byte-identical to pre-batching behavior (one frame
-// per message, exactly as today).
+// Transport-level batching for serialized messages. The same bundle format is used by
+// both senders and decoded by `Receiver`.
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
 use tokio::time::{Duration, Instant};
 
-/// A small `Copy` config threaded into every `ReliableSender`/`SimpleSender` this node
-/// spawns (`with_batching`), and into every `network::Receiver` it spawns (`acks`/
-/// `batch` at `spawn_full`). Committee-wide consistent by construction (every node's
-/// `Parameters` comes from the same generated config).
+/// Configuration shared by senders and receivers. Peers must use the same setting.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BatchConfig {
-    /// Off by default -- no coalescer is ever consulted, byte-identical wire/behavior.
+    /// Whether to combine multiple messages into one frame.
     pub enabled: bool,
-    /// Hybrid flush size cap, in bytes of buffered (pre-bundle-header) payload. A
-    /// push that crosses this threshold flushes immediately (near-zero added latency
-    /// under high fan-in, since the cap fills before the delay timer would fire).
+    /// Flush when buffered payload reaches this size, in bytes.
     pub max_bytes: usize,
-    /// Hybrid flush delay, armed on the first message buffered after an empty
-    /// coalescer; fires (flushing whatever accumulated) if the size cap is never
-    /// reached first.
+    /// Maximum time to retain a non-empty buffer before flushing, in milliseconds.
     pub max_delay_ms: u64,
 }
 
 impl Default for BatchConfig {
     fn default() -> Self {
-        // 5 ms costs only ~2.5 ms average added latency (a message waits ~window/2)
-        // -- negligible next to a WAN's ~400 ms p50 -- while coalescing substantially
-        // more per flush than a 1 ms window, which matters more as n grows (n~50/100).
-        // `max_bytes`'s size cap still short-circuits this window under a burst.
         Self {
             enabled: false,
             max_bytes: 65_536,
@@ -52,11 +31,8 @@ impl BatchConfig {
     }
 }
 
-/// Bundle frame payload (transport-level, self-contained): `[count: u32-LE]
-/// ( [len: u32-LE][msg bytes] ) x count`. This is the value handed to the outer
-/// length-delimited-framing pipeline as a single logical message -- the outer frame
-/// length prefix wraps the WHOLE bundle, and it occupies exactly one delay-queue slot
-/// (one injected latency for the whole bundle).
+/// Bundle payload: `[count: u32-LE]` followed by `count` pairs of message length and
+/// message bytes. The outer length-delimited frame contains the complete bundle.
 pub(crate) fn encode_bundle(items: &[Bytes]) -> Bytes {
     let payload_bytes: usize = items.iter().map(|m| m.len()).sum();
     let mut out = BytesMut::with_capacity(4 + payload_bytes + 4 * items.len());
@@ -84,12 +60,7 @@ pub(crate) fn decode_bundle(payload: &Bytes) -> Result<Vec<Bytes>, DecodeBundleE
         return Err(DecodeBundleError("truncated count".to_string()));
     }
     let count = buf.get_u32_le() as usize;
-    // FIX 2 (P2, DoS, adversarial audit): bound `count` against the remaining bytes
-    // BEFORE reserving -- every sub-message needs at least 4 bytes for its own length
-    // prefix, so `count` can never legitimately exceed `remaining / 4`. Without this,
-    // a crafted (or mis-framed, see FIX 1) frame with `count = 0xFFFFFFFF` would
-    // `Vec::with_capacity` ~137 GB and abort the process before the existing
-    // per-element truncation checks below ever run.
+    // Bound the count before allocation. Each item needs a four-byte length prefix.
     if count > buf.remaining() / 4 {
         return Err(DecodeBundleError(format!(
             "count {} exceeds what the {} remaining byte(s) could possibly hold",
@@ -111,17 +82,8 @@ pub(crate) fn decode_bundle(payload: &Bytes) -> Result<Vec<Bytes>, DecodeBundleE
     Ok(messages)
 }
 
-/// Per-connected-session outbound coalescing accumulator. Generic over `T`, the extra
-/// per-message payload each sender kind carries alongside the raw bytes
-/// (`ReliableSender` carries a fan-out `Vec<oneshot::Sender<Bytes>>` per constituent
-/// message so every original `send()`'s `CancelHandler` still resolves off the ONE
-/// bundle ack; `SimpleSender` carries nothing, `T = ()`).
-///
-/// Deliberately NOT a `Connection` field: it only exists for the life of one connected
-/// session (`keep_alive_*`/`run_*`). If the connection drops mid-accumulation, its
-/// unflushed contents are handed back (via `drain`) to the caller's own retry/requeue
-/// path as ordinary individual entries -- nothing needs to survive a reconnect, and
-/// nothing is silently dropped.
+/// Per-session outbound accumulator. `T` stores sender-specific metadata for each
+/// message. Unflushed items are returned by `drain` when the session ends.
 pub(crate) struct Coalescer<T> {
     items: Vec<(Bytes, T)>,
     bytes: usize,
@@ -165,23 +127,15 @@ impl<T> Coalescer<T> {
         (bundle, extras)
     }
 
-    /// Drain without building a frame -- used when the connection drops mid-
-    /// accumulation. The caller MUST re-encode whatever comes back through
-    /// `encode_bundle` (as one bundle) before requeuing it, rather than treating these
-    /// as ordinary raw entries -- see `reliable_sender.rs`'s FIX 1b: anything that
-    /// reaches `Connection::buffer` while batching is enabled must already be
-    /// bundle-framed, since `keep_alive_*` writes buffered entries to the wire
-    /// verbatim and the peer's `Receiver` runs every frame through `decode_bundle`
-    /// while batching is on.
+    /// Return unflushed items without encoding them. Callers must encode them before
+    /// requeueing when batching is enabled.
     pub(crate) fn drain(&mut self) -> Vec<(Bytes, T)> {
         self.bytes = 0;
         std::mem::take(&mut self.items)
     }
 }
 
-/// A `None` deadline means "no message is currently buffered, don't arm the flush
-/// timer at all" -- mirrors `keep_alive_delayed`'s own `delay_queue.front()`-driven
-/// `due` future (pending forever when the guarded resource is empty).
+/// A `None` deadline leaves the flush timer pending.
 pub(crate) async fn sleep_until_or_pending(deadline: Option<Instant>) {
     match deadline {
         Some(at) => tokio::time::sleep_until(at).await,
@@ -218,9 +172,7 @@ mod tests {
         assert!(decode_bundle(&Bytes::from_static(&[1, 0, 0, 0])).is_err());
     }
 
-    /// FIX 2 (P2, DoS, adversarial audit): a `count` that couldn't possibly fit in
-    /// the remaining bytes must be rejected BEFORE `Vec::with_capacity(count)` runs --
-    /// this must return an `Err`, not abort the process trying to reserve ~137 GB.
+    /// Reject a count that cannot fit in the remaining bytes before allocation.
     #[test]
     fn decode_rejects_huge_count_without_preallocating() {
         // count = 0xFFFFFFFF, no body at all.
@@ -228,22 +180,14 @@ mod tests {
         assert!(decode_bundle(&huge_count_no_body).is_err());
 
         // count = 0xFFFFFFFF with a little real trailing data -- still nowhere near
-        // enough to hold that many sub-messages (each needs >= 4 bytes), so this must
-        // still be rejected by the bound, not by exhausting memory mid-loop.
+        // The count still cannot fit in the remaining bytes.
         let mut with_trailer = BytesMut::from(&[0xFF, 0xFF, 0xFF, 0xFF][..]);
         with_trailer.put_slice(b"only a few bytes follow");
         assert!(decode_bundle(&with_trailer.freeze()).is_err());
     }
 
-    /// FIX 1 (adversarial audit): simulates the exact mis-framing scenario the sender-
-    /// side bug could have produced -- an arbitrary raw (non-bundle) payload, such as
-    /// a bincode-serialized message, handed to `decode_bundle` as if it were a bundle
-    /// frame. The receiver must never panic/abort on this input; it either rejects it
-    /// outright or (if the leading 4 bytes happen to parse as a small, in-range count)
-    /// returns some best-effort split -- the actual guarantee against this ever
-    /// reaching `decode_bundle` for real lives in `reliable_sender.rs` (FIX 1a/1b:
-    /// every `Connection::buffer` entry is bundle-framed whenever batching is on), not
-    /// here; this test only locks that the decoder itself is panic-free on garbage.
+    /// The decoder must return an error or a best-effort result for arbitrary bytes
+    /// without panicking.
     #[test]
     fn decode_does_not_panic_on_raw_non_bundle_bytes() {
         // A plausible raw bincode-ish payload: no relation to the bundle format at all.
@@ -254,8 +198,7 @@ mod tests {
             &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02],
         ];
         for raw in raw_payloads {
-            // Must return a `Result`, never panic/abort -- what it decides to (either
-            // arm is acceptable here) is not the point of this test.
+            // The result is not important; the decoder must not panic.
             let _ = decode_bundle(&Bytes::copy_from_slice(raw));
         }
     }

@@ -46,11 +46,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Two overlapping run.sh invocations share ONE compose project, so the first one to
-# reach its duration tears down the SECOND one's containers mid-run. Observed
-# 2026-08-09: a chaos.sh run against the newer cluster aborted with "No such
-# container: vantage-node-1" and looked exactly like a validator that failed to
-# restart. Refuse to start rather than let that be mistaken for a protocol failure.
+# Refuse overlapping runs because they share one Compose project.
 if docker compose -f "$SCRIPT_DIR/docker-compose.yml" ps -q 2>/dev/null | grep -q .; then
     echo "run.sh: a benchmark cluster is already up from another run.sh -- wait for it" \
          "to finish, or clear it with:" >&2
@@ -118,7 +114,7 @@ echo "==> [4/7] starting Prometheus and Grafana"
 # an existing Prometheus container would otherwise retain the deleted inode and keep
 # scraping the previous run's targets, even though the source path looks unchanged to
 # Compose. Recreate Prometheus deliberately; its named TSDB volume preserves the
-# rolling 24-hour history across container recreation. Then start/reuse Grafana.
+# The named TSDB volume preserves samples across container recreation. Then start Grafana.
 monitoring_compose up -d --force-recreate prometheus
 monitoring_compose up -d grafana
 PROMETHEUS_CONTAINER_ID="$(monitoring_compose ps -q prometheus)"

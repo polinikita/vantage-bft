@@ -1,12 +1,3 @@
-// PHASE3-SPEC.md/PHASE4-SPEC.md -- Vantage: per-author hash-chained blocks (the
-// existing `Header` with `Option` fields, §3.1), all-to-all unsigned ACKs, first-hand
-// availability accounting (`lanes::LaneManager`, §3.2), authorized recursive repair
-// (`repair::Repairer`, §3.3), the Direct-AGB per-view engine (`agb::AgbEngine`,
-// PHASE4-SPEC.md §§3-8), the responsive proposal frontier (`frontier::Frontier`, §4),
-// the output cursor (`cursor::Cursor`, §9), and the production wiring task
-// (`node::VantageCore`, §1). Gated behind `Protocol::Vantage`; the two Autobahn
-// assemblies never construct anything in this module.
-
 pub mod agb;
 pub mod avail;
 pub mod block;
@@ -47,221 +38,87 @@ use config::WorkerId;
 use crypto::{Digest, PublicKey};
 use std::time::Instant;
 
-/// Outbound side-effects produced by `LaneManager`/`Repairer`/`AgbEngine`/`Frontier`/
-/// `Cursor` methods. All five are pure (no direct network/worker I/O) so that tests can
-/// drive them without a live network -- callers (the production wiring, or a test)
-/// execute these against the real transport/worker/timer channels.
+/// Side effects emitted by Vantage state machines for the runtime to execute.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// N1: broadcast our own freshly-created block to every primary.
+    /// Broadcasts a locally created block.
     BroadcastPublish(Header),
-    /// N3: broadcast an unsigned ack for a tuple that just became `DirectPub`.
+    /// Broadcasts an unsigned availability acknowledgment.
     BroadcastAck(Ack),
-    /// D1: ask our own workers to sync these missing batches for `author`'s block
-    /// (named by its own digest -- PHASE4-SPEC.md §1's production wiring correlates a
-    /// resolved `store.notify_read` waiter back to `LaneManager::set_payload_ready` via
-    /// this digest; a minimal extension of the Phase-3 shape, documented in
-    /// PHASE4-NOTES.md).
+    /// Requests missing batches from local workers for `(author, header digest)`.
     SyncBatches(
-        PublicKey, /* author */
-        Digest,    /* header digest */
+        PublicKey, // Block author.
+        Digest,    // Header digest.
         Vec<(Digest, WorkerId)>,
     ),
-    /// D2/N6: send `request(h)` to `peer` (fan-out is one `Effect` per peer, emitted at
-    /// most once per (peer, h) ever -- see `Repairer::requested`).
     RequestTo(PublicKey, Digest),
-    /// N7: send `serve(h, b)` to `peer` in answer to its request.
     ServeTo(PublicKey, Header),
-    /// A block was just cached (via publish or serve) -- production wiring forwards
-    /// this to `Repairer::on_block_available` so a walk stuck waiting on this exact
-    /// digest can advance (§3.3: "whenever a cached block matches an authorized exact
-    /// coordinate ... the walk advances"). Tests forward it manually too.
+    /// Reports a newly cached block so exact-digest repair walks can resume.
     BlockCached(Digest),
 
-    // --- PHASE4-SPEC.md §§3-8 (AGB engine) ---
-    /// R1: broadcast our own freshly-constructed view proposal. PHASE7 (`Parameters::
-    /// batched_anchors`): `ProposalOut` -- `Single` is byte-identical to the
-    /// pre-PHASE7 `ViewProposal` payload (same wire message, `VantagePropose`);
-    /// `Batch` rides a separate, flag-gated wire message (`VantageProposeBatch`),
-    /// chosen at the `execute`/`drain_local` call site by shape, never by the flag
-    /// itself (the flag only ever controls whether `Batch` is EVER constructed).
     BroadcastPropose(ProposalOut),
-    /// R2: broadcast a (grade-1 or grade-0) proposal echo. PHASE7: `EchoOut`,
-    /// mirroring `BroadcastPropose`'s `ProposalOut` generalization.
     BroadcastEcho(EchoOut),
-    /// R2 fallback/absolute deadline: broadcast an echo-skip for `view` (sender is
-    /// filled in by the caller, which always knows its own identity -- symmetric with
-    /// `BroadcastNoReady` below).
     BroadcastEchoSkip(View),
-    /// R3: broadcast a proposal ready (grade One/Zero/Mix). PHASE7: `ReadyOut`,
-    /// mirroring `BroadcastPropose`'s `ProposalOut` generalization.
     BroadcastReady(ReadyOut),
-    /// R3 absolute deadline: broadcast a no-ready for `view`.
     BroadcastNoReady(View),
-    /// signature-free.tex's "Grounded post-ready skip" (par:skip-seal): the one-shot
-    /// statement `<skip-vote, u>` -- broadcast at most once per target, after this
-    /// party's own durably-emitted `NO-READY(u)`, a first-hand `2f+1` `ECHO-SKIP(u)`
-    /// census, a `free` resolution stance, and no known non-skip terminal seal for
-    /// `u` (sender is filled in by the caller, symmetric with `BroadcastEchoSkip`/
-    /// `BroadcastNoReady` above).
+    /// Broadcasts a skip vote after the local no-ready and `2f + 1` skip predicates.
     BroadcastSkipVote(View),
-    /// §5's `Fixed` transition outcome for `view` (`true` = well-formed proposal now
-    /// fixed, `false` = malformed/Reject) -- not itself a spec-named wire effect, but a
-    /// necessary, minimal channel from `AgbEngine::on_propose` to `Frontier::record_fixed`
-    /// (§4's frontier-advance rule reads exactly this bit); documented as a deviation in
-    /// PHASE4-NOTES.md.
+    /// Reports whether the fixed proposal for a view is well formed.
     Fixed(View, bool),
-    /// R4 completion (`complete(v) -> B`): the core becomes irrevocable; hand `(C, T)`
-    /// to the cursor as this view's manifests, state `gopen`. Not itself a spec-named
-    /// wire effect (completion produces no network message) but a necessary, minimal
-    /// channel from `AgbEngine` to `Cursor` (§7's "hand (C,T) to the cursor"); documented
-    /// as a deviation in PHASE4-NOTES.md.
+    /// Reports irrevocable completion with the core and tail manifests.
     Completed(View, Manifest, Manifest),
-    /// The try-seal arbiter's terminal, first-wins result for `view` -- drives the
-    /// cursor (§9).
+    /// Reports the first terminal outcome selected for a view.
     Sealed(View, Outcome),
-    /// Arm a timer at the given deadline (§10; `Instant` computed by the engine at arm
-    /// time from Δ/θE/θR and the view's own entry/first-proposal instants -- carried
-    /// directly here, a minimal extension of the module plan's `ArmTimer(View,
-    /// TimerKind)` signature so the caller (`VantageCore`) needn't duplicate that
-    /// arithmetic; documented as a deviation in PHASE4-NOTES.md).
+    /// Arms a view timer at an absolute deadline.
     ArmTimer(View, TimerKind, Instant),
 
-    // --- PHASE4-SPEC.md §9 (output cursor) ---
-    /// Commit metric (Phase-2 parity): for every block just appended to the output log,
-    /// notify our own workers (grouped by `WorkerId`) of the batches committed.
-    /// Third field (PHASE7-PREP-NOTES.md, paying down the PHASE4-NOTES.md §6 scope
-    /// cut): the committed blocks' own `Header`s, in commit order, already looked up
-    /// from `BlockCache` by the cursor at emit time -- so `VantageCore` only has to
-    /// forward them to `tx_output`, matching the Autobahn `Committer`'s output-channel
-    /// shape without VantageCore needing its own `BlockCache` handle.
+    /// Carries `(UTC milliseconds, batches by worker, headers in commit order)`.
     NotifyCommitted(
-        u64, /* commit UTC-millis */
+        u64, // UTC milliseconds.
         Vec<(WorkerId, Vec<Digest>)>,
         Vec<Header>,
     ),
 
-    // --- PHASE5-SPEC.md §1-3 (WISH pacemaker) ---
-    /// W2 amplification: broadcast a standalone `VantageWish` (sender filled in by the
-    /// caller at serialization time, symmetric with `BroadcastEchoSkip`/
-    /// `BroadcastNoReady`).
     BroadcastWish(View),
-    /// W2's formal-entry-target-advance step: record entry to `view` -- executed as
-    /// `AgbEngine::enter(view, ...)` + `Frontier::enter(view)`, in increasing order
-    /// (`Pacemaker` already emits these in ascending order, one per newly-covered view).
     Enter(View),
-    /// W3's two-response wish trigger, surfaced by `AgbEngine::two_response_wish_target`
-    /// (a pure query -- the engine itself never touches `Pacemaker`, keeping D5-3's
-    /// module separation): raise our own wish to `View` before the response effect
-    /// immediately following it in the same batch is executed (`VantageCore::execute`'s
-    /// FIFO queue always processes this one first). Not itself a spec-named wire effect
-    /// -- a necessary, minimal channel from `AgbEngine` to `Pacemaker::raise_own_wish`,
-    /// documented as a deviation in PHASE5-NOTES.md.
+    /// Raises the local wish before the following response effect is executed.
     RaiseWish(View),
 
-    /// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §8: the cursor TERMINALLY advanced past `view`
-    /// (`Full`, `Core`, or `Skip`), carrying the exact ordered set of block digests it
-    /// emitted while processing that view, after cross- and within-view deduplication.
-    ///
-    /// Internal handoff only -- never a wire frame, and never one oversized chunk:
-    /// `SequenceStore` folds the vector into the incremental delta chain, and a later
-    /// phase serves it in bounded pieces. Emitted on every terminal advance regardless of
-    /// whether checkpoints are enabled, so the cursor has exactly one code path and
-    /// cannot derive a head that depends on configuration.
+    /// Reports terminal view output in emission order.
     SequenceFinalized {
         view: View,
         outcome: sequence::SequenceOutcome,
         output_delta: Vec<Digest>,
     },
+    /// Restores this node's lane from a checkpoint-certified committed header.
+    RecoverOwnLane(Header),
 
-    // --- PHASE6-SPEC.md §5 (completion reports + control log) ---
-    /// The FIRST genuine R4 completion for `view` with `M != None` -- a necessary,
-    /// minimal channel from `AgbEngine` to `control::ControlLog` (mirrors `Completed`'s
-    /// own role for the cursor); carries the full proposal (`B_w`) since
-    /// `control::ControlLog` both counts the report AND retains/serves `B_w`. PHASE7:
-    /// `ProposalOut`, mirroring `BroadcastPropose`'s generalization.
+    /// Reports the first genuine completion of a proposal carrying recovery entries.
     CompletionReportable(View, ProposalOut),
-    /// Broadcast our own `CompReport` (sender filled in by the caller).
     BroadcastCompReport(View, Digest),
-    /// The control round's leader step: broadcast `ControlInit` (the control proposal,
-    /// plus `B_w` as validation data when the value is non-empty). PHASE7:
-    /// `Option<ProposalOut>`, mirroring `BroadcastPropose`'s generalization.
     BroadcastControlInit(control::ControlProposal, Option<ProposalOut>),
-    /// Broadcast our own `ControlEcho` (sender filled in by the caller).
     BroadcastControlEcho(control::ControlProposal),
-    /// Broadcast our own `ControlReady` (sender filled in by the caller).
     BroadcastControlReady(control::ControlProposal),
-    /// Broadcast our own `ControlCommit` vote for `Round` (sender filled in by the
-    /// caller). PHASE6-SPEC.md §5's wire list does not itself name a commit message,
-    /// but the paper's own **Vote** step ("send `<commit, curr_round>` to all
-    /// parties") is load-bearing for the **Commit** rule -- a necessary, minimal,
-    /// documented addition (D6-6, PHASE6-NOTES.md), appended last on the wire per the
-    /// same bincode-compat discipline as every other Vantage-only variant.
+    /// Broadcasts the control protocol's commit vote.
     BroadcastControlCommit(Round),
-    /// The round-timeout notification's **Vote** step (Fig. 4): broadcast
-    /// `ControlTimeoutVote` (sender filled in by the caller).
     BroadcastControlTimeoutVote(Round),
-    /// The round-timeout notification's **Accept**/**Cascade** step: broadcast
-    /// `ControlTimeoutAccept` (sender filled in by the caller).
     BroadcastControlTimeoutAccept(Round),
-    /// Fan-out request for a still-missing `B_w`, one `Effect` per target peer (mirrors
-    /// `RequestTo`'s shape).
     ControlFetchTo(PublicKey, View, Digest),
-    /// Answer a peer's `ControlFetch` with our own held, verified `B_w`. PHASE7:
-    /// `ProposalOut`, mirroring `BroadcastPropose`'s generalization.
+    /// Serves a held, verified control proposal body.
     ControlServeTo(PublicKey, View, ProposalOut),
-    /// Arm the control-round timer (`6Δ`, §5) at the given deadline.
+    /// Arms a control-round timer at an absolute deadline.
     ArmControlTimer(Round, Instant),
 
-    // --- PHASE6-SPEC.md §6 (anchors + apply-anchor adapter) ---
-    /// `control::ControlLog`'s log-consumption pump, upon observing `A_u` for a
-    /// not-yet-anchored view `u`: `Outcome` is `X_u` (`gfull`/`gcore`/`gskip`, already
-    /// derived from the resolution entry); the `Vec<BlockRef>` is the non-skip
-    /// manifest references to authorize BEFORE submitting to the try-seal arbiter (the
-    /// executor, `VantageCore`, owns both `Repairer::authorize` and
-    /// `AgbEngine::submit_anchor` -- `control::ControlLog` itself touches neither).
+    /// Applies an anchor outcome and its authorized non-skip block references.
     ApplyAnchor(View, Outcome, Vec<BlockRef>),
 
-    // --- signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
-    // digest_statements`) ---
-    /// Fan-out request for a still-missing AGB proposal body, one `Effect` per
-    /// target peer (mirrors `ControlFetchTo`'s identical role for control-log
-    /// carrier bodies, one level down at the AGB ECHO/READY layer instead of the
-    /// resolution/control layer).
     BodyFetchTo(PublicKey, View, Digest),
-    /// Answer a peer's `VantageBodyFetch` with our own held, fixed `ViewProposal`
-    /// (mirrors `ControlServeTo`). Always a `ViewProposal`, never a
-    /// `BatchViewProposal` -- digest-named statements are the `ViewProposal`
-    /// (Single)-only encoding (see `EchoDigest`'s own doc comment).
+    /// Serves a requested AGB proposal body.
     BodyServeTo(PublicKey, View, ViewProposal),
 
-    // --- Mechanism A (sender-side lane resume, `vantage::resume`) ---
-    /// Unicast our own original-dissemination header to `requester`, one entry of a
-    /// resume batch answering its `VantageLaneResume` (design doc step 3). Deliberately
-    /// NOT `Effect::ServeTo`: that effect always sends `Header(_, true)` ("Serve"),
-    /// which carries no sender claim to MAC-bind and is never subject to the
-    /// `--withhold` filter or the receive path's DirectPub/ack accounting the way an
-    /// ORIGINAL-dissemination `Header(_, false)` publish is -- see this variant's own
-    /// construction site (`vantage::node::VantageCore::dispatch_inbound`'s
-    /// `Inbound::LaneResume` arm) for why the resumed republish must use the OTHER
-    /// encoding. Executed via `Wire::enqueue_resume_header` -- a non-blocking
-    /// hand-off onto the dedicated resume-sender task (`Wire::spawn_resume_sender`),
-    /// never `Wire::send_message` directly -- so the withholding fault injector
-    /// still governs it mid-window (checked at enqueue time, before hand-off).
-    ResumeServeTo(PublicKey /* requester */, Header),
-    /// AVAIL-ECHO-SPEC.md (`Parameters::echo_avail_claims`): `sender`'s positional
-    /// availability claims, already resolved against the echoed proposal's reference
-    /// vector. `bool` is "this was an at-tip bit", which the receiver needs in order to
-    /// skip the linkage check -- an at-tip claim's digest came from the proposal itself,
-    /// which `proposal_digest` commits to, whereas a short claim's anchor is the sender's
-    /// own word and must be verified against our copy.
-    ///
-    /// An `Effect` rather than a direct call because BOTH echo encodings funnel through
-    /// `AgbEngine::on_echo` -- the by-value `VantageEcho` arm and, via
-    /// `DigestStatements`, the `VantageEchoDigest` one that production actually sends --
-    /// so emitting here covers both with one hook, and keeps `AgbEngine` free of the
-    /// `LaneManager`/`BlockCache` access that crediting needs. Resolved refs rather than
-    /// the proposal itself so this never clones a manifest pair (~14 KB at n=100).
+    /// Serves a replayed block to the requesting peer.
+    ResumeServeTo(PublicKey, Header),
+    /// Carries resolved claims; `true` means the digest came from the proposal tip.
     AvailClaimed(PublicKey, Vec<(BlockRef, bool)>),
 }
 

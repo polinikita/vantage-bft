@@ -1,216 +1,10 @@
-// Simple-IT cut-consensus state machine (stage 2 of a port from the upstream
-// `simpleit/Opt-Mempool-Simple-IT-Failure` branch's primary/src/core.rs). Ports exactly
-// 25 named methods (the cut-consensus half of upstream's `Core`); everything else in
-// that file -- header/vote/certificate processing, the Autobahn view-based consensus
-// (`process_consensus_*`), the run loop, every network/store/channel field -- is
-// Autobahn residue or data-plane wiring and is not ported. See each method's doc
-// comment below for its exact upstream line range -- EXCEPT where the FIGURE-2 REWRITE
-// paragraph below says otherwise: this module now implements the paper's Figure 2
-// directly, and where that disagrees with upstream's own implementation, Figure 2
-// governs. Upstream line citations on individual methods below are retained as
-// provenance (what upstream had at that call site), not as an implied claim that the
-// method still behaves as upstream did.
+// Simple-IT cut-consensus state machine.
 //
-// FIGURE-2 REWRITE (this revision, arXiv:2606.14404 Fig. 2): upstream's cut-consensus
-// design -- ported here unchanged until now -- broadcasts a `CutCertificate` (a
-// `Vec<PublicKey>` of claimed voters) once any party's own vote count crosses
-// `mint_threshold`, and every OTHER party accepts that certificate on the strength of
-// `CutCertificate::verify` alone: checking only that the LISTED names are distinct,
-// stake-bearing committee members -- never that they actually voted. This protocol is
-// signature-free, so a vote carries no transferable proof of its own authorship; any
-// party could therefore assert a certificate for any `cut_id`, forging a notarization
-// that advances `cut_round`/`highest_safe_cut` (formerly `highest_certified_cut`) for a
-// round it never itself established. Commit itself stayed protected (`try_commit_round`
-// requires the locally-recorded leader proposal), but a forged certificate still let a
-// party stall the chain -- see the task history for the full liveness-attack argument.
+// Network-free cut-consensus state machine. Methods return effects for the caller to
+// execute. Round-indexed state is pruned by `prune_below`.
 //
-// Figure 2 itself has NO certificate message anywhere. `safe[r]` is established purely
-// by rb-delivering `proposal[r]` and checking `SafeParent` (no vote-counting at all, in
-// the paper's own text -- that guarantee comes for free from the reliable broadcast's
-// totality property, which this port's `CutProposal`+`CutVote` pair only
-// APPROXIMATES, see the REPAIR paragraph below), and `committed[r]` by each party
-// counting `⟨commit, r⟩` (this engine's `Decide`) from n - f parties FIRST-HAND -- see
-// the module doc comment on `Decide` (messages.rs) for why it is exactly Fig. 2's Vote
-// step. This module's own design already has parties count `CutVote`s into a
-// `mint_threshold`-thresholded aggregator as its chosen stand-in for "the proposal is
-// corroborated enough to trust" (playing the role a real RBC's echo/ready phases would
-// play, at the message-pattern level this codebase works at); this revision's fix is
-// narrower than re-deriving that from scratch: keep the same threshold, but make EVERY
-// party evaluate it over votes it individually verified and counted itself
-// (`process_cut_vote` -> `mark_cut_safe`), and delete the one step that let a party
-// skip its own counting by trusting a peer's relayed aggregate instead
-// (`process_cut_certificate`'s old certificate-accept path, and the certificate
-// broadcast that fed it). No `CutOut`/`Inbound`/`PrimaryMessage` variant can carry a
-// notarization anymore -- the removal is enforced by the type system, not merely by
-// this module's own logic (see `mod tests`' `inbound_has_no_certificate_shaped_variant`
-// below for why that is a compile-time, not run-time, guarantee).
-//
-// FIELD MAPPING (old upstream-derived name -> Fig. 2's state variable -> this module's
-// name), for every field this revision renames:
-//   cut_certificates: BTreeMap<CutRound, CutCertificate>  -- safe[r] (+ its proposal)
-//     -> safe: BTreeMap<CutRound, Digest>  (key presence IS safe[r]; the value IS
-//        proposal[r]'s id -- the two are always established together here, so one map
-//        carries both, exactly as upstream's own bool-map/proposal-map pair would if
-//        upstream had used one map for each too)
-//   highest_certified_cut: Digest  -- no single Fig.-2 variable names this; it is this
-//     engine's own cache of "which safe cut should the next round's proposal parent
-//     onto", playing `make_cut_proposal`'s convenience role
-//     -> highest_safe_cut: Digest
-//   sent_timeouts: BTreeSet<CutRound>  -- timed_out
-//     -> timed_out: BTreeSet<CutRound>  (Fig. 2: one per-current-round bool, reset on
-//        round entry; here, one persistent latch per round, since this engine tracks
-//        many rounds' in-flight messages concurrently rather than only curr_round)
-//   decides_by_round: BTreeMap<CutRound, Decide>  -- committed[r]
-//     -> committed: BTreeMap<CutRound, Decide>  (key presence IS committed[r]; the
-//        value is the quorum-crossing `Decide` itself, needed by `try_commit_round`'s
-//        cut-id comparison against `leader_cut_by_round`)
-//   sent_decide_rounds: BTreeSet<CutRound>  -- voted ("has this party sent its own
-//     ⟨commit, r⟩ yet" -- `Decide` IS the paper's commit message)
-//     -> voted: BTreeSet<CutRound>
-//   voted_cut_rounds: BTreeSet<CutRound>  -- NO Fig.-2 equivalent: this is this
-//     engine's OWN CutVote-sent latch, standing in for RBC-echo participation, which
-//     the paper's `rb-broadcast` primitive absorbs and never names as a party-visible
-//     step at all
-//     -> sent_cut_votes: BTreeSet<CutRound>  (renamed FROM `voted_cut_rounds`
-//        specifically to stop colliding with the real `voted` above, which means
-//        something else -- see this module's own task report for the conflict this
-//        surfaced and why both names changed together)
-// Left deliberately UNCHANGED (not among the names the task asked to align -- `safe`,
-// `voted`, `timed_out`, `committed`): `certified_timed_out` (closest Fig.-2 analogue:
-// `disabled`), `sent_commit_rounds` (Fig. 2 names no flag for this at all -- it is the
-// **Deliver** action's own local, one-shot latch, distinct from `committed[r]` itself),
-// `cut_round_by_id`, `leader_cut_by_round`, `cut_proposals`, `pending_cut_children`,
-// every timeout-ladder/aggregator/repair field.
-//
-// Architecture: `CutEngine` is a pure state machine. It never holds a `ReliableSender`,
-// a `Wire`, a `LaneManager`, a `Store`, or any channel -- upstream's `Core` holds all of
-// these, and removing them is the entire point of this port. Every public method
-// returns `Vec<CutEffect>` (see effects.rs) in place of upstream's direct
-// `self.network.broadcast(...)`/`self.tx_committer.send(...)` calls; the caller (a
-// not-yet-written production core, or this module's own tests) executes those effects
-// against the real transport/timer/committer. This mirrors
-// `primary/src/vantage/agb.rs`'s `AgbEngine` and `primary/src/vantage/control.rs`'s
-// `ControlLog` -- both effect-returning, network-free engines already in this crate --
-// rather than upstream's own style.
-//
-// Two oracles are *given* to the engine rather than held by it:
-//   1. `tips: &Cut` -- upstream's `current_cut()` reads `self.current_certified_tips`,
-//      an Autobahn-DAG field this engine does not have. The caller builds this fresh,
-//      per call, from `LaneManager::c_candidate(author)` for each committee member
-//      (`BlockRef = (PublicKey, Height, Digest)` maps onto `(author, Proposal
-//      { header_digest, height })`) -- `CutEngine` never imports `LaneManager`.
-//   2. `oracle: &dyn TipOracle` -- the f+1 tip-availability gate (deviation 3 below)
-//      needs to ask "have I seen enough evidence for this tip", which is also
-//      `LaneManager` state. The trait is defined here; the not-yet-written production
-//      core implements it over `LaneManager::is_q_available(r, validity_threshold())`.
-//      `&dyn` (not `&impl`) deliberately: nearly every one of the 25 methods can
-//      transitively reach a vote or a re-propose decision (see `try_propose_cut_for_
-//      current_round`'s callers), so `tips`/`oracle` thread through almost the entire
-//      call graph -- a generic parameter would have to repeat on every one of those
-//      signatures for no benefit, since the engine only ever calls one method on it.
-//
-// Required deviations from upstream (beyond the two oracle-passing changes above,
-// which are themselves required -- see the task brief):
-//   1. Leader schedule: `leader_for_round` below, not `leader.rs`/`LeaderElector`.
-//   2. Prunable state is `BTreeMap`/`BTreeSet`, never `HashMap`/`HashSet`; `prune_below`
-//      is the one `split_off`-based GC entry point (no `retain` anywhere).
-//   3. The f+1 tip-availability gate in `process_cut_proposal`, behind `gate_tips`
-//      (defaults to `true`, paper-faithful; upstream never checks `proposal.tips` at
-//      all -- `gate_tips: false` reproduces that).
-//   4. `process_cut_proposal`'s internal queue no longer aborts (and silently drops
-//      every already-dequeued sibling) on one bad proposal -- see that method's doc
-//      comment.
-//   5. No Autobahn types anywhere (`Slot`/`View`/`QC`/`TC`/`CommitQC`/`ConsensusMessage`);
-//      `CutRound` (from `simpleit::messages`) is the one round type. `agb::proposer`
-//      takes a `View` -- `leader_for_round` is the one, explicitly documented place
-//      that type ever appears, as a same-width conversion (`View = CutRound = u64`).
-//
-// None of the ported methods are `async fn`, unlike upstream. Every reason upstream's
-// versions were async is gone here: network broadcasts and the committer channel send
-// are replaced by effect values (no `.await` left to perform), and the three trivial
-// `Timeout::new`/`TimeoutAccept::new`/`Decide::new` upstream `async fn` constructors
-// (stage 1, primary/src/simpleit/messages.rs) are bypassed via plain struct literals
-// (their fields are all `pub`) rather than requiring an async context for a
-// constructor that does no actual `.await` work. This matches `AgbEngine`/`ControlLog`,
-// neither of which has a single `async fn` either.
-//
-// REPAIR (not upstream, not the paper either -- new machinery, added after the port to
-// close a liveness gap this port's OWN message pattern creates that a real reliable
-// broadcast would not have): the paper's `rb-broadcast`/`rb-deliver` gives every
-// correct party the SAME `proposal[r]` once any correct party has it at all (RBC's
-// totality property). This port's stand-in for that -- `CutProposal` broadcast plus
-// all-to-all `CutVote` echo (`process_cut_vote`) -- carries no such guarantee on its
-// own: a `CutVote` names only a `round` and `cut_id`, so a party can cross
-// `mint_threshold` (and so call `mark_cut_safe`) for a round whose own `CutProposal`
-// it never received -- `safe_cut_parent` cannot then resolve a citing child's parent
-// through `cut_round_by_id`, so the chain stalls rather than committing (see this
-// module's own test `missing_proposal_stalls_the_chain_rather_than_skipping_a_round`).
-// This liveness gap predates the Figure-2 rewrite above and is UNCHANGED by it (before
-// the rewrite, the identical gap existed one step later: a party could accept a PEER's
-// certificate for round r without ever having received round r's own `CutProposal`
-// either) -- only the trigger that surfaces it moves, from certificate-acceptance to
-// locally reaching `safe`. `ensure_cut_fetch`/`on_cut_fetch`/`on_cut_serve` restore the
-// missing property operationally, by pull rather than by broadcast -- mirroring
-// `vantage::control::ControlLog`'s own `ensure_fetch`/`on_control_fetch`/
-// `on_control_serve` for its carrier bodies exactly (see each method's own doc comment
-// for the parallel, and `mark_cut_safe`/`process_cut_proposal` for the two triggers).
-// The fetch TARGET set at `mark_cut_safe`'s trigger is exactly the `mint_threshold`-many
-// voters THIS party itself counted (`CutVoteAggregator::append`'s own returned
-// `voters`) -- the closest available analogue to the removed certificate's `votes`
-// list, but (unlike that list) never transmitted or trusted from a peer: it is this
-// party's own first-hand record of who it received a vote from, so asking exactly
-// those peers for the proposal carries no less assurance than the old design did.
-//
-// BRACHA VARIANT (separate task, separate upstream branch, `simpleit/
-// Bracha-Mempool-Simple-IT` -- fetched as the same `simpleit` remote, read-only, never
-// checked out/merged/applied; primary/src/core.rs there, cited per method below):
-// arXiv:2606.14404 Table 1/2 + Corollary 5 name TWO cut-consensus variants -- "Opt"
-// (everything above this paragraph) and "S" (Bracha-RBC), the latter trading Opt's
-// larger `mint_threshold` first-hand census for a second, plain-`quorum_threshold`
-// echo round, in exchange for never needing more than `quorum_threshold`-many live
-// authors to make progress (Opt's `mint_threshold` can exceed `quorum_threshold` at
-// large committees -- see `aggregators::mint_threshold`'s own doc comment). `variant:
-// Variant` (below) selects between them; `Variant::Opt` is the default and is
-// byte-for-byte the engine described above -- every method already documented above
-// is unchanged by this addition, and reading them, `variant` never appears.
-//
-// Mechanism (`Variant::Bracha`): `process_cut_vote`'s own first-hand `CutVote` census
-// -- the SAME `cut_vote_aggregators` map `Variant::Opt` uses, just thresholded at
-// plain `quorum_threshold` instead of `mint_threshold` (see `CutVoteAggregator::
-// append`'s `threshold` parameter) -- crossing threshold broadcasts one-shot
-// `CutReady(round, cut_id, author)` (`broadcast_cut_ready`, latched once per round by
-// `sent_cut_ready`, mirroring `sent_cut_votes`'s identical shape) instead of calling
-// `mark_cut_safe` directly. Every party then counts `CutReady`s first-hand, exactly
-// like `CutVote`s, into its own `cut_ready_aggregators` (`process_cut_ready`); crossing
-// `quorum_threshold` there calls `mark_cut_safe` with the `CutReady` senders as the
-// fetch-witness set -- the identical REPAIR mechanism above, just fed from the second
-// echo round's own census instead of the first's. `mark_cut_safe` itself, and every
-// downstream step it reaches (self-Decide, `try_commit_round`, the timeout ladder,
-// `try_propose_cut_for_current_round`, `schedule_cut_timer`), is IDENTICAL for both
-// variants -- neither reads `self.variant` anywhere.
-//
-// Upstream citations: `Core::process_cut_vote` (primary/src/core.rs:417-433 there)
-// crossing `quorum_threshold` calls `broadcast_cut_ready` (:435-459), which -- unlike
-// this port -- unconditionally re-broadcasts (no per-round latch upstream); `Core::
-// process_cut_ready` (:646-679) mints+broadcasts a `CutCertificate` on crossing
-// `quorum_threshold` at its `CutReadyAggregator` (primary/src/aggregators.rs:59-65,
-// 138-182 there) -- the exact same Fig.-2-rewrite defect the module doc comment above
-// already fixed for the Opt variant's own certificate, fixed here identically (first-
-// hand `mark_cut_safe`, no certificate ever minted or broadcast). Upstream's own
-// `CutVoteAggregator` on THIS branch (:54-57, 114-136) is a separately-shaped type
-// from the Opt branch's (returns a bare `bool`, no witness list -- Bracha's
-// certificate design never needed one); this port's `CutVoteAggregator` unifies both
-// into one type via the `threshold` parameter, as noted above.
-//
-// NOT reproduced (deliberate, flagged in the accompanying task report, not a defect
-// in the port): upstream's `Core::process_cut_ready` has no f+1-ready amplification
-// step at all -- unlike its OWN `handle_timeout_accept_action`'s f+1-triggered
-// re-broadcast of `TimeoutAccept` (ported above, unchanged, and shared by both
-// variants), a `CutReady` census that reaches f+1 (short of the full
-// `quorum_threshold` needed to mark safe) never causes upstream to do anything at all
-// -- no re-broadcast, no amplification, nothing. This port reproduces that absence
-// faithfully rather than inventing an amplification step upstream itself does not
-// have.
+// Safety requires an available proposal, individually verified quorum messages, and a
+// first-hand `Decide` quorum. The Bracha variant adds a ready echo.
 
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
@@ -228,21 +22,8 @@ use crypto::{Digest, Hash as _, PublicKey};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// The messages `CutEngine` consumes, plus the one non-message input (a previously
-/// armed timer firing). Wiring this to the real wire enum (`PrimaryMessage`) and to
-/// `vantage::node::Inbound` is a separate, later task -- this type is deliberately not
-/// related to either.
-///
-/// No certificate-shaped variant exists here (see the module doc comment's "FIGURE-2
-/// REWRITE" paragraph) -- this is this engine's ENTIRE inbound message surface, so the
-/// absence is a compile-time guarantee, not merely a run-time one: nothing outside this
-/// enum can ever reach `CutEngine::handle` at all, and `handle`'s own match over it is
-/// exhaustive with no wildcard arm (see `mod tests`'
-/// `inbound_has_no_certificate_shaped_variant` for a test that fails to COMPILE, not
-/// merely to pass, if a certificate-shaped variant is ever added back here). `CutReady`
-/// (BRACHA VARIANT ADDITION, see the module doc comment's "BRACHA VARIANT" paragraph)
-/// is not certificate-shaped either -- same single-named-author shape as `CutVote` --
-/// and is included in that same exhaustive, no-wildcard guarantee.
+/// Messages and timer events consumed by `CutEngine`. The exhaustive dispatch match
+/// defines the complete input surface.
 #[derive(Clone, Debug)]
 pub enum Inbound {
     CutProposal(CutProposal),
@@ -250,152 +31,72 @@ pub enum Inbound {
     Decide(Decide),
     Timeout(Timeout),
     TimeoutAccept(TimeoutAccept),
-    /// Bracha variant only (`Variant::Bracha`) -- Bracha-RBC's own second echo round.
+    /// Bracha variant only: the second echo round.
     /// Never constructed under `Variant::Opt`; see `CutEngine::process_cut_ready`.
     CutReady(CutReady),
-    /// A previously `CutEffect::ArmTimer`-requested deadline for this round has
-    /// elapsed. Corresponds to upstream's `cut_timer_futures` yielding a round.
+    /// A scheduled deadline for this round has elapsed.
     TimerFired(CutRound),
-    /// A peer's request for the `CutProposal` identified by `(round, cut_id)`.
-    /// Repair machinery, not upstream (upstream has no equivalent -- see this
-    /// module's doc comment). The requester is carried explicitly, mirroring
-    /// `vantage::node::Inbound::ControlFetch`.
+    /// A peer requests the `CutProposal` identified by `(round, cut_id)`.
     CutFetch(CutRound, Digest, /* requester */ PublicKey),
-    /// A peer's answer to our own fetch. Mirrors `vantage::node::Inbound::
-    /// ControlServe`.
+    /// A peer answers a fetch request.
     CutServe(CutProposal),
 }
 
-/// Tip-availability oracle for the f+1 gate (deviation 3): "has this party itself seen
-/// at least f+1 evidence for `tip`, authored by `author`". `CutEngine` never
-/// implements this -- the production core implements it over
-/// `LaneManager::is_q_available(&(author, tip.height, tip.header_digest), committee.
-/// validity_threshold())`; a test implements it directly (see `mod tests` below).
+/// Reports whether the local node has validity-threshold evidence for a proposal tip.
 pub trait TipOracle {
     fn available_at_validity(&self, author: &PublicKey, tip: &Proposal) -> bool;
 }
 
-/// BRACHA VARIANT ADDITION -- see the module doc comment's "BRACHA VARIANT" paragraph
-/// for the full mechanism. Selects which cut-consensus census/echo shape
-/// `CutEngine::process_cut_vote` (and, for `Bracha`, `process_cut_ready`) runs;
-/// `CutEngine::new`'s default (`Opt`) is byte-for-byte the engine as it existed before
-/// this addition. `config::Protocol::SimpleItBracha` selects `Bracha`; every other
-/// protocol selects (or defaults to) `Opt` -- see `simpleit::node::SimpleItCore::build`.
+/// Selects the cut-consensus message flow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Variant {
-    /// arXiv:2606.14404's "Opt" cut-consensus variant: a single first-hand `CutVote`
-    /// census, thresholded at `mint_threshold`, reaches `mark_cut_safe` directly. Every
-    /// method documented in the module doc comment ABOVE the "BRACHA VARIANT"
-    /// paragraph describes this variant.
+    /// `Opt` uses one first-hand `CutVote` census and reaches `mark_cut_safe` directly.
     #[default]
     Opt,
-    /// arXiv:2606.14404's "S" cut-consensus variant (Bracha-RBC, Table 1/2 +
-    /// Corollary 5): a first-hand `CutVote` census, thresholded at plain
+    /// `Bracha` uses a first-hand `CutVote` census, thresholded at
     /// `quorum_threshold`, broadcasts `CutReady`; a second first-hand `CutReady`
     /// census, also at `quorum_threshold`, reaches `mark_cut_safe`.
     Bracha,
 }
 
-/// The Simple-IT cut-consensus state machine. See the module doc comment above for the
-/// architecture; see each method below for its upstream provenance.
+/// Simple-IT cut-consensus state machine.
 pub struct CutEngine {
     name: PublicKey,
     committee: Committee,
-    /// Upstream `Core::timeout_delay`: the relative delay `schedule_cut_timer` arms
-    /// each round's timeout deadline for.
+    /// Relative delay used by `schedule_cut_timer`.
     timeout_delay: u64,
-    /// Deviation 3: gates `process_cut_proposal`'s vote on f+1 tip availability when
-    /// `true` (the paper-faithful default). `false` reproduces upstream exactly (votes
-    /// without ever inspecting `proposal.tips`).
+    /// Gates `process_cut_proposal` on f+1 tip availability when enabled.
     gate_tips: bool,
-    /// BRACHA VARIANT ADDITION -- see `Variant`'s own doc comment. `CutEngine::new`'s
-    /// default (`Variant::Opt`) is byte-for-byte the engine as it existed before this
-    /// field was added.
+    /// Selects the cut-consensus variant. The default is `Variant::Opt`.
     variant: Variant,
 
-    /// Upstream `Core::cut_round`. Starts at 1 (confirmed by reading upstream's own
-    /// `Core::spawn` constructor -- NOT 0; round 0 is reserved as `safe_cut_parent`'s
-    /// genesis-parent sentinel and is never an actual contested round; see
-    /// `leader_for_round`'s doc comment for why this discrepancy from the task brief
-    /// does not affect the round -> leader mapping either way).
+    /// Current cut round. Starts at 1; round 0 is the genesis-parent sentinel.
     cut_round: CutRound,
-    /// Upstream `Core::highest_certified_cut`, renamed `highest_safe_cut`: the paper
-    /// (Fig. 2) names no single variable for "the cut the next round's proposal should
-    /// parent onto", but this field's role is unchanged by the Fig.-2 rewrite -- only
-    /// what sets it changed (`mark_cut_safe`'s own local threshold-crossing, never a
-    /// received certificate; see the module doc comment's field-mapping table).
+    /// Safe cut used as the parent for the next proposal.
     highest_safe_cut: Digest,
-    /// The floor `prune_below` was last called with (0 if never). Doubles as
-    /// `sanitize_timeout_accept`'s staleness floor -- see that method's doc comment for
-    /// why this replaces upstream's Autobahn-typed `gc_round: Height`.
+    /// Last pruning floor. Also rejects stale timeout accepts.
     gc_floor: CutRound,
 
-    /// Upstream `cut_vote_aggregators: HashMap<Digest, CutVoteAggregator>`. Re-keyed
-    /// per deviation 2: every read site (`process_cut_vote`) already has `vote.round`
-    /// in hand, so keying by `(CutRound, Digest)` costs nothing at the lookup sites and
-    /// makes this `prune_below`-able by `split_off`. Round-prunable; covered.
+    /// Vote aggregators keyed by round and cut. Round-prunable.
     cut_vote_aggregators: BTreeMap<(CutRound, Digest), CutVoteAggregator>,
-    /// BRACHA VARIANT ADDITION (`Variant::Bracha` only -- see the module doc
-    /// comment's "BRACHA VARIANT" paragraph): first-hand `CutReady` census, mirroring
-    /// `cut_vote_aggregators` exactly (same key shape, same `split_off`-pruning
-    /// reason). Never populated under `Variant::Opt` -- that variant never
-    /// constructs or accepts a `CutReady` at all (see `process_cut_ready`'s own
-    /// variant guard). Round-prunable; covered.
+    /// Bracha-variant ready aggregators keyed by round and cut. Round-prunable.
     cut_ready_aggregators: BTreeMap<(CutRound, Digest), CutReadyAggregator>,
-    /// Upstream `timeouts_aggregators: HashMap<u64, TimeoutAggregator>`. Already
-    /// round-keyed; container swap only. Round-prunable; covered.
+    /// Timeout aggregators by round.
     timeouts_aggregators: BTreeMap<CutRound, TimeoutAggregator>,
-    /// Upstream `timeout_accept_aggregators: HashMap<u64, TimeoutAcceptAggregator>`.
-    /// Already round-keyed; container swap only. Round-prunable; covered.
+    /// Timeout-accept aggregators by round.
     timeout_accept_aggregators: BTreeMap<CutRound, TimeoutAcceptAggregator>,
-    /// Upstream `cut_proposals: HashMap<Digest, CutProposal>`. Re-keyed per deviation 2
-    /// exactly as `cut_vote_aggregators` above: every read site
-    /// (`process_cut_proposal`'s dedup check, `emit_commit_to_committer`) already has
-    /// the round in hand. Round-prunable; covered. `prune_below` also uses this map's
-    /// own split_off to drive `cut_round_by_id`'s cleanup (see that field).
+    /// Proposals by round and cut. Round-prunable.
     cut_proposals: BTreeMap<(CutRound, Digest), CutProposal>,
-    /// Upstream `pending_cut_children: HashMap<Digest, Vec<CutProposal>>` (keyed by the
-    /// *parent* cut's digest). Re-keyed as `(CutRound, Digest)` where the round is each
-    /// buffered *child* proposal's own round and the digest is still the cited parent
-    /// -- a strict refinement of upstream's grouping (splits one upstream bucket into
-    /// one bucket per distinct child round citing that parent; every buffered proposal
-    /// upstream would ever have held is still held, just possibly in a different
-    /// bucket alongside fewer/other siblings), not a behavior change. This makes
-    /// `prune_below` a clean `split_off` (a child whose own round is already GC'd can
-    /// never be validly processed anyway). The cost: reparenting when a parent becomes
-    /// known (`process_cut_proposal`) can no longer do a single `HashMap::remove`,
-    /// since the round component of a pending child's key is not known in advance from
-    /// the parent's digest alone -- it scans this map's (bounded-by-current-backlog)
-    /// keys for matches. That scan is a lookup, not the GC-pruning operation the "no
-    /// retain" rule targets, so it is not a violation of that rule. Round-prunable;
-    /// covered.
+    /// Proposals waiting for their parent, keyed by child round and parent cut.
+    /// Round-prunable.
     pending_cut_children: BTreeMap<(CutRound, Digest), Vec<CutProposal>>,
-    /// Upstream `cut_round_by_id: HashMap<Digest, u64>`. Its one read site
-    /// (`safe_cut_parent`) looks up a round FROM a digest -- the opposite direction
-    /// from every other map above, so it cannot itself be re-keyed by round without
-    /// destroying that lookup's whole purpose (the round is exactly the unknown being
-    /// looked up). Kept `Digest`-keyed (switched to `BTreeMap` for consistency, not for
-    /// `split_off`-ability on its own key). NOT independently round-prunable by its own
-    /// key -- see `prune_below`'s doc comment for how it is still covered, by riding
-    /// `cut_proposals`' split_off (the two maps are populated together, one insert
-    /// each, only by `record_cut_proposal`).
+    /// Maps a cut id to its round. Entries are removed with their proposals.
     cut_round_by_id: BTreeMap<Digest, CutRound>,
-    /// Upstream `leader_cut_by_round: HashMap<u64, Digest>`. Already round-keyed.
-    /// Round-prunable; covered.
+    /// Leader cut by round. Round-prunable.
     leader_cut_by_round: BTreeMap<CutRound, Digest>,
-    /// Upstream `cut_certificates: HashMap<u64, CutCertificate>`, renamed `safe` and
-    /// re-typed `BTreeMap<CutRound, Digest>` -- Fig. 2's `safe[r]` state variable: key
-    /// presence IS `safe[r] = true`; the value is `proposal[r]`'s id (Fig. 2 tracks
-    /// that separately, in `proposal[r]`, but the two are only ever established
-    /// together in this engine -- see `mark_cut_safe`). Populated ONLY by
-    /// `mark_cut_safe`, reached ONLY from `process_cut_vote`'s own
-    /// `CutVoteAggregator` crossing `mint_threshold` on first-hand-verified votes --
-    /// never from a received message asserting a round is safe (there is no such
-    /// message; see the module doc comment's "FIGURE-2 REWRITE" paragraph). Already
-    /// round-keyed. Round-prunable; covered.
+    /// Safe cut by round. Presence means the round passed the vote threshold.
     safe: BTreeMap<CutRound, Digest>,
-    /// Upstream `decide_aggregators: HashMap<(u64, Digest), DecideAggregator>`. Already
-    /// tuple-keyed by round; container swap only. Round-prunable; covered.
+    /// Decide aggregators by round and cut. Round-prunable.
     decide_aggregators: BTreeMap<(CutRound, Digest), DecideAggregator>,
     /// Upstream `decides_by_round: HashMap<u64, Decide>`, renamed `committed` -- Fig.
     /// 2's `committed[r]` state variable: key presence IS `committed[r] = true`; the
@@ -406,12 +107,12 @@ pub struct CutEngine {
     /// Upstream `voted_cut_rounds: HashSet<u64>`, renamed `sent_cut_votes`. NOT Fig.
     /// 2's `voted` (that is the field below, `voted`) -- this is this engine's OWN
     /// CutVote-sent latch, standing in for RBC-echo participation, a step the paper's
-    /// `rb-broadcast` primitive absorbs and never names. Renamed specifically to stop
+    /// `rb-broadcast` primitive absorbs and never names. It is separate from
     /// colliding with the real `voted` below now that the Fig.-2 alignment makes the
-    /// distinction load-bearing -- see the module doc comment's field-mapping table.
+    /// distinction required -- see the module doc comment's field-mapping table.
     /// Round-prunable; covered.
     sent_cut_votes: BTreeSet<CutRound>,
-    /// BRACHA VARIANT ADDITION (`Variant::Bracha` only): this party's own one-shot
+    /// Bracha variant (`Variant::Bracha` only): this party's own one-shot
     /// `CutReady`-broadcast latch per round, mirroring `sent_cut_votes` immediately
     /// above exactly (same per-round-not-per-current-round-bool shape, same
     /// rationale). Never populated under `Variant::Opt`. Round-prunable; covered.
@@ -510,7 +211,7 @@ impl CutEngine {
         self
     }
 
-    /// BRACHA VARIANT ADDITION's switch -- see `Variant`'s own doc comment. Defaults
+    /// Bracha variant's switch -- see `Variant`'s own doc comment. Defaults
     /// to `Variant::Opt` (byte-for-byte the engine as it existed before this method
     /// was added); pass `Variant::Bracha` to run the Bracha-RBC variant instead.
     pub fn with_variant(mut self, variant: Variant) -> Self {
@@ -618,7 +319,7 @@ impl CutEngine {
         self.cut_vote_aggregators = self
             .cut_vote_aggregators
             .split_off(&(floor, Digest::default()));
-        // BRACHA VARIANT ADDITION: always spliced, even under `Variant::Opt` (where
+        // Bracha variant: always spliced, even under `Variant::Opt` (where
         // both maps/sets stay empty the whole run) -- a no-op `split_off` on an empty
         // map, mirroring how every OTHER round-prunable field here is unconditional
         // regardless of which upstream deviation populates it.
@@ -715,27 +416,21 @@ impl CutEngine {
             .collect()
     }
 
-    /// Was upstream primary/src/core.rs:448-478 (minted+broadcast a `CutCertificate`
-    /// once THIS party's own vote count crossed `mint_threshold`). Now Fig. 2's
+    /// The mark-safe step counts individually verified votes. Once this party's
+    /// vote weight crosses `mint_threshold`, it transitions to `mark_cut_safe`.
     /// Mark-safe step, evaluated FIRST-HAND: every `CutVote` is individually verified
     /// (`vote.verify`) and fed to this party's OWN `CutVoteAggregator` -- never a
-    /// peer's relayed claim. Under `Variant::Opt` (unchanged from before the Bracha
-    /// addition), once weight crosses `mint_threshold`, this party transitions
-    /// straight into `mark_cut_safe` with the exact witnesses it counted. No
-    /// certificate is minted, broadcast, or received by anyone, anywhere -- see the
-    /// module doc comment's "FIGURE-2 REWRITE" paragraph for why this is the fix, not
-    /// merely a rename.
+    /// peer's relayed claim. No certificate is minted or accepted.
     ///
-    /// BRACHA VARIANT ADDITION: under `Variant::Bracha`, this is instead Bracha-RBC's
-    /// own FIRST echo round -- the SAME `CutVoteAggregator`/`cut_vote_aggregators` map,
+    /// Bracha variant: this is its first echo round, using the same
+    /// `CutVoteAggregator` map,
     /// just thresholded at plain `quorum_threshold` (see `CutVoteAggregator::append`'s
     /// `threshold` parameter) rather than `mint_threshold`, and crossing it broadcasts
     /// a `CutReady` (`broadcast_cut_ready`) rather than calling `mark_cut_safe`
     /// directly -- `witnesses` (the vote senders) are not used as a fetch-witness set
     /// at this step; see `broadcast_cut_ready`/`process_cut_ready` below for the
     /// second echo round that actually reaches `mark_cut_safe`. See the module doc
-    /// comment's "BRACHA VARIANT" paragraph for the full mechanism and upstream
-    /// citation.
+    /// comment above for the variant rules.
     pub fn process_cut_vote(
         &mut self,
         vote: CutVote,
@@ -762,7 +457,7 @@ impl CutEngine {
         }
     }
 
-    /// BRACHA VARIANT ADDITION (`Variant::Bracha` only): reached when this party's own
+    /// Bracha variant (`Variant::Bracha` only): reached when this party's own
     /// first-hand `CutVote` census (`process_cut_vote` above) crosses
     /// `quorum_threshold` -- Bracha-RBC's own first echo-to-ready transition (arXiv:
     /// 2606.14404 Table 1/2 + Corollary 5, variant S). One-shot per round
@@ -802,7 +497,7 @@ impl CutEngine {
         effects
     }
 
-    /// BRACHA VARIANT ADDITION: `Inbound::CutReady`'s entry point -- Bracha-RBC's own
+    /// Bracha variant: `Inbound::CutReady`'s entry point -- Bracha-RBC's own
     /// second echo round (see `broadcast_cut_ready`'s doc comment for the first).
     /// Mirrors `process_cut_vote`'s shape exactly: individually verifies, dedups via
     /// this party's OWN first-hand `CutReadyAggregator`, and on crossing
@@ -810,7 +505,7 @@ impl CutEngine {
     /// `CutReady` senders counted as the fetch-witness set -- see `mark_cut_safe`'s
     /// own doc comment for how `witnesses` is used there (`ensure_cut_fetch`'s target
     /// set). No certificate is minted or broadcast anywhere -- see the module doc
-    /// comment's "FIGURE-2 REWRITE" paragraph; this is that identical fix applied to
+    /// comment's "safety rules" paragraph; this is that identical fix applied to
     /// the separate soundness gap upstream's OWN Bracha branch has at this exact
     /// point (`Core::process_cut_ready`, primary/src/core.rs:646-679 there, which
     /// minted+broadcast a `CutCertificate` on crossing `quorum_threshold` -- see the
@@ -1588,7 +1283,7 @@ mod tests {
             .collect()
     }
 
-    /// BRACHA VARIANT ADDITION: mirrors `find_vote_for_round`/`find_decide_for_round`
+    /// Bracha variant: mirrors `find_vote_for_round`/`find_decide_for_round`
     /// exactly, for the new `CutOut::CutReady` broadcast.
     fn find_ready_for_round(effects: &[CutEffect], round: CutRound) -> Option<CutReady> {
         effects.iter().find_map(|e| match e {
@@ -1689,7 +1384,7 @@ mod tests {
         happy_path_commit(10);
     }
 
-    /// BRACHA VARIANT ADDITION -- Test 1's Bracha analogue, at both n=4 and n=10:
+    /// Bracha variant -- Test 1's Bracha analogue, at both n=4 and n=10:
     /// proposal -> votes to `quorum_threshold` -> this party broadcasts+self-processes
     /// its own `CutReady` -> readys to `quorum_threshold` -> safe (and, in the SAME
     /// step, this party's own `Decide`) -> decides to `quorum_threshold` -> commit
@@ -1803,7 +1498,7 @@ mod tests {
         happy_path_commit_bracha(10);
     }
 
-    /// BRACHA VARIANT ADDITION: `broadcast_cut_ready` broadcasts at most once per
+    /// Bracha variant: `broadcast_cut_ready` broadcasts at most once per
     /// round, even if the internal trigger (crossing `quorum_threshold` on the vote
     /// census) somehow fires again for a DIFFERENT `cut_id` in the same round (e.g. an
     /// equivocating leader) -- `sent_cut_ready` is a per-ROUND latch, mirroring
@@ -1836,7 +1531,7 @@ mod tests {
         );
     }
 
-    /// BRACHA VARIANT ADDITION: `process_cut_ready`'s own `CutReadyAggregator` census
+    /// Bracha variant: `process_cut_ready`'s own `CutReadyAggregator` census
     /// dedups by author exactly like `CutVoteAggregator` does (see
     /// `safe_is_reached_only_by_counting_distinct_votes_never_below_quorum`'s
     /// identical final assertion for votes) -- `safe` is reached at exactly
@@ -1896,7 +1591,7 @@ mod tests {
         );
     }
 
-    /// BRACHA VARIANT ADDITION: `process_cut_ready` is a no-op under `Variant::Opt` --
+    /// Bracha variant: `process_cut_ready` is a no-op under `Variant::Opt` --
     /// a stray/Byzantine `CutReady` cannot make an Opt-configured engine take the
     /// Bracha-shaped path it was never configured to run.
     #[test]
@@ -1920,7 +1615,7 @@ mod tests {
         assert!(!engine.safe.contains_key(&1));
     }
 
-    /// BRACHA VARIANT ADDITION -- the motivating case: at n=20, Opt's own
+    /// Bracha variant -- the motivating case: at n=20, Opt's own
     /// `mint_threshold` (15) exceeds the number of live authors in this scenario (14),
     /// so no Opt-variant engine could ever reach `safe` here, no matter how long it
     /// waited. Bracha's own threshold (plain `quorum_threshold`, 14 at n=20) is exactly
@@ -2029,7 +1724,7 @@ mod tests {
         assert_eq!(commits[0].1, proposal.tips);
     }
 
-    /// REGRESSION (audit fix, see `aggregators::mint_threshold`); ADAPTED for the
+    /// Test, see `aggregators::mint_threshold`); ADAPTED for the
     /// Fig.-2 rewrite -- was `minted_certificate_passes_its_own_verify_at_small_
     /// committees`. There is no certificate to verify anymore: each party marks a
     /// round safe by counting its OWN `CutVote`s to `mint_threshold =
@@ -2184,7 +1879,7 @@ mod tests {
             match inbound {
                 Inbound::CutProposal(_)
                 | Inbound::CutVote(_)
-                // BRACHA VARIANT ADDITION: `Inbound::CutReady` is exactly the kind of
+                // Bracha variant: `Inbound::CutReady` is exactly the kind of
                 // new variant this test's own doc comment describes -- adding it here
                 // is REQUIRED (the match would fail to COMPILE otherwise, per this
                 // test's stated purpose), not a behavior change to the test itself.
@@ -2205,7 +1900,7 @@ mod tests {
         assert_exhaustive_with_no_certificate_arm(Inbound::TimerFired(0));
     }
 
-    /// AUDIT (ADAPTED for the Fig.-2 rewrite -- the trigger was a hand-built
+    /// Test for the Fig.-2 rewrite -- the trigger was a hand-built
     /// `CutCertificate`, now `mint_threshold`-many `CutVote`s): what actually happens
     /// to a party that counts enough votes to mark round r safe LOCALLY but never
     /// itself received round r's own PROPOSAL. Establishes whether the failure mode
@@ -2309,7 +2004,7 @@ mod tests {
         .id()
     }
 
-    /// AUDIT FOLLOWUP (cut-proposal repair; ADAPTED for the Fig.-2 rewrite -- was
+    /// Test (cut-proposal repair; ADAPTED for the Fig.-2 rewrite -- was
     /// `certificate_with_unknown_proposal_triggers_fetch_to_its_voters`): the same
     /// missing-proposal scenario as `missing_proposal_stalls_the_chain_rather_than_
     /// skipping_a_round` above, now asserting the repair fix -- locally crossing
@@ -2381,7 +2076,7 @@ mod tests {
         );
     }
 
-    /// AUDIT FOLLOWUP (cut-proposal repair, additional coverage beyond the task's
+    /// Test (cut-proposal repair, additional coverage beyond the task's
     /// required list -- see the report): the OTHER trigger -- a proposal citing a
     /// parent this engine has never heard of AT ALL (no certificate either) still
     /// gets buffered exactly as before, but now ALSO fans a fetch out to the full
@@ -2990,7 +2685,7 @@ mod tests {
         assert!(engine.safe.contains_key(&2));
     }
 
-    /// BRACHA VARIANT ADDITION: `prune_below` covers the two new round-prunable
+    /// Bracha variant: `prune_below` covers the two new round-prunable
     /// fields (`cut_ready_aggregators`, `sent_cut_ready`) exactly like
     /// `prune_below_is_exact` above covers every pre-existing one -- a separate test
     /// (rather than an addition to that one) so no pre-existing test is modified.

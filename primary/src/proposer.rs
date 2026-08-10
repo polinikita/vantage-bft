@@ -108,7 +108,6 @@ impl Proposer {
 
         if self.is_special {
             header.special = true;
-            //TODO: need to also include the digest of the last proposal. Otherwise there is no gain in latency for that tx.
             // Instead of including Certificate as parent => include digest.
         }
 
@@ -155,7 +154,6 @@ impl Proposer {
             // we have a ticket to propose a new block
             // For both normal blocks and special blocks, delegate the actual sending to the consensus module
             // in other words core should not be disseminating headers
-            //let enough_parents = !self.last_parent.is_empty();
             let enough_parent = self.last_parent.is_some();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
@@ -223,7 +221,6 @@ impl Proposer {
                 }
 
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
-                    //println!("   received payload from worker {}", worker_id);
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                 }

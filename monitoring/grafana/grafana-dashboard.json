@@ -9,6 +9,7 @@
   "links": [],
   "panels": [
     {
+      "id": 2,
       "type": "stat",
       "title": "Validators (live)",
       "datasource": {
@@ -49,6 +50,7 @@
       ]
     },
     {
+      "id": 3,
       "type": "stat",
       "title": "Protocol / tx mode",
       "datasource": {
@@ -104,6 +106,7 @@
       ]
     },
     {
+      "id": 15,
       "type": "stat",
       "title": "TPS",
       "datasource": {
@@ -145,8 +148,10 @@
       ]
     },
     {
+      "id": 38,
       "type": "stat",
-      "title": "Ordering latency p50 (median validator, cumulative)",
+      "title": "Ordering p50",
+      "description": "Cumulative median across validators.",
       "datasource": {
         "type": "prometheus",
         "uid": "Fixed-UID-vantage"
@@ -185,8 +190,10 @@
       ]
     },
     {
+      "id": 39,
       "type": "stat",
-      "title": "Materialized latency p50 (median validator, cumulative)",
+      "title": "Materialized p50",
+      "description": "Cumulative median across validators.",
       "datasource": {
         "type": "prometheus",
         "uid": "Fixed-UID-vantage"
@@ -279,7 +286,7 @@
           "refId": "A"
         }
       ],
-      "description": "Every validator's worker-0 observes the replicated commit sequence, so the total is the maximum worker-0 byte rate rather than a committee-wide sum.",
+      "description": "Committee commit throughput. Each worker observes the same stream, so the query uses max, not sum.",
       "title": "Committed bytes/s",
       "type": "stat"
     },
@@ -340,7 +347,7 @@
       ],
       "title": "Views sealed/s",
       "type": "stat",
-      "description": "Median across validators. Every primary seals the same view once, so this is a per-validator view-sealing rate -- never sum it across nodes (that reads n-times high)."
+      "description": "Median per-validator seal rate. Do not sum replicated view seals."
     },
     {
       "collapsed": false,
@@ -444,7 +451,7 @@
       ],
       "title": "Seal route mix (stacked views/s, median validator)",
       "type": "timeseries",
-      "description": "Routes are stacked normally. The total reference line is the exact sum of the displayed per-route medians and is excluded from the stack to avoid double-counting."
+      "description": "Stacked median route rates. The unstacked total is their sum."
     },
     {
       "datasource": {
@@ -453,7 +460,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "percent"
         },
         "overrides": []
       },
@@ -475,7 +482,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -547,7 +554,7 @@
       ],
       "title": "Fallback seal routes/s (median validator)",
       "type": "timeseries",
-      "description": "Median per-validator rate of every seal route except fast_full and direct_full. Any sustained non-zero value is a degradation signal."
+      "description": "Median rate of non-fast seal routes. Sustained nonzero values indicate degraded consensus."
     },
     {
       "datasource": {
@@ -593,7 +600,7 @@
           "refId": "A"
         }
       ],
-      "description": "Median across validator worker-0 observations of the same replicated commit stream. This is deliberately neither a per-validator fan-out nor a committee-wide sum.",
+      "description": "Median worker observation of the replicated commit stream.",
       "title": "Committed TPS (median validator)",
       "type": "timeseries"
     },
@@ -649,7 +656,7 @@
           "refId": "B"
         }
       ],
-      "description": "Submission-to-ordering p50/p95, run-cumulative, aggregated as the median across all selected worker percentile gauges. The source exports per-worker percentile gauges rather than mergeable histogram buckets, so these are committee medians of worker percentiles, not pooled global percentiles. The y-axis uses the full observed range.",
+      "description": "Run-cumulative submission-to-ordering latency. Values are medians of per-worker percentiles.",
       "title": "Ordering latency (median across workers, p50/p95)",
       "type": "timeseries"
     },
@@ -705,7 +712,7 @@
           "refId": "B"
         }
       ],
-      "description": "Submission-to-ordering-and-local-payload p50/p95, run-cumulative, aggregated as the median across all selected worker percentile gauges. The source exports per-worker percentile gauges rather than mergeable histogram buckets, so these are committee medians of worker percentiles, not pooled global percentiles. The y-axis uses the full observed range.",
+      "description": "Run-cumulative latency through local payload materialization. Values are medians of per-worker percentiles.",
       "title": "Materialized latency (median across workers, p50/p95)",
       "type": "timeseries"
     },
@@ -764,7 +771,7 @@
       ],
       "title": "Core thread busy (median validator)",
       "type": "timeseries",
-      "description": "Median across selected Vantage primaries. Busy is accumulated wall time in the single VantageCore select loop as a percentage of one thread; 100% means that task is saturated. Known downstream wait is the measured subset blocked on store_probe and is already included in busy. Other network awaits are not separately classified, so busy minus known wait is an upper bound on CPU work."
+      "description": "Median VantageCore wall-time utilization. It includes measured waits; 100% means the core task is saturated."
     },
     {
       "datasource": {
@@ -852,7 +859,271 @@
       ],
       "title": "Core wall time by operation (stacked, median validator)",
       "type": "timeseries",
-      "description": "Each stacked band is the median across selected validators of the percentage of wall time spent in one named VantageCore operation. The unstacked total line is the exact sum of the displayed operation medians. It can differ slightly from the median total-busy line at left because quantile and sum do not commute."
+      "description": "Median wall-time utilization by core operation. The total sums the displayed medians."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 36
+      },
+      "id": 40,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "clamp_min(max(vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"}) - min(vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"}), 0) or vector(0)",
+          "legendFormat": "views",
+          "refId": "A"
+        }
+      ],
+      "description": "Difference between the highest and lowest sequence heads. It must return to zero after catch-up.",
+      "title": "Sequence spread",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 36
+      },
+      "id": 41,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "max((sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) and on(node) protocol_info{protocol=\"vantage\"})) / 10000 or vector(0)",
+          "legendFormat": "percent",
+          "refId": "A"
+        }
+      ],
+      "description": "Busiest VantageCore thread. Sustained 100% means saturation.",
+      "title": "Worst core busy",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 36
+      },
+      "id": 42,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "max(100 * max by (queue) (worker_queue_peak{node=~\"$node\",node=~\".*-worker-0$\"}) / max by (queue) (worker_queue_capacity{node=~\"$node\",node=~\".*-worker-0$\"})) or vector(0)",
+          "legendFormat": "percent",
+          "refId": "A"
+        }
+      ],
+      "description": "Highest one-second queue utilization across worker stages and validators.",
+      "title": "Worst worker queue",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 36
+      },
+      "id": 43,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "sum(vantage_sequence_sync_exhausted_total{node=~\"$node\",node=~\".*-primary$\"}) + sum(vantage_sequence_install_failed_total{node=~\"$node\",node=~\".*-primary$\"}) + sum(vantage_sequence_install_rejected_total{node=~\"$node\",node=~\".*-primary$\"}) + sum(vantage_sequence_verify_mismatch_total{node=~\"$node\",node=~\".*-primary$\"}) + sum(vantage_sequence_record_rejected_total{node=~\"$node\",node=~\".*-primary$\"}) + sum(vantage_sequence_equivocators{node=~\"$node\",node=~\".*-primary$\"}) + sum(process_panics{node=~\"$node\"})",
+          "legendFormat": "faults",
+          "refId": "A"
+        }
+      ],
+      "description": "Protocol fault counters and process panics. Must stay zero.",
+      "title": "Critical faults",
+      "type": "stat"
     },
     {
       "collapsed": false,
@@ -864,7 +1135,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 40
       },
       "id": 11,
       "panels": [],
@@ -886,7 +1157,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 37
+        "y": 41
       },
       "id": 12,
       "options": {
@@ -900,7 +1171,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -941,7 +1212,7 @@
           "refId": "D"
         }
       ],
-      "description": "All series are per-second rates. vantage_entered_view is a monotone view-number gauge, so rate() is valid and yields views entered/s; it tracks sealed/s 1:1 on a healthy run. anchor/s is empty unless a view falls back to the anchor path.",
+      "description": "Per-second view rates. Entry and seal rates should match; anchor activity indicates fallback recovery.",
       "title": "View entry / seal / anchor rates",
       "type": "timeseries"
     },
@@ -960,7 +1231,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 37
+        "y": 41
       },
       "id": 13,
       "options": {
@@ -974,7 +1245,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -983,7 +1254,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"}",
+          "expr": "clamp_min(vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"}, 0)",
           "legendFormat": "{{node}} cursor lag",
           "refId": "A"
         },
@@ -992,7 +1263,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_own_watermark{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"}",
+          "expr": "clamp_min(vantage_own_watermark{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_entered_view{node=~\"$node\",node=~\".*-primary$\"}, 0)",
           "legendFormat": "{{node}} wish lead",
           "refId": "B"
         },
@@ -1001,14 +1272,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "vantage_control_delivered_len{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_control_consume_pos{node=~\"$node\",node=~\".*-primary$\"}",
+          "expr": "clamp_min(vantage_control_delivered_len{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_control_consume_pos{node=~\"$node\",node=~\".*-primary$\"}, 0)",
           "legendFormat": "{{node}} control-log gap",
           "refId": "C"
         }
       ],
       "title": "View lag: cursor / wish / control-log (views)",
       "type": "timeseries",
-      "description": "Small-integer view gaps, all near zero when healthy. cursor lag = entered but not yet output; wish lead = own wish ahead of entry; control-log gap = delivered but unconsumed control entries (a persistent gap means anchors are blocked on a missing B_w)."
+      "description": "Clamped view gaps. Persistent cursor, wish, or control-log gaps indicate stalled progress."
     },
     {
       "datasource": {
@@ -1025,7 +1296,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 45
+        "y": 49
       },
       "id": 14,
       "options": {
@@ -1039,7 +1310,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1073,7 +1344,7 @@
       ],
       "title": "View frontiers (pacemaker / responsive / output)",
       "type": "timeseries",
-      "description": "All series are view numbers on one axis and should track within a few views. Sustained separation localizes a stall: entry (pacemaker) vs proposal (frontier) vs output (cursor)."
+      "description": "Pacemaker, proposal, and output frontiers should remain within a few views."
     },
     {
       "datasource": {
@@ -1090,7 +1361,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 45
+        "y": 49
       },
       "id": 9001,
       "options": {
@@ -1104,7 +1375,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1138,7 +1409,7 @@
       ],
       "title": "Pacemaker wish / entry (views)",
       "type": "timeseries",
-      "description": "Wish/entry state (exported but previously on NO panel). Healthy invariant: omega_q >= entry_target >= entered_view, own_watermark leading. A stalled omega_q under a rising own_watermark localizes the stall to PEER wishes, not this node."
+      "description": "Healthy order: omega_q >= entry target >= entered view, with own watermark ahead."
     },
     {
       "collapsed": false,
@@ -1150,7 +1421,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 57
       },
       "id": 22,
       "panels": [],
@@ -1172,7 +1443,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 54
+        "y": 58
       },
       "id": 23,
       "options": {
@@ -1186,7 +1457,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1227,7 +1498,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 58
       },
       "id": 24,
       "options": {
@@ -1241,7 +1512,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1284,7 +1555,7 @@
       ],
       "title": "Ack census per node: per-block acks / watermark avail (Vantage / Simple-IT)",
       "type": "timeseries",
-      "description": "Under --ack-watermarks the per-block VantageAck broadcast is suppressed, so 'acks recv/s' is structurally 0 while 'ack confirms/s' keeps counting N3 confirmations (LaneManager is flag-unaware) -- that asymmetry is expected, not a failure. The avail_* series are the watermark front-end and are 0 when the flag is off."
+      "description": "Logical confirmations remain active in every mode. Wire traffic uses per-block ACKs, periodic watermarks, or default echo claims."
     },
     {
       "datasource": {
@@ -1301,7 +1572,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 62
+        "y": 66
       },
       "id": 25,
       "options": {
@@ -1315,7 +1586,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1356,7 +1627,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 62
+        "y": 66
       },
       "id": 26,
       "options": {
@@ -1370,7 +1641,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1402,7 +1673,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 70
+        "y": 74
       },
       "id": 27,
       "options": {
@@ -1439,7 +1710,7 @@
           "refId": "B"
         }
       ],
-      "description": "submitted = per-worker client ingress (additive). committed = the SAME cluster-wide committed set observed independently by every worker, so it is NOT additive -- max() is the cluster view (sum would read n-times high). Caveats: committed_transactions needs the `benchmark` cargo feature; the worker-0 filter equals the full cut only with one worker per validator; and it counts only txs whose payload was locally readable (see latency_misses).",
+      "description": "Submitted traffic is additive. Committed traffic is replicated, so the query uses max across worker-0 observations.",
       "title": "Submitted vs. sequenced (committed) transactions/s",
       "type": "timeseries"
     },
@@ -1458,7 +1729,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 70
+        "y": 74
       },
       "id": 28,
       "options": {
@@ -1515,7 +1786,7 @@
       ],
       "title": "Proposed block size, cumulative since start (p50/p90/p99/max, bytes)",
       "type": "timeseries",
-      "description": "Values are cumulative since process start (the histogram is drained without being cleared), so a rise means 'at some point during the run' and v=max never decreases. avg-of-per-node-quantiles is not a cluster quantile, so this reports the worst node."
+      "description": "Run-cumulative block-size percentiles and maximum. The maximum never decreases."
     },
     {
       "collapsed": false,
@@ -1527,7 +1798,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 82
       },
       "id": 29,
       "panels": [],
@@ -1549,7 +1820,7 @@
         "h": 7,
         "w": 6,
         "x": 0,
-        "y": 79
+        "y": 83
       },
       "id": 30,
       "options": {
@@ -1563,7 +1834,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1596,7 +1867,7 @@
         "h": 7,
         "w": 9,
         "x": 6,
-        "y": 79
+        "y": 83
       },
       "id": 34,
       "options": {
@@ -1610,7 +1881,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1624,7 +1895,7 @@
           "refId": "A"
         }
       ],
-      "description": "Per-validator CPU used by its standalone primary and worker processes, expressed as percent of one logical core and excluding the client load generator. Values may exceed 100% when a validator uses multiple cores. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
+      "description": "Primary plus worker CPU per validator, excluding the client. Values may exceed one logical core.",
       "title": "CPU usage (per validator, % of one core)",
       "type": "timeseries"
     },
@@ -1644,7 +1915,7 @@
         "h": 7,
         "w": 9,
         "x": 15,
-        "y": 79
+        "y": 83
       },
       "id": 35,
       "options": {
@@ -1658,7 +1929,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1672,7 +1943,7 @@
           "refId": "A"
         }
       ],
-      "description": "Per-validator resident memory summed across its standalone primary and worker processes, excluding the client load generator. Available on Linux process deployments; intentionally absent from the single-process local-benchmark.",
+      "description": "Primary plus worker resident memory per validator, excluding the client.",
       "title": "Memory usage (RSS, per validator)",
       "type": "timeseries"
     },
@@ -1691,7 +1962,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 90
       },
       "id": 31,
       "options": {
@@ -1705,7 +1976,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1721,7 +1992,7 @@
       ],
       "title": "VantageCore utilization by section (% wall-clock busy)",
       "type": "timeseries",
-      "description": "Accumulated WALL time per labeled section of VantageCore's single select loop, as a percent of one core. Wall, not CPU: a section blocked on an .await (the store actor's FIFO, a channel send) counts as fully busy here. Subtract the wait panel to the right to get actual CPU. The labels no longer nest -- every section that calls execute() drops its own timer first -- so summing them over a node approximates how much of the core loop's second was spent not idle. 100% means the single core task is saturated, whatever the machine's other 7 vCPUs are doing."
+      "description": "Wall-time utilization by core section. Await time is included; 100% means the single core task is saturated."
     },
     {
       "datasource": {
@@ -1738,7 +2009,7 @@
         "h": 7,
         "w": 6,
         "x": 12,
-        "y": 86
+        "y": 90
       },
       "id": 9002,
       "options": {
@@ -1752,7 +2023,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1777,7 +2048,7 @@
       ],
       "title": "VantageCore: CPU vs waiting (% of one core)",
       "type": "timeseries",
-      "description": "Splits the wall time on the left into the part spent computing and the part spent blocked on downstream I/O. 'waiting' is core_wait_timer, opened only around regions known to block (today: store_probe, the payload-presence round-trip through the single store actor); 'cpu' is utilization minus waiting. Read 'cpu' as an UPPER bound: the inbound_dispatch, effect_execution, avail_flush and resume_tick sections also await the network with no matching wait scope, so some of what lands in 'cpu' is really time in a channel send. Rising 'cpu' still means the core task is compute-bound and more load will queue behind it; rising 'waiting' means it is starved by the store instead. Filtered to protocol=vantage: the store_probe scope lives in LaneManager, which Simple-IT shares, while every utilization scope is Vantage-only -- unfiltered, a Simple-IT run would render negative cpu."
+      "description": "Estimated compute time is utilization minus measured store waits. Unmeasured network waits make compute an upper bound."
     },
     {
       "datasource": {
@@ -1794,7 +2065,7 @@
         "h": 7,
         "w": 6,
         "x": 18,
-        "y": 86
+        "y": 90
       },
       "id": 32,
       "options": {
@@ -1808,7 +2079,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1833,7 +2104,7 @@
       ],
       "title": "VantageCore inbound-queue depth (now / peak)",
       "type": "timeseries",
-      "description": "rx_vantage's depth. 'now' is sampled once/sec from the core thread itself, so it can only be read at an instant that thread is between select branches -- it systematically misses sub-second bursts. 'peak' is the max observed on EVERY loop iteration since the previous sample, reset each publish. Peak growing while 'now' stays near zero is the signature of a core that is falling behind in bursts; both growing together means it is falling behind outright."
+      "description": "Current and one-second peak inbound depth. Rising peak means burst backlog; rising current depth means sustained backlog."
     },
     {
       "datasource": {
@@ -1849,9 +2120,9 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 24,
+        "w": 12,
         "x": 0,
-        "y": 93
+        "y": 97
       },
       "id": 9003,
       "options": {
@@ -1865,7 +2136,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -1874,14 +2145,62 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "network_connections{node=~\"$node\"}",
+          "expr": "network_connections{node=~\"$node\",node=~\".*-primary$\"}",
           "legendFormat": "{{node}} {{listener}}",
           "refId": "A"
         }
       ],
-      "title": "Open inbound TCP connections by node / listener",
+      "title": "Primary inbound TCP connections",
       "type": "timeseries",
-      "description": "Live accepted inbound TCP sessions, labeled by listener role. The Prometheus `node` label separates primary and worker processes (for example node-7-primary vs node-7-worker-0), while `listener` separates primary_to_primary, worker_to_primary, primary_to_worker, transactions, worker_to_worker, and legacy unlabeled receivers."
+      "description": "Open inbound sessions on primary listeners."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "id": 9004,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "network_connections{node=~\"$node\",node=~\".*-worker-[0-9]+$\"}",
+          "legendFormat": "{{node}} {{listener}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Worker inbound TCP connections",
+      "type": "timeseries",
+      "description": "Open inbound sessions on worker listeners."
     },
     {
       "datasource": {
@@ -1905,7 +2224,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 100
+        "y": 104
       },
       "id": 16,
       "options": {
@@ -2018,7 +2337,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"CertificatesRequest|ProposalHeadersRequest\"}[1m]))",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"CertificatesRequest|ProposalHeadersRequest|VantageSequence.*\"}[1m]))",
           "legendFormat": "sync",
           "refId": "K"
         },
@@ -2028,7 +2347,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
-          "legendFormat": "local",
+          "legendFormat": "node-local/LAN",
           "refId": "L"
         },
         {
@@ -2036,14 +2355,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|VantageSequence.*|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
           "legendFormat": "uncategorized (BUG if >0)",
           "refId": "Z"
         }
       ],
       "title": "Messages/s sent by category (stacked)",
       "type": "timeseries",
-      "description": "Categories cover every wire variant emitted today; the `type` label is derived automatically from the message enum, so a NEW variant would silently vanish from a stacked total -- the 'uncategorized' series is the drift guard and must stay flat at 0."
+      "description": "Every wire type has one category. A positive uncategorized value indicates a missing mapping."
     },
     {
       "datasource": {
@@ -2067,7 +2386,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 100
+        "y": 104
       },
       "id": 17,
       "options": {
@@ -2180,7 +2499,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"CertificatesRequest|ProposalHeadersRequest\"}[1m]))",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"CertificatesRequest|ProposalHeadersRequest|VantageSequence.*\"}[1m]))",
           "legendFormat": "sync",
           "refId": "K"
         },
@@ -2190,7 +2509,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
-          "legendFormat": "local",
+          "legendFormat": "node-local/LAN",
           "refId": "L"
         },
         {
@@ -2198,14 +2517,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|VantageSequence.*|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
           "legendFormat": "uncategorized (BUG if >0)",
           "refId": "Z"
         }
       ],
       "title": "Bytes/s sent by category (stacked)",
       "type": "timeseries",
-      "description": "Categories cover every wire variant emitted today; the `type` label is derived automatically from the message enum, so a NEW variant would silently vanish from a stacked total -- the 'uncategorized' series is the drift guard and must stay flat at 0."
+      "description": "Every wire type has one category. A positive uncategorized value indicates a missing mapping."
     },
     {
       "datasource": {
@@ -2234,7 +2553,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 109
+        "y": 113
       },
       "id": 18,
       "options": {
@@ -2262,7 +2581,7 @@
           "refId": "A"
         }
       ],
-      "description": "Per-validator amplification: bytes actually put on the wire divided by bytes sequenced. The previous form divided a COMMITTEE-WIDE numerator by a single validator, so it grew linearly with n (read 10.6 where per-validator truth was 2.65). True overhead = value - 1.",
+      "description": "Per-validator wire bytes divided by sequenced bytes. Overhead equals the displayed value minus one.",
       "title": "Wire bytes sent per sequenced byte (per validator)",
       "type": "stat"
     },
@@ -2293,7 +2612,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 109
+        "y": 113
       },
       "id": 19,
       "options": {
@@ -2352,7 +2671,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 109
+        "y": 113
       },
       "id": 21,
       "options": {
@@ -2378,20 +2697,70 @@
           "expr": "sum(rate(bytes_sent_total{node=~\"$node\"}[1m]))*8",
           "legendFormat": "sent",
           "refId": "A"
+        }
+      ],
+      "title": "Wire sent (committee total)",
+      "type": "stat",
+      "description": "Committee-wide wire send rate."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
         },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 113
+      },
+      "id": 20,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum(rate(bytes_received_total{node=~\"$node\"}[1m]))*8",
-          "legendFormat": "received (incl. client ingress)",
-          "refId": "B"
+          "legendFormat": "received",
+          "refId": "A"
         }
       ],
-      "title": "Network bandwidth, wire (committee total)",
+      "title": "Wire received (committee total)",
       "type": "stat",
-      "description": "Committee-wide totals. received exceeds sent by the client submission rate, because client->worker ingress is counted as received while the unscraped client's send is counted nowhere."
+      "description": "Committee-wide wire receive rate, including client ingress."
     },
     {
       "collapsed": false,
@@ -2399,7 +2768,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 114
+        "y": 118
       },
       "id": 9100,
       "panels": [],
@@ -2421,7 +2790,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 115
+        "y": 119
       },
       "id": 9101,
       "options": {
@@ -2446,21 +2815,12 @@
           },
           "refId": "A",
           "legendFormat": "{{queue}}",
-          "expr": "max by (queue) (worker_queue_peak{node=~\"$node\",node=~\".*-worker-0$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "B",
-          "legendFormat": "bound",
-          "expr": "max(worker_queue_capacity{node=~\"$node\",node=~\".*-worker-0$\"})"
+          "expr": "100 * max by (queue) (worker_queue_peak{node=~\"$node\",node=~\".*-worker-0$\"}) / max by (queue) (worker_queue_capacity{node=~\"$node\",node=~\".*-worker-0$\"})"
         }
       ],
-      "title": "Worker channel occupancy, peak per stage (worst validator)",
+      "title": "Worker queue utilization",
       "type": "timeseries",
-      "description": "Peak occupancy of each bounded channel inside the worker, reduced to the WORST validator per stage -- a wedge is one node out of n, so a median would hide it. Stages: synchronizer (primary->worker Synchronize), batch_maker (client tx), processor_own / processor_peer (our vs peers' batches), helper (peer batch requests), primary_connector (worker->primary digests), store (the store actor's own command channel). A stage sitting at 'bound' is a stalled stage, and WHICH stage localizes the fault without a debugger. Note the bounds differ: the pipeline channels hold 1000, the store actor 100, so read each series against its own cap."
+      "description": "Worst-validator one-second peak by stage. Sustained 100% identifies a blocked stage."
     },
     {
       "datasource": {
@@ -2471,13 +2831,30 @@
         "defaults": {
           "unit": "ms"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "panics"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 115
+        "y": 119
       },
       "id": 9102,
       "options": {
@@ -2501,8 +2878,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "store actor age (ms)",
-          "expr": "max(store_actor_heartbeat_age_ms{node=~\"$node\"})"
+          "legendFormat": "loop age (peak)",
+          "expr": "max(store_actor_heartbeat_age_ms_peak{node=~\"$node\"})"
         },
         {
           "datasource": {
@@ -2510,13 +2887,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "panics (count)",
+          "legendFormat": "panics",
           "expr": "sum(process_panics{node=~\"$node\"})"
         }
       ],
-      "title": "Store-actor staleness and panics (worst validator)",
+      "title": "Store loop health",
       "type": "timeseries",
-      "description": "Milliseconds since the store actor last COMPLETED a loop iteration, worst node. Its flush ticker fires unconditionally every 50 ms, so steady state is <50 ms at ANY load and this is load-independent: a large value is always a real stall, never just quiet. Together with the occupancy panel this separates the two failure modes -- a BLOCKED actor (RocksDB write stall) shows growing age with store occupancy pinned at 100, while a DEAD actor (task panic) shows growing age plus a nonzero panic count. Panics are otherwise invisible: nothing awaits a JoinHandle, so tokio drops a task panic silently and every unrelated counter keeps advancing."
+      "description": "Peak loop age should stay below 50 ms. Panics must stay zero."
     },
     {
       "collapsed": false,
@@ -2524,11 +2901,11 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 123
+        "y": 127
       },
       "id": 9200,
       "panels": [],
-      "title": "Sequence checkpoints (SEQUENCE-CHECKPOINT-SYNC-PLAN.md, Phase A: record-only)",
+      "title": "Sequence checkpoints",
       "type": "row"
     },
     {
@@ -2546,7 +2923,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 124
+        "y": 128
       },
       "id": 9201,
       "options": {
@@ -2560,7 +2937,7 @@
           ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "single"
         }
       },
       "targets": [
@@ -2571,7 +2948,7 @@
           },
           "refId": "A",
           "legendFormat": "{{node}} lag",
-          "expr": "(vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"} - 1) - vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"}"
+          "expr": "clamp_min((vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"} - 1) - vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"}, 0)"
         },
         {
           "datasource": {
@@ -2580,12 +2957,12 @@
           },
           "refId": "B",
           "legendFormat": "worst lag",
-          "expr": "max((vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"} - 1) - vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"})"
+          "expr": "max(clamp_min((vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"} - 1) - vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"}, 0))"
         }
       ],
-      "title": "Sequence head lag behind the cursor (must be 0)",
+      "title": "Sequence recording lag",
       "type": "timeseries",
-      "description": "The sequence log covers every TERMINALLY processed view, and the cursor's next_view is the lowest view NOT yet advanced past -- so head_view == cursor_next_view - 1 exactly, and this plots the difference, which must sit at 0. Plotting the two raw series against each other would show a permanent off-by-one and hide a real one-view lag inside it. A persistent nonzero value means views are advancing without being recorded. Empty unless `sequence_checkpoints` is on. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
+      "description": "Must stay zero. Persistent lag means terminal views were not recorded."
     },
     {
       "datasource": {
@@ -2602,7 +2979,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 124
+        "y": 128
       },
       "id": 9202,
       "options": {
@@ -2626,7 +3003,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "distinct heads at the fleet's highest boundary",
+          "legendFormat": "distinct heads",
           "expr": "count(count by (head) (vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"}))))"
         },
         {
@@ -2635,13 +3012,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "nodes at that boundary",
+          "legendFormat": "validators compared",
           "expr": "count(vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"} == scalar(max(vantage_sequence_boundary_head{node=~\"$node\",node=~\".*-primary$\"})))"
         }
       ],
-      "title": "Checkpoint head agreement (DIVERGENCE if > 1)",
+      "title": "Checkpoint agreement",
       "type": "timeseries",
-      "description": "THE Phase A gate. Series A counts how many DISTINCT heads are reported by the nodes that have reached the fleet's highest boundary. Correct parties that terminally processed the same views must derive the identical head, so this must be exactly 1; 2 or more means two nodes at the SAME height committed different output, which is a release blocker and must be reduced to the first divergent view before anything is announced. Comparing boundary VIEWS cannot detect this -- divergent nodes are at identical heights by construction. Series B is the sample size: series A is only meaningful once B covers most of the committee. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
+      "description": "Distinct heads must be one. Validators compared shows the sample size."
     },
     {
       "datasource": {
@@ -2656,56 +3033,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
-        "y": 132
-      },
-      "id": 9203,
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "A",
-          "legendFormat": "{{node}}",
-          "expr": "vantage_sequence_boundary_head_lo{node=~\"$node\",node=~\".*-primary$\"}"
-        }
-      ],
-      "title": "Boundary head per validator (leading 8 bytes)",
-      "type": "timeseries",
-      "description": "The same heads as a plottable number, so divergence is visible as a line that separates from the others while boundary views still match. Lossy (8 of 32 bytes) and NOT authoritative -- `docker-bench/sequence_check.py` compares full hex heads and is what decides the gate. Steps whenever a node passes a new boundary; all validators should step to the same value at the same boundary. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "Fixed-UID-vantage"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 132
+        "y": 136
       },
       "id": 9204,
       "options": {
@@ -2729,8 +3059,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "records/s",
-          "expr": "sum(rate(vantage_sequence_records_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "legendFormat": "records/s (median)",
+          "expr": "clamp_min(quantile(0.5, rate(vantage_sequence_records_total{node=~\"$node\",node=~\".*-primary$\"}[1m])), 0)"
         },
         {
           "datasource": {
@@ -2738,8 +3068,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "cursor views/s",
-          "expr": "sum(deriv(vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "legendFormat": "cursor views/s (median)",
+          "expr": "clamp_min(quantile(0.5, deriv(vantage_cursor_next_view{node=~\"$node\",node=~\".*-primary$\"}[1m])), 0)"
         },
         {
           "datasource": {
@@ -2747,8 +3077,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "C",
-          "legendFormat": "delta blocks/s",
-          "expr": "sum(rate(vantage_sequence_delta_digests_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "legendFormat": "output blocks/s (median)",
+          "expr": "clamp_min(quantile(0.5, rate(vantage_sequence_delta_digests_total{node=~\"$node\",node=~\".*-primary$\"}[1m])), 0)"
         },
         {
           "datasource": {
@@ -2756,13 +3086,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "D",
-          "legendFormat": "rejected (total)",
+          "legendFormat": "rejections (total)",
           "expr": "sum(vantage_sequence_record_rejected_total{node=~\"$node\",node=~\".*-primary$\"})"
         }
       ],
-      "title": "Sequence record rate and rejections",
+      "title": "Sequence recording",
       "type": "timeseries",
-      "description": "Records/s must equal the cursor's own view-advance rate -- one record per terminally processed view, including Skip. Delta blocks/s is the committed BLOCK rate as the sequence log sees it; it is deliberately not compared against committed_transactions, which counts TRANSACTIONS in a different process and differs by the batch fan-out factor. Rejections count a LOCAL invariant violation (a view finalized out of order), never remote input; any nonzero value invalidates this node's head and blocks the phase. Restricted to -primary targets: the worker process registers these gauges but never sets them, so an unfiltered aggregate would silently average in one constant zero per node."
+      "description": "Record and cursor rates should match. Rejections must stay zero."
     },
     {
       "collapsed": false,
@@ -2770,11 +3100,11 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 140
+        "y": 144
       },
       "id": 9210,
       "panels": [],
-      "title": "Sequence state sync (Phase B: announce, fetch, verify -- installs nothing)",
+      "title": "Sequence state sync",
       "type": "row"
     },
     {
@@ -2792,7 +3122,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 141
+        "y": 145
       },
       "id": 9211,
       "options": {
@@ -2816,8 +3146,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "announced/s",
-          "expr": "sum(rate(vantage_sequence_announced_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "legendFormat": "sent/s (median)",
+          "expr": "quantile(0.5, rate(vantage_sequence_announced_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
           "datasource": {
@@ -2825,8 +3155,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "counted first-hand/s",
-          "expr": "sum(rate(vantage_sequence_announce_counted_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "legendFormat": "counted/s (median)",
+          "expr": "quantile(0.5, rate(vantage_sequence_announce_counted_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
           "datasource": {
@@ -2834,8 +3164,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "C",
-          "legendFormat": "ignored/s",
-          "expr": "sum(rate(vantage_sequence_announce_ignored_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "legendFormat": "ignored/s (worst)",
+          "expr": "max(rate(vantage_sequence_announce_ignored_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
           "datasource": {
@@ -2843,8 +3173,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "D",
-          "legendFormat": "certified (total)",
-          "expr": "sum(vantage_sequence_certified_total{node=~\"$node\",node=~\".*-primary$\"})"
+          "legendFormat": "certified (least)",
+          "expr": "min(vantage_sequence_certified_total{node=~\"$node\",node=~\".*-primary$\"})"
         },
         {
           "datasource": {
@@ -2852,13 +3182,13 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "E",
-          "legendFormat": "equivocators",
-          "expr": "sum(vantage_sequence_equivocators{node=~\"$node\",node=~\".*-primary$\"})"
+          "legendFormat": "equivocators (worst)",
+          "expr": "max(vantage_sequence_equivocators{node=~\"$node\",node=~\".*-primary$\"})"
         }
       ],
-      "title": "Checkpoint announce and certify",
+      "title": "Checkpoint announcements",
       "type": "timeseries",
-      "description": "Announcements are first-hand claims, never forwarded evidence: each node collects its own f+1 matching heads. counted/s should be roughly (n-1)x announced/s in a healthy fleet. ignored/s covers forged sender, non-member, duplicate, equivocation and too-far-ahead -- steady growth means a peer is misbehaving or badly out of date, not that the protocol is failing. equivocators must stay 0: a nonzero value names senders caught announcing two heads for one view, and their announcements are retracted from every candidate including already-certified ones."
+      "description": "A checkpoint certifies at f+1 counted announcements. Repeats may be ignored; equivocators must stay zero."
     },
     {
       "datasource": {
@@ -2875,7 +3205,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 141
+        "y": 145
       },
       "id": 9212,
       "options": {
@@ -2953,16 +3283,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "G",
-          "legendFormat": "served frames/s",
-          "expr": "sum(rate(vantage_sequence_sync_served_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "H",
-          "legendFormat": "egress dropped frames/s",
+          "legendFormat": "egress drops/s",
           "expr": "sum(rate(vantage_sequence_sync_dropped_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
@@ -2970,14 +3291,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "refId": "I",
-          "legendFormat": "inbound dropped frames/s",
+          "refId": "H",
+          "legendFormat": "inbound drops/s",
           "expr": "sum(rate(vantage_sequence_sync_inbound_dropped_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         }
       ],
-      "title": "State-sync transfer lifecycle",
+      "title": "State transfer",
       "type": "timeseries",
-      "description": "started should converge to verified. exhausted means every announcer of a certified target was dropped, i.e. the set that certified it could not serve it -- the one shape that breaks recovery liveness. invalid/s is NOT a fault by itself: up to f matching announcers may serve corrupt bytes by assumption and the requester fails over. Egress drops are the dedicated bounded sender refusing work; inbound drops are this node's dedicated sequence queue filling. The requester recovers from either by repeated announcements or timeout/failover. A chunks/s that dwarfs the target size is request amplification, the failure that once produced 5.4M chunks from a single 45s outage."
+      "description": "Started transfers should become verified. Exhaustion and queue drops must stay zero."
     },
     {
       "datasource": {
@@ -2994,7 +3315,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 149
+        "y": 153
       },
       "id": 9213,
       "options": {
@@ -3018,7 +3339,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "match (total)",
+          "legendFormat": "independent matches",
           "expr": "sum(vantage_sequence_verify_match_total{node=~\"$node\",node=~\".*-primary$\"})"
         },
         {
@@ -3027,7 +3348,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "MISMATCH (total)",
+          "legendFormat": "mismatches",
           "expr": "sum(vantage_sequence_verify_mismatch_total{node=~\"$node\",node=~\".*-primary$\"})"
         },
         {
@@ -3035,8 +3356,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "refId": "H",
-          "legendFormat": "self-check only (installed)",
+          "refId": "C",
+          "legendFormat": "installed self-checks",
           "expr": "sum(vantage_sequence_install_selfcheck_match_total{node=~\"$node\",node=~\".*-primary$\"})"
         },
         {
@@ -3044,23 +3365,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "refId": "C",
-          "legendFormat": "verified view",
-          "expr": "max(vantage_sequence_sync_verified_view{node=~\"$node\",node=~\".*-primary$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
           "refId": "D",
-          "legendFormat": "local head view",
-          "expr": "max(vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"})"
+          "legendFormat": "verified lead (views)",
+          "expr": "max(clamp_min(vantage_sequence_sync_verified_view{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_sequence_head_view{node=~\"$node\",node=~\".*-primary$\"}, 0))"
         }
       ],
-      "title": "Phase B closing check: verified head vs local execution (MISMATCH must be 0)",
+      "title": "Sequence verification",
       "type": "timeseries",
-      "description": "The gate for Phase C. A transfer verifying only proves the served chain hashes to the head f+1 peers announced -- a chain that is internally consistent but WRONG verifies perfectly, because the hash chain is self-referential and cannot know what the views contained. This panel compares that head against the one the receiving node derives ITSELF once ordinary execution reaches the same view, which is the difference between 'the peers agreed with each other' and 'the peers were right'. MISMATCH must be 0: nonzero means either more than f announcers agreed on a head no correct party derives, or correct parties disagree. Either forbids installation. 'verified view' leading 'local head view' is normal and is exactly the lag Phase C exists to close by installing instead of waiting. NOTE: 'match' counts only comparisons where the local head was derived by ORDINARY EXECUTION. With sequence_install_enabled=true the installed view carries the transfer's own outcome and delta into the comparison, so both sides share a source and it degenerates into a self-check -- counted separately as 'self-check only (installed)'. Score the Phase C gate on a run with installation DISABLED, where 'match' is the independent number."
+      "description": "Verified lead should return to zero after catch-up. Mismatches must stay zero."
     },
     {
       "datasource": {
@@ -3077,7 +3389,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 149
+        "y": 153
       },
       "id": 9214,
       "options": {
@@ -3101,8 +3413,8 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "A",
-          "legendFormat": "staged (total)",
-          "expr": "sum(vantage_sequence_install_staged_total{node=~\"$node\",node=~\".*-primary$\"})"
+          "legendFormat": "views pending",
+          "expr": "max(clamp_min(vantage_sequence_install_views{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_sequence_install_views_ready{node=~\"$node\",node=~\".*-primary$\"}, 0))"
         },
         {
           "datasource": {
@@ -3110,61 +3422,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "refId": "B",
-          "legendFormat": "views in target",
-          "expr": "max(vantage_sequence_install_views{node=~\"$node\",node=~\".*-primary$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "C",
-          "legendFormat": "views held locally",
-          "expr": "max(vantage_sequence_install_views_ready{node=~\"$node\",node=~\".*-primary$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "D",
-          "legendFormat": "views in flight",
-          "expr": "max(vantage_sequence_install_views_in_flight{node=~\"$node\",node=~\".*-primary$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "E",
-          "legendFormat": "targets fully held",
-          "expr": "sum(vantage_sequence_install_ready_total{node=~\"$node\",node=~\".*-primary$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "F",
-          "legendFormat": "rejected (total)",
-          "expr": "sum(vantage_sequence_install_rejected_total{node=~\"$node\",node=~\".*-primary$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "G",
-          "legendFormat": "repair pending settle",
-          "expr": "max(vantage_pending_settle_len{node=~\"$node\",node=~\".*-primary$\"})"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "H",
-          "legendFormat": "blocks awaited in install window",
+          "legendFormat": "blocks awaited",
           "expr": "max(vantage_sequence_install_blocks_awaited{node=~\"$node\",node=~\".*-primary$\"})"
         },
         {
@@ -3172,17 +3430,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "refId": "I",
-          "legendFormat": "stale sync-gap inputs dropped/s",
-          "expr": "sum(rate(vantage_sequence_install_obsolete_inbound_dropped_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "Fixed-UID-vantage"
-          },
-          "refId": "J",
-          "legendFormat": "batched headers in flight",
+          "refId": "C",
+          "legendFormat": "headers in flight",
           "expr": "max(vantage_sequence_install_header_requests_in_flight{node=~\"$node\",node=~\".*-primary$\"})"
         },
         {
@@ -3190,23 +3439,50 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "refId": "K",
-          "legendFormat": "batched headers requested/s",
-          "expr": "sum(rate(vantage_sequence_install_headers_requested_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "refId": "D",
+          "legendFormat": "headers received/s",
+          "expr": "sum(rate(vantage_sequence_install_headers_received_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "refId": "L",
-          "legendFormat": "batched headers received/s",
-          "expr": "sum(rate(vantage_sequence_install_headers_received_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+          "refId": "E",
+          "legendFormat": "views applied/s",
+          "expr": "sum(rate(vantage_sequence_install_views_applied_total{node=~\"$node\",node=~\".*-primary$\"}[1m]))"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "F",
+          "legendFormat": "completed",
+          "expr": "sum(vantage_sequence_install_completed_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "G",
+          "legendFormat": "failed",
+          "expr": "sum(vantage_sequence_install_failed_total{node=~\"$node\",node=~\".*-primary$\"})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "refId": "H",
+          "legendFormat": "rejected",
+          "expr": "sum(vantage_sequence_install_rejected_total{node=~\"$node\",node=~\".*-primary$\"})"
         }
       ],
-      "title": "Install staging: verified target -> locally held blocks",
+      "title": "Sequence installation",
       "type": "timeseries",
-      "description": "A verified target names block DIGESTS, not blocks. This panel tracks turning those names into blocks the node actually holds, which is the precondition for installing anything. 'views held locally' should climb toward 'views in target'; a flat line with 'views in flight' pinned at the window bound (default 64) means fetching is the limiter. 'blocks awaited' is the active fetch-window backlog. The batched-header series show the checkpoint-source fast path separately from generic repair. 'stale sync-gap inputs dropped/s' rises when an active large-gap install discards consensus/control/service traffic that would otherwise park stale state; data needed to materialize the install still passes. 'rejected' counts verified targets whose per-view output was not contiguous above the local head; a verified chain cannot have a hole, so nonzero is an internal inconsistency, not peer misbehaviour."
+      "description": "Pending views and blocks should drain while headers arrive and views apply. Failed and rejected must stay zero."
     }
   ],
   "preload": false,

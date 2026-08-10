@@ -22,7 +22,6 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    //std::env::set_var("RUST_BACKTRACE", "1");
 
     let matches = Command::new(crate_name!())
         .version(crate_version!())
@@ -96,11 +95,7 @@ async fn main() -> Result<()> {
         )
         .subcommand(
             Command::new("local-benchmark")
-                .about(
-                    "Self-host a whole local benchmark run (every primary, every \
-                    worker, and one client per worker) in this one process \
-                    (PHASE2-SPEC.md #8) -- the local replacement for `fab local`",
-                )
+                .about("Run a complete local benchmark in one process")
                 .arg(
                     Arg::new("nodes")
                         .long("nodes")
@@ -153,16 +148,11 @@ async fn main() -> Result<()> {
                         .long("mode")
                         .value_name("MODE")
                         .default_value("random")
-                        // "all-zero" (hyphen) kept as a legacy alias; "all_zero" (snake_case)
-                        // is the starfish-aligned canonical spelling normalized in
-                        // `TransactionMode::parse`.
+                        // Accept both spellings for compatibility.
                         .value_parser(["all_zero", "all-zero", "random"])
                         .action(ArgAction::Set)
                         .help(
-                            "Transaction payload mode (default 'random' as \
-                        of METRICS-DASHBOARD-SPEC.md §8 -- pin '--mode all_zero' explicitly for \
-                        comparability with historical gate/sweep numbers, all of which are \
-                        all_zero; legacy 'all-zero' spelling still accepted)",
+                            "Transaction payload mode (default: random; all-zero is also accepted)",
                         ),
                 )
                 .arg(
@@ -187,7 +177,7 @@ async fn main() -> Result<()> {
                         .value_name("PATH")
                         .default_value(".local-bench")
                         .action(ArgAction::Set)
-                        .help("Directory for per-node stores/reference config"),
+                        .help("Directory for per-node stores and configuration"),
                 )
                 .arg(
                     Arg::new("crash")
@@ -195,12 +185,7 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("0")
                         .action(ArgAction::Set)
-                        .help(
-                            "PHASE6-SPEC.md R2: number of trailing nodes \
-                        to leave unspawned (true crash fault -- committee membership is \
-                        unchanged, only the last k nodes' primary/worker/client tasks are \
-                        never started); offered rate is scaled to the live clients only",
-                        ),
+                        .help("Number of trailing nodes to leave unspawned"),
                 )
                 .arg(
                     Arg::new("load-nodes")
@@ -292,7 +277,7 @@ async fn main() -> Result<()> {
                         .long("timeline")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "PHASE7-PREP-NOTES.md Finding A: print a once/sec progress-gauge \
+                            "Print a once-per-second progress line \
                         line per live node (entered view / frontier a_i / cursor next_view / \
                         control round / delivered-log len / consume pos) for the duration of \
                         the run -- diagnostic only, off by default (verbose)",
@@ -305,7 +290,7 @@ async fn main() -> Result<()> {
                         .default_value("0")
                         .action(ArgAction::Set)
                         .help(
-                            "PHASE7-PREP-NOTES.md (WAN-shaped local runs): uniform EXPLICIT \
+                            "Uniform \
                         OVERRIDE RTT-ms value applied to every inter-authority link (one-way = \
                         value/2), as if every cell of a --latency-table CSV held this same \
                         number. A value > 0, EXPLICITLY passed on the command line, selects \
@@ -323,7 +308,7 @@ async fn main() -> Result<()> {
                         .value_name("PATH")
                         .action(ArgAction::Set)
                         .help(
-                            "PHASE7-PREP-NOTES.md (WAN-shaped local runs): path to an NxN \
+                            "Path to an NxN \
                         RTT-ms CSV matrix (N = --nodes, no header row, node index = committee \
                         order), applied one-way (RTT/2) to each node's own inter-authority \
                         primary-to-primary/-worker connections (starfish-style per-connection \
@@ -388,18 +373,18 @@ async fn main() -> Result<()> {
                     Arg::new("echo-avail-claims")
                         .long("echo-avail-claims")
                         .action(ArgAction::SetTrue)
+                        .conflicts_with("no-echo-avail-claims")
                         .help(
-                            "AVAIL-ECHO-SPEC.md: carry availability acknowledgments \
-                        POSITIONALLY on the AGB echo -- a bit per lane against the echoed \
-                        proposal's own reference vector -- instead of VantageAvail's \
-                        explicit (author, height, digest) tuples, and stop scheduling the \
-                        periodic watermark flush entirely. Same statements, same \
-                        thresholds, same Definition(Availability): only the encoding \
-                        changes. Measured motivation, n=100 per node: VantageAvail was \
-                        18.330 of 19.880 MB/s -- 92.2% of the node's entire wire budget, \
-                        at 9,258 B per message -- while Header was 1.4%. OFF by default; \
-                        requires --no-ack-watermarks NOT be set, since claims replace that \
-                        front-end rather than the per-block ACK path.",
+                            "Compatibility flag. Echo availability claims are enabled by default.",
+                        ),
+                )
+                .arg(
+                    Arg::new("no-echo-avail-claims")
+                        .long("no-echo-avail-claims")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Use periodic VantageAvail watermarks instead of positional \
+                             availability bits on AGB echoes.",
                         ),
                 )
                 .arg(
@@ -502,24 +487,11 @@ async fn run(matches: &ArgMatches) -> Result<()> {
         None => Parameters::default(),
     };
 
-    // `protocol` is authoritative over the legacy `use_optimistic_tips` knob.
+    // `protocol` selects the consensus mode.
     parameters.reconcile_protocol();
 
-    // PHASE7 (AWS/distributed WAN-shaped runs): expand a DEPLOYABLE latency knob
-    // (which -- unlike the `#[serde(skip)]` `latency_table` -- rides through
-    // `parameters.json`) into the in-process `latency_table` that
-    // `Primary::spawn`/`Worker::spawn` already consume via `Committee::latency_map`.
-    // Sourced from the deployed config instead of a CLI flag, so latency injection
-    // works identically on the distributed path with no primary/worker/Vantage
-    // changes. Only applied when `latency_table` isn't already set (never is on this
-    // path). Precedence (mirrors starfish's own default for single-region AWS
-    // benchmarking): `mimic_latency_ms` present (`Some`, including `Some(0)`) is an
-    // EXPLICIT OVERRIDE to a uniform scalar; absent (`None` -- true of every
-    // pre-Phase-7 `parameters.json`, the field being absent) DEFAULTS to the real
-    // 10-AWS-region RTT matrix (`LatencyTable::aws_rtt`, ported VERBATIM from
-    // starfish). This default substitution is CLI-entry-only: `Parameters::default()`
-    // itself still yields `mimic_latency_ms: None` / `latency_table: None`, so library
-    // defaults and existing unit tests are unaffected.
+    // Expand the configured latency mode into the in-process latency table.
+    // An explicit mimic_latency_ms value overrides the AWS RTT default.
     if parameters.latency_table.is_none() {
         parameters.latency_table = Some(std::sync::Arc::new(match parameters.mimic_latency_ms {
             Some(rtt_ms) => LatencyTable::uniform(committee.size(), rtt_ms as f64),
@@ -530,12 +502,12 @@ async fn run(matches: &ArgMatches) -> Result<()> {
     // Select the node assembly by protocol. Both Autobahn variants share the
     // existing primary/worker assembly (the seamless path is activated inside
     // the primary Core via `use_optimistic_tips = false`); Vantage spawns a single
-    // `VantageCore` task instead (PHASE4-SPEC.md §1 -- D3 lifted).
+    // Start the Vantage core task.
 
     // The `SignatureService` provides signatures on input digests.
     let signature_service = SignatureService::new(keypair.secret);
 
-    // Make the data store, tuned per Phase-2's RocksDB profile (PHASE2-SPEC.md #7):
+    // Create the data store.
     // the primary's store holds small, point-lookup metadata (headers/certs/payload
     // markers), workers' stores hold large, append-heavy batch bytes.
     let store_profile = match matches.subcommand_name() {
@@ -551,14 +523,8 @@ async fn run(matches: &ArgMatches) -> Result<()> {
     // Channel for sending headers between DAG and Consensus
     let (tx_sailfish, _rx_sailfish) = channel(CHANNEL_CAPACITY);
 
-    // Channel for sending loopback headerds that completed validation between DAG and Consensus
-    //let (tx_validation, rx_validation) = channel(CHANNEL_CAPACITY);
-
-    // Channel for indicating commit and that new header should be proposed
-    //let (tx_ticket, rx_ticket) = channel(CHANNEL_CAPACITY);
-
     // Check whether to run a primary, a worker, or an entire authority.
-    //Note: Each node has at most one worker. Workers that don't include a primary (e.g. are not an entire authority) use PrimaryConnector to connect to a designated primary.
+    // Each node has at most one worker. A worker-only node connects to its primary.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         Some(("primary", _)) => {
@@ -579,29 +545,12 @@ async fn run(matches: &ArgMatches) -> Result<()> {
                 rx_committer,
                 /* rx_consensus */ rx_feedback,
                 tx_sailfish,
-                //rx_ticket,
                 rx_pushdown_cert,
                 rx_request_header_sync,
                 tx_output,
             );
             metrics::register_process_collector(&registry)
                 .context("Failed to register primary process metrics")?;
-            /*Consensus::spawn(
-                name,
-                committee,
-                parameters,
-                signature_service,
-                store,
-                /* rx_consensus */ rx_new_certificates,
-                rx_committer,
-                /* tx_mempool */ tx_feedback,
-                tx_output,
-                tx_ticket,
-                tx_validation,
-                rx_sailfish,
-                tx_pushdown_cert,
-                tx_request_header_sync,
-            );*/
         }
 
         // Spawn a single worker.

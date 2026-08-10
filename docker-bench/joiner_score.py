@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Judge the four pass conditions for "recover, contribute, never resync".
+"""Judge late-joiner recovery and contribution.
 
-Usage: check_latch.py <start HH:MM:SS> <end HH:MM:SS> [date]
+Usage: joiner_score.py <start HH:MM:SS> <end HH:MM:SS> [date]
 
-Deliberately mechanical: prints PASS/FAIL per condition so the run is judged against
-stated criteria rather than eyeballed.
+Prints one PASS or FAIL result per condition.
 """
 import datetime
 import json
 import os
+from pathlib import Path
 import statistics
 import sys
 import urllib.parse
 import urllib.request
 
 PROM = "http://localhost:9095"
+DATA = Path(__file__).resolve().parent / "data"
 # The joiner is the last node of the committee; match joiner_verify.sh's NODES.
-JOINER = f"node-{int(os.environ.get('NODES', 21)) - 1}-primary"
+JOINER = f"node-{int(os.environ.get('NODES', 10)) - 1}-primary"
 
 
 def rng(expr, s, e, step="20s"):
@@ -34,12 +35,16 @@ def one(expr, s, e, step="20s"):
     return {t: float(v) for t, v in (r[0]["values"] if r else [])}
 
 
-def counter_delta(metric, s, e):
+def series_delta(expr, s, e):
     out = {}
-    for ser in rng(f'{metric}{{node=~".*-primary$"}}', s, e, "20s"):
+    for ser in rng(expr, s, e, "20s"):
         vals = [float(v[1]) for v in ser["values"]]
         out[ser["metric"].get("node", "?")] = sum(max(b - a, 0.0) for a, b in zip(vals, vals[1:]))
     return out
+
+
+def counter_delta(metric, s, e):
+    return series_delta(f'{metric}{{node=~".*-primary$"}}', s, e)
 
 
 def author_of(node):
@@ -47,7 +52,7 @@ def author_of(node):
     metric's author label, read from the generated committee."""
     import re
     idx = int(re.search(r"node-(\d+)-", node).group(1))
-    path = f"data/node-{idx}/key.json"
+    path = DATA / f"node-{idx}/key.json"
     try:
         with open(path) as fh:
             return json.load(fh)["name"][:16]
@@ -64,9 +69,8 @@ def main():
     fleet = one('max(vantage_cursor_next_view{node=~".*-primary$"})', s, e)
     join = one(f'vantage_cursor_next_view{{node="{JOINER}"}}', s, e)
     rec = one(f'vantage_sequence_sync_recovered{{node="{JOINER}"}}', s, e)
-    tr = one(f'rate(vantage_sequence_sync_verified_total{{node="{JOINER}"}}[60s])', s, e)
-    # Spread among PEERS ONLY. Including the joiner makes max-min contain the joiner's own
-    # lag, so "lag <= spread" would be trivially true -- a circular check.
+    tr = one(f'rate(vantage_sequence_sync_verified_total{{node="{JOINER}"}}[20s])', s, e)
+    # Exclude the joiner from the reference spread.
     peer_sel = '{node=~".*-primary$",node!="%s"}' % JOINER
     spread = one(f'max(vantage_cursor_next_view{peer_sel}) - '
                  f'min(vantage_cursor_next_view{peer_sel})', s, e)
@@ -78,7 +82,7 @@ def main():
         print("  ", datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S"),
               f"{lag:>9,.0f} {rec.get(t, -1):>10.0f} {tr.get(t, -1):>12.2f}")
 
-    # Judge on the LAST THIRD of the window: the tail is where "never again" lives.
+    # Judge stable behavior on the last third of the run.
     tail = times[len(times) * 2 // 3:]
     if not tail:
         print("\nno samples")
@@ -88,12 +92,16 @@ def main():
     tail_rec = [rec.get(t, 0.0) for t in tail]
     peer_spread = statistics.median([spread.get(t, 0.0) for t in tail])
 
-    # Contribution must be read on a CAUGHT-UP PEER, per author. The joiner's own view of
-    # its commits is confounded: it has not reached the views where its blocks were
-    # committed, so it reports zero regardless.
-    pub = counter_delta("vantage_blocks_published", s, e)
+    contribution_start = tail[0]
+    contribution_end = tail[-1]
+    seconds = max(contribution_end - contribution_start, 1)
+
+    # Read committed blocks from a caught-up peer.
+    pub = counter_delta("vantage_blocks_published", contribution_start, contribution_end)
     by_author = {}
-    for ser in rng('vantage_committed_by_author{node="node-0-primary"}', s, e, "20s"):
+    for ser in rng(
+            'vantage_committed_by_author{node="node-0-primary"}',
+            contribution_start, contribution_end, "20s"):
         vals = [float(v[1]) for v in ser["values"]]
         by_author[ser["metric"].get("author", "?")] = sum(
             max(b - a, 0.0) for a, b in zip(vals, vals[1:]))
@@ -107,20 +115,43 @@ def main():
             continue
         peer_ratios.append(by_author.get(author_of(node), 0.0) / p)
     pr = statistics.median(peer_ratios) if peer_ratios else 0.0
-    print(f"  (data blocks, peer-observed: joiner committed {jc:,.0f} of {jp:,.0f})")
+    print(f"  (tail data blocks, peer-observed: joiner committed {jc:,.0f} of {jp:,.0f})")
 
-    # CONSENSUS contribution: proposer turns served and committed. Data blocks carry client
-    # transactions and are committed by everyone, so they cannot show whether this node is
-    # taking its turn in agreement.
-    made = counter_delta("vantage_own_proposals_made_total", s, e)
-    turns = counter_delta("vantage_own_proposer_turns_total", s, e)
-    prop_com = counter_delta("vantage_own_proposals_committed_total", s, e)
+    # Count proposals after recovery; installed turns include the outage.
+    made = counter_delta(
+        "vantage_own_proposals_made_total", contribution_start, contribution_end)
+    turns = counter_delta(
+        "vantage_own_proposer_turns_total", contribution_start, contribution_end)
+    prop_com = counter_delta(
+        "vantage_own_proposals_committed_total", contribution_start, contribution_end)
     jt, jm, jpc = turns.get(JOINER, 0), made.get(JOINER, 0), prop_com.get(JOINER, 0)
     peer_prop = [(prop_com.get(n, 0) / t) for n, t in turns.items() if n != JOINER and t]
     ppr = statistics.median(peer_prop) if peer_prop else 0.0
     jpr = (jpc / jt) if jt else 0.0
-    print(f"  proposals: joiner made {jm:,.0f}, turns {jt:,.0f}, committed {jpc:,.0f} "
+    print(f"  tail proposals: joiner made {jm:,.0f}, turns {jt:,.0f}, committed {jpc:,.0f} "
           f"-> {jpr:.2f} vs peer median {ppr:.2f}")
+
+    direct = series_delta(
+        'vantage_walk_steps_total{family="direct",node=~".*-primary$"}',
+        contribution_start, contribution_end)
+    inbound = series_delta(
+        'utilization_timer{proc="inbound_dispatch",node=~".*-primary$"}',
+        contribution_start, contribution_end)
+    effects = series_delta(
+        'utilization_timer{proc="effect_execution",node=~".*-primary$"}',
+        contribution_start, contribution_end)
+
+    def rate_pair(values):
+        joiner_rate = values.get(JOINER, 0.0) / seconds
+        peer_rates = [value / seconds for node, value in values.items() if node != JOINER]
+        return joiner_rate, statistics.median(peer_rates) if peer_rates else 0.0
+
+    direct_j, direct_p = rate_pair(direct)
+    inbound_j, inbound_p = rate_pair(inbound)
+    effects_j, effects_p = rate_pair(effects)
+    print(f"  tail direct walks/s: joiner {direct_j:,.0f} vs peer median {direct_p:,.0f}")
+    print(f"  tail core utilization: inbound {inbound_j / 1e4:.2f}% vs {inbound_p / 1e4:.2f}%, "
+          f"effects {effects_j / 1e4:.2f}% vs {effects_p / 1e4:.2f}%")
 
     print()
     checks = [
@@ -130,8 +161,14 @@ def main():
          f"median lag {statistics.median(tail_lag):.0f} vs PEER-ONLY spread {peer_spread:.0f}"),
         ("4 data blocks committed", jr >= 0.8 * pr if pr else False,
          f"joiner ratio {jr:.2f} vs peer median {pr:.2f}"),
-        ("5 own PROPOSALS committed", jpr >= 0.8 * ppr if ppr else False,
+        ("5 all terminal proposals", jt > 0 and jpc == jt,
          f"joiner {jpr:.2f} vs peer median {ppr:.2f} ({jpc:.0f}/{jt:.0f} turns)"),
+        ("6 direct-walk CPU", direct_p > 0 and direct_j <= 1.5 * direct_p,
+         f"joiner {direct_j:.0f}/s vs peer median {direct_p:.0f}/s"),
+        ("7 inbound utilization", inbound_p > 0 and inbound_j <= 1.5 * inbound_p,
+         f"joiner {inbound_j / 1e4:.2f}% vs peer median {inbound_p / 1e4:.2f}%"),
+        ("8 effect utilization", effects_p > 0 and effects_j <= 1.5 * effects_p,
+         f"joiner {effects_j / 1e4:.2f}% vs peer median {effects_p / 1e4:.2f}%"),
     ]
     for name, ok, detail in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {name:<22} {detail}")

@@ -1,13 +1,3 @@
-// signature-free.tex §8.3 "Digest-named AGB statements" (`Parameters::
-// digest_statements`) -- unit tests for the translation layer (`vantage::agb::
-// DigestStatements`), driven directly against `AgbEngine`/`Repairer`/
-// `DigestStatements` (no network, no `Node` harness -- mirrors `completion_tests.rs`'s
-// own direct-engine style; `on_ready`/`on_echo` need no `LaneManager` positive-gate
-// ceremony, only `on_propose` does, and only for its `lm` parameter's type, never its
-// content here). The flag-on end-to-end integration test (identical committed output,
-// zero fetches in the favorable path) lives in `integration_tests.rs`, alongside its
-// flag-off/ack-watermarks siblings.
-
 use super::common::*;
 use crate::vantage::agb::{
     DigestStatements, Echo, EchoDigest, Outcome, Ready, ReadyDigest, ReadyGrade, ViewProposal,
@@ -27,9 +17,6 @@ fn sample_proposal(view: u64) -> ViewProposal {
     }
 }
 
-/// Mirrors `completion_tests.rs::dummy_repairer` exactly (same doc rationale: opening
-/// a `LaneManager`/`Store` needs a live runtime, and every call site needs its own
-/// path).
 fn dummy_repairer(name: PublicKey, path: &str) -> Repairer {
     let (lm, _store) = new_lane_manager(name, path);
     new_repairer(name, &lm)
@@ -72,13 +59,6 @@ fn completed_count(effects: &[Effect]) -> usize {
         .count()
 }
 
-// ============================================================ Requirement 2: encoding
-// equivalence.
-
-/// A digest-named READY received once its body is already held+verified must produce
-/// the IDENTICAL `AgbEngine` state transition, statement by statement, as the by-value
-/// READY it encodes -- driven through `DigestStatements::on_ready_digest`, never a
-/// parallel counting path.
 #[tokio::test]
 async fn digest_ready_with_body_held_matches_by_value_transitions() {
     let all = authors();
@@ -86,7 +66,6 @@ async fn digest_ready_with_body_held_matches_by_value_transitions() {
     let sid = test_sid();
     let digest = proposal.digest(&sid);
 
-    // Engine A: every statement travels by value (the existing, unchanged path).
     let (name_a, _) = all[3];
     let mut agb_a = new_agb_engine(name_a);
     let mut rep_a = dummy_repairer(name_a, ".db_test_digest_equiv_a");
@@ -100,10 +79,6 @@ async fn digest_ready_with_body_held_matches_by_value_transitions() {
         &mut rep_a,
     );
 
-    // Engine B: identically seeded (the same by-value propose, so the body is
-    // already `Fixed` -- held -- by the time any digest statement arrives), but
-    // every READY arrives digest-named. `DigestStatements` must resolve+feed it
-    // immediately, with no buffering at all.
     let (name_b, _) = all[3];
     let mut agb_b = new_agb_engine(name_b);
     let mut rep_b = dummy_repairer(name_b, ".db_test_digest_equiv_b");
@@ -145,17 +120,9 @@ async fn digest_ready_with_body_held_matches_by_value_transitions() {
         "3 grade-1 readies must reach the direct-full quorum"
     );
 
-    // The body was already held at every arrival -- nothing was ever buffered.
     assert_eq!(digest_stmts.buffered_ready_count_for_test(1), 0);
 }
 
-// ================================================== Requirement 3: cross-encoding
-// one-shot.
-
-/// Forward direction: a by-value ECHO followed by a digest-named ECHO from the SAME
-/// sender for the SAME view counts once -- the digest arm resolves+feeds straight
-/// into the SAME `AgbEngine::count_echo_statement` dedup a second by-value statement
-/// would hit, never a parallel counted set.
 #[tokio::test]
 async fn cross_encoding_one_shot_value_then_digest() {
     let all = authors();
@@ -207,10 +174,6 @@ async fn cross_encoding_one_shot_value_then_digest() {
     );
 }
 
-/// Reverse direction: a digest-named ECHO arrives first (buffered -- no body held
-/// yet), then the by-value ECHO from the SAME sender arrives directly. Still counted
-/// once: the by-value arm's own dedup fires regardless of the buffered digest copy,
-/// and draining the now-fixed body finds nothing left to feed for that sender.
 #[tokio::test]
 async fn cross_encoding_one_shot_digest_then_value() {
     let all = authors();
@@ -225,8 +188,6 @@ async fn cross_encoding_one_shot_digest_then_value() {
     let (mut lm, _store) = new_lane_manager(name, ".db_test_digest_oneshot_rev_lm");
     let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
 
-    // The digest-named echo arrives BEFORE the body is held -- it must buffer, not
-    // count, and must issue a fetch.
     let msg = EchoDigest {
         view: 1,
         digest: digest.clone(),
@@ -250,9 +211,6 @@ async fn cross_encoding_one_shot_digest_then_value() {
         "buffering a first-hand statement for an unheld body must issue a fetch"
     );
 
-    // The by-value echo from the SAME sender arrives directly, over its own,
-    // completely separate path (exactly as if it had come over the wire
-    // untranslated) -- first the body itself is fixed (as `on_propose` requires).
     let proposer = agb.proposer(1);
     agb.on_propose(
         proposer,
@@ -268,8 +226,6 @@ async fn cross_encoding_one_shot_digest_then_value() {
         "the by-value statement counts, exactly once"
     );
 
-    // Draining the now-fixed body finds nothing left to feed for this sender --
-    // `AgbEngine`'s own dedup already holds its slot, so the drain is a no-op.
     let drained = digest_stmts.on_local_fixed(1, &mut agb, &mut rep);
     assert!(
         drained.is_empty(),
@@ -287,14 +243,6 @@ async fn cross_encoding_one_shot_digest_then_value() {
     );
 }
 
-// ============================================================== Requirement 4:
-// buffer-until-body.
-
-/// 2f+1 digest-named READY statements buffered with NO body held anywhere must
-/// produce no completion/seal; only once the body arrives (here: via a served
-/// response) does draining fire completion -- AND the serve itself must set no
-/// direct-receipt state (`AgbEngine::fixed_proposal`, the ONLY provenance marker a
-/// real proposal receipt sets, must stay `None`).
 #[tokio::test]
 async fn buffered_readies_wait_for_body_then_drain_on_serve() {
     let all = authors();
@@ -350,12 +298,8 @@ async fn buffered_readies_wait_for_body_then_drain_on_serve() {
         "no direct-receipt state anywhere yet -- on_propose was never called"
     );
 
-    // The body arrives via a served response -- never via on_propose.
     let serve_effects = digest_stmts.on_body_serve(1, proposal.clone(), &mut agb, &mut rep);
 
-    // Completion (any grade, >= quorum) and the direct-full outcome (homogeneous
-    // grade-1, >= quorum) both fire now that the body is verified and every
-    // buffered statement drains through the by-value path.
     assert_eq!(
         completed_count(&serve_effects),
         1,
@@ -372,23 +316,12 @@ async fn buffered_readies_wait_for_body_then_drain_on_serve() {
         "fully drained"
     );
 
-    // CRITICAL: serving must never mark the proposal as directly received from the
-    // proposer -- `AgbEngine::fixed_proposal` (the ONLY direct-receipt/rho_i marker
-    // this engine keeps) must still be `None`.
     assert!(
         agb.fixed_proposal(1).is_none(),
         "on_body_serve must never set Fixed::Proposal (no proposal provenance from served bytes)"
     );
 }
 
-// ========================================================= Requirement 5: mismatched
-// serve rejected.
-
-/// A served body naming a DIFFERENT digest than any outstanding fetch is rejected
-/// outright -- no state change -- and the original fetch stays outstanding, so the
-/// next retry re-asks (possibly a different holder). Mirrors `control_tests.rs`'s
-/// `p6_2_wrong_digest_serve_rejected_correct_digest_accepted`/
-/// `p6_2_poisoning_attempt_rejected_true_anchor_still_applies`.
 #[tokio::test]
 async fn mismatched_serve_rejected_fetch_retried() {
     let all = authors();
@@ -412,9 +345,6 @@ async fn mismatched_serve_rejected_fetch_retried() {
     digest_stmts.on_ready_digest(msg, Instant::now(), &mut agb, &mut rep);
     assert_eq!(digest_stmts.pending_fetch_count_for_test(), 1);
 
-    // A DIFFERENT well-formed proposal for the same view (a different C entry,
-    // hence a different digest) must never be accepted as an answer to our
-    // outstanding (view=1, true_digest) fetch.
     let (other_author, _) = all[1];
     let wrong_proposal = ViewProposal {
         view: 1,
@@ -445,8 +375,6 @@ async fn mismatched_serve_rejected_fetch_retried() {
     );
     assert!(agb.completed_for_test(1).is_none());
 
-    // The original fetch is still outstanding (untouched by the rejection) -- the
-    // next periodic retry re-asks the still-buffered sender.
     assert_eq!(digest_stmts.pending_fetch_count_for_test(), 1);
     let retry_now =
         Instant::now() + Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1);
@@ -458,23 +386,17 @@ async fn mismatched_serve_rejected_fetch_retried() {
         "the retry must re-fan to the still-buffered sender for the still-unheld true digest"
     );
 
-    // The TRUE serve is accepted afterward, and drains cleanly.
     digest_stmts.on_body_serve(1, true_proposal.clone(), &mut agb, &mut rep);
     assert!(digest_stmts.known_body_for_test(1, &true_digest));
     assert_eq!(digest_stmts.buffered_ready_count_for_test(1), 0);
 }
 
-/// Malformed half of requirement 5: a served body that hash-matches the outstanding
-/// fetch EXACTLY (so the digest-match gate alone would accept it) but fails
-/// `Formed_v` is still rejected -- `agb::formed` is an independent, additional gate,
-/// not merely a byproduct of the digest check.
 #[tokio::test]
 async fn malformed_serve_rejected_even_with_matching_digest() {
     let all = authors();
     let sid = test_sid();
     let (a0, _) = all[0];
     let (a1, _) = all[1];
-    // Duplicate hash across C and T -- malformed per `formed`'s distinct-hashes rule.
     let shared = Digest([3u8; 32]);
     let malformed = ViewProposal {
         view: 1,
@@ -499,8 +421,6 @@ async fn malformed_serve_rejected_even_with_matching_digest() {
     };
     digest_stmts.on_ready_digest(msg, Instant::now(), &mut agb, &mut rep);
 
-    // The EXACT same (malformed) bytes are served back -- the digest matches
-    // perfectly, so only the `formed` check can reject this.
     let rejected = digest_stmts.on_body_serve(1, malformed, &mut agb, &mut rep);
     assert!(
         rejected.is_empty(),
@@ -510,11 +430,6 @@ async fn malformed_serve_rejected_even_with_matching_digest() {
     assert_eq!(digest_stmts.buffered_ready_count_for_test(1), 1);
 }
 
-// ======================================================================
-// Requirement 6: GC.
-
-/// Buffered statements and fetch bookkeeping are pruned by `gc_below`, mirroring
-/// `AgbEngine`/`control::ControlLog`'s own view-window GC (`split_off`, no `retain`).
 #[tokio::test]
 async fn gc_prunes_buffered_statements_and_fetch_state() {
     let all = authors();
@@ -528,7 +443,6 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
     let (mut lm, _store) = new_lane_manager(name, ".db_test_digest_gc_lm");
     let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
 
-    // buffered_echo + pending_fetch: a first-hand digest echo with no body held yet.
     let (sender, _) = all[0];
     let msg = EchoDigest {
         view: 1,
@@ -543,7 +457,6 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
     assert_eq!(digest_stmts.buffered_echo_count_for_test(1), 1);
     assert_eq!(digest_stmts.pending_fetch_count_for_test(), 1);
 
-    // known_bodies + draining pending_fetch: accept a matching serve.
     digest_stmts.on_body_serve(1, proposal.clone(), &mut agb, &mut rep);
     assert!(digest_stmts.known_body_for_test(1, &digest));
     assert_eq!(digest_stmts.pending_fetch_count_for_test(), 0);
@@ -553,9 +466,6 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
         "drained on accept"
     );
 
-    // fetch_answered: this party also holds view 1 by value now -- seed it
-    // separately so the SERVING side (answering a peer's own fetch) is exercised
-    // too, not just the fetching side above.
     let proposer = agb.proposer(1);
     agb.on_propose(
         proposer,
@@ -582,8 +492,6 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
     assert_eq!(digest_stmts.pending_fetch_count_for_test(), 0);
     assert_eq!(digest_stmts.fetch_answered_count_for_test(), 0);
 
-    // A late statement for the now-pruned view is a no-op (mirrors `AgbEngine::
-    // gc_below`'s own "old view messages become no-ops" contract).
     let late = EchoDigest {
         view: 1,
         digest,
@@ -598,11 +506,6 @@ async fn gc_prunes_buffered_statements_and_fetch_state() {
     assert_eq!(digest_stmts.buffered_echo_count_for_test(1), 0);
 }
 
-/// n=100 straggler fix (2026-08-08): `pending_fetch` is capped, and eviction takes the
-/// HIGHEST views. That direction is load-bearing -- resolution is strictly sequential,
-/// so the LOWEST pending view is the one actually blocking progress while far-ahead
-/// views are useless until it clears. Evicting the lowest would throw away exactly the
-/// fetch the node needs to make progress.
 #[tokio::test]
 async fn pending_fetch_is_capped_and_evicts_the_highest_views() {
     use crate::vantage::agb::MAX_PENDING_FETCH;
@@ -614,8 +517,6 @@ async fn pending_fetch_is_capped_and_evicts_the_highest_views() {
     let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
     let now = Instant::now();
 
-    // Fill well past the ceiling, ascending. Each distinct view/digest pair creates one
-    // pending fetch (the statement is buffered, so the pair is re-creatable at will).
     let total = MAX_PENDING_FETCH + 50;
     for v in 1..=total {
         let msg = ReadyDigest {
@@ -633,25 +534,16 @@ async fn pending_fetch_is_capped_and_evicts_the_highest_views() {
         len <= MAX_PENDING_FETCH,
         "pending_fetch grew to {len}, above the {MAX_PENDING_FETCH} ceiling"
     );
-    // The LOW views must have survived -- they are the ones blocking resolution.
     assert!(
         digest_stmts.has_pending_fetch_for_test(1),
         "view 1 was evicted; the lowest pending view must be retained"
     );
-    // And the far-ahead ones must be the casualties.
     assert!(
         !digest_stmts.has_pending_fetch_for_test(total as u64),
         "the highest view survived; eviction is taking the wrong end"
     );
 }
 
-/// Body fetch asks a NARROW set first and widens only on retry, instead of asking every
-/// buffered author every time.
-///
-/// The full fan-out was measured at 433,656 `VantageBodyFetch` on one 2026-08-08 n=100
-/// straggler against 53 on a healthy node -- 153 pending pairs x ~37 targets x 76 retry
-/// rounds -- at ~50us per send on the single consensus core, and at a network-wide answer
-/// rate of 7.8%.
 #[tokio::test]
 async fn body_fetch_starts_narrow_and_widens_on_retry() {
     let all = authors();
@@ -669,9 +561,6 @@ async fn body_fetch_starts_narrow_and_widens_on_retry() {
     let mut rep = dummy_repairer(me, ".db_test_fetch_width");
     let mut ds = DigestStatements::new(TEST_DELTA_MS);
 
-    // Every author in the test committee buffers the same (view, digest). The committee
-    // is small, so full width is only a handful -- the point is that the FIRST ask is
-    // narrower than that, and widens only when it goes unanswered.
     let mut t0 = Instant::now();
     let count = |effects: &[Effect]| {
         effects
@@ -697,7 +586,6 @@ async fn body_fetch_starts_narrow_and_widens_on_retry() {
         if n == 0 {
             widths.push(count(&effects));
         } else {
-            // Latched on the pair: buffering another author must not re-ask.
             assert_eq!(
                 count(&effects),
                 0,
@@ -711,9 +599,6 @@ async fn body_fetch_starts_narrow_and_widens_on_retry() {
         widths.push(count(&ds.retry_fetches(t0)));
     }
 
-    // The first ask happens when only ONE author has buffered, so it is 1 here; what
-    // matters is that it is bounded by the width and strictly below the set the old code
-    // would have used once everyone buffered.
     assert!(
         widths[0] <= FETCH_WIDTH_START,
         "the first ask must be bounded by the start width: {widths:?}"
@@ -732,8 +617,6 @@ async fn body_fetch_starts_narrow_and_widens_on_retry() {
     );
 }
 
-/// A pair is ABANDONED after the attempt cap rather than re-asked forever -- and is
-/// re-created by the next statement for that view, which is what makes abandoning safe.
 #[tokio::test]
 async fn body_fetch_is_abandoned_after_the_cap_and_recreated_by_a_new_statement() {
     let all = authors();
@@ -767,8 +650,6 @@ async fn body_fetch_is_abandoned_after_the_cap_and_recreated_by_a_new_statement(
     );
     assert_eq!(ds.pending_fetch_count_for_test(), 1);
 
-    // Retry past the cap. Nothing answers, so the pair must be dropped rather than
-    // keep paying fan-out for the rest of the run.
     for _ in 0..8 {
         t += Duration::from_millis(TEST_DELTA_MS) * 8 + Duration::from_millis(1);
         ds.retry_fetches(t);
@@ -779,9 +660,6 @@ async fn body_fetch_is_abandoned_after_the_cap_and_recreated_by_a_new_statement(
         "an unanswerable pair must be abandoned, not retried forever"
     );
 
-    // The safety argument: a later statement for the same view re-creates it, so
-    // abandoning is "stop spending until the view proves it is still live", not
-    // "never fetch this again".
     let (sender2, _) = all[1];
     ds.on_ready_digest(
         ReadyDigest {
@@ -802,9 +680,6 @@ async fn body_fetch_is_abandoned_after_the_cap_and_recreated_by_a_new_statement(
     );
 }
 
-/// A correct body response can arrive after the active retry slot has been abandoned.
-/// That should stop further fetch spending, but it must not make an already-requested
-/// exact body unprocessable while buffered digest statements still need it.
 #[tokio::test]
 async fn late_body_serve_after_fetch_abandonment_drains_buffered_statements() {
     let all = authors();
@@ -862,9 +737,6 @@ async fn late_body_serve_after_fetch_abandonment_drains_buffered_statements() {
     );
 }
 
-/// A sender's digest statement is one-shot. A later duplicate from that sender,
-/// even if it names a different digest, must not create a fetch for a digest that was
-/// not actually buffered.
 #[tokio::test]
 async fn duplicate_digest_statement_does_not_create_phantom_fetch() {
     let all = authors();

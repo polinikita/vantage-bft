@@ -83,7 +83,7 @@ fi
 # rather than building a shared "extra args" array, so no call site needs to expand a
 # possibly-empty array under `set -u` (same bash-3.2 concern as above).
 #
-# CUT-MODE ASYMMETRY FIX (found by a debug-logged validation run): the INPUT
+# In cut mode, apply the rule in both directions: the INPUT
 # REJECT generates an RST toward the peer, but that RST is a locally-generated
 # packet and traverses THIS node's OUTPUT chain -- where the plain OUTPUT REJECT
 # ate it. Peers therefore never learned their connections died: from their side

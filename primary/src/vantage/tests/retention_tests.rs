@@ -1,12 +1,9 @@
-// PHASE3-SPEC.md §7 "Retention (N8)".
 use super::common::*;
 use crate::messages::Header;
 use crate::vantage::repair::Repairer;
 use crate::vantage::Effect;
 use std::collections::BTreeMap;
 
-/// N8(i)/N7: an acked prefix is retained, and served to a requester that only asks
-/// afterwards.
 #[tokio::test]
 async fn acked_prefix_served_to_later_requester() {
     let all = authors();
@@ -34,9 +31,6 @@ async fn acked_prefix_served_to_later_requester() {
     );
 }
 
-/// N8(ii)/(iii): a prefix fetched to satisfy a local check (here: a repair walk to
-/// genesis) is retained and served even when the requester's ask arrives only after
-/// retention already happened ("prompting window has closed by arrival").
 #[tokio::test]
 async fn late_request_still_served_after_retention() {
     let all = authors();
@@ -59,9 +53,8 @@ async fn late_request_still_served_after_retention() {
     let block = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
     let h = block.id.clone();
     repairer.authorize((author, 1, h.clone()));
-    repairer.on_serve(block.clone()); // completes the walk through genesis, retains it
+    repairer.on_serve(block.clone());
 
-    // Only now does a requester ask -- no request was pending when retention happened.
     let effects = repairer.on_request(requester, h.clone());
     assert_eq!(
         effects
@@ -72,7 +65,6 @@ async fn late_request_still_served_after_retention() {
     );
 }
 
-/// N8: no local event ever discards a retained/acked fact.
 #[tokio::test]
 async fn no_discard_on_local_events() {
     let all = authors();
@@ -82,8 +74,6 @@ async fn no_discard_on_local_events() {
     let r = (author, header.height, header.id.clone());
     assert!(lm.holds_prefix(&r));
 
-    // Unrelated local events: acks for a different author/tuple, more (unrelated)
-    // publishes.
     let (other, _) = all[1];
     mark_validity_available(&mut lm, (other, 99, crypto::Digest([1u8; 32])));
     let (_second_header, _) = lm.publish_own(BTreeMap::new()).await;

@@ -1,11 +1,3 @@
-// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §13 (pure unit tests), PHASE A subset.
-//
-// Everything here is about ONE property: two correct parties that terminally process the
-// same views must derive the identical head, and nothing else must. Phase A cannot be
-// promoted to announcement until that holds, because an announced head derived by
-// divergent code would let `f+1` honest parties certify a target no correct party can
-// serve.
-
 use super::common::{authors, test_sid};
 use crate::vantage::agb::Manifest;
 use crate::vantage::sequence::*;
@@ -20,7 +12,6 @@ fn manifest(byte: u8) -> Manifest {
     vec![(author, 1, digest(byte))]
 }
 
-/// A distinct session id, for checking domain separation across sessions.
 fn other_sid() -> Digest {
     digest(0xAB)
 }
@@ -49,10 +40,6 @@ fn record_head_is_deterministic_and_session_separated() {
     );
 }
 
-/// `Full`, `Core`, and `Skip` must be distinguishable even when they name the SAME
-/// manifest. This is why the plan commits the terminal outcome rather than the proposal
-/// digest: `Full(c, t)` and `Core(c)` share `c`, so a proposal-keyed encoding would give
-/// two different output sequences the same head.
 #[test]
 fn outcome_variants_have_distinct_digests() {
     let sid = test_sid();
@@ -117,9 +104,6 @@ fn every_record_field_is_bound_into_the_head() {
     }
 }
 
-/// The delta chain must bind ORDER, not just membership -- the cursor's output is a
-/// sequence, and two nodes that emitted the same blocks in different orders have
-/// genuinely diverged.
 #[test]
 fn delta_chain_binds_order_and_position() {
     let sid = test_sid();
@@ -144,8 +128,6 @@ fn delta_chain_binds_order_and_position() {
     );
 }
 
-/// A `Skip` emits nothing, so its commitment is the bare seed with length 0. A receiver
-/// uses exactly this to reject a `Skip` record that arrives carrying items.
 #[test]
 fn empty_delta_commits_to_the_seed() {
     let sid = test_sid();
@@ -154,9 +136,6 @@ fn empty_delta_commits_to_the_seed() {
     assert_eq!(head, delta_seed(&sid, 11));
 }
 
-/// Models the chunked receiver of §7.3: fold the items one at a time, in index order,
-/// and arrive at the same head the producer committed to. This is what lets an
-/// arbitrarily large delta stream without buffering one oversized frame.
 #[test]
 fn incremental_verification_reproduces_the_commitment() {
     let sid = test_sid();
@@ -170,8 +149,6 @@ fn incremental_verification_reproduces_the_commitment() {
     assert_eq!(len, items.len() as u64);
     assert_eq!(running, head);
 
-    // A chunk applied at the wrong offset must not validate: the index is bound into
-    // every step, so a receiver cannot splice a genuine chunk in at the wrong place.
     let spliced = delta_step(&sid, 12, 0, &delta_seed(&sid, 12), &items[1]);
     let honest = delta_step(&sid, 12, 0, &delta_seed(&sid, 12), &items[0]);
     assert_ne!(spliced, honest);
@@ -204,8 +181,6 @@ fn store_chains_records_and_tracks_the_head() {
     assert_ne!(first, second);
     assert_eq!(store.head_view(), 2);
 
-    // Each record must name its predecessor, so a chain cannot be re-cut at a different
-    // starting point without changing every head above it.
     let record2 = store.record_for(2).expect("record 2 retained");
     assert_eq!(record2.previous_head, first);
     assert_eq!(record2.delta_len, 1);
@@ -215,9 +190,6 @@ fn store_chains_records_and_tracks_the_head() {
     );
 }
 
-/// A gap would produce a head no other correct party derives. Refusing loudly is the
-/// whole point of Phase A -- silently skipping ahead would hide the divergence this
-/// phase exists to detect.
 #[test]
 fn store_rejects_out_of_order_views() {
     let mut store = SequenceStore::new(test_sid(), 100);
@@ -270,15 +242,12 @@ fn store_records_boundaries_at_the_interval() {
     );
 }
 
-/// A zero interval is a misconfiguration, not a reason to divide by zero.
 #[test]
 fn zero_interval_makes_every_view_a_boundary() {
     let mut store = SequenceStore::new(test_sid(), 0);
     store.record(1, &SequenceOutcome::Skip, &[]).unwrap();
     assert!(store.boundary(1).is_some());
 }
-
-// ------------------------------------------------------------ f+1 checkpoint collector
 
 fn announcement(view: u64, head: Digest, sender: crypto::PublicKey) -> SequenceAnnouncement {
     SequenceAnnouncement {
@@ -303,14 +272,11 @@ fn certified(outcome: AnnouncementOutcome) -> bool {
     )
 }
 
-/// The core of the safety argument: `f+1` distinct first-hand senders certify, `f` do
-/// not. For n = 3f+1 any f+1 parties contain a correct one; at f the set can be entirely
-/// Byzantine and the head may name output no correct party ever produced.
 #[test]
 fn exactly_f_plus_one_matching_announcements_certify() {
     let keys = authors();
     let head = digest(1);
-    let mut collector = CheckpointCollector::new(3, 16, 1000); // f+1 = 3
+    let mut collector = CheckpointCollector::new(3, 16, 1000);
 
     for (index, (sender, _)) in keys.iter().take(2).enumerate() {
         let outcome =
@@ -334,16 +300,12 @@ fn exactly_f_plus_one_matching_announcements_certify() {
     assert_eq!(collector.certified_head(0), Some((100, head.clone())));
     assert_eq!(collector.support(100, &head), 3);
 
-    // Certification fires exactly once for a (view, head).
     let (fourth, _) = keys[3];
     let again = collector.on_announcement(&announcement(100, head, fourth), &fourth, true, 100);
     assert!(counted(again));
     assert!(!certified(again), "certification must be reported once");
 }
 
-/// The payload's `sender` field is decoration; the connection is authoritative. If a
-/// forged `sender` were honoured, one Byzantine peer could mint all f+1 announcements by
-/// itself and the whole rule collapses.
 #[test]
 fn a_forged_sender_field_never_counts() {
     let keys = authors();
@@ -366,9 +328,6 @@ fn a_forged_sender_field_never_counts() {
     );
 }
 
-/// One sender must never supply two of the `f+1`. Repeating the SAME claim is harmless
-/// and counts once; announcing a DIFFERENT head for the same view discards both, since we
-/// cannot tell which (if either) is honest.
 #[test]
 fn duplicates_count_once_and_equivocation_counts_never() {
     let keys = authors();
@@ -397,7 +356,6 @@ fn duplicates_count_once_and_equivocation_counts_never() {
         "a duplicate must not certify"
     );
 
-    // Same sender, different head for the same view.
     assert_eq!(
         collector.on_announcement(&announcement(100, digest(2), a), &a, true, 100),
         AnnouncementOutcome::Ignored(IgnoreReason::Equivocation)
@@ -408,12 +366,10 @@ fn duplicates_count_once_and_equivocation_counts_never() {
         0,
         "an equivocator's earlier vote must be retracted, not left standing"
     );
-    // Anything further from that sender is dead, including a later honest-looking claim.
     assert_eq!(
         collector.on_announcement(&announcement(101, digest(1), a), &a, true, 101),
         AnnouncementOutcome::Ignored(IgnoreReason::Equivocation)
     );
-    // An honest sender is unaffected.
     assert!(counted(collector.on_announcement(
         &announcement(100, digest(1), b),
         &b,
@@ -423,9 +379,6 @@ fn duplicates_count_once_and_equivocation_counts_never() {
     assert_eq!(collector.support(100, &digest(1)), 1);
 }
 
-/// An equivocation discovered AFTER a head reached the threshold must take certification
-/// back: the head would otherwise rest on f+1 senders one of which supplied a second,
-/// contradictory claim, so the "at least one correct" guarantee no longer holds.
 #[test]
 fn equivocation_after_certification_retracts_it() {
     let keys = authors();
@@ -450,20 +403,14 @@ fn equivocation_after_certification_retracts_it() {
     );
 }
 
-/// Competing heads for one view must be counted separately -- f Byzantine parties
-/// announcing a fabricated head must never reach the threshold on it while the correct
-/// nodes announce another.
 #[test]
 fn a_minority_head_never_certifies_alongside_the_real_one() {
-    // The test committee is n=4, so f=1 and the threshold is f+1=2.
     let keys = authors();
     let mut collector = CheckpointCollector::new(2, 16, 1000);
     let (real, fake) = (digest(1), digest(2));
 
-    // The f = 1 Byzantine party pushes a fabricated head.
     let (liar, _) = keys[0];
     collector.on_announcement(&announcement(100, fake.clone(), liar), &liar, true, 100);
-    // The remaining correct parties announce the real one.
     for (sender, _) in keys.iter().skip(1) {
         collector.on_announcement(&announcement(100, real.clone(), *sender), sender, true, 100);
     }
@@ -472,8 +419,6 @@ fn a_minority_head_never_certifies_alongside_the_real_one() {
     assert_eq!(collector.certified_head(0), Some((100, real)));
 }
 
-/// Byzantine peers must not be able to grow memory without bound by announcing arbitrary
-/// future boundaries.
 #[test]
 fn future_views_and_candidate_count_are_bounded() {
     let keys = authors();
@@ -495,8 +440,6 @@ fn future_views_and_candidate_count_are_bounded() {
     );
 }
 
-/// The requester needs the matching announcer set as its source list, and picks the
-/// highest certified target above what it already holds.
 #[test]
 fn announcers_and_highest_target_above_local() {
     let keys = authors();
@@ -527,11 +470,6 @@ fn announcers_and_highest_target_above_local() {
     assert_eq!(sources, expected);
 }
 
-// ------------------------------------------------------------- serving and verification
-
-/// Build a real chain in a store, then verify it back the way a requester would. This is
-/// the round trip Phase B exists to prove: what a correct party serves is exactly what a
-/// recovering party can validate against a certified head.
 fn populated_store(views: u64) -> (SequenceStore, Digest) {
     let sid = test_sid();
     let mut store = SequenceStore::new(sid.clone(), 4);
@@ -607,7 +545,6 @@ fn a_served_chain_verifies_against_the_certified_head() {
 
     let mut verifier =
         ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), target_view, target_head);
-    // Served in small chunks, exactly as the transport will.
     let mut from = 1;
     let mut complete = false;
     while !complete {
@@ -621,7 +558,6 @@ fn a_served_chain_verifies_against_the_certified_head() {
     assert!(verifier.is_complete());
     assert_eq!(verifier.verified_len(), 12);
 
-    // Every outcome and delta the store serves must check against the verified records.
     for view in 1..=12u64 {
         let record = verifier
             .verified_record(view)
@@ -650,14 +586,11 @@ fn a_served_chain_verifies_against_the_certified_head() {
     }
 }
 
-/// The content binding. A Byzantine source may serve a perfectly well-formed chain -- it
-/// just cannot make one that reaches the certified head.
 #[test]
 fn a_forged_chain_cannot_reach_the_certified_head() {
     let (store, sid) = populated_store(6);
     let honest_head = store.head().clone();
 
-    // A parallel history built by a liar: same shape, different content.
     let (fake_store, _) = {
         let mut fake = SequenceStore::new(sid.clone(), 4);
         for view in 1..=6u64 {
@@ -681,8 +614,6 @@ fn a_forged_chain_cannot_reach_the_certified_head() {
     );
 }
 
-/// A rejected chunk must leave the verifier untouched, so one bad source cannot force a
-/// restart -- with f Byzantine matching announcers, that would otherwise be f restarts.
 #[test]
 fn a_corrupt_chunk_leaves_the_verifier_usable() {
     let (store, sid) = populated_store(8);
@@ -693,7 +624,6 @@ fn a_corrupt_chunk_leaves_the_verifier_usable() {
     verifier.absorb_records(&good).unwrap();
     assert_eq!(verifier.next_view(), 5);
 
-    // A source tampers with one field. Any of them breaks the link or the final head.
     let mut tampered = store.records_from(5, 4);
     tampered[1].delta_len += 1;
     assert!(verifier.absorb_records(&tampered).is_err());
@@ -704,7 +634,6 @@ fn a_corrupt_chunk_leaves_the_verifier_usable() {
     );
     assert_eq!(verifier.verified_len(), 4);
 
-    // The honest copy of the same range still completes the transfer.
     let honest = store.records_from(5, 4);
     assert!(verifier
         .absorb_records(&honest)
@@ -744,7 +673,6 @@ fn delta_chunks_reject_gaps_overruns_and_wrong_content() {
     let mut v = DeltaVerifier::new(sid.clone(), 1, &record);
     let (items, _) = store.delta_chunk(1, 0, 3).unwrap();
 
-    // Wrong offset.
     assert_eq!(
         v.absorb(1, &items),
         Err(ChainError::UnexpectedIndex {
@@ -752,28 +680,23 @@ fn delta_chunks_reject_gaps_overruns_and_wrong_content() {
             got: 1
         })
     );
-    // Overlong.
     let too_many: Vec<Digest> = (0..5).map(digest).collect();
     assert_eq!(
         v.absorb(0, &too_many),
         Err(ChainError::DeltaTooLong { view: 1 })
     );
-    // Right length, wrong content -- caught only at the final head comparison.
     let wrong: Vec<Digest> = (0..3).map(|i| digest(200 + i)).collect();
     assert_eq!(
         v.absorb(0, &wrong),
         Err(ChainError::DeltaMismatch { view: 1 })
     );
-    // And the honest items still verify afterwards.
     assert!(v.absorb(0, &items).expect("honest delta verifies"));
     assert!(v.is_complete());
 }
 
-/// Section 7.3 step 3, and section 9's rule against silent clamping.
 #[test]
 fn skip_deltas_are_empty_and_unretained_views_are_not_faked() {
     let (store, sid) = populated_store(6);
-    // View 3 is a Skip in the fixture.
     let record = store.record_for(3).expect("view 3").clone();
     assert_eq!(record.delta_len, 0);
     let (items, last) = store
@@ -784,7 +707,6 @@ fn skip_deltas_are_empty_and_unretained_views_are_not_faked() {
     let head = store.head().clone();
     let mut verifier = ChainVerifier::new(sid.clone(), 0, genesis_head(&sid), 6, head);
     verifier.absorb_records(&store.records_from(1, 6)).unwrap();
-    // A liar claims the Skip carried output.
     assert_eq!(
         verifier.check_outcome(3, &SequenceOutcome::Core { c: manifest(1) }),
         Err(ChainError::OutcomeMismatch { view: 3 })
@@ -793,14 +715,11 @@ fn skip_deltas_are_empty_and_unretained_views_are_not_faked() {
         .check_outcome(3, &SequenceOutcome::Skip)
         .expect("the honest Skip matches");
 
-    // A view the store never had is reported as absent, never as an empty success.
     assert!(store.delta_chunk(99, 0, 8).is_none());
     assert!(store.outcome_for(99).is_none());
     assert_eq!(store.serve_floor(), 1);
 }
 
-/// A gap must truncate the answer rather than be skipped: the requester chains
-/// `previous_head`, so a response that jumps a view cannot link and looks like corruption.
 #[test]
 fn records_from_stops_at_a_gap() {
     let (store, _) = populated_store(5);
@@ -810,9 +729,6 @@ fn records_from_stops_at_a_gap() {
     assert_eq!(store.records_from(1, 2).len(), 2, "max is respected");
 }
 
-// ------------------------------------------------------------------ requester transfers
-
-/// Drive a transfer to completion against an honest store, the way `VantageCore` will.
 fn run_transfer(
     store: &SequenceStore,
     sid: &Digest,
@@ -881,8 +797,6 @@ fn run_transfer(
     t
 }
 
-/// The end-to-end Phase B path: records, then outcomes, then deltas, all verified
-/// against the certified head, ending at Verified and never installing.
 #[test]
 fn a_transfer_downloads_and_verifies_a_whole_target() {
     let (store, sid) = populated_store(9);
@@ -898,7 +812,6 @@ fn a_transfer_downloads_and_verifies_a_whole_target() {
         9,
         "every view in the target range is verified"
     );
-    // Views 3, 6 and 9 are Skips in the fixture and must carry no output.
     for (view, outcome, delta) in output {
         if matches!(outcome, SequenceOutcome::Skip) {
             assert!(
@@ -911,8 +824,6 @@ fn a_transfer_downloads_and_verifies_a_whole_target() {
     }
 }
 
-/// Outcome ranges are content-addressed, so harmless overlap from concurrent honest
-/// sources must advance the first missing view rather than being treated as bad framing.
 #[test]
 fn outcome_batches_accept_useful_overlap() {
     let (store, sid) = populated_store(6);
@@ -979,8 +890,6 @@ fn outcome_batches_accept_useful_overlap() {
     );
 }
 
-/// The liveness property the concurrent-source design exists for: `f` matching announcers
-/// may corrupt or refuse everything, and the one correct announcer still completes it.
 #[test]
 fn f_byzantine_sources_cannot_stop_the_one_correct_one() {
     let (store, sid) = populated_store(6);
@@ -1004,7 +913,6 @@ fn f_byzantine_sources_cannot_stop_the_one_correct_one() {
         "all matching announcers are asked at once"
     );
 
-    // The liar serves a well-formed but wrong chain twice and spends its budget.
     let mut fake = SequenceStore::new(sid.clone(), 4);
     for view in 1..=6u64 {
         fake.record(view, &SequenceOutcome::Skip, &[]).unwrap();
@@ -1027,16 +935,12 @@ fn f_byzantine_sources_cannot_stop_the_one_correct_one() {
         "a twice-invalid source is dropped"
     );
 
-    // The silent one simply never answers; it is rotated past on timeout.
     t.rotate();
 
-    // The honest one completes the transfer.
     let finished = run_transfer(&store, &sid, 6, vec![honest], &honest);
     assert_eq!(finished.state(), TransferState::Verified);
 }
 
-/// A response must be bound to the transfer AND the target, or a stale answer from an
-/// earlier target could be folded into the current one.
 #[test]
 fn responses_not_bound_to_this_transfer_are_ignored() {
     let (store, sid) = populated_store(4);
@@ -1062,7 +966,6 @@ fn responses_not_bound_to_this_transfer_are_ignored() {
         sender: source,
     };
 
-    // Wrong transfer id.
     let mut wrong_id = good.clone();
     wrong_id.transfer_id = 8;
     t.on_records(&wrong_id, &source).unwrap();
@@ -1072,7 +975,6 @@ fn responses_not_bound_to_this_transfer_are_ignored() {
         "ignored"
     );
 
-    // Wrong target head.
     let mut wrong_head = good.clone();
     wrong_head.target_head = digest(0xEE);
     t.on_records(&wrong_head, &source).unwrap();
@@ -1082,7 +984,6 @@ fn responses_not_bound_to_this_transfer_are_ignored() {
         "ignored"
     );
 
-    // A peer that is not a matching announcer.
     t.on_records(&good, &stranger).unwrap();
     assert_eq!(
         t.want(),
@@ -1090,13 +991,10 @@ fn responses_not_bound_to_this_transfer_are_ignored() {
         "ignored"
     );
 
-    // The real one is accepted.
     t.on_records(&good, &source).unwrap();
     assert_eq!(t.state(), TransferState::FetchingOutcomes);
 }
 
-/// Section 9: "cannot serve" is a fact about the SOURCE, not the target. Matching
-/// announcers legitimately sit at different serve floors.
 #[test]
 fn unavailable_drops_only_that_source() {
     let (store, sid) = populated_store(4);
@@ -1131,8 +1029,6 @@ fn unavailable_drops_only_that_source() {
     );
     assert_ne!(t.state(), TransferState::Exhausted);
 
-    // When the last source goes too, the target is unreachable and says so rather than
-    // hanging forever.
     t.on_unavailable(
         &SequenceUnavailable {
             version: SEQUENCE_VERSION,
@@ -1147,8 +1043,6 @@ fn unavailable_drops_only_that_source() {
     assert_eq!(t.want(), None);
 }
 
-/// A corrupt delta chunk must not strand its view at a poisoned offset: the next source
-/// restarts that delta from index 0.
 #[test]
 fn a_corrupt_delta_chunk_restarts_that_view() {
     let (store, sid) = populated_store(3);
@@ -1163,7 +1057,6 @@ fn a_corrupt_delta_chunk_restarts_that_view() {
         store.head().clone(),
         vec![source],
     );
-    // Records then outcomes.
     t.on_records(
         &SequenceRecordChunk {
             version: SEQUENCE_VERSION,
@@ -1189,10 +1082,6 @@ fn a_corrupt_delta_chunk_restarts_that_view() {
     .unwrap();
     assert_eq!(t.state(), TransferState::FetchingDeltas);
 
-    // A bad delta for view 1. It must be the FULL length: the item chain only commits
-    // at its end, so a short chunk of wrong content is indistinguishable from an honest
-    // partial one until the delta completes. That is inherent to streaming verification
-    // -- the cost is bounded by delta_len, and the head still catches it.
     let bad: Vec<Digest> = (0..3).map(|i| digest(240 + i)).collect();
     assert!(t
         .on_delta(
@@ -1219,9 +1108,6 @@ fn a_corrupt_delta_chunk_restarts_that_view() {
     );
 }
 
-/// Concurrent sources answer the SAME request, so duplicate valid responses are normal
-/// and must be idempotent. Charging them as corrupt retires every honest source: measured
-/// live as 29 transfers started, 0 verified, 28 exhausted.
 #[test]
 fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
     let (store, sid) = populated_store(6);
@@ -1248,7 +1134,6 @@ fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
     t.on_records(&chunk, &a).expect("first copy verifies");
     assert_eq!(t.state(), TransferState::FetchingOutcomes);
 
-    // The other source's identical copy must be a no-op, not an invalid chunk.
     t.on_records(&chunk, &b)
         .expect("the duplicate must not be an error");
     assert_eq!(
@@ -1258,7 +1143,6 @@ fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
     );
     assert_ne!(t.state(), TransferState::Exhausted);
 
-    // And duplicate deltas likewise.
     t.on_outcomes(
         &SequenceOutcomeServe {
             version: SEQUENCE_VERSION,
@@ -1287,15 +1171,11 @@ fn duplicate_valid_responses_from_concurrent_sources_are_idempotent() {
     assert_eq!(t.next_sources(3).len(), 2, "still no source penalized");
 }
 
-/// An honest server serves a contiguous run from its OWN chain and does not stop at our
-/// target, so a chunk routinely overshoots. Rejecting that as PastTarget retires honest
-/// sources: measured live as 15 transfers started, 0 verified, 14 exhausted.
 #[test]
 fn records_past_the_target_are_trimmed_not_rejected() {
     let (store, sid) = populated_store(20);
     let keys = authors();
     let (source, _) = keys[0];
-    // Target is view 6, but the server has 20 and serves all of them.
     let head_at_6 = {
         let mut partial = SequenceStore::new(sid.clone(), 4);
         for view in 1..=6u64 {
@@ -1334,16 +1214,6 @@ fn records_past_the_target_are_trimmed_not_rejected() {
     );
 }
 
-/// Phase B's closing check, at the level `VantageCore::record_sequence` performs it: a
-/// target downloaded from a peer and verified against `f+1` announcements must equal the
-/// head the receiving node derives ITSELF once ordinary execution reaches that view.
-///
-/// Verification alone cannot establish this. `ChainVerifier` only proves the served chain
-/// hashes to the certified head, so a chain that is internally consistent but WRONG
-/// verifies perfectly -- the hash chain is self-referential and cannot know what the views
-/// actually contained. Only replaying the same views locally and comparing heads
-/// distinguishes "the peers agreed with each other" from "the peers were right", which is
-/// the difference between a target that may be installed and one that may not.
 #[test]
 fn a_verified_target_equals_what_local_execution_derives() {
     let (remote, sid) = populated_store(9);
@@ -1354,8 +1224,6 @@ fn a_verified_target_equals_what_local_execution_derives() {
     let (target_view, target_head) = transfer.target();
     let (target_view, target_head) = (target_view, target_head.clone());
 
-    // The receiving node catching up on its own: same views, same deterministic
-    // execution, none of the transfer's bytes.
     let (local, _) = populated_store(9);
 
     assert_eq!(local.head_view(), target_view, "compared at the same view");

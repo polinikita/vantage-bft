@@ -76,7 +76,7 @@ pub enum DagError {
     InvalidSpecialParent,
 
     #[error("Slow QC not ready")]
-    InvalidSlowQCRequest, //TODO: move to ConsensusError
+    InvalidSlowQCRequest,
 
     #[error("Do not need to process this signature")]
     CarAlreadySatisfied,
@@ -90,7 +90,7 @@ pub type ConsensusResult<T> = Result<T, ConsensusError>;
 // clippy::large_enum_variant / clippy::result_large_err: `InvalidTimeout(Timeout)`
 // (~560 B) makes this enum, and every `ConsensusResult<T>` return type, large --
 // boxing it would touch every construction site (`ConsensusError::X(...)`) and every
-// `match`/`if let` arm across the audited Autobahn consensus path for a pure
+// `match`/`if let` arm across the Autobahn consensus path for a pure
 // stack-size optimization with no functional benefit at this workspace's message
 // volumes; not done. Applies to every `ConsensusResult<T>`-returning fn too
 // (messages.rs's `verify`/`validate_winning_proposal`), so allowed here rather than

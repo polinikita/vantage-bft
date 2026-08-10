@@ -28,7 +28,7 @@ pub struct Synchronizer {
     /// `CertificateWaiter`'s receiver early. Since the channel is genuinely never fed
     /// either way, this is a no-op-preserving choice, not a functional change; removing
     /// the field cleanly would mean also removing the parameter and its call site
-    /// plumbing, which is out of this cleanup's scope (touches cross-file wiring for a
+    /// plumbing, which is outside this module (touches cross-file wiring for a
     /// field with no correctness weight either way).
     #[allow(dead_code)]
     tx_certificate_waiter: Sender<Certificate>,
@@ -118,7 +118,6 @@ impl Synchronizer {
     ) -> DagResult<Vec<Header>> {
         let mut missing = Vec::new();
         let mut proposals_vector = Vec::new();
-        //println!("getting proposals");
 
         match consensus_message {
             ConsensusMessage::Prepare {
@@ -129,7 +128,6 @@ impl Synchronizer {
                 proposals,
             } => {
                 for (pk, proposal) in proposals {
-                    //println!("proposal inside prepare");
 
                     if proposal.header_digest == self.genesis_headers.get(pk).unwrap().digest() {
                         proposals_vector.push(self.genesis_headers.get(pk).unwrap().clone());
@@ -143,9 +141,7 @@ impl Synchronizer {
 
                     match self.store.read(proposal.header_digest.to_vec()).await? {
                         Some(header) => {
-                            //println!("in some case");
                             proposals_vector.push(bincode::deserialize(&header)?);
-                            //println!("after adding to proposal vector");
                         }
                         None => missing.push(proposal.clone()),
                     }
@@ -193,12 +189,10 @@ impl Synchronizer {
         }
 
         if missing.is_empty() {
-            //println!("Have all proposals");
             debug!("have all proposals and their ancestors");
             return Ok(proposals_vector);
         }
 
-        //println!("sending to header waiter");
         debug!("Triggering sync for proposals");
         debug!("missing proposals are {:?}", missing);
         self.tx_header_waiter
@@ -211,75 +205,6 @@ impl Synchronizer {
             .expect("Failed to send sync parents request");
         Ok(Vec::new())
     }
-
-    // pub async fn sync_proposals(&mut self, consensus_message: &ConsensusMessage) -> DagResult<bool> {
-    //     let mut missing = Vec::new();
-    //     //println!("synchronizing on proposals");
-
-    //     match consensus_message {
-    //         ConsensusMessage::Prepare { slot: _, view: _, tc: _, qc_ticket: _, proposals } => {
-    //             for (pk, proposal) in proposals {
-    //                 //println!("proposal inside prepare");
-
-    //                 if proposal.header_digest == self.genesis_headers.get(&pk).unwrap().digest() {
-    //                     continue;
-    //                 }
-
-    //                 match self.store.read(proposal.header_digest.to_vec()).await? {
-    //                     Some(header) => {},
-    //                     None => missing.push(proposal.clone()),
-    //                 }
-    //             }
-    //         },
-    //         ConsensusMessage::Confirm { slot: _, view: _, qc: _, proposals } => {
-    //             for (pk, proposal) in proposals {
-
-    //                 if proposal.header_digest == self.genesis_headers.get(&pk).unwrap().digest() {
-    //                     continue;
-    //                 }
-
-    //                 match self.store.read(proposal.header_digest.to_vec()).await? {
-    //                     Some(header) => {},
-    //                     None => missing.push(proposal.clone()),
-    //                 }
-    //             }
-
-    //             //Start async sync.
-    //             if !missing.is_empty() {
-    //                 self.tx_header_waiter
-    //                 .send(WaiterMessage::SyncProposalsCAsync(missing))
-    //                 .await
-    //                 .expect("Failed to send sync parents request");
-    //                 return Ok(false);
-    //             }
-    //         },
-    //         ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
-    //             for (pk, proposal) in proposals {
-
-    //                 if proposal.header_digest == self.genesis_headers.get(&pk).unwrap().digest() {
-    //                     continue;
-    //                 }
-
-    //                 match self.store.read(proposal.header_digest.to_vec()).await? {
-    //                     Some(header) => {},
-    //                     None => missing.push(proposal.clone()),
-    //                 }
-    //             }
-
-    //             //Start sync with loopback
-    //             if !missing.is_empty() {
-    //                 self.tx_header_waiter
-    //                 .send(WaiterMessage::SyncProposalsC(missing, consensus_message.clone()))
-    //                 .await
-    //                 .expect("Failed to send sync parents request");
-    //                 return Ok(false);
-    //             }
-    //         },
-    //     }
-
-    //     Ok(true)
-    // }
-
     pub async fn get_all_headers_for_proposal(
         &mut self,
         proposal: Proposal,

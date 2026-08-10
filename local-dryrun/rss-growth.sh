@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Measure RSS growth of a local n-node committee -- a leak detector, not a benchmark.
 #
-# Why local: `local-benchmark` runs every node in ONE process, so a per-node leak shows up
-# amplified n-fold in a single RSS series. That makes a 13 MB/s/node leak (the 2026-08-07
-# n=100 AckAggregator finding) trivially visible in 30 seconds on a laptop, where the AWS
-# run needed a 123s window across 100 machines to establish the same number.
+# Why local: `local-benchmark` runs every node in one process, so per-node growth is
+# amplified in one RSS series.
 #
 # Reports MB/s over the second half of the run only: the first half includes RocksDB
 # warm-up and allocator growth, which are one-off and would flatter or spoil the slope.
@@ -105,6 +103,5 @@ if cspan:
         # the leak; far above it means something else dominates.
         print(f" => {per_node*1e6/cache_rate:8.0f} bytes of per-node RSS growth per cache entry")
 print("-----------------------------------------")
-# The AWS n=100 leak was 13.43 MB/s PER NODE. Anything near that per node is the same bug.
 print("LEAK" if per_node > 1.0 else "OK (sub-1 MB/s per node)")
 PY

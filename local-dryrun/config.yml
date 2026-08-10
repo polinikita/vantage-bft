@@ -1,12 +1,4 @@
-# local-dryrun config (METRICS-DASHBOARD-SPEC.md §5) -- every run parameter in one
-# file. Commented values below are the n=10 / 1000 tx/s WAN-shaped latency experiment
-# (PHASE7-PREP-NOTES.md's own latency-table runs) -- edit in place, or copy this file
-# and pass `--config <path>` to `dryrun.py`.
-#
-# Mirrors starfish's own local-dryrun UX (~/code/starfish/local-dryrun, read-only
-# reference for the UX only -- that one is a bash script driving one Docker container
-# per validator; this one is Python driving native `node local-benchmark` processes,
-# per Phase-2 §8's deliberate deviation -- see README.md).
+# Local benchmark configuration. Copy this file to create another run profile.
 
 # Consensus protocol: vantage | autobahn-optimistic | autobahn-seamless
 protocol: vantage
@@ -19,13 +11,11 @@ workers: 1
 rate: 1000          # tx/s
 tx_size: 512        # bytes
 
-# Transaction payload mode: all_zero | random (METRICS-DASHBOARD-SPEC.md §8: random
-# is the new default everywhere -- pin all_zero here if you need a number comparable
-# to this repo's historical (pre-§8) gate/sweep figures).
+# Transaction payload mode: all_zero | random.
 mode: random
 
 # Run duration in seconds. 0 = run until Ctrl-C (clean shutdown, RESULTS still
-# printed) -- METRICS-DASHBOARD-SPEC.md §5.
+# printed).
 duration: 0
 
 # Vantage AGB base delay unit (ms); irrelevant to the two Autobahn paths.
@@ -41,20 +31,19 @@ batch_messages: true
 batch_max_bytes: 65536
 batch_max_delay_ms: 5
 
-# PHASE6-SPEC.md R2 crash-fault count: this many trailing nodes are never spawned
+# Number of trailing nodes to leave unspawned.
 # (committee membership unchanged). 0 = fault-free.
 crash: 0
 
-# PHASE7-PREP-NOTES.md WAN-shaped local runs: path to an NxN RTT-ms CSV matrix
+# Optional NxN RTT-ms matrix for WAN-shaped runs.
 # (relative to the repository root), or the literal string `none` for zero injected
-# latency (pure loopback -- measures machine capacity, not geography; this is what
-# METRICS-DASHBOARD-SPEC.md §7's scaling sweep uses; dryrun.py passes an EXPLICIT
+# latency (pure loopback; measures machine capacity, not geography). dryrun.py passes an explicit
 # `--mimic-latency-ms 0` for this case, so it really means zero). The commented
 # default below is the n=10 latency experiment's own table. Note: `node
 # local-benchmark` itself defaults to the real 10-AWS-region RTT matrix
-# (`LatencyTable::aws_rtt`) whenever BOTH `--latency-table` and `--mimic-latency-ms`
-# are omitted -- irrelevant here since dryrun.py always passes one or the other.
-latency_table: wan-testbed-latency-10node.csv
+# (`LatencyTable::aws_rtt`) whenever both `--latency-table` and `--mimic-latency-ms`
+# are omitted; dryrun.py always passes one or the other.
+latency_table: local-dryrun/latency/wan-rtt-10.csv
 # latency_table: none
 
 # Where `node local-benchmark` writes its per-node stores + prometheus.yaml.

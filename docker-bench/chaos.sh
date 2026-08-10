@@ -21,13 +21,8 @@
 #            up to 10s for SIGTERM to be honoured, which would silently swallow a
 #            10s outage window.
 #
-#            NOT A RESILIENCE TEST TODAY. Vantage has no state sync, so a restarted
-#            node cannot rejoin a committee that has moved on -- it re-enters the
-#            broadcast layer but its commit cursor never leaves view 1, and it is
-#            gone for good. Measured 2026-08-09: one restart permanently removes a
-#            validator, so at n=4 the second one takes the committee below quorum
-#            and everything stops. That is the missing feature, not a bug, and this
-#            mode only becomes meaningful once state sync exists. Use `pause`.
+#            A restarted node must rejoin through state sync. Use `pause` to test a
+#            temporary stall without removing the node from the committee.
 #   pause -- `docker pause`/`unpause` (cgroup freezer). The process keeps its
 #            memory AND its established TCP connections; peers see a peer that has
 #            simply stopped reading. Models a long GC/scheduler stall, and isolates
@@ -216,8 +211,7 @@ echo "chaos.sh: all $NODES up; settling for ${SETTLE}s -- this window is the mea
 sleep "$SETTLE"
 END_MS="$(now_ms)"
 
-# Report which nodes are alive at the end. A node that crashed on its own (rather
-# than by our hand) shows up here, and that is a finding, not a harness error.
+# Report nodes that are not running at the end.
 DEAD=()
 for ((i = 0; i < NODES; i++)); do running "$i" || DEAD+=("$i"); done
 
@@ -236,7 +230,7 @@ print(f"chaos.sh: timeline -> {path}")
 PYEOF
 
 if [ "${#DEAD[@]}" -gt 0 ]; then
-    echo "chaos.sh: FINDING -- ${#DEAD[@]} node(s) not running at the end: ${DEAD[*]}" >&2
+    echo "chaos.sh: ${#DEAD[@]} node(s) not running at the end: ${DEAD[*]}" >&2
     exit 1
 fi
 echo "chaos.sh: all $NODES nodes running at the end"

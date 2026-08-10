@@ -39,7 +39,7 @@ impl GarbageCollector {
         consensus_round: Arc<AtomicU64>,
         rx_consensus: Receiver<Certificate>,
         tx_loopback: Sender<Certificate>,
-        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
@@ -70,7 +70,6 @@ impl GarbageCollector {
     async fn run(&mut self) {
         let mut last_committed_round = 0;
         while let Some(certificate) = self.rx_consensus.recv().await {
-            // TODO [issue #9]: Re-include batch digests that have not been sequenced into our next block.
 
             // Loop back the certificate from HotStuff in case we haven't seen it.
             if self

@@ -1,7 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Thin CLI wrapper around `client::Client` (PHASE2-SPEC.md §8 -- extracted so
-// `local-benchmark` can reuse the exact same transaction-generation logic in-process,
-// instead of a parallel reimplementation).
+// CLI wrapper around the shared transaction client.
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, Arg, ArgAction, Command};
 use env_logger::Env;
@@ -55,14 +53,11 @@ async fn main() -> Result<()> {
                 .value_name("MODE")
                 .required(false)
                 .default_value("random")
-                // "all-zero" (hyphen) kept as a legacy alias; "all_zero" (snake_case) is
-                // the starfish-aligned canonical spelling normalized in
-                // `TransactionMode::parse`.
+                // Accept both spellings for compatibility.
                 .value_parser(["all_zero", "all-zero", "random"])
                 .action(ArgAction::Set)
                 .help(
-                    "Transaction payload mode: 'all_zero' or 'random' (default, as of \
-                    METRICS-DASHBOARD-SPEC.md §8; legacy 'all-zero' spelling still accepted)",
+                    "Transaction payload mode: 'all_zero' or 'random' (default; 'all-zero' is also accepted)",
                 ),
         )
         .arg(

@@ -6,9 +6,6 @@ use tokio::time::{sleep, Duration, Instant, Sleep};
 use crate::messages::{ConsensusVote, Vote};
 use crate::primary::{Slot, View};
 
-//#[cfg(test)]
-//#[path = "tests/timer_tests.rs"]
-//pub mod timer_tests;
 
 pub struct Timer {
     slot: Slot,
@@ -46,7 +43,7 @@ impl Future for Timer {
     }
 }
 
-//This timer is used for FastPath and for Cars waiting to proceed without consensus
+// This timer supports fast-path and CAR scheduling.
 pub struct CarTimer {
     vote: Vote,
     duration: u64,

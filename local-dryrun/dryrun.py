@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""`node local-benchmark` launcher (METRICS-DASHBOARD-SPEC.md §5), starfish-style UX
-(~/code/starfish/local-dryrun is the read-only reference for the UX only -- that one
-drives one Docker container per validator via a bash script; this one drives NATIVE
-`node local-benchmark` processes, the deliberate Phase-2 §8 deviation -- see
-README.md).
+"""Run a local `node local-benchmark` instance.
 
 Usage:
     python3 dryrun.py                     # uses config.yml in this directory
@@ -26,7 +22,7 @@ try:
     import yaml
 except ImportError:
     sys.exit(
-        "dryrun.py needs pyyaml (stdlib + pyyaml only, per METRICS-DASHBOARD-SPEC.md §5). "
+        "dryrun.py needs pyyaml (stdlib + pyyaml only). "
         "Install it in this Python's environment: pip install pyyaml"
     )
 
@@ -65,7 +61,7 @@ def build(no_build: bool) -> None:
 
 def generate_prometheus_targets(data_dir: Path, nodes: int, workers: int, base_port: int = 4000) -> Path:
     """Mirrors `config::Committee::local_benchmark`'s deterministic port allocation
-    (config/src/lib.rs) exactly, so this file has real content BEFORE `node
+    (config/src/lib.rs) exactly, so this file has content before `node
     local-benchmark` itself has ever run -- needed so `docker compose up` has
     something real to bind-mount (an about-to-exist file, mounted read-only, would
     otherwise make Docker create an empty directory in its place). `node
@@ -139,7 +135,7 @@ def open_dashboard() -> None:
     url = f"{GRAFANA_URL}/d/{DASHBOARD_UID}"
     print(f"[dryrun] dashboard: {url}")
     if sys.platform == "darwin":
-        subprocess.run(["open", url], check=False)  # best-effort, per spec
+        subprocess.run(["open", url], check=False)  # Best effort.
     else:
         print("[dryrun] (not macOS -- open the URL above manually)")
 
@@ -164,17 +160,10 @@ def build_local_benchmark_args(cfg: dict, binary: Path) -> list:
     if latency_table.lower() != "none":
         args += ["--latency-table", latency_table]
     else:
-        # Fable audit FIX 1: `node local-benchmark` now distinguishes an EXPLICITLY
-        # passed `--mimic-latency-ms 0` (zero injected latency, pure loopback) from
-        # simply omitting the flag (which now defaults to the real 10-AWS-region RTT
-        # matrix, config/src/lib.rs's `LatencyTable::aws_rtt`). Passing no latency
-        # flags at all -- what this branch used to do -- would therefore silently
-        # inject that AWS matrix instead of the pure-loopback mode this config value
-        # documents, so the zero must be explicit.
+        # Pass zero explicitly to select loopback latency.
         args += ["--mimic-latency-ms", "0"]
-    # Transport-level batching is ON by default in both Parameters and the native
-    # CLI. Only emit the opt-out flag when explicitly disabled. The old launcher
-    # emitted a now-nonexistent `--batch-messages` opt-in flag when this key was true.
+        # Transport-level batching is enabled by default. Emit the opt-out flag only
+        # when it is disabled.
     batch_messages = cfg.get("batch_messages", True)
     if not isinstance(batch_messages, bool):
         sys.exit("batch_messages must be true or false")

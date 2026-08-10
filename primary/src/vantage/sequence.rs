@@ -1,46 +1,22 @@
-// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §4/§9 -- canonical sequence objects and the local
-// record store.
-//
-// PHASE A (record-only shadow mode) is what lives here: every terminally processed view
-// gets exactly one hash-chained `SequenceRecord`, and checkpoint boundaries get a head
-// that a later phase may announce. Nothing in this module announces, fetches, installs,
-// or touches live AGB -- it only observes what the cursor has already terminally output.
-//
-// The point of building this first, alone, is that it is decisively testable without any
-// protocol change: correct parties that terminally process through view `v` MUST derive
-// the identical `H_v`. A mismatch between two healthy nodes at a common boundary is a
-// determinism bug in this code or in the cursor, and the plan makes it a release blocker
-// (§14 Phase A). Announcing a head derived by divergent code would be actively unsafe,
-// so determinism has to be established before anything is put on the wire.
-
+use crate::messages::Header;
 use crate::primary::View;
 use crate::vantage::agb::{Manifest, Outcome};
 use crate::vantage::block;
 use crypto::{Digest, PublicKey};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Wire/format version of every object in this module. Bumped as a unit: a record's
-/// version is covered by its own hash, so two versions can never collide into the same
-/// chain even if their bincode shapes happen to coincide.
+/// Wire version shared by every sequence object.
 pub const SEQUENCE_VERSION: u16 = 1;
 
-// Domain tags. Distinct per object so no encoding of one can ever be reinterpreted as
-// another under the same session, matching the discipline in `agb.rs`'s digests.
 const TAG_GENESIS: &[u8] = b"vantage-sequence-genesis";
 const TAG_RECORD: &[u8] = b"vantage-sequence-record";
 const TAG_OUTCOME: &[u8] = b"vantage-sequence-outcome";
 const TAG_DELTA: &[u8] = b"vantage-sequence-delta";
 const TAG_ITEM: &[u8] = b"vantage-sequence-item";
 
-/// §4.2: the canonical state-transfer-only view result.
-///
-/// Deliberately commits the TERMINAL result rather than the proposal body. A proposal
-/// digest alone cannot distinguish `Full` from `Core` -- both name the same `c` -- and a
-/// `Skip` has no proposal at all, so a proposal-keyed encoding would make two different
-/// output sequences share a head. Recovery safety must not depend on obtaining
-/// historical proposal traffic.
+/// Canonical terminal result for one view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SequenceOutcome {
     Full { c: Manifest, t: Manifest },
@@ -49,22 +25,13 @@ pub enum SequenceOutcome {
 }
 
 impl SequenceOutcome {
-    /// `outcome_digest = H("vantage-sequence-outcome" || sid || v || bincode(outcome))`.
-    ///
-    /// `(view, self)` is serialized as one tuple, which bincode lays out as the
-    /// concatenation of its fields -- byte-identical to the plan's `v || encode(outcome)`
-    /// while keeping the length framing bincode gives the variant payload.
+    /// Hashes the outcome with its session and view.
     pub fn digest(&self, sid: &Digest, view: View) -> Digest {
         let bytes = bincode::serialize(&(view, self)).expect("SequenceOutcome serializes");
         block::domain_hash(TAG_OUTCOME, sid, &bytes)
     }
 
-    /// Number of variable-sized manifest references carried by this outcome.
-    ///
-    /// This is the useful frame-size unit for range serving: `Skip` is tiny, `Core`
-    /// carries one manifest, and `Full` carries two. Bounding only the number of views
-    /// wastes most of a frame for small committees and can still oversize one for a
-    /// large committee.
+    /// Returns the number of manifest references used as the response-size unit.
     pub fn manifest_items(&self) -> usize {
         match self {
             Self::Full { c, t } => c.len().saturating_add(t.len()),
@@ -87,18 +54,13 @@ impl From<&Outcome> for SequenceOutcome {
     }
 }
 
-/// §4.1 seed: `D_v[0] = H("vantage-sequence-delta" || sid || v || 0)`.
+/// Returns the initial hash for a view's ordered output delta.
 pub fn delta_seed(sid: &Digest, view: View) -> Digest {
     let bytes = bincode::serialize(&(view, 0u64)).expect("(View, u64) serializes");
     block::domain_hash(TAG_DELTA, sid, &bytes)
 }
 
-/// §4.1 step: `D_v[i+1] = H("vantage-sequence-item" || sid || v || i || D_v[i] || item)`.
-///
-/// An incremental item chain rather than a Merkle tree, so an arbitrarily large delta can
-/// be streamed and verified chunk by chunk without buffering one oversized frame or
-/// materializing a tree. `index` is bound into every step, so a receiver cannot splice a
-/// valid chunk in at the wrong offset.
+/// Extends a delta hash with the item index, previous hash, and item digest.
 pub fn delta_step(
     sid: &Digest,
     view: View,
@@ -112,7 +74,7 @@ pub fn delta_step(
     block::domain_hash(TAG_ITEM, sid, &bytes)
 }
 
-/// Fold a complete delta into its `(delta_len, delta_head)` commitment.
+/// Returns the item count and final hash for a complete delta.
 pub fn delta_commitment(sid: &Digest, view: View, items: &[Digest]) -> (u64, Digest) {
     let mut head = delta_seed(sid, view);
     for (index, item) in items.iter().enumerate() {
@@ -121,17 +83,12 @@ pub fn delta_commitment(sid: &Digest, view: View, items: &[Digest]) -> (u64, Dig
     (items.len() as u64, head)
 }
 
-/// The session's genesis sequence head `H_0`, below which no record exists.
+/// Returns the session-specific head before view 1.
 pub fn genesis_head(sid: &Digest) -> Digest {
     block::domain_hash(TAG_GENESIS, sid, &[])
 }
 
-/// Full 64-character hex of a head.
-///
-/// NOT `Digest`'s `Display`, which is deliberately truncated to 16 base64 characters for
-/// log readability. A cross-node divergence check compares head IDENTITY, so it must see
-/// every byte -- a truncated head that happens to match would report agreement that does
-/// not exist.
+/// Returns all 32 digest bytes as 64 hexadecimal characters.
 pub fn head_hex(head: &Digest) -> String {
     let mut out = String::with_capacity(64);
     for byte in head.0 {
@@ -141,16 +98,7 @@ pub fn head_hex(head: &Digest) -> String {
     out
 }
 
-/// Leading 8 bytes of a head as a signed integer, so a dashboard can GRAPH divergence
-/// (a Prometheus label cannot be plotted). Lossy on purpose and never authoritative:
-/// `sequence_check.py` compares full hex.
-pub fn head_prefix_i64(head: &Digest) -> i64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&head.0[..8]);
-    i64::from_be_bytes(bytes)
-}
-
-/// §4.3: exactly one record per terminally processed view, including `Skip`.
+/// Commits one terminal view to the preceding sequence head.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceRecord {
     pub version: u16,
@@ -162,19 +110,14 @@ pub struct SequenceRecord {
 }
 
 impl SequenceRecord {
-    /// `H_v = H("vantage-sequence-record" || sid || bincode(record_v))`.
     pub fn head(&self, sid: &Digest) -> Digest {
         let bytes = bincode::serialize(self).expect("SequenceRecord serializes");
         block::domain_hash(TAG_RECORD, sid, &bytes)
     }
 }
 
-/// Why a record was refused. Every variant is a local invariant violation, not a
-/// remote-input condition -- Phase A has no remote input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SequenceError {
-    /// The cursor finalized a view out of order. §4.3 requires a gapless chain, so
-    /// recording this would silently produce a head no other party can reproduce.
     OutOfOrder { expected: View, got: View },
 }
 
@@ -189,36 +132,20 @@ impl std::fmt::Display for SequenceError {
     }
 }
 
-/// §9's local store. Phase A keeps records in memory and retains them indefinitely,
-/// which matches the plan's version-1 choice (§16) and the paper's current
-/// indefinite-retention model; bounded GC needs its own proof and a snapshot rule first.
+/// Retains the ordered record chain and all bodies needed to serve announced checkpoints.
 pub struct SequenceStore {
     sid: Digest,
-    /// Checkpoint boundary interval `K` in views. Fixed boundaries (rather than "current
-    /// head") are what make `f+1` EXACT matches likely while correct cursors sit a few
-    /// views apart -- see §4.4.
     interval: u64,
     head: Digest,
-    /// The view the next record must carry; `head` is the head through `next_view - 1`.
     next_view: View,
     records: BTreeMap<View, SequenceRecord>,
-    /// Boundary view -> head at that boundary. A later phase announces from here.
     boundaries: BTreeMap<View, Digest>,
-    /// Terminal outcome bodies, and the ordered per-view output deltas.
-    ///
-    /// Retained because section 9's correctness rule is that a party never announces a
-    /// checkpoint whose state it cannot actually serve. Holding the record alone would
-    /// let this node advertise a head and then fail every transfer against it, which
-    /// costs a requester its whole recovery -- the `f+1` argument guarantees one correct
-    /// announcer EXISTS, so a correct announcer that cannot serve is a liveness bug.
-    /// Version 1 retains indefinitely (section 16); bounded GC needs its own proof.
     outcomes: BTreeMap<View, SequenceOutcome>,
     deltas: BTreeMap<View, Vec<Digest>>,
+    headers: HashMap<Digest, Header>,
 }
 
 impl SequenceStore {
-    /// `interval` of 0 is treated as 1 (every view is a boundary) rather than panicking
-    /// or dividing by zero on a misconfiguration.
     pub fn new(sid: Digest, interval: u64) -> Self {
         Self {
             head: genesis_head(&sid),
@@ -229,15 +156,14 @@ impl SequenceStore {
             boundaries: BTreeMap::new(),
             outcomes: BTreeMap::new(),
             deltas: BTreeMap::new(),
+            headers: HashMap::new(),
         }
     }
 
-    /// Current chain head, `H_0` before any record.
     pub fn head(&self) -> &Digest {
         &self.head
     }
 
-    /// Highest view covered by `head`, or 0 when empty.
     pub fn head_view(&self) -> View {
         self.next_view - 1
     }
@@ -254,8 +180,6 @@ impl SequenceStore {
         self.records.is_empty()
     }
 
-    /// The highest checkpoint boundary this party has passed, if any. Phase A only
-    /// exposes it for comparison across nodes and for the head-view gauge.
     pub fn latest_boundary(&self) -> Option<(View, &Digest)> {
         self.boundaries.last_key_value().map(|(v, h)| (*v, h))
     }
@@ -264,10 +188,18 @@ impl SequenceStore {
         self.boundaries.get(&view)
     }
 
-    /// Up to `limit` newest fixed checkpoint boundaries, returned oldest-first for
-    /// deterministic wire order. Announcing a short suffix rather than only the latest
-    /// lets validators whose cursors straddle adjacent boundaries contribute to the
-    /// same f+1 certificate.
+    /// Retains verified headers referenced by recorded deltas.
+    pub(crate) fn retain_verified_headers(&mut self, headers: impl IntoIterator<Item = Header>) {
+        for header in headers {
+            self.headers.entry(header.id.clone()).or_insert(header);
+        }
+    }
+
+    pub(crate) fn retained_header(&self, digest: &Digest) -> Option<&Header> {
+        self.headers.get(digest)
+    }
+
+    /// Returns up to `limit` newest boundaries in ascending view order.
     pub fn recent_boundaries(&self, limit: usize) -> Vec<(View, Digest)> {
         let mut boundaries: Vec<_> = self
             .boundaries
@@ -284,12 +216,7 @@ impl SequenceStore {
         view.is_multiple_of(self.interval)
     }
 
-    /// Record the terminal result of `view` and extend the chain.
-    ///
-    /// Returns the new head. Refuses anything but exactly the next view: a gap would
-    /// produce a head that no other correct party derives, which is precisely the
-    /// divergence Phase A exists to detect, so it must fail loudly rather than be papered
-    /// over by skipping ahead.
+    /// Appends exactly the next view and rejects gaps or reordering.
     pub fn record(
         &mut self,
         view: View,
@@ -323,15 +250,7 @@ impl SequenceStore {
     }
 }
 
-// ---------------------------------------------------------------- checkpoint collector
-
-/// §4.4: a first-hand claim that the sender's own terminal output through `view` has head
-/// `head`, and that it can serve state back to `serve_floor`.
-///
-/// NOT a certificate and never forwarded as evidence. It counts only when received
-/// first-hand over an authenticated channel from its encoded sender, so a third party
-/// must collect its own `f+1`. `serve_floor` is informational and cannot strengthen the
-/// claim -- a lying floor costs the requester one failed transfer, not safety.
+/// Carries a first-hand checkpoint claim from an authenticated committee member.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceAnnouncement {
     pub version: u16,
@@ -341,62 +260,37 @@ pub struct SequenceAnnouncement {
     pub sender: PublicKey,
 }
 
-/// Why an announcement did not count. Every variant is remote input, so all of them are
-/// ordinary operation rather than local invariant violations -- none may panic or abort.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IgnoreReason {
-    /// The encoded `sender` differs from the authenticated connection's identity. The
-    /// authoritative identity is ALWAYS the connection, exactly as on Vantage's other
-    /// first-hand paths; accepting the payload's own claim would make announcements
-    /// forgeable and destroy the `f+1` argument outright.
     SenderMismatch,
-    /// Not a committee member, so it cannot be one of the `f+1`.
     NotAMember,
-    /// Unknown object version.
     Version,
-    /// Same `(view, head)` from a sender already counted for that view. Counted once.
     Duplicate,
-    /// A DIFFERENT head from a sender that already announced this view. Recorded and
-    /// never counted -- for either head. A Byzantine party that could have both of its
-    /// announcements counted would need only `(f+1)/2` accomplices.
     Equivocation,
-    /// Too far above anything the fleet is plausibly at; bounds unbounded future-view
-    /// memory from a Byzantine peer.
     TooFarAhead,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnouncementOutcome {
-    /// Counted toward `(view, head)`. `newly_certified` is true on the announcement that
-    /// pushed it to `f+1` -- exactly once per `(view, head)`.
     Counted {
+        /// This is true only for the announcement that first reaches the threshold.
         newly_certified: bool,
     },
     Ignored(IgnoreReason),
 }
 
-/// §7.1's head collector: the `f+1` matching first-hand rule.
-///
-/// For `n = 3f+1`, any `f+1` distinct parties contain at least one correct party. A
-/// correct party announces `(v, H_v)` only for output it actually, terminally sequenced
-/// and can still serve, so `f+1` identical first-hand announcements mean at least one
-/// correct party holds exactly that prefix. The rule is LOCAL: these messages are not a
-/// transferable certificate.
+/// Certifies a head after matching first-hand announcements reach the configured threshold.
 pub struct CheckpointCollector {
     threshold: usize,
     max_candidate_views: usize,
     future_view_slack: View,
-    /// view -> head -> distinct senders that announced it first-hand.
     candidates: BTreeMap<View, BTreeMap<Digest, BTreeSet<PublicKey>>>,
-    /// (view, sender) -> the FIRST head that sender announced for that view.
     first_claim: BTreeMap<(View, PublicKey), Digest>,
     equivocators: BTreeSet<PublicKey>,
     certified: BTreeMap<View, Digest>,
 }
 
 impl CheckpointCollector {
-    /// `threshold` is `f+1`. Derived by the caller from the committee so this type stays
-    /// free of committee plumbing and is trivially testable at any `f`.
     pub fn new(threshold: usize, max_candidate_views: usize, future_view_slack: View) -> Self {
         Self {
             threshold: threshold.max(1),
@@ -409,11 +303,9 @@ impl CheckpointCollector {
         }
     }
 
-    /// Count one announcement.
+    /// Counts a claim only when its sender matches the authenticated connection identity.
     ///
-    /// `authenticated_sender` comes from the connection, never from the payload.
-    /// `local_view` is roughly where this node believes the fleet is; it only bounds
-    /// future-view memory and can be stale without affecting safety.
+    /// A sender that announces two heads for one view contributes to neither head.
     pub fn on_announcement(
         &mut self,
         announcement: &SequenceAnnouncement,
@@ -440,9 +332,6 @@ impl CheckpointCollector {
                 return AnnouncementOutcome::Ignored(IgnoreReason::Duplicate);
             }
             Some(_) => {
-                // A second, different head for the same view from the same sender. Both
-                // are now worthless: we cannot tell which (if either) is honest, and
-                // counting either would let one Byzantine party supply two of the f+1.
                 self.equivocators.insert(*authenticated_sender);
                 self.retract(announcement.view, authenticated_sender);
                 return AnnouncementOutcome::Ignored(IgnoreReason::Equivocation);
@@ -472,13 +361,7 @@ impl CheckpointCollector {
         AnnouncementOutcome::Counted { newly_certified }
     }
 
-    /// Remove an equivocator's vote for `view` from every head it may have reached.
-    ///
-    /// Retraction can take a candidate back BELOW threshold, but a `(view, head)` already
-    /// promoted to `certified` is deliberately left alone: it was certified by `f+1`
-    /// DISTINCT senders, so even discounting this one entirely, `f` remain and at least
-    /// one of those was correct only if the threshold still holds. Certification is
-    /// therefore re-derived rather than assumed -- see `certified_head`.
+    /// Retracts an equivocator and removes certification if support falls below the threshold.
     fn retract(&mut self, view: View, sender: &PublicKey) {
         if let Some(heads) = self.candidates.get_mut(&view) {
             for senders in heads.values_mut() {
@@ -499,8 +382,6 @@ impl CheckpointCollector {
         }
     }
 
-    /// Bound retained candidate boundaries. Evicts the LOWEST views: the target is always
-    /// the highest certified head above the local one, so old candidates are dead weight.
     fn evict_if_needed(&mut self) {
         while self.candidates.len() > self.max_candidate_views {
             let Some((&lowest, _)) = self.candidates.iter().next() else {
@@ -511,7 +392,6 @@ impl CheckpointCollector {
         }
     }
 
-    /// The highest certified `(view, head)` strictly above `above`, if any.
     pub fn certified_head(&self, above: View) -> Option<(View, Digest)> {
         self.certified
             .iter()
@@ -520,7 +400,6 @@ impl CheckpointCollector {
             .map(|(view, head)| (*view, head.clone()))
     }
 
-    /// Distinct senders that announced this exact `(view, head)` first-hand.
     pub fn support(&self, view: View, head: &Digest) -> usize {
         self.candidates
             .get(&view)
@@ -529,7 +408,6 @@ impl CheckpointCollector {
             .unwrap_or(0)
     }
 
-    /// Matching announcers for a certified target -- the source set §7.2 requests from.
     pub fn announcers(&self, view: View, head: &Digest) -> Vec<PublicKey> {
         self.candidates
             .get(&view)
@@ -547,11 +425,7 @@ impl CheckpointCollector {
     }
 }
 
-// -------------------------------------------------------------------------- serving
-
 impl SequenceStore {
-    /// Lowest view this node can fully serve. Version 1 retains indefinitely, so this is
-    /// the lowest recorded view (or `next_view` when empty, i.e. "nothing serveable").
     pub fn serve_floor(&self) -> View {
         self.records
             .keys()
@@ -560,12 +434,7 @@ impl SequenceStore {
             .unwrap_or(self.next_view)
     }
 
-    /// Consecutive records starting at `from`, capped at `max`.
-    ///
-    /// Returns only a CONTIGUOUS run: a requester verifies records by chaining
-    /// `previous_head`, so a response with a hole is worthless to it and silently
-    /// skipping the hole would look like a chain that does not link. Stops at the first
-    /// gap and lets the requester see a short answer.
+    /// Returns a contiguous record range and stops at the first missing view.
     pub fn records_from(&self, from: View, max: usize) -> Vec<SequenceRecord> {
         let mut out = Vec::new();
         let mut view = from;
@@ -583,14 +452,9 @@ impl SequenceStore {
         self.outcomes.get(&view)
     }
 
-    /// A consecutive outcome range beginning at `from`, bounded by view count, total
-    /// manifest references, and `through`.
+    /// Returns a contiguous, bounded outcome range.
     ///
-    /// The manifest-reference budget self-adjusts to committee size and actual outcome
-    /// shape. Always serving the first retained outcome guarantees progress even when a
-    /// single outcome exceeds the requester's budget; `max_views` still bounds a run of
-    /// tiny `Skip` outcomes. Stops at the first retention gap; callers answer an empty
-    /// range with `SequenceUnavailable` rather than pretending the request completed.
+    /// The first retained outcome is returned even when it exceeds `max_items`.
     pub fn outcomes_from(
         &self,
         from: View,
@@ -622,11 +486,7 @@ impl SequenceStore {
         outcomes
     }
 
-    /// One delta chunk: up to `max` digests from `start`, plus whether it reaches the end.
-    ///
-    /// `None` when the view is not retained at all, which the caller answers with
-    /// `SequenceUnavailable` and its authoritative floor rather than an empty chunk --
-    /// section 9 forbids silently clamping a request and calling the transfer complete.
+    /// Returns at most `max` delta items and whether the chunk reaches the delta end.
     pub fn delta_chunk(&self, view: View, start: u64, max: usize) -> Option<(Vec<Digest>, bool)> {
         let delta = self.deltas.get(&view)?;
         let start = start as usize;
@@ -637,12 +497,7 @@ impl SequenceStore {
         Some((delta[start..end].to_vec(), end == delta.len()))
     }
 
-    /// Consecutive delta chunks beginning at `from_view`.
-    ///
-    /// The first view starts at `start_index`; later views always start at zero. The
-    /// response is bounded both by view count and by total digest count, so a catch-up
-    /// request can collapse many empty/small view deltas into one frame without allowing a
-    /// single response to grow with the checkpoint distance.
+    /// Returns consecutive delta chunks bounded by view count and total item count.
     pub fn delta_entries_from(
         &self,
         from_view: View,
@@ -685,10 +540,6 @@ impl SequenceStore {
     }
 }
 
-// ------------------------------------------------------------------------ wire types
-
-/// Sections 6/7.2: ask a matching announcer for the record range that links our local head
-/// to a certified target.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceRequest {
     pub version: u16,
@@ -770,10 +621,7 @@ pub struct SequenceOutcomeRequest {
     pub target_head: Digest,
     pub target_view: View,
     pub from_view: View,
-    /// Maximum number of outcome views. Bounds a long run of tiny `Skip` outcomes.
     pub max_views: u32,
-    /// Maximum total manifest references across the response. This is the variable-size
-    /// byte proxy and therefore the primary frame bound.
     pub max_items: u32,
     pub requester: PublicKey,
 }
@@ -793,9 +641,7 @@ pub struct SequenceOutcomeServe {
     pub sender: PublicKey,
 }
 
-/// Section 9: an explicit "I cannot serve that" carrying the authoritative floor, so the
-/// requester can try another matching announcer or a newer checkpoint. Never a silent
-/// truncation presented as success.
+/// Reports that one source cannot serve the request and includes that source's floor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceUnavailable {
     pub version: u16,
@@ -805,60 +651,51 @@ pub struct SequenceUnavailable {
     pub sender: PublicKey,
 }
 
-// ----------------------------------------------------------------------- verification
-
-/// Why downloaded state was rejected. All of these are ordinary remote input: up to `f`
-/// of the matching announcers may withhold or corrupt every byte, so none may panic.
+/// Describes invalid remote sequence data; callers must handle every variant without panicking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChainError {
     Version,
-    /// Not the record we are waiting for. Chunks must arrive in view order because each
-    /// record is verified against the running head.
     UnexpectedView {
+        /// The verifier expected this view before `got`.
         expected: View,
         got: View,
     },
-    /// `previous_head` does not match the head we have built. The core content binding:
-    /// a plausible-looking prefix from a Byzantine peer dies here unless it can complete
-    /// the chain to the certified head, which it cannot without a hash collision.
     BrokenLink {
+        /// The record at this view did not extend the running head.
         view: View,
     },
-    /// The chain reached the target view but not the certified head.
     HeadMismatch {
+        /// The chain reached this view without reaching the certified head.
         view: View,
     },
-    /// More records than the target view calls for.
     PastTarget {
+        /// The response contained records after this target view.
         target: View,
     },
     UnexpectedIndex {
+        /// The verifier expected this item index before `got`.
         expected: u64,
         got: u64,
     },
-    /// The delta produced a different commitment than its record promised.
     DeltaMismatch {
+        /// The completed delta for this view did not match its committed head.
         view: View,
     },
-    /// More delta items than `delta_len`.
     DeltaTooLong {
+        /// The delta for this view exceeded its committed item count.
         view: View,
     },
-    /// A `Skip` must have an empty delta (section 7.3 step 3).
     SkipWithDelta {
+        /// This skipped view committed a non-empty delta.
         view: View,
     },
-    /// The served outcome does not hash to the record's `outcome_digest`.
     OutcomeMismatch {
+        /// The outcome for this view did not match its committed digest.
         view: View,
     },
 }
 
-/// Section 7.2: verify a record range links our local head to the certified target.
-///
-/// Verification is incremental and strictly ordered so an arbitrarily long range streams
-/// without buffering, and so a corrupt chunk is rejected at the point it breaks rather
-/// than after a whole range has been accepted.
+/// Verifies an ordered record chain against a trusted base and target head.
 pub struct ChainVerifier {
     sid: Digest,
     target_view: View,
@@ -870,8 +707,6 @@ pub struct ChainVerifier {
 }
 
 impl ChainVerifier {
-    /// `base_view`/`base_head` are what the requester already holds and trusts -- its own
-    /// installed head, or genesis.
     pub fn new(
         sid: Digest,
         base_view: View,
@@ -906,12 +741,7 @@ impl ChainVerifier {
         self.verified.len()
     }
 
-    /// Absorb one chunk of consecutive records. `Ok(true)` once the chain reaches the
-    /// certified head.
-    ///
-    /// A rejected chunk leaves the verifier UNCHANGED, so a Byzantine source cannot
-    /// poison the running head and force the requester to restart: the next source's
-    /// copy of the same chunk is still accepted.
+    /// Accepts consecutive records and leaves verifier state unchanged on failure.
     pub fn absorb_records(&mut self, records: &[SequenceRecord]) -> Result<bool, ChainError> {
         let mut view = self.next_view;
         let mut head = self.head.clone();
@@ -938,8 +768,6 @@ impl ChainVerifier {
             staged.push(record.clone());
             view += 1;
         }
-        // Only at the target may the head be compared: an intermediate head is expected
-        // to differ from the target.
         let reached = view > self.target_view;
         if reached && head != self.target_head {
             return Err(ChainError::HeadMismatch {
@@ -955,8 +783,7 @@ impl ChainVerifier {
         Ok(reached)
     }
 
-    /// Section 7.3 steps 1 and 3: a served outcome must hash to the verified record's
-    /// commitment, and a `Skip` must carry an empty delta.
+    /// Checks an outcome against its verified record and requires an empty delta for `Skip`.
     pub fn check_outcome(&self, view: View, outcome: &SequenceOutcome) -> Result<(), ChainError> {
         let record = self.verified.get(&view).ok_or(ChainError::UnexpectedView {
             expected: self.next_view,
@@ -972,8 +799,7 @@ impl ChainVerifier {
     }
 }
 
-/// Section 7.3 step 2: stream one view's output digests and verify them against the
-/// `(delta_len, delta_head)` its verified record committed to.
+/// Verifies consecutive delta items against a record's length and final hash.
 pub struct DeltaVerifier {
     sid: Digest,
     view: View,
@@ -1005,14 +831,11 @@ impl DeltaVerifier {
         self.next_index == self.expected_len
     }
 
-    /// The verified digests, only once the whole delta checks out.
     pub fn take_items(self) -> Option<Vec<Digest>> {
         self.is_complete().then_some(self.items)
     }
 
-    /// Absorb consecutive items at `start_index`. `Ok(true)` when the delta is complete
-    /// AND its head matches. Rejects gaps, wrong offsets, and overlong deltas; leaves the
-    /// verifier unchanged on error.
+    /// Accepts the next consecutive items and leaves verifier state unchanged on failure.
     pub fn absorb(&mut self, start_index: u64, items: &[Digest]) -> Result<bool, ChainError> {
         if start_index != self.next_index {
             return Err(ChainError::UnexpectedIndex {
@@ -1040,10 +863,6 @@ impl DeltaVerifier {
     }
 }
 
-// ------------------------------------------------------------------ requester (7.1-7.3)
-
-/// What the requester wants next. `VantageCore` turns one of these into a wire message
-/// per source; the transfer itself never touches the network.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SequenceWant {
     Records { from_view: View },
@@ -1056,44 +875,26 @@ pub enum TransferState {
     FetchingRecords,
     FetchingOutcomes,
     FetchingDeltas,
-    /// Phase B's terminal state: the whole target is downloaded and verified. Phase C
-    /// installs from here; Phase B deliberately stops.
     Verified,
-    /// Every matching announcer was dropped. The target cannot be completed from this
-    /// source set; the collector must certify a newer one.
     Exhausted,
 }
 
-/// Two invalid responses for one target and a source is done: `f` of the `f+1` matching
-/// announcers may be Byzantine, so a source that has now twice failed to produce
-/// verifying bytes is not worth further requests. One is tolerated because a single
-/// mismatch can also be a stale or truncated honest answer.
+// One invalid response is tolerated; the second removes that source from the transfer.
 const MAX_INVALID_PER_SOURCE: usize = 2;
 
-/// Section 7: one installation target at a time, downloaded and verified from the set of
-/// matching announcers.
+/// Downloads one certified target from its matching first-hand announcers.
 pub struct SequenceTransfer {
     sid: Digest,
     transfer_id: u64,
     target_view: View,
     target_head: Digest,
-    /// Matching announcers still worth asking.
     sources: Vec<PublicKey>,
-    /// Rotates so a timeout fails over to the NEXT source, never the same one.
     cursor: usize,
     invalid: BTreeMap<PublicKey, usize>,
     chain: ChainVerifier,
     outcomes: BTreeMap<View, SequenceOutcome>,
     deltas: BTreeMap<View, Vec<Digest>>,
     delta_in_flight: BTreeMap<View, DeltaVerifier>,
-    /// Lowest view that can never again be reported missing -- it has a verified record AND
-    /// its body is present. Records are only added and the maps only grow, so this can only
-    /// advance, which is what lets the scan resume here instead of restarting at view 1.
-    ///
-    /// `advance_if_done` calls both scans on EVERY completed delta view, so restarting at 1
-    /// made verification bookkeeping O(gap^2) on the core loop: ~440 s of single-threaded
-    /// CPU at a 60-minute gap, on the node being rescued. `Cell` so `want(&self)` keeps its
-    /// signature.
     outcome_scan_from: Cell<View>,
     delta_scan_from: Cell<View>,
     state: TransferState,
@@ -1155,7 +956,7 @@ impl SequenceTransfer {
         self.state == TransferState::Verified
     }
 
-    /// The verified result, only once everything checks out. Phase C's input.
+    /// Returns output only after the record chain, outcomes, and deltas are verified.
     pub fn verified_output(&self) -> Option<Vec<(View, &SequenceOutcome, &Vec<Digest>)>> {
         if !self.is_verified() {
             return None;
@@ -1170,12 +971,7 @@ impl SequenceTransfer {
         )
     }
 
-    /// The verified chain's head at every view in the target range.
-    ///
-    /// Phase C's rebase needs these: when ordinary execution overtakes part of a target,
-    /// the head it derived at that boundary must be checked against what the chain says
-    /// before the prefix is dropped, or a correct suffix could be spliced onto a divergent
-    /// history.
+    /// Returns each verified boundary head for safe rebasing against local execution.
     pub fn verified_heads(&self) -> Option<Vec<(View, Digest)>> {
         if !self.is_verified() {
             return None;
@@ -1191,12 +987,7 @@ impl SequenceTransfer {
         )
     }
 
-    /// Up to `max` sources to send the next request to, CONCURRENTLY.
-    ///
-    /// Serial failover would multiply worst-case recovery by `f`, since up to `f` of the
-    /// `f+1` matching announcers may withhold every response. Asking several at once
-    /// bounds it by the one correct announcer's latency, at a bandwidth cost of at most
-    /// `max`x -- and the first valid copy cancels the rest.
+    /// Returns up to `max` sources beginning at the current failover cursor.
     pub fn next_sources(&self, max: usize) -> Vec<PublicKey> {
         if self.sources.is_empty() {
             return Vec::new();
@@ -1207,7 +998,6 @@ impl SequenceTransfer {
             .collect()
     }
 
-    /// What to request next, or `None` when verified or exhausted.
     pub fn want(&self) -> Option<SequenceWant> {
         match self.state {
             TransferState::FetchingRecords => Some(SequenceWant::Records {
@@ -1238,14 +1028,7 @@ impl SequenceTransfer {
         self.first_missing(&self.delta_scan_from, &self.deltas)
     }
 
-    /// Lowest view with a verified record whose body `have` does not contain.
-    ///
-    /// The cursor advances only across the contiguous prefix of views that have BOTH a
-    /// verified record and a body -- such a view can never become missing again, so
-    /// skipping it is permanently safe. It deliberately does NOT advance past a view whose
-    /// record is still absent: that record may yet arrive and make the view missing.
-    /// Beyond the settled prefix this falls back to a forward scan, but from the cursor
-    /// rather than from view 1.
+    /// Advances only across the contiguous prefix with both a verified record and body.
     fn first_missing<T>(&self, cursor: &Cell<View>, have: &BTreeMap<View, T>) -> Option<View> {
         loop {
             let view = cursor.get();
@@ -1265,14 +1048,11 @@ impl SequenceTransfer {
             .find(|v| !have.contains_key(v))
     }
 
-    /// A response only counts from a source still in the matching set, and only when its
-    /// transfer id and target head match. Section 6: anything else is ignored -- this is
-    /// the "answers a pair we never asked for" discipline.
+    /// Accepts responses only from a selected source for this transfer and target head.
     fn accepts(&self, from: &PublicKey, transfer_id: u64, head: &Digest) -> bool {
         transfer_id == self.transfer_id && head == &self.target_head && self.sources.contains(from)
     }
 
-    /// Charge a source for an invalid response and drop it once it has spent its budget.
     fn penalize(&mut self, from: &PublicKey) {
         let count = self.invalid.entry(*from).or_insert(0);
         *count += 1;
@@ -1281,7 +1061,6 @@ impl SequenceTransfer {
         }
     }
 
-    /// Remove a source. Keeps `cursor` in range without rotating past an untried peer.
     pub fn drop_source(&mut self, from: &PublicKey) {
         if let Some(index) = self.sources.iter().position(|s| s == from) {
             self.sources.remove(index);
@@ -1296,14 +1075,13 @@ impl SequenceTransfer {
         }
     }
 
-    /// Rotate to the next source. Called on a request timeout, so a silent peer costs one
-    /// timeout rather than the whole transfer.
     pub fn rotate(&mut self) {
         if !self.sources.is_empty() {
             self.cursor = (self.cursor + 1) % self.sources.len();
         }
     }
 
+    /// Ignores duplicate and past-target records before verifying the useful range.
     pub fn on_records(
         &mut self,
         chunk: &SequenceRecordChunk,
@@ -1314,17 +1092,6 @@ impl SequenceTransfer {
         {
             return Ok(());
         }
-        // Concurrent sources answer the SAME request, so duplicate valid chunks are
-        // normal and MUST be idempotent (section 6). Trim what we already absorbed
-        // before verifying: without this the second and third copies present as
-        // `UnexpectedView`, get charged as corrupt, and retire every honest source --
-        // measured on a live cluster as 29 transfers started, 0 verified, 28 exhausted.
-        // Trim BOTH ends. A server serves a contiguous run from its own chain and does
-        // not stop at our target, so an honest chunk routinely runs past it -- rejecting
-        // that as PastTarget retired honest sources and exhausted the transfer (measured:
-        // 15 started, 0 verified, 14 exhausted, even after the duplicate fix). Records
-        // below `already` are duplicates from a concurrent source; records above the
-        // target are simply more than we asked for. Neither is misbehaviour.
         let already = self.chain.next_view();
         let target = self.target_view;
         let fresh: Vec<SequenceRecord> = chunk
@@ -1351,6 +1118,7 @@ impl SequenceTransfer {
         }
     }
 
+    /// Ignores overlapping bodies and penalizes only content that fails its record commitment.
     pub fn on_outcomes(
         &mut self,
         serve: &SequenceOutcomeServe,
@@ -1361,10 +1129,6 @@ impl SequenceTransfer {
         {
             return Ok(());
         }
-        // Concurrent sources may return overlapping ranges after another source has
-        // already advanced us. Validate every still-useful body by its committed digest
-        // and ignore already-held/out-of-range entries. Framing overlap is not evidence
-        // of a bad source; only invalid content spends its source budget.
         for entry in &serve.outcomes {
             if self.outcomes.contains_key(&entry.view)
                 || self.chain.verified_record(entry.view).is_none()
@@ -1419,19 +1183,15 @@ impl SequenceTransfer {
         Ok(())
     }
 
+    /// Ignores unsolicited or duplicate delta data and restarts a view after invalid content.
     fn on_delta_entry(
         &mut self,
         entry: &SequenceDeltaEntry,
         from: &PublicKey,
     ) -> Result<(), ChainError> {
         let Some(record) = self.chain.verified_record(entry.view).cloned() else {
-            // A delta for a view whose record we never verified. Not attributable to a
-            // corrupt chain, just unsolicited -- ignore without penalty.
             return Ok(());
         };
-        // Same idempotence rule as records: a duplicate copy of a view we already
-        // finished, or of a chunk already absorbed, is a normal consequence of asking
-        // several sources at once and must not be charged as invalid.
         if self.deltas.contains_key(&entry.view) {
             return Ok(());
         }
@@ -1457,8 +1217,6 @@ impl SequenceTransfer {
                 Ok(())
             }
             Err(e) => {
-                // Drop the partial verifier so a corrupt chunk cannot strand this view at
-                // a poisoned offset; the next source restarts it from index 0.
                 self.delta_in_flight.remove(&entry.view);
                 self.penalize(from);
                 Err(e)
@@ -1466,9 +1224,7 @@ impl SequenceTransfer {
         }
     }
 
-    /// Section 9: an explicit "cannot serve" is a SOURCE fact, not a target fact. The
-    /// source is dropped and the transfer continues against the rest -- exactly the case
-    /// where matching announcers sit at different serve floors.
+    /// Drops only the source that reports it cannot serve this transfer.
     pub fn on_unavailable(&mut self, unavailable: &SequenceUnavailable, from: &PublicKey) {
         if unavailable.transfer_id != self.transfer_id
             || unavailable.target_head != self.target_head

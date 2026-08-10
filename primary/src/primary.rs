@@ -48,7 +48,7 @@ pub type Slot = u64;
 // clippy::large_enum_variant: `Timeout(Timeout)` (~560 B) makes this enum large --
 // boxing it is wire-compatible (serde's `Box<T>` impl serializes identically to `T`)
 // but would still touch every `PrimaryMessage::X(...)` construction and `match`/
-// `if let` destructuring site across the audited dispatch code in core.rs,
+// `if let` destructuring site across the dispatch code in core.rs,
 // vantage/node.rs, primary.rs, committer.rs, header_waiter.rs, helper.rs for a pure
 // stack-size optimization; not done.
 #[allow(clippy::large_enum_variant)]
@@ -65,90 +65,53 @@ pub enum PrimaryMessage {
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
     HeadersRequest(Vec<Digest>, /* requestor */ PublicKey),
     ProposalHeadersRequest(Proposal, Height, /* requestor */ PublicKey),
-    // Vantage only (PHASE3-SPEC.md §5). Appended last -- bincode wire compat, same rule
+    // Vantage only. Appended last for bincode wire compatibility; the same rule
     // as `PrimaryWorkerMessage::Committed` above: this is a variant index, inserting it
     // anywhere else would shift every following discriminant.
     VantageAck(Ack),
-    // Vantage AGB engine (PHASE4-SPEC.md §2). Appended after `VantageAck`, in the
-    // spec's declared order -- same bincode wire-compat rule as above.
+    // Vantage AGB engine. Keep new variants appended for bincode compatibility.
     VantagePropose(ViewProposal),
     VantageEcho(Echo),
-    // PHASE5-SPEC.md §2 (D5-2): `EchoSkip`/`NoReady` gain a trailing `View` wish
+    // `EchoSkip` and `NoReady` carry a trailing `View` wish
     // piggyback field, same convention as `Echo`/`Ready`'s own new `wish` field.
     VantageEchoSkip(View, /* sender */ PublicKey, /* wish */ View),
     VantageReady(Ready),
     VantageNoReady(View, /* sender */ PublicKey, /* wish */ View),
-    // Vantage WISH pacemaker (PHASE5-SPEC.md §2). Appended after `VantageNoReady`, last
+    // Vantage WISH pacemaker. Appended after `VantageNoReady`, last
     // -- same bincode wire-compat rule as every other Vantage-only variant above.
     VantageWish(View, /* sender */ PublicKey),
-    // Vantage resolution + control log (PHASE6-SPEC.md §5). Appended after
-    // `VantageWish`, in the spec's declared order plus D6-6's necessary commit-vote
-    // addition -- same bincode wire-compat rule as above.
+    // Vantage resolution and control-log messages. Keep new variants appended.
     CompReport(View, Digest, /* sender */ PublicKey),
     ControlInit(crate::vantage::ControlProposal, Option<ViewProposal>),
     ControlEcho(crate::vantage::ControlProposal, /* sender */ PublicKey),
     ControlReady(crate::vantage::ControlProposal, /* sender */ PublicKey),
     ControlFetch(View, Digest, /* requester */ PublicKey),
     ControlServe(View, ViewProposal),
-    // D6-6 (PHASE6-NOTES.md): the paper's Vote step ("send <commit, curr_round> to all
-    // parties") has no listed wire message in the spec's §5 enumeration but is
-    // load-bearing for the Commit rule -- added here, appended last.
+    // Control commit messages are appended to preserve existing wire indices.
     ControlCommit(crate::vantage::Round, /* sender */ PublicKey),
-    // Simple-IT's reliable-notification round-timeout messages (Fig. 4) -- appended
-    // last per the spec's "whatever round-timeout notification message the reference
-    // requires (append last)".
+    // Simple-IT timeout messages are appended to preserve existing wire indices.
     ControlTimeoutVote(crate::vantage::Round, /* sender */ PublicKey),
     ControlTimeoutAccept(crate::vantage::Round, /* sender */ PublicKey),
-    // Simple-IT cut-consensus (a fourth, separate protocol assembly -- primary/src/
-    // simpleit/**), reusing Vantage's own data plane (`Header`/`HeadersRequest`/
-    // `VantageAck` above) for dissemination and adding these five for its own
-    // cut-consensus layer. Appended last -- same bincode wire-compat rule as every
-    // other protocol-specific variant above. `SimpleItTimeout`/`SimpleItTimeoutAccept`
-    // are deliberately distinct types from the pre-existing `Timeout` (Autobahn's,
-    // above) and from `ControlTimeoutVote`/`ControlTimeoutAccept` (Vantage's own
-    // resolution-layer notifications) -- three unrelated protocols' round-timeout
-    // messages, never unified into one wire type. NOTE: this used to be six variants,
-    // including `SimpleItCutCertificate` -- removed (arXiv:2606.14404 Fig.-2 rewrite,
-    // see `primary/src/simpleit/engine.rs`'s module doc comment): that message let a
-    // party assert a signature-free "notarization" for any `cut_id`, checked only for
-    // committee membership, never for whether its listed voters actually voted. Each
-    // party now marks a round safe by counting `SimpleItCutVote`s itself. Removing a
-    // non-last variant shifts every later discriminant by one, which the bincode
-    // wire-compat rule above would normally forbid -- safe here only because every
-    // node in a run is the same compiled binary (this codebase's actual deployment
-    // model; see `node/src/local_benchmark.rs` and the nightly-binary release flow),
-    // so there is no old/new version pair that ever needs to decode each other's
-    // bytes.
+    // Simple-IT cut-consensus messages use Vantage's data plane and keep their
+    // existing variants distinct. New variants are appended for wire compatibility.
     SimpleItCutProposal(crate::simpleit::CutProposal),
     SimpleItCutVote(crate::simpleit::CutVote),
     SimpleItDecide(crate::simpleit::Decide),
     SimpleItTimeout(crate::simpleit::Timeout),
     SimpleItTimeoutAccept(crate::simpleit::TimeoutAccept),
-    // Simple-IT cut-proposal repair: mirrors `ControlFetch`/`ControlServe` above
-    // exactly (see `vantage::control::ControlLog::on_control_fetch`/
-    // `on_control_serve`'s identical role for Vantage's own carrier bodies) -- closes
-    // a liveness gap where a party locally marks round r safe (via vote-counting,
-    // naming only a `cut_id`) without ever receiving round r's own `CutProposal`.
-    // Appended last -- same bincode wire-compat rule as every other
-    // protocol-specific variant above.
+    // Simple-IT cut-proposal repair messages. New variants are appended.
     SimpleItCutFetch(
         crate::simpleit::CutRound,
         Digest,
         /* requester */ PublicKey,
     ),
     SimpleItCutServe(crate::simpleit::CutProposal),
-    // Optional, flag-gated periodic per-lane availability watermark
-    // (`Parameters::ack_watermarks`) -- replaces per-block acks with one compact
-    // broadcast per period naming, for each author this party holds, the greatest
-    // DirectPub (height, head digest) pair (lanes are hash chains, so this one pair
-    // covers the whole verified prefix through that height). Shared by both Vantage
-    // and Simple-IT (same `LaneManager`/`AckAggregator` data plane). Appended last --
-    // same bincode wire-compat rule as every other protocol-specific variant above.
+    // Optional periodic per-lane availability watermark. Appended for wire
+    // compatibility and shared by Vantage and Simple-IT.
     VantageAvail(Vec<crate::vantage::AvailEntry>, /* sender */ PublicKey),
-    // Vantage only, flag-gated (`Parameters::batched_anchors`, signature-free.tex's
-    // "Batched resolution entries"): the vector-`M` counterparts of
+    // Vantage-only batched resolution entries. New variants are appended.
     // `VantagePropose`/`VantageEcho`/`VantageReady`/`ControlInit`/`ControlServe`.
-    // Deliberately NEVER on the pre-existing variants above (see `agb::ViewProposal`'s
+    // Never use these on the variants above (see `agb::ViewProposal`'s
     // doc comment) -- constructed only when the flag is on AND the proposer's
     // recovery-turn prefix has `>= 2` entries; a run with the flag off never
     // constructs or sends any of these five, so the flag-off wire format is
@@ -162,15 +125,13 @@ pub enum PrimaryMessage {
         Option<crate::vantage::BatchViewProposal>,
     ),
     ControlServeBatch(View, crate::vantage::BatchViewProposal),
-    // Vantage only, signature-free.tex's "Grounded post-ready skip" (par:skip-seal).
-    // Unconditional protocol behavior (no flag, unlike the variants above): the
+    // Vantage-only skip vote. It is unconditional protocol behavior:
     // one-shot statement `<skip-vote, u>`, sent by a correct party after its own
     // durably-emitted no-ready, a first-hand 2f+1 echo-skip census, and a free
     // resolution stance. Appended last -- same bincode wire-compat rule as every
     // other protocol-specific variant above.
     VantageSkipVote(View, /* sender */ PublicKey),
-    // Vantage only, flag-gated (`Parameters::digest_statements`, signature-free.tex
-    // §8.3's "Digest-named AGB statements"): the digest-named counterparts of
+    // Vantage-only digest-named AGB statements. The digest variants are enabled by
     // `VantageEcho`/`VantageReady` (naming the proposal by `hash(B_v)` instead of
     // carrying it), plus fetch/serve for the `ViewProposal` body itself. Constructed
     // only when the flag is on; a run with the flag off never sends any of these
@@ -181,16 +142,13 @@ pub enum PrimaryMessage {
     VantageReadyDigest(crate::vantage::ReadyDigest),
     VantageBodyFetch(View, Digest, /* requester */ PublicKey),
     VantageBodyServe(View, ViewProposal),
-    // Simple-IT's Bracha-RBC variant (a fifth protocol assembly, `--protocol
-    // simple-it-bracha` -- arXiv:2606.14404 Table 1/2 + Corollary 5, variant S):
+    // Simple-IT's Bracha-RBC variant:
     // Bracha-RBC's own second echo round ("ready"), sent once a party's own
     // `SimpleItCutVote` census crosses `quorum_threshold` (see
     // `simpleit::engine::CutEngine::broadcast_cut_ready`). Appended last -- same
     // bincode wire-compat rule as every other protocol-specific variant above.
     SimpleItCutReady(crate::simpleit::CutReady),
-    // Mechanism A (sender-side lane resume, modeled on Starfish's subscription
-    // resume but ack-census-gap-triggered rather than reconnection-triggered --
-    // motivated by the windowed `--withhold` experiment). A requester asks the named
+    // Lane resume. A requester asks the named
     // lane AUTHOR to re-publish its own lane from `from` (inclusive) upward --
     // unicast to the author only, never broadcast. Shared by both Vantage and
     // Simple-IT (same `LaneManager`/`Wire` data plane); see `vantage::resume`'s own
@@ -209,8 +167,8 @@ pub enum PrimaryMessage {
         /* from height, inclusive */ Height,
         /* requester */ PublicKey,
     ),
-    // reconnect-replay plan §7 (server-authoritative floor, v3): a SEPARATE
-    // mechanism from `VantageLaneResume` above (see `vantage::resume`'s own module
+    // Replay of durable messages lost during a connection reset. This is separate
+    // from `VantageLaneResume`:
     // doc comment) -- resumes ONE-SHOT AGB/consensus broadcasts lost to a volatile
     // session death, rather than lane content. `VantageResumeHello(floor hint,
     // sender)` is sent unicast (i) on this node's own reconnect event, (ii) by the
@@ -235,7 +193,7 @@ pub enum PrimaryMessage {
         PublicKey, /* sender */
     ),
 
-    // --- SEQUENCE-CHECKPOINT-SYNC-PLAN.md section 6, Phase B. APPENDED, never
+    // Sequence messages are appended and must not be reordered:
     // reordered: bincode encodes an enum by its variant INDEX, so inserting anywhere
     // above would silently reinterpret every existing message on a mixed-version fleet.
     //
@@ -253,8 +211,8 @@ pub enum PrimaryMessage {
     VantageSequenceUnavailable(SequenceUnavailable),
     VantageSequenceDeltaRangeRequest(SequenceDeltaRangeRequest),
     VantageSequenceDeltaRange(SequenceDeltaRangeChunk),
-    // Phase C materialization. These are separate from `HeadersRequest`/`Header(_, true)`
-    // so a late joiner's committed-history responses stay on the dedicated sequence
+    // These materialization messages are separate from `HeadersRequest`/`Header(_, true)`
+    // so a late joiner's committed responses stay on the dedicated sequence
     // transport and ingress queue instead of refilling its saturated consensus queue.
     VantageSequenceHeadersRequest(Vec<Digest>, /* requester */ PublicKey),
     VantageSequenceHeaders(Vec<Header>, /* sender */ PublicKey),
@@ -262,8 +220,7 @@ pub enum PrimaryMessage {
 }
 
 impl PrimaryMessage {
-    /// METRICS-DASHBOARD-SPEC.md §1: the wire variant name used as the `type` label
-    /// for `network_messages_received_total`/`network_bytes_received_total` at
+    /// Returns the wire variant name used as the `type` label
     /// receiver-dispatch sites whose match has a catch-all arm (so a literal string
     /// per arm isn't available the way it is at send call sites, which construct one
     /// specific variant at a time).
@@ -317,10 +274,7 @@ impl PrimaryMessage {
             PrimaryMessage::SimpleItCutReady(..) => "SimpleItCutReady",
             PrimaryMessage::VantageLaneResume(..) => "VantageLaneResume",
             PrimaryMessage::VantageResumeHello(..) => "VantageResumeHello",
-            // reconnect-replay plan §7: labeled by its own variant name, distinct
-            // from the "Replay" label the wire-frame chunks it terminates use (see
-            // `vantage::wire`'s resume task) -- `Done` is a `PrimaryMessage` in its
-            // own right, never a raw `Bytes` chunk.
+            // Keep the completion message label distinct from replay chunks.
             PrimaryMessage::VantageReplayDone(..) => "VantageReplayDone",
             PrimaryMessage::VantageSequenceAnnounce(..) => "VantageSequenceAnnounce",
             PrimaryMessage::VantageSequenceRequest(..) => "VantageSequenceRequest",
@@ -341,10 +295,9 @@ impl PrimaryMessage {
     }
 }
 
-/// METRICS-DASHBOARD-SPEC.md §1: shared by every `MessageHandler::dispatch` impl in
+/// Records a typed receive for every `MessageHandler::dispatch` implementation in
 /// this crate (a no-op if `metrics` is `None`). `len` is the serialized payload size
-/// (no frame prefix -- `network_bytes_received_total` is "beyond starfish", the
-/// serialized-length-is-in-hand convention noted in the spec).
+/// `len` is the serialized payload length without a frame prefix.
 pub(crate) fn record_typed_received(metrics: &Arc<Metrics>, msg_type: &'static str, len: usize) {
     metrics
         .network_messages_received_total
@@ -366,7 +319,7 @@ pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// The primary indicates a round update.
     Cleanup(Height),
-    /// Benchmark-only (PHASE2-SPEC.md #5, amended): the primary indicates these batch
+    /// Benchmark-only: the primary indicates these batch
     /// digests were just committed, carrying the commit instant itself (UTC millis,
     /// taken once at the "Committed B..." log site) so the worker measures
     /// submission -> commit exactly -- not submission -> whenever this notification
@@ -376,7 +329,7 @@ pub enum PrimaryWorkerMessage {
 }
 
 impl PrimaryWorkerMessage {
-    /// METRICS-DASHBOARD-SPEC.md §1: see `PrimaryMessage::type_name`.
+    /// Returns the same wire type label as `PrimaryMessage::type_name`.
     pub fn type_name(&self) -> &'static str {
         match self {
             PrimaryWorkerMessage::Synchronize(..) => "Synchronize",
@@ -396,7 +349,7 @@ pub enum WorkerPrimaryMessage {
 }
 
 impl WorkerPrimaryMessage {
-    /// METRICS-DASHBOARD-SPEC.md §1: see `PrimaryMessage::type_name`.
+    /// Returns the same wire type label as `PrimaryMessage::type_name`.
     pub fn type_name(&self) -> &'static str {
         match self {
             WorkerPrimaryMessage::OurBatch(..) => "OurBatch",
@@ -411,7 +364,7 @@ impl Primary {
     // clippy::too_many_arguments: see `Committer::spawn`'s identical justification --
     // this is the top-level assembly constructor wiring every channel between the
     // two protocol families; a params struct would only add indirection, not reduce
-    // the audited call site's actual argument count.
+    // the call site's actual argument count.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -449,8 +402,7 @@ impl Primary {
         parameters.log();
 
         // Boot the (always-on, starfish-parity) Prometheus metrics server. Primary's
-        // registry is near-empty in Phase 2 -- nothing here observes into `metrics` yet
-        // -- but it is wired up now so Phase 3+ only has to add counters, not plumbing.
+        // The registry starts with no primary-specific counters.
         let metrics_address = committee
             .primary(&name)
             .expect("Our public key or worker id is not in the committee")
@@ -459,7 +411,7 @@ impl Primary {
         binding_metrics_address.set_ip("0.0.0.0".parse().unwrap());
         let registry = Registry::new();
         let (metrics, reporter) = Metrics::new(&registry);
-        // METRICS-DASHBOARD-SPEC.md §8: write-once at boot.
+        // Set protocol metrics once at boot.
         metrics.set_protocol_info(parameters.protocol.label());
         if let Some(mode) = parameters.tx_mode.as_deref() {
             metrics.set_transaction_mode_info(mode);
@@ -469,7 +421,7 @@ impl Primary {
         // `synchronizer`), but `ActiveWindowCollector` publishes
         // `metrics_active_seconds` from this same value -- so leaving it unset made the
         // primary's series read a permanent 0 in every scrape, an active false lead
-        // during the 2026-08-07/08 n=100 investigation (it looks exactly like "the
+        // during startup (it looks exactly like "the
         // measurement window never opened").
         metrics.set_active_from_millis(parameters.metrics_active_at_ms);
         // Task panics are otherwise dropped on the floor -- nothing here awaits a
@@ -516,7 +468,7 @@ impl Primary {
 
         match parameters.protocol {
             Protocol::Vantage => {
-                // PHASE4-SPEC.md §1: a single `VantageCore` task replaces
+                // A single `VantageCore` task replaces
                 // Core/Proposer/HeaderWaiter/Helper/consensus entirely. Only the
                 // worker-facing receiver and the metrics server (already booted above)
                 // are shared with Autobahn.
@@ -614,11 +566,10 @@ impl Primary {
                 // Simple-IT cut-consensus: a single `SimpleItCore` task, mirroring
                 // `Protocol::Vantage`'s assembly exactly (same address setup, same
                 // `acks: true`, same batch parameters) -- it drives
-                // `simpleit::CutEngine` over the identical data plane (`LaneManager`/
+                // `simpleit::CutEngine` over the shared data plane (`LaneManager`/
                 // `Repairer`/`Wire`/`PayloadIo`) Vantage uses, as its own separate
                 // instances (deliberately not shared mutable state -- see
                 // `simpleit::node::SimpleItCore`'s own doc comment). One shared arm
-                // for BOTH `SimpleIt` (Opt) and `SimpleItBracha` (Bracha-RBC, arXiv:
                 // 2606.14404 Table 1/2 + Corollary 5, variant S) -- `SimpleItCore::
                 // build` reads `parameters.protocol` (already threaded through below)
                 // to select `simpleit::engine::Variant::{Opt,Bracha}`.
@@ -768,10 +719,7 @@ impl Primary {
                     /* tx_certificate_waiter */ tx_sync_certificates,
                 );
 
-                // use_optimistic_tips: bool,     //default = true (TODO: implement non optimistic tip option)
 
-                // use_parallel_proposals: bool,  //default = true (TODO: implement sequential slot option)
-                // let k = 1; //Max open conensus instances at a time.
 
                 // use_fast_path: bool,           // Autobahn only; default = true
                 // fast_path_timeout: u64,
@@ -808,9 +756,9 @@ impl Primary {
                     parameters.simulate_asynchrony,
                     parameters.asynchrony_start,
                     parameters.asynchrony_duration,
-                    // PHASE7-PREP-NOTES.md (WAN-shaped local runs, optional item):
-                    // resolved once here (empty == current behavior, byte-identical,
-                    // unless `--latency-table`/`--mimic-latency-ms` set
+                    // Optional per-destination latency map:
+                    // resolved once here (empty keeps the default behavior, unless
+                    // `--latency-table`/`--mimic-latency-ms` set
                     // `parameters.latency_table`) -- the fairness point: the exact
                     // same `Committee::latency_map` call `Protocol::Vantage`'s arm
                     // above makes for `VantageCore::spawn`.
@@ -820,7 +768,7 @@ impl Primary {
                         .map(|table| committee.latency_map(&name, table))
                         .unwrap_or_default(),
                     // Data-plane withholding fault injector (`--withhold`): resolved
-                    // once here (`None` == current behavior, byte-identical, unless
+                    // once here (`None` keeps the default behavior, unless
                     // `--withhold` selects this node as a withholding sender) -- same
                     // "doesn't otherwise take a `Parameters`" reasoning as
                     // `latency_map` just above.
@@ -970,7 +918,6 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .await
                 .expect("Failed to send primary message"),
             request => {
-                ////println!("Made it to dispatch");
                 self.tx_primary_messages
                     .send(request)
                     .await

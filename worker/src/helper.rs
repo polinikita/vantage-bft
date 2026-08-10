@@ -31,22 +31,16 @@ pub struct Helper {
 }
 
 impl Helper {
-    // clippy::too_many_arguments: see `worker::batch_maker::BatchMaker::spawn`'s
-    // identical justification (the new `batch` param pushed this over the threshold).
+    // The constructor has more arguments than Clippy's default limit.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: WorkerId,
         committee: Committee,
         store: Store,
         rx_request: Receiver<(Vec<Digest>, PublicKey)>,
-        // Fable audit item 4 (WAN latency injection): this authority's own
-        // per-destination artificial latency map (same contract/construction as
-        // `BatchMaker::spawn`'s -- see its doc comment). Applied to this worker's
-        // batch-request replies to other workers, previously undelayed even under a
-        // WAN-shaped run.
+        // Per-destination network latency.
         latency_map: HashMap<SocketAddr, Duration>,
-        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as primary-side
-        // `::spawn` functions.
+        // Metrics registry.
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,

@@ -1,25 +1,11 @@
 #!/usr/bin/env bash
-# SEQUENCE-CHECKPOINT-SYNC-PLAN.md Phase C: can a validator that missed the start rejoin
-# purely by state sync?
+# Restarts one validator after an outage and leaves time for state sync.
 #
-# The node is stopped, not paused: the process dies, its in-memory consensus state goes
-# with it, and it comes back at view 1 with an empty cursor. Nothing replays the history it
-# missed -- reconnect replay works from a coarse WISH watermark and cannot reconstruct a
-# minute of finalized output. So catching up is state sync or nothing, which is exactly the
-# case that was impossible before Phase C.
-#
-# NOTE ON WHAT THIS DOES AND DOES NOT SHOW. There is no application snapshot, so the joiner
-# has base_view = 0 and must download and execute EVERY block from view 1. It can only do
-# that because `SequenceStore` and `BlockCache` are both retained indefinitely. This
-# therefore tests the install path, not survival under bounded retention.
-#
-#     ./late_joiner.sh [--nodes 21] [--rate 1000] [--down 60] [--settle 90]
+# Usage: ./late_joiner.sh [--nodes 10] [--rate 1000] [--down 60] [--settle 90]
 set -euo pipefail
 cd "$(dirname "$0")"
 
-NODES=21; RATE=1000; DOWN=60; SETTLE=90; INTERVAL=20; JOINER=""
-# Control arm. With state sync off this is the pre-Phase-C behaviour, which is the only
-# way to show that the install -- not ordinary dissemination -- is what recovers the node.
+NODES=10; RATE=1000; DOWN=60; SETTLE=90; INTERVAL=20; JOINER=""
 EXTRA=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,10 +21,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 JOINER="vantage-node-$((NODES - 1))"
-# Warm-up before the outage + the outage itself + time to sync afterwards. The clients
-# start when Compose starts, while run.sh's visible timeline starts only after the killed
-# joiner comes back and every target is healthy. Add margin so the client workload is
-# still alive during the recovery window instead of expiring during readiness.
+# Keep clients active through startup, outage, and recovery.
 DURATION=$((15 + DOWN + SETTLE + 20))
 
 echo "==> late joiner: n=$NODES, $JOINER down for ${DOWN}s, ${SETTLE}s to catch up"
@@ -48,7 +31,7 @@ echo "==> late joiner: n=$NODES, $JOINER down for ${DOWN}s, ${SETTLE}s to catch 
     ${EXTRA[@]+"${EXTRA[@]}"} &
 RUN_PID=$!
 
-# Wait for the joiner to exist, then kill it before it can learn anything useful.
+# Stop the joiner before the initial warm-up completes.
 until docker ps --format '{{.Names}}' | grep -qx "$JOINER"; do sleep 2; done
 sleep 5
 echo "==> stopping $JOINER at $(date +%T)"

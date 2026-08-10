@@ -19,12 +19,7 @@ class AWSError(Exception):
 
 class InstanceManager:
     INSTANCE_NAME = 'dag-node'
-    # METRICS-COLLECTOR-PREP: the dedicated metrics-collector instance gets its own
-    # tag:Name value so it is distinguishable from validators at a glance (AWS
-    # console, `describe_instances`) and, critically, so hosts()/internal_hosts()
-    # (which filter on INSTANCE_NAME only, see below) never surface it to
-    # `_select_hosts`/`_select_hosts_config` -- the collector is not a committee
-    # member and runs no node.
+    # Keep the metrics collector separate from validator instances.
     COLLECTOR_NAME = 'metrics-collector'
     SECURITY_GROUP_NAME = 'dag'
     # Prometheus HTTP API port on the metrics-collector instance -- scraped targets
@@ -39,17 +34,7 @@ class InstanceManager:
     # their :3000).
     GRAFANA_PORT = 3000
 
-    # COST-ESTIMATE: static on-demand fallback price (USD/hr), used by
-    # `estimate_cost()` whenever an instance isn't Spot, or is Spot but its
-    # `describe_spot_price_history` lookup fails. Keyed by instance type;
-    # `DEFAULT_FALLBACK_PRICE` covers any type without its own entry.
-    # c5.xlarge/eu-west-1 on-demand was ~0.192 USD/hr, and c5d.xlarge/eu-west-1
-    # on-demand was ~0.216 USD/hr (settings.json's validator instance_type,
-    # added by the single-AZ-pinning change), both at the time this was
-    # written -- re-check https://aws.amazon.com/ec2/pricing/on-demand/ if
-    # instance_type/region in settings.json changes; this is a documented
-    # approximation, not a live price feed (Cost Explorer/CloudTrail are
-    # denied for this IAM user).
+    # Static fallback prices used when Spot pricing is unavailable.
     ON_DEMAND_FALLBACK_PRICE = {
         'c5.xlarge': 0.192,  # eu-west-1
         'c5d.xlarge': 0.216,  # eu-west-1
@@ -143,33 +128,7 @@ class InstanceManager:
                 break
 
     def _create_security_group(self, client):
-        ''' Idempotent w.r.t. BOTH the group and its ingress rules.
-
-        METRICS-COLLECTOR-STEP2: the observed bug was every
-        `fab fetch-metrics` query to the collector's Prometheus HTTP API
-        (coordinator -> collector:9090) timing out, while the per-run direct
-        node scrape (coordinator/nodes -> each validator's own metrics port,
-        within the "Dag port" range below) worked fine. The MONITOR_PORT rule
-        below already asks for 0.0.0.0/0 -- so a *freshly created* group is
-        fine. The actual bug is `create_security_group` being a create-only,
-        run-once operation: `create_instances` swallows
-        'InvalidGroup.Duplicate' and never revisits an ALREADY-EXISTING group
-        (e.g. one created by an earlier `fab create` against an older
-        revision of this file, before the MONITOR_PORT rule existed here) --
-        that group keeps whatever rules it had at creation time forever,
-        silently missing any rule added to the code since. The "Dag port"
-        rule predates MONITOR_PORT, so it was already present on such a
-        group; :9090 was not, hence exactly this symptom.
-
-        Fix: always (whether the group is new or pre-existing) (re-)authorize
-        every ingress rule below, one `authorize_security_group_ingress` call
-        per rule rather than one call for all three -- AWS fails the ENTIRE
-        call if ANY single permission in it is already present
-        ('InvalidPermission.Duplicate'), so a combined call against a
-        partially-provisioned pre-existing group would raise on the first
-        already-present rule and never reach the missing one. Per-rule calls
-        let each rule's own 'already there' be swallowed independently while
-        any genuinely missing rule (like :9090 above) still gets added. '''
+        '''Create the security group and ensure each ingress rule exists.'''
         try:
             client.create_security_group(
                 Description='HotStuff node',
@@ -207,17 +166,7 @@ class InstanceManager:
                 }],
             },
             {
-                # METRICS-COLLECTOR-PREP: the metrics-collector's Prometheus
-                # HTTP API, queried by the coordinator laptop after a run
-                # (remote.py's fetch_collector_metrics). Same shared security
-                # group as the validators (simplicity: one group, one call
-                # site) -- validators get this rule too but nothing listens
-                # on their :9090, so it is inert there. 0.0.0.0/0, same
-                # posture as the SSH/Dag-port rules above: this is a
-                # throwaway testbed (`fab destroy` tears the group down with
-                # it), so narrowing to the coordinator's own public IP would
-                # add a resolve-my-IP dependency (and break the moment that
-                # IP changes mid-campaign) for no real security benefit here.
+                # Prometheus API access for the metrics collector.
                 'IpProtocol': 'tcp',
                 'FromPort': self.MONITOR_PORT,
                 'ToPort': self.MONITOR_PORT,
@@ -259,44 +208,11 @@ class InstanceManager:
                     raise
 
     def _resolve_az_subnet(self, client, region):
-        ''' Single-AZ pinning: resolve the (availability_zone, subnet_id, vpc_id)
-        EVERY instance in `region` (validators AND the collector) launches into,
-        so intra-committee traffic -- already routed over private IPs, see
-        `internal_hosts()` -- stays INTRA-AZ, not merely intra-region: AWS bills
-        cross-AZ private-IP transfer (~$0.01/GB each way) even within a single
-        VPC/region, and only same-AZ private-IP traffic is genuinely free.
+        '''Return a region's availability zone, subnet, and VPC.
 
-        AZ selection: `settings.json`'s `instances.availability_zone`, if set,
-        in EITHER of two forms:
-          - a plain string (e.g. "eu-west-1a"), applied to every region -- only
-            sound for a single-region settings.json, since an AZ name is
-            region-scoped ("eu-west-1a" does not exist in us-east-1).
-          - a dict mapping region -> az (e.g. {"eu-west-1": "eu-west-1a",
-            "us-east-1": "us-east-1b"}), for a multi-region settings.json. A
-            region absent from the mapping is NOT an error -- it falls
-            through to auto-pick below, so only some regions need pinning.
-        Whichever form resolves an AZ for `region`, the result must start with
-        `region` or this raises `BenchError` naming both the AZ and `region`
-        -- see the region-scope check below. That check covers BOTH forms
-        deliberately: a wrong-region string and a typo'd mapping entry fail
-        identically, rather than the mapping form retaining the late,
-        confusing `describe_subnets` failure the check exists to replace.
-        Absent either form (or a dict with no entry for `region`): the first
-        AZ `describe_availability_zones` reports as 'available' in this
-        region -- restricted to ordinary AZs (see the zone-type/opt-in-status
-        filters below, which exclude Local/Wavelength Zones: an account
-        opted into one can have it sort before the plain AZs by name, and
-        Local/Wavelength Zones have no default-for-az subnet, so picking one
-        here would fail the `describe_subnets` call below) -- sorted by name
-        for a deterministic pick across repeated `fab create` invocations.
-
-        The subnet is that AZ's DEFAULT-VPC default-for-az subnet (resolved via
-        `describe_subnets`) -- every account already has one per AZ (the same
-        implicit subnet `run_instances` picked before this pinning existed), so
-        no new VPC/subnet provisioning is required. The subnet's `VpcId` is
-        also returned so `_security_group_id` can scope its lookup to that
-        same VPC: security-group names are unique only WITHIN a VPC, not
-        account-wide. '''
+        Use the configured zone when valid; otherwise choose the first ordinary
+        available zone by name. The result keeps validators and the collector
+        in one zone.'''
         configured_az = getattr(self.settings, 'availability_zone', None)
         az = None
         mapping_form = isinstance(configured_az, dict)
@@ -371,22 +287,7 @@ class InstanceManager:
         return az, subnets[0]['SubnetId'], subnets[0]['VpcId']
 
     def _security_group_id(self, client, vpc_id):
-        ''' Resolves `SECURITY_GROUP_NAME` to its GroupId, scoped to `vpc_id`
-        (the VPC of the subnet this launch is pinned into -- see
-        `_resolve_az_subnet`). Needed because launching into an explicit
-        `SubnetId` (single-AZ pinning) requires `SecurityGroupIds`, not the
-        `SecurityGroups` (by-name) form the prior implicit-default-subnet
-        launch used.
-
-        The `vpc-id` filter matters: security-group names are unique only
-        WITHIN a VPC, not account-wide, so without it an account with a
-        same-named group in a different VPC could resolve to a group that
-        does not belong to the pinned subnet's VPC, and `run_instances` would
-        then fail with "security group ... and subnet ... belong to different
-        networks". If more than one group still matches even scoped to one
-        VPC (should not happen -- names are unique per VPC -- but checked
-        rather than silently taking the first), this raises instead of
-        guessing which one to use. '''
+        '''Return the security-group ID for `vpc_id`, failing on ambiguity.'''
         r = client.describe_security_groups(
             Filters=[
                 {'Name': 'group-name', 'Values': [self.SECURITY_GROUP_NAME]},
@@ -418,16 +319,7 @@ class InstanceManager:
     CANONICAL_OWNER_ID = '099720109477'
 
     def _get_ami(self, client):
-        # The AMI id changes per region and the old fixed build-date
-        # description (2020-10-26 focal) is long deregistered, so resolve
-        # the newest available Ubuntu amd64 HVM/EBS image by owner + name
-        # glob instead of pinning an ImageId or exact date.
-        #
-        # Ubuntu 24.04 LTS (noble), not 22.04 (jammy): the fetch-binary deploy
-        # path (remote.py's default, non-`--source-build`, mode) downloads a
-        # `node`/`benchmark_client` built in this repo's Dockerfile against
-        # `rust:1.95-bookworm` -- glibc 2.36. Jammy ships glibc 2.35, too old
-        # to dynamically link that binary; Noble ships glibc 2.39. The name
+            # Select the newest compatible Ubuntu amd64 HVM/EBS image.
         # glob matches both `hvm-ssd/` (pre-24.04 path) and the newer
         # `hvm-ssd-gp3/` Canonical publishes 24.04+ server images under.
         response = client.describe_images(
@@ -471,12 +363,7 @@ class InstanceManager:
         try:
             # Create all instances.
             size = instances * len(self.clients)
-            # Opt-in EC2 Spot (settings.json instances.spot == true). One-time
-            # requests, terminate-on-interruption, and NO MaxPrice -- boto3 then
-            # caps the bid at the on-demand price, so Spot never costs more than
-            # on-demand while still yielding the usual discount, and there is no
-            # surprise-price exposure. Absent/false -> {} -> on-demand, i.e. the
-            # exact prior run_instances call (byte-identical request).
+            # Use one-time EC2 Spot requests when enabled.
             spot_options = {}
             if getattr(self.settings, 'spot', False):
                 spot_options = {
@@ -488,13 +375,7 @@ class InstanceManager:
                         },
                     }
                 }
-            # Single-AZ pinning (see `_resolve_az_subnet`'s doc comment): resolve
-            # once per region and cache, so the collector launch below (in the
-            # first region) reuses the EXACT SAME (az, subnet, vpc,
-            # security-group-id) a validator in that region gets, instead of a
-            # second, independent resolution that could -- in principle, if
-            # AWS's 'available' AZ ordering ever changed between calls --
-            # disagree.
+            # Resolve each region's subnet once and reuse it for the collector.
             az_subnet_by_region = {}
             sg_id_by_region = {}
             progress = progress_bar(
@@ -537,29 +418,12 @@ class InstanceManager:
             self._wait(['pending'], name=self.INSTANCE_NAME)
             Print.heading(f'Successfully created {size} new instances')
 
-            # METRICS-COLLECTOR-PREP: one dedicated, extra metrics-collector
-            # instance (not a validator, runs no node) -- in the FIRST configured
-            # region only. A single collector regardless of how many regions
-            # `settings.json` lists: scraping a validator over its PRIVATE ip from
-            # a collector in a *different* region would need cross-region VPC
-            # peering this harness never sets up (today's settings.json is
-            # single-region, so this is exact there; a genuinely multi-region
-            # campaign would need that peering for validator<->validator traffic
-            # regardless of this feature). Tagged COLLECTOR_NAME (never
-            # INSTANCE_NAME) so hosts()/internal_hosts() -- and therefore
-            # `_select_hosts`/the committee -- never see it; only
-            # terminate_instances (matches both tags) and collector_host()
-            # (COLLECTOR_NAME only) do.
+            # Create one metrics collector in the first configured region.
             region, client = next(iter(self.clients.items()))
             collector_type = getattr(
                 self.settings, 'monitor_instance_type', None
             ) or self.settings.instance_type
-            # Single-AZ pinning: reuse this region's already-resolved (az,
-            # subnet, vpc, security-group-id) -- see the validator loop above
-            # and `_resolve_az_subnet`'s doc comment -- so the collector lands
-            # in the SAME AZ as this region's validators (both spot launch
-            # calls agree), keeping collector<->validator scrape traffic
-            # intra-AZ too.
+            # Reuse the validator subnet so collector traffic stays intra-AZ.
             _, collector_subnet_id, _ = az_subnet_by_region[region]
             collector_sg_id = sg_id_by_region[region]
             Print.info(
@@ -602,15 +466,7 @@ class InstanceManager:
             raise BenchError('Failed to create AWS instances', AWSError(e))
 
     def _spot_price(self, client, instance_type):
-        ''' Latest Spot price (USD/hr, float) for `instance_type` in
-        `client`'s region, or None if the lookup fails (no history returned,
-        or an API error) -- callers fall back to a static on-demand estimate
-        in that case (see `ON_DEMAND_FALLBACK_PRICE`).
-
-        `MaxResults=1` relies on `describe_spot_price_history` returning
-        entries most-recent-timestamp-first when no explicit StartTime/
-        EndTime is given (the documented/observed default) -- this is a
-        "latest price" read, not a historical query. '''
+        '''Return the latest Spot price, or `None` when unavailable.'''
         try:
             r = client.describe_spot_price_history(
                 InstanceTypes=[instance_type],
@@ -654,57 +510,10 @@ class InstanceManager:
         return '\n'.join(lines)
 
     def estimate_cost(self, states=('pending', 'running')):
-        ''' Deterministic AWS EC2 cost estimate for every instance this
-        harness owns (validators AND the metrics-collector) currently in
-        `states` (default: the ones a teardown is about to terminate) --
-        computed entirely from `describe_instances`/
-        `describe_spot_price_history` (both allowed for this IAM user), with
-        NO Cost Explorer/CloudTrail calls (both denied).
+        '''Estimate EC2 cost for instances in `states`.
 
-        For each instance: alive_hours = (now(UTC) - LaunchTime) / 3600.
-        Spot instances (`InstanceLifecycle == 'spot'`) get priced from the
-        latest `describe_spot_price_history` entry for their (region,
-        instance type), cached per (region, type) so each pair is queried at
-        most once regardless of instance count. Non-spot instances, and spot
-        instances whose price lookup fails, fall back to a static on-demand
-        estimate (`ON_DEMAND_FALLBACK_PRICE`/`DEFAULT_FALLBACK_PRICE`) and are
-        flagged `approximate=True`.
-
-        EXCLUDES: EBS volume cost; EC2->internet egress; and the in-use
-        public IPv4 address charge. The egress exclusion is not negligible --
-        this harness itself generates billed EC2->internet egress on every
-        run, over each instance's PUBLIC ip: `_run_single` downloads every
-        primary/worker/client log file to the coordinator laptop (remote.py's
-        `c.get` calls), and `fetch_collector_metrics` pulls the metrics JSON
-        from the collector. A single 10-node rate point has been measured at
-        ~65 MB of logs in this repo, so a multi-node, multi-rate-point
-        campaign is on the order of 1-2 GB of metered egress. Likewise
-        excluded: the in-use public IPv4 address charge (~$0.005/hr per
-        address; a 20-validator + 1-collector testbed carries 21 of them,
-        ~$0.105/hr total), which is larger than the egress line for a short
-        run. What IS genuinely free, not merely excluded: node<->node/
-        collector traffic over private VPC IPs (see `internal_hosts()`),
-        because every instance is also pinned to a single availability zone
-        (see `create_instances`/`_resolve_az_subnet`), making that traffic
-        intra-AZ, which AWS does not bill. Spot is billed per-second, so
-        `alive_hours` itself is exact -- the only approximation is the
-        fallback price path.
-        This must be called while instances are still up (LaunchTime is only
-        visible pre-termination), i.e. BEFORE `terminate_instances()`.
-
-        Returns:
-          {
-            'total_usd': float,
-            'breakdown': [
-              {
-                'region': str, 'instance_type': str, 'count': int,
-                'price_per_hour': float, 'approximate': bool,
-                'instance_hours': float, 'subtotal_usd': float,
-              }, ...
-            ],
-            'formatted': str,  # multi-line human-readable report
-          }
-        '''
+        The estimate excludes EBS, internet egress, and public IPv4 charges.
+        Call it before termination so launch times are available.'''
         now = datetime.now(timezone.utc)
         spot_price_cache = {}  # (region, instance_type) -> float or None
         # (region, instance_type, approximate) -> {'count', 'instance_hours', 'price'}
@@ -849,24 +658,10 @@ class InstanceManager:
             raise BenchError('Failed to gather instances IPs', AWSError(e))
 
     def internal_hosts(self, flat=False):
-        ''' PRIVATE (VPC-internal) IPs, index-aligned per region with
-        `hosts()` (both are read from a single `_paired_hosts()` snapshot per
-        call). The Committee (primary/worker/consensus/transactions/metrics
-        addresses -- everything nodes and collocated clients talk to each
-        other over) must be built from these, never from `hosts()`'s public
-        IPs: same-region node<->node traffic over public IPs is billed
-        cross-instance data transfer and routes through the internet edge
-        instead of the VPC, which is what collapsed a live 20-node run to
-        ~1.6k tx/s at 50k offered.
+        '''Return validator private IPs, aligned with `hosts()` by region.
 
-        Residual risk: `hosts()` and `internal_hosts()` are two independent
-        `describe_instances` calls, so pairing across the two calls relies on
-        AWS returning the same per-region instance order both times (true in
-        practice for an unchanged, non-transitioning fleet queried
-        back-to-back, which is how `_select_hosts`/`_select_hosts_config`
-        call them in `run()`) rather than on a shared API response.
-
-        Validators ONLY -- see `hosts()`'s same note re: the metrics-collector. '''
+        These addresses are used for node and client traffic. The collector is
+        excluded.'''
         try:
             pairs = self._paired_hosts(['pending', 'running'], name=self.INSTANCE_NAME)
             ips = {region: [priv for _, priv in v] for region, v in pairs.items()}

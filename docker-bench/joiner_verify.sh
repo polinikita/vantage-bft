@@ -1,31 +1,50 @@
 #!/usr/bin/env bash
-# Does the recovered joiner stop syncing, reach peer parity, and contribute?
-#
-# Pass conditions, all four:
-#   1. vantage_sequence_sync_recovered -> 1
-#   2. transfers/s -> 0 and STAYS 0
-#   3. lag settles toward the healthy peer spread (~19-23 views), not 50-120
-#   4. own-committed / own-published ratio comparable to peers
-#
-# --settle 180 so there is a long post-recovery window to prove (2) and (3) rather than
-# just catching the moment of catch-up.
+# Runs and scores the late-joiner recovery regression.
 set -uo pipefail
-cd /Users/nikitapolianskii/code/vantage/docker-bench
-# NOT under ./data -- late_joiner.sh's gen step recreates that directory, which unlinks
-# the run log mid-run and loses the report (observed 2026-08-10: anchor1's log vanished).
-OUT="${OUT:-./joiner-runs}"
-mkdir -p "$OUT"
-banner () { echo "===== $* :: $(date +%T)"; }
 
-NAME="${1:-latch}"
-# Committee size; the joiner is node-(NODES-1). joiner_score.py reads the same variable.
-NODES="${NODES:-21}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+OUT="${OUT:-./joiner-runs}"
+NAME="${1:-late-joiner}"
+NODES="${NODES:-10}"
+JOINER="node-$((NODES - 1))-primary"
+mkdir -p "$OUT"
+
+banner() {
+    echo "===== $* :: $(date +%T)"
+}
+
+DAY="$(date +%F)"
+START="$(date +%T)"
 banner "$NAME START (nodes=$NODES)"
-./late_joiner.sh --nodes "$NODES" --rate 1000 --down 60 --settle 120 \
-    --interval 50 \
-    --sequence-sync-min-gap-views 100 \
-    --sequence-sync-shed-gap-views 100 > "$OUT/$NAME.log" 2>&1
-banner "$NAME RUN EXIT=$?"
-python3 joiner_report.py --window 700 > "$OUT/$NAME.report" 2>&1
-banner "$NAME REPORT done"
-banner "ALL DONE"
+
+RUN_ARGS=(
+    --nodes "$NODES"
+    --rate 1000
+    --down 60
+    --settle 120
+    --interval 50
+    --sequence-sync-min-gap-views 100
+    --sequence-sync-shed-gap-views 300
+)
+./late_joiner.sh "${RUN_ARGS[@]}" > "$OUT/$NAME.log" 2>&1
+RUN_RC=$?
+END="$(date +%T)"
+banner "$NAME RUN EXIT=$RUN_RC"
+
+python3 joiner_report.py --joiner "$JOINER" --nodes "$NODES" --window 700 \
+    > "$OUT/$NAME.report" 2>&1
+REPORT_RC=$?
+cat "$OUT/$NAME.report"
+
+NODES="$NODES" python3 joiner_score.py "$START" "$END" "$DAY" > "$OUT/$NAME.score" 2>&1
+SCORE_RC=$?
+cat "$OUT/$NAME.score"
+
+if [ "$RUN_RC" -ne 0 ] || [ "$REPORT_RC" -ne 0 ] || [ "$SCORE_RC" -ne 0 ]; then
+    banner "$NAME FAIL"
+    exit 1
+fi
+
+banner "$NAME PASS"

@@ -39,14 +39,12 @@ impl VotesAggregator {
         }
         let author = vote.author;
         // Ensure it is the first time this authority votes.
-        //println!("author is {:?}", author);
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 
         self.votes.push((author, vote.signature));
         self.dissemination_weight += committee.stake(&author);
 
         if self.dissemination_weight >= committee.validity_threshold() {
-            //self.dissemination_weight = 0;
             if self.diss_cert.is_none() {
                 let dissemination_cert: Certificate = Certificate {
                     author: vote.origin,
@@ -58,11 +56,9 @@ impl VotesAggregator {
                 self.diss_cert = Some(dissemination_cert);
             }
             self.complete = true;
-            //return Ok(self.diss_cert.clone());
             return Ok((true, true));
         }
         Ok((false, false))
-        //Ok(self.diss_cert.clone())
     }
 
     pub fn get(&mut self) -> DagResult<Option<Certificate>> {
@@ -81,7 +77,7 @@ pub struct QCMaker {
     pub votes: Vec<(PublicKey, Signature)>,
     used: HashSet<PublicKey>,
 
-    pub try_fast: bool, //TODO: Configure it for Fast path (if it's a Quorummaker for Prepare)
+    pub try_fast: bool,
     qc_dig: Digest,
     first: bool, //Indicate when SlowQC is first ready -> I.e. only start ONE timer.
     completed_fast: bool, //Indicate whether or not we succeeded on Fast Path. This stops timer that loopbacks from re-submitting QC
@@ -106,14 +102,11 @@ impl QCMaker {
         vote: (Digest, Signature),
         committee: &Committee,
     ) -> DagResult<(bool, Option<QC>)> {
-        //bool = QC is available. Option = Some only if QC ready to be used.
-        //println!("calling append");
+        // A QC is available only when the returned value is `Some`.
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
-        //println!("after ensure");
 
         self.votes.push((author, vote.1));
         self.weight += committee.stake(&author);
-        //println!("QC weight is {:?}", self.weight);
 
         if self.try_fast {
             return self.check_fast_qc(vote.0, committee);
@@ -160,7 +153,7 @@ impl QCMaker {
         Ok((false, None))
     }
 
-    //Call this function to fetch slowQC after fastQC timer expires
+    // Returns the slow QC after the fast-path timer expires.
     pub fn get_qc(&mut self) -> DagResult<(bool, Option<QC>)> {
         if self.completed_fast {
             return Ok((false, None)); //Already finished fast.

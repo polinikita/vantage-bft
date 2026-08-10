@@ -1,30 +1,3 @@
-// SEQUENCE-CHECKPOINT-SYNC-PLAN.md §10 -- Phase C staging: turn a VERIFIED sequence
-// target into verified headers this node can sequence.
-//
-// A verified transfer yields per-view `(outcome, delta)`, where the delta is a list of
-// block DIGESTS -- the identities of the blocks the target says were output, not the
-// blocks themselves. Nothing can be installed until those headers are in the local cache
-// and chain-verified, so this module is the bridge: it turns each view's outcome
-// manifests into fetch work for the existing `Repairer`, and reports when a view's whole
-// delta is finally sequence-ready.
-//
-// The fetch instruction is the OUTCOME's manifests, not the delta. A `Manifest` entry is
-// exactly a `BlockRef`, and `Repairer::authorize` already walks the named lane's prefix,
-// requesting every missing ancestor with bounded fan-out, a congestion window and worker-
-// payload sync on arrival. The delta is the completion test instead: it is the
-// authoritative list of what this view must sequence, and checking it against the cache
-// works no matter how the headers arrived, so ordinary dissemination beating repair to
-// them costs nothing. Worker payload materialization is deliberately not part of this
-// readiness gate: the commit notification carries batch digests to the worker
-// synchronizer, which is the layer responsible for fetching transaction bytes.
-//
-// PACING. A target can span hundreds of views across n lanes, and authorizing all of it at
-// once grows repair's authorized suffix without bound. So views are admitted in install
-// order behind a hard window: at most `window_views` views in flight. An earlier version
-// also vetoed admission while `Repairer::pending_settle_len()` was high, but that signal
-// is high precisely because the node is behind. Keying rescue on it made the installer
-// stop in the condition it exists to clear.
-
 use crate::messages::Header;
 use crate::primary::{Height, View};
 use crate::vantage::block::BlockRef;
@@ -34,26 +7,20 @@ use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Views admitted into the fetch window at once. The installer applies views in order,
-/// but fetch must run farther ahead: a late joiner otherwise waits on one slow repaired
-/// header inside an eight-view window while hundreds of later headers could already be in
-/// flight. 64 keeps the authorized set bounded (`64 * n` refs) while giving repair enough
-/// runway to overlap WAN delay.
+/// Maximum number of views admitted for concurrent fetch.
 pub const DEFAULT_WINDOW_VIEWS: usize = 64;
 
-/// Retained for config compatibility. Admission is now bounded by `DEFAULT_WINDOW_VIEWS`
-/// only; repair backlog is an outcome of lag and must not veto state sync.
+/// Retained for configuration compatibility; admission ignores this value.
 pub const DEFAULT_SETTLE_CEILING: usize = 2_048;
 
-/// What a rebase concluded about a target after the cursor moved under it.
+/// Result of rebasing an installation target onto local progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseOutcome {
-    /// The target still has an installable suffix.
+    /// An installable suffix remains.
     Continue,
-    /// Ordinary dissemination reached the target on its own; nothing left to install.
+    /// Local execution reached or passed the target.
     Overtaken,
-    /// The head local execution derived at the rebase boundary is not the one the verified
-    /// chain records. Installing the suffix would splice it onto a divergent history.
+    /// The verified and local sequence heads disagree at the rebase boundary.
     Diverged {
         view: View,
         expected: Digest,
@@ -64,47 +31,32 @@ pub enum RebaseOutcome {
 #[derive(Debug)]
 struct StagedView {
     outcome: SequenceOutcome,
-    /// The verified output of this view, in emission order. Both the completion test and,
-    /// in the install step, the delivery order.
+    /// Verified output digests in emission order.
     delta: Arc<[Digest]>,
-    /// `outcome`'s manifest entries: what to hand `Repairer::authorize`.
     refs: Vec<BlockRef>,
     admitted: bool,
-    /// Number of consecutive deliverable digests already checked. Readiness validation is
-    /// resumed from here so a large view is never re-scanned from its first block.
+    /// Number of consecutive deliverable digests already checked.
     ready_prefix: usize,
-    /// Every digest in `delta` is cached and block-verified. Latched: the cache only
-    /// grows within a session for blocks this range needs, and re-checking a finished
-    /// view every tick is the per-tick sweep this module exists to avoid.
     complete: bool,
 }
 
-/// A verified target being turned into locally held blocks.
-///
-/// Holds no borrow of the transfer that produced it -- the transfer is retired as soon as
-/// it verifies, and everything needed to install is copied out here.
+/// Converts a verified sequence target into ordered, locally deliverable views.
 #[derive(Debug)]
 pub struct SequenceInstall {
-    /// Highest view the local chain held when the transfer started. Installation covers
-    /// `base_view + 1 ..= target_view`.
     base_view: View,
     target_view: View,
     target_head: Digest,
     views: BTreeMap<View, StagedView>,
-    /// The verified chain's head at each view in the range, kept after the view itself is
-    /// installed or dropped. `rebase` needs the head at a boundary the staged views no
-    /// longer cover, so this deliberately outlives `views`.
+    lane_tips: BTreeMap<PublicKey, BlockRef>,
+    /// Verified heads retained for rebase checks after staged views are removed.
     heads: BTreeMap<View, Digest>,
-    /// Next view to admit into the fetch window.
     next_admit: View,
-    /// Next view to install. Never runs ahead of `next_admit`.
     next_install: View,
     window_views: usize,
 }
 
 impl SequenceInstall {
-    /// `staged` is the verified per-view output, which must cover `base_view+1..=target`
-    /// contiguously; anything outside that range is dropped rather than trusted.
+    /// Stages entries in `base_view + 1..=target_view` and drops entries outside that range.
     pub fn new(
         base_view: View,
         target_view: View,
@@ -119,13 +71,20 @@ impl SequenceInstall {
             .filter(|(view, _)| *view > base_view && *view <= target_view)
             .collect();
         let mut views = BTreeMap::new();
+        let mut lane_tips = BTreeMap::new();
         for (view, outcome, delta) in staged {
             if view <= base_view || view > target_view {
                 continue;
             }
             let refs = manifest_refs(&outcome);
-            // A Skip carries no manifest and no output, so it is finished on arrival and
-            // must never wait on a fetch that will never be needed.
+            for r in &refs {
+                let replace = lane_tips
+                    .get(&r.0)
+                    .is_none_or(|current: &BlockRef| r.1 > current.1);
+                if replace {
+                    lane_tips.insert(r.0, r.clone());
+                }
+            }
             let complete = delta.is_empty() && refs.is_empty();
             views.insert(
                 view,
@@ -144,6 +103,7 @@ impl SequenceInstall {
             target_view,
             target_head,
             views,
+            lane_tips,
             heads,
             next_admit: base_view + 1,
             next_install: base_view + 1,
@@ -155,27 +115,9 @@ impl SequenceInstall {
         (self.target_view, &self.target_head)
     }
 
-    /// Drop the views ordinary execution reached while the blocks were still being fetched.
-    ///
-    /// `base_view` is where the local chain stood when the TRANSFER started, and a node
-    /// that is merely slow rather than stuck keeps committing the whole time. Without this
-    /// the first `Cursor::install` would be `OutOfOrder` against a cursor that has moved
-    /// on, and a target still perfectly good above the new position would be abandoned.
-    ///
-    /// `local_head` is the head the local chain derived at `local_view`, and it is
-    /// REVALIDATED against the verified chain before any prefix is dropped. Skipping that
-    /// check would be the one way this mechanism could install a correct suffix onto a
-    /// divergent prefix: the verified chain says what the head at `local_view` must be, and
-    /// if the locally derived one differs then everything above it is being spliced onto a
-    /// history no correct party shares. The remaining suffix is otherwise unaffected -- the
-    /// chain is per-view, so dropping a REVALIDATED prefix weakens nothing.
-    ///
-    /// A boundary outside the target's range cannot be checked and is not treated as
-    /// agreement: below `base_view` the chain says nothing, and at or above `target_view`
-    /// the target is spent anyway.
+    /// Rebases onto local progress and rejects a conflicting verified head.
     pub fn rebase(&mut self, local_view: View, local_head: &Digest) -> RebaseOutcome {
         if local_view >= self.next_install {
-            // Only meaningful where the verified chain has an opinion.
             if let Some(expected) = self.heads.get(&local_view) {
                 if expected != local_head {
                     return RebaseOutcome::Diverged {
@@ -202,33 +144,16 @@ impl SequenceInstall {
         self.base_view
     }
 
-    /// Contiguity is a precondition for installing anything: the cursor advances one view
-    /// at a time, so a hole makes every later view unreachable no matter what arrives.
-    /// Checked once, at construction time, rather than discovered mid-install.
     pub fn is_contiguous(&self) -> bool {
         (self.base_view + 1..=self.target_view).all(|v| self.views.contains_key(&v))
     }
 
-    /// The highest `(author, height)` this target needs from each lane.
-    ///
-    /// For seeding repair's holder index from the checkpoint announcers. That index is
-    /// keyed by lane and keeps the maximum height per peer, so one entry per author
-    /// carries exactly the same information as every manifest entry would, at `n` updates
-    /// instead of `views * n`.
-    ///
-    /// Sound to attribute to an announcer: a first-hand announcement claims the sender
-    /// terminally processed through the target view, and a party cannot terminally process
-    /// a view without holding the blocks its manifests name. A lying announcer costs one
-    /// misdirected request, never correctness -- the index only biases WHICH peer is asked.
     pub fn lane_tips(&self) -> Vec<(PublicKey, Height)> {
-        let mut tips: BTreeMap<PublicKey, Height> = BTreeMap::new();
-        for staged in self.views.values() {
-            for (author, height, _) in &staged.refs {
-                let entry = tips.entry(*author).or_insert(0);
-                *entry = (*entry).max(*height);
-            }
-        }
-        tips.into_iter().collect()
+        self.lane_tips.values().map(|r| (r.0, r.1)).collect()
+    }
+
+    pub fn lane_tip(&self, author: &PublicKey) -> Option<BlockRef> {
+        self.lane_tips.get(author).cloned()
     }
 
     pub fn views_total(&self) -> usize {
@@ -239,7 +164,6 @@ impl SequenceInstall {
         self.views.values().filter(|v| v.complete).count()
     }
 
-    /// Admitted, still waiting on blocks.
     pub fn views_in_flight(&self) -> usize {
         self.views
             .values()
@@ -247,10 +171,6 @@ impl SequenceInstall {
             .count()
     }
 
-    /// Digests admitted into the fetch window whose headers are still not sequence-ready.
-    /// Diagnostic only -- an install that stops making progress is otherwise
-    /// indistinguishable from a slow one. Deliberately bounded to admitted views so the
-    /// gauge cannot scan a thousand-view target on every tick.
     pub fn blocks_awaited(&self, blocks: &SharedBlocks) -> usize {
         let cache = blocks.lock();
         self.views
@@ -261,20 +181,17 @@ impl SequenceInstall {
             .count()
     }
 
-    /// Missing output digests in install order, restricted to the admitted window.
-    ///
-    /// The ordinary repairer walks from manifest tips and is the correctness fallback,
-    /// but it requests individual digests. State sync can ask the certified checkpoint
-    /// sources for these already-committed output identities in bounded batches. Deltas
-    /// are disjoint by cursor construction, so no cross-view dedup set is needed here.
-    pub fn missing_digests(&self, blocks: &SharedBlocks, limit: usize) -> Vec<Digest> {
+    /// Returns missing headers from at most `scan_limit` staged positions.
+    pub fn missing_digests(&self, blocks: &SharedBlocks, scan_limit: usize) -> Vec<Digest> {
         let cache = blocks.lock();
         let mut out = Vec::new();
+        let mut examined = 0usize;
         for staged in self.views.values().filter(|v| v.admitted && !v.complete) {
             for digest in staged.delta.iter().skip(staged.ready_prefix) {
-                if out.len() >= limit {
+                if examined >= scan_limit {
                     return out;
                 }
+                examined += 1;
                 if !deliverable(&cache, digest) {
                     out.push(digest.clone());
                 }
@@ -283,21 +200,10 @@ impl SequenceInstall {
         out
     }
 
-    /// Return a bounded set of cached headers whose worker payload is still missing.
-    /// Payload readiness is monotonic, but the initial Synchronize can be lost; callers
-    /// use this to retry without requiring another header announcement.
-    ///
-    /// Each view is scanned from `ready_prefix`, not from its first digest. Everything
-    /// below that index was already observed deliverable and `payload_ok` never goes back
-    /// to false, so re-examining it can only ever produce misses -- and this runs every
-    /// tick against up to `window_views` deltas that are each a whole lane suffix, which is
-    /// exactly the per-tick sweep over already-settled state this module exists to avoid.
     pub fn payload_retry_headers(&self, blocks: &SharedBlocks, limit: usize) -> Vec<Header> {
         let cache = blocks.lock();
         let mut out = Vec::new();
         for staged in self.views.values().filter(|v| v.admitted && !v.complete) {
-            // Deltas are disjoint across views -- `expand` deduplicates against `D` before
-            // a digest is ever recorded -- so no cross-view dedup set is needed here.
             for digest in staged.delta.iter().skip(staged.ready_prefix) {
                 if out.len() >= limit {
                     return out;
@@ -313,9 +219,7 @@ impl SequenceInstall {
         out
     }
 
-    /// Re-test at most `budget` new digests and latch views whose whole delta can be
-    /// sequenced. Each view resumes at its first unchecked digest, avoiding a full scan on
-    /// every tick while preserving strict prefix readiness.
+    /// Checks at most `budget` digests and returns the number examined.
     pub fn refresh_budgeted(&mut self, blocks: &SharedBlocks, budget: usize) -> usize {
         let cache = blocks.lock();
         let mut examined = 0usize;
@@ -345,31 +249,18 @@ impl SequenceInstall {
         self.refresh_budgeted(blocks, usize::MAX);
     }
 
-    /// Refs to hand `Repairer::authorize`, respecting the install window.
-    ///
-    /// Returns empty when the window is full or the target is fully staged; both are
-    /// ordinary, not errors. The `pending_settle_len` parameter is kept so older call
-    /// sites/tests using the pre-window-only API still compile, but it deliberately does
-    /// not gate admission.
+    /// Admits views in order while the fetch window has capacity.
     pub fn admit(&mut self, _pending_settle_len: usize) -> Vec<BlockRef> {
         let mut out = Vec::new();
-        // Counted ONCE, then tracked locally. `views_in_flight` is O(staged views) -- the
-        // whole gap, thousands of entries -- and evaluating it in the loop condition made
-        // admission O(window * gap) on every 100 ms tick (64 x 46,800 ~= 3M visits/tick at
-        // a 60-minute gap). Nothing inside the loop completes a view, so the only change
-        // this pass can make to the count is the admissions it performs itself.
         let mut in_flight = self.views_in_flight();
         while self.next_admit <= self.target_view && in_flight < self.window_views {
             let view = self.next_admit;
             let Some(staged) = self.views.get_mut(&view) else {
-                // A hole: `is_contiguous` already refused this target, so reaching here
-                // means the install was started anyway. Stop rather than skip -- skipping
-                // would install a gap.
                 break;
             };
             self.next_admit += 1;
             if staged.complete {
-                continue; // Skip view, or one ordinary dissemination already delivered.
+                continue;
             }
             staged.admitted = true;
             in_flight += 1;
@@ -378,9 +269,6 @@ impl SequenceInstall {
         out
     }
 
-    /// The next view ready to apply, or `None` while its headers are still missing.
-    /// Strictly in order: a later complete view is never installed ahead of an earlier
-    /// incomplete one.
     pub fn installable(&self) -> Option<View> {
         if self.next_install > self.target_view {
             return None;
@@ -389,14 +277,12 @@ impl SequenceInstall {
         staged.complete.then_some(self.next_install)
     }
 
-    /// The verified content of `view`, for the caller to apply.
+    /// Returns the verified outcome and output order for a staged view.
     pub fn view_output(&self, view: View) -> Option<(&SequenceOutcome, Arc<[Digest]>)> {
         let staged = self.views.get(&view)?;
         Some((&staged.outcome, Arc::clone(&staged.delta)))
     }
 
-    /// Record that `view` has been applied. Panics only on a caller bug (installing out of
-    /// order), which would otherwise corrupt the cursor silently.
     pub fn mark_installed(&mut self, view: View) {
         assert_eq!(
             view, self.next_install,
@@ -411,24 +297,13 @@ impl SequenceInstall {
     }
 }
 
-/// Can this block be sequenced by the consensus cursor?
-///
-/// Presence is NOT enough: a cached header must also have passed `block_ok`, otherwise a
-/// checkpoint transfer could make the cursor emit an unauthenticated lane suffix. Worker
-/// payload possession is intentionally not required here. `Cursor::emit` sends the header's
-/// batch digests to the worker, and the worker synchronizer is responsible for downloading
-/// any transaction bytes it missed while the primary catches up consensus state.
+/// Readiness requires a cached, block-verified header; payload retrieval is handled later.
 fn deliverable(cache: &BlockCache, digest: &Digest) -> bool {
     cache
         .get(digest)
         .is_some_and(|entry| entry.block_ok_verified)
 }
 
-/// A view's fetch instruction: every manifest entry named by its outcome.
-///
-/// `Full` names both the core `c` and the terminal `t`; the union is required, because the
-/// delta is the expansion of both and a block reachable only through `t` would otherwise
-/// never be requested.
 fn manifest_refs(outcome: &SequenceOutcome) -> Vec<BlockRef> {
     match outcome {
         SequenceOutcome::Full { c, t } => c.iter().chain(t.iter()).cloned().collect(),

@@ -1,4 +1,3 @@
 boto3==1.43.53
 fabric>=3.2
 matplotlib==3.11.1
-google-cloud-compute==1.50.0

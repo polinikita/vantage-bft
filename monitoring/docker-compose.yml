@@ -1,12 +1,6 @@
-# Optional monitoring stack for `node local-benchmark` (PHASE2-SPEC.md #8), also
-# reused for docker-bench and orchestration-mode (AWS) monitoring
-# (METRICS-DASHBOARD-SPEC.md §4). Deliberate deviation from starfish's own compose:
-# starfish also
-# dockerizes the node processes themselves (one `dry-run` container per authority);
-# here the nodes run natively in one process (`node local-benchmark`), so this compose
-# file brings up only the stock prometheus+grafana containers, reaching the native
-# nodes' metrics endpoints via `host.docker.internal` (see the generated
-# `<data-dir>/prometheus.yaml`).
+# Optional monitoring stack for `node local-benchmark`, docker-bench, and remote runs.
+# The compose file starts Prometheus and Grafana; node metrics are reached through
+# the generated target file.
 #
 # Local mode usage (from the repository root, after starting `node local-benchmark` in
 # another terminal so `.local-bench/prometheus.yaml` exists):
@@ -23,8 +17,7 @@
 # plain `docker compose up -d` with no env var is unchanged local-mode behavior). See
 # monitoring/README.md for the full walkthrough of all three flows.
 #
-# Host ports 3003/9095 (not starfish's own 3002/9093): this machine's Docker Desktop
-# already holds 3001/3002, and starfish's own local-dryrun compose collides with 9093.
+# Host ports 3003/9095 avoid the ports used by the local-dryrun stack.
 
 services:
   prometheus:

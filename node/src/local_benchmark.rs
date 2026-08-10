@@ -1,11 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// `node local-benchmark` (PHASE2-SPEC.md #8): self-hosts a whole local run -- every
-// primary, every worker, and one client task per worker -- in this single process,
-// replacing `fab local` as the local vehicle (fab stays for remote/Phase-7 runs).
-// Reuses the exact same spawn paths (`Primary::spawn`, `Worker::spawn`) and client
-// logic (`crate::client::Client`) the standalone binaries use -- no parallel
-// reimplementation of any of it -- plus generates a `prometheus.yaml` for the optional
-// `monitoring/` docker-compose stack.
+// Run primaries, workers, and clients in one process and generate Prometheus targets.
 
 use crate::client::{Client, TransactionMode};
 use crate::CHANNEL_CAPACITY;
@@ -81,11 +75,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         nodes
     );
     let live_nodes = nodes - crash;
-    // Load-skew: which of the LIVE nodes spawn client tasks. Absent, defaults to every
-    // live node (today's behavior, byte-identical). The loaded set is always "the
-    // first `load_nodes` live indices" -- since crashed nodes are already excluded by
-    // being the trailing `crash` indices (R2, just above), this selection can never
-    // overlap the crashed set without any extra bookkeeping here.
+    // Load-skew: absent defaults to every live node. The loaded set is the first
+    // `load_nodes` live indices; crashed nodes are outside this range.
     let load_nodes: usize = match matches.get_one::<String>("load-nodes") {
         Some(s) => s
             .parse()
@@ -120,11 +111,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold,
         nodes
     );
-    // Time-windows the data-plane withholding fault injector above: absent (the
-    // default) means WHOLE-RUN withholding, byte-identical to --withhold's original
-    // (unwindowed) behavior. `--withhold-at 0` (withholding starts immediately at
-    // measurement start) is just an ordinary value -- there is no "explicit 0 vs.
-    // absent" ambiguity to resolve here.
+    // An absent withholding window applies for the full run. `--withhold-at 0`
+    // starts withholding at the measurement start.
     let withhold_at_secs: Option<u64> = matches
         .get_one::<String>("withhold-at")
         .map(|s| {
@@ -171,31 +159,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--ack-watermark-period-ms must be a non-negative integer")?;
-    // PHASE7-PREP-NOTES.md Finding A: diagnostic-only, off by default. Auto-enabled
-    // whenever a withholding window is configured (`--withhold-at`), since its whole
-    // point is to make the committed-throughput dip/recovery shape visible (see the
-    // `TIMELINE:` series below).
+    let ack_watermarks = !matches.get_flag("no-ack-watermarks");
+    let echo_avail_claims = ack_watermarks && !matches.get_flag("no-echo-avail-claims");
+    // Enable the timeline when requested or when a withholding window is configured.
     let timeline: bool = matches.get_flag("timeline") || withhold_at_secs.is_some();
-    // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `--latency-table <csv>` (an n x n
-    // RTT-ms matrix, node index = committee order) takes precedence over
-    // `--mimic-latency-ms <u64>` (the uniform EXPLICIT OVERRIDE shorthand -- defined
-    // as exactly the trivial table whose every cell is that value -- see
-    // `LatencyTable::uniform`). If NEITHER is given, DEFAULT to the real 10-AWS-region
-    // RTT matrix (`LatencyTable::aws_rtt`, ported VERBATIM from starfish) -- mirroring
-    // starfish's own default for single-region AWS benchmarking; flags above override
-    // this default.
-    //
-    // Fable audit FIX 1: the clap default for `--mimic-latency-ms` is the string "0",
-    // which is indistinguishable from an EXPLICITLY PASSED `--mimic-latency-ms 0`
-    // unless the two are told apart via clap's value-source API -- otherwise, once
-    // "neither given" started defaulting to `aws_rtt` below, no flag combination could
-    // ever request zero injected latency again (every existing zero-latency
-    // invocation, e.g. local-dryrun's documented pure-loopback mode, would silently
-    // become WAN-shaped). Resulting precedence:
-    //   1. `--latency-table <csv>` given                   -> that CSV
-    //   2. `--mimic-latency-ms <n>` explicitly given, n > 0 -> `LatencyTable::uniform(nodes, n)`
-    //   3. `--mimic-latency-ms 0` explicitly given          -> `None` (zero injected latency, pure loopback)
-    //   4. neither given                                    -> `LatencyTable::aws_rtt(nodes)` (default)
+    // A latency table takes precedence over a uniform value. An explicit zero
+    // selects loopback latency; omitting both options selects the AWS RTT table.
     let mimic_latency_ms: u64 = matches
         .get_one::<String>("mimic-latency-ms")
         .unwrap()
@@ -264,16 +233,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         delta_ms, max_batch_delay_ms, max_header_delay_ms
     );
     println!("Data dir: {}", data_dir.display());
-    if !matches.get_flag("no-ack-watermarks") {
+    if echo_avail_claims {
+        println!("Availability acknowledgments: positional claims on AGB echoes (default)");
+    } else if ack_watermarks {
         println!(
-            "Ack watermarks: ON (periodic per-lane availability broadcast every {} ms, replaces per-block acks)",
+            "Availability acknowledgments: periodic VantageAvail every {} ms",
             ack_watermark_period_ms
-        );
-    }
-    if matches.get_flag("echo-avail-claims") {
-        println!(
-            "Echo availability claims: ON (positional bit-per-lane on the AGB echo; the \
-             periodic VantageAvail flush is NOT scheduled)"
         );
     }
     if !matches.get_flag("no-digest-statements") {
@@ -294,12 +259,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         );
     }
     if withhold > 0 {
-        // Stable, grep-parseable: the "only X of N nodes" count is the staggered
-        // unblocked half INCLUDING the withholding sender itself (n - floor(n/2)),
-        // matching `withheld_destinations`'s own derivation exactly. The line stays
-        // BYTE-IDENTICAL to c35fc4a's own (grep-stable) wording when no window is
-        // configured; `--withhold-at` appends one trailing clause rather than
-        // altering anything already printed.
+        // Report the reachable half, including the withholding sender.
         let reachable = nodes - nodes / 2;
         match withhold_at_secs {
             Some(at) => println!(
@@ -320,7 +280,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     }
     println!("======================================\n");
 
-    // Wipe and recreate the data dir (starfish's own local-benchmark does the same).
+    // Recreate the benchmark data directory.
     let _ = fs::remove_dir_all(&data_dir);
     fs::create_dir_all(&data_dir).context("Failed to create --data-dir")?;
 
@@ -344,21 +304,13 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     let mut parameters = Parameters {
         protocol,
         delta_ms,
-        // FAIRNESS: derive Simple-IT's round timeout from the SAME Delta as Vantage's
+        // Use the same delay base for Simple-IT and Vantage.
         // theta_E/theta_R rather than leaving it on Autobahn's unrelated 5s default.
-        // `CutEngine`'s timer is `parameters.timeout_delay` (simpleit/node.rs), so
-        // without this the two signature-free protocols would be timed off different
-        // bases and any timeout-path comparison would be meaningless. 8x matches the
-        // paper's own Delta_to = (d_s + d_t)Delta for the Opt-RBC variant
-        // (arXiv:2606.14404, Corollary 5: 8Delta + 4delta). Fault-free runs never fire
-        // these timers, so this does not affect happy-path latency either way -- it
-        // makes the comparison principled rather than accidental.
+        // The timer is inactive on the fault-free path. The factors match the
+        // protocol delay bounds.
         timeout_delay: match protocol {
             Protocol::SimpleIt => delta_ms.saturating_mul(8),
-            // arXiv:2606.14404 Corollary 5, variant S (Bracha-RBC): Delta_to = 5Delta
-            // + 2delta -- same treatment as `SimpleIt`'s own 8Delta+4delta comment
-            // just above (the +2delta/+4delta terms are dropped: this local-benchmark
-            // model has no separate delta parameter of its own, only delta_ms).
+            // The Bracha variant uses a five-delay timeout.
             Protocol::SimpleItBracha => delta_ms.saturating_mul(5),
             _ => Parameters::default().timeout_delay,
         },
@@ -369,11 +321,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         batch_messages: !matches.get_flag("no-batch-messages"),
         batch_max_bytes,
         batch_max_delay_ms,
-        // Autobahn (Giridharan et al., SOSP'24) §5.5.3: off by default, byte-identical
-        // behavior when off.
+        // Enable all-to-all transport only when requested.
         all_to_all: matches.get_flag("all-to-all"),
-        ack_watermarks: !matches.get_flag("no-ack-watermarks"),
-        echo_avail_claims: matches.get_flag("echo-avail-claims"),
+        ack_watermarks,
+        echo_avail_claims,
         ack_watermark_period_ms,
         digest_statements: !matches.get_flag("no-digest-statements"),
         withhold_senders: withhold,
@@ -386,10 +337,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold_at_ms: withhold_at_secs.map(|secs| secs * 1000),
         withhold_for_ms: withhold_for_secs * 1000,
         withhold_window: withhold_window_cell.clone(),
-        // PHASE7-PREP-NOTES.md (WAN-shaped local runs): `#[serde(skip)]` on this field
-        // means it never round-trips through the `parameters.json` export just below --
-        // set on the in-memory `Parameters` every node's `Primary::spawn` receives, which
-        // is all `Core::spawn`/`vantage::node::VantageCore::spawn` ever read it from.
+        // This field is in-memory only and is not exported to parameters.json.
         latency_table: latency_table.map(Arc::new),
         ..Parameters::default()
     };
@@ -404,12 +352,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             .context("Failed to write node keypair")?;
     }
 
-    // R2 (PHASE6-SPEC.md): a true crash fault -- the committee above already covers all
-    // `nodes` authorities unchanged (every live node still sees the full membership,
-    // e.g. still counts the crashed node's absence as an ordinary faulty-party gap in
-    // quorum thresholds); only the *spawning* below is restricted to the first
-    // `live_nodes` keypairs, so the trailing `crash` nodes' primary/worker/client tasks
-    // are simply never started -- no process to kill, no message ever sent as them.
+    // Keep the full committee and spawn only the live prefix.
     let live_keypairs = &keypairs[..live_nodes];
 
     // Every LIVE worker's client-facing address -- every client task waits for all of
@@ -433,19 +376,19 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
 
     // Spawn every primary and every worker natively, in this one process -- only for
     // the live nodes (R2).
-    // Fable audit item 1: kept per NODE index (not a flat list) -- with `--workers >
+    // Keep metrics grouped by node. With `--workers >
     // 1`, each worker's own registry only ever observes the slice of the committed
     // stream tagged with ITS OWN worker id (`Synchronizer::observe_committed`), so
     // summing every worker belonging to the same node recovers that node's true
     // committed total; only THEN is it comparable across nodes (see `print_results`).
     let mut worker_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
-    // PHASE6-SPEC.md §9 gate amendment: `vantage_seals` lives on each PRIMARY's own
+    // `vantage_seals` lives on each primary's own
     // registry (distinct from `worker_metrics` above) -- kept per node index so the
     // RESULTS block can print each node's own route breakdown (they can legitimately
     // differ across nodes) plus a summed total.
     let mut primary_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
     let mut metrics_targets: Vec<(String, SocketAddr)> = Vec::new(); // (label, addr) for prometheus.yaml
-                                                                     // Fable audit item 5: every client task's handle, so they can be stopped (aborted)
+                                                                     // Client task handles for shutdown.
                                                                      // before the final, drained re-read -- see the end of this fn.
     let mut client_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -483,7 +426,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         client_handles.extend(workers_client_handles);
     }
 
-    // Generate prometheus.yaml for the optional monitoring/ stack (PHASE2-SPEC.md #8):
+    // Generate prometheus.yaml for the optional monitoring stack:
     // native nodes reachable from the dockerized prometheus via host.docker.internal.
     write_prometheus_config(&data_dir, &metrics_targets)?;
     println!(
@@ -495,8 +438,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     );
     println!("Grafana (once up): http://localhost:3003\n");
 
-    // METRICS-DASHBOARD-SPEC.md §5: `--duration 0` = run until Ctrl-C (clean shutdown,
-    // final RESULTS still printed). Actual wall-clock elapsed time is tracked
+    // `--duration 0` runs until Ctrl-C. Track elapsed wall-clock time so
     // separately from the configured `duration` so RESULTS' TPS/BPS figures are
     // correct whether the run went the full configured length, was interrupted
     // early, or (duration 0) has no configured length at all.
@@ -526,7 +468,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         );
     }
     if timeline {
-        // PHASE7-PREP-NOTES.md Finding A: once/sec progress-gauge line per live
+        // Print a once-per-second progress line per live
         // primary, for the whole run -- reads the same registries `print_results`
         // reads below, just every second instead of once at the end. Diagnostic only;
         // does not touch the client/committer/execute path in any way.
@@ -614,13 +556,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     }
 
     let actual_secs = run_start.elapsed().as_secs().max(1);
-    // Unchanged from before this fix: read + print exactly as always (byte-identical
-    // numbers for every existing config, including the default gate config) --
-    // client tasks are still running and the commit pipeline may still be advancing
-    // underneath this read, same as before.
+    // Read results while clients and commits may still be progressing.
     print_results(&worker_metrics, &primary_metrics, actual_secs, protocol, "").await;
 
-    // Fable audit item 5 (measurement window): the RESULTS above can under- or
+    // The first RESULTS block can under- or
     // over-count the tail of the run, since client tasks are never stopped and the
     // registries are read while commits are still non-atomically advancing. Rather
     // than changing the numbers above (which would move already-recorded headline
@@ -662,7 +601,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
-/// METRICS-DASHBOARD-SPEC.md §2: the wire-`type` -> traffic-category map, one per
+/// Map each wire type to a traffic category, one per
 /// protocol family (Vantage's wire variants are entirely disjoint from Autobahn's,
 /// but both protocols share a few names -- e.g. `Header`, `Synchronize`,
 /// `BatchRequest`, `Committed` -- with different category meanings per protocol, so
@@ -695,7 +634,7 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             // because it shares the `Header` wire variant with the publish path --
             // `VantageBodyFetch`/`VantageBodyServe` have no such sharing accident, so
             // both ends of this pair land in "repair" cleanly).
-            // Mechanism A (sender-side lane resume, `vantage::resume`): same "repair"
+            // Lane resume uses the repair category.
             // category as the fetch/serve pairs above -- it recovers already-
             // identified missing data (a peer's own ack-census gap) given only a
             // height, same role as `HeadersRequest`/`VantageBodyFetch` for their own
@@ -716,21 +655,11 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             "Committed" => "metricsplumbing",
             _ => "other",
         },
-        // Simple-IT reuses Vantage's own data plane verbatim (same `LaneManager`/
-        // `Repairer`, hence the identical `Header`/`VantageAck`/`HeadersRequest`/
-        // `Synchronize`/`BatchRequest` wire names and categories below) and adds its
-        // own cut-consensus message family on top, grouped under `consensus` -- the
-        // same category name Autobahn uses for its own consensus-layer messages
-        // below, since this is the same kind of traffic (round-based, leader/vote/
-        // certificate/timeout messages), just from a different protocol. Kept as a
-        // separate arm rather than folded into `Protocol::Vantage`'s (even though the
-        // data-plane lines are identical) so neither protocol's dashboard ever shows
-        // the other's message vocabulary as a valid `msg_type`.
+        // Simple-IT shares the Vantage data plane and adds cut-consensus messages.
         Protocol::SimpleIt => match msg_type {
             "Header" | "Batch" => "dissemination",
             "VantageAck" | "VantageAvail" => "acks",
-            // Mechanism A: same data plane as `Protocol::Vantage`'s own identical
-            // addition above (`SimpleItCore` reuses `LaneManager`/`Wire` verbatim).
+            // Lane resume uses the shared data plane.
             "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageLaneResume" => "repair",
             "SimpleItCutProposal"
             | "SimpleItCutVote"
@@ -749,9 +678,7 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
         Protocol::SimpleItBracha => match msg_type {
             "Header" | "Batch" => "dissemination",
             "VantageAck" | "VantageAvail" => "acks",
-            // Mechanism A: same data plane as `Protocol::SimpleIt`'s own identical
-            // addition above (`SimpleItCore` serves both variants -- see
-            // `SimpleItCore::build`'s own `Variant::{Opt,Bracha}` selection).
+            // Lane resume uses the shared data plane for both variants.
             "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageLaneResume" => "repair",
             "SimpleItCutProposal"
             | "SimpleItCutVote"
@@ -780,8 +707,7 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
 }
 
 /// Spawns one live node's primary in-process -- the exact same `Primary::spawn`
-/// wiring `node run ... primary` uses standalone (PHASE2-SPEC.md #8: "reuses the
-/// exact same spawn paths ... no parallel reimplementation"). The `tx_output`/
+/// wiring `node run ... primary` uses. The `tx_output`/
 /// `rx_output` channel is a same-process no-op consumer, matching
 /// `node/src/main.rs::analyze` (there is no separate application here). Returns
 /// the primary's metrics registry/reporter and its own metrics-scrape target
@@ -826,9 +752,7 @@ fn spawn_node_primary(
         rx_request_header_sync,
         tx_output,
     );
-    // METRICS-DASHBOARD-SPEC.md §8: write-once (see `spawn_node_workers`'s identical
-    // comment -- primary/worker both know `mode` here since `local-benchmark` builds
-    // both).
+    // Record the transaction mode once.
     primary_metrics.set_transaction_mode_info(mode.label());
     // Application logic no-op, matching node/src/main.rs::analyze.
     tokio::spawn(async move { while rx_output.recv().await.is_some() {} });
@@ -847,8 +771,7 @@ fn spawn_node_primary(
 /// still spawn and still listen, they just get no client task. Returns each
 /// worker's metrics registry/reporter alongside its own metrics-scrape target for
 /// `prometheus.yaml` (in worker-id order), plus every spawned client task's own
-/// `JoinHandle` (Fable audit item 5: so the caller can stop it before a final,
-/// drained re-read -- see `run`; empty when `rate_share` is `None`).
+/// `JoinHandle` for each client task, empty when `rate_share` is `None`.
 // clippy::too_many_arguments: see primary/src/committer.rs's identical justification
 // (this local helper mirrors Worker::spawn's own wiring one-for-one).
 #[allow(clippy::too_many_arguments)]
@@ -881,10 +804,7 @@ fn spawn_node_workers(
             parameters.clone(),
             worker_store,
         );
-        // METRICS-DASHBOARD-SPEC.md §8: write-once -- only `local-benchmark` has the
-        // client's tx-mode in scope at registry-construction time (see `Metrics::
-        // set_transaction_mode_info`'s doc for why the standalone `node run` path
-        // doesn't set this).
+        // Record the transaction mode once.
         metrics.set_transaction_mode_info(mode.label());
         let target = (
             format!("node-{}-worker-{}", i, j),
@@ -922,8 +842,7 @@ fn spawn_node_workers(
 }
 
 /// Computed in-process from each worker's own `Registry` -- no scraping, no log
-/// parsing -- aggregated with the same rules `logs.py`'s audited `_real_transaction_
-/// latency` uses (PHASE2-SPEC.md #5 amendments): max for count/misses (every node
+/// parsing. Aggregate counts consistently across worker registries: max for count/misses,
 /// counts the same replicated commit stream), summed sum/sum-of-squares for the exact
 /// avg/stddev ratio, median across nodes for percentiles.
 async fn print_results(
@@ -934,7 +853,7 @@ async fn print_results(
     label: &str,
 ) {
     let mut snapshots: Vec<LatencySnapshot> = Vec::new();
-    // Fable audit item 1: with `--workers > 1`, each worker's registry only ever
+    // With `--workers > 1`, each worker's registry only ever
     // observes the slice of the committed stream tagged with ITS OWN worker id
     // (`Synchronizer::observe_committed` routes a `Committed` notification to the
     // local worker whose id matches the header author's payload entries) -- so
@@ -1044,7 +963,7 @@ async fn print_results(
         }
     }
 
-    // METRICS-DASHBOARD-SPEC.md §2: goodput (submitted vs. sequenced) + wire-taxonomy
+    // Compute goodput (submitted versus sequenced) and wire categories
     // breakdown, computed here (not stored) from the §1 counters. Submitted/wire
     // counters are SUMMED across every node (each node's own independent traffic,
     // additive) -- unlike the replicated-commit-stream latency snapshot above, which
@@ -1132,12 +1051,7 @@ async fn print_results(
         }
     }
 
-    // Mechanism A (sender-side lane resume, `vantage::resume`) diagnostic: read
-    // straight from each primary's own registry -- not derived from the wire-type
-    // counters above (which only ever see what actually reached the wire).
-    // `vantage_lane_resume_send_drops` in particular never appears on the wire at
-    // all by construction (a dropped enqueue never becomes a send), so this is the
-    // only way to observe it post-run.
+    // Read lane-resume counters from each primary registry.
     let resume_requests_sent: u64 = primary_metrics
         .iter()
         .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_requests_sent"))
@@ -1156,7 +1070,7 @@ async fn print_results(
     );
     println!();
 
-    // PHASE6-SPEC.md §9 gate amendment: per-node seal-route breakdown (near-idle/absent
+    // Per-node seal-route breakdown (near-idle/absent
     // on the two Autobahn paths, which never observe into `vantage_seals` at all).
     let mut per_route_totals: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();

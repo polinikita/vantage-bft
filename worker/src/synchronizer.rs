@@ -127,7 +127,7 @@ pub struct Synchronizer {
     /// processing will resume when we get the missing batches in the store or we no longer need them.
     /// It also keeps the round number and a timestamp (`u128`) of each request we sent.
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
-    /// Starfish-parity real transaction latency (PHASE2-SPEC.md #5). Always present
+    /// Real transaction latency. Always present
     /// (the metrics server and its registered gauge shape are always on), but only
     /// observed into under the `benchmark` feature -- genuinely unused (not dead
     /// code to delete) on the default build, hence the feature-scoped allow.
@@ -152,9 +152,8 @@ pub struct Synchronizer {
     /// scan of the live set.
     #[cfg(feature = "benchmark")]
     observed_commits_order: BTreeSet<(u64, Digest)>,
-    /// Digests the primary told us were committed but that missed our local store on
-    /// first read, deferred rather than dropped (see `observe_committed`'s doc
-    /// comment: this is the measurement-bug fix). Maps `(commit_millis, digest)` --
+    /// Digests the primary reported as committed but that missed the local store.
+    /// Maps `(commit_millis, digest)` --
     /// the ORIGINAL commit instant, preserved so a later retry still measures true
     /// commit -> materialise latency, not lookup-time latency -- to the cancel
     /// handle for that digest's `metrics_waiter` wait (see `run`). Same
@@ -176,10 +175,7 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
-        // Fable audit item 4 (WAN latency injection): this authority's own
-        // per-destination artificial latency map (same contract/construction as
-        // `BatchMaker::spawn`'s -- see its doc comment). Applied to worker-to-worker
-        // sync requests, previously undelayed even under a WAN-shaped run.
+        // Per-destination network latency.
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
@@ -264,7 +260,7 @@ impl Synchronizer {
     async fn run(&mut self) {
         let (tx_waiter, mut rx_waiter) =
             channel::<Result<Option<Digest>, StoreError>>(CHANNEL_CAPACITY);
-        // Starfish-parity real transaction latency (PHASE2-SPEC.md #5, amended):
+        // Real transaction latency metrics use deferred retry waiters.
         // metrics-only retry waiters for deferred misses (see `observe_committed`'s doc
         // comment) -- structurally the same "wait for `store.notify_read` or be canceled"
         // shape as the waiters above, just for a different consumer
@@ -306,7 +302,7 @@ impl Synchronizer {
                         //
                         // Deviation from the per-key form: `read_many` reports an
                         // unreadable key as `None`, indistinguishable from absent (it logs
-                        // per key -- see `StoreCommand::ReadMany`), where the old code
+                        // per key -- see `StoreCommand::ReadMany`), where a single
                         // `continue`d and created no waiter. Treating an error as missing
                         // is the safe direction: re-requesting a batch we may already hold
                         // wastes bandwidth, whereas failing to request one we lack is a
@@ -378,7 +374,7 @@ impl Synchronizer {
                     // the feature-scoped allow (not dead code to delete).
                     #[cfg_attr(not(feature = "benchmark"), allow(unused_variables))]
                     PrimaryWorkerMessage::Committed(commit_millis, digests) => {
-                        // Starfish-parity real transaction latency (PHASE2-SPEC.md #5).
+                        // Record real transaction latency when benchmarking is enabled.
                         #[cfg(feature = "benchmark")]
                         for miss in self.observe_committed(commit_millis, digests).await {
                             // SPAWNED, for the same reason as the sync waiters -- see
@@ -476,7 +472,7 @@ impl Synchronizer {
         }
     }
 
-    /// Starfish-parity real transaction latency (PHASE2-SPEC.md #5, amended): for each
+    /// For each
     /// batch the primary just told us was committed, read it from our local store and
     /// observe every contained transaction's TWO latency series --
     /// `transaction_committed_latency` (`commit_millis`, the primary's own instant
@@ -485,7 +481,7 @@ impl Synchronizer {
     /// which would additionally include the primary->worker notification hop and
     /// this task's own queueing delay under load) and `transaction_materialised_
     /// latency` (this call's own "now" minus the same submission timestamp; see that
-    /// field's doc comment on `Metrics` for the starfish-comparable semantics this
+    /// field's doc comment on `Metrics` for the reference-comparable semantics this
     /// adds). The two are nearly identical for an immediate hit; for a digest that
     /// missed and was later resolved by `finish_deferred_retry`, `commit_millis`
     /// stays the ORIGINAL instant while the materialised series uses the LATER retry
@@ -510,11 +506,11 @@ impl Synchronizer {
     /// `Processor`'s two spawned instances (own or others' batches; both write
     /// through the same `Store`) performs that write. Never polled.
     ///
-    /// Gated on `Metrics::metrics_active` (perf-audit addendum, starfish parity:
+    /// Gated on `Metrics::metrics_active`:
     /// `RealCommitHandler::transaction_observer`'s identical early return) -- late
     /// commits during warmup/wind-down would otherwise skew TPS, the latency
     /// distribution, and the bandwidth-efficiency denominator, exactly as they would
-    /// for starfish. `prune_stale` runs unconditionally, BEFORE the gate: bounding
+    /// for reference. `prune_stale` runs unconditionally, BEFORE the gate: bounding
     /// memory is not a rate metric and must keep working even while inactive (e.g. a
     /// deployment that never activates metrics at all).
     #[cfg(feature = "benchmark")]
@@ -708,7 +704,7 @@ impl Synchronizer {
         for tx in transactions {
             // §4 wire format: [1 B marker][8 B id, BE][8 B submission timestamp, LE].
             // A transaction shorter than the header (should not happen once every
-            // client is on the Phase-2 format) is skipped rather than indexed into.
+            // client is on the current format) is skipped rather than indexed into.
             if tx.len() < 17 {
                 continue;
             }

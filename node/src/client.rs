@@ -1,7 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Transaction-generating client, extracted from `benchmark_client.rs` (PHASE2-SPEC.md
-// §8) so both the standalone `benchmark_client` binary and the in-process
-// `local-benchmark` subcommand share exactly one implementation.
+// Shared transaction-generating client for the standalone and local benchmark commands.
 use anyhow::{Context, Result};
 use bytes::BufMut as _;
 use bytes::BytesMut;
@@ -15,11 +13,7 @@ use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-/// How the transaction payload (bytes 17..size) is filled. Mirrors starfish's
-/// `TransactionMode` (`all_zero` is upstream-equivalent; `random` is the honest mode that
-/// defeats accidental compression/dedup anywhere in the stack). `all_zero` (snake_case)
-/// is the starfish-aligned canonical wire spelling; `parse` also accepts the legacy
-/// `all-zero` (hyphen) spelling as an alias.
+/// How bytes 17..size of the transaction payload are filled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TransactionMode {
     AllZero,
@@ -28,8 +22,7 @@ pub enum TransactionMode {
 
 impl TransactionMode {
     pub fn parse(s: &str) -> Result<Self> {
-        // Legacy hyphen spelling ("all-zero") accepted as an alias; starfish-aligned
-        // snake_case ("all_zero") is canonical.
+        // Accept the hyphenated spelling for compatibility.
         match s.replace('-', "_").as_str() {
             "all_zero" => Ok(Self::AllZero),
             "random" => Ok(Self::Random),
@@ -40,13 +33,7 @@ impl TransactionMode {
         }
     }
 
-    /// METRICS-DASHBOARD-SPEC.md §8: canonical string label for `transaction_mode_info`
-    /// -- the exact (canonical) strings `--mode` already accepts. Only called from
-    /// `local_benchmark.rs`, which is compiled into the `node` binary target, not
-    /// `benchmark_client` (both share this file via `#[path = "client.rs"]`, so
-    /// clippy's per-binary dead-code analysis flags it as unused from
-    /// `benchmark_client`'s own compilation unit) -- genuinely used from the `node`
-    /// binary, not dead code.
+    /// Return the canonical metric label.
     #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
@@ -57,23 +44,13 @@ impl TransactionMode {
 }
 
 pub struct Client {
-    pub target: SocketAddr, //specifies the worker to connect to
-    pub size: usize,        //specifies the bit size of transactions
+    pub target: SocketAddr, // Worker address.
+    pub size: usize,        // Transaction size in bytes.
     pub rate: u64,
-    pub nodes: Vec<SocketAddr>, //specifies the addresses of all nodes. Currently only used to wait for them to be alive, but also necessary if we wanted to receive result replies (from any node).
+    pub nodes: Vec<SocketAddr>, // Addresses to await before sending.
     pub mode: TransactionMode,
-    /// Benchmark only: absolute wall-clock instant (epoch milliseconds) before which
-    /// no transaction is submitted. Must be the SAME instant the nodes were given as
-    /// `config::Parameters::metrics_active_at_ms`, so that the first transaction this
-    /// client submits is also the first one the nodes count -- one value shared by
-    /// both sides, rather than two independently-computed delays that can drift.
-    ///
-    /// Why this is needed on top of `wait()`: `wait()` only blocks until every peer's
-    /// transaction port ACCEPTS TCP, and a node binds that listener long before its
-    /// committee is functional. Measured 2026-08-06 at n=50: transactions kept being
-    /// submitted through a ~7.4s committee-formation window, and their multi-second
-    /// latencies pinned the reported p99 near 3.5s at every offered rate.
-    /// `None` submits immediately, as before this field existed.
+    /// Epoch-millisecond time before which the client submits no transactions.
+    /// Use the same value as `Parameters::metrics_active_at_ms`.
     pub activate_at_ms: Option<u64>,
 }
 
@@ -83,8 +60,7 @@ impl Client {
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
         // Header is [1 B marker][8 B id, BE][8 B submission timestamp, LE] = 17 B
-        // (starfish's own header is 16 B; we keep the extra marker byte so the legacy
-        // sample-tx cross-validation metric keeps working byte-identically).
+        // The extra marker byte keeps sample transaction metrics compatible.
         if self.size < 17 {
             return Err(anyhow::Error::msg(
                 "Transaction size must be at least 17 bytes (1 B marker + 8 B id + 8 B timestamp)",
@@ -114,10 +90,7 @@ impl Client {
                 );
                 sleep(Duration::from_millis(wait)).await;
             } else {
-                // Already past it: the harness's budget was too small for how long
-                // deploy actually took, so the early transactions this client is
-                // about to submit WILL be counted. Loud, because it silently
-                // reintroduces exactly the startup skew the window exists to remove.
+                // Submit immediately when the activation time has passed.
                 warn!(
                     "Metrics-active window at {} (epoch ms) already elapsed {} ms ago; \
                      submitting immediately -- the startup transient will be included \
@@ -130,23 +103,7 @@ impl Client {
 
         // Submit all transactions.
         //
-        // Fable audit item 2 originally guarded only the `rate < PRECISION` case, where
-        // `rate / PRECISION` truncates to 0 and the loop would silently send nothing
-        // forever. But that same truncation loses throughput at EVERY rate that is not a
-        // multiple of `PRECISION`, not only sub-grid ones: at 20 nodes and an aggregate
-        // 1000 tx/s each client's rate is 50, `50 / 20 == 2`, and the achieved rate is
-        // `2 * 20 == 40` tx/s per client -- 800 aggregate, a silent 20% shortfall against
-        // the requested 1000. Only multiples of 400 were reachable at n=20.
-        //
-        // So the fractional accumulator below is now the ONLY path, at every rate. It is
-        // a standard fixed-point (Bresenham) rate limiter: it reproduces the old `burst`
-        // value exactly whenever `rate` divides evenly by `PRECISION`, and otherwise
-        // alternates between floor and ceil so the one-second average is exactly `rate`.
-        // At rate 50 it emits 2,3,2,3,... per tick -- 50 tx/s, not 40.
-        //
-        // `this_tick_count` may legitimately be 0 on a given tick for a sub-grid rate;
-        // the `for x in 0..this_tick_count` loop below then simply does not execute, so
-        // the `counter % this_tick_count` inside it is never evaluated at zero.
+        // Use a fractional accumulator so the average rate remains exact.
         if self.rate > 0 && self.rate < PRECISION {
             warn!(
                 "Per-client rate {} tx/s is below the sampling precision ({} ticks/s), so \
@@ -173,10 +130,7 @@ impl Client {
             interval.as_mut().tick().await;
             let now = Instant::now();
 
-            // One fixed-point accumulator for every rate (see the comment above the
-            // `sub_burst_carry` declaration). Emits floor or ceil of `rate / PRECISION`
-            // on each tick so the one-second average is exactly `rate`; identical to the
-            // old unconditional `burst` whenever `rate` divides evenly by `PRECISION`.
+            // Emit floor or ceil of rate / precision on each tick.
             let this_tick_count = {
                 sub_burst_carry += self.rate;
                 let n = sub_burst_carry / PRECISION;

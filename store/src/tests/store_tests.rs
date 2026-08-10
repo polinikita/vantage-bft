@@ -59,8 +59,7 @@ async fn read_many_preserves_order_and_gaps() {
     store.write(k_a.clone(), vec![10u8]).await;
     store.write(k_b.clone(), vec![20u8]).await;
 
-    // Requested order deliberately differs from write order, and repeats a key: the
-    // reply must line up index-for-index with the request.
+    // The reply preserves request order and repeated keys.
     let got = store
         .read_many(vec![
             k_missing_1,
@@ -87,8 +86,7 @@ async fn read_many_preserves_order_and_gaps() {
 
 #[tokio::test]
 async fn batched_writes_survive_the_flush() {
-    // Writes are buffered and flushed as one batch; they must be readable both BEFORE
-    // the flush (via the pending overlay) and AFTER it (from RocksDB itself).
+    // Values must be readable before and after the pending batch flushes.
     let path = ".db_test_batched_flush";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
@@ -98,11 +96,11 @@ async fn batched_writes_survive_the_flush() {
         store.write(key.clone(), vec![i as u8, 0xAA]).await;
     }
 
-    // Before any tick: served from the pending overlay.
+    // Read from the pending overlay.
     let before = store.read_many(keys.clone()).await;
     assert!(before.iter().all(Option::is_some), "pre-flush read failed");
 
-    // Let at least one flush tick fire, then read again -- now out of RocksDB.
+    // Read again after a flush tick.
     tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 3)).await;
     let after = store.read_many(keys).await;
     assert_eq!(before, after, "values changed across the flush boundary");
@@ -137,11 +135,7 @@ async fn read_notify() {
     assert!(handle.await.is_ok());
 }
 
-/// The actor's liveness heartbeat advances on the flush ticker alone, with no traffic.
-///
-/// This is the property the wedge diagnostic rests on: if the heartbeat only moved when
-/// commands arrived, a quiet store would be indistinguishable from a stalled one and
-/// `store_actor_heartbeat_age_ms` would fire on idle nodes.
+/// The actor heartbeat advances while the store is idle.
 #[tokio::test]
 async fn heartbeat_advances_while_idle() {
     let path = ".db_test_heartbeat_idle";
@@ -151,7 +145,7 @@ async fn heartbeat_advances_while_idle() {
     let first = store.heartbeat_millis();
     assert!(first > 0, "heartbeat must be stamped at construction");
 
-    // Strictly more than three flush ticks, and no commands sent in between.
+    // Wait without sending commands.
     tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 3 + 20)).await;
 
     assert!(
@@ -179,12 +173,7 @@ async fn queue_depth_reports_occupancy() {
     assert!(store.queue_depth() <= capacity);
 }
 
-/// The drain counter advances as commands are dequeued.
-///
-/// This is the discriminator `heartbeat_millis` cannot provide: `queue_depth` counts
-/// PERMITS HELD, so a full reading means either genuine saturation (drain advancing) or
-/// permits captured by never-polled `send()` futures (drain flat, queue actually empty).
-/// The 2026-08-08 wedge was the second, and was first misread as the first.
+/// The drain counter advances when commands leave the channel.
 #[tokio::test]
 async fn drain_counter_advances_with_dequeued_commands() {
     let path = ".db_test_drain_counter";
@@ -196,7 +185,7 @@ async fn drain_counter_advances_with_dequeued_commands() {
     for i in 0..5u8 {
         store.write(vec![i], vec![i]).await;
     }
-    // One read to force a round trip, so every preceding write is certainly dequeued.
+    // A read round trip confirms that preceding writes were dequeued.
     let _ = store.read(vec![0u8]).await;
     let after_writes = store.commands_drained();
     assert!(

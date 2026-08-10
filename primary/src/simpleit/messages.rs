@@ -1,65 +1,7 @@
-// Simple-IT cut-consensus wire types (stage 1 of a port from the upstream
-// `simpleit/Opt-Mempool-Simple-IT-Failure` branch's primary/src/messages.rs).
+// Simple-IT cut-consensus wire types.
 //
-// Ported (exact upstream line ranges noted per type below): `Timeout`, `TimeoutAccept`,
-// `Decide`, `TimeoutCert`, `CutProposal`, `CutVote`, plus the `Cut` type alias.
-// `Proposal` (upstream messages.rs:692-731) is deliberately NOT redefined here: this
-// crate's own `crate::messages::Proposal` already has the identical shape (header
-// digest + height) and already hashes with `Blake3Hasher`, so `Cut` below aliases that
-// type directly, exactly as upstream aliases its own local `Proposal`.
-//
-// NOT ported: upstream's `CutCertificate` (upstream messages.rs:813-836). Upstream's
-// `CutCertificate::verify` (and this crate's own former copy of it) checks only that
-// `votes: Vec<PublicKey>` names distinct, stake-bearing committee members -- never that
-// those parties actually voted, since this protocol is signature-free and a vote
-// carries no transferable proof of its own authorship. Any party could thus assert a
-// certificate for any `cut_id`. The paper this engine implements (arXiv:2606.14404,
-// Fig. 2) has no certificate message at all: safety comes from each party counting
-// votes/commits FIRST-HAND, never from accepting another party's relayed aggregate --
-// see `primary/src/simpleit/engine.rs`'s module doc comment ("FIGURE-2 REWRITE") for
-// the full rationale and the replacement mechanism (`CutVoteAggregator` plus
-// `CutEngine::mark_cut_safe`, both stage-1/stage-2 respectively).
-//
-// `Decide` additionally drops upstream's dead `origin: PublicKey` field (AUDIT FIX,
-// finding F5): never read anywhere in this crate, and upstream's own single call site
-// passes `&self.name` for both `origin` and `author`, so even upstream never
-// distinguished the two. `Decide` is this engine's `⟨commit, r⟩` (Fig. 2's Vote step);
-// only `id`/`round`/`author` are load-bearing.
-//
-// BRACHA VARIANT ADDITION (separate task, separate upstream branch): `CutReady` is
-// ported from a DIFFERENT upstream branch, `simpleit/Bracha-Mempool-Simple-IT`
-// (fetched as the same `simpleit` remote, read-only, never checked out/merged/applied
-// -- primary/src/messages.rs:781-805 there), not from Opt-Mempool-Simple-IT-Failure
-// like every other type in this file. It backs `engine::Variant::Bracha` -- Bracha-
-// RBC's own second echo round (arXiv:2606.14404 Table 1/2 + Corollary 5, variant S).
-// Same shape as `CutVote` (round + cut_id + author) -- upstream defines the two
-// identically there too. See `engine.rs`'s module doc comment for the variant
-// mechanism this feeds.
-//
-// Required deviations from upstream (see primary/src/simpleit/mod.rs for the full
-// rationale):
-//   1. Every `impl Hash` uses `Blake3Hasher`, not `Sha512`. The sequence of fields fed
-//      to the hasher, and every `to_le_bytes()` encoding, is otherwise unchanged --
-//      only the hash function, and the mechanical `&x.0`-style byte access it requires
-//      (matching `crate::messages`/`crate::vantage::block`), differ.
-//   2. `CutRound` (`= u64`, defined below) replaces upstream's local `Round` alias
-//      (used by `Timeout`/`TimeoutAccept`/`Decide`/`TimeoutCert`) and upstream's bare
-//      `u64` (used by `CutProposal`/`CutVote`) uniformly, so there is one unambiguous
-//      cut-round type. Neither `primary::primary::Slot` nor `primary::primary::View`
-//      is used anywhere in this module, and `CutRound` is deliberately distinct from
-//      `crate::vantage::control::Round` (an unrelated control-round counter re-exported
-//      from `crate::vantage`).
-//   3. None of these six types holds a collection keyed by cut round -- the per-round
-//      maps this rule targets (e.g. a future `BTreeMap<CutRound, CutVoteAggregator>`)
-//      belong to the not-yet-ported state machine. `Cut` itself (`BTreeMap<PublicKey,
-//      Proposal>`) is keyed by author, already a `BTreeMap` upstream, and unchanged.
-//   4. See primary/src/simpleit/aggregators.rs for the named-`Committee`-threshold
-//      requirement; `TimeoutCert::verify` below uses `quorum_threshold` (2f+1 at
-//      n=3f+1), noted inline. `TimeoutCert` (unlike the removed `CutCertificate`) never
-//      had this defect: it is purely a LOCAL data structure, never broadcast (see
-//      `effects.rs`'s `CutOut` doc comment) -- each party only ever verifies its OWN,
-//      independently-assembled `TimeoutCert`, never one asserted by a peer.
-
+// The protocol counts individually verified votes and commits. No certificate
+// message is defined. `CutReady` is used only by the Bracha variant.
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
 use config::Committee;
@@ -68,13 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
-/// One cut-consensus round counter. Upstream mixes a local `Round = u64` alias (on
-/// `Timeout`/`TimeoutAccept`/`Decide`/`TimeoutCert`) with a bare `u64` (on
-/// `CutProposal`/`CutVote`) for what is, across all six types, the same counter.
-/// Unified here under one explicit name.
+/// Cut-consensus round number.
 pub type CutRound = u64;
 
-/// Upstream primary/src/messages.rs:172-213.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Timeout {
     pub round: CutRound,
@@ -117,7 +55,6 @@ impl fmt::Display for Timeout {
     }
 }
 
-/// Upstream primary/src/messages.rs:215-254.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TimeoutAccept {
     pub round: CutRound,
@@ -160,9 +97,7 @@ impl fmt::Display for TimeoutAccept {
     }
 }
 
-/// Commit message in the protocol -- Fig. 2's `⟨commit, r⟩` (the **Vote** step: "send
-/// `⟨commit, curr_round⟩` to all parties"). Upstream primary/src/messages.rs:375-417,
-/// minus the dead `origin` field (AUDIT FIX F5 -- see the module doc comment).
+/// Commit message for a round.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Decide {
     pub id: Digest,
@@ -171,10 +106,7 @@ pub struct Decide {
 }
 
 impl Decide {
-    /// Mirrors `Timeout::new`/`TimeoutAccept::new`'s shape (round + author, no
-    /// `origin`) now that the dead field is gone -- upstream's own single call site
-    /// passed `&self.name` for both `origin` and `author`, so this loses no
-    /// information upstream itself ever populated distinctly.
+    /// Creates a commit message.
     pub async fn new(header_id: Digest, round: CutRound, author: &PublicKey) -> Self {
         Self {
             id: header_id,
@@ -203,8 +135,6 @@ impl fmt::Debug for Decide {
     }
 }
 
-/// Upstream primary/src/messages.rs:419-468. No `impl Hash`/`Debug` upstream either --
-/// a certified `TimeoutCert` is identified by its `round` field directly.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct TimeoutCert {
     pub round: CutRound,
@@ -256,12 +186,9 @@ impl TimeoutCert {
     }
 }
 
-/// A cut is a snapshot of certified tips across all lanes. Upstream
-/// primary/src/messages.rs:734. Aliases `crate::messages::Proposal` directly -- see
-/// the module doc comment above -- rather than a locally redefined tip type.
+/// Snapshot of certified tips across all lanes.
 pub type Cut = BTreeMap<PublicKey, Proposal>;
 
-/// Upstream primary/src/messages.rs:736-784.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CutProposal {
     pub round: CutRound,
@@ -313,7 +240,6 @@ impl fmt::Debug for CutProposal {
     }
 }
 
-/// Upstream primary/src/messages.rs:786-811.
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub struct CutVote {
     pub round: CutRound,
@@ -342,14 +268,7 @@ impl Hash for CutVote {
     }
 }
 
-/// Bracha variant only (`engine::Variant::Bracha`) -- see this module's own doc
-/// comment ("BRACHA VARIANT ADDITION") for provenance. Bracha-RBC's second echo round:
-/// broadcast once a party's own `CutVote` census crosses `quorum_threshold`
-/// (`engine::CutEngine::broadcast_cut_ready`), and counted first-hand by every other
-/// party into its own `CutReadyAggregator` (aggregators.rs) exactly like `CutVote`
-/// above. Same shape as `CutVote` deliberately -- upstream
-/// (`Bracha-Mempool-Simple-IT` branch) defines the two identically
-/// (primary/src/messages.rs:754-768 there is `CutVote`, :781-795 is this type).
+/// Bracha variant's second echo message, counted first-hand by each recipient.
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub struct CutReady {
     pub round: CutRound,

@@ -7,17 +7,7 @@ class SettingsError(Exception):
 
 
 class Settings:
-    ''' Cloud-provider-agnostic settings.
-
-    `instance.py` (AWS/boto3) reads `aws_regions`; `gcp_instance.py` reads
-    `gcp_zones` and `project_id`/`templates`. Both attributes are populated
-    from the same `instances.regions` list so a single settings file works
-    for whichever InstanceManager `benchmark/fabfile.py` and `remote.py`
-    are wired to. `project_id`/`templates`/`username` are GCP/SSH-user
-    conveniences with no AWS meaning beyond `username` (the SSH login,
-    e.g. "ubuntu"); they default to None/[]/"ubuntu" so an AWS-only
-    settings file doesn't need to carry GCP placeholders.
-    '''
+    '''Cloud-provider settings shared by AWS and GCP managers.'''
 
     def __init__(self, key_name, key_path, base_port, repo_name, repo_url,
                  branch, instance_type, aws_regions, project_id=None,
@@ -56,15 +46,9 @@ class Settings:
         self.project_id = project_id
         self.templates = templates if templates is not None else []
         self.username = username
-        # AWS EC2 Spot request (instance.py). Opt-in: absent/false in settings.json
-        # -> on-demand, byte-identical to prior behavior. When true, create_instances
-        # requests one-time Spot capacity capped at the on-demand price (no MaxPrice).
+        # AWS EC2 Spot requests are enabled only when `spot` is true.
         self.spot = spot
-        # METRICS-COLLECTOR-PREP: instance type for the dedicated metrics-collector
-        # instance (instance.py's create_instances). Optional -- None (absent from
-        # settings.json, the default) makes instance.py fall back to the same
-        # `instance_type` the validators use, byte-identical to a settings.json
-        # written before this feature existed.
+        # Optional instance type for the metrics collector.
         self.monitor_instance_type = monitor_instance_type
         # Build-once/deploy-prebuilt-binary (fetch mode, remote.py's default
         # non-`--source-build` path): "<OWNER>/<REPO>" GitHub slug the

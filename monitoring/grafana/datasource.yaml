@@ -2,17 +2,7 @@ apiVersion: 1
 
 datasources:
   - name: Fixed-UID-vantage
-    # Real, pre-existing bug found during METRICS-DASHBOARD-SPEC.md §6 live-dashboard
-    # verification: without an explicit `uid:` here, Grafana auto-generates a random
-    # one at provisioning time, while every dashboard panel (grafana-dashboard.json)
-    # hardcodes `"uid": "Fixed-UID-vantage"` as if that were the datasource's uid, not
-    # just its display name -- every panel's datasource reference was a dangling
-    # UID, silently (Grafana doesn't error, it just returns no data). Confirmed via
-    # `GET /api/datasources` before this fix: the provisioned uid was a random
-    # `P262AC26F48E9548F`-shaped string, not `Fixed-UID-vantage`. Predates this
-    # session's changes (the original minimal Phase-2 dashboard had the same latent
-    # bug -- it had apparently never been checked against a live Grafana instance
-    # before this verification pass).
+    # Keep the provisioned UID aligned with dashboard panel references.
     uid: Fixed-UID-vantage
     type: prometheus
     access: proxy

@@ -21,62 +21,10 @@ class Key:
 
 
 class Committee:
-    ''' The committee looks as follows:
-        "authorities: {
-            "name": {
-                "stake": 1,
-                "consensus: {
-                    "consensus_to_consensus": x.x.x.x:x,
-                },
-                "primary: {
-                    "primary_to_primary": x.x.x.x:x,
-                    "worker_to_primary": x.x.x.x:x,
-                    "metrics": x.x.x.x:x,
-                },
-                "workers": {
-                    "0": {
-                        "primary_to_worker": x.x.x.x:x,
-                        "worker_to_worker": x.x.x.x:x,
-                        "transactions": x.x.x.x:x,
-                        "metrics": x.x.x.x:x
-                    },
-                    ...
-                }
-            },
-            ...
-        }
-
-        Phase 2: each primary and each worker gains a "metrics" (Prometheus scrape)
-        address, growing the per-authority port count from 6 to 8 (1 worker/authority,
-        `fab remote`'s default). committee.json is regenerated every run, so there
-        is no back-compat concern with older committee files.
-    '''
+    '''Store committee addresses and public SSH host mappings.'''
 
     def __init__(self, addresses, base_port, public_hosts=None):
-        ''' The `addresses` field looks as follows:
-            {
-                "name": ["host", "host", ...],
-                ...
-            }
-            These MUST be the PRIVATE (VPC-internal) IPs when this committee
-            is for a real (multi-instance) deployment: they become the
-            node<->node and client<->node wire addresses every authority
-            reads out of committee.json, and same-region traffic over public
-            IPs is billed cross-instance data transfer and collapses
-            throughput (routes through the internet edge instead of the
-            VPC).
-
-            `public_hosts` (optional): same shape/order as `addresses` was
-            *before* this constructor consumes it (index 0 = the primary's
-            physical host, 1.. = each worker's, one entry per authority) --
-            the PUBLIC (internet-routable) IP of the instance that authority
-            actually runs on. This is the orchestrator's own SSH/rsync/tmux
-            connection-target bookkeeping (`public_ips()` and friends below);
-            it is never written to committee.json and never read by a node
-            binary. Omit it when `addresses` already IS the connection
-            target (e.g. a purely local run with no public/private
-            distinction) -- `public_ips()` then falls back to `ips()`.
-        '''
+        '''Build a committee from private wire addresses and optional public hosts.'''
         assert isinstance(addresses, OrderedDict)
         assert all(isinstance(x, str) for x in addresses.keys())
         assert all(
@@ -304,48 +252,10 @@ class Committee:
 def generate_collector_scrape_config(
     committee_json, faults=0, scrape_interval='1s', job_name='vantage-collector'
 ):
-    ''' METRICS-COLLECTOR-PREP: Prometheus scrape-config YAML for the dedicated
-    metrics-collector instance -- one target per (non-faulty) authority's
-    primary metrics endpoint and one per worker, all on the PRIVATE (VPC) ip.
+    '''Build Prometheus scrape configuration from a committee dictionary.
 
-    Operates on the RAW committee dict (`{'authorities': {name: {...}}}` --
-    exactly `.committee.json`'s shape, and exactly what a live `Committee`
-    exposes as `committee.json`), not a `Committee` object, so the same
-    function drives both `remote.py`'s `Bench.deploy_monitoring` (called with
-    the live committee right after `_config()`) and a standalone
-    `fab monitor-collector` re-deploy (called with `.committee.json` loaded
-    straight off disk, `fab monitor`'s own read-only pattern) -- and is
-    directly unit-testable against a hand-built dict, no AWS/live Committee
-    required.
-
-    The committee only ever stores the PUBLIC ip in each 'metrics' field (see
-    `Committee.__init__`'s docstring: metrics is scraped by an external
-    observer, never dialed by a peer, so it's free to be the address the
-    *coordinator laptop* can reach). The dedicated collector instead lives
-    inside the VPC and must scrape over the PRIVATE ip (same
-    cross-instance-billing/throughput reasoning as every peer-dialed
-    committee field) -- so this derives the private host from the
-    'primary_to_primary'/'primary_to_worker' fields (always the private ip)
-    and keeps the port from 'metrics' (primary: port+2 of
-    'primary_to_primary'; worker: port+3 of 'primary_to_worker' -- see
-    `Committee.__init__`), rather than reading 'metrics' directly.
-
-    Every target carries TWO labels, not one: `node` (per-PROCESS --
-    '<name[:8]>-primary' or '<name[:8]>-worker-<id>', one series per
-    primary/worker) and `host` (per-INSTANCE/NIC -- the same private ip this
-    target's own address is built from, below). They are not interchangeable
-    for aggregation: under the campaign's `collocate: True`, an authority's
-    primary and its worker run as two PROCESSES on the SAME instance sharing
-    ONE NIC, so `sum by (node) (...)` yields (up to) twice as many series as
-    there are physical hosts, and a max/peak taken over `node` silently
-    reports one process's share of the NIC's traffic instead of the
-    instance's actual total. `sum by (host) (...)` collapses a collocated
-    primary+worker pair onto the one series that actually corresponds to
-    their shared NIC, and is therefore the ONLY one of the two labels valid
-    to compare against a per-NIC bandwidth limit (see remote.py's
-    `Bench._report_nic_peak`, and `remote.COLLECTOR_QUERIES`'s
-    `bytes_sent_rate_by_host`/`bytes_received_rate_by_host`). `node` remains
-    useful on its own for per-process (not per-NIC) breakdowns. '''
+    Targets use private addresses and retain the metrics ports from the
+    committee. Labels identify both the process and the host.'''
     assert faults >= 0
     authorities = committee_json['authorities']
     names = list(authorities.keys())
@@ -396,22 +306,7 @@ class NodeParameters:
         if not all(isinstance(x, int) for x in inputs):
             raise ConfigError('Invalid parameters type')
 
-        # Vantage / distributed WAN-mimic knobs. These are NOT required (the Rust
-        # side supplies serde defaults for every one of them), but when present they
-        # must be well typed -- the whole `json` dict is written verbatim into
-        # parameters.json and deserialized by `config::Parameters` on each node, so a
-        # typo here would only surface as a node-side parse error mid-deploy.
-        #  - `protocol`: selects the node assembly; "vantage" runs Vantage (serde
-        #    kebab-case of `Protocol::Vantage`), else one of the two autobahn labels.
-        #  - `delta_ms`: Vantage AGB base delay unit (ms).
-        #  - `mimic_latency_ms`: DEPLOYABLE uniform RTT (ms) mimic latency, an EXPLICIT
-        #    OVERRIDE. `node run` expands it into a uniform NxN one-way (RTT/2)
-        #    latency_table at spawn. When this key is ABSENT (the campaign's default
-        #    `--latency aws`), `node run` instead defaults to the real 10-AWS-region
-        #    RTT matrix (`config::LatencyTable::aws_rtt`, ported from starfish). This
-        #    is the ONLY way to inject latency on the distributed path, since
-        #    `Parameters.latency_table` itself is `#[serde(skip)]` and thus never
-        #    travels through parameters.json.
+        # Validate optional protocol and latency settings before deployment.
         if 'protocol' in json and json['protocol'] not in (
             'autobahn-optimistic', 'autobahn-seamless', 'vantage'
         ):
@@ -422,13 +317,7 @@ class NodeParameters:
                 if not isinstance(v, int) or isinstance(v, bool) or v < 0:
                     raise ConfigError(f"'{key}' must be a non-negative integer")
 
-        #  - `vantage_gc_window_views`: how many VIEWS of per-view internal state
-        #    VantageCore retains behind its resolved prefix before pruning. Distinct
-        #    from `gc_depth` below, which is a depth in Autobahn ROUNDS -- the Vantage
-        #    GC originally reused `gc_depth`, so tuning Autobahn's knob silently
-        #    resized Vantage's retention window. Must be >= 1 (a window of 0 puts the
-        #    GC floor at the resolved watermark itself); the node clamps it too, but
-        #    reject it here so the misconfiguration surfaces before deploying.
+        # Keep the Vantage retention window positive.
         if 'vantage_gc_window_views' in json:
             v = json['vantage_gc_window_views']
             if not isinstance(v, int) or isinstance(v, bool) or v < 1:
@@ -459,19 +348,7 @@ class BenchParameters:
             rate = rate if isinstance(rate, list) else [rate]
             if not rate:
                 raise ConfigError('Missing input rate')
-            # Normalise to ASCENDING order here rather than trusting the
-            # caller: remote.py's `run()` peak-relative early-stop (CHANGE A,
-            # see BenchParameters.early_stop_margin below) walks self.rate in
-            # list order and `break`s the FIRST point whose TPS falls too far
-            # below the running peak, printing "stopping sweep (remaining
-            # higher rates skipped)" -- both the early-stop logic and that
-            # message assume the list is already low-to-high (matching
-            # fabfile.py's own "rate SWEEP ascending toward saturation"
-            # docstring). An out-of-order --rates (e.g.
-            # 50000,250000,100000) would otherwise let a spurious dip at
-            # 250000 `break` the sweep and silently skip the still-unrun
-            # (and perfectly valid, lower) 100000 point, while claiming to
-            # have skipped only "remaining higher rates".
+            # Run rate sweeps in ascending order.
             self.rate = sorted(int(x) for x in rate)
 
             self.workers = int(json['workers'])
@@ -483,13 +360,9 @@ class BenchParameters:
 
             self.tx_size = int(json['tx_size'])
 
-            # Additive: pre-Phase-2 bench params without 'tx_mode' keep the
-            # upstream-equivalent all_zero payload.
+            # Omit `tx_mode` to use the all-zero payload default.
             self.tx_mode = str(json['tx_mode']) if 'tx_mode' in json else 'all_zero'
-            # Legacy hyphen spelling ('all-zero') accepted as an alias; starfish-aligned
-            # snake_case ('all_zero') is canonical. Single normalization site -- every
-            # downstream use of `self.tx_mode` (commands.py::run_client, remote.py) sees
-            # only the canonical spelling.
+            # Accept the hyphenated spelling as an alias and normalize it once.
             self.tx_mode = self.tx_mode.replace('-', '_')
             if self.tx_mode not in ('all_zero', 'random'):
                 raise ConfigError(
@@ -505,15 +378,7 @@ class BenchParameters:
             self.partition_start = int(json['partition_start'])
             self.partition_duration = int(json['partition_duration'])
 
-            # CHANGE A (rate-sweep early stop): fraction the running PEAK
-            # committed TPS is allowed to drop by before `remote.py`'s rate
-            # loop stops sweeping to higher rates (saturation reached).
-            # Peak-relative (not previous-point-relative), so a single noisy
-            # point that dips below its *immediate predecessor* without
-            # actually falling off the true peak does not truncate the
-            # sweep early -- see remote.py's `run()` for the comparison
-            # itself. 0.10 (10%) default; 0 disables early-stop entirely
-            # (the sweep always runs every configured rate, prior behavior).
+            # Stop a sweep when committed TPS falls below the running peak.
             self.early_stop_margin = (
                 float(json['early_stop_margin'])
                 if 'early_stop_margin' in json else 0.10
@@ -521,18 +386,7 @@ class BenchParameters:
             if self.early_stop_margin < 0:
                 raise ConfigError('early_stop_margin must be non-negative')
 
-            # Opt-out for remote.py's `_update` binary-provenance check
-            # (fetch-binary deploy path only -- irrelevant under
-            # --source-build, which always compiles the current working
-            # tree and has nothing to compare against). By default, a SHA
-            # mismatch between the nightly release's commit.txt and the
-            # local working tree's HEAD hard-fails the deploy (see
-            # `_update`'s docstring: a stale binary silently invalidates the
-            # measurement, made worse by `config::Parameters` having no
-            # `#[serde(deny_unknown_fields)]`). Set true only once you've
-            # deliberately confirmed the drift is immaterial for what you're
-            # running -- the mismatch is then downgraded to a `Print.warn`
-            # instead of aborting the deploy.
+            # Allow a release SHA mismatch only when explicitly requested.
             self.allow_stale_binary = (
                 bool(json['allow_stale_binary'])
                 if 'allow_stale_binary' in json else False

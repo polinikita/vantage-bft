@@ -2,8 +2,11 @@
 name = "primary"
 version = "0.1.0"
 authors = ["Libra <oncall+libra@xmail.facebook.com>"]
-publish = false
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 futures = { workspace = true }

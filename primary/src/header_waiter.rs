@@ -24,7 +24,7 @@ use tokio::time::{sleep, Duration, Instant};
 const TIMER_RESOLUTION: u64 = 1_000;
 
 /// The commands that can be sent to the `Waiter`.
-// clippy::enum_variant_names: the shared `Sync` prefix is intentional/documentary
+// The shared `Sync` prefix is intentional.
 // (every variant IS a sync command, per the doc comment above) -- renaming would
 // touch 8 call sites across this file and synchronizer.rs for a pure naming-style
 // lint with no behavior implication; not done.
@@ -93,7 +93,7 @@ impl HeaderWaiter {
         rx_synchronizer: Receiver<WaiterMessage>,
         tx_core: Sender<Header>,
         tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
-        // METRICS-DASHBOARD-SPEC.md §1: appended last, same convention as `Core::spawn`.
+        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
         // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
@@ -290,11 +290,9 @@ impl HeaderWaiter {
 
 
                         WaiterMessage::SyncProposals(missing, consensus_message, header) => {
-                            //let header_id = header.id.clone();
                             let height = header.height();
                             let author = header.author;
                             let id = proposal_digest(&consensus_message);
-                            //println!("syncing proposals in header waiter");
 
                             // Ensure we sync only once per proposal
                             if self.pending.contains_key(&id) {
@@ -310,7 +308,6 @@ impl HeaderWaiter {
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(id, (height, tx_cancel));
                             let fut = Self::proposal_waiter(wait_for, (consensus_message, header), rx_cancel);
-                            //println!("created proposal waiter");
                             proposal_waiting.push(fut);
 
                             // Ensure we didn't already sent a sync request for these parents.
@@ -362,7 +359,6 @@ impl HeaderWaiter {
 
                 Some(result) = proposal_waiting.next() => match result {
                     Ok(Some(deliver)) => {
-                        //println!("finished syncing");
                         let id = proposal_digest(&deliver.0);
                         let _ = self.pending.remove(&id);
                         for x in deliver.1.payload.keys() {
@@ -399,17 +395,7 @@ impl HeaderWaiter {
                         .as_millis();
 
                     //Retry HeaderRequests  -- We don't use this
-                    // let mut retry = Vec::new();
-                    // for (digest, (_, timestamp)) in &self.header_requests {
-                    //     if timestamp + (self.sync_retry_delay as u128) < now {
-                    //         debug!("Requesting sync for header {} (retry)", digest);
                     //         retry.push(digest.clone());
-                    //     }
-                    // }
-                    // let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
-                    // let message = PrimaryMessage::HeadersRequest(retry, self.name);
-                    // let bytes = bincode::serialize(&message).expect("Failed to serialize header request");
-                    // self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
 
                     //Retry CertificateRequests
                     let mut retry = Vec::new();

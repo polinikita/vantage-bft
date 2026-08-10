@@ -1,7 +1,3 @@
-// Test fixtures shared by every PHASE3-SPEC.md §7 / PHASE4-SPEC.md §12 test module.
-// Reuses the crate's existing 4-authority (n=4, f=1 => f+1=2, 2f+1=3) committee/key
-// fixtures.
-
 use crate::common::{committee, keys};
 use crate::messages::Header;
 use crate::vantage::agb::{self, AgbEngine, Manifest};
@@ -14,8 +10,6 @@ use std::collections::BTreeMap;
 use store::Store;
 
 pub const MAX_BLOCK_PAYLOAD: usize = 16;
-/// A small Δ (PHASE4-SPEC.md §10) so timer-boundary tests use human-scale
-/// `Duration`s (θE = 500ms, θR = 600ms) instead of the production 1s default.
 pub const TEST_DELTA_MS: u64 = 100;
 
 pub fn test_committee() -> Committee {
@@ -34,10 +28,6 @@ pub fn new_agb_engine(name: PublicKey) -> AgbEngine {
     AgbEngine::new(name, test_committee(), test_sid(), TEST_DELTA_MS)
 }
 
-/// PHASE7 (`Parameters::batched_anchors`): `new_agb_engine`'s generalization over an
-/// arbitrary committee -- the fixed `test_committee()` (n=4, f=1) never allows a
-/// genuine `k >= 2` batch (`agb::batch_cap` floors at `f`, which is 1 there), so
-/// batching-specific tests need a bigger one.
 pub fn new_agb_engine_with_committee(name: PublicKey, committee: Committee) -> AgbEngine {
     let sid = block::session_id(&committee);
     AgbEngine::new(name, committee, sid, TEST_DELTA_MS)
@@ -47,10 +37,6 @@ pub fn proposer_of(view: crate::primary::View) -> PublicKey {
     agb::proposer(&test_committee(), view)
 }
 
-/// Build a well-formed, directly-published, empty-payload chain of height `n` for
-/// `author` in `lm`'s own view. No ack quorum needed: `direct_pub` only requires
-/// direct + `payload_ok`, and an empty payload is trivially `payload_ok` regardless of
-/// author (`LaneManager::payload_present`'s loop has nothing to check).
 pub async fn direct_chain(lm: &mut LaneManager, author: PublicKey, n: u64) -> Vec<Header> {
     let sid = lm.sid().clone();
     let mut prev = lm.genesis().clone();
@@ -64,9 +50,6 @@ pub async fn direct_chain(lm: &mut LaneManager, author: PublicKey, n: u64) -> Ve
     headers
 }
 
-/// A header carrying one distinct payload entry (worker 0), so its digest differs from
-/// an otherwise-identical empty-payload header at the same coordinate -- used to build
-/// sibling forks.
 pub fn tagged_header(
     author: PublicKey,
     height: crate::primary::Height,
@@ -100,21 +83,16 @@ pub fn mark_quorum_available(lm: &mut LaneManager, reference: BlockRef) {
     mark_ack_available(lm, reference, AckThreshold::Quorum);
 }
 
-/// Sort a manifest by author -- `Formed_v`'s "strictly increasing author order".
 pub fn sorted_manifest(mut m: Manifest) -> Manifest {
     m.sort_by_key(|r| r.0);
     m
 }
 
-/// A fresh on-disk store at `path` (removed first, so re-running a test starts clean).
 pub fn fresh_store(path: &str) -> Store {
     let _ = std::fs::remove_dir_all(path);
     Store::new(path).unwrap()
 }
 
-/// A `LaneManager` plus a second handle onto the *same* store, so a test can write
-/// payload-presence markers behind its back (simulating a worker's `OthersBatch`
-/// report) the same way `payload_receiver::PayloadReceiver` would in production.
 pub fn new_lane_manager(name: PublicKey, path: &str) -> (LaneManager, Store) {
     let store = fresh_store(path);
     (
@@ -123,8 +101,6 @@ pub fn new_lane_manager(name: PublicKey, path: &str) -> (LaneManager, Store) {
     )
 }
 
-/// PHASE7: `new_lane_manager`'s generalization over an arbitrary committee -- see
-/// `new_agb_engine_with_committee`'s identical rationale.
 pub fn new_lane_manager_with_committee(
     name: PublicKey,
     path: &str,
@@ -148,8 +124,6 @@ pub fn new_repairer(name: PublicKey, lm: &LaneManager) -> Repairer {
     )
 }
 
-/// PHASE7: `new_repairer`'s generalization over an arbitrary committee -- see
-/// `new_agb_engine_with_committee`'s identical rationale.
 pub fn new_repairer_with_committee(
     name: PublicKey,
     lm: &LaneManager,
@@ -165,9 +139,6 @@ pub fn new_repairer_with_committee(
     )
 }
 
-/// Writes the payload-presence marker `payload_receiver::PayloadReceiver` would write
-/// on receiving `OthersBatch(digest, worker_id)` -- the same key shape
-/// `LaneManager::payload_present` (D1) probes.
 pub async fn mark_payload_present(
     store: &mut Store,
     digest: &crypto::Digest,

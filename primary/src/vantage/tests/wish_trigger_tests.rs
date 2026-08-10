@@ -1,7 +1,3 @@
-// PHASE5-SPEC.md §12 "W3"/"W4" -- the two-response wish trigger (`AgbEngine`'s
-// `two_response_wish_target` hook, exercised end-to-end through its five
-// response-emission call sites) and the piggyback-outside-identity convention.
-
 use super::common::*;
 use super::harness::{drain_local, Node};
 use crate::vantage::agb::{Echo, EchoOut, Ready, ReadyGrade, ReadyOut, ViewProposal};
@@ -28,8 +24,6 @@ fn raise_wish_target(effects: &[Effect]) -> Option<crate::primary::View> {
     })
 }
 
-// --- W3: both trigger-arithmetic cases -------------------------------------------------
-
 #[tokio::test]
 async fn w3_echo_stage_completes_pair_raises_wish_to_u_plus_2() {
     let (self_name, _) = authors()[3];
@@ -37,9 +31,6 @@ async fn w3_echo_stage_completes_pair_raises_wish_to_u_plus_2() {
     let mut rep = new_repairer(self_name, &lm);
     let mut agb = new_agb_engine(self_name);
 
-    // A real 2f+1=3-sender quorum of counted proposal echoes for view 1 (any grade,
-    // any sender -- R3's tally doesn't care who) fires our own ready-stage response
-    // for view 1, with no proposal/lane-content machinery needed at all.
     let proposal1 = sample_proposal(1);
     let senders: Vec<_> = authors().into_iter().take(3).collect();
     let mut last = Vec::new();
@@ -61,10 +52,6 @@ async fn w3_echo_stage_completes_pair_raises_wish_to_u_plus_2() {
         "test setup: view 1's ready-stage response must be sent"
     );
 
-    // Now the echo-stage response for u=2 is about to be emitted (the absolute
-    // deadline unconditionally emits an echo-skip -- no proposal/entry needed either)
-    // with the ready-stage response for u-1=1 already sent -- W3 must raise the wish
-    // to u+2=4, *before* the response effect.
     let effects = agb.on_echo_absolute_timer(2, &mut rep);
     assert!(effects
         .iter()
@@ -91,8 +78,6 @@ async fn w3_echo_stage_without_the_pairing_ready_never_raises() {
     let mut rep = new_repairer(self_name, &lm);
     let mut agb = new_agb_engine(self_name);
 
-    // Ready-stage response for view 1 was never sent -- the echo-stage response for
-    // u=2 must not raise anything.
     let effects = agb.on_echo_absolute_timer(2, &mut rep);
     assert!(raise_wish_target(&effects).is_none());
 }
@@ -104,16 +89,11 @@ async fn w3_ready_stage_completes_pair_raises_wish_to_u_plus_3() {
     let mut rep = new_repairer(self_name, &lm);
     let mut agb = new_agb_engine(self_name);
 
-    // Echo-stage response for view 2 already sent (an unconditional echo-skip at the
-    // absolute deadline, no pairing needed for *this* one).
     let effects = agb.on_echo_absolute_timer(2, &mut rep);
     assert!(effects
         .iter()
         .any(|e| matches!(e, Effect::BroadcastEchoSkip(2))));
 
-    // The ready-stage response for u=1 is about to be emitted (its own absolute
-    // deadline) with the echo-stage response for u+1=2 already sent -- W3 must raise
-    // the wish to u+3=4.
     let effects = agb.on_ready_timer(1);
     assert!(effects
         .iter()
@@ -134,19 +114,12 @@ async fn w3_ready_stage_completes_pair_raises_wish_to_u_plus_3() {
 async fn w3_ready_stage_without_the_pairing_echo_never_raises() {
     let (self_name, _) = authors()[3];
     let mut agb = new_agb_engine(self_name);
-    let effects = agb.on_ready_timer(1); // echo-stage response for view 2 never sent
+    let effects = agb.on_ready_timer(1);
     assert!(raise_wish_target(&effects).is_none());
 }
 
-// --- W4: piggyback outside identity -----------------------------------------------------
-
 #[tokio::test]
 async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
-    // Drives `harness::Node::dispatch` directly (mirrors `VantageCore::dispatch_inbound`
-    // exactly): two `Echo`s from the same sender, same proposal/grade, differing only
-    // in the piggybacked wish. The underlying statement counts once (confirmed below
-    // by needing exactly one *more* distinct sender to reach R3's quorum of 3, not
-    // two), but the wish component of *both* deliveries must still be absorbed.
     let mut node = Node::new(authors()[3].0, ".db_test_w4_duplicate_response", 6);
     let now = Instant::now();
     let proposal = sample_proposal(1);
@@ -184,9 +157,6 @@ async fn w4_duplicate_response_counted_once_but_wish_absorbed_both_times() {
         "the duplicate's wish must still be absorbed"
     );
 
-    // Confirm the statement really was counted only once: feeding this same `sender`
-    // twice must not itself be enough progress toward the quorum -- two genuinely
-    // distinct senders are still required afterward.
     let (s2, _) = authors()[1];
     let effects = node
         .dispatch(
@@ -241,8 +211,6 @@ async fn w4_piggybacked_wish_alone_drives_entry_with_no_standalone_wish_messages
         .filter(|(pk, _)| *pk != nodes[0].name)
         .collect();
 
-    // 3 distinct senders' `EchoSkip(view=1, wish=5)` -- pure piggyback, never an
-    // `Inbound::Wish` datagram.
     for (pk, _) in others.iter().take(3) {
         let effects = nodes[0].dispatch(Inbound::EchoSkip(1, *pk, 5), now).await;
         drain_local(&mut nodes, 0, effects, now, &mut outbox);
@@ -262,14 +230,12 @@ async fn w4_piggybacked_wish_alone_drives_entry_with_no_standalone_wish_messages
 
 #[tokio::test]
 async fn w4_piggyback_rides_on_all_four_response_types() {
-    // Every one of `Echo`/`EchoSkip`/`Ready`/`NoReady` must carry an absorbable wish --
-    // exercised directly against `Node::dispatch` (mirrors `VantageCore` exactly).
     let mut node = Node::new(authors()[3].0, ".db_test_w4_all_four_response_types", 6);
     let now = Instant::now();
     let (s1, _) = authors()[0];
     let (s2, _) = authors()[1];
     let (s3, _) = authors()[2];
-    let (s4, _) = authors()[1]; // reused sender is fine -- each check is independent
+    let (s4, _) = authors()[1];
 
     node.dispatch(
         Inbound::Echo(EchoOut::Single(Echo {

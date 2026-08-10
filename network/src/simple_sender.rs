@@ -26,18 +26,15 @@ pub mod simple_sender_tests;
 const STARTUP_RETRY_DELAY_MS: u64 = 200;
 const STARTUP_RETRY_BACKOFF_MAX_MS: u64 = 2_000;
 
-/// We keep alive one TCP connection per peer, each connection is handled by a separate task (called `Connection`).
-/// We communicate with our 'connections' through a dedicated channel kept by the HashMap called `connections`.
+/// Maintains one TCP connection per peer and sends through a per-peer channel.
 pub struct SimpleSender {
     /// A map holding the channels to our connections.
     connections: HashMap<SocketAddr, Sender<Bytes>>,
-    /// Small RNG just used to shuffle nodes and randomize connections (not crypto related).
+    /// RNG used to randomize broadcast destinations.
     rng: SmallRng,
-    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): per-destination artificial send
-    /// latency, empty by default (current behavior, byte-identical). See
-    /// `network/src/lib.rs`'s module doc for the injection point/semantics.
+    /// Optional fixed per-destination send latency.
     latency: HashMap<SocketAddr, Duration>,
-    /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::metrics`.
+    /// same contract as `ReliableSender::metrics`.
     metrics: Option<Arc<Metrics>>,
     /// Same contract as `ReliableSender::batch` (see `network::batch`'s module doc).
     batch: BatchConfig,
@@ -60,16 +57,13 @@ impl SimpleSender {
         }
     }
 
-    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): attach a per-destination
-    /// artificial latency map (same contract as `ReliableSender::with_latency`) --
-    /// call BEFORE any connection to an address in the map is spawned.
+    /// Set fixed per-destination send latency before spawning connections.
     pub fn with_latency(mut self, map: HashMap<SocketAddr, Duration>) -> Self {
         self.latency = map;
         self
     }
 
-    /// METRICS-DASHBOARD-SPEC.md §1: attach a wire-metrics handle (same contract as
-    /// `ReliableSender::with_metrics`).
+    /// Attach wire metrics before spawning connections.
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
@@ -113,8 +107,7 @@ impl SimpleSender {
         }
     }
 
-    /// Pick a few addresses at random (specified by `nodes`) and try (best-effort) to send the
-    /// message only to them. This is useful to pick nodes with whom to sync.
+    /// Send to up to `nodes` randomly selected addresses.
     pub async fn lucky_broadcast(
         &mut self,
         mut addresses: Vec<SocketAddr>,
@@ -126,8 +119,7 @@ impl SimpleSender {
         self.broadcast(addresses, data).await
     }
 
-    /// METRICS-DASHBOARD-SPEC.md §1: typed variant of `send` (see `ReliableSender::
-    /// send_typed`).
+    /// Send with a message-type metric.
     pub async fn send_typed(&mut self, address: SocketAddr, data: Bytes, msg_type: &'static str) {
         record_typed_sent(&self.metrics, msg_type, data.len());
         self.send(address, data).await;
@@ -159,16 +151,15 @@ impl SimpleSender {
     }
 }
 
-/// A connection is responsible to establish and keep alive (if possible) a connection with a single peer.
+/// Maintains a connection to one peer.
 struct Connection {
     /// The destination address.
     address: SocketAddr,
     /// Channel from which the connection receives its commands.
     receiver: Receiver<Bytes>,
-    /// PHASE7-PREP-NOTES.md (WAN-shaped local runs): this connection's own fixed
-    /// artificial one-way delay to `address` (`Duration::ZERO` = off, the default).
+    /// Fixed one-way delay for this connection.
     extra_latency: Duration,
-    /// METRICS-DASHBOARD-SPEC.md §1: same contract as `ReliableSender::Connection::metrics`.
+    /// same contract as `ReliableSender::Connection::metrics`.
     metrics: Option<Arc<Metrics>>,
     /// Same contract as `ReliableSender::Connection::batch`.
     batch: BatchConfig,
@@ -201,12 +192,8 @@ impl Connection {
         }
     }
 
-    /// Main loop trying to connect to the peer and transmit messages. Fable perf
-    /// audit item 6: dispatches to one of two loops depending on whether a
-    /// per-destination latency is actually configured -- mirrors `ReliableSender::
-    /// keep_alive`'s existing `extra_latency.is_zero()` split (`keep_alive_immediate`
-    /// vs. `keep_alive_delayed`). Startup connect failures are retried with capped
-    /// backoff so local/AWS launch skew does not discard the first queued frame.
+    /// Connects to the peer and selects the zero-delay or delayed send loop.
+    /// Connection attempts use capped exponential backoff.
     async fn run(&mut self) {
         if self.extra_latency.is_zero() {
             self.run_immediate().await
@@ -221,31 +208,10 @@ impl Connection {
         tokio::time::Instant::now() + self.extra_latency
     }
 
-    /// Wait out `delay` between connect attempts, DRAINING (and discarding) anything
-    /// queued for a peer we are not connected to yet. Returns false if the channel is
-    /// closed and empty -- `SimpleSender` is gone, so this task should exit instead of
-    /// retrying forever.
-    ///
-    /// This is `ReliableSender::run`'s `'waiter` arm minus the durable/volatile split,
-    /// which `SimpleSender` has no concept of: every send here is best-effort by the
-    /// API's own contract ("Try (best-effort) to send"), so everything drained is
-    /// dropped rather than replayed.
-    ///
-    /// NOT OPTIONAL, and the reason is subtle. `self.receiver` stays alive for as long
-    /// as this task retries, so the 100_000-slot channel behind it stays OPEN rather
-    /// than closing the way it did when a failed connect returned outright. A plain
-    /// `sleep` here lets that queue fill; `SimpleSender::send`'s `tx.send(..).await`
-    /// then blocks on a FULL channel instead of failing fast, and since `broadcast`
-    /// walks its addresses sequentially, one unreachable peer stops delivery to every
-    /// other peer. Draining also keeps a reconnect from flushing a whole outage's
-    /// backlog in one burst at a peer that has just come back.
-    ///
-    /// Starfish reaches the same guarantee structurally instead of by draining:
-    /// `network.rs`'s `make_connection` mints fresh per-session channels, so a peer
-    /// that is down has no channel to accumulate into at all.
+    /// Wait between connection attempts while discarding queued best-effort messages.
+    /// Returns false when the channel is closed and drained.
     async fn drain_until(&mut self, delay: Duration) -> bool {
-        // `metrics` is cloned out first so the discard arm does not borrow `self`
-        // while `self.receiver.recv()` holds it mutably inside the `select!`.
+        // Clone metrics before borrowing the receiver in `select!`.
         let metrics = self.metrics.clone();
         let timer = tokio::time::sleep(delay);
         tokio::pin!(timer);
@@ -258,8 +224,7 @@ impl Connection {
                             metrics.network_connect_wait_discarded_total.inc();
                         }
                     }
-                    // Closed AND drained: `recv` yields buffered messages first and
-                    // only then `None`, so this cannot cut a pending queue short.
+                    // `recv` returns buffered messages before `None`.
                     None => return false,
                 },
             }
@@ -272,10 +237,7 @@ impl Connection {
         loop {
             match TcpStream::connect(self.address).await {
                 Ok(stream) => {
-                    // Nagle + delayed-ACK stalls sub-MSS consensus frames by up to an
-                    // RTT on real WAN links (invisible on loopback); starfish sets
-                    // nodelay on both sides (network.rs:423,444). Best-effort, like
-                    // every other socket option here.
+                    // Disable Nagle buffering for small protocol frames.
                     let _ = stream.set_nodelay(true);
                     info!("Outgoing connection established with {}", self.address);
                     return Some(stream);
@@ -292,18 +254,7 @@ impl Connection {
         }
     }
 
-    /// Fable perf audit item 6: the zero-latency fast path -- byte-identical to the
-    /// pre-D7-3 loop (no delay queue, no `Instant::now()`/`sleep_until` bookkeeping at
-    /// all), used whenever no artificial per-destination latency is configured (the
-    /// default). Every message still goes through the same metrics accounting as
-    /// `run_delayed` does, so the bytes actually written to the wire are identical
-    /// either way -- only the zero-cost scheduling differs.
-    ///
-    /// Batching (`self.batch.enabled`) coalesces arrivals into bundle frames before
-    /// they ever reach `writer.send` -- best-effort, same as everything else here: if
-    /// the connection drops mid-accumulation, whatever is still buffered is simply
-    /// dropped (after a connection is established, SimpleSender still does not retry
-    /// mid-session failures, on or off batching).
+    /// Send loop without an artificial delay. Batching is applied before writing.
     async fn run_immediate(&mut self) {
         let Some(stream) = self.connect().await else {
             return;
@@ -313,7 +264,7 @@ impl Connection {
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
 
-        // Transmit messages once we have established a connection.
+        // Transmit messages after connecting.
         loop {
             let coalesce_due = sleep_until_or_pending(coalesce_deadline);
 
@@ -367,7 +318,7 @@ impl Connection {
                             // Sink the reply.
                         },
                         _ => {
-                            // Something has gone wrong (either the channel dropped or we failed to read from it).
+                            // The connection or acknowledgement stream failed.
                             warn!("{}", NetworkError::FailedToReceiveAck(self.address));
                             return;
                         }
@@ -377,27 +328,20 @@ impl Connection {
         }
     }
 
-    /// The pre-existing delay-queue loop, used whenever a nonzero per-destination
-    /// latency is configured. See `Connection::run`'s doc comment. Batching coalesces
-    /// arrivals the same way as `run_immediate`; a flushed bundle is treated as a
-    /// single fresh "arrival" into `delay_queue` (one release time, one injected
-    /// latency for the whole bundle), computed at flush time.
+    /// Send loop for a nonzero per-destination delay. Bundles receive one release time.
     async fn run_delayed(&mut self) {
         let Some(stream) = self.connect().await else {
             return;
         };
         let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
 
-        // D7-3: a plain FIFO delay queue, same reasoning as `ReliableSender::
-        // keep_alive_delayed` (every message on this link gets the identical fixed
-        // delay, so arrival order implies release-order -- no jitter, no concurrency,
-        // strict ordering preserved by construction).
+        // A FIFO queue preserves per-connection ordering.
         let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> =
             std::collections::VecDeque::new();
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
 
-        // Transmit messages once we have established a connection.
+        // Transmit messages after connecting.
         loop {
             let due = async {
                 match delay_queue.front() {
@@ -407,7 +351,7 @@ impl Connection {
             };
             let coalesce_due = sleep_until_or_pending(coalesce_deadline);
 
-            // Check if there are any new messages to send or if we get an ACK for messages we already sent.
+            // Wait for new messages, due messages, or acknowledgements.
             tokio::select! {
                 () = due, if !delay_queue.is_empty() => {
                     let (_, data) = delay_queue.pop_front().unwrap();
@@ -446,7 +390,7 @@ impl Connection {
                             // Sink the reply.
                         },
                         _ => {
-                            // Something has gone wrong (either the channel dropped or we failed to read from it).
+                            // The connection or acknowledgement stream failed.
                             warn!("{}", NetworkError::FailedToReceiveAck(self.address));
                             return;
                         }

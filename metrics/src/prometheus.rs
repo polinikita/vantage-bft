@@ -1,10 +1,4 @@
-// Ported from starfish (`~/code/starfish/crates/starfish-core/src/prometheus.rs`,
-// Apache-2.0) for the Starfish-parity metrics endpoint (PHASE2-SPEC.md #5).
-//
-// Deviations from starfish: no `tower_http::compression::CompressionLayer` (an internal
-// endpoint scraped a handful of times per run by the benchmark harness needs no response
-// compression) and no custom `runtime::{Handle, JoinHandle}` wrapper (starfish's own
-// multi-runtime abstraction; plain `tokio::spawn` suffices here).
+// Prometheus endpoint and process metrics.
 
 use std::net::SocketAddr;
 
@@ -14,15 +8,8 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 pub const METRICS_ROUTE: &str = "/metrics";
 
-/// Registers CPU-time and resident-memory metrics for this OS process.
-///
-/// Standalone primary/worker binaries call this after constructing their registry,
-/// giving Prometheus one `process_*` series per independently running process.  The
-/// in-process benchmark deliberately does not call it: all validators there share a
-/// PID, so attaching the same process collector to every per-validator registry would
-/// falsely duplicate whole-process resource usage.  The upstream collector is Linux-
-/// only; other platforms keep the endpoint operational but expose no `process_*`
-/// series.
+/// Registers CPU-time and resident-memory metrics for this process.
+/// Process metrics are available on Linux.
 pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus::Error> {
     #[cfg(target_os = "linux")]
     {
@@ -38,8 +25,7 @@ pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus:
     }
 }
 
-/// Always-on Prometheus text-exposition endpoint (starfish parity: it also serves
-/// Phase-3+ protocol metrics once those land on the same registry).
+/// Starts the Prometheus text-exposition endpoint.
 pub fn start_prometheus_server(
     address: SocketAddr,
     registry: &Registry,

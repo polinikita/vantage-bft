@@ -82,19 +82,11 @@ pub struct Worker {
     parameters: Parameters,
     /// The persistent storage.
     store: Store,
-    /// Starfish-parity metrics (PHASE2-SPEC.md #5): the registry is always served, this
+    /// Metrics: the registry is always served; this
     /// worker's own real-transaction-latency counters are only observed into under the
     /// `benchmark` feature (see `Synchronizer::observe_committed`).
     metrics: Arc<Metrics>,
-    /// Fable audit item 4 (WAN latency injection): this authority's own
-    /// per-destination artificial latency map, resolved once at spawn time exactly
-    /// the way `Core::spawn`/`vantage::node::VantageCore::spawn` resolve theirs (same
-    /// `Committee::latency_map` call, same `name`/`parameters.latency_table`) --
-    /// empty (== current behavior, byte-identical) unless `--latency-table`/
-    /// `--mimic-latency-ms` set `parameters.latency_table`. Threaded into every
-    /// worker-to-worker/worker-to-primary-reply `SimpleSender` this worker spawns
-    /// (`BatchMaker`, `Synchronizer`, `Helper`), which previously ran at zero
-    /// injected delay even under a WAN-shaped run.
+    /// Per-destination network latency applied to worker senders.
     latency_map: HashMap<SocketAddr, Duration>,
     /// Data-plane withholding fault injector (`Parameters::withhold_senders`),
     /// resolved once at spawn time (same convention as `latency_map` above) via
@@ -133,7 +125,7 @@ impl Worker {
         parameters: Parameters,
         store: Store,
     ) -> (Arc<Metrics>, Arc<MetricReporter>, Registry) {
-        // Boot the (always-on, starfish-parity) Prometheus metrics server.
+        // Start the Prometheus metrics server.
         let metrics_address = committee
             .worker(&name, &id)
             .expect("Our public key or worker id is not in the committee")
@@ -142,7 +134,7 @@ impl Worker {
         binding_metrics_address.set_ip("0.0.0.0".parse().unwrap());
         let registry = Registry::new();
         let (metrics, reporter) = Metrics::new(&registry);
-        // METRICS-DASHBOARD-SPEC.md §8: write-once at boot.
+        // write-once at boot.
         metrics.set_protocol_info(parameters.protocol.label());
         if let Some(mode) = parameters.tx_mode.as_deref() {
             metrics.set_transaction_mode_info(mode);
@@ -155,7 +147,7 @@ impl Worker {
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Worker {} metrics listening on {}", id, metrics_address);
 
-        // Fable audit item 4: resolved once, relative to OUR OWN committee index --
+        // resolved once, relative to OUR OWN committee index --
         // empty (== current behavior) unless `--latency-table`/`--mimic-latency-ms`
         // set `parameters.latency_table`. Identical construction to
         // `vantage::node::VantageCore::spawn`'s own `latency_map` (same table, same
@@ -305,10 +297,8 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
     ) -> Vec<QueueProbe> {
-        //tx_primary: channel between processor and PrimaryConnector
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY); //channel between TxReceive (Client) and batch maker
-                                                                          //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY); //channel between quorum waiter and processor
+        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
+        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
         let probes = vec![
             probe("batch_maker", tx_batch_maker.clone()),
             probe("processor_own", tx_processor.clone()),
@@ -341,15 +331,7 @@ impl Worker {
             "transactions",
         );
 
-        // Data-plane withholding fault injector, time-windowed variant: `BatchMaker`
-        // now makes the filtered-vs-full choice PER SEAL (time-windowed withholding
-        // can turn on/off mid-run, unlike c35fc4a's original whole-run filter), so
-        // BOTH the full and the filtered address list must be resolved here --
-        // `full_workers_addresses` is exactly `workers_addresses`' old (unfiltered)
-        // construction; `withheld_workers_addresses` is `None` unless THIS authority
-        // is a withholding sender at all (`--withhold`), in which case `BatchMaker::
-        // seal` never even consults `self.withhold_window` -- one cheap `match`
-        // discriminant, no allocation, no perturbation, on that default path.
+        // Resolve both address lists because withholding can change during a run.
         let full_workers_addresses: Vec<(PublicKey, SocketAddr)> = self
             .committee
             .others_workers(&self.name, &self.id)
@@ -365,17 +347,12 @@ impl Worker {
                     .collect()
             });
 
-        // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
-        // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
-        // gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
+        // BatchMaker assembles and broadcasts transactions, then sends the batch to Processor.
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
-            /* rx_transaction */
-            rx_batch_maker, //receiver channel to connect to TxReceiverHandler
-            // tx_message tx_quorum_waiter,   //sender channel to connect to quorum waiter
-            /* tx_batch */
-            tx_processor, //sender channel to connect to processor
+            rx_batch_maker,
+            tx_processor,
             /* workers_addresses */ full_workers_addresses,
             /* withheld_workers_addresses */ withheld_workers_addresses,
             /* withhold_window */ self.withhold_window.clone(),
@@ -384,17 +361,7 @@ impl Worker {
             self.batch,
         );
 
-        // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
-        // // the batch to the `Processor`.
-        // QuorumWaiter::spawn(
-        //     self.committee.clone(),
-        //     /* stake */ self.committee.stake(&self.name),
-        //     /* rx_message */ rx_quorum_waiter, //receiver channel to connect to batch maker.
-        //     /* tx_batch */ tx_processor,  //sender channel to connect to processor
-        // );
-
-        // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the `PrimaryConnector`
-        // that will send it to our primary machine.
+        // Processor stores each batch and sends its digest to the primary.
         Processor::spawn(
             self.id,
             self.store.clone(),
@@ -485,11 +452,11 @@ impl Worker {
 /////////////////////////// Network Handlers ///////////////////////////////
 
 /// Defines how the network receiver handles incoming transactions.
-//Note: Only expect to receive client messages submitting new transactions.
+// Receives client transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
     tx_batch_maker: Sender<Transaction>, //sender channel to connect to batch maker
-    /// Fable perf audit item 1: shared (across every connection this handler's
+    /// shared (across every connection this handler's
     /// `Receiver` accepts -- `handler.clone()` per accepted connection, see
     /// `network::Receiver::run`) counter gating how often `dispatch` actually yields.
     /// Purely a scheduling-fairness knob (see `dispatch`'s doc comment); no protocol
@@ -505,15 +472,14 @@ impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         // Send the transaction to the batch maker. `message` is already an owned
         // `Bytes` handed to us by `network::Receiver` -- forward it directly instead
-        // of the previous `message.to_vec()`, which copied every single transaction
-        // out of an already-owned buffer for no reason (Fable perf audit item 1).
+        // of the previous `message.to_vec()`, which copied every transaction.
         self.tx_batch_maker
             .send(message)
             .await
             .expect("Failed to send transaction");
 
         // Occasionally give the chance to schedule other tasks, instead of on every
-        // single transaction (Fable perf audit item 1) -- tokio's own cooperative
+        // single transaction -- Tokio's own cooperative
         // scheduling budget already yields periodically regardless; this just adds
         // an explicit, cheap backstop under sustained client load.
         if self
@@ -528,7 +494,7 @@ impl MessageHandler for TxReceiverHandler {
 }
 
 /// Defines how the network receiver handles incoming workers messages.
-//Note: Only expect to receive worker messages that are a) proposing batches, or b) acknowledging batches
+// Receives batches and batch requests from workers.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>, //sender channel to connect to helper
@@ -562,8 +528,8 @@ impl MessageHandler for WorkerReceiverHandler {
                     .inc_by(serialized.len() as u64);
                 // `serialized` is already an owned `Bytes` -- forward it directly
                 // instead of the previous `serialized.to_vec()`, which copied every
-                // received batch a second time for no reason (Fable perf audit item
-                // 3). `Processor` now does the one unavoidable `Bytes -> Vec<u8>`
+                // received batch a second time. `Processor` does the unavoidable
+                // `Bytes -> Vec<u8>`
                 // copy itself, right at `Store::write`'s fixed `Vec<u8>` boundary.
                 self.tx_processor
                     .send(serialized)

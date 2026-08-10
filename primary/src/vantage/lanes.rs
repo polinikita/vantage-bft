@@ -1,12 +1,3 @@
-// PHASE3-SPEC.md §3.2 -- lane state, first-hand availability, ACK trigger (N1-N5).
-//
-// `LaneManager` owns the per-author block index, the ack bookkeeping, and the C/T
-// candidate registers. It shares its block cache (`BlockCache`, behind `SharedBlocks`)
-// with `repair::Repairer`, which also writes into it (repaired/served blocks) and
-// reads it (to decide what it may serve). This is a deliberate simplification of the
-// spec's "one task each" framing (§3.2/§3.3) into "two tasks, one shared chain cache,
-// two disjoint bookkeeping sets" -- documented in PHASE3-NOTES.md.
-
 use crate::messages::{Ack, Header};
 use crate::primary::Height;
 use crate::vantage::block::{self, block_ok, BlockRef};
@@ -19,118 +10,47 @@ use parking_lot::Mutex;
 use prometheus::IntCounter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound::{Excluded, Included};
 use std::sync::Arc;
 use store::Store;
 
-/// Per-block bookkeeping (§3.2 `BlockEntry`).
 #[derive(Clone)]
 pub struct BlockEntry {
     pub block: Header,
-    /// N1/N2: received via an authentic `publish` from the encoded author (channel
-    /// sender == author), directly or as an upgrade of previously-repaired bytes.
+    /// The block arrived from its encoded author through the publish path.
     pub direct: bool,
-    /// N6: arrived (at least once) only via `serve`, without provenance.
+    /// The block arrived through the repair path without publish provenance.
     pub repaired: bool,
-    /// N8: must be held + served forever once set. Sticky (never cleared).
+    /// Retained blocks remain available for repair service.
     pub retained: bool,
-    /// D1: this block's own referenced worker batches are locally present.
+    /// Every worker batch referenced by this block is present locally.
     pub payload_ok: bool,
-    /// PHASE6-SPEC.md §9 gate amendment (D6-7, performance-only, deterministic-
-    /// equivalent): memoized result of `direct_prefix_ok`'s walk down to genesis for
-    /// THIS exact digest -- the original PHASE3-SPEC.md §3.2 design. Once true, never
-    /// reset (the underlying chain a digest names is immutable once cached, and
-    /// `direct`/`payload_ok` are themselves monotonic -- see `direct_prefix_ok`'s own
-    /// doc comment for why this is a sound memoization, not just an optimization).
-    /// Only ever set to `true`; a failed check never caches `false`, so a later retry
-    /// (once e.g. `payload_ok` flips) always re-walks from scratch.
+    /// A successful direct-and-payload prefix check; this flag is monotonic.
     pub direct_prefix_verified: bool,
-    /// PHASE6-SPEC.md §9 gate amendment (D6-7 continued -- profiled AFTER the original
-    /// (a)/(b) fixes still left the capacity probe short): memoized result of
-    /// `verified_prefix_through_genesis`'s OWN walk down to genesis for THIS exact
-    /// digest -- a DIFFERENT, previously-unmemoized check from `direct_prefix_verified`
-    /// above (chain/`BlockOK` validity alone, no `direct`/`payload_ok` requirement) that
-    /// `direct_pub`/`holds_prefix` each call on every single invocation. Sound for the
-    /// identical reason `direct_prefix_verified` is: only a successful walk all the way
-    /// to genesis (or to an already-verified ancestor) ever sets it, a cached block's
-    /// own content is immutable, and `BlockOK` is a pure function of that content -- so
-    /// nothing can ever make an already-verified chain stop verifying.
+    /// A successful chain-validity prefix check; this flag is monotonic.
     pub chain_verified: bool,
-    /// Fable perf audit: memoized result of `block::block_ok(&self.block, ...)` for
-    /// THIS exact digest. Set exactly once, in `BlockCache::upsert`, and ONLY by a
-    /// caller that has ALREADY run a genuine, passing `block_ok` check on this exact
-    /// `Header` (both current call sites -- `LaneManager::process_publish_inner` and
-    /// `Repairer::on_serve` -- check `block_ok` first and return early without ever
-    /// calling `upsert` if it fails, so `upsert` is never reached with a failing
-    /// header). Sound to trust forever after that: the cache is digest-keyed and a
-    /// cached entry's `block` content is immutable once inserted (a later `upsert` for
-    /// the SAME digest is, by construction, byte-identical content -- see `upsert`'s own
-    /// doc comment), and `block_ok` is a pure function of that content plus the
-    /// (per-session-constant) committee/sid/size-cap arguments -- so a digest that
-    /// passed once can never later fail. Read-side chain walks
-    /// (`verified_prefix_through_genesis`, `collect_verified_suffix`, and
-    /// `repair::Repairer::settle`) consult this flag instead of re-running the header's
-    /// `blake3` self-consistency check on every visit.
+    /// The exact cached header passed `block_ok`; this flag is monotonic.
     pub block_ok_verified: bool,
 }
 
 impl BlockEntry {
-    /// Author-pin + consecutive-height check shared by every author-pinned chain
-    /// walk in this file (`direct_prefix_ok`/`verified_prefix_through_genesis`/
-    /// `collect_verified_chain`/`collect_verified_suffix`): `true` iff this entry
-    /// belongs to `author` and sits at exactly `expected_height` (§1 "one author
-    /// index" + "consecutive heights" -- see `direct_prefix_ok`'s doc comment for
-    /// why a Byzantine parent-pointer graft/cycle needs both checks to terminate
-    /// the walk safely).
+    /// Checks the author and expected height used as the walk's termination measure.
     fn pinned_at(&self, author: PublicKey, expected_height: Height) -> bool {
         self.block.author == author && self.block.height == expected_height
     }
 }
 
-/// Shared block cache: every block this node has ever obtained, keyed by its digest
-/// (`Header.id`, which folds `sid` -- §3.1). Forks are representable (multiple digests
-/// per (author, height)).
 #[derive(Default)]
+/// Digest-keyed block cache that can represent multiple digests at one author and height.
 pub struct BlockCache {
     by_digest: HashMap<Digest, BlockEntry>,
     by_author: HashMap<PublicKey, BTreeMap<Height, HashSet<Digest>>>,
-    /// Total nodes visited by `verified_prefix_through_genesis` / `direct_prefix_ok`
-    /// since construction, monotonic.
-    ///
-    /// Both walks memoize only SUCCESS (`chain_verified` / `direct_prefix_verified`; see
-    /// those fields' doc comments -- "a failed check never caches `false`"). So a cached
-    /// suffix sitting above a MISSING block is re-walked, in full, on every call, and
-    /// these predicates are called per inbound message via `recheck_all` and per publish
-    /// via `refresh_author`. The 2026-08-08 n=100 straggler hypothesis is that this is
-    /// where a pinned node's core goes: 10/100 nodes ran their core at 97% busy with
-    /// `inbound_dispatch` and `effect_execution` each ~2.5x healthy, on FEWER messages and
-    /// FEWER settle calls than healthy nodes -- i.e. the cost is per-event, ~99 us/message
-    /// against ~39 us healthy, which volume-based explanations cannot produce.
-    ///
-    /// Plain `u64` rather than a metrics counter: incrementing a labeled Prometheus
-    /// counter per visited node would itself be a hot-path cost of the same order as the
-    /// step being counted. Flushed once a second by `VantageCore::sample_metrics`, the
-    /// convention this module already uses for `vantage_block_cache_len`.
     walk_steps_chain: u64,
     walk_steps_direct: u64,
-    /// Failure-branch tallies for the two prefix walks, `[missing, pinned, gate]` --
-    /// `missing` = `by_digest` miss, `pinned` = author/height mismatch (or a height/
-    /// genesis contradiction), `gate` = the per-family predicate (`block_ok_verified`
-    /// for chain, `direct && payload_ok` for direct). Added after the 2026-08-10 fleet
-    /// freeze, whose forensics could see 1.5M failing chain steps/s per peer but not
-    /// WHICH branch failed. Same flush convention as `walk_steps_*`.
+    /// Failure counts indexed as missing block, coordinate mismatch, and validity gate.
     walk_fail_chain: [u64; 3],
     walk_fail_direct: [u64; 3],
-    /// Missing-parent refs observed by failing walks: the exact `(author, height,
-    /// digest)` a walk needed and the cache did not hold. Drained by the caller into
-    /// `Repairer::authorize`, whose settle machinery requests the block and recursively
-    /// backfills deeper holes -- once present, the walk verifies and memoizes, so each
-    /// hole costs one repair round-trip instead of unbounded re-walks. This is how a
-    /// kill-window hole in a restarted node's lane (persisted+restored locally, but the
-    /// SEND died with the process, so no peer holds it) ever heals on the peers: live
-    /// publishes with missing parents trigger no other repair path anywhere.
-    ///
-    /// Bounded: at steady state a failing walk re-reports the same ref, so the set
-    /// stays at the number of distinct holes (one per restarted lane, in practice).
+    /// Missing exact coordinates awaiting repair authorization.
     missing_parents: BTreeSet<BlockRef>,
 }
 
@@ -146,9 +66,7 @@ enum DirectPubCheck {
     Failed,
 }
 
-/// `missing_parents` cap -- distinct simultaneous holes, not a rate. One restart
-/// produces one hole (rarely a few, if the sender queue died deep); 64 covers every
-/// lane of a large committee restarting at once.
+/// Maximum distinct missing coordinates retained for reporting.
 const MISSING_PARENTS_CAP: usize = 64;
 
 impl BlockCache {
@@ -160,23 +78,16 @@ impl BlockCache {
         self.by_digest.get(h)
     }
 
-    /// Monotonic walk-step totals `(chain, direct)` -- see `walk_steps_chain`. Read as a
-    /// delta against the previous sample; the ratio to `blocks_received` is the diagnostic
-    /// (expected <= ~2x when every walk short-circuits, orders of magnitude above that
-    /// when a hole forces full re-walks).
+    /// Returns monotonic `(chain, direct)` walk-step counts.
     pub fn walk_steps(&self) -> (u64, u64) {
         (self.walk_steps_chain, self.walk_steps_direct)
     }
 
-    /// Monotonic walk-failure branch totals `(chain, direct)`, each `[missing, pinned,
-    /// gate]` -- see `walk_fail_chain`. Same delta-sampling convention as `walk_steps`.
+    /// Returns monotonic `(chain, direct)` failure counts in missing, coordinate, gate order.
     pub fn walk_failures(&self) -> ([u64; 3], [u64; 3]) {
         (self.walk_fail_chain, self.walk_fail_direct)
     }
 
-    /// Record a `(author, height, digest)` a prefix walk needed and this cache did not
-    /// hold -- see `missing_parents`. Capped; a full set drops the report (the walk will
-    /// re-report it once the set drains).
     fn note_missing_parent(&mut self, author: PublicKey, height: Height, digest: Digest) {
         if self.missing_parents.len() >= MISSING_PARENTS_CAP {
             return;
@@ -184,8 +95,7 @@ impl BlockCache {
         self.missing_parents.insert((author, height, digest));
     }
 
-    /// Drain up to `cap` missing-parent reports for the caller to hand to
-    /// `Repairer::authorize`.
+    /// Removes and returns at most `cap` missing exact coordinates.
     pub fn take_missing_parents(&mut self, cap: usize) -> Vec<BlockRef> {
         let mut out = Vec::new();
         while out.len() < cap {
@@ -197,9 +107,6 @@ impl BlockCache {
         out
     }
 
-    /// Entries held, exported as `vantage_block_cache_len`. Measured at 4,286 bytes of
-    /// per-node RSS growth per entry, growing at exactly the committee's block rate
-    /// (`local-dryrun/rss-growth.sh`), which is why `evict_author_below` exists.
     pub fn len(&self) -> usize {
         self.by_digest.len()
     }
@@ -208,29 +115,14 @@ impl BlockCache {
         self.by_digest.is_empty()
     }
 
-    /// Drop every cached block of `author` strictly below `height`. Returns how many
-    /// entries went away.
+    /// Deletes blocks below `height` and returns the number deleted.
     ///
-    /// MEMORY (2026-08-07): this type kept "every block this node has ever obtained" with no
-    /// eviction of any kind, which after the `AckAggregator` retirement was the dominant
-    /// remaining leak -- 2.504 MB/s/node at n=30, ~4,286 B per entry, with `len()` climbing
-    /// at exactly the committee block rate (584/s = 30 nodes x 20 blocks/s at a 50ms header
-    /// delay). Extrapolated to n=100 that is OOM against 8 GiB in roughly 8-10 minutes.
-    ///
-    /// SAFETY IS THE CALLER'S: this method is a mechanical delete and will happily drop a
-    /// block the node still needs. `height` must be a floor below which no correct party --
-    /// local or remote -- can still require the data. `LaneManager::evict_universally_held`
-    /// derives it from "every peer has confirmed holding this lane at or above h", which
-    /// makes serving requests below it unnecessary by construction. Do not call this with a
-    /// floor derived from local progress alone: N8 forbids discarding retained blocks
-    /// precisely because peers may still ask for them, and starving a peer's repair is the
-    /// failure this whole line of work exists to fix.
+    /// The caller must ensure no correct local or remote party can require those blocks;
+    /// a floor derived only from local progress is unsafe.
     pub fn evict_author_below(&mut self, author: &PublicKey, height: Height) -> usize {
         let Some(by_height) = self.by_author.get_mut(author) else {
             return 0;
         };
-        // `split_off` keeps `height..` in place and hands back everything below it, the same
-        // GC discipline `AgbEngine`/`ControlLog` use -- no `retain`, no full-map scan.
         let keep = by_height.split_off(&height);
         let below = std::mem::replace(by_height, keep);
         let mut dropped = 0;
@@ -251,25 +143,9 @@ impl BlockCache {
         self.by_digest.contains_key(h)
     }
 
-    /// Insert a freshly-seen block, or upgrade an existing entry's provenance/payload
-    /// flags. `direct`/`repaired`/`payload_ok`/`block_ok_verified` are OR-merged (N2: "a
-    /// later publish may upgrade bytes previously cached via repair"; all flags besides
-    /// the block body itself are monotonic/sticky, matching N8's "no discard").
-    /// `block_ok_verified` must be `true` only when the caller has already run a
-    /// genuine, passing `block::block_ok` check on this exact `block` (see
-    /// `BlockEntry::block_ok_verified`'s doc comment) -- both current call sites satisfy
-    /// this by construction.
+    /// Inserts a block and monotonically merges its provenance and validation flags.
     ///
-    /// Fable perf audit: the valuable part on an EXISTING entry is OR-merging the
-    /// monotonic flags (esp. `block_ok_verified`, so readers never re-run `block_ok`).
-    /// The `block` field is still overwritten last-writer-wins, exactly as before this
-    /// audit -- NOT skipped: although the digest key pins everything `Header::digest()`
-    /// folds and everything `block_ok` checks, the one field it pins neither
-    /// (`parent_cert.author`) is Byzantine-forgeable, so two same-`id` headers can
-    /// differ there; keeping the overwrite preserves the pre-audit last-writer-wins
-    /// bytes exactly (that field is dead on every vantage read path, so this is purely
-    /// about staying byte-identical, not correctness). The overwrite is a cheap move of
-    /// an already-owned `Header`, not a clone.
+    /// `block_ok_verified` may be true only after this exact header passes `block_ok`.
     pub fn upsert(
         &mut self,
         block: Header,
@@ -306,29 +182,14 @@ impl BlockCache {
                 entry.repaired |= repaired;
                 entry.payload_ok |= payload_ok;
                 entry.block_ok_verified |= block_ok_verified;
-                entry.block = block; // last-writer-wins, as before the audit (see doc)
+                entry.block = block;
             }
         }
     }
 
-    /// Boot-time restore (`LaneManager::restore_own_frontier`): admit `block` as a
-    /// TRUSTED, fully-verified anchor of this node's OWN lane. Sets `chain_verified`
-    /// and `direct_prefix_verified` so both prefix walks terminate here instead of
-    /// failing forever at the pre-restart prefix this memory-only cache lost.
+    /// Restores a verified, retained anchor for this node's own lane.
     ///
-    /// Soundness: both flags memoize facts that are monotone and immutable once true
-    /// (see their field doc comments), and for the node's own lane they WERE true in
-    /// the process that persisted this header -- `publish_own` only ever extends a
-    /// self-published (direct, own-payload) chain, so by induction from the first boot
-    /// every persisted frontier had a direct, payload-ready, chain-valid prefix through
-    /// genesis. Restoring the memo across a restart of the same session (the caller
-    /// checks the sid, re-runs `block_ok`, and pins author/digest) claims nothing the
-    /// previous process had not genuinely verified. Only ever call this for a header
-    /// this party authored itself.
-    ///
-    /// Also marked `retained` (N8): the pre-restart process retained it on the ack
-    /// path, and peers may still repair against it -- with the rest of the lane gone,
-    /// this entry is what lets a peer fetch the tip this node builds on.
+    /// The caller must verify the session, author, frontier coordinate, and `block_ok` first.
     pub(crate) fn seed_own_anchor(&mut self, block: Header) {
         let digest = block.id.clone();
         self.upsert(block, true, false, true, true);
@@ -339,7 +200,18 @@ impl BlockCache {
         }
     }
 
-    /// Returns `true` iff this call is the one that newly retained `h` (idempotent).
+    /// Seeds a checkpoint-certified anchor without claiming local payload storage.
+    pub(crate) fn seed_recovered_own_anchor(&mut self, block: Header) {
+        let digest = block.id.clone();
+        self.upsert(block, false, true, false, true);
+        if let Some(entry) = self.by_digest.get_mut(&digest) {
+            entry.chain_verified = true;
+            entry.direct_prefix_verified = true;
+            entry.retained = true;
+        }
+    }
+
+    /// Returns true only when this call changes `h` to retained.
     pub fn mark_retained(&mut self, h: &Digest) -> bool {
         match self.by_digest.get_mut(h) {
             Some(entry) if !entry.retained => {
@@ -350,7 +222,7 @@ impl BlockCache {
         }
     }
 
-    /// Returns `true` iff this call is the one that newly marked payload presence.
+    /// Returns true only when this call records payload availability for `h`.
     pub fn set_payload_ok(&mut self, h: &Digest, ok: bool) -> bool {
         match self.by_digest.get_mut(h) {
             Some(entry) if ok && !entry.payload_ok => {
@@ -367,26 +239,13 @@ impl BlockCache {
             .is_some_and(|entry| entry.direct && entry.payload_ok)
     }
 
-    /// Mechanism A (sender-side lane resume, `vantage::resume`): this author's own
-    /// cached block at exactly `height`, if any. An author's own lane carries at
-    /// most one digest per height absent a Byzantine fork (`upsert`'s own doc
-    /// comment on fork representability); the first indexed digest is taken. Every
-    /// call site (`LaneManager::author_block_at`, reached only from
-    /// `VantageCore`/`SimpleItCore`'s `Inbound::LaneResume` handling after already
-    /// checking `author == self.name`) only ever asks about ITS OWN lane, which this
-    /// protocol never lets fork at the party serving it.
+    /// Returns one cached block at the exact author and height.
     pub fn author_block_at(&self, author: &PublicKey, height: Height) -> Option<&Header> {
         let digest = self.by_author.get(author)?.get(&height)?.iter().next()?;
         self.by_digest.get(digest).map(|e| &e.block)
     }
 
-    /// Mechanism A: the smallest height this party holds ANY cached block for
-    /// `author` at. Currently always `Some(1)` once `author` has published anything
-    /// -- N8 retention never discards (`BlockEntry::retained`'s doc comment: "must be
-    /// held + served forever once set") -- and `None` before that; kept as a real
-    /// query over `by_author`'s own index (not a hardcoded `1`) so the resume-serve
-    /// clamp this feeds (`LaneManager::earliest_authored_height`) stays correct if
-    /// height-based eviction is ever added to this cache.
+    /// Returns the smallest cached height for `author`.
     pub fn earliest_height(&self, author: &PublicKey) -> Option<Height> {
         self.by_author.get(author)?.keys().next().copied()
     }
@@ -405,37 +264,10 @@ impl BlockCache {
             .unwrap_or_default()
     }
 
-    /// `direct_prefix_ok(a, k, h)` (§3.2): direct mark + `payload_ok` on this block, and
-    /// the same holds recursively for the parent, down to genesis (D1's "whole
-    /// prefix").
+    /// Verifies one author, consecutive heights, direct provenance, and payload availability.
     ///
-    /// Walks by expected height (strictly decreasing each step, checked against each
-    /// visited block's *own* height field) rather than purely by digest pointer: a
-    /// Byzantine pair of blocks can reference each other as "parent" with no hash
-    /// preimage cost at all (each is individually self-consistent -- `BlockOK` only
-    /// checks a block against *its own* `parent_cert.height`, never against the real
-    /// height of whatever the pointer resolves to), which would otherwise make a
-    /// pointer-only walk spin forever. Tracking height gives a strictly-decreasing
-    /// termination measure independent of any adversarial digest choice, and doubles as
-    /// this function's enforcement of "consecutive heights" (part of "valid lane
-    /// prefix", §1). Also pins the walk's author to the starting block's own author and
-    /// rejects any visited block authored by someone else (§1's "one author index" --
-    /// otherwise a Byzantine author can graft their block onto a *different* author's
-    /// genuine, already-verified chain: `BlockOK` never checks a parent pointer's target
-    /// against the child's own author, only the child's internal height arithmetic).
-    /// PHASE6-SPEC.md §9 gate amendment (D6-7): incrementally memoized via
-    /// `BlockEntry::direct_prefix_verified` -- the walk stops as soon as it reaches an
-    /// ancestor already known verified (trusting it, exactly as the original PHASE3-
-    /// SPEC.md §3.2 design intended), instead of re-walking all the way to genesis on
-    /// every call. Sound because: (a) only a SUCCESSFUL full walk to genesis (or to an
-    /// already-verified ancestor) ever sets the flag, never a failed one, so a
-    /// negative result is never memoized and a later retry (e.g. once `payload_ok`
-    /// flips true) still re-walks from scratch; (b) `direct`/`payload_ok` are
-    /// themselves monotonic (only ever OR-merged upward, §3.2 N2/N8), so a chain that
-    /// verified once can never stop verifying; (c) a cached digest's own `block`/
-    /// `parent_cert` content is immutable once inserted. Every other check (author
-    /// pinning, height arithmetic, `direct && payload_ok`) is unchanged from the
-    /// original per-visited-node semantics.
+    /// Expected height decreases on every step, so malformed parent cycles terminate.
+    /// Only successful prefixes are memoized.
     pub fn direct_prefix_ok(&mut self, genesis: &Digest, h: &Digest) -> bool {
         matches!(
             self.direct_prefix_check(genesis, h),
@@ -468,7 +300,7 @@ impl BlockCache {
             if expected_height == 0 {
                 self.walk_steps_direct += steps;
                 self.walk_fail_direct[1] += 1;
-                return DirectPrefixCheck::Failed; // ran out of height before reaching genesis
+                return DirectPrefixCheck::Failed;
             }
             let Some(entry) = self.by_digest.get(&cur) else {
                 self.walk_steps_direct += steps;
@@ -479,15 +311,15 @@ impl BlockCache {
             if !entry.pinned_at(author, expected_height) {
                 self.walk_steps_direct += steps;
                 self.walk_fail_direct[1] += 1;
-                return DirectPrefixCheck::Failed; // cross-author graft (§1 "one author index") or height gap
+                return DirectPrefixCheck::Failed;
+            }
+            if entry.direct_prefix_verified {
+                break;
             }
             if !(entry.direct && entry.payload_ok) {
                 self.walk_steps_direct += steps;
                 self.walk_fail_direct[2] += 1;
                 return DirectPrefixCheck::Gate(cur);
-            }
-            if entry.direct_prefix_verified {
-                break; // this ancestor (and everything below it) already verified
             }
             newly_walked.push(cur.clone());
             cur = entry.block.parent_cert.header_digest.clone();
@@ -502,31 +334,9 @@ impl BlockCache {
         DirectPrefixCheck::Verified
     }
 
-    /// A "valid lane prefix" (§1 last row): one author, consecutive heights, matching
-    /// predecessor hashes, every block `BlockOK`, back to genesis. See
-    /// `direct_prefix_ok`'s doc comment for why this walks by expected height (and
-    /// pinned author) rather than purely by digest pointer (termination against
-    /// adversarial reference cycles/grafts, and the "one author"/"consecutive heights"
-    /// checks themselves).
+    /// Verifies one author, consecutive heights, validated blocks, and the genesis link.
     ///
-    /// PHASE6-SPEC.md §9 gate amendment (D6-7 continued): incrementally memoized via
-    /// `BlockEntry::chain_verified`, mirroring `direct_prefix_ok`'s exact pattern --
-    /// stops at the first already-verified ancestor instead of re-walking to genesis on
-    /// every call (this used to delegate to `collect_verified_chain`'s genesis-anew
-    /// walk on EVERY invocation; profiling the capacity probe after the (a)/(b) fixes
-    /// showed this specific, separate walk -- called by `direct_pub`/`holds_prefix` on
-    /// every C/T/T-pairing check -- as the new dominant cost). `collect_verified_chain`
-    /// itself is unchanged (still used by nothing else; kept for the shape/doc
-    /// parallel with `collect_verified_suffix`, and in case a future caller needs the
-    /// actual hash sequence again).
-    ///
-    /// Fable perf audit: the per-visited-block `block::block_ok` re-check now consults
-    /// `BlockEntry::block_ok_verified` instead of recomputing (every cached entry has
-    /// this memo set true at admission time -- see that field's doc comment), so
-    /// `_committee`/`_sid`/`_max_block_payload` are no longer read in this body; kept as
-    /// parameters (renamed, not removed) to leave `collect_verified_suffix`'s identical
-    /// signature shape and this function's own call sites (`direct_pub`, `holds_prefix`)
-    /// untouched.
+    /// Expected height decreases on every step, and only successful prefixes are memoized.
     pub fn verified_prefix_through_genesis(
         &mut self,
         _committee: &Committee,
@@ -570,7 +380,7 @@ impl BlockCache {
             if !entry.pinned_at(author, expected_height) {
                 self.walk_steps_chain += steps;
                 self.walk_fail_chain[1] += 1;
-                return false; // cross-author graft (§1 "one author index") or height gap
+                return false;
             }
             if !entry.block_ok_verified {
                 self.walk_steps_chain += steps;
@@ -578,7 +388,7 @@ impl BlockCache {
                 return false;
             }
             if entry.chain_verified {
-                break; // this ancestor (and everything below it) already verified
+                break;
             }
             newly_walked.push(cur.clone());
             cur = entry.block.parent_cert.header_digest.clone();
@@ -593,17 +403,7 @@ impl BlockCache {
         true
     }
 
-    /// PHASE4-SPEC.md §9: like `verified_prefix_through_genesis`, but returns the actual
-    /// verified chain (genesis first, `h` last) instead of a bare bool -- the output
-    /// cursor's `Expand_D` needs the hashes themselves, not just a validity bit.
-    /// `verified_prefix_through_genesis` is NOT a thin wrapper over this (this doc used
-    /// to say it was): the D6-7 gate amendment below gave it its own `chain_verified`
-    /// memoization and its own copy of the walk with an early-break this function
-    /// doesn't need (this one has no memo to stop at -- every call walks all the way to
-    /// genesis). No caller in this workspace currently needs the actual hash sequence
-    /// (only `collect_verified_suffix`'s incremental sibling is called, by
-    /// `cursor.rs`) -- kept as public API per the original PHASE4-SPEC.md #9 design for
-    /// whichever future caller needs it.
+    /// Returns a validated digest chain in ascending height order, including genesis.
     pub fn collect_verified_chain(
         &self,
         committee: &Committee,
@@ -631,14 +431,8 @@ impl BlockCache {
             }
             let entry = self.by_digest.get(&cur)?;
             if !entry.pinned_at(author, expected_height) {
-                return None; // cross-author graft (§1 "one author index") or height gap
+                return None;
             }
-            // NOTE (2026-08-07): unlike `collect_verified_suffix` and
-            // `verified_prefix_through_genesis`, this walk re-runs `block_ok` rather than
-            // consulting `BlockEntry::block_ok_verified`. Left as-is deliberately: this
-            // function has NO production callers -- `expand`/the gate amendment replaced it
-            // with the suffix/prefix walks -- so memoizing it would be a change to dead code
-            // and would imply a hot-path win that does not exist.
             if !block_ok(&entry.block, committee, sid, max_block_payload) {
                 return None;
             }
@@ -648,24 +442,7 @@ impl BlockCache {
         }
     }
 
-    /// PHASE6-SPEC.md §9 gate amendment (D6-7, performance-only, deterministic-
-    /// equivalent): like `collect_verified_chain`, but stops at a caller-supplied
-    /// watermark `(stop_height, stop_digest)` instead of walking all the way to
-    /// genesis every time -- the cursor's per-lane emitted-height watermark records
-    /// exactly this (the last block of this author's lane already verified+emitted),
-    /// so re-verifying everything below it on every subsequent seal is pure waste.
-    /// Returns just the NEW suffix, ascending, excluding the watermark itself. `None`
-    /// if the walk breaks before reaching the watermark (missing/invalid block) OR if
-    /// the chain reaches `stop_height` on a DIFFERENT digest than `stop_digest` (a
-    /// fork below the watermark -- Byzantine-unreachable under this protocol's own
-    /// safety properties, since the cursor only ever advances along a single agreed
-    /// chain per author, but checked defensively rather than assumed).
-    ///
-    /// Fable perf audit: the per-visited-block `block::block_ok` re-check now consults
-    /// `BlockEntry::block_ok_verified` instead of recomputing (see that field's doc
-    /// comment); `_committee`/`_sid`/`_max_block_payload` are no longer read in this
-    /// body but stay in the signature (renamed, not removed) so `cursor.rs`'s call site
-    /// -- outside this change's scope -- is untouched.
+    /// Returns the validated suffix above the exact stop coordinate in ascending order.
     pub fn collect_verified_suffix(
         &self,
         _committee: &Committee,
@@ -688,13 +465,7 @@ impl BlockCache {
         }
     }
 
-    /// `collect_verified_suffix`, but separating the two reasons a walk can fail.
-    ///
-    /// Callers that can only wait (availability crediting, simpleit's cut expansion) use
-    /// the `Option` wrapper above and treat both as "not yet". `Cursor::expand` MUST NOT:
-    /// a `Forked` entry can never become walkable, so waiting on one wedges the output
-    /// cursor of every honest node forever -- measured 2026-08-09, one restart froze all
-    /// 21 cursors on a docker-bench fleet.
+    /// Distinguishes missing validation data from ancestry that contradicts the stop coordinate.
     pub fn classify_suffix(
         &self,
         _committee: &Committee,
@@ -714,25 +485,17 @@ impl BlockCache {
         loop {
             if expected_height == stop_height {
                 if &cur != stop_digest {
-                    // The target descends through a DIFFERENT block at a height we have
-                    // already output. Irreconcilable, not slow.
                     return SuffixWalk::Forked;
                 }
                 chain.reverse();
                 return SuffixWalk::Ready(chain);
             }
             if expected_height == 0 {
-                // Bottomed out at genesis without ever meeting the watermark: the
-                // target's history does not contain what we output. Also permanent.
                 return SuffixWalk::Forked;
             }
             let Some(entry) = self.by_digest.get(&cur) else {
                 return SuffixWalk::Pending;
             };
-            // Cross-author graft (§1 "one author index") or height gap. Deliberately
-            // NOT `Forked`: a structurally impossible entry means the cache is corrupt
-            // rather than the history contradictory, and dropping output on that basis
-            // is the more dangerous error.
             if !entry.pinned_at(author, expected_height) {
                 return SuffixWalk::Pending;
             }
@@ -746,27 +509,19 @@ impl BlockCache {
     }
 }
 
-/// The outcome of walking a lane suffix from a watermark to a named target.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of validating ancestry above an exact watermark coordinate.
 pub enum SuffixWalk {
-    /// The verified suffix, in ascending height order.
+    /// Validated digests in ascending height order.
     Ready(Vec<Digest>),
-    /// A block on the path is missing or not yet chain-verified. Transient: retry on the
-    /// next `BlockCached` wakeup.
+    /// A required block or validation result is unavailable.
     Pending,
-    /// The target's ancestry contradicts the watermark. No block that can ever arrive
-    /// makes this walk succeed.
+    /// The target ancestry does not contain the watermark coordinate.
     Forked,
 }
 
-/// One entry of a periodic per-lane availability watermark (optional, flag-gated
-/// replacement for per-block ACKs -- `Parameters::ack_watermarks`): "for `author`, the
-/// declaring party holds `author`'s lane through (`height`, `head`)". Digest-bound,
-/// never height-only -- see `LaneManager::resolve_watermark`'s doc comment for why
-/// crediting must always resolve to an exact `BlockRef` before touching the shared
-/// `AckAggregator` (the same invariant a per-block ack already satisfies via
-/// `Ack::reference`). Derives mirror `Ack`'s own wire derives (`messages::Ack`).
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+/// A claim that the sender holds `author` through the exact `(height, head)` coordinate.
 pub struct AvailEntry {
     pub author: PublicKey,
     pub height: Height,
@@ -795,8 +550,7 @@ fn author_upper_bound(author: PublicKey) -> BlockRef {
     (author, u64::MAX, max_digest())
 }
 
-/// Greatest height, ties broken by lexicographically smallest digest (§2 N5 "newest"),
-/// read directly from an `(author, height, digest)` BTree index.
+/// Selects the greatest height and the smallest digest at that height.
 fn newest_indexed(index: &BTreeSet<BlockRef>, author: PublicKey) -> Option<BlockRef> {
     let mut current_height = None;
     let mut best_at_height = None;
@@ -808,8 +562,6 @@ fn newest_indexed(index: &BTreeSet<BlockRef>, author: PublicKey) -> Option<Block
             break;
         }
         current_height.get_or_insert(r.1);
-        // Reverse BTree iteration sees larger digests first for a fixed height.
-        // Overwrite through the height group so the smallest digest wins ties.
         best_at_height = Some(r.clone());
     }
     best_at_height
@@ -848,28 +600,13 @@ pub struct AckAggregationResult {
     pub availability: Option<AckAvailability>,
 }
 
-/// First-hand ACK accumulator for Vantage data dissemination.
-///
-/// This intentionally sits outside `LaneManager`'s hot protocol state: it keeps the
-/// per-sender dedup sets needed to implement the paper's first-hand ACK counting, and
-/// emits only monotone f+1 / 2f+1 availability marks to the core.
 pub struct AckAggregator {
     committee: Committee,
     members: HashSet<PublicKey>,
-    /// Per-ref first-hand sender dedup set. RETIRED once the ref reaches `Quorum` -- see
-    /// `record_ack`'s doc comment for the 13.4 MB/s leak that made this necessary.
+    /// Distinct committee senders counted for each exact reference.
     senders: HashMap<BlockRef, HashSet<PublicKey>>,
-    /// Per-ref accumulated stake. Retired alongside `senders`, for the same reason.
     weights: HashMap<BlockRef, Stake>,
-    /// The highest threshold already emitted per ref. Outlives `senders`/`weights` and
-    /// doubles as the "retired" marker: `Quorum` here means the other two maps have been
-    /// dropped on purpose, not that they were never populated.
-    ///
-    /// STILL UNBOUNDED, deliberately: one entry is ~73 B against `senders`' ~4.2 KB, so
-    /// retiring the other two cuts growth ~59x (13.4 -> ~0.23 MB/s), but this map alone
-    /// still grows about 0.8 GB/hour at n=100. Bounding it needs a safe floor below which
-    /// a re-emitted availability mark is known harmless, which is the same policy question
-    /// as `Repairer`'s GC floor -- not decidable here.
+    /// Highest emitted threshold; quorum entries permanently retire working state.
     emitted: HashMap<BlockRef, AckThreshold>,
 }
 
@@ -885,24 +622,7 @@ impl AckAggregator {
         }
     }
 
-    /// Record a first-hand ack and report whether it crossed a new availability threshold.
-    ///
-    /// MEMORY (2026-08-07): once a ref reaches `Quorum` -- the top threshold -- no further
-    /// ack for it can change any output, so its `senders` set and `weights` entry are dead
-    /// and are dropped. Keeping them was the dominant memory leak at n=100: measured RSS
-    /// growth of 13.43 MB/s per node, 1.19 -> 2.73 GiB across a 123s window, i.e. OOM
-    /// against an 8 GiB box in about 7 minutes. The run only survived because it was short.
-    ///
-    /// The arithmetic, from that run's own counters: 403,418 blocks received x ~100 senders
-    /// each = 40.3M acks (`vantage_avail_credited_refs` read 39.3M), and `senders` held one
-    /// `HashSet<PublicKey>` of ~97 entries -- about 4.2 KB with capacity rounding -- per
-    /// block ever seen, forever. 403,418 x 4.3 KB = 1.73 GB, or 14.1 MB/s over the window.
-    ///
-    /// Correctness of the drop: a later ack for a retired ref is short-circuited by the
-    /// `emitted == Quorum` check below, BEFORE `senders` is touched, so it neither
-    /// re-allocates the set nor re-counts stake nor re-emits a mark. Without that check the
-    /// drop would be a bug -- the set would be recreated by the very next ack and the
-    /// weight would restart from one sender's stake.
+    /// Counts each committee sender once and emits each crossed threshold once.
     pub fn record_ack(&mut self, sender: PublicKey, reference: BlockRef) -> AckAggregationResult {
         if !self.members.contains(&sender) {
             return AckAggregationResult {
@@ -910,8 +630,6 @@ impl AckAggregator {
                 availability: None,
             };
         }
-        // Retired: `Quorum` is terminal, so nothing this ack could do would be observable.
-        // Must precede every `senders`/`weights` access -- see the doc comment above.
         if self.emitted.get(&reference) == Some(&AckThreshold::Quorum) {
             return AckAggregationResult {
                 accepted: true,
@@ -959,8 +677,7 @@ impl AckAggregator {
         }
         self.emitted.insert(reference.clone(), threshold);
         if threshold == AckThreshold::Quorum {
-            // Terminal threshold reached: retire the per-ref working state. The `emitted`
-            // entry left behind is what makes every subsequent ack a single hash lookup.
+            // Quorum is terminal; `emitted` prevents later acknowledgments from recreating state.
             self.senders.remove(&reference);
             self.weights.remove(&reference);
         }
@@ -973,16 +690,10 @@ impl AckAggregator {
         }
     }
 
-    /// Live per-ref working-state size (`senders`), exported as
-    /// `vantage_ack_senders_tracked` so the retirement above is observable: it should sit
-    /// near the count of refs still BELOW quorum, not grow with every block ever seen.
     pub fn senders_tracked(&self) -> usize {
         self.senders.len()
     }
 
-    /// Refs that have reached a threshold and been retired (`emitted`). Exported as
-    /// `vantage_ack_refs_retired` -- still unbounded by design, see the field's comment,
-    /// so this is the series that shows the remaining ~0.23 MB/s.
     pub fn refs_retired(&self) -> usize {
         self.emitted.len()
     }
@@ -999,146 +710,50 @@ pub struct LaneManager {
     store: Store,
     blocks: SharedBlocks,
 
-    /// ACK-derived availability marks per exact tuple. First-hand sender counting lives
-    /// in `AckAggregator`; the core consumes only these monotone threshold facts.
+    /// Highest acknowledgment threshold for each exact reference.
     ack_availability: HashMap<BlockRef, AckThreshold>,
-    /// N3: tuples we have already broadcast our own ack for (at most once, ever).
+    /// Exact references already acknowledged by this node.
     acked: HashSet<BlockRef>,
-    /// Direct, payload-ready tuples whose prefix has not yet been confirmed
-    /// `DirectPub`. A missing parent/payload can make a descendant become valid later;
-    /// this keeps retries to that monotone frontier instead of every cached block.
     pending_direct: BTreeSet<BlockRef>,
-    /// Pending direct tuples removed from the active scan because their most recent
-    /// `direct_pub` attempt found a specific ancestor whose D1 direct/payload gate was
-    /// still false. The tuple is woken when that exact blocker becomes gate-ready.
+    /// Current direct-prefix blocker for each deferred reference.
     pending_direct_blocked_by: BTreeMap<BlockRef, Digest>,
+    /// Inverse index of `pending_direct_blocked_by`.
     pending_direct_waiters_by_blocker: HashMap<Digest, BTreeSet<BlockRef>>,
-    /// Digest-level mirror of `pending_direct_blocked_by`, used to let newly-arrived
-    /// descendants inherit a parent's known blocker without walking the prefix once.
     direct_prefix_blocker_by_digest: HashMap<Digest, Digest>,
-    /// Rotating start offset for `refresh_author`'s bounded scan, so a bounded budget still
-    /// tests every pending ref over successive calls rather than starving the tail.
-    refresh_scan_offset: usize,
-    /// Tuples already confirmed as `DirectPub`. Ordered by `(author, height, digest)` so
-    /// N5's newest selection and GC can walk/prune by key rather than scanning all block
-    /// cache entries.
+    /// Last pending reference checked for each author.
+    refresh_scan_after: HashMap<PublicKey, BlockRef>,
     direct_pub_refs: BTreeSet<BlockRef>,
-    /// Confirmed `DirectPub` tuples that have reached quorum ack stake.
     quorum_direct_refs: BTreeSet<BlockRef>,
 
-    /// N5 registers.
     c_candidate: HashMap<PublicKey, BlockRef>,
     t_candidate: HashMap<PublicKey, BlockRef>,
 
-    /// Our own lane frontier: (height, digest of that block, or genesis at height 0).
+    /// This node's lane tip, or `(0, genesis)` before its first block.
     own_frontier: (Height, Digest),
 
-    /// Optional ack-watermark front-end (flag-gated at the core level; see
-    /// `Parameters::ack_watermarks`). This party's own greatest DIRECT-PREFIX height
-    /// per author, and the digest at that height -- "the greatest h such that every
-    /// height <= h of that author's lane is DirectPub at this party". Advanced
-    /// incrementally, exactly where N3's DirectPub confirmation already fires
-    /// (`record_direct_pub`), never by rescanning. Bounded by committee size (one
-    /// entry per author) -- plain `HashMap`, no GC needed. This bookkeeping is
-    /// unconditional (LaneManager itself doesn't know the flag) and inert unless
-    /// `take_avail_flush` is ever called by the core.
+    /// This node's highest contiguous direct prefix for each author.
     own_avail_watermark: HashMap<PublicKey, (Height, Digest)>,
-    /// Set whenever `own_avail_watermark` advances; cleared by `take_avail_flush`.
     avail_dirty: bool,
-    /// Per (sender, author) credited floor for INCOMING watermarks: the height up to
-    /// which `sender`'s watermark has already been credited for `author`'s lane.
-    /// Bounded by O(n^2) (sender x author pairs, n = committee size) -- plain
-    /// `HashMap`, no GC needed.
-    /// MOVED (2026-08-07): watermark resolution now lives in `avail::AvailResolver`, so it
-    /// can be lifted off the core thread -- it consumes ~190k per-(sender, author, height)
-    /// facts per second at n=100 and emits only ~4k monotone threshold marks, a ~47x funnel.
-    /// Held here for now so the call sites and tests are unchanged; the threading move is the
-    /// next step. See that module's header for the measurements.
     avail: crate::vantage::avail::AvailResolver,
-    /// Per (sender, author) latest-wins pending slot: a watermark entry whose head
-    /// resolved (attested, credited) but whose segment below the head did not fully
-    /// resolve locally yet -- retried by `retry_pending_avail` once a new block is
-    /// cached. Bounded by O(n^2), same as `credited_floor`, no GC needed.
-    /// n=100 straggler fix (2026-08-08): `author -> senders with a stashed entry for that
-    /// author`. `retry_pending_avail` used to scan ALL of `pending_avail` and filter by
-    /// author on every newly cached block; this makes it O(senders waiting on THIS
-    /// author). The same un-indexed-sweep shape as `Repairer::on_block_available`'s, in
-    /// a second place -- measured 426M scan iterations on an n=100 straggler. Kept as a
-    /// strict mirror of `pending_avail`'s key set: every insert/remove below updates
-    /// both, and an emptied bucket is dropped so the index cannot leak authors.
 
-    /// Mechanism A (sender-side lane resume, `vantage::resume`) requester-side
-    /// trigger input: per-author max height that has reached at least an
-    /// (f+1)-availability mark (`AckThreshold::Validity`), maintained in
-    /// `process_ack_availability` -- the SAME mark-consumption site
-    /// `ack_availability`/`quorum_direct_refs` are already updated from, just also
-    /// tracking the plain running max height per author. Deliberately NOT
-    /// necessarily a contiguous prefix (an ack-availability mark is per EXACT tuple,
-    /// so a higher height can cross the threshold before a lower one does under
-    /// network asynchrony) -- this is exactly `avail(a)` in the design doc, "the
-    /// highest height with an (f+1)-availability mark for lane a", compared against
-    /// `own_avail_watermark`'s own CONTIGUOUS frontier below to detect a gap.
-    /// Bounded by committee size, same as `own_avail_watermark`, no GC needed.
+    /// Greatest height with at least a validity-threshold availability mark.
     avail_watermark_high: HashMap<PublicKey, Height>,
 
-    /// §6.4 counters; `None` in most unit tests, which don't assert on metrics.
     metrics: Option<Arc<Metrics>>,
 
-    /// Cached `core_wait_timer{proc="store_probe"}` handle -- resolved on first use,
-    /// then reused, exactly like `VantageCore::cached_utilization_timer`'s caches.
-    /// Times `missing_payload`'s single store round-trip, the one genuine block on
-    /// the VantageCore thread inside this module.
     wt_store_probe: Option<IntCounter>,
 
-    /// The anchor header `restore_own_frontier` seeded, held for the caller to
-    /// RE-BROADCAST at boot (taken once via `take_seeded_anchor`). A kill can lose the
-    /// final block's SEND while its write-ahead persist survived, leaving the restored
-    /// node chaining on a block no peer holds; a fresh authentic publish from the author
-    /// both fills that hole and carries DIRECT provenance (N2 upgrade), which a repair
-    /// serve cannot -- and peers' ack pipeline (`direct_prefix_ok`) needs direct, not
-    /// merely present. Idempotent for peers that already hold it (`upsert` OR-merge).
+    /// Restored anchor available for one boot-time broadcast.
     seeded_anchor: Option<Header>,
 }
 
-/// Store key for this party's own lane frontier.
-///
-/// A restart that forgets the frontier makes the node re-sign a DIFFERENT block at a
-/// height it already used -- it forks its own lane. That is not merely a local problem:
-/// peers walk a lane prefix from their per-author watermark toward the digest a manifest
-/// names (`Cursor::expand` -> `BlockCache::collect_verified_suffix`), and a forked block
-/// chains to genesis rather than to that watermark, so the walk can never connect.
-/// `expand` then returns `None` forever and `pump()` breaks, wedging the OUTPUT CURSOR OF
-/// EVERY HONEST NODE at the first view whose manifest names the forked block.
-///
-/// Measured 2026-08-09, docker-bench netem n=21: one `docker stop`/`docker start` froze
-/// all 21 cursors permanently (view 952) while AGB ran on past view 2181 and committed
-/// transactions went to zero. Reproduced with checkpoint state sync both on and off.
-///
-/// The key is 20 bytes, distinct in length from both the 32-byte digest keys and the
-/// 36-byte `[digest || worker_id]` payload keys, so it cannot collide with either.
 const OWN_FRONTIER_KEY: &[u8] = b"vantage/own_frontier";
 
-/// Companion record to `OWN_FRONTIER_KEY` carrying the frontier HEADER itself, so a
-/// restart can seed the (memory-only) `BlockCache` with a verified anchor of its own
-/// lane. Without it the restarted process holds NO entry for its own tip: every
-/// `direct_prefix_ok`/`verified_prefix_through_genesis` walk from any post-restart
-/// own-lane reference fails at that missing block -- and nothing ever refills it
-/// (self-published blocks are not re-delivered, repair's settle fan-out is only
-/// triggered by served blocks, and an uncommitted tip is in no install manifest).
-/// Measured on docker-bench (n=21 late-joiner): 4.0M failing chain-walk steps/s and
-/// 0.59M direct-walk steps/s, 26x/775x a healthy peer, saturating the core loop.
-///
-/// 27 bytes, distinct in length from every other key shape in this store.
 const OWN_FRONTIER_HEADER_KEY: &[u8] = b"vantage/own_frontier_header";
 
-/// `direct_pub` walks toward genesis twice, and `refresh_author` runs on every publish, so
-/// the number of candidate refs re-tested per call must be bounded independently of how many
-/// are pending. 8 keeps a publish cheap while still draining a backlog within a few calls at
-/// the ~19 publishes/s a healthy node sustains.
+/// Maximum pending direct references checked per refresh call.
 const REFRESH_WALK_BUDGET: usize = 8;
 
-/// `OWN_FRONTIER_KEY`'s value. Carries the sid so a store surviving a committee change
-/// cannot be mistaken for this session's lane.
 #[derive(Serialize, Deserialize)]
 struct PersistedFrontier {
     sid: Digest,
@@ -1146,10 +761,6 @@ struct PersistedFrontier {
     digest: Digest,
 }
 
-/// `OWN_FRONTIER_HEADER_KEY`'s value. Same sid discipline as `PersistedFrontier`; the
-/// header is re-verified (`block_ok`, author, digest-vs-frontier match) on restore, so a
-/// corrupted or split-write record degrades to the old no-anchor behavior rather than
-/// admitting an unverified block.
 #[derive(Serialize, Deserialize)]
 struct PersistedFrontierHeader {
     sid: Digest,
@@ -1181,8 +792,6 @@ impl LaneManager {
     ) -> Self {
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
-        // Built before the struct literal: it borrows the same committee/sid/genesis/blocks
-        // the literal then moves.
         let avail = crate::vantage::avail::AvailResolver::new(
             committee.clone(),
             sid.clone(),
@@ -1204,7 +813,7 @@ impl LaneManager {
             pending_direct_blocked_by: BTreeMap::new(),
             pending_direct_waiters_by_blocker: HashMap::new(),
             direct_prefix_blocker_by_digest: HashMap::new(),
-            refresh_scan_offset: 0,
+            refresh_scan_after: HashMap::new(),
             direct_pub_refs: BTreeSet::new(),
             quorum_direct_refs: BTreeSet::new(),
             c_candidate: HashMap::new(),
@@ -1220,7 +829,6 @@ impl LaneManager {
         }
     }
 
-    /// Attach §6.4 counters (production wiring only -- most unit tests skip this).
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
@@ -1234,22 +842,13 @@ impl LaneManager {
         &self.genesis
     }
 
-    /// Shared block-cache size, for `vantage_block_cache_len`. Takes the same lock the
-    /// hot paths do, so it is sampled once per second from `sample_metrics`, never per
-    /// message.
     pub fn block_cache_len(&self) -> usize {
         self.blocks.lock().len()
     }
 
-    /// Evict cached blocks of `author` that every peer has confirmed holding, keeping the
-    /// most recent `keep` heights as slack. Returns entries dropped.
+    /// Evicts blocks below `floor - keep` and returns the number deleted.
     ///
-    /// `floor` comes from `Repairer::universally_held_below`, i.e. "all n-1 peers have
-    /// credited this lane at or above this height", which is what makes the drop safe --
-    /// see `BlockCache::evict_author_below` for why the caller owns that argument. `keep`
-    /// exists because the floor is derived from credits that can lag the node's own
-    /// position slightly; it costs a few blocks per lane and removes any dependence on
-    /// credit timing.
+    /// `floor` must be confirmed by every other primary; local progress alone is not safe.
     pub fn evict_universally_held(
         &mut self,
         author: &PublicKey,
@@ -1267,9 +866,6 @@ impl LaneManager {
         self.blocks.clone()
     }
 
-    /// The `pending_avail` index's own key set, for the test that pins it as a strict
-    /// mirror of `pending_avail`. A drifted index would silently stop retrying a stashed
-    /// avail entry -- the sender's watermark would then never resolve.
     #[cfg(test)]
     pub(crate) fn pending_avail_index_for_test(
         &self,
@@ -1289,14 +885,6 @@ impl LaneManager {
         self.store.clone()
     }
 
-    /// Persist the frontier we are about to build on. WRITE-AHEAD: this must complete
-    /// before the block that advances the frontier reaches the network, so a restart can
-    /// never observe a frontier lower than one a peer has already seen.
-    ///
-    /// `header` is the frontier block itself (`header.height`/`header.id` equal
-    /// `own_frontier` by construction at the only call site). It is persisted under its
-    /// own key so `restore_own_frontier` can seed the block cache with a verified
-    /// anchor -- see `OWN_FRONTIER_HEADER_KEY` for why the anchor matters.
     async fn persist_own_frontier(&mut self, header: &Header) {
         let (height, digest) = self.own_frontier.clone();
         let record = PersistedFrontier {
@@ -1306,8 +894,6 @@ impl LaneManager {
         };
         match bincode::serialize(&record) {
             Ok(bytes) => self.store.write(OWN_FRONTIER_KEY.to_vec(), bytes).await,
-            // Not fatal on its own -- it costs durability of THIS height, and the next
-            // published block rewrites the key -- but it is never expected.
             Err(e) => log::error!("vantage lanes: cannot serialize own lane frontier: {e}"),
         }
         let record = PersistedFrontierHeader {
@@ -1324,12 +910,10 @@ impl LaneManager {
         }
     }
 
-    /// Adopt the lane frontier a previous process left behind. MUST run before the core
-    /// loop can publish; see `OWN_FRONTIER_KEY` for what happens if it does not.
+    /// Restores only a frontier from the current protocol session.
     pub async fn restore_own_frontier(&mut self) {
         let bytes = match self.store.read(OWN_FRONTIER_KEY.to_vec()).await {
             Ok(Some(bytes)) => bytes,
-            // First boot of this store. Genesis is the correct frontier.
             Ok(None) => return,
             Err(e) => {
                 log::error!("vantage lanes: cannot read own lane frontier: {e}");
@@ -1343,10 +927,6 @@ impl LaneManager {
                 return;
             }
         };
-        // A store carried across a committee change describes a lane in a different
-        // session: `Header::new_vantage` stamps the CURRENT sid, so chaining onto that
-        // digest would produce blocks whose prefix no peer in this session can walk.
-        // Starting from genesis is correct there -- the old lane is not ours to extend.
         if record.sid != self.sid {
             log::warn!(
                 "vantage lanes: persisted lane frontier belongs to another session; \
@@ -1366,16 +946,79 @@ impl LaneManager {
         self.seed_own_anchor_from_store().await;
     }
 
-    /// Seed the block cache with the restored frontier's HEADER as a verified anchor of
-    /// our own lane (see `OWN_FRONTIER_HEADER_KEY`). Every failure mode degrades to the
-    /// pre-anchor behavior (frontier restored, cache unseeded) -- never to adopting an
-    /// unverified block: the record must decode, carry this session's sid, be authored
-    /// by US, pass `block_ok`, and name exactly the digest the frontier record restored
-    /// (a split write across the two keys shows up as that mismatch).
+    /// Replaces uncommitted local lane state with a checkpoint-certified tip.
+    pub async fn recover_own_frontier(&mut self, header: Header) -> bool {
+        if header.author != self.name
+            || header.height == 0
+            || !block_ok(&header, &self.committee, &self.sid, self.max_block_payload)
+        {
+            return false;
+        }
+        let recovered = (header.height, header.id.clone());
+        if self.own_frontier == recovered {
+            return false;
+        }
+
+        let mut stale_digests = HashSet::new();
+        for r in self
+            .pending_direct
+            .iter()
+            .chain(self.pending_direct_blocked_by.keys())
+            .chain(self.direct_pub_refs.iter())
+            .chain(self.quorum_direct_refs.iter())
+            .chain(self.ack_availability.keys())
+            .chain(self.acked.iter())
+        {
+            if r.0 == self.name {
+                stale_digests.insert(r.2.clone());
+            }
+        }
+
+        self.pending_direct.retain(|r| r.0 != self.name);
+        self.pending_direct_blocked_by
+            .retain(|r, _| r.0 != self.name);
+        self.pending_direct_waiters_by_blocker.retain(|_, refs| {
+            refs.retain(|r| r.0 != self.name);
+            !refs.is_empty()
+        });
+        self.direct_prefix_blocker_by_digest
+            .retain(|digest, _| !stale_digests.contains(digest));
+        self.direct_pub_refs.retain(|r| r.0 != self.name);
+        self.quorum_direct_refs.retain(|r| r.0 != self.name);
+        self.ack_availability.retain(|r, _| r.0 != self.name);
+        self.acked.retain(|r| r.0 != self.name);
+        self.refresh_scan_after.remove(&self.name);
+        self.c_candidate.remove(&self.name);
+        self.t_candidate.remove(&self.name);
+
+        let anchor = (self.name, header.height, header.id.clone());
+        self.blocks.lock().seed_recovered_own_anchor(header.clone());
+        self.avail.reset_author(self.name, &anchor);
+        self.ack_availability
+            .insert(anchor.clone(), AckThreshold::Quorum);
+        self.avail.note_threshold(&anchor, AckThreshold::Quorum);
+        self.acked.insert(anchor.clone());
+        self.direct_pub_refs.insert(anchor.clone());
+        self.quorum_direct_refs.insert(anchor.clone());
+        self.c_candidate.insert(self.name, anchor.clone());
+        self.own_avail_watermark
+            .insert(self.name, (anchor.1, anchor.2.clone()));
+        self.avail_watermark_high.insert(self.name, anchor.1);
+        self.avail_dirty = true;
+        self.own_frontier = recovered;
+        self.seeded_anchor = None;
+        self.persist_own_frontier(&header).await;
+        log::info!(
+            "vantage lanes: reconciled own lane to committed height={}",
+            header.height
+        );
+        true
+    }
+
     async fn seed_own_anchor_from_store(&mut self) {
         let bytes = match self.store.read(OWN_FRONTIER_HEADER_KEY.to_vec()).await {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return, // store predates the anchor record
+            Ok(None) => return,
             Err(e) => {
                 log::error!("vantage lanes: cannot read own frontier header: {e}");
                 return;
@@ -1389,7 +1032,7 @@ impl LaneManager {
             }
         };
         if record.sid != self.sid {
-            return; // same reason `restore_own_frontier` ignores a foreign-session record
+            return;
         }
         let header = record.header;
         if header.author != self.name
@@ -1413,18 +1056,11 @@ impl LaneManager {
             header.height
         );
         self.blocks.lock().seed_own_anchor(header.clone());
-        // Held for the boot re-broadcast -- see the field's doc comment.
         self.seeded_anchor = Some(header);
-        // Re-enter the tip into the ack pipeline: `acked` is memory-only too, so the
-        // next `refresh_author(self.name)` (the first own publish) re-confirms it via
-        // the now-succeeding walk, re-acks it (peers dedupe by watermark), and -- the
-        // part that matters -- re-admits our own lane into the N5 registers so our
-        // proposals can vouch for it again.
         self.pending_direct.insert(r);
     }
 
-    /// The anchor header the restore seeded, if any -- taken once by the boot path to
-    /// re-broadcast it (see `seeded_anchor`).
+    /// Takes the restored anchor at most once.
     pub fn take_seeded_anchor(&mut self) -> Option<Header> {
         self.seeded_anchor.take()
     }
@@ -1527,17 +1163,11 @@ impl LaneManager {
         effects
     }
 
-    /// Drain missing-parent reports from failing prefix walks -- see
-    /// `BlockCache::missing_parents`. The caller hands them to `Repairer::authorize`.
     pub fn take_missing_parents(&mut self, cap: usize) -> Vec<BlockRef> {
         self.blocks.lock().take_missing_parents(cap)
     }
 
-    /// N1: create and self-publish our own next block. Height advances immediately on
-    /// self-creation -- lanes are ack-independent (no certificate wait, unlike
-    /// Autobahn's `last_parent` gate at proposer.rs:241). Self-delivery counts: we
-    /// process our own block as a direct publication; `VantageCore` feeds the resulting
-    /// local ACK back through `AckAggregator`.
+    /// Persists the new lane tip before returning its broadcast effect.
     pub async fn publish_own(
         &mut self,
         payload: BTreeMap<Digest, WorkerId>,
@@ -1546,8 +1176,6 @@ impl LaneManager {
         let next_height = height + 1;
         let header = Header::new_vantage(self.name, next_height, payload, prev, self.sid.clone());
         self.own_frontier = (next_height, header.id.clone());
-        // Before `process_publish_inner` and before the `BroadcastPublish` effect the
-        // caller executes -- the whole point is that the write precedes the send.
         self.persist_own_frontier(&header).await;
         if let Some(metrics) = &self.metrics {
             metrics.vantage_blocks_published.inc();
@@ -1557,9 +1185,7 @@ impl LaneManager {
         (header, effects)
     }
 
-    /// N1/N2: handle an incoming `publish` (or relayed-publish) message. `sender` is
-    /// the network channel's sender (D4-trusted); direct iff it equals the block's own
-    /// encoded author.
+    /// Accepts only session-valid blocks that pass `block_ok`.
     pub async fn process_publish(&mut self, sender: PublicKey, header: Header) -> Vec<Effect> {
         self.process_publish_inner(sender, header).await
     }
@@ -1567,8 +1193,6 @@ impl LaneManager {
     async fn process_publish_inner(&mut self, sender: PublicKey, header: Header) -> Vec<Effect> {
         let mut effects = Vec::new();
 
-        // N9: session hygiene + malformed messages are rejected before storing or
-        // counting -- no state change.
         if header.sid.as_ref() != Some(&self.sid) {
             return effects;
         }
@@ -1576,31 +1200,21 @@ impl LaneManager {
             return effects;
         }
 
-        let direct = sender == header.author; // N1
+        // Direct provenance requires the authenticated sender to equal the encoded author.
+        let direct = sender == header.author;
         let missing_payload = self.missing_payload(&header).await;
         let payload_ok = missing_payload.is_empty();
         let digest = header.id.clone();
 
         let gate_ready = {
             let mut blocks = self.blocks.lock();
-            // `block_ok` just passed above for this exact header -- memoize it.
             blocks.upsert(header.clone(), direct, false, payload_ok, true);
             blocks.direct_gate_ready(&digest)
         };
         if direct && payload_ok {
             let r = (header.author, header.height, digest.clone());
-            // Only track tuples we have NOT already acked. `refresh_author` removes a ref
-            // from `pending_direct` inside its `!acked && direct_pub` branch, so an
-            // already-acked ref re-inserted here could never be evicted again -- one
-            // permanently pinned entry per re-delivered publish, and `pending_direct` is
-            // scanned on every `refresh_author`. That defeats this set's whole purpose
-            // ("under steady honest traffic the pending set contains only the freshly-
-            // arrived tip"), and `LaneManager` has no GC to mop it up.
             self.enqueue_pending_direct(r);
         } else if direct {
-            // This exact block cannot be part of any descendant's direct prefix until
-            // its payload arrives. Mark it now so descendants can sleep immediately
-            // instead of each walking down to the same payload gate failure once.
             self.note_direct_prefix_self_blocker(&digest);
         }
         effects.push(Effect::BlockCached(digest.clone()));
@@ -1625,23 +1239,11 @@ impl LaneManager {
         effects
     }
 
-    /// Returns the payload entries not present in the local worker store, using the
-    /// exact key shape `synchronizer::Synchronizer::missing_payload`/
-    /// `payload_receiver::PayloadReceiver` use (`[digest || worker_id LE]`, written
-    /// on `OthersBatch`). We don't store the payload of our own workers under that key
-    /// (mirroring `missing_payload`'s early return for `header.author == self.name`) --
-    /// our own blocks are always payload-ready since the `OurBatch` digests we proposed
-    /// with are, by construction, digests our own workers already sealed.
+    /// Returns payload entries absent under the `[digest || worker_id_le]` store key.
     pub(crate) async fn missing_payload(&mut self, header: &Header) -> Vec<(Digest, WorkerId)> {
         if header.author == self.name {
             return Vec::new();
         }
-        // ONE store round-trip for the whole payload, not one per entry. The previous
-        // per-entry `store.read(..).await` serialized up to `max_block_payload` (16)
-        // round-trips through the single store actor -- on the VantageCore thread, for
-        // every inbound and every served block -- each queued behind the batch-write
-        // stream sharing that channel. `read_many` preserves input order, so results
-        // zip 1:1 with `header.payload`.
         let entries: Vec<_> = header.payload.iter().collect();
         let keys: Vec<_> = entries
             .iter()
@@ -1662,16 +1264,11 @@ impl LaneManager {
         entries
             .iter()
             .enumerate()
-            // `found.len() == keys.len()` by construction; `unwrap_or(true)` is a
-            // defensive "treat as missing", never taken.
             .filter(|(i, _)| found.get(*i).map(Option::is_none).unwrap_or(true))
             .map(|(_, (digest, worker_id))| ((*digest).clone(), **worker_id))
             .collect()
     }
 
-    /// Call once a previously-missing block's worker batches have arrived (production:
-    /// after `store.notify_read` resolves following a `SyncBatches` effect; tests:
-    /// after writing the payload marker directly). Re-runs the N3 ack check.
     pub fn set_payload_ready(&mut self, digest: &Digest) -> Vec<Effect> {
         let (direct_ready, gate_ready) = {
             let mut blocks = self.blocks.lock();
@@ -1687,7 +1284,6 @@ impl LaneManager {
         let mut effects = Vec::new();
         match direct_ready {
             Some(r) => {
-                // Same already-acked guard as `process_publish` -- see its comment.
                 let author = r.0;
                 self.enqueue_pending_direct(r);
                 effects.extend(self.refresh_author(author));
@@ -1700,46 +1296,42 @@ impl LaneManager {
         effects
     }
 
-    /// Re-run the N3 ack trigger over direct, payload-ready tuples of `author` that have
-    /// not yet been confirmed as `DirectPub`, then refresh N5 registers from the indexed
-    /// direct/quorum sets. This is intentionally not a full block-cache scan: under
-    /// steady honest traffic the pending set contains only the freshly-arrived tip.
-    ///
-    /// Deterministic and idempotent: `acked`/registers only ever grow/replace with a
-    /// "newer" (§2 N5) reference, never regress.
+    /// Checks a rotating bounded subset of pending direct references for `author`.
     fn refresh_author(&mut self, author: PublicKey) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let refs: Vec<BlockRef> = self
-            .pending_direct
-            .range(author_lower_bound(author)..=author_upper_bound(author))
-            .cloned()
-            .collect();
-        let mut registers_changed = false;
-        // BOUNDED work per call, resuming where the last call stopped.
-        //
-        // `direct_pub` costs two walks toward genesis (`verified_prefix_through_genesis` and
-        // `direct_prefix_ok`), and this runs on every publish. A node that restarts has no
-        // cache entries for its OWN lane prefix -- the cache is memory-only -- so none of its
-        // blocks confirm until repair refills that prefix, `pending_direct` grows without
-        // bound, and testing all of it made this quadratic: measured on a recovering joiner,
-        // `header_seal` burned 478 ms of every second, 1,078x a healthy peer, worsening as
-        // the set grew.
-        //
-        // Do NOT "stop at the lowest blocked height" instead. Prefix failure is monotone in
-        // height on the canonical chain, but `pending_direct` can also hold refs from
-        // ABANDONED branches, which are permanently unconfirmable; one of those at a low
-        // height would then block every higher ref forever. Measured exactly that -- own
-        // blocks committed fell to zero. Rotation keeps the cost bounded while guaranteeing
-        // every ref is still tested.
-        let len = refs.len();
-        let start = if len > 0 {
-            self.refresh_scan_offset % len
+        let lower = author_lower_bound(author);
+        let upper = author_upper_bound(author);
+        let mut refs = Vec::with_capacity(REFRESH_WALK_BUDGET);
+        if let Some(after) = self.refresh_scan_after.get(&author) {
+            refs.extend(
+                self.pending_direct
+                    .range((Excluded(after.clone()), Included(upper.clone())))
+                    .take(REFRESH_WALK_BUDGET)
+                    .cloned(),
+            );
+            if refs.len() < REFRESH_WALK_BUDGET {
+                refs.extend(
+                    self.pending_direct
+                        .range((Included(lower), Included(after.clone())))
+                        .take(REFRESH_WALK_BUDGET - refs.len())
+                        .cloned(),
+                );
+            }
         } else {
-            0
-        };
-        let budget = REFRESH_WALK_BUDGET.min(len);
-        for i in 0..budget {
-            let r = &refs[(start + i) % len];
+            refs.extend(
+                self.pending_direct
+                    .range(lower..=upper)
+                    .take(REFRESH_WALK_BUDGET)
+                    .cloned(),
+            );
+        }
+        if let Some(last) = refs.last() {
+            self.refresh_scan_after.insert(author, last.clone());
+        } else {
+            self.refresh_scan_after.remove(&author);
+        }
+        let mut registers_changed = false;
+        for r in &refs {
             if self.acked.contains(r) {
                 self.pending_direct.remove(r);
                 continue;
@@ -1758,18 +1350,13 @@ impl LaneManager {
             self.on_direct_pub_confirmed(&r, &mut effects);
             registers_changed = true;
         }
-        self.refresh_scan_offset = self.refresh_scan_offset.wrapping_add(budget);
         if registers_changed {
             self.refresh_registers(author);
         }
         effects
     }
 
-    /// Note: does *not* itself call `refresh_registers` -- `refresh_author` (the only
-    /// caller) always does so once after processing this batch, covering every tuple
-    /// confirmed in the same pass.
     fn on_direct_pub_confirmed(&mut self, r: &BlockRef, effects: &mut Vec<Effect>) {
-        // N8(i): retain the whole valid lane prefix through h.
         self.retain_prefix(r);
         self.acked.insert(r.clone());
         let ack = Ack::new(r.0, r.1, r.2.clone(), self.name);
@@ -1780,38 +1367,7 @@ impl LaneManager {
         self.record_direct_pub(r);
     }
 
-    /// Callers only ever reach this after `verified_prefix_through_genesis` (which
-    /// bounds itself by strictly-decreasing expected height) already proved the chain
-    /// from `r` to genesis is real and cycle-free; this walk still tracks expected
-    /// height itself too, defensively, so it can never hang even if that invariant were
-    /// ever violated by a future change.
-    ///
-    /// Fable perf audit: early-breaks the walk at the first block that's already
-    /// `retained`, instead of continuing to genesis (and re-serializing every already-
-    /// retained ancestor along the way just to have `mark_retained` report "not new")
-    /// every single call. Sound by the retention invariant this codebase already
-    /// relies on elsewhere (mirroring the `chain_verified`/`direct_prefix_verified`/
-    /// `settled` memoization pattern): retention is prefix-closed -- whenever a block is
-    /// retained, its ENTIRE ancestor chain down to genesis is already retained too. This
-    /// holds inductively because `mark_retained` is only ever reached in two places, and
-    /// both preserve it: (a) this same function, which -- absent the early break --
-    /// walks a block's *whole* verified prefix down to genesis (or down to an ancestor
-    /// that, by the same induction, already has ITS prefix retained) in one call; (b)
-    /// `Repairer::settle`'s post-order ascend, which retains a chain's ancestors
-    /// strictly before the chain's own tip in the same call (see that function's own
-    /// doc comment). So the first already-retained block this walk meets is guaranteed
-    /// to already have its own full prefix retained -- stopping there, rather than
-    /// re-walking it, changes neither the final retained SET nor the total newly-
-    /// retained byte count: every block below the break point would have contributed
-    /// `size` only to have `mark_retained` return `false` (already retained) and discard
-    /// it, exactly as skipping it here discards nothing new.
-    ///
-    /// Also computes `serialized_size` only for a block this call is about to newly
-    /// retain: the `!entry.retained` state (checked, and not yet the early-break
-    /// condition, at this point in the loop) combined with this function holding the
-    /// cache's lock for its whole duration guarantees `mark_retained` below always
-    /// newly retains here, so sizing every visited block up front (including ones later
-    /// discarded) is no longer necessary.
+    /// Retains the verified prefix through `r`; retained prefixes are prefix-closed.
     fn retain_prefix(&mut self, r: &BlockRef) {
         let mut cur = r.2.clone();
         let mut expected_height = r.1;
@@ -1823,13 +1379,13 @@ impl LaneManager {
                     break;
                 }
                 let Some(entry) = blocks.get(&cur) else {
-                    break; // defensive; direct_pub already established this exists
+                    break;
                 };
                 if entry.block.height != expected_height {
-                    break; // defensive; height mismatch means this isn't the real chain
+                    break;
                 }
                 if entry.retained {
-                    break; // prefix-closed: everything below here is already retained
+                    break;
                 }
                 let next = entry.block.parent_cert.header_digest.clone();
                 let size = bincode::serialized_size(&entry.block).unwrap_or(0);
@@ -1846,7 +1402,7 @@ impl LaneManager {
         }
     }
 
-    /// Consume a compact ACK-derived availability mark from `AckAggregator`.
+    /// Records only monotonic availability thresholds for an exact reference.
     pub fn process_ack_availability(&mut self, availability: AckAvailability) -> Vec<Effect> {
         let r = availability.reference;
         let threshold = availability.threshold;
@@ -1858,19 +1414,7 @@ impl LaneManager {
             return Vec::new();
         }
         self.ack_availability.insert(r.clone(), threshold);
-        // Tell the resolver, so it can stop crediting this ref once the threshold is
-        // terminal. `Quorum` admits no further change, and all n senders credit the same
-        // block while only the first 2f+1 matter -- plus `retry_pending_avail` re-credits a
-        // stuck head ref once per arriving block until this cuts it off. The resolver keeps
-        // its own set rather than reading `ack_availability`, so it stays independent of core
-        // state and can move off the core thread.
         self.avail.note_threshold(&r, threshold);
-        // Mechanism A (`vantage::resume`): every mark reaching this point is, by
-        // construction, at least `Validity` (f+1) -- `AckAggregator::record_ack`
-        // never emits anything weaker -- so this is unconditional, not gated on
-        // `threshold`. A running max, not an insert-if-absent: marks for the same
-        // author can arrive out of height order (this is a per-EXACT-tuple fact, not
-        // a prefix), so only a genuinely higher height may advance it.
         let high = self.avail_watermark_high.entry(r.0).or_insert(0);
         if r.1 > *high {
             *high = r.1;
@@ -1884,8 +1428,7 @@ impl LaneManager {
         Vec::new()
     }
 
-    /// §4 query: `is_q_available(ref, q)`, `q` typically `committee.validity_threshold()`
-    /// (f+1) or `committee.quorum_threshold()` (2f+1).
+    /// Returns whether the exact reference has accumulated at least stake `q`.
     pub fn is_q_available(&self, r: &BlockRef, q: Stake) -> bool {
         match self.ack_availability.get(r) {
             Some(AckThreshold::Quorum) => q <= self.committee.quorum_threshold(),
@@ -1901,17 +1444,24 @@ impl LaneManager {
             .is_some_and(|e| e.block.author == r.0 && e.block.height == r.1)
     }
 
-    /// `DirectPub_i(a,k,h)` (§1 D1 / §2 N1-N3): whole prefix is both chain-valid
-    /// (`BlockOK` all through) and directly-published-with-payload all through.
+    /// Requires an exact coordinate and a direct, payload-ready prefix through genesis.
     pub fn direct_pub(&self, r: &BlockRef) -> bool {
         matches!(self.direct_pub_check(r), DirectPubCheck::Confirmed)
     }
 
     fn direct_pub_check(&self, r: &BlockRef) -> DirectPubCheck {
-        if !self.exact_coordinate(r) {
+        let mut blocks = self.blocks.lock();
+        if !blocks
+            .get(&r.2)
+            .is_some_and(|entry| entry.block.author == r.0 && entry.block.height == r.1)
+        {
             return DirectPubCheck::Failed;
         }
-        let mut blocks = self.blocks.lock();
+        if let Some(blocker) = self.direct_prefix_blocker_by_digest.get(&r.2) {
+            if !blocks.direct_gate_ready(blocker) {
+                return DirectPubCheck::BlockedOnGate(blocker.clone());
+            }
+        }
         if !blocks.verified_prefix_through_genesis(
             &self.committee,
             &self.sid,
@@ -1928,30 +1478,17 @@ impl LaneManager {
         }
     }
 
-    /// §4 query: `locally_available(ref)` = holds the valid lane prefix, or
-    /// (f+1)-available.
+    /// Returns true for a locally held valid prefix or a validity-threshold certificate.
     pub fn locally_available(&mut self, r: &BlockRef) -> bool {
         self.holds_prefix(r) || self.is_q_available(r, self.committee.validity_threshold())
     }
 
-    /// §4 query: `author_ok(ref)` = `DirectPub_i` or (f+1)-available. Check the
-    /// availability certificate first: it is an O(1) lookup and is enough on its own.
-    /// Late joiners can hold many repaired/certified refs that are not locally direct,
-    /// and walking their direct prefixes would just fail at D1's direct/payload gate.
-    /// `DirectPub_i` already implies retention (N3 retains on the same transition that
-    /// triggers the ack, via `refresh_author`/`on_direct_pub_confirmed`), so unlike
-    /// `holds_prefix` this doesn't need its own retain-on-success side effect.
+    /// Returns true for direct publication or a validity-threshold certificate.
     pub fn author_ok(&self, r: &BlockRef) -> bool {
         self.is_q_available(r, self.committee.validity_threshold()) || self.direct_pub(r)
     }
 
-    /// §4 query: `holds_prefix(ref)` -- we hold a verified (chain-valid) prefix through
-    /// this exact reference, regardless of provenance (direct or repaired). N8(ii): a
-    /// local-availability check that succeeds *because* we hold the prefix must retain
-    /// it from now on -- unlike `direct_pub`'s success (already retained via N3, since
-    /// `refresh_author` runs on every relevant mutation), a chain-valid-but-not-yet-
-    /// `DirectPub` prefix (e.g. payload still missing somewhere up the chain) is not
-    /// otherwise retained anywhere, so this query must retain it itself.
+    /// Verifies and retains the exact reference's valid prefix when locally held.
     pub fn holds_prefix(&mut self, r: &BlockRef) -> bool {
         if !self.exact_coordinate(r) {
             return false;
@@ -1985,22 +1522,6 @@ impl LaneManager {
         if self.is_q_available(r, self.committee.quorum_threshold()) {
             self.quorum_direct_refs.insert(r.clone());
         }
-        // Ack-watermark front-end (see `own_avail_watermark`'s doc comment): advance
-        // this author's own DIRECT-PREFIX watermark. Absent a Byzantine fork,
-        // DirectPub confirmations for a fixed author are always recorded in strictly
-        // consecutive height order: `direct_prefix_ok`'s own chain walk requires every
-        // ancestor's `direct && payload_ok` flags, which -- by the same recursive
-        // argument applied to the ancestor -- means the ancestor's own DirectPub
-        // confirmation was already recorded first (this method is only ever reached
-        // from `refresh_author`'s ascending-`BTreeSet` range walk over `pending_direct`
-        // for one author, via `on_direct_pub_confirmed`). Tracking the greatest seen
-        // height regardless of exact contiguity (`>`, not `== + 1`) is a defensive
-        // choice under an equivocating author who gets two different DirectPub digests
-        // recorded at the SAME height at this party (last-recorded wins): harmless
-        // liveness-only degradation, never a soundness issue, since the RECEIVE side
-        // (`resolve_watermark`) always re-verifies the exact digest chain before
-        // crediting anything -- this value is only ever a candidate to ADVERTISE, not
-        // something trusted on its own.
         let advances = match self.own_avail_watermark.get(&r.0) {
             Some((h, _)) => r.1 > *h,
             None => true,
@@ -2011,14 +1532,7 @@ impl LaneManager {
         }
     }
 
-    /// Full-vector-when-dirty ack-watermark flush (flag-gated at the core level -- see
-    /// `Parameters::ack_watermarks`): if this party's own watermark has advanced since
-    /// the last flush, clear the dirty bit and return the FULL current vector (every
-    /// author with a recorded watermark); else `None`. Deliberately not a delta: the
-    /// result is monotone and idempotent on the receive side (`resolve_watermark`'s own
-    /// credited floor silently re-ignores an already-covered or stale entry), so a
-    /// duplicate or slightly-stale full vector is always harmless, and an idle lane
-    /// (nothing new to report) goes silent instead of re-broadcasting forever.
+    /// Returns the full watermark vector once after any local watermark advances.
     pub fn take_avail_flush(&mut self) -> Option<Vec<AvailEntry>> {
         if !self.avail_dirty {
             return None;
@@ -2036,13 +1550,7 @@ impl LaneManager {
         )
     }
 
-    /// Mechanism A (`vantage::resume`) requester-side trigger input: `frontier(a)` in
-    /// the design doc -- this party's own held CONTIGUOUS direct-verified prefix
-    /// height for lane `author`. Reuses `own_avail_watermark` -- the ack-watermark
-    /// front-end's identical per-author bookkeeping, unconditional regardless of
-    /// `Parameters::ack_watermarks` (see that field's own doc comment) -- rather than
-    /// duplicating a second frontier tracker. `0` (genesis) if nothing of `author`'s
-    /// has ever confirmed DirectPub at this party.
+    /// Returns this node's contiguous direct-prefix height for `author`, or zero.
     pub fn own_direct_frontier(&self, author: &PublicKey) -> Height {
         self.own_avail_watermark
             .get(author)
@@ -2050,32 +1558,7 @@ impl LaneManager {
             .unwrap_or(0)
     }
 
-    /// AVAIL-ECHO-SPEC.md step 3: this party's own availability claims against
-    /// `proposal`, for piggybacking on the AGB echo it is about to send.
-    ///
-    /// One pass over `manifest_refs`, reading only `own_avail_watermark` (the contiguous
-    /// DirectPub prefix per author, maintained unconditionally -- see
-    /// `own_direct_frontier`) plus one `BlockCache` lookup per at-tip candidate. That
-    /// makes it O(|refs|) with no chain walk, against `resolve_watermark`'s
-    /// `collect_verified_suffix` per entry -- the whole point is that the sender already
-    /// knows what it holds.
-    ///
-    /// Three outcomes per lane, exactly as the spec's §4 states:
-    ///   - own watermark reaches the named height AND the named digest is held, verified,
-    ///     at that exact coordinate  => at-tip bit. Holding the named digest is what makes
-    ///     this a claim about the RIGHT chain; an author that forked has two digests at one
-    ///     height and only one of them is the proposal's.
-    ///   - own watermark is short but nonzero => `ShortClaim` at our own frontier, carrying
-    ///     OUR head digest. We cannot prove here that our prefix lies on `chain(named)`
-    ///     without holding that chain, so the receiver re-checks the linkage against its
-    ///     own copy (`AvailResolver::note_claim`). Emitting it is what keeps the ack rate
-    ///     from collapsing under ragged frontiers.
-    ///   - nothing held for that author => no claim. Silence is not a negative
-    ///     acknowledgment; it just carries no information.
-    ///
-    /// Claiming ABOVE the named height is deliberately inexpressible: there is no digest
-    /// in the proposal to anchor it, and availability only ever has to certify what a
-    /// proposal names (spec §3, consequence 2).
+    /// Claims a proposal tip only when its exact coordinate is held and validated.
     pub fn build_avail_claim(&self, proposal: &crate::vantage::agb::ViewProposal) -> AvailClaim {
         let refs = manifest_refs(proposal);
         let mut claim = AvailClaim::with_capacity(refs.len());
@@ -2095,9 +1578,6 @@ impl LaneManager {
                 if holds_named {
                     claim.set_at_tip(j);
                 }
-                // else: our lane for this author is a DIFFERENT chain at that height (the
-                // author equivocated). Claiming either endpoint would be a claim about a
-                // chain we do not hold, so we say nothing.
             } else if *own_h > 0 {
                 claim.push_short(j, height - *own_h, own_head.clone());
             }
@@ -2105,57 +1585,28 @@ impl LaneManager {
         claim
     }
 
-    /// Mechanism A requester-side trigger input: `avail(a)` in the design doc -- see
-    /// `avail_watermark_high`'s own doc comment. `0` if no (f+1) mark has ever been
-    /// recorded for `author`.
     pub fn avail_high(&self, author: &PublicKey) -> Height {
         self.avail_watermark_high.get(author).copied().unwrap_or(0)
     }
 
-    /// Mechanism A serve-side upper bound: this party's own current lane tip height
-    /// (`own_frontier`'s pre-existing role for `publish_own`). Only meaningful as
-    /// "the requested lane's own tip" when `self.name` IS that lane's author --
-    /// `VantageCore`/`SimpleItCore`'s `Inbound::LaneResume` handling only ever calls
-    /// this after already checking exactly that.
     pub fn own_tip_height(&self) -> Height {
         self.own_frontier.0
     }
 
-    /// Mechanism A serve-side clamp floor, delegating to `BlockCache::
-    /// earliest_height`; `1` (the lowest real block height -- height 0 is the
-    /// implicit, never-transmitted genesis) when nothing has been cached for
-    /// `author` yet, so a request naming `from <= 1` (or `0`) clamps up to the
-    /// earliest block that could ever legitimately be served.
+    /// Returns the earliest cached height, or one because height zero is implicit genesis.
     pub fn earliest_authored_height(&self, author: &PublicKey) -> Height {
         self.blocks.lock().earliest_height(author).unwrap_or(1)
     }
 
-    /// Mechanism A serve-side lookup, delegating to `BlockCache::author_block_at`.
     pub fn author_block_at(&self, author: &PublicKey, height: Height) -> Option<Header> {
         self.blocks.lock().author_block_at(author, height).cloned()
     }
 
-    /// Mechanism A receipt-continuation: the cached author of `digest`'s block, if
-    /// held. `on_payload_ready`'s delayed DirectPub transition (a header whose bytes
-    /// already arrived but whose payload was still syncing) is keyed by header
-    /// digest alone, unlike `Inbound::Publish`'s direct access to `header.author` --
-    /// this is the one extra lookup that lets the SAME "did frontier(author) just
-    /// advance" continuation check run at that call site too.
     pub fn author_of(&self, digest: &Digest) -> Option<PublicKey> {
         self.blocks.lock().get(digest).map(|e| e.block.author)
     }
 
-    /// Resolves a peer's ack-watermark vector into the exact `BlockRef`s this party's
-    /// own cache lets it credit -- see this module's own header comment for why
-    /// crediting must always resolve to a specific `(author, height, digest)` before
-    /// touching `AckAggregator`: a height-only credit would let an equivocating
-    /// author's fork reach quorum with zero correct holders of the counted digest.
-    /// `sender` is the watermark's declaring party -- D4-trusted the same way an
-    /// `Ack::sender` already is; the caller (`VantageCore`/`SimpleItCore::
-    /// dispatch_inbound`) has already checked committee membership before reaching
-    /// N5 ack-watermark front-end. Delegates to `avail::AvailResolver` -- see that module
-    /// for why resolution is a separate type (it is a ~47x funnel and belongs off the core
-    /// thread).
+    /// Resolves height claims to exact locally validated references before crediting them.
     pub fn resolve_watermark(
         &mut self,
         sender: PublicKey,
@@ -2164,11 +1615,6 @@ impl LaneManager {
         self.avail.resolve_watermark(sender, entries)
     }
 
-    /// AVAIL-ECHO-SPEC.md: the positional-claim counterpart of `resolve_watermark` --
-    /// `sender`'s echo-piggybacked claims, already resolved positionally by
-    /// `AgbEngine::on_echo`, returned as the refs that survive monotonicity and (for short
-    /// claims) linkage. Same delegation to `avail::AvailResolver`, and the caller feeds the
-    /// result through the same `credit_refs`, so the two front-ends differ only in encoding.
     pub fn note_claim(
         &mut self,
         sender: PublicKey,
@@ -2177,21 +1623,15 @@ impl LaneManager {
         self.avail.note_claim(sender, resolved)
     }
 
-    /// AVAIL-ECHO-SPEC.md: the quorum availability height for `author`'s lane as computed
-    /// from positional claims -- the 2f+1-th largest claimed height. Exposed for the
-    /// shadow comparison against the explicit-tuple path's own watermark.
     pub fn claim_avail_height(&self, author: &PublicKey) -> Height {
         self.avail.avail_height(author)
     }
 
-    /// Re-attempt every `(sender, author)` watermark entry pending on `digest`'s author.
     pub fn retry_pending_avail(&mut self, digest: &Digest) -> Vec<(PublicKey, BlockRef)> {
         self.avail.retry_pending_avail(digest)
     }
 
-    /// N5: refresh both registers for `author` from the monotone direct/quorum indexes.
-    /// This preserves `newest` (greatest height, smallest digest tie-break) without
-    /// walking every historical block ref on each ack.
+    /// Refreshes candidates using greatest height and smallest-digest tie-breaking.
     fn refresh_registers(&mut self, author: PublicKey) {
         let c = newest_indexed(&self.quorum_direct_refs, author);
         set_candidate(&mut self.c_candidate, author, c.clone());
@@ -2223,28 +1663,15 @@ impl LaneManager {
                 None => true,
             };
             if qualifies {
-                // Reverse BTree iteration sees larger digests first for a fixed height.
-                // Overwrite through the height group so the smallest digest wins ties.
                 best_at_height = Some(r.clone());
             }
         }
         best_at_height
     }
 
-    /// Does `r`'s ancestor chain pass through `target`'s exact (height, digest) as a
-    /// (non-strict-here; strictness is enforced by the caller's `r.1 > c_ref.1`) ancestor?
-    /// Also realizes the fork rule: a branch that never passes through `target` (e.g. a
-    /// sibling fork) returns `false`, so it can never be picked as T against that C.
-    /// Height-bounded walk (see `direct_prefix_ok`'s doc comment): tracks `r`'s own
-    /// height, decrementing by exactly one per step and rejecting any mismatch against
-    /// the block actually found there, so an adversarial reference cycle can only ever
-    /// cost `r.1` iterations, never hang.
+    /// Returns whether `r` contains `target` at its exact height and digest.
     ///
-    /// `pub` (PHASE4-SPEC.md §5): the AGB engine's R2 tip-anchoring check
-    /// (`TipOK_i(C,T)`) needs this same "does r's chain pass through target" query
-    /// against arbitrary manifest entries from *received* proposals, not just this
-    /// node's own N5 registers -- extended in place per the reuse rule rather than
-    /// duplicated.
+    /// The walk pins the author and decreases expected height on every step.
     pub fn prefix_contains(&self, r: &BlockRef, target: &BlockRef) -> bool {
         let blocks = self.blocks.lock();
         let author = r.0;
@@ -2258,7 +1685,7 @@ impl LaneManager {
                 return false;
             };
             if entry.block.author != author {
-                return false; // defense-in-depth: enforce "one author" here too (§1)
+                return false;
             }
             if entry.block.height != expected_height {
                 return false;

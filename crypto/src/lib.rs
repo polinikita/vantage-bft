@@ -18,7 +18,7 @@ pub mod crypto_tests;
 
 pub type CryptoError = ed25519::Error;
 
-/// The hasher used for all content digests (Starfish parity). blake3 produces a
+/// The hasher used for all content digests. Blake3 produces a
 /// 32-byte output directly, matching `Digest`'s width with no truncation.
 pub type Blake3Hasher = blake3::Hasher;
 

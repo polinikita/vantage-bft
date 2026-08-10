@@ -1,4 +1,3 @@
-// PHASE3-SPEC.md §7 "ACK discipline (N3/N4)".
 use super::common::*;
 use crate::messages::Header;
 use crate::vantage::lanes::{AckAggregator, AckThreshold};
@@ -13,8 +12,6 @@ fn ack_count(effects: &[Effect]) -> usize {
         .count()
 }
 
-/// N3: ack fires exactly once per tuple, even if the same (already-acked) direct
-/// publication is reprocessed.
 #[tokio::test]
 async fn acks_exactly_once_per_tuple() {
     let (author, _) = authors()[0];
@@ -22,13 +19,10 @@ async fn acks_exactly_once_per_tuple() {
     let (header, effects) = lm.publish_own(BTreeMap::new()).await;
     assert_eq!(ack_count(&effects), 1);
 
-    // Reprocessing the identical direct publish must not re-ack.
     let effects = lm.process_publish(author, header).await;
     assert_eq!(ack_count(&effects), 0);
 }
 
-/// N3: a prefix obtained only through repair (never a direct publish) is held but
-/// never acked.
 #[tokio::test]
 async fn repaired_only_prefix_never_acked() {
     let (watcher, _) = authors()[0];
@@ -41,17 +35,13 @@ async fn repaired_only_prefix_never_acked() {
     let header = Header::new_vantage(other_author, 1, BTreeMap::new(), genesis, sid);
     let r = (other_author, 1, header.id.clone());
 
-    // Arrives only via `serve` (after being requested, P1-2), never via `publish`.
     repairer.authorize(r.clone());
     let effects = repairer.on_serve(header.clone());
     assert!(!effects.iter().any(|e| matches!(e, Effect::BroadcastAck(_))));
     assert!(!lm.direct_pub(&r));
-    // It IS cached/held (holds_prefix looks at the shared cache regardless of
-    // provenance) -- just never acked.
     assert!(lm.holds_prefix(&r));
 }
 
-/// N4: the same ack, received twice from the same sender, counts once.
 #[tokio::test]
 async fn per_sender_ack_dedup() {
     let (watcher, _) = authors()[0];
@@ -75,7 +65,6 @@ async fn per_sender_ack_dedup() {
     assert_eq!(availability.threshold, AckThreshold::Validity);
 }
 
-/// N4: q-available at the exact f+1 / 2f+1 stake boundaries (n=4, f=1 => f+1=2, 2f+1=3).
 #[tokio::test]
 async fn q_available_exact_boundaries() {
     let (watcher, _) = authors()[0];
@@ -85,8 +74,8 @@ async fn q_available_exact_boundaries() {
     let r = (author, 1u64, Digest([9u8; 32]));
     let mut aggregator = AckAggregator::new(test_committee());
 
-    let validity = 2; // f+1
-    let quorum = 3; // 2f+1
+    let validity = 2; // f + 1
+    let quorum = 3; // 2f + 1
 
     assert!(aggregator
         .record_ack(all[0].0, r.clone())
@@ -110,8 +99,6 @@ async fn q_available_exact_boundaries() {
     assert!(lm.is_q_available(&r, quorum));
 }
 
-/// ACK discipline / D1: withholding one worker batch withholds the ack until it
-/// arrives, even though the block itself was directly published in full.
 #[tokio::test]
 async fn ack_withheld_until_payload_arrives() {
     let (watcher, _) = authors()[0];
@@ -139,19 +126,9 @@ async fn ack_withheld_until_payload_arrives() {
     assert!(lm.direct_pub(&r));
 }
 
-/// MEMORY (2026-08-07): once a ref reaches `Quorum` its per-sender dedup set and weight
-/// are dead, and holding them was the dominant memory leak at n=100 -- measured RSS growth
-/// of 13.43 MB/s per node (1.19 -> 2.73 GiB over a 123s window, ~7 min to OOM on 8 GiB).
-/// One `HashSet<PublicKey>` of ~97 entries is ~4.2 KB, kept per block ever seen, forever;
-/// the run's own counters put it at 403,418 blocks x ~4.3 KB = 1.73 GB.
-///
-/// Pins BOTH halves, because either alone is a bug: the working state must be released,
-/// AND a later ack for a retired ref must not resurrect it (without the `emitted == Quorum`
-/// short-circuit the very next ack would recreate the set and restart the weight from one
-/// sender's stake).
 #[tokio::test]
 async fn quorum_retires_the_per_ref_working_state_and_late_acks_do_not_resurrect_it() {
-    let all = authors(); // n=4, f=1 => f+1=2, 2f+1=3
+    let all = authors(); // n = 4, f = 1, f + 1 = 2, and 2f + 1 = 3.
     let (author, _) = all[1];
     let r = (author, 1u64, Digest([9u8; 32]));
     let mut aggregator = AckAggregator::new(test_committee());
@@ -172,7 +149,6 @@ async fn quorum_retires_the_per_ref_working_state_and_late_acks_do_not_resurrect
     );
     assert_eq!(aggregator.refs_retired(), 1, "retirement marker kept");
 
-    // The 4th sender's ack: accepted, but emits nothing and must not re-allocate.
     let late = aggregator.record_ack(all[3].0, r.clone());
     assert!(late.accepted);
     assert!(
@@ -185,15 +161,11 @@ async fn quorum_retires_the_per_ref_working_state_and_late_acks_do_not_resurrect
         "a late ack resurrected the retired working state -- the leak is back"
     );
 
-    // A DIFFERENT ref is unaffected: retirement is per-ref, not global.
     let r2 = (author, 2u64, Digest([8u8; 32]));
     aggregator.record_ack(all[0].0, r2);
     assert_eq!(aggregator.senders_tracked(), 1);
 }
 
-/// The retirement must not weaken the ack COUNT: quorum still requires 2f+1 distinct
-/// senders. A retirement that fired early (say at Validity) would emit Quorum-grade
-/// availability on f+1 stake, which is a soundness break, not a memory optimization.
 #[tokio::test]
 async fn retirement_does_not_lower_the_quorum_requirement() {
     let all = authors();
@@ -201,7 +173,6 @@ async fn retirement_does_not_lower_the_quorum_requirement() {
     let r = (author, 7u64, Digest([3u8; 32]));
     let mut aggregator = AckAggregator::new(test_committee());
 
-    // Two distinct senders reach f+1 only; the set must still be live afterwards.
     assert!(aggregator
         .record_ack(all[0].0, r.clone())
         .availability
