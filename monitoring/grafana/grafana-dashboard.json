@@ -2127,7 +2127,7 @@
       "id": 9003,
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "hidden",
           "placement": "bottom",
           "calcs": [
             "mean",
@@ -2146,13 +2146,22 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "network_connections{node=~\"$node\",node=~\".*-primary$\",listener=\"primary_to_primary\"}",
-          "legendFormat": "{{node}}",
+          "legendFormat": "{{node}} sessions",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "network_unique_peers{node=~\"$node\",node=~\".*-primary$\",listener=\"primary_to_primary\"}",
+          "legendFormat": "{{node}} peers",
+          "refId": "B"
         }
       ],
-      "title": "Primary-to-primary TCP connections",
+      "title": "Primary TCP sessions / peers",
       "type": "timeseries",
-      "description": "Open inbound validator connections on the primary-to-primary listener."
+      "description": "Open inbound sessions and distinct validator IPs. Extra sessions come from separate sender pools."
     },
     {
       "datasource": {
@@ -2175,7 +2184,7 @@
       "id": 9004,
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "hidden",
           "placement": "bottom",
           "calcs": [
             "mean",
@@ -2194,13 +2203,22 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "network_connections{node=~\"$node\",node=~\".*-worker-[0-9]+$\",listener=\"worker_to_worker\"}",
-          "legendFormat": "{{node}}",
+          "legendFormat": "{{node}} sessions",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "network_unique_peers{node=~\"$node\",node=~\".*-worker-[0-9]+$\",listener=\"worker_to_worker\"}",
+          "legendFormat": "{{node}} peers",
+          "refId": "B"
         }
       ],
-      "title": "Worker-to-worker TCP connections",
+      "title": "Worker TCP sessions / peers",
       "type": "timeseries",
-      "description": "Open inbound validator connections on the worker-to-worker listener."
+      "description": "Open inbound sessions and distinct validator IPs. Payload repair can open additional sessions."
     },
     {
       "datasource": {
@@ -3483,6 +3501,94 @@
       "title": "Sequence installation",
       "type": "timeseries",
       "description": "Pending views and blocks should drain while headers arrive and views apply. Failed and rejected must stay zero."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 161
+      },
+      "id": 9301,
+      "options": {
+        "legend": {
+          "displayMode": "hidden",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "network_peer_rtt_microseconds_total{node=~\"$node\",node=~\".*-primary$\",listener=\"primary_to_primary\"} / clamp_min(network_peer_rtt_samples_total{node=~\"$node\",node=~\".*-primary$\",listener=\"primary_to_primary\"}, 1) / 1000",
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Primary network RTT by validator",
+      "type": "timeseries",
+      "description": "Mean kernel TCP RTT sampled when each distinct peer first connects."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-vantage"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 161
+      },
+      "id": 9302,
+      "options": {
+        "legend": {
+          "displayMode": "hidden",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-vantage"
+          },
+          "expr": "network_peer_rtt_microseconds_total{node=~\"$node\",node=~\".*-worker-[0-9]+$\",listener=\"worker_to_worker\"} / clamp_min(network_peer_rtt_samples_total{node=~\"$node\",node=~\".*-worker-[0-9]+$\",listener=\"worker_to_worker\"}, 1) / 1000",
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Worker network RTT by validator",
+      "type": "timeseries",
+      "description": "Mean kernel TCP RTT sampled when each distinct peer first connects."
     }
   ],
   "preload": false,

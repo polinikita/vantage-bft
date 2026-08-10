@@ -21,5 +21,10 @@ async-trait = { workspace = true }
 metrics = { path = "../metrics" }
 
 parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 bincode = { workspace = true }
+prometheus = { workspace = true }

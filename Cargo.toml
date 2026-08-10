@@ -31,5 +31,6 @@ rocksdb = { version = "0.23", features = ["lz4", "zstd"] }
 serial_test = "0.9"
 prometheus = { version = "0.13", features = ["process"] }
 parking_lot = "0.12"
+libc = "0.2"
 axum = "0.7"
 fdlimit = "0.3"

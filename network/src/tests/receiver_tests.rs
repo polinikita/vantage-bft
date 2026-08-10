@@ -39,3 +39,87 @@ async fn receive() {
     let received = message.unwrap();
     assert_eq!(received, sent);
 }
+
+#[test]
+fn connection_metrics_distinguish_sessions_from_peers() {
+    let registry = prometheus::Registry::new();
+    let (metrics, _reporter) = Metrics::new(&registry);
+    let peers = Arc::new(PeerSessions::default());
+    let first = "127.0.0.1".parse().unwrap();
+    let second = "127.0.0.2".parse().unwrap();
+
+    let first_session = ConnectionMetricGuard::new(
+        Some(metrics.clone()),
+        "test",
+        first,
+        peers.clone(),
+        Some(1_000),
+    );
+    let duplicate_session = ConnectionMetricGuard::new(
+        Some(metrics.clone()),
+        "test",
+        first,
+        peers.clone(),
+        Some(2_000),
+    );
+    let second_peer =
+        ConnectionMetricGuard::new(Some(metrics.clone()), "test", second, peers, Some(3_000));
+
+    let label = &["test"];
+    assert_eq!(
+        metrics.network_connections.with_label_values(label).get(),
+        3
+    );
+    assert_eq!(
+        metrics.network_unique_peers.with_label_values(label).get(),
+        2
+    );
+    assert_eq!(
+        metrics
+            .network_connections_accepted_total
+            .with_label_values(label)
+            .get(),
+        3
+    );
+    assert_eq!(
+        metrics
+            .network_peer_rtt_microseconds_total
+            .with_label_values(label)
+            .get(),
+        4_000
+    );
+    assert_eq!(
+        metrics
+            .network_peer_rtt_samples_total
+            .with_label_values(label)
+            .get(),
+        2
+    );
+
+    drop(first_session);
+    assert_eq!(
+        metrics.network_unique_peers.with_label_values(label).get(),
+        2
+    );
+    drop(duplicate_session);
+    assert_eq!(
+        metrics.network_unique_peers.with_label_values(label).get(),
+        1
+    );
+    drop(second_peer);
+    assert_eq!(
+        metrics.network_connections.with_label_values(label).get(),
+        0
+    );
+    assert_eq!(
+        metrics.network_unique_peers.with_label_values(label).get(),
+        0
+    );
+    assert_eq!(
+        metrics
+            .network_connections_closed_total
+            .with_label_values(label)
+            .get(),
+        3
+    );
+}

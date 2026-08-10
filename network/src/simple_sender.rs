@@ -5,7 +5,7 @@ use crate::reliable_sender::record_typed_sent;
 use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
-use log::{info, warn};
+use log::{debug, warn};
 use metrics::Metrics;
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
@@ -232,7 +232,7 @@ impl Connection {
                 Ok(stream) => {
                     // Disable Nagle buffering for small protocol frames.
                     let _ = stream.set_nodelay(true);
-                    info!("Outgoing connection established with {}", self.address);
+                    debug!("Outgoing connection established with {}", self.address);
                     return Some(stream);
                 }
                 Err(e) => {

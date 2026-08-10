@@ -395,6 +395,16 @@ pub struct Metrics {
     pub network_volatile_shed_total: IntCounter,
     /// Open inbound TCP connections by listener role.
     pub network_connections: IntGaugeVec,
+    /// Distinct remote IPs with an open inbound connection.
+    pub network_unique_peers: IntGaugeVec,
+    /// Inbound TCP connections accepted since process start.
+    pub network_connections_accepted_total: IntCounterVec,
+    /// Inbound TCP connections closed since process start.
+    pub network_connections_closed_total: IntCounterVec,
+    /// Sum of TCP RTT samples in microseconds, sampled once per peer episode.
+    pub network_peer_rtt_microseconds_total: IntCounterVec,
+    /// Number of TCP RTT samples.
+    pub network_peer_rtt_samples_total: IntCounterVec,
     // --- Sequence-chain metrics.
     /// Highest view covered by the local sequence chain.
     pub vantage_sequence_head_view: IntGauge,
@@ -1158,6 +1168,41 @@ impl Metrics {
             network_connections: register_int_gauge_vec_with_registry!(
                 "network_connections",
                 "Currently-open inbound TCP connections by listener role",
+                &["listener"],
+                registry,
+            )
+            .unwrap(),
+            network_unique_peers: register_int_gauge_vec_with_registry!(
+                "network_unique_peers",
+                "Distinct remote IPs with an open inbound TCP connection",
+                &["listener"],
+                registry,
+            )
+            .unwrap(),
+            network_connections_accepted_total: register_int_counter_vec_with_registry!(
+                "network_connections_accepted_total",
+                "Inbound TCP connections accepted",
+                &["listener"],
+                registry,
+            )
+            .unwrap(),
+            network_connections_closed_total: register_int_counter_vec_with_registry!(
+                "network_connections_closed_total",
+                "Inbound TCP connections closed",
+                &["listener"],
+                registry,
+            )
+            .unwrap(),
+            network_peer_rtt_microseconds_total: register_int_counter_vec_with_registry!(
+                "network_peer_rtt_microseconds_total",
+                "Sum of TCP RTT samples in microseconds, sampled once per peer episode",
+                &["listener"],
+                registry,
+            )
+            .unwrap(),
+            network_peer_rtt_samples_total: register_int_counter_vec_with_registry!(
+                "network_peer_rtt_samples_total",
+                "TCP RTT samples, one per peer connection episode",
                 &["listener"],
                 registry,
             )
