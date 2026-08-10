@@ -18,8 +18,10 @@ mkdir -p "$OUT"
 banner () { echo "===== $* :: $(date +%T)"; }
 
 NAME="${1:-latch}"
-banner "$NAME START"
-./late_joiner.sh --nodes 21 --rate 1000 --down 60 --settle 120 \
+# Committee size; the joiner is node-(NODES-1). joiner_score.py reads the same variable.
+NODES="${NODES:-21}"
+banner "$NAME START (nodes=$NODES)"
+./late_joiner.sh --nodes "$NODES" --rate 1000 --down 60 --settle 120 \
     --interval 50 \
     --sequence-sync-min-gap-views 100 \
     --sequence-sync-shed-gap-views 100 > "$OUT/$NAME.log" 2>&1

@@ -1054,6 +1054,13 @@ pub struct Metrics {
     /// short-circuits on a memo, orders of magnitude larger once a hole forces full
     /// re-walks. A straggler whose walk-step rate is NOT elevated refutes the hypothesis.
     pub vantage_walk_steps_total: IntCounterVec,
+    /// Failed prefix walks by family (`chain`/`direct`) and failure branch (`missing` =
+    /// cache miss on an ancestor digest, `pinned` = author/height contradiction,
+    /// `gate` = the per-family predicate: `block_ok_verified` for chain,
+    /// `direct && payload_ok` for direct). The 2026-08-10 fleet-freeze forensics could
+    /// see 1.5M failing chain steps/s per peer in `vantage_walk_steps_total` but not
+    /// WHICH branch failed, which decides the remedy (repair refill vs provenance).
+    pub vantage_walk_failures_total: IntCounterVec,
     /// Body-fetch pairs given up on after `MAX_FETCH_ATTEMPTS` rather than asked again.
     ///
     /// Abandoning is safe and re-creatable (see `MAX_FETCH_ATTEMPTS`), so a healthy rate
@@ -2139,6 +2146,13 @@ impl Metrics {
                 "vantage_walk_steps_total",
                 "Nodes visited by the O(gap) prefix walks, by family",
                 &["family"],
+                registry,
+            )
+            .unwrap(),
+            vantage_walk_failures_total: register_int_counter_vec_with_registry!(
+                "vantage_walk_failures_total",
+                "Failed prefix walks by family and failure branch",
+                &["family", "branch"],
                 registry,
             )
             .unwrap(),

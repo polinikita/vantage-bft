@@ -282,6 +282,47 @@ async fn restart_can_still_prove_its_own_lane() {
         is_acked(&effects),
         "the post-restart publish must re-arm the ack pipeline"
     );
+
+    // The boot path re-broadcasts the anchor once: a kill can lose the final block's
+    // SEND while its persist survived, so no peer may hold the restored frontier -- and
+    // only a fresh authentic publish restores DIRECT provenance on the peers.
+    let anchor = restarted
+        .take_seeded_anchor()
+        .expect("the restore must stage the anchor for re-broadcast");
+    assert_eq!(anchor.id, first.id);
+    assert!(
+        restarted.take_seeded_anchor().is_none(),
+        "the anchor is taken once"
+    );
+}
+
+/// A prefix walk that fails on a MISSING ancestor must report the exact `(author,
+/// height, digest)` so the caller can hand it to repair -- a live publish with a missing
+/// parent triggers no other repair path anywhere, and an unhealed hole costs full-depth
+/// re-walks per inbound message forever (the 2026-08-10 fleet freeze on every peer).
+#[tokio::test]
+async fn failing_walk_reports_the_missing_parent() {
+    let (author, _) = authors()[0];
+    let (mut sender_lm, _s1) = new_lane_manager(author, ".db_test_vantage_missing_parent_src");
+    let (first, _) = sender_lm.publish_own(BTreeMap::new()).await;
+    let (second, _) = sender_lm.publish_own(BTreeMap::new()).await;
+
+    // A peer that never saw `first` (the kill-window hole) receives `second` directly.
+    let (receiver, _) = authors()[1];
+    let (mut peer, _s2) = new_lane_manager(receiver, ".db_test_vantage_missing_parent_dst");
+    peer.process_publish(author, second.clone()).await;
+
+    let r = (author, second.height, second.id.clone());
+    assert!(!peer.direct_pub(&r), "the prefix has a hole");
+    let reported = peer.take_missing_parents(8);
+    assert!(
+        reported.contains(&(author, first.height, first.id.clone())),
+        "the walk must report the hole it failed on, got {reported:?}"
+    );
+    assert!(
+        peer.take_missing_parents(8).is_empty(),
+        "draining empties the set until a walk re-reports"
+    );
 }
 
 /// A store carried across a committee change describes a lane in a DIFFERENT session.

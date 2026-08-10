@@ -112,7 +112,32 @@ pub struct BlockCache {
     /// convention this module already uses for `vantage_block_cache_len`.
     walk_steps_chain: u64,
     walk_steps_direct: u64,
+    /// Failure-branch tallies for the two prefix walks, `[missing, pinned, gate]` --
+    /// `missing` = `by_digest` miss, `pinned` = author/height mismatch (or a height/
+    /// genesis contradiction), `gate` = the per-family predicate (`block_ok_verified`
+    /// for chain, `direct && payload_ok` for direct). Added after the 2026-08-10 fleet
+    /// freeze, whose forensics could see 1.5M failing chain steps/s per peer but not
+    /// WHICH branch failed. Same flush convention as `walk_steps_*`.
+    walk_fail_chain: [u64; 3],
+    walk_fail_direct: [u64; 3],
+    /// Missing-parent refs observed by failing walks: the exact `(author, height,
+    /// digest)` a walk needed and the cache did not hold. Drained by the caller into
+    /// `Repairer::authorize`, whose settle machinery requests the block and recursively
+    /// backfills deeper holes -- once present, the walk verifies and memoizes, so each
+    /// hole costs one repair round-trip instead of unbounded re-walks. This is how a
+    /// kill-window hole in a restarted node's lane (persisted+restored locally, but the
+    /// SEND died with the process, so no peer holds it) ever heals on the peers: live
+    /// publishes with missing parents trigger no other repair path anywhere.
+    ///
+    /// Bounded: at steady state a failing walk re-reports the same ref, so the set
+    /// stays at the number of distinct holes (one per restarted lane, in practice).
+    missing_parents: BTreeSet<BlockRef>,
 }
+
+/// `missing_parents` cap -- distinct simultaneous holes, not a rate. One restart
+/// produces one hole (rarely a few, if the sender queue died deep); 64 covers every
+/// lane of a large committee restarting at once.
+const MISSING_PARENTS_CAP: usize = 64;
 
 impl BlockCache {
     pub fn new() -> Self {
@@ -129,6 +154,35 @@ impl BlockCache {
     /// when a hole forces full re-walks).
     pub fn walk_steps(&self) -> (u64, u64) {
         (self.walk_steps_chain, self.walk_steps_direct)
+    }
+
+    /// Monotonic walk-failure branch totals `(chain, direct)`, each `[missing, pinned,
+    /// gate]` -- see `walk_fail_chain`. Same delta-sampling convention as `walk_steps`.
+    pub fn walk_failures(&self) -> ([u64; 3], [u64; 3]) {
+        (self.walk_fail_chain, self.walk_fail_direct)
+    }
+
+    /// Record a `(author, height, digest)` a prefix walk needed and this cache did not
+    /// hold -- see `missing_parents`. Capped; a full set drops the report (the walk will
+    /// re-report it once the set drains).
+    fn note_missing_parent(&mut self, author: PublicKey, height: Height, digest: Digest) {
+        if self.missing_parents.len() >= MISSING_PARENTS_CAP {
+            return;
+        }
+        self.missing_parents.insert((author, height, digest));
+    }
+
+    /// Drain up to `cap` missing-parent reports for the caller to hand to
+    /// `Repairer::authorize`.
+    pub fn take_missing_parents(&mut self, cap: usize) -> Vec<BlockRef> {
+        let mut out = Vec::new();
+        while out.len() < cap {
+            let Some(r) = self.missing_parents.pop_first() else {
+                break;
+            };
+            out.push(r);
+        }
+        out
     }
 
     /// Entries held, exported as `vantage_block_cache_len`. Measured at 4,286 bytes of
@@ -381,24 +435,30 @@ impl BlockCache {
             if &cur == genesis {
                 if expected_height != 0 {
                     self.walk_steps_direct += steps;
+                    self.walk_fail_direct[1] += 1;
                     return false;
                 }
                 break;
             }
             if expected_height == 0 {
                 self.walk_steps_direct += steps;
+                self.walk_fail_direct[1] += 1;
                 return false; // ran out of height before reaching genesis
             }
             let Some(entry) = self.by_digest.get(&cur) else {
                 self.walk_steps_direct += steps;
+                self.walk_fail_direct[0] += 1;
+                self.note_missing_parent(author, expected_height, cur);
                 return false;
             };
             if !entry.pinned_at(author, expected_height) {
                 self.walk_steps_direct += steps;
+                self.walk_fail_direct[1] += 1;
                 return false; // cross-author graft (§1 "one author index") or height gap
             }
             if !(entry.direct && entry.payload_ok) {
                 self.walk_steps_direct += steps;
+                self.walk_fail_direct[2] += 1;
                 return false;
             }
             if entry.direct_prefix_verified {
@@ -466,24 +526,30 @@ impl BlockCache {
             if &cur == genesis {
                 if expected_height != 0 {
                     self.walk_steps_chain += steps;
+                    self.walk_fail_chain[1] += 1;
                     return false;
                 }
                 break;
             }
             if expected_height == 0 {
                 self.walk_steps_chain += steps;
+                self.walk_fail_chain[1] += 1;
                 return false;
             }
             let Some(entry) = self.by_digest.get(&cur) else {
                 self.walk_steps_chain += steps;
+                self.walk_fail_chain[0] += 1;
+                self.note_missing_parent(author, expected_height, cur);
                 return false;
             };
             if !entry.pinned_at(author, expected_height) {
                 self.walk_steps_chain += steps;
+                self.walk_fail_chain[1] += 1;
                 return false; // cross-author graft (§1 "one author index") or height gap
             }
             if !entry.block_ok_verified {
                 self.walk_steps_chain += steps;
+                self.walk_fail_chain[2] += 1;
                 return false;
             }
             if entry.chain_verified {
@@ -990,6 +1056,15 @@ pub struct LaneManager {
     /// Times `missing_payload`'s single store round-trip, the one genuine block on
     /// the VantageCore thread inside this module.
     wt_store_probe: Option<IntCounter>,
+
+    /// The anchor header `restore_own_frontier` seeded, held for the caller to
+    /// RE-BROADCAST at boot (taken once via `take_seeded_anchor`). A kill can lose the
+    /// final block's SEND while its write-ahead persist survived, leaving the restored
+    /// node chaining on a block no peer holds; a fresh authentic publish from the author
+    /// both fills that hole and carries DIRECT provenance (N2 upgrade), which a repair
+    /// serve cannot -- and peers' ack pipeline (`direct_prefix_ok`) needs direct, not
+    /// merely present. Idempotent for peers that already hold it (`upsert` OR-merge).
+    seeded_anchor: Option<Header>,
 }
 
 /// Store key for this party's own lane frontier.
@@ -1105,6 +1180,7 @@ impl LaneManager {
             avail_watermark_high: HashMap::new(),
             metrics: None,
             wt_store_probe: None,
+            seeded_anchor: None,
         }
     }
 
@@ -1300,13 +1376,27 @@ impl LaneManager {
             "vantage lanes: seeded own lane anchor at height={} into the block cache",
             header.height
         );
-        self.blocks.lock().seed_own_anchor(header);
+        self.blocks.lock().seed_own_anchor(header.clone());
+        // Held for the boot re-broadcast -- see the field's doc comment.
+        self.seeded_anchor = Some(header);
         // Re-enter the tip into the ack pipeline: `acked` is memory-only too, so the
         // next `refresh_author(self.name)` (the first own publish) re-confirms it via
         // the now-succeeding walk, re-acks it (peers dedupe by watermark), and -- the
         // part that matters -- re-admits our own lane into the N5 registers so our
         // proposals can vouch for it again.
         self.pending_direct.insert(r);
+    }
+
+    /// The anchor header the restore seeded, if any -- taken once by the boot path to
+    /// re-broadcast it (see `seeded_anchor`).
+    pub fn take_seeded_anchor(&mut self) -> Option<Header> {
+        self.seeded_anchor.take()
+    }
+
+    /// Drain missing-parent reports from failing prefix walks -- see
+    /// `BlockCache::missing_parents`. The caller hands them to `Repairer::authorize`.
+    pub fn take_missing_parents(&mut self, cap: usize) -> Vec<BlockRef> {
+        self.blocks.lock().take_missing_parents(cap)
     }
 
     /// N1: create and self-publish our own next block. Height advances immediately on

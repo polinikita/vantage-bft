@@ -881,6 +881,9 @@ pub struct VantageCore {
     /// (`BlockCache`, `Repairer`) because incrementing a labeled metric per visited node
     /// would cost as much as the step being counted.
     walk_steps_published: (u64, u64, u64),
+    /// Previous `BlockCache::walk_failures` sample -- same delta convention as
+    /// `walk_steps_published`.
+    walk_fails_published: ([u64; 3], [u64; 3]),
     ut_header_seal: Option<IntCounter>,
     /// Running max of `rx_vantage.len()` since the last 1 Hz publish -- see
     /// `Metrics::core_queue_peak`.
@@ -1306,6 +1309,7 @@ impl VantageCore {
             ut_resume_tick: None,
             ut_metrics_tick: None,
             walk_steps_published: (0, 0, 0),
+            walk_fails_published: ([0; 3], [0; 3]),
             ut_header_seal: None,
             queue_len_peak: 0,
             recheck_pending: false,
@@ -1339,9 +1343,21 @@ impl VantageCore {
         // re-signs a different block at a height it already used, and every honest node's
         // output cursor wedges on the fork -- see `lanes::OWN_FRONTIER_KEY`.
         self.lm.restore_own_frontier().await;
+        // Re-broadcast the seeded anchor: a kill can lose the final block's SEND while
+        // its write-ahead persist survived, so the restored frontier may be a block NO
+        // peer holds -- and a live publish with a missing parent triggers no repair
+        // anywhere, so every peer's prefix walk on this lane would fail full-depth on
+        // every inbound message forever (the 2026-08-10 fleet freeze: ~1.5M failing
+        // chain-walk steps/s per peer, per-message dispatch cost through the echo
+        // deadlines). A fresh authentic publish both fills the hole and carries DIRECT
+        // provenance, which a repair serve cannot. Idempotent for peers that hold it.
+        let mut effects = Vec::new();
+        if let Some(anchor) = self.lm.take_seeded_anchor() {
+            effects.push(Effect::BroadcastPublish(anchor));
+        }
         // Genesis bootstrap (§4/PHASE5-SPEC.md W1): every party enters view 1 at boot,
         // then the WISH pacemaker sets its own wish to 2 and broadcasts it.
-        let mut effects = self.enter_view_effects(1, boot);
+        effects.extend(self.enter_view_effects(1, boot));
         effects.extend(self.pacemaker.genesis());
         // PHASE6-SPEC.md §5: the control log's own genesis (enter control round 1).
         effects.extend(self.control.genesis());
@@ -1672,6 +1688,21 @@ impl VantageCore {
                     // ablation; see `Repairer::adapt_recovery_ceiling`.
                     self.rep.observe_core_queue(rx_vantage.len());
                     retry_effects.extend(self.rep.retry_requests());
+                    // Heal holes that failing prefix walks reported (see
+                    // `BlockCache::missing_parents`): authorize each so repair's settle
+                    // machinery requests it and backfills deeper. One second of latency
+                    // per hole-hop is fine -- a hole is a rare, one-time restart artifact,
+                    // and every second it stands costs full-depth re-walks per inbound
+                    // message on this node.
+                    for r in self.lm.take_missing_parents(16) {
+                        log::info!(
+                            "vantage repair: prefix walk reported a missing block \
+                             author={} height={}; authorizing repair",
+                            r.0,
+                            r.1
+                        );
+                        retry_effects.extend(self.rep.authorize(r));
+                    }
                     // Dropped so the nested `execute` is not double-counted into this
                     // tick's own label; re-opened for the tail below.
                     drop(metrics_timer);
@@ -2309,9 +2340,14 @@ impl VantageCore {
         // `BlockCache`/`Repairer` and this needs `&mut self.walk_steps_published`, which
         // cannot coexist with the long `metrics` borrow the rest of this function holds.
         if self.metrics.is_some() {
-            let chain_direct = self.lm.blocks_handle().lock().walk_steps();
+            let (chain_direct, fails) = {
+                let blocks = self.lm.blocks_handle();
+                let blocks = blocks.lock();
+                (blocks.walk_steps(), blocks.walk_failures())
+            };
             let now = (chain_direct.0, chain_direct.1, self.rep.walk_steps_settle());
             let prev = self.walk_steps_published;
+            let prev_fails = self.walk_fails_published;
             if let Some(metrics) = &self.metrics {
                 for (family, cur, was) in [
                     ("chain", now.0, prev.0),
@@ -2323,8 +2359,20 @@ impl VantageCore {
                         .with_label_values(&[family])
                         .inc_by(cur.saturating_sub(was));
                 }
+                for (family, cur, was) in [
+                    ("chain", fails.0, prev_fails.0),
+                    ("direct", fails.1, prev_fails.1),
+                ] {
+                    for (i, branch) in ["missing", "pinned", "gate"].iter().enumerate() {
+                        metrics
+                            .vantage_walk_failures_total
+                            .with_label_values(&[family, branch])
+                            .inc_by(cur[i].saturating_sub(was[i]));
+                    }
+                }
             }
             self.walk_steps_published = now;
+            self.walk_fails_published = fails;
         }
         let Some(metrics) = &self.metrics else { return };
         metrics
@@ -4338,12 +4386,19 @@ impl VantageCore {
         // latch strands the cursor in a dead zone it can never seal (the 2026-08-10
         // zombie: latched at head 2252 with the floor effectively at ~2440, wedged at
         // 2253 forever).
+        // The floor clause must NOT live inside the `is_some_and`: between two certified
+        // boundaries `target` is `None` (nothing certified above the local head yet),
+        // and folding the clause in latched exactly there -- measured on run anchor2:
+        // "RECOVERED at view=695 (live-intake floor 717)", wedged at 696, re-armed at
+        // gap 800, and repeated at 1500 vs floor 1653. Below the floor, recovery holds
+        // regardless of what is currently certified; the next boundary above the head
+        // starts the transfer that closes the dead zone.
         let was_recovering = self.sequence_sync_recovery_active;
         self.sequence_sync_recovery_active = self.sequence_install_enabled
-            && target.is_some_and(|target| {
-                target.saturating_sub(local) >= self.sequence_sync_min_gap_views
-                    || local < self.sequence_live_intake_floor
-            });
+            && (local < self.sequence_live_intake_floor
+                || target.is_some_and(|target| {
+                    target.saturating_sub(local) >= self.sequence_sync_min_gap_views
+                }));
         // Inside the sync threshold, stop FETCHING: a transfer competes for exactly the
         // queue and bandwidth the tail now needs for ordinary participation. A staged
         // install is deliberately left to drain -- it applies already-verified state under

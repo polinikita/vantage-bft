@@ -8,13 +8,15 @@ stated criteria rather than eyeballed.
 """
 import datetime
 import json
+import os
 import statistics
 import sys
 import urllib.parse
 import urllib.request
 
 PROM = "http://localhost:9095"
-JOINER = "node-20-primary"
+# The joiner is the last node of the committee; match joiner_verify.sh's NODES.
+JOINER = f"node-{int(os.environ.get('NODES', 21)) - 1}-primary"
 
 
 def rng(expr, s, e, step="20s"):
