@@ -353,7 +353,13 @@ impl SequenceInstall {
     /// not gate admission.
     pub fn admit(&mut self, _pending_settle_len: usize) -> Vec<BlockRef> {
         let mut out = Vec::new();
-        while self.next_admit <= self.target_view && self.views_in_flight() < self.window_views {
+        // Counted ONCE, then tracked locally. `views_in_flight` is O(staged views) -- the
+        // whole gap, thousands of entries -- and evaluating it in the loop condition made
+        // admission O(window * gap) on every 100 ms tick (64 x 46,800 ~= 3M visits/tick at
+        // a 60-minute gap). Nothing inside the loop completes a view, so the only change
+        // this pass can make to the count is the admissions it performs itself.
+        let mut in_flight = self.views_in_flight();
+        while self.next_admit <= self.target_view && in_flight < self.window_views {
             let view = self.next_admit;
             let Some(staged) = self.views.get_mut(&view) else {
                 // A hole: `is_contiguous` already refused this target, so reaching here
@@ -366,6 +372,7 @@ impl SequenceInstall {
                 continue; // Skip view, or one ordinary dissemination already delivered.
             }
             staged.admitted = true;
+            in_flight += 1;
             out.extend(staged.refs.iter().cloned());
         }
         out

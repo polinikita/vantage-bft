@@ -440,7 +440,8 @@ impl Cursor {
         }
 
         let install = self.installing.take().expect("present until complete");
-        self.apply_watermarks(&install.outcome);
+        let delivered: Vec<Digest> = install.verified.iter().cloned().collect();
+        self.apply_watermarks(&delivered);
         effects.push(self.finalize(install.outcome));
         Ok((effects, true, examined))
     }
@@ -461,21 +462,34 @@ impl Cursor {
     /// leave the next ordinary `expand` walking from a stale point across a prefix it may
     /// no longer hold in full -- correct output (`D` still deduplicates) reached by the
     /// pathological path this index exists to remove.
-    fn apply_watermarks(&mut self, outcome: &SequenceOutcome) {
-        let manifests: [&Manifest; 2] = match outcome {
-            SequenceOutcome::Full { c, t } => [c, t],
-            SequenceOutcome::Core { c } => [c, c],
-            SequenceOutcome::Skip => return,
+    /// Derived from what was DELIVERED, never from the manifest.
+    ///
+    /// The manifest is intent; the delta is delivery, and the two differ. `expand` drops a
+    /// `SuffixWalk::Forked` entry and leaves that author's watermark untouched, while the
+    /// manifest still names the forked tip -- so advancing from the manifest made an
+    /// installing node adopt a watermark an executing node never adopts. It could then walk
+    /// forward from the forked branch and emit blocks the executing node drops: two correct
+    /// nodes, divergent committed logs, from identical verified input. Before `Forked`
+    /// entries were dropped this was unreachable, because `expand` simply waited forever.
+    ///
+    /// Strictly `>`, matching `expand`'s `height <= stop_height` skip, so an equal-height
+    /// entry can never rewrite the digest -- the other way the two paths could disagree.
+    fn apply_watermarks(&mut self, delivered: &[Digest]) {
+        let advances: Vec<(PublicKey, Height, Digest)> = {
+            let blocks = self.blocks.lock();
+            delivered
+                .iter()
+                .filter_map(|digest| {
+                    blocks
+                        .get(digest)
+                        .map(|entry| (entry.block.author, entry.block.height, digest.clone()))
+                })
+                .collect()
         };
-        for manifest in manifests {
-            for (author, height, digest) in manifest {
-                let entry = self
-                    .watermarks
-                    .entry(*author)
-                    .or_insert((0, digest.clone()));
-                if *height >= entry.0 {
-                    *entry = (*height, digest.clone());
-                }
+        for (author, height, digest) in advances {
+            let entry = self.watermarks.entry(author).or_insert((0, digest.clone()));
+            if height > entry.0 {
+                *entry = (height, digest);
             }
         }
     }

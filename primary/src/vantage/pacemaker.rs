@@ -171,6 +171,29 @@ impl Pacemaker {
         self.advance_entry_target(omega_q)
     }
 
+    /// State-sync install has already made every view below `next_live` terminal locally.
+    /// Fast-forward this pacemaker's local-entry bookkeeping to that first live view
+    /// without replaying one `Enter` per historical view.
+    ///
+    /// This is intentionally narrower than W2's quorum-driven `advance_entry_target`:
+    /// state sync is a local catch-up proof, not a first-hand wish quorum. The caller must
+    /// still execute formal entry for exactly `next_live` in the AGB/frontier components;
+    /// this method only makes the pacemaker agree that all skipped entry effects are no
+    /// longer missing and raises the local wish watermark used for subsequent piggybacks
+    /// and outbox filing.
+    pub fn fast_forward_installed_entry(&mut self, next_live: View) {
+        if next_live > self.entry_target {
+            self.entry_target = next_live;
+        }
+        if next_live > self.largest_entered_view {
+            self.largest_entered_view = next_live;
+        }
+        if next_live > self.own_watermark {
+            self.omega[self.own_index] = next_live;
+            self.own_watermark = next_live;
+        }
+    }
+
     /// W2's target-advance step: if `omega_q` increased past the current entry target,
     /// raise it and record formal entry to every missing view through the new target,
     /// immediately and in increasing order (one `Effect::Enter` per view, ascending).

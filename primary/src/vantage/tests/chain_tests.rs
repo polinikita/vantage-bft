@@ -89,6 +89,85 @@ async fn rejects_wrong_predecessor() {
     assert!(!lm.holds_prefix(&r));
 }
 
+/// A direct, payload-ready descendant above a payload-missing ancestor cannot become
+/// `DirectPub` until that exact ancestor's payload arrives. The pending-direct retry
+/// loop should not re-walk the same blocked descendant on unrelated author refreshes;
+/// it should wake when the blocker becomes direct/payload-ready.
+#[tokio::test]
+async fn pending_direct_payload_blocker_sleeps_until_payload_ready() {
+    let (self_name, _) = authors()[3];
+    let (author, _) = authors()[0];
+    let (mut lm, mut store) = new_lane_manager(self_name, ".db_test_vantage_pending_blocker");
+    let sid = lm.sid().clone();
+    let genesis = lm.genesis().clone();
+
+    let payload_digest = Digest([91u8; 32]);
+    let mut payload = BTreeMap::new();
+    payload.insert(payload_digest.clone(), 0);
+    let h1 = Header::new_vantage(author, 1, payload, genesis, sid.clone());
+    let h1_effects = lm.process_publish(author, h1.clone()).await;
+    assert!(!is_acked(&h1_effects));
+    let after_h1 = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+
+    let h2 = Header::new_vantage(author, 2, BTreeMap::new(), h1.id.clone(), sid);
+    let h2_effects = lm.process_publish(author, h2.clone()).await;
+    assert!(
+        !is_acked(&h2_effects),
+        "h2 is direct and payload-ready, but h1's payload still blocks its direct prefix"
+    );
+    let after_block = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert_eq!(
+        after_block, after_h1,
+        "a direct child of a known payload-missing block should sleep without one walk"
+    );
+
+    let relay_effects = lm.process_publish(self_name, h2.clone()).await;
+    assert!(!is_acked(&relay_effects));
+    let after_relay = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert_eq!(
+        after_relay, after_block,
+        "a candidate already blocked on a specific payload hole must sleep, not re-walk"
+    );
+
+    let h3 = Header::new_vantage(author, 3, BTreeMap::new(), h2.id.clone(), lm.sid().clone());
+    let h3_effects = lm.process_publish(author, h3.clone()).await;
+    assert!(!is_acked(&h3_effects));
+    let after_inherited = {
+        let blocks = lm.blocks_handle();
+        let blocks = blocks.lock();
+        (blocks.walk_steps(), blocks.walk_failures())
+    };
+    assert_eq!(
+        after_inherited, after_relay,
+        "a new descendant of a blocked ref should inherit the blocker without one walk"
+    );
+
+    mark_payload_present(&mut store, &payload_digest, 0).await;
+    let wake_effects = lm.set_payload_ready(&h1.id);
+    let ack_count = wake_effects
+        .iter()
+        .filter(|e| matches!(e, Effect::BroadcastAck(_)))
+        .count();
+    assert_eq!(
+        ack_count, 3,
+        "payload readiness should ack the blocker first, then wake and ack descendants"
+    );
+    assert!(lm.direct_pub(&block_ref(&h3)));
+    assert!(lm.direct_pub(&block_ref(&h2)));
+}
+
 /// N1/N2: non-consecutive height (`parent_cert.height` not `height - 1`) fails
 /// `BlockOK` on the block alone -- rejected outright, never even cached.
 #[tokio::test]
@@ -238,6 +317,90 @@ async fn restart_continues_the_lane_instead_of_forking_it() {
     assert_eq!(
         second.parent_cert.header_digest, first.id,
         "the post-restart block must chain onto the pre-restart tip, not genesis"
+    );
+}
+
+/// A restart must also restore the lane's PROVABILITY, not just its coordinates. The
+/// block cache is memory-only, so without seeding the persisted frontier header back
+/// into it, every `direct_pub`/`holds_prefix` walk from a post-restart own block fails
+/// at the missing pre-restart tip -- forever (self-published blocks are never
+/// re-delivered, and repair never asks for them). Measured on docker-bench (n=21
+/// late-joiner): millions of failing walk steps/s, the node never re-acks or vouches
+/// for its own lane, and its proposer turns seal empty.
+#[tokio::test]
+async fn restart_can_still_prove_its_own_lane() {
+    let (author, _) = authors()[0];
+    let (mut lm, store) = new_lane_manager(author, ".db_test_vantage_restart_anchor");
+    let (first, _) = lm.publish_own(BTreeMap::new()).await;
+
+    let mut restarted = crate::vantage::lanes::LaneManager::new(
+        author,
+        test_committee(),
+        MAX_BLOCK_PAYLOAD,
+        store.clone(),
+    );
+    restarted.restore_own_frontier().await;
+
+    // The restored tip itself is provable again...
+    let tip = (author, first.height, first.id.clone());
+    assert!(
+        restarted.direct_pub(&tip),
+        "the restored frontier header must be seeded as a verified anchor"
+    );
+    assert!(restarted.holds_prefix(&tip));
+
+    // ...and so is everything published on top of it, which is what N3's ack and the
+    // N5 registers (this party vouching for its own lane in its proposals) hang off.
+    let (second, effects) = restarted.publish_own(BTreeMap::new()).await;
+    let r = (author, second.height, second.id.clone());
+    assert!(
+        restarted.direct_pub(&r),
+        "a post-restart block must verify through the seeded anchor"
+    );
+    assert!(
+        is_acked(&effects),
+        "the post-restart publish must re-arm the ack pipeline"
+    );
+
+    // The boot path re-broadcasts the anchor once: a kill can lose the final block's
+    // SEND while its persist survived, so no peer may hold the restored frontier -- and
+    // only a fresh authentic publish restores DIRECT provenance on the peers.
+    let anchor = restarted
+        .take_seeded_anchor()
+        .expect("the restore must stage the anchor for re-broadcast");
+    assert_eq!(anchor.id, first.id);
+    assert!(
+        restarted.take_seeded_anchor().is_none(),
+        "the anchor is taken once"
+    );
+}
+
+/// A prefix walk that fails on a MISSING ancestor must report the exact `(author,
+/// height, digest)` so the caller can hand it to repair -- a live publish with a missing
+/// parent triggers no other repair path anywhere, and an unhealed hole costs full-depth
+/// re-walks per inbound message forever (the 2026-08-10 fleet freeze on every peer).
+#[tokio::test]
+async fn failing_walk_reports_the_missing_parent() {
+    let (author, _) = authors()[0];
+    let (mut sender_lm, _s1) = new_lane_manager(author, ".db_test_vantage_missing_parent_src");
+    let (first, _) = sender_lm.publish_own(BTreeMap::new()).await;
+    let (second, _) = sender_lm.publish_own(BTreeMap::new()).await;
+
+    // A peer that never saw `first` (the kill-window hole) receives `second` directly.
+    let (receiver, _) = authors()[1];
+    let (mut peer, _s2) = new_lane_manager(receiver, ".db_test_vantage_missing_parent_dst");
+    peer.process_publish(author, second.clone()).await;
+
+    let r = (author, second.height, second.id.clone());
+    assert!(!peer.direct_pub(&r), "the prefix has a hole");
+    let reported = peer.take_missing_parents(8);
+    assert!(
+        reported.contains(&(author, first.height, first.id.clone())),
+        "the walk must report the hole it failed on, got {reported:?}"
+    );
+    assert!(
+        peer.take_missing_parents(8).is_empty(),
+        "draining empties the set until a walk re-reports"
     );
 }
 

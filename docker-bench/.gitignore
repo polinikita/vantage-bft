@@ -3,6 +3,7 @@
 # --nodes/--rate/--protocol/etc., not hand-authored).
 /data/
 /docker-compose.yml
+/joiner-runs/
 
 __pycache__/
 *.pyc

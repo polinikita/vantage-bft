@@ -264,6 +264,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
+        "sequence_sync_shed_gap_views": args.sequence_sync_shed_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
         "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
@@ -470,6 +471,7 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
         "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
+        "sequence_sync_shed_gap_views": args.sequence_sync_shed_gap_views,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
         "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
@@ -527,7 +529,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--sequence-checkpoint-interval", type=int, default=20,
                    help="checkpoint boundary interval K in views; must be small "
                         "enough that the run crosses several boundaries on 2+ nodes")
-    p.add_argument("--sequence-sync-min-gap-views", type=int, default=50,
+    p.add_argument("--sequence-sync-shed-gap-views", type=int, default=300,
+                   help="gap above which ordinary consensus traffic is shed; must be "
+                        ">= --sequence-sync-min-gap-views (default 300)")
+    p.add_argument("--sequence-sync-min-gap-views", type=int, default=100,
                    help="minimum certified cursor gap that starts state sync (default 50)")
     p.add_argument("--sequence-sync-chunk-outcomes", type=int, default=256,
                    help="maximum outcome views per state-sync response (default 256)")
@@ -574,6 +579,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--sequence-checkpoint-interval must be at least 1")
     if args.sequence_sync_min_gap_views < 0:
         p.error("--sequence-sync-min-gap-views must be non-negative")
+    if args.sequence_sync_shed_gap_views < args.sequence_sync_min_gap_views:
+        # Inverted thresholds would shed while inside the sync threshold -- deaf and not
+        # syncing at the same time, which is the one combination that cannot recover.
+        p.error("--sequence-sync-shed-gap-views must be >= --sequence-sync-min-gap-views")
     if args.sequence_sync_chunk_outcomes < 1:
         p.error("--sequence-sync-chunk-outcomes must be at least 1")
     if args.sequence_sync_chunk_outcome_items < 1:
