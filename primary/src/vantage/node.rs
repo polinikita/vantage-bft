@@ -497,6 +497,9 @@ pub struct VantageCore {
     /// Missing verified-output headers requested from certified checkpoint sources.
     sequence_block_requests: HashMap<Digest, SequenceBlockRequestState>,
 
+    /// Certified sources retained for the active installation target.
+    sequence_install_sources: Vec<PublicKey>,
+
     /// Highest fully verified remote target awaiting local comparison.
     sequence_verified_target: Option<(View, Digest)>,
 
@@ -847,6 +850,7 @@ impl VantageCore {
             sequence_transfer: None,
             sequence_transfer_seq: 0,
             sequence_block_requests: HashMap::new(),
+            sequence_install_sources: Vec::new(),
             sequence_verified_target: None,
             sequence_install: None,
             sequence_install_window_views: parameters.sequence_install_window_views,
@@ -1953,6 +1957,7 @@ impl VantageCore {
                     })
                     .unwrap_or_default();
                 let heads = transfer.verified_heads().unwrap_or_default();
+                let sources = transfer.next_sources(usize::MAX);
                 let views = staged.len();
                 let (view, head) = transfer.target();
                 let (view, head) = (view, head.clone());
@@ -1976,21 +1981,18 @@ impl VantageCore {
                     }
 
                     let tips = install.lane_tips();
-                    let announcers = self
-                        .sequence_sync
-                        .as_ref()
-                        .map(|c| c.announcers(view, install.target().1))
-                        .unwrap_or_default();
                     for (author, height) in tips {
-                        for peer in &announcers {
+                        for peer in &sources {
                             self.rep.note_holder(*peer, author, height);
                         }
                     }
                     self.sequence_block_requests.clear();
+                    self.sequence_install_sources = sources;
                     self.sequence_install = Some(install);
                     self.sequence_install_ready_logged = false;
                     self.sequence_target_installed = false;
                 } else {
+                    self.sequence_install_sources.clear();
                     if let Some(metrics) = &self.metrics {
                         metrics.vantage_sequence_install_rejected_total.inc();
                     }
@@ -2125,6 +2127,7 @@ impl VantageCore {
     async fn drive_sequence_install(&mut self, now: Instant) -> Vec<Effect> {
         if self.sequence_install.is_none() {
             self.sequence_block_requests.clear();
+            self.sequence_install_sources.clear();
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_sequence_install_views.set(0);
                 metrics.vantage_sequence_install_views_ready.set(0);
@@ -2198,18 +2201,11 @@ impl VantageCore {
 
     /// Fetches missing verified headers in bounded batches from certified sources.
     async fn drive_sequence_block_fetch(&mut self, now: Instant) {
-        let Some((target_view, target_head)) = self
-            .sequence_install
-            .as_ref()
-            .map(|install| (install.target().0, install.target().1.clone()))
-        else {
+        if self.sequence_install.is_none() {
             self.sequence_block_requests.clear();
             return;
-        };
-        let Some(collector) = self.sequence_sync.as_ref() else {
-            return;
-        };
-        let sources = collector.announcers(target_view, &target_head);
+        }
+        let sources = self.sequence_install_sources.clone();
         if sources.is_empty() {
             return;
         }
@@ -4682,10 +4678,15 @@ mod tests {
                 (second.author, second.height, second.id.clone()),
             ],
         };
+        core.sequence_install_sources = core
+            .sequence_sync
+            .as_ref()
+            .unwrap()
+            .announcers(1, &target_head);
         let mut install = SequenceInstall::new(
             0,
             1,
-            target_head,
+            target_head.clone(),
             vec![(1, outcome, vec![first.id.clone(), second.id.clone()])],
             Vec::new(),
             8,
@@ -4694,11 +4695,58 @@ mod tests {
         assert_eq!(install.admit(0).len(), 2);
         core.sequence_install = Some(install);
 
-        core.drive_sequence_block_fetch(Instant::now()).await;
+        let now = Instant::now();
+        core.drive_sequence_block_fetch(now).await;
         assert_eq!(
             core.sequence_block_requests.len(),
             2,
             "both missing delta digests are batched without waiting for parent walks"
+        );
+
+        // A long installation can outlive the collector's candidate window.
+        for view in 2..=34 {
+            for (sender, _) in keys.iter().skip(1).take(2) {
+                let announcement = SequenceAnnouncement {
+                    version: SEQUENCE_VERSION,
+                    view,
+                    head: Digest([view as u8; 32]),
+                    serve_floor: 1,
+                    sender: *sender,
+                };
+                core.sequence_sync.as_mut().unwrap().on_announcement(
+                    &announcement,
+                    sender,
+                    true,
+                    0,
+                );
+            }
+        }
+        assert!(
+            core.sequence_sync
+                .as_ref()
+                .unwrap()
+                .announcers(1, &target_head)
+                .is_empty(),
+            "the collector should evict the old target"
+        );
+        let requested = core
+            .metrics
+            .as_ref()
+            .unwrap()
+            .vantage_sequence_install_headers_requested_total
+            .get();
+        core.drive_sequence_block_fetch(
+            now + Duration::from_millis(core.sequence_request_timeout_ms + 1),
+        )
+        .await;
+        assert!(
+            core.metrics
+                .as_ref()
+                .unwrap()
+                .vantage_sequence_install_headers_requested_total
+                .get()
+                > requested,
+            "the retained sources should keep timed-out requests moving"
         );
 
         let effects = core
