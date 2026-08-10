@@ -324,15 +324,38 @@ Sealing stopped exactly there (`direct_full` seal counter flat from 12:26:40 loc
 entry then crawled at skip-timeout pace (~1 view/8 s, `vote_skip` +14 over the freeze).
 
 Structural trap worth recording: **a view the whole fleet echoed grade-1 has no seal
-path left if the echo/ready wave is lost** -- echo statements are one-per-view-ever, so
-2f+1 echo-skips can never form (skip-vote impossible), the direct routes need the very
-messages that were lost, and nothing retransmits echo/ready. The designed rescue
-(resolver carriers targeting the stuck view) did fire (w=2761 node-5, w=2762 node-0,
-~45 s later) but post-freeze entry crawls, so the other 18 nodes had not yet ENTERED the
-carrier views when the run ended -- recovery would arrive at timeout pace, minutes, if
-at all. The trigger for the lost wave at 10:26:37 (23 s after the catcher went dark and
-started accumulating pending outbound ops) is under investigation -- suspected inbound
-overload on the peers from the zombie catcher's retry traffic.
+path left if the echo/ready wave is lost or late past the deadlines** -- echo statements
+are one-per-view-ever, so 2f+1 echo-skips can never form (skip-vote impossible), the
+direct routes need the very messages that were delayed, and nothing retransmits
+echo/ready. The designed rescue (resolver carriers targeting the stuck view) did fire
+(w=2761 node-5, w=2762 node-0, ~45 s later) but post-freeze entry crawls at skip-timeout
+pace, so the other 18 nodes had not yet ENTERED the carrier views when the run ended.
 
-Watch for it with condition 3's frozen lag + `vantage_cursor_next_view` flat across all
-peers + `vantage_seals{route="direct_full"}` flat while `vote_skip` still ticks.
+**Trigger, established by a full-fleet forensic sweep (metrics + all 21 logs): the
+PEER-SIDE mirror of the c2535fc bug.** Every healthy peer's `family="chain"` walk rate
+tracks node-20's Header egress exactly (baseline ~700 steps/s/node; collapses to 134
+when node-20 pauses publishing 10:25:10-20; grows unboundedly from 10:25:30 to ~1.5M
+steps/s/node as node-20's lane extends -- 2,100x baseline, `direct` and `settle`
+families flat). The failing, success-only-memoized `verified_prefix_through_genesis`
+re-walks node-20's whole lane per inbound message on EVERY peer; per-message core cost
+rose 245 -> 4,795 us, inbound queueing delay crossed delta=200 ms right as 2748's wave
+was in flight (9 ms at 10:26:35, 478 ms at 10:26:45, 2.2 s at 10:27:00), and about half
+the saturated cost is `store_probe` waits (`missing_payload`'s `read_many` behind a
+starved store actor). Ruled out by the same sweep: any node-20 flood (its egress FELL
+below the peer average; only Header/announce/lane-resume types non-zero), any drop
+counter (all flat until teardown), and serve-side saturation (state-sync serving had
+already subsided by 10:26:10). Queue overflow (1000-slot) began at 10:26:50 -- after the
+2748 wave -- a consequence, as is node-20's cancel_handlers leak (onset 10:26:50).
+
+Open: WHICH branch the peer-side walk fails on (`by_digest` miss / `pinned_at` /
+`block_ok_verified`) is not decidable from current metrics -- `vantage_walk_steps_total`
+has no outcome label. The suspected shape is a kill-window discontinuity: the write-ahead
+frontier persist completes (queued) while the last block's SEND is lost with the process,
+so the restarted node chains on a block NO PEER HOLDS, and a live publish with a missing
+parent triggers no repair request anywhere -- the hole never heals. Two regimes in the
+data (bounded ~21k plateau 10:24:40-10:25:00, unbounded growth from 10:25:30) still need
+an explanation; instrument walk-failure branches before theorizing further.
+
+Watch for the freeze with condition 3's frozen lag + `vantage_cursor_next_view` flat
+across all peers + `vantage_seals{route="direct_full"}` flat while `vote_skip` still
+ticks.
