@@ -48,7 +48,56 @@ Two earlier measurement traps, both of which cost several wasted iterations:
 - Final lag in a joiner run flatters itself, because the client workload expires before the
   run ends and the fleet stops advancing. Judge the tail, not the last sample.
 
-## 3. The core open finding
+## 3. The core finding -- RESOLVED 2026-08-10, root cause fixed in c2535fc
+
+**The 0.50 was never about proposal content.** Ground truth from correlating peers' echo
+logs (`organic grade-1 echo view=`) with the catcher's owned views (run of 2026-08-10
+morning, tail 2700-3550):
+
+- The lost turns are **bursts of 2-3 consecutive owned views, recurring every ~105 views
+  (~8.2 s), and the missing set is IDENTICAL on every peer** -- so the loss is
+  sender-side, not a per-peer adoption decision. Peers that miss the proposal echo-skip
+  silently via the absolute deadline (`on_echo_absolute_timer` has no log line; the
+  fallback path's `FALLBACK` line appeared zero times), which is why this looked like
+  "peers decline to adopt".
+- Each burst coincides exactly with one 100-view sequence-sync transfer cycle
+  (receive -> `VERIFIED target` -> `applied through`, ~1.4 s visible + the receive
+  window). The single-threaded core chews the transfer for seconds; view entry and
+  proposal emission stall; the node then still proposes for the missed views (hence
+  made ~= turns -- the count never distinguished on-time from late) but past the peers'
+  echo deadline, and those views seal Skip.
+- Recovery-entry content was exonerated directly: several recovery-carrying proposals
+  in the same tail were echoed grade-1 and committed, and most lost views carried no
+  resolution entry at all.
+
+**Why the core was too slow to do both jobs** (and why the tail never recovered): after a
+restart the node's own frontier block is missing from the memory-only `BlockCache` and
+NOTHING can ever refill it -- self-published blocks are not re-delivered, repair's settle
+fan-out is only triggered by served blocks, and an uncommitted tip is in no install
+manifest. Every `direct_prefix_ok`/`verified_prefix_through_genesis` walk from any
+post-restart own-lane ref (its own pending acks on every publish; `recheck_all`/`tip_ok`
+on every proposal naming its tip, which is all of them) then fails at that block,
+full-depth, unmemoized, forever. Measured in the tail: **4.0M chain-walk steps/s and
+0.59M direct-walk steps/s (26x / 775x a healthy peer)**, `inbound_dispatch` 314 ms/s,
+`effect_execution` 380 ms/s. That is the core tax that turned transfers into stalls and
+kept the lag equilibrium alive.
+
+**Fix (c2535fc), at the source the doc's lead #2 pointed to** -- with one correction:
+headers were NOT persisted (only the `(height, digest)` frontier record). The frontier
+HEADER is now persisted write-ahead next to it, and `restore_own_frontier` re-verifies it
+(sid, author, digest match, `block_ok`) and seeds it as a trusted verified anchor
+(`chain_verified` + `direct_prefix_verified` + `retained`, re-entered into
+`pending_direct` so acks and the N5 registers re-latch).
+
+Measured (anchor1, same repro): direct walks 589k -> 133k steps/s, chain walks 4.0M ->
+1.5M steps/s during catch-up, the node's proposals were adopted THROUGHOUT catch-up
+(every owned view 2308-2434 committed), it closed a ~1,200-view gap in ~2 minutes, and
+`RECOVERED` latched for the first time ever. The run then hit two DOWNSTREAM failures --
+section 9 -- which are the new front line.
+
+The subsections below are kept as the measurement record that led here.
+
+### The original (superseded) framing
 
 **The catcher proposes, but its proposals are not adopted.** Latest measurement (latch7):
 
@@ -241,3 +290,49 @@ scope — this is a testbed.** Still open and relevant here:
 - retention is 19.4 KB/view at n=100 = **911 MB/h per node**, against the plan's estimate of
   10 MB per 100k views (~190× off) — the item most likely to break the AWS n=100 gate;
 - `serve_sequence_headers` has no per-request bound; every sibling serve path clamps.
+
+## 9. Open problems after the anchor fix (2026-08-10, run anchor1)
+
+With the catcher finally able to catch up and latch, two failures that were previously
+unreachable became the binding constraints. Timeline (UTC): restart 10:23:53, latch
+10:25:58, catcher goes dark 10:26:14, fleet output freezes 10:26:37, run ends 10:27:59.
+
+### 9a. The latch/shed zombie deadlock (catcher-local)
+
+`RECOVERED at view=2252` fired the moment the install caught up to within the sync gate
+-- but the node's live AGB evidence only starts around the view where it stopped shedding
+(~2440). Views 2253..~2440 can never seal locally: the evidence was shed, peers never
+re-send old echoes/readys, and peers' resolvers never target views THEY already resolved.
+So the output cursor wedged at 2253 (waiting for a seal, not for blocks -- zero
+`cursor: waiting` lines). The gap then regrew past the shed gate, **shedding resumed
+while the latch held transfers off**: not syncing, not participating. Its last organic
+echo is view 2441 at 10:26:14; after that, 100 s of AGB silence with `timers.len()=0`
+and `cancel_handlers` growing ~40 -> 7,622 by run end. The re-arm threshold (800) was
+never reached because the fleet froze first (gap pinned at 495).
+
+Fix direction: the latch (and the shed release) must be conditioned on ordinary
+execution having actually TAKEN OVER -- e.g. keep installing until the target covers the
+first view with live (unshed) AGB evidence, or latch only after the cursor advances N
+views via ordinary (non-install) seals. Latching at the installed target is exactly one
+shed-window short.
+
+### 9b. Fleet-wide ready-stage starvation froze the output cursor at view 2748
+
+At 10:26:37 all 20 healthy peers logged `organic grade-1 echo view=2748` (a healthy
+peer's data-only proposal) -- and the view never sealed anywhere; same for 2750-2752.
+Sealing stopped exactly there (`direct_full` seal counter flat from 12:26:40 local),
+entry then crawled at skip-timeout pace (~1 view/8 s, `vote_skip` +14 over the freeze).
+
+Structural trap worth recording: **a view the whole fleet echoed grade-1 has no seal
+path left if the echo/ready wave is lost** -- echo statements are one-per-view-ever, so
+2f+1 echo-skips can never form (skip-vote impossible), the direct routes need the very
+messages that were lost, and nothing retransmits echo/ready. The designed rescue
+(resolver carriers targeting the stuck view) did fire (w=2761 node-5, w=2762 node-0,
+~45 s later) but post-freeze entry crawls, so the other 18 nodes had not yet ENTERED the
+carrier views when the run ended -- recovery would arrive at timeout pace, minutes, if
+at all. The trigger for the lost wave at 10:26:37 (23 s after the catcher went dark and
+started accumulating pending outbound ops) is under investigation -- suspected inbound
+overload on the peers from the zombie catcher's retry traffic.
+
+Watch for it with condition 3's frozen lag + `vantage_cursor_next_view` flat across all
+peers + `vantage_seals{route="direct_full"}` flat while `vote_skip` still ticks.

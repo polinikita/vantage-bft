@@ -11,7 +11,9 @@
 # just catching the moment of catch-up.
 set -uo pipefail
 cd /Users/nikitapolianskii/code/vantage/docker-bench
-OUT="${OUT:-./data/joiner-runs}"
+# NOT under ./data -- late_joiner.sh's gen step recreates that directory, which unlinks
+# the run log mid-run and loses the report (observed 2026-08-10: anchor1's log vanished).
+OUT="${OUT:-./joiner-runs}"
 mkdir -p "$OUT"
 banner () { echo "===== $* :: $(date +%T)"; }
 
