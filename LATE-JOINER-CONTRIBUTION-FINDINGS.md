@@ -113,11 +113,33 @@ catcher's own availability bookkeeping:
    catcher's turns produce `Skip`, and a `Skip` costs the whole fleet a view, not just the
    joiner. Yielding the turn is worth considering on its own merits.
 
+### The deficit is post-recovery, not an artifact of the outage
+
+`vantage_own_proposer_turns_total` increments in `record_sequence`, i.e. when the node
+LOCALLY finalizes a view. Turns it held while switched off necessarily sealed `Skip` and are
+counted later as it replays them, so the whole-window ratio is contaminated. Splitting
+latch9's window settles it:
+
+| window | turns | committed | ratio |
+|---|---|---|---|
+| whole (11:44:40–11:47:50) | 109 | 44 | 0.40 |
+| first third | 21 | 12 | 0.57 |
+| **last third** | 36 | 18 | **0.50** |
+
+The outage does contaminate the whole-window figure, but the tail does not recover toward
+1.00 — it sits at 0.50. The last third runs 145–210 s after restart while the node is only
+~86 views (~6.6 s) behind, so every turn counted there is for a view long after the outage
+ended. And `made 37` against `turns 36` means it proposes for every one of them.
+
+**So: the catcher proposes, on time, for current views, and peers adopt only half.** Any
+explanation resting on the outage window, on proposal timing, or on the node's view position
+is ruled out. Score the tail only when re-measuring this.
+
 ### What a Skip actually costs here
 
 Worth quantifying before optimising: at n=21 the catcher owns 1 view in 21, and loses ~60 % of
-those, so ~2.9 % of all views seal empty because of it. That is the fleet-level cost of one
-recovering node.
+those, so ~2.4 % of all views seal empty because of it (using the steady-state 0.50, not the
+outage-contaminated 0.40). That is the fleet-level cost of one recovering node.
 
 ## 4. Why sync never stops (condition 1/2)
 
