@@ -57,24 +57,20 @@ median lag 84 views          peer-only spread 18 views
 transfers 0.14/s, never stopping;  recovered never latches
 ```
 
-So it is not failing to propose — it proposes for its turns. Its proposals arrive too late
-to be adopted, and peers skip-vote those views. 58 % of its proposer turns are lost.
+So it is not failing to propose — it proposes for essentially all its turns. Peers decline to
+ADOPT the proposal, and those views seal as `Skip`. 58–60 % of its proposer turns are lost,
+reproducibly (0.42 in latch7, 0.40 in latch9).
 
-### Why (confirmed by code inspection)
+### A structural fact, which turned out NOT to be the cause
 
-**Nothing advances the AGB view on install.** `apply_sequence_install` raises the output
-cursor and calls `resolver.note_installed_through(target)`, but `enter_view_effects` is
-reached only from boot and `Effect::Enter`. The AGB view advances *solely* through the
-ordinary WISH pacemaker. So state sync fixes output but leaves the node's *consensus
-position* behind, and proposer turns are per-view.
+**Nothing advances the AGB view on install.** `apply_sequence_install` raises the output cursor
+and calls `resolver.note_installed_through(target)`, but `enter_view_effects` is reached only
+from boot and `Effect::Enter`, so the AGB view advances solely through the WISH pacemaker.
+Consensus position therefore trails output position. Directly observed: node-20 echoing views
+2773–2815 while node-0 echoed 2795–2877.
 
-**Shedding discards the signal that would fix it.** `keep_during_large_sequence_sync` did
-not retain `Inbound::Wish`, and `install_replaces_inbound` drops `Wish(view)` for
-`view <= target`. WISH is how a node learns where the fleet is. Directly observed: node-20
-echoing views 2773–2815 while node-0 echoed 2795–2877.
-
-A one-line fix (retain `Inbound::Wish` while shedding) is committed but **UNVERIFIED** — the
-run that would have measured it was interrupted. That is the first thing to measure.
+This is true, and it is *not* what breaks the proposals — see the refuted fixes below. Recorded
+because it is a real asymmetry someone will rediscover and assume is the cause, as I did.
 
 ### Two candidate fixes MEASURED AND REFUTED (latch9)
 
