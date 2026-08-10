@@ -48,7 +48,6 @@ class PathMaker:
 
     @staticmethod
     def remote_db_path(i, j=None):
-        '''Return the validator store path under the NVMe mount.'''
         return join(PathMaker.REMOTE_STORE_BASE, PathMaker.db_path(i, j))
 
     @staticmethod
@@ -85,17 +84,14 @@ class PathMaker:
 
     @staticmethod
     def collector_prometheus_file():
-        '''Return the local staging path for collector scrape configuration.'''
         return '.collector-prometheus.yml'
 
     @staticmethod
     def collector_metrics_path():
-        '''Return the top-level directory for collector metric exports.'''
         return 'collector-metrics'
 
     @staticmethod
     def collector_metrics_dir(subdir=None):
-        '''Return the export directory, optionally below `subdir`.'''
         base = PathMaker.collector_metrics_path()
         return join(base, subdir) if subdir else base
 
@@ -133,9 +129,7 @@ class PathMaker:
 
 
 def scrape_metrics(address, filename, timeout=5):
-    '''Save a node's Prometheus response to `filename`.
-
-    Scrape failures warn and return without writing a file.'''
+    '''Save a node's Prometheus response; warn and skip failures.'''
     assert isinstance(address, str)
     assert isinstance(filename, str)
     url = f'http://{address}/metrics'
@@ -150,9 +144,7 @@ def scrape_metrics(address, filename, timeout=5):
 
 
 def prometheus_query(base_url, promql, start=None, end=None, step='1s', timeout=10):
-    '''Return a parsed Prometheus query response.
-
-    With `start` and `end`, run a range query using Unix-second timestamps.'''
+    '''Run an instant or range Prometheus query and parse its response.'''
     assert isinstance(base_url, str)
     assert isinstance(promql, str)
     if start is None and end is None:

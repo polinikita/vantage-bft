@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Check that correct nodes expose the same sequence head at each boundary.
-
-The check compares full hexadecimal heads across nodes.
-
-    python3 docker-bench/sequence_check.py [--prom http://localhost:9095] [--window 3600]
-
-Exit status is zero when all shared boundaries agree.
-"""
+"""Check full sequence-head agreement at checkpoint boundaries."""
 
 import argparse
 import json
@@ -40,22 +33,10 @@ def main():
     series = query_range(a.prom, METRIC, end - a.window, end, a.step)
     if not series:
         print("FAIL: no vantage_sequence_boundary_head series.", file=sys.stderr)
-        print("      Is `sequence_checkpoints` enabled? It defaults OFF.", file=sys.stderr)
+        print("      Run long enough to cross a checkpoint boundary.", file=sys.stderr)
         return 1
 
-    # (sid, boundary view) -> head hex -> set of nodes.
-    #
-    # The metric's VALUE is the boundary view and its `head` LABEL is that boundary's
-    # head, so one sample is a complete (node, boundary, head) claim. A node re-exports
-    # the same pair on every scrape until it passes the next boundary; collapsing to sets
-    # makes the result independent of scrape cadence and of how long a node sat there.
-    #
-    # KEYED BY SESSION, not just by view. Heads are domain-separated by session id, so two
-    # runs against different committees derive different heads for the same view BY
-    # DESIGN. docker-bench keeps Prometheus up across runs on purpose and node labels
-    # repeat, so a window spanning two runs otherwise reports a spurious divergence --
-    # observed doing exactly that. Sessions are scored independently and a run is compared
-    # only against itself.
+    # Group claims by session, boundary, and head.
     claims = defaultdict(lambda: defaultdict(set))
     skipped_no_sid = set()
     for s in series:
@@ -65,9 +46,7 @@ def main():
         if not head:
             continue
         if not sid:
-            # Emitted by a binary predating the sid label. Such a series cannot be
-            # attributed to a session, and lumping several runs together under one
-            # placeholder manufactures exactly the divergence this gate looks for.
+            # Ignore series without a run identifier.
             skipped_no_sid.add(node)
             continue
         for _, value in s["values"]:
@@ -79,9 +58,9 @@ def main():
     sessions = sorted({sid for sid, _ in boundaries})
 
     if skipped_no_sid:
-        print(f"skipped {len(skipped_no_sid)} unlabelled series from a pre-sid binary")
+        print(f"skipped {len(skipped_no_sid)} series without session labels")
     if not claims:
-        print("\nFAIL: every series lacked a sid label (pre-sid binary only).",
+        print("\nFAIL: every series lacks a session label.",
               file=sys.stderr)
         return 1
     print(f"sessions in window: {len(sessions)}"

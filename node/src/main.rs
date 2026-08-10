@@ -17,12 +17,11 @@ mod client;
 #[cfg(feature = "benchmark")]
 mod local_benchmark;
 
-/// The default channel capacity.
+/// Default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-
     let matches = Command::new(crate_name!())
         .version(crate_version!())
         .about("A research implementation of Sailfish.")
@@ -148,7 +147,6 @@ async fn main() -> Result<()> {
                         .long("mode")
                         .value_name("MODE")
                         .default_value("random")
-                        // Accept both spellings for compatibility.
                         .value_parser(["all_zero", "all-zero", "random"])
                         .action(ArgAction::Set)
                         .help(
@@ -192,14 +190,7 @@ async fn main() -> Result<()> {
                         .long("load-nodes")
                         .value_name("INT")
                         .action(ArgAction::Set)
-                        .help(
-                            "Load-skew: number of the first live nodes whose clients \
-                        submit transactions; remaining live nodes still run their \
-                        primary/worker tasks and still listen for transactions, they just \
-                        receive none. Aggregate offered --rate is unchanged -- it is \
-                        redivided among these clients only. Must be between 1 and the \
-                        number of live nodes inclusive. Default: all live nodes.",
-                        ),
+                        .help("Number of live nodes that submit the aggregate transaction load"),
                 )
                 .arg(
                     Arg::new("withhold")
@@ -207,31 +198,14 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("0")
                         .action(ArgAction::Set)
-                        .help(
-                            "Data-plane withholding fault injector: number of the \
-                        first committee indices (0-based, sorted order -- same convention as \
-                        --crash/--load-nodes) that withhold their payload-dissemination \
-                        broadcasts (worker Batch, primary Header/lane-block publish) from a \
-                        staggered half of the committee -- everyone else, including the sender \
-                        itself, still receives normally. Every other message (consensus, acks, \
-                        every repair/request-response path) is unaffected -- the blocked half \
-                        must recover the payload through the existing repair paths. Must be \
-                        between 0 and --nodes inclusive. Default: 0 (disabled, byte-identical \
-                        to no withholding).",
-                        ),
+                        .help("Number of leading nodes that withhold payload broadcasts from half the committee"),
                 )
                 .arg(
                     Arg::new("withhold-at")
                         .long("withhold-at")
                         .value_name("SEC")
                         .action(ArgAction::Set)
-                        .help(
-                            "Time-windows --withhold: offset from measurement start, in \
-                        seconds, when withholding begins. Absent (default): whole-run \
-                        withholding, byte-identical to --withhold's original (unwindowed) \
-                        behavior. Requires --withhold > 0. --withhold-for selects the window \
-                        duration; --timeline is auto-enabled whenever this is set.",
-                        ),
+                        .help("Seconds after measurement starts before withholding begins"),
                 )
                 .arg(
                     Arg::new("withhold-for")
@@ -239,10 +213,7 @@ async fn main() -> Result<()> {
                         .value_name("SEC")
                         .default_value("30")
                         .action(ArgAction::Set)
-                        .help(
-                            "Withholding window duration, in seconds. Irrelevant unless \
-                        --withhold-at is set.",
-                        ),
+                        .help("Withholding duration in seconds"),
                 )
                 .arg(
                     Arg::new("delta-ms")
@@ -250,11 +221,7 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("200")
                         .action(ArgAction::Set)
-                        .help(
-                            "Vantage AGB base delay unit Δ, ms \
-                        (theta_E=3Δ, theta_R=4Δ, control-round=6Δ derive from this \
-                        automatically; irrelevant to the two Autobahn paths)",
-                        ),
+                        .help("Vantage AGB base delay in milliseconds"),
                 )
                 .arg(
                     Arg::new("max-batch-delay-ms")
@@ -276,12 +243,7 @@ async fn main() -> Result<()> {
                     Arg::new("timeline")
                         .long("timeline")
                         .action(ArgAction::SetTrue)
-                        .help(
-                            "Print a once-per-second progress line \
-                        line per live node (entered view / frontier a_i / cursor next_view / \
-                        control round / delivered-log len / consume pos) for the duration of \
-                        the run -- diagnostic only, off by default (verbose)",
-                        ),
+                        .help("Print per-node progress once per second"),
                 )
                 .arg(
                     Arg::new("mimic-latency-ms")
@@ -289,51 +251,20 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("0")
                         .action(ArgAction::Set)
-                        .help(
-                            "Uniform \
-                        OVERRIDE RTT-ms value applied to every inter-authority link (one-way = \
-                        value/2), as if every cell of a --latency-table CSV held this same \
-                        number. A value > 0, EXPLICITLY passed on the command line, selects \
-                        this uniform table. An EXPLICIT `--mimic-latency-ms 0` instead means \
-                        zero injected latency (pure loopback) -- distinguished from simply \
-                        omitting the flag via clap's value-source tracking. Omitting the flag \
-                        entirely (the default) defers to the real 10-AWS-region RTT matrix \
-                        default (see --latency-table). Ignored if --latency-table is also \
-                        given.",
-                        ),
+                        .help("Uniform inter-authority RTT in milliseconds; overridden by --latency-table"),
                 )
                 .arg(
                     Arg::new("latency-table")
                         .long("latency-table")
                         .value_name("PATH")
                         .action(ArgAction::Set)
-                        .help(
-                            "Path to an NxN \
-                        RTT-ms CSV matrix (N = --nodes, no header row, node index = committee \
-                        order), applied one-way (RTT/2) to each node's own inter-authority \
-                        primary-to-primary/-worker connections (starfish-style per-connection \
-                        injection, read-only reference: \
-                        ~/code/starfish/crates/starfish-core/src/network.rs). Takes precedence \
-                        over --mimic-latency-ms. Unset (default): falls back to \
-                        --mimic-latency-ms's own precedence -- an EXPLICIT \
-                        `--mimic-latency-ms 0` means zero injected latency (pure loopback); \
-                        omitting both flags defaults to the real 10-AWS-region RTT matrix \
-                        (`LatencyTable::aws_rtt`, ported VERBATIM from starfish, committee index \
-                        i -> region i % 10) -- mirroring starfish's own default for \
-                        single-region AWS benchmarking.",
-                        ),
+                        .help("Path to a headerless NxN RTT matrix in milliseconds"),
                 )
                 .arg(
                     Arg::new("no-batch-messages")
                         .long("no-batch-messages")
                         .action(ArgAction::SetTrue)
-                        .help(
-                            "Disable transport-level per-peer outbound message batching \
-                        (coalescing; 5 ms / 64 KB hybrid flush, applied uniformly by the \
-                        network crate to every sender/receiver, all protocols \
-                        identically, except the client-facing transaction port). ON by \
-                        default; this flag restores unbatched per-message framing.",
-                        ),
+                        .help("Disable transport-level outbound message batching"),
                 )
                 .arg(
                     Arg::new("batch-max-bytes")
@@ -341,10 +272,7 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("65536")
                         .action(ArgAction::Set)
-                        .help(
-                            "Batching hybrid flush size cap, in bytes -- irrelevant unless \
-                        batching is enabled (the default)",
-                        ),
+                        .help("Maximum bundled frame size in bytes"),
                 )
                 .arg(
                     Arg::new("batch-max-delay-ms")
@@ -352,22 +280,13 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("5")
                         .action(ArgAction::Set)
-                        .help(
-                            "Batching hybrid flush delay, in ms -- irrelevant unless \
-                        batching is enabled (the default)",
-                        ),
+                        .help("Maximum bundle delay in milliseconds"),
                 )
                 .arg(
                     Arg::new("all-to-all")
                         .long("all-to-all")
                         .action(ArgAction::SetTrue)
-                        .help(
-                            "Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all \
-                        communication: on the external-consensus path, replicas broadcast \
-                        Prepare-Votes/Confirm-Acks and assemble PrepareQC/ConfirmQC locally \
-                        instead of unicasting to the leader for it to assemble and \
-                        re-broadcast. Off by default -- byte-identical behavior when off.",
-                        ),
+                        .help("Use all-to-all Autobahn vote and acknowledgement exchange"),
                 )
                 .arg(
                     Arg::new("echo-avail-claims")
@@ -391,17 +310,7 @@ async fn main() -> Result<()> {
                     Arg::new("no-ack-watermarks")
                         .long("no-ack-watermarks")
                         .action(ArgAction::SetTrue)
-                        .help(
-                            "DISABLE ack watermarks and go back to per-block ACK broadcasts \
-                        (N3). Watermarks are ON by default: each party periodically \
-                        broadcasts one compact per-author lane-availability watermark \
-                        instead of one ack per (block, acker, recipient), which cut wire \
-                        messages ~3.8x and ~8 pp CPU/node at n=20 / 1000 tx/s with no p50 \
-                        cost (they do cost ~+45 ms at very low load, where the periodic \
-                        tick dominates, and they lengthen the p99 tail). Digest-bound, so \
-                        crediting still resolves to an exact block reference. Applies to \
-                        both Vantage and Simple-IT.",
-                        ),
+                        .help("Disable compact availability claims and send per-block acknowledgements"),
                 )
                 .arg(
                     Arg::new("ack-watermark-period-ms")
@@ -409,24 +318,13 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("50")
                         .action(ArgAction::Set)
-                        .help(
-                            "Ack-watermark broadcast period, ms -- irrelevant unless \
-                        ack watermarks are enabled (the default)",
-                        ),
+                        .help("Periodic availability watermark interval in milliseconds"),
                 )
                 .arg(
                     Arg::new("no-digest-statements")
                         .long("no-digest-statements")
                         .action(ArgAction::SetTrue)
-                        .help(
-                            "DISABLE digest-named AGB statements and carry proposals by value \
-                        in ECHO/READY. Digest naming is ON by default (signature-free.tex \
-                        sec.8.3): every Vantage ECHO/READY names its proposal by hash, and a \
-                        receiver fetches the body on demand from a buffered statement's own \
-                        author if it doesn't already hold it -- this halved wire bytes \
-                        (76.8 -> 38.3 MB/s at n=20 / 1000 tx/s) with p50 unchanged. \
-                        Emission-only: reception handles both encodings either way.",
-                        ),
+                        .help("Send full proposals in AGB ECHO and READY messages"),
                 ),
         )
         .subcommand_required(true)
@@ -466,20 +364,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Runs either a worker or a primary.
+// Runs a primary or worker.
 async fn run(matches: &ArgMatches) -> Result<()> {
     let key_file = matches.get_one::<String>("keys").unwrap();
     let committee_file = matches.get_one::<String>("committee").unwrap();
     let parameters_file = matches.get_one::<String>("parameters").map(|s| s.as_str());
     let store_path = matches.get_one::<String>("store").unwrap();
 
-    // Read the committee and node's keypair from file.
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
     let name = keypair.name;
     let committee =
         Committee::import(committee_file).context("Failed to load the committee information")?;
 
-    // Load default parameters if none are specified.
     let mut parameters = match parameters_file {
         Some(filename) => {
             Parameters::import(filename).context("Failed to load the node's parameters")?
@@ -487,11 +383,8 @@ async fn run(matches: &ArgMatches) -> Result<()> {
         None => Parameters::default(),
     };
 
-    // `protocol` selects the consensus mode.
     parameters.reconcile_protocol();
 
-    // Expand the configured latency mode into the in-process latency table.
-    // An explicit mimic_latency_ms value overrides the AWS RTT default.
     if parameters.latency_table.is_none() {
         parameters.latency_table = Some(std::sync::Arc::new(match parameters.mimic_latency_ms {
             Some(rtt_ms) => LatencyTable::uniform(committee.size(), rtt_ms as f64),
@@ -499,17 +392,8 @@ async fn run(matches: &ArgMatches) -> Result<()> {
         }));
     }
 
-    // Select the node assembly by protocol. Both Autobahn variants share the
-    // existing primary/worker assembly (the seamless path is activated inside
-    // the primary Core via `use_optimistic_tips = false`); Vantage spawns a single
-    // Start the Vantage core task.
-
-    // The `SignatureService` provides signatures on input digests.
     let signature_service = SignatureService::new(keypair.secret);
 
-    // Create the data store.
-    // the primary's store holds small, point-lookup metadata (headers/certs/payload
-    // markers), workers' stores hold large, append-heavy batch bytes.
     let store_profile = match matches.subcommand_name() {
         Some("worker") => StoreProfile::Data,
         _ => StoreProfile::Metadata,
@@ -517,16 +401,11 @@ async fn run(matches: &ArgMatches) -> Result<()> {
     let store =
         Store::new_with_profile(store_path, store_profile).context("Failed to create a store")?;
 
-    // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
-    // Channel for sending headers between DAG and Consensus
     let (tx_sailfish, _rx_sailfish) = channel(CHANNEL_CAPACITY);
 
-    // Check whether to run a primary, a worker, or an entire authority.
-    // Each node has at most one worker. A worker-only node connects to its primary.
     match matches.subcommand() {
-        // Spawn the primary and consensus core.
         Some(("primary", _)) => {
             let (tx_new_certificates, _rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (_tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
@@ -540,10 +419,10 @@ async fn run(matches: &ArgMatches) -> Result<()> {
                 parameters.clone(),
                 signature_service.clone(),
                 store.clone(),
-                /* tx_consensus */ tx_new_certificates,
+                tx_new_certificates,
                 tx_committer,
                 rx_committer,
-                /* rx_consensus */ rx_feedback,
+                rx_feedback,
                 tx_sailfish,
                 rx_pushdown_cert,
                 rx_request_header_sync,
@@ -553,7 +432,6 @@ async fn run(matches: &ArgMatches) -> Result<()> {
                 .context("Failed to register primary process metrics")?;
         }
 
-        // Spawn a single worker.
         Some(("worker", sub_matches)) => {
             let id = sub_matches
                 .get_one::<String>("id")
@@ -567,16 +445,12 @@ async fn run(matches: &ArgMatches) -> Result<()> {
         _ => unreachable!(),
     }
 
-    // Analyze the consensus' output.
     analyze(rx_output).await;
 
-    // If this expression is reached, the program ends and all other tasks terminate.
     unreachable!();
 }
 
-/// Receives an ordered list of certificates and apply any application-specific logic.
+/// Receives ordered headers.
 async fn analyze(mut rx_output: Receiver<Header>) {
-    while let Some(_header) = rx_output.recv().await {
-        // NOTE: Here goes the application logic.
-    }
+    while let Some(_header) = rx_output.recv().await {}
 }

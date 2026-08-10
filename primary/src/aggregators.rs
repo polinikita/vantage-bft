@@ -12,8 +12,10 @@ pub struct VotesAggregator {
     used: HashSet<PublicKey>,
     diss_cert: Option<Certificate>,
 
-    pub complete: bool, //Indicate that QC is ready. Stops adding new signatures
-    get_once: bool, //Indicate that QC was already used. E.g. do not re-submit QC if Timer triggers after we succeeded already
+    /// Whether the certificate has reached quorum.
+    pub complete: bool,
+    /// Whether the completed certificate has been returned.
+    get_once: bool,
 }
 
 impl VotesAggregator {
@@ -38,7 +40,7 @@ impl VotesAggregator {
             return Ok((true, false));
         }
         let author = vote.author;
-        // Ensure it is the first time this authority votes.
+        // Count each authority once.
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 
         self.votes.push((author, vote.signature));
@@ -71,7 +73,7 @@ impl VotesAggregator {
     }
 }
 
-/// Aggregate consensus info votes and check if we reach a quorum.
+/// Aggregates consensus votes and checks quorum thresholds.
 pub struct QCMaker {
     weight: Stake,
     pub votes: Vec<(PublicKey, Signature)>,
@@ -79,8 +81,10 @@ pub struct QCMaker {
 
     pub try_fast: bool,
     qc_dig: Digest,
-    first: bool, //Indicate when SlowQC is first ready -> I.e. only start ONE timer.
-    completed_fast: bool, //Indicate whether or not we succeeded on Fast Path. This stops timer that loopbacks from re-submitting QC
+    /// Whether the slow quorum was reached for the first time.
+    first: bool,
+    /// Whether the fast quorum completed.
+    completed_fast: bool,
 }
 
 impl QCMaker {
@@ -89,7 +93,7 @@ impl QCMaker {
             weight: 0,
             votes: Vec::new(),
             used: HashSet::new(),
-            try_fast: false, // explicitly set it. (NOT done via constructor)
+            try_fast: false,
             qc_dig: Digest::default(),
             first: true,
             completed_fast: false,
@@ -102,7 +106,6 @@ impl QCMaker {
         vote: (Digest, Signature),
         committee: &Committee,
     ) -> DagResult<(bool, Option<QC>)> {
-        // A QC is available only when the returned value is `Some`.
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 
         self.votes.push((author, vote.1));
@@ -111,9 +114,9 @@ impl QCMaker {
         if self.try_fast {
             return self.check_fast_qc(vote.0, committee);
         }
-        //else Slow path:
+        // Slow path.
         if self.weight >= committee.quorum_threshold() {
-            // Ensure QC is only made once.
+            // Emit the QC once.
             self.weight = 0;
             return Ok((
                 true,
@@ -133,7 +136,7 @@ impl QCMaker {
         committee: &Committee,
     ) -> DagResult<(bool, Option<QC>)> {
         if self.weight >= committee.fast_threshold() {
-            // Ensure QC is only made once.
+            // Emit the QC once.
             self.weight = 0;
             self.completed_fast = true;
             return Ok((
@@ -147,7 +150,7 @@ impl QCMaker {
             self.qc_dig = vote_dig;
             let first = self.first;
             self.first = false;
-            return Ok((first, None)); //Only say qc_ready ONCE for 2f+1 => I.e. only one timer will be started
+            return Ok((first, None));
         }
 
         Ok((false, None))
@@ -156,10 +159,10 @@ impl QCMaker {
     // Returns the slow QC after the fast-path timer expires.
     pub fn get_qc(&mut self) -> DagResult<(bool, Option<QC>)> {
         if self.completed_fast {
-            return Ok((false, None)); //Already finished fast.
+            return Ok((false, None));
         }
         ensure!(
-            self.qc_dig != Digest::default(), //I.e. SlowQC is ready!
+            self.qc_dig != Digest::default(),
             DagError::InvalidSlowQCRequest
         );
         Ok((
@@ -191,17 +194,16 @@ impl TCMaker {
     pub fn append(&mut self, timeout: Timeout, committee: &Committee) -> DagResult<Option<TC>> {
         let author = timeout.author;
 
-        // Ensure it is the first time this authority votes.
+        // Count each authority once.
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 
         let slot = timeout.slot;
         let view = timeout.view;
 
-        // Add the timeout to the accumulator.
         self.votes.push(timeout);
         self.weight += committee.stake(&author);
         if self.weight >= committee.quorum_threshold() {
-            self.weight = 0; // Ensures TC is only created once.
+            self.weight = 0;
             return Ok(Some(TC {
                 slot,
                 view,

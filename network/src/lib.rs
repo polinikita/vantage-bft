@@ -1,4 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+//! Network senders and receivers.
+//! Senders preserve FIFO order when applying per-destination delay.
+
 mod batch;
 mod error;
 mod receiver;
@@ -13,7 +16,3 @@ pub use crate::batch::BatchConfig;
 pub use crate::receiver::{MessageHandler, Receiver, Writer};
 pub use crate::reliable_sender::{CancelHandler, DirtyMap, ReliableSender};
 pub use crate::simple_sender::SimpleSender;
-
-// Senders may apply a fixed per-destination delay. The delay is read when each
-// connection starts and preserves FIFO order on that connection. An empty map disables
-// the delay.

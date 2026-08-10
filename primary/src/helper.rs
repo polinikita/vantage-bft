@@ -10,16 +10,16 @@ use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
-/// A task dedicated to help other authorities by replying to their certificates requests.
+/// Serves certificate and header requests from other authorities.
 pub struct Helper {
     /// The committee information.
     committee: Committee,
     /// The persistent storage.
     store: Store,
-    /// Input channel to receive certificates requests.
+    /// Certificate requests.
     rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
 
-    /// Input channel to receive certificates requests.
+    /// Header requests.
     rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
@@ -31,9 +31,7 @@ impl Helper {
         store: Store,
         rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
         rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
-        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
-        // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
@@ -56,7 +54,6 @@ impl Helper {
             tokio::select! {
                 Some((digests, origin)) = self.rx_primaries_certs.recv() => {
 
-                    // get the requestors address.
                     let address = match self.committee.primary(&origin) {
                         Ok(x) => x.primary_to_primary,
                         Err(e) => {
@@ -65,7 +62,6 @@ impl Helper {
                         }
                     };
 
-                    // Reply to the request (the best we can).
                     for digest in digests {
                         match self.store.read(digest.to_vec()).await {
                             Ok(Some(data)) => {
@@ -82,7 +78,6 @@ impl Helper {
                 },
                 Some((digests, origin)) = self.rx_primaries_headers.recv() => {
 
-                    // get the requestors address.
                     let address = match self.committee.primary(&origin) {
                         Ok(x) => x.primary_to_primary,
                         Err(e) => {
@@ -91,13 +86,12 @@ impl Helper {
                         }
                     };
 
-                    // Reply to the request (the best we can).
                     for digest in digests {
                         match self.store.read(digest.to_vec()).await {
                                 Ok(Some(data)) => {
                                     let header = bincode::deserialize(&data)
                                         .expect("Failed to deserialize our own certificate");
-                                    let bytes = bincode::serialize(&PrimaryMessage::Header(header, true))  //sync = true
+                                    let bytes = bincode::serialize(&PrimaryMessage::Header(header, true))
                                         .expect("Failed to serialize our own certificate");
                                     self.network.send_typed(address, Bytes::from(bytes), "Header").await;
                                 }

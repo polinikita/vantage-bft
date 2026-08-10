@@ -218,17 +218,13 @@ use crate::stat::{histogram, DivUsize, HistogramSender, PreciseHistogram};
 /// Transaction latency and protocol metrics.
 #[derive(Clone)]
 pub struct Metrics {
-    /// Channel-fed observation point for a single transaction's (commit time - embedded
-    /// submission timestamp). Hot path: `observe` is a lock-free unbounded-channel push.
+    /// Submit-to-commit latency observations.
     pub transaction_committed_latency: HistogramSender<Duration>,
-    /// Running sum of (latency in microseconds)^2 across all observed transactions --
-    /// paired with the histogram's `sum`/`count` gauges this gives the harness an exact
-    /// global stddev: `sqrt(squared_sum/count - (sum/count)^2)`.
+    /// Sum of squared submit-to-commit latencies in microseconds.
     pub transaction_committed_latency_squared_micros: IntCounter,
     /// Submit-to-materialized latency. It ends when the worker has the batch locally.
     pub transaction_materialised_latency: HistogramSender<Duration>,
-    /// Mirrors `transaction_committed_latency_squared_micros` exactly (same batched
-    /// accumulate-then-`inc_by` treatment), for `transaction_materialised_latency`.
+    /// Sum of squared submit-to-materialized latencies in microseconds.
     pub transaction_materialised_latency_squared_micros: IntCounter,
     /// Total transactions whose latency was successfully observed.
     pub committed_transactions: IntCounter,
@@ -242,7 +238,7 @@ pub struct Metrics {
     pub latency_misses_resolved: IntCounter,
 
     // --- Vantage data-plane counters.
-    /// Blocks this node published (self-authored, including our own).
+    /// Blocks published by this node.
     pub vantage_blocks_published: IntCounter,
     /// Own blocks that reached committed output.
     pub vantage_own_blocks_committed_total: IntCounter,
@@ -252,8 +248,9 @@ pub struct Metrics {
     pub vantage_own_proposer_turns_total: IntCounter,
     /// Proposer turns that sealed with a non-Skip outcome.
     pub vantage_own_proposals_committed_total: IntCounter,
-    /// Committed blocks by author, as observed by this node. One series per committee
-    /// member.
+    /// Locally broadcast proposals whose views ended in Skip.
+    pub vantage_own_proposals_skipped_total: IntCounter,
+    /// Committed blocks by author as observed by this node.
     pub vantage_committed_by_author: IntCounterVec,
     /// Set to 1 after state sync completes recovery.
     pub vantage_sequence_sync_recovered: IntGauge,
@@ -261,17 +258,16 @@ pub struct Metrics {
     pub vantage_own_payload_committed_total: IntCounter,
     /// Blocks this node received (direct publish or relayed) and cached.
     pub vantage_blocks_received: IntCounter,
-    /// Direct-publish confirmations produced by this node. This is not a wire-send
-    /// count; `vantage_avail_sent` counts watermark broadcasts.
+    /// Direct-publish confirmations produced by this node.
     pub vantage_acks_sent: IntCounter,
     /// Wire acknowledgments counted first-hand. Watermark credits are counted by
     /// `vantage_avail_credited_refs`.
     pub vantage_acks_received: IntCounter,
-    /// `request(h)` messages this node sent (N6/D2).
+    /// `request(h)` messages sent by this node.
     pub vantage_repairs_requested: IntCounter,
-    /// `serve(h, b)` messages this node sent (N7).
+    /// `serve(h, b)` messages sent by this node.
     pub vantage_repairs_served: IntCounter,
-    /// Cumulative bincode-encoded size of every block this node has retained (N8).
+    /// Cumulative encoded size of retained blocks.
     pub vantage_retained_bytes: IntCounter,
     /// Inbound messages dropped because the declared sender is not a committee member.
     pub vantage_rejected_nonmember_total: IntCounter,
@@ -299,11 +295,9 @@ pub struct Metrics {
     pub vantage_skip_votes_received: IntCounter,
 
     // --- Digest-named AGB statements.
-    /// `VantageBodyFetch` messages this node sent (one per target statement author,
-    /// per outstanding (view, digest) pair, per retry attempt).
+    /// `VantageBodyFetch` messages sent by this node.
     pub vantage_body_fetches_sent: IntCounter,
-    /// `VantageBodyServe` messages this node sent, answering a peer's
-    /// `VantageBodyFetch` with its own held, fixed `ViewProposal`.
+    /// `VantageBodyServe` messages sent by this node.
     pub vantage_bodies_served: IntCounter,
 
     // --- Lane resume.
@@ -315,9 +309,7 @@ pub struct Metrics {
     pub vantage_lane_resume_send_drops: IntCounter,
 
     // --- Reconnect replay.
-    /// `Wire::enqueue_replay`'s `try_send` onto the resume-sender task's channel
-    /// failed (full or closed). `pending_low` is left
-    /// untouched on this path, recovered by the next nudge/tick re-ask.
+    /// Replay streams rejected by a full or closed sender queue.
     pub vantage_replay_enqueue_drops_total: IntCounter,
     /// `VantageReplayDone` sends where `outbox_floor` truncated the requested span.
     pub vantage_replay_done_clamped_total: IntCounter,
@@ -327,28 +319,25 @@ pub struct Metrics {
     pub vantage_replay_inflight_ttl_expired_total: IntCounter,
 
     // --- Progress gauges.
-    /// `Pacemaker::entered_view` -- the largest view this party has formally entered (W5).
+    /// Largest view entered by the pacemaker.
     pub vantage_entered_view: IntGauge,
-    /// `Pacemaker::own_watermark` -- this party's own current wish.
+    /// Local wish watermark.
     pub vantage_own_watermark: IntGauge,
-    /// `Pacemaker::entry_target` -- the entry target `advance_entry_target` last set.
+    /// Current pacemaker entry target.
     pub vantage_entry_target: IntGauge,
-    /// `Pacemaker::omega_q` -- the (2f+1)-party wish statistic driving entry.
+    /// Wish threshold that drives view entry.
     pub vantage_omega_q: IntGauge,
-    /// `Frontier::a_i` -- the responsive proposal frontier.
+    /// Responsive proposal frontier.
     pub vantage_frontier_a_i: IntGauge,
-    /// `Cursor::next_view` -- the lowest view the output cursor has not yet advanced past.
+    /// Lowest view not finalized by the output cursor.
     pub vantage_cursor_next_view: IntGauge,
     /// Entries dropped because an author's lane contradicted delivered output.
     pub vantage_cursor_forked_entries_dropped: IntGauge,
-    /// `ControlLog::curr_round` -- the resolution pipeline's current Simple-IT round.
+    /// Current control-log round.
     pub vantage_control_round: IntGauge,
-    /// `ControlLog::delivered_log.len()` -- total (view, digest) pairs RB-delivered into
-    /// the control log so far.
+    /// Control-log entries delivered by reliable broadcast.
     pub vantage_control_delivered_len: IntGauge,
-    /// `ControlLog::consume_pos` -- how far `pump_log` has consumed that delivered log
-    /// (a persistent gap between this and `delivered_len` means every subsequent anchor
-    /// is blocked on a still-missing `B_w`, not on delivery itself).
+    /// Number of delivered control-log entries consumed.
     pub vantage_control_consume_pos: IntGauge,
     /// Active and fixed views waiting for an echo.
     pub vantage_pending_gate_len: IntGauge,
@@ -362,14 +351,11 @@ pub struct Metrics {
     pub vantage_repair_settle_calls_total: IntCounter,
     /// Times `settle` entered its missing-block branch.
     pub vantage_repair_fanout_loops_total: IntCounter,
-    /// Adaptive per-tick repair-request ceiling. It decreases on bulk-inbound drops and
-    /// increases on clean ticks.
+    /// Adaptive per-tick repair-request limit.
     pub vantage_repair_emit_ceiling: IntGauge,
-    /// Repair-ceiling halvings caused by core-queue pressure.
-    pub vantage_repair_ceiling_halved_by_queue: IntCounter,
     /// Repair-ceiling halvings caused by new bulk-inbound drops.
     pub vantage_repair_ceiling_halved_by_drops: IntCounter,
-    /// Ticks on which `adapt_recovery_ceiling` increased or held the ceiling.
+    /// Ticks that increased or retained the repair limit.
     pub vantage_repair_ceiling_raised: IntCounter,
     /// In-flight repair slots reclaimed after an unanswered request round timed out.
     pub vantage_repair_asks_reclaimed_total: IntCounter,
@@ -377,10 +363,6 @@ pub struct Metrics {
     pub vantage_avail_credit_skipped_total: IntCounter,
     /// Repair requests outstanding. Capped by `RECOVERY_IN_FLIGHT_MAX`.
     pub vantage_repair_in_flight: IntGauge,
-    /// Cached blocks evicted after every peer confirmed holding them.
-    pub vantage_block_cache_evicted_total: IntCounter,
-    /// Lanes pinned because a peer has not reported an eviction floor.
-    pub vantage_block_cache_evict_blocked: IntGauge,
     /// Repair requests deferred because the per-tick recovery allowance was exhausted.
     pub vantage_repair_budget_deferred_total: IntCounter,
     /// Number of entries held by `BlockCache`.
@@ -411,9 +393,7 @@ pub struct Metrics {
     pub network_frames_sent_total: IntCounter,
     /// Volatile sends shed after the destination queue reaches its soft cap.
     pub network_volatile_shed_total: IntCounter,
-    /// Currently-open inbound TCP connections, labeled by listener role. The
-    /// Prometheus target already separates primary and worker processes; this label
-    /// separates the listeners inside a process.
+    /// Open inbound TCP connections by listener role.
     pub network_connections: IntGaugeVec,
     // --- Sequence-chain metrics.
     /// Highest view covered by the local sequence chain.
@@ -516,9 +496,7 @@ pub struct Metrics {
     pub submitted_transactions_bytes: IntCounter,
 
     // --- Consensus quality and utilization.
-    /// Vantage block serialized size at publish time (self-authored blocks only),
-    /// reported via the same `HistogramReporter` pattern as
-    /// `transaction_committed_latency`.
+    /// Serialized size of self-authored Vantage blocks.
     pub proposed_block_size_bytes: HistogramSender<usize>,
     /// Serialized metadata size of self-authored proposals, excluding payloads.
     pub proposed_header_size_bytes: HistogramSender<usize>,
@@ -526,9 +504,7 @@ pub struct Metrics {
     pub proposed_transaction_size_bytes: HistogramSender<usize>,
     /// Accumulated section time in microseconds, labeled by `proc`.
     pub utilization_timer: IntCounterVec,
-    /// Time spent waiting in instrumented sections, in microseconds. This overlaps
-    /// `utilization_timer`; it is not a partition. Uninstrumented waits remain in the
-    /// utilization total.
+    /// Instrumented wait time in microseconds; overlaps `utilization_timer`.
     pub core_wait_timer: IntCounterVec,
     /// `VantageCore` inbound-message channel depth, sampled once per second.
     pub core_queue_length: IntGauge,
@@ -536,9 +512,7 @@ pub struct Metrics {
     pub core_queue_peak: IntGauge,
 
     // --- Worker-process observability.
-    /// Current occupancy of each bounded worker channel. Labels identify the pipeline
-    /// stage: `synchronizer`, `batch_maker`, `processor_own`, `processor_peer`,
-    /// `helper`, `primary_connector`, and `store`.
+    /// Current occupancy of each bounded worker channel.
     pub worker_queue_depth: IntGaugeVec,
     /// Peak queue occupancy since the previous publication.
     pub worker_queue_peak: IntGaugeVec,
@@ -785,6 +759,12 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            vantage_own_proposals_skipped_total: register_int_counter_with_registry!(
+                "vantage_own_proposals_skipped_total",
+                "Locally broadcast proposals whose views ended in Skip",
+                registry,
+            )
+            .unwrap(),
             vantage_committed_by_author: register_int_counter_vec_with_registry!(
                 "vantage_committed_by_author",
                 "Committed blocks by authoring node, as observed by this node",
@@ -903,166 +883,157 @@ impl Metrics {
             .unwrap(),
             vantage_body_fetches_sent: register_int_counter_with_registry!(
                 "vantage_body_fetches_sent",
-                "Digest-named AGB statements (signature-free.tex sec.8.3): VantageBodyFetch messages this node sent",
+                "VantageBodyFetch messages sent by this node",
                 registry,
             )
             .unwrap(),
             vantage_bodies_served: register_int_counter_with_registry!(
                 "vantage_bodies_served",
-                "Digest-named AGB statements (signature-free.tex sec.8.3): VantageBodyServe messages this node sent",
+                "VantageBodyServe messages sent by this node",
                 registry,
             )
             .unwrap(),
             vantage_lane_resume_requests_sent: register_int_counter_with_registry!(
                 "vantage_lane_resume_requests_sent",
-                "Mechanism A (sender-side lane resume): VantageLaneResume requests this node sent",
+                "VantageLaneResume requests sent by this node",
                 registry,
             )
             .unwrap(),
             vantage_lane_resume_blocks_served: register_int_counter_with_registry!(
                 "vantage_lane_resume_blocks_served",
-                "Mechanism A (sender-side lane resume): own blocks this node served answering a VantageLaneResume request",
+                "Own blocks served for VantageLaneResume requests",
                 registry,
             )
             .unwrap(),
             vantage_lane_resume_send_drops: register_int_counter_with_registry!(
                 "vantage_lane_resume_send_drops",
-                "Mechanism A (sender-side lane resume): resume messages dropped because the dedicated resume-sender task's channel was full or closed",
+                "Lane-resume messages dropped by a full or closed sender queue",
                 registry,
             )
             .unwrap(),
             vantage_replay_enqueue_drops_total: register_int_counter_with_registry!(
                 "vantage_replay_enqueue_drops_total",
-                "Reconnect replay: enqueue_replay try_send drops (Full/Closed) onto the resume-sender task",
+                "Replay streams rejected by a full or closed sender queue",
                 registry,
             )
             .unwrap(),
             vantage_replay_done_clamped_total: register_int_counter_with_registry!(
                 "vantage_replay_done_clamped_total",
-                "Reconnect replay: VantageReplayDone sends truncated below the requested span by outbox_floor",
+                "Replay responses clamped to the retained outbox floor",
                 registry,
             )
             .unwrap(),
             vantage_replay_pending_low_nudges_total: register_int_counter_with_registry!(
                 "vantage_replay_pending_low_nudges_total",
-                "Reconnect replay: server-side nudge Hellos sent for a set pending_low with no recent serve",
+                "Replay nudges sent for unresolved peer gaps",
                 registry,
             )
             .unwrap(),
             vantage_replay_inflight_ttl_expired_total: register_int_counter_with_registry!(
                 "vantage_replay_inflight_ttl_expired_total",
-                "Reconnect replay: stale in-flight-replay-stream entries evicted past replay_episode_max_ms",
+                "Replay streams removed after their TTL expired",
                 registry,
             )
             .unwrap(),
             vantage_entered_view: register_int_gauge_with_registry!(
                 "vantage_entered_view",
-                "Pacemaker: largest view formally entered (W5)",
+                "Largest view entered by the pacemaker",
                 registry,
             )
             .unwrap(),
             vantage_own_watermark: register_int_gauge_with_registry!(
                 "vantage_own_watermark",
-                "Pacemaker: this party's own current wish",
+                "Local wish watermark",
                 registry,
             )
             .unwrap(),
             vantage_entry_target: register_int_gauge_with_registry!(
                 "vantage_entry_target",
-                "Pacemaker: current entry target",
+                "Current pacemaker entry target",
                 registry,
             )
             .unwrap(),
             vantage_omega_q: register_int_gauge_with_registry!(
                 "vantage_omega_q",
-                "Pacemaker: (2f+1)-party wish statistic omega_q",
+                "Wish threshold that drives view entry",
                 registry,
             )
             .unwrap(),
             vantage_frontier_a_i: register_int_gauge_with_registry!(
                 "vantage_frontier_a_i",
-                "Frontier: responsive proposal frontier a_i",
+                "Responsive proposal frontier",
                 registry,
             )
             .unwrap(),
             vantage_cursor_next_view: register_int_gauge_with_registry!(
                 "vantage_cursor_next_view",
-                "Cursor: lowest view not yet advanced past",
+                "Lowest view not finalized by the output cursor",
                 registry,
             )
             .unwrap(),
             vantage_cursor_forked_entries_dropped: register_int_gauge_with_registry!(
                 "vantage_cursor_forked_entries_dropped",
-                "Cursor: manifest entries dropped because their ancestry contradicts \
-                 delivered output (a forked lane -- restart that lost its frontier, or \
-                 a Byzantine author)",
+                "Manifest entries dropped because their ancestry conflicts with committed output",
                 registry,
             )
             .unwrap(),
             vantage_control_round: register_int_gauge_with_registry!(
                 "vantage_control_round",
-                "ControlLog: current Simple-IT resolution round",
+                "Current control-log round",
                 registry,
             )
             .unwrap(),
             vantage_control_delivered_len: register_int_gauge_with_registry!(
                 "vantage_control_delivered_len",
-                "ControlLog: total (view,digest) pairs RB-delivered into the control log",
+                "Control-log entries delivered by reliable broadcast",
                 registry,
             )
             .unwrap(),
             vantage_control_consume_pos: register_int_gauge_with_registry!(
                 "vantage_control_consume_pos",
-                "ControlLog: consumption position of the delivered log (pump_log)",
+                "Delivered control-log entries consumed",
                 registry,
             )
             .unwrap(),
             vantage_pending_gate_len: register_int_gauge_with_registry!(
                 "vantage_pending_gate_len",
-                "AgbEngine: views active+fixed but not yet echoed (recheck_all's scan population)",
+                "Fixed active views waiting for an echo",
                 registry,
             )
             .unwrap(),
             vantage_pending_body_fetch_len: register_int_gauge_with_registry!(
                 "vantage_pending_body_fetch_len",
-                "DigestStatements: outstanding AGB body fetches (capped by MAX_PENDING_FETCH)",
+                "Outstanding AGB body fetches",
                 registry,
             )
             .unwrap(),
             vantage_body_fetch_evicted_total: register_int_counter_with_registry!(
                 "vantage_body_fetch_evicted_total",
-                "Body-fetch pairs dropped because pending_fetch hit its ceiling",
+                "Body-fetch pairs dropped at the pending-fetch limit",
                 registry,
             )
             .unwrap(),
             vantage_pending_settle_len: register_int_gauge_with_registry!(
                 "vantage_pending_settle_len",
-                "Repairer: authorized-but-unsettled refs (on_block_available's sweep population)",
+                "Authorized repair references awaiting settlement",
                 registry,
             )
             .unwrap(),
             vantage_repair_settle_calls_total: register_int_counter_with_registry!(
                 "vantage_repair_settle_calls_total",
-                "Repairer::settle calls; divide by blocks_received for the sweep amplification",
+                "Repair settlement attempts",
                 registry,
             )
             .unwrap(),
             vantage_repair_fanout_loops_total: register_int_counter_with_registry!(
                 "vantage_repair_fanout_loops_total",
-                "Times settle reached the missing-block branch (fan-out considered, not \
-                 necessarily emitted); compare with vantage_repairs_requested",
+                "Settlement attempts that encountered a missing block",
                 registry,
             )
             .unwrap(),
             vantage_repair_emit_ceiling: register_int_gauge_with_registry!(
                 "vantage_repair_emit_ceiling",
-                "Adaptive per-tick ceiling on repair-request emission (AIMD on bulk drops)",
-                registry,
-            )
-            .unwrap(),
-            vantage_repair_ceiling_halved_by_queue: register_int_counter_with_registry!(
-                "vantage_repair_ceiling_halved_by_queue",
-                "Legacy core-queue emit-ceiling halvings (zero in queue-backoff ablation)",
+                "Adaptive per-tick repair-request limit",
                 registry,
             )
             .unwrap(),
@@ -1086,67 +1057,49 @@ impl Metrics {
             .unwrap(),
             vantage_avail_credit_skipped_total: register_int_counter_with_registry!(
                 "vantage_avail_credit_skipped_total",
-                "Availability credits skipped because the ref was already at quorum (the \
-                 ack fan-in's waste; compare with vantage_avail_credited_refs)",
+                "Availability credits skipped after the reference reached quorum",
                 registry,
             )
             .unwrap(),
             vantage_repair_in_flight: register_int_gauge_with_registry!(
                 "vantage_repair_in_flight",
-                "Repair requests outstanding (the window that bounds inbound answers)",
-                registry,
-            )
-            .unwrap(),
-            vantage_block_cache_evicted_total: register_int_counter_with_registry!(
-                "vantage_block_cache_evicted_total",
-                "Cached blocks evicted because every peer confirmed holding them",
-                registry,
-            )
-            .unwrap(),
-            vantage_block_cache_evict_blocked: register_int_gauge_with_registry!(
-                "vantage_block_cache_evict_blocked",
-                "Lanes pinned in memory because some peer has not reported on them (safe, \
-                 but memory keeps growing for those lanes)",
+                "Outstanding repair requests",
                 registry,
             )
             .unwrap(),
             vantage_repair_budget_deferred_total: register_int_counter_with_registry!(
                 "vantage_repair_budget_deferred_total",
-                "Repair requests deferred to the next tick because this tick's recovery \
-                 allowance was spent (bounds the SUM of the recovery mechanisms)",
+                "Repair requests deferred after the per-tick limit was reached",
                 registry,
             )
             .unwrap(),
             vantage_block_cache_len: register_int_gauge_with_registry!(
                 "vantage_block_cache_len",
-                "BlockCache entries held (no eviction exists, so monotone)",
+                "Entries held in the Vantage block cache",
                 registry,
             )
             .unwrap(),
             vantage_ack_senders_tracked: register_int_gauge_with_registry!(
                 "vantage_ack_senders_tracked",
-                "AckAggregator: refs still accumulating first-hand acks (retired at \
-                 quorum; must not grow with every block ever seen)",
+                "References accumulating first-hand acknowledgements",
                 registry,
             )
             .unwrap(),
             vantage_ack_refs_retired: register_int_gauge_with_registry!(
                 "vantage_ack_refs_retired",
-                "AckAggregator: refs retired after reaching a threshold (still unbounded)",
+                "References retired after reaching an acknowledgement threshold",
                 registry,
             )
             .unwrap(),
             vantage_repair_fanout_pending: register_int_gauge_with_registry!(
                 "vantage_repair_fanout_pending",
-                "Repairer: digests whose peer fan-out is started but not yet complete \
-                 (the outstanding-repair backlog, i.e. the size of this node's gap)",
+                "Digests with incomplete repair fan-out",
                 registry,
             )
             .unwrap(),
             vantage_repair_fanout_escalations_total: register_int_counter_with_registry!(
                 "vantage_repair_fanout_escalations_total",
-                "Repairer: fan-out rounds beyond the first (coverage had to widen because \
-                 the bounded first round went unanswered)",
+                "Repair fan-out rounds beyond the first",
                 registry,
             )
             .unwrap(),
@@ -1192,15 +1145,13 @@ impl Metrics {
             .unwrap(),
             network_frames_sent_total: register_int_counter_with_registry!(
                 "network_frames_sent_total",
-                "Physical wire frames sent (bundles count once); compare against \
-                 network_messages_sent_total for the batching coalescing ratio",
+                "Physical wire frames sent; bundles count once",
                 registry,
             )
             .unwrap(),
             network_volatile_shed_total: register_int_counter_with_registry!(
                 "network_volatile_shed_total",
-                "Volatile sends shed at enqueue (outbound queue depth reached the soft \
-                 cap); every shed key is min-merged into the drop map for replay",
+                "Volatile sends dropped at the outbound queue limit",
                 registry,
             )
             .unwrap(),
@@ -1231,7 +1182,7 @@ impl Metrics {
             .unwrap(),
             vantage_sequence_boundary_head: register_int_gauge_vec_with_registry!(
                 "vantage_sequence_boundary_head",
-                "Checkpoint boundary head (hex label), valued by its boundary view",
+                "Checkpoint head by session and digest",
                 &["sid", "head"],
                 registry,
             )
@@ -1352,13 +1303,13 @@ impl Metrics {
             .unwrap(),
             vantage_sequence_install_selfcheck_match_total: register_int_counter_with_registry!(
                 "vantage_sequence_install_selfcheck_match_total",
-                "Head comparisons over an INSTALLED target -- self-consistency, not independent",
+                "Installed targets whose head matched local execution",
                 registry,
             )
             .unwrap(),
             vantage_sequence_verify_mismatch_total: register_int_counter_with_registry!(
                 "vantage_sequence_verify_mismatch_total",
-                "Verified checkpoint heads that DISAGREED with local execution -- must stay 0",
+                "Verified checkpoint heads that disagreed with local execution",
                 registry,
             )
             .unwrap(),
@@ -1408,7 +1359,7 @@ impl Metrics {
             vantage_sequence_install_headers_requested_total:
                 register_int_counter_with_registry!(
                     "vantage_sequence_install_headers_requested_total",
-                    "Header digest asks sent by the batched sequence-install fast path",
+                    "Sequence-install header requests sent",
                     registry,
                 )
                 .unwrap(),
@@ -1433,7 +1384,7 @@ impl Metrics {
             .unwrap(),
             vantage_sequence_install_failed_total: register_int_counter_with_registry!(
                 "vantage_sequence_install_failed_total",
-                "Installs refused by the cursor -- cursor unchanged, target abandoned",
+                "Installs refused by the output cursor",
                 registry,
             )
             .unwrap(),

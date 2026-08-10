@@ -28,13 +28,10 @@ from benchmark.logs import LogParser, ParseError
 from benchmark.instance import InstanceManager
 
 
-# PromQL queries used by `Bench.fetch_collector_metrics`.
 COLLECTOR_QUERIES = {
     'committed_transactions_total': 'sum(committed_transactions)',
     'committed_transactions_rate': 'sum(rate(committed_transactions[30s]))',
-    # transaction_committed_latency is exposed as a gauge vector labeled by
-    # `v` (p25/p50/p75/p90/p99/max/sum/count), not a native Prometheus
-    # histogram -- see HistogramReporter::report in metrics/src/metrics.rs.
+    # Latency percentiles are exported as labeled gauges, not a histogram.
     'transaction_committed_latency': 'transaction_committed_latency',
     'vantage_seals_by_route': 'sum by (route) (vantage_seals)',
     'network_messages_sent_by_type': 'sum by (type) (network_messages_sent_total)',
@@ -51,8 +48,7 @@ COLLECTOR_QUERIES = {
     'protocol_info': 'protocol_info',
     'transaction_mode_info': 'transaction_mode_info',
     # `up` reports scrape health.
-    # Node labels provide process-level rates; host labels provide NIC-level
-    # rates when a primary and worker share an instance.
+    # Node labels are process-level; host labels are NIC-level.
     'up': 'up',
     'bytes_sent_rate_by_node': 'sum by (node) (rate(bytes_sent_total[30s]))',
     'bytes_received_rate_by_node': 'sum by (node) (rate(bytes_received_total[30s]))',
@@ -63,7 +59,7 @@ COLLECTOR_QUERIES = {
 
 
 class FabricError(Exception):
-    ''' Wrapper for Fabric exception with a meaningfull error message. '''
+    '''Wrap a Fabric group error with its message.'''
 
     def __init__(self, error):
         assert isinstance(error, GroupException)
@@ -114,18 +110,10 @@ class Bench:
                 raise ExecutionError(output.stderr)
 
     def _repo_root(self):
-        ''' Absolute path to the local repo root: this file lives at
-        benchmark/benchmark/remote.py, so the root is two directories up. '''
         return abspath(join(dirname(__file__), '..', '..'))
 
     def _ssh_opts(self):
-        # Fresh instances have unknown host keys; Fabric's own Connection
-        # already auto-adds them (fabric.Connection.open sets
-        # AutoAddPolicy unconditionally), but the plain `ssh`/`rsync`
-        # subprocess calls below don't go through Fabric, so they need the
-        # same behaviour spelled out explicitly. accept-new (rather than
-        # disabling checking outright) still guards against a host key
-        # that *changes* after first contact.
+        # Accept new host keys while still rejecting changed keys.
         return [
             '-i', self.settings.key_path,
             '-o', 'StrictHostKeyChecking=accept-new',
@@ -134,18 +122,13 @@ class Bench:
         ]
 
     def _sync_tree(self, ips):
-        '''Upload the working tree, excluding build output and local data.'''
+        '''Upload the working tree, excluding build output, local data, and credentials.'''
         assert isinstance(ips, list)
         root = self._repo_root()
         exclude_args = []
         for pattern in self.RSYNC_EXCLUDES:
             exclude_args += ['--exclude', pattern]
-        # Also honor the repo's own (per-directory) .gitignore files -- this is
-        # what actually excludes the volatile `.local-bench*/`/`.db_test*`/etc.
-        # local-run scratch directories (config/data churned by concurrent
-        # local benchmarking) that RSYNC_EXCLUDES above doesn't enumerate.
-        # Without it, rsync's file-list scan can race a concurrent write/delete
-        # under one of those directories and abort with a transfer error.
+        # Exclude volatile local-run data covered by repository .gitignore files.
         exclude_args += ['--filter=:- .gitignore']
         ssh_cmd = 'ssh ' + ' '.join(self._ssh_opts())
 
@@ -180,11 +163,7 @@ class Bench:
                 )
 
     def _nvme_mount_snippet(self):
-        '''Return a safe, best-effort NVMe mount snippet for validator stores.
-
-        The root disk and any disk with a filesystem or mount are excluded.
-        A mount failure leaves the required writable store directory check to
-        `install()`.'''
+        '''Return a best-effort snippet that avoids root and mounted disks.'''
         base = PathMaker.REMOTE_STORE_BASE
         user = self.settings.username
         return (
@@ -226,7 +205,7 @@ class Bench:
                 'sudo apt-get -y upgrade',
                 'sudo apt-get -y autoremove',
 
-                # The following dependencies prevent the error: [error: linker `cc` not found].
+                # Required for native linking.
                 'sudo apt-get -y install build-essential',
                 'sudo apt-get -y install cmake',
 
@@ -235,32 +214,13 @@ class Bench:
                 'source $HOME/.cargo/env',
                 'rustup default stable',
 
-                # This is missing from the Rocksdb installer (needed for Rocksdb).
+                # Required by RocksDB.
                 'sudo apt-get install -y clang',
-                # e2fsprogs: provides mkfs.ext4 for the NVMe instance-store
-                # format step below -- same reason the fetch-binary branch
-                # below installs it; `_run_single` passes `--store` under
-                # `/mnt/db` regardless of which install mode provisioned the
-                # host, so this branch needs it too.
+                # Provides mkfs.ext4 for the optional NVMe store.
                 'sudo apt-get -y install e2fsprogs',
-                # NVMe-INSTANCE-STORE: format + mount the local instance-store
-                # NVMe disk (if any) at PathMaker.REMOTE_STORE_BASE ('/mnt/db')
-                # -- see `_nvme_mount_snippet`'s docstring for the full
-                # rationale and the `|| true`-placement pitfall it avoids.
+                # Best-effort mount of the local NVMe store.
                 self._nvme_mount_snippet(),
-                # STORE-BASE-REQUIRED: `_run_single` passes `--store
-                # PathMaker.remote_db_path(...)` = `/mnt/db/.db-*`
-                # unconditionally, and RocksDB (`store/src/lib.rs`,
-                # `create_if_missing(true)`) creates only that leaf
-                # directory, never `/mnt/db` itself -- and `/mnt` is
-                # root-owned. Run deliberately AFTER the NVMe mount attempt
-                # above (not folded into its best-effort subshell): it chowns
-                # whatever now sits at `{base}` -- the freshly mounted
-                # filesystem's root when the NVMe branch above succeeded, a
-                # plain directory on the EBS root otherwise -- to the ssh
-                # user, and `test -w` makes a failed/partial mount abort
-                # install() loudly here instead of surfacing only later as
-                # every primary/worker silently dying at boot.
+                # Ensure the store root exists, is owned by the SSH user, and is writable.
                 f'sudo mkdir -p {base} && sudo chown -R {user}:{user} {base} && test -w {base}',
             ]
             try:
@@ -278,40 +238,13 @@ class Bench:
             user = self.settings.username
             cmd = [
                 'sudo apt-get update',
-                # curl: downloads the release binaries in `_update`. ca-certificates:
-                # verifies the https://github.com download. tmux: `_background_run`
-                # launches every primary/worker/client inside a tmux session.
-                # e2fsprogs: provides mkfs.ext4 for the NVMe instance-store format
-                # step below (normally preinstalled on Ubuntu's base system, but
-                # made explicit rather than assumed).
+                # Runtime tools, release download verification, and NVMe formatting.
                 'sudo apt-get -y install curl ca-certificates tmux e2fsprogs',
-                # NVMe-INSTANCE-STORE: format + mount the local instance-store
-                # NVMe disk (if any) at PathMaker.REMOTE_STORE_BASE ('/mnt/db')
-                # so the RocksDB store lands on fast local disk instead of the
-                # EBS root volume -- see `_nvme_mount_snippet`'s docstring for
-                # the full rationale (root cause of the AWS throughput
-                # collapse), the root-device-exclusion safety argument, and
-                # the `|| true`-placement pitfall it avoids. Best-effort: a
-                # failed detection/format/mount here leaves nothing at
-                # `{base}`, caught loudly by the required step right below.
+                # Best-effort mount of the local NVMe store.
                 self._nvme_mount_snippet(),
-                # STORE-BASE-REQUIRED: `_run_single` passes `--store
-                # PathMaker.remote_db_path(...)` = `/mnt/db/.db-*`
-                # unconditionally, and RocksDB (`store/src/lib.rs`,
-                # `create_if_missing(true)`) creates only that leaf
-                # directory, never `/mnt/db` itself -- and `/mnt` is
-                # root-owned. Run deliberately AFTER the NVMe mount attempt
-                # above (not folded into its best-effort subshell): it chowns
-                # whatever now sits at `{base}` -- the freshly mounted
-                # filesystem's root when the NVMe branch above succeeded, a
-                # plain directory on the EBS root otherwise -- to the ssh
-                # user, and `test -w` makes a failed/partial mount abort
-                # install() loudly here instead of surfacing only later as
-                # every primary/worker silently dying at boot.
+                # Ensure the store root exists, is owned by the SSH user, and is writable.
                 f'sudo mkdir -p {base} && sudo chown -R {user}:{user} {base} && test -w {base}',
-                # Same directory layout `_config`/`_update`/`_background_run`
-                # already expect from the source-build path, just without a
-                # compiled-from-source tree underneath it.
+                # Match the source-build directory layout.
                 f'mkdir -p {repo_name}/target/release',
             ]
             try:
@@ -413,18 +346,10 @@ class Bench:
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
 
-    # Binaries the orchestrator launches (node/Cargo.toml's default `[[bin]]`
-    # from src/main.rs, plus the explicit `benchmark_client` `[[bin]]`) --
-    # same names commands.py's CommandMaker.run_primary/run_worker/run_client
-    # and alias_binaries hardcode, and the same names docker.yml publishes
-    # release assets under (`<bin>-linux-amd64`).
     RELEASE_BINARIES = ('node', 'benchmark_client')
 
     def _check_binary_provenance(self, release_repo, allow_stale_binary):
-        '''Verify that the release commit matches the local checkout.
-
-        A mismatch raises `BenchError` unless `allow_stale_binary` is true.
-        An unavailable commit marker warns and continues.'''
+        '''Verify the release commit, allowing an explicit stale-binary override.'''
         local_head = subprocess.run(
             ['git', 'rev-parse', 'HEAD'],
             cwd=self._repo_root(), capture_output=True, text=True,
@@ -445,9 +370,7 @@ class Bench:
             f'https://github.com/{release_repo}/releases/download/'
             'nightly/commit.txt'
         )
-        # Anonymous, local curl -- same public-release assumption as the
-        # binary fetches themselves, just run HERE (coordinator) instead of
-        # on each instance, and BEFORE any instance is touched.
+        # Check release availability before deployment.
         remote = subprocess.run(
             ['curl', '-fsL', '--retry', '3', commit_url],
             capture_output=True, text=True,
@@ -524,9 +447,7 @@ class Bench:
                     f'nightly/{binary}-linux-amd64'
                 )
                 dest = f'{repo_name}/target/release/{binary}'
-                # Anonymous curl -- the release is public, no auth needed.
-                # Same parallel-across-hosts pattern as the source-build
-                # path above: one Group.run(), not a per-host loop.
+                # The public release needs no authentication.
                 cmd.append(f'curl -fL --retry 3 -o {dest} {url} && chmod +x {dest}')
             cmd.append(CommandMaker.alias_binaries(
                 f'./{repo_name}/target/release/'
@@ -538,19 +459,15 @@ class Bench:
         '''Build and upload configuration using public SSH and private wire IPs.'''
         Print.info('Generating configuration files...')
 
-        # Cleanup all local configuration files.
         cmd = CommandMaker.cleanup()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
-        # Recompile the latest code.
         cmd = CommandMaker.compile().split()
         subprocess.run(cmd, check=True, cwd=PathMaker.node_crate_path())
 
-        # Create alias for the client and nodes binary.
         cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
         subprocess.run([cmd], shell=True)
 
-        # Generate configuration files.
         keys = []
         key_files = [PathMaker.key_file(i) for i in range(len(hosts))]
         for filename in key_files:
@@ -582,10 +499,7 @@ class Bench:
 
         node_parameters.print(PathMaker.parameters_file())
 
-        # Cleanup all nodes and upload configuration files. Connections MUST
-        # go over the PUBLIC ip (committee.public_ips) -- committee.ips()
-        # would now return the (private, VPC-only) wire addresses, which the
-        # coordinator laptop cannot reach.
+        # Use public IPs for coordinator-to-node connections.
         names = names[:len(names)-bench_parameters.faults]
         progress = progress_bar(names, prefix='Uploading config files:')
         for i, name in enumerate(progress):
@@ -599,10 +513,7 @@ class Bench:
         return committee
 
     def deploy_monitoring(self, committee_json, faults=0):
-        '''Deploy Prometheus and Grafana on the metrics collector.
-
-        Uses private validator metrics addresses. Missing collectors produce a
-        warning and do not stop the benchmark.'''
+        '''Deploy Prometheus and Grafana using private validator metrics addresses.'''
         collector = self.manager.collector_host()
         if collector is None:
             Print.warn(
@@ -630,11 +541,11 @@ class Bench:
         c.run(install_cmd, hide=True)
         c.put(local_path, 'prometheus.yml')
 
-        # Share a user-defined network so Grafana resolves Prometheus by name.
+        # Let Grafana resolve Prometheus by name.
         c.run('sudo docker network create monitor-net || true', hide=True)
 
         run_cmd = ' && '.join([
-            # Keep the TSDB volume when replacing the Prometheus container.
+            # Preserve samples across container replacement.
             'sudo docker rm -f prometheus || true',
             'sudo docker run -d --name prometheus --restart unless-stopped '
             '--network monitor-net '
@@ -661,7 +572,7 @@ class Bench:
             c.put(join(grafana_dir, 'grafana-dashboard.json'), 'grafana-dashboard.json')
 
             home = f'/home/{self.settings.username}'
-            # Use a random admin password because the dashboard port is public.
+            # Use a random password because the dashboard port is public.
             grafana_admin_password = secrets.token_urlsafe(12)
             grafana_cmd = ' && '.join([
                 'sudo docker rm -f grafana || true',
@@ -675,8 +586,7 @@ class Bench:
                 '-e GF_USERS_ALLOW_SIGN_UP=false '
                 f'-v {home}/grafana-datasource.yaml:/etc/grafana/provisioning/datasources/datasource.yaml '
                 f'-v {home}/grafana-dashboard-provider.yaml:/etc/grafana/provisioning/dashboards/dashboard.yaml '
-                # Matches dashboard.yaml's own provider `path:
-                # /var/lib/grafana/dashboards`.
+                # Match the dashboard provider path.
                 f'-v {home}/grafana-dashboard.json:/var/lib/grafana/dashboards/grafana-dashboard.json '
                 'grafana/grafana',
             ])
@@ -694,10 +604,7 @@ class Bench:
         return collector_public_ip
 
     def fetch_collector_metrics(self, start=None, end=None, step='1s', subdir=None):
-        '''Fetch collector series as JSON.
-
-        Pass `start` and `end` together for a range query. Without them, use
-        an instant query. A failed series warns and does not stop the export.'''
+        '''Fetch collector series as JSON; use `start` and `end` for range queries.'''
         collector = self.manager.collector_host()
         if collector is None:
             Print.warn('No metrics-collector instance found; nothing to fetch')
@@ -719,10 +626,7 @@ class Bench:
         Print.heading(f'Wrote collector metrics to {out_dir}')
 
     def _report_nic_peak(self, subdir):
-        '''Report peak wire transmit rate per physical host.
-
-        The metric file is Prometheus query-range JSON. Missing or malformed
-        data produces a warning and returns.'''
+        '''Report peak wire transmit rate per physical host from range metrics.'''
         path = PathMaker.collector_metrics_file('bytes_sent_rate_by_host', subdir)
         try:
             with open(path, 'r') as f:
@@ -748,10 +652,7 @@ class Bench:
         )
 
     def _record_run_window(self, n, rate, protocol, campaign, start, end):
-        '''Record a rate-point time window in `run-windows.json`.
-
-        The run identifier distinguishes repeated points and supports later
-        range queries while the collector is available.'''
+        '''Record a rate-point query window in `run-windows.json`.'''
         path = join(PathMaker.collector_metrics_dir(), 'run-windows.json')
         windows = []
         if isfile(path):
@@ -789,20 +690,13 @@ class Bench:
         cmd = CommandMaker.clean_logs()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
-        # Run the clients (they will wait for the nodes to be ready).
-        # Filter all faulty nodes from the client addresses (or they will wait
-        # for the faulty nodes to be online).
         Print.info('Booting clients...')
         workers_addresses = committee.workers_addresses(faults)
         workers_public_ips = committee.workers_public_ips(faults)
         rate_share = ceil(rate / committee.workers())
         for i, addresses in enumerate(workers_addresses):
             for (id, address), (_, host) in zip(addresses, workers_public_ips[i]):
-                # `address` (the client's own submit target, and the peer
-                # addresses below) is the PRIVATE committee address -- the
-                # client runs ON the instance and talks to its co-located
-                # worker/peers over the VPC. `host` (the fabric SSH target
-                # to spawn it) is the instance's PUBLIC ip.
+                # Clients use private peer addresses; SSH uses public hosts.
                 cmd = CommandMaker.run_client(
                     address,
                     bench_parameters.tx_size,
@@ -814,15 +708,12 @@ class Bench:
                 log_file = PathMaker.client_log_file(i, id)
                 self._background_run(host, cmd, log_file)
 
-        # Run the primaries (except the faulty ones).
         Print.info('Booting primaries...')
         for i, host in enumerate(committee.primary_public_ips(faults)):
             cmd = CommandMaker.run_primary(
                 PathMaker.key_file(i),
                 PathMaker.committee_file(),
-                # NVMe-INSTANCE-STORE: the remote store now lives on the
-                # mounted local NVMe instance-store disk (install() formats +
-                # mounts it), not the EBS root -- see PathMaker.remote_db_path.
+                # Use the configured remote store path.
                 PathMaker.remote_db_path(i),
                 PathMaker.parameters_file(),
                 debug=debug
@@ -830,15 +721,13 @@ class Bench:
             log_file = PathMaker.primary_log_file(i)
             self._background_run(host, cmd, log_file)
 
-        # Run the workers (except the faulty ones).
         Print.info('Booting workers...')
         for i, addresses in enumerate(workers_addresses):
             for (id, address), (_, host) in zip(addresses, workers_public_ips[i]):
                 cmd = CommandMaker.run_worker(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
-                    # NVMe-INSTANCE-STORE: see the primary's run_primary call
-                    # above -- same NVMe-mounted store, per-worker subdirectory.
+                    # Use the worker's configured remote store path.
                     PathMaker.remote_db_path(i, id),
                     PathMaker.parameters_file(),
                     id,  # The worker's id.
@@ -847,7 +736,6 @@ class Bench:
                 log_file = PathMaker.worker_log_file(i, id)
                 self._background_run(host, cmd, log_file)
 
-         # Wait for all transactions to be processed.
         duration = bench_parameters.duration
         for i in progress_bar(range(20), prefix=f'Running benchmark ({duration} sec):'):
             tick_size = ceil(duration / 20)
@@ -872,11 +760,7 @@ class Bench:
         self.kill(hosts=hosts, delete_logs=False)
 
     def _simulate_partition(self, bench_parameters, committee, faults):
-        # `tc ... match ip dst` must target the PRIVATE (wire) address peers
-        # actually dial (unchanged); the SSH connection to install that rule
-        # must go to the PUBLIC ip of the physical host running primary `i`
-        # -- Committee.ip(address) on a (now private) committee address is
-        # not reachable from the coordinator laptop.
+        # Shape private peer traffic through public SSH hosts.
         primary_public_ips = committee.primary_public_ips(faults)
         for i, address in enumerate(committee.primary_addresses(faults)):
             if i < bench_parameters.partition_nodes:
@@ -899,7 +783,7 @@ class Bench:
                 g.run(' && '.join(cmd), hide=True)
         
     def _delete_partition(self, bench_parameters, committee, faults):
-        # Same PUBLIC-for-SSH note as `_simulate_partition` above.
+        # Use public SSH hosts and private peer addresses.
         primary_public_ips = committee.primary_public_ips(faults)
         for i, address in enumerate(committee.primary_addresses(faults)):
             if i < bench_parameters.partition_nodes:
@@ -909,16 +793,7 @@ class Bench:
                 g.run(' && '.join(cmd), hide=True)
 
     def _logs(self, committee, faults, duration=None):
-        # NOTE: local logs/metrics are cleared in `_run_single` now (before
-        # this run's `scrape_metrics()` writes its metrics-*.txt), not here
-        # -- doing it here would delete this run's own metrics files, which
-        # `_run_single` already wrote into the same `logs/` directory, before
-        # `LogParser.process()` below ever gets to read them. See the note
-        # in `_run_single`.
-
-        # Download log files. SSH targets are the PUBLIC (physical-host)
-        # ips -- Committee.ip(address) on a committee address would now
-        # extract a PRIVATE ip, unreachable from the coordinator.
+        # Download logs over public SSH hosts.
         workers_addresses = committee.workers_addresses(faults)
         workers_public_ips = committee.workers_public_ips(faults)
         progress = progress_bar(workers_addresses, prefix='Downloading workers logs:')
@@ -943,7 +818,6 @@ class Bench:
                 local=PathMaker.primary_log_file(i)
             )
 
-        # Parse logs; `duration` is the TPS denominator when provided.
         Print.info('Parsing logs and computing performance...')
         return LogParser.process(
             PathMaker.logs_path(), faults=faults, duration=duration
@@ -952,7 +826,7 @@ class Bench:
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
         Print.heading('Starting remote benchmark')
-        # Record the run window in Unix seconds for Prometheus range queries.
+        # Record the run window for Prometheus range queries.
         campaign_start = time.time()
         try:
             bench_parameters = BenchParameters(bench_parameters_dict)
@@ -960,31 +834,24 @@ class Bench:
         except ConfigError as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
-        # Namespace collector exports by protocol and run start time.
+        # Namespace exports by protocol and start time.
         campaign_subdir = (
             f"{node_parameters.json.get('protocol', 'unknown')}-"
             f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(campaign_start))}"
         )
 
-        # Select which hosts to use -- PUBLIC ips (SSH/rsync/tmux: install,
-        # deploy, background-run, kill, log download all connect through
-        # these, from the coordinator laptop).
+        # Select public hosts for coordinator operations.
         selected_hosts = self._select_hosts(bench_parameters)
         if not selected_hosts:
             Print.warn('There are not enough instances available')
             return
 
-        # Same selection, but PRIVATE (VPC-internal) ips -- index-aligned
-        # with `selected_hosts` above (same region ordering, same slicing).
-        # This is what the Committee (node<->node, client<->node) gets built
-        # from, so same-region traffic never crosses the public internet
-        # edge. See instance.py's `internal_hosts()` for the pairing caveat.
+        # Select index-aligned private hosts for node-to-node traffic.
         selected_hosts_private = self._select_hosts_config(bench_parameters)
         if not selected_hosts_private:
             Print.warn('There are not enough instances available (private IPs)')
             return
 
-        # Update nodes.
         print(selected_hosts)
         try:
             self._update(
@@ -995,7 +862,6 @@ class Bench:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to update nodes', e)
 
-        # Upload all configuration files.
         try:
             committee = self._config(
                 selected_hosts, selected_hosts_private,
@@ -1011,7 +877,6 @@ class Bench:
         except Exception as e:
             Print.warn(f'Failed to deploy monitoring on the metrics-collector: {e}')
 
-        # Run benchmarks.
         for n in bench_parameters.nodes:
             committee_copy = deepcopy(committee)
             committee_copy.remove_nodes(committee.size() - n)
@@ -1025,7 +890,6 @@ class Bench:
                 # Query metrics over this rate point's wall-clock window.
                 point_start = time.time()
 
-                # Run the benchmark.
                 run_committed_tps = []
                 for i in range(bench_parameters.runs):
                     Print.heading(f'Run {i+1}/{bench_parameters.runs}')
@@ -1107,7 +971,7 @@ class Bench:
 
         # Fetch a run-wide metrics export before the collector is destroyed.
         campaign_end = time.time()
-        # Widen the step for long runs to stay below Prometheus's point limit.
+        # Keep long range queries below Prometheus's point limit.
         campaign_step = max(1, ceil((campaign_end - campaign_start) / 10_000))
         try:
             self.fetch_collector_metrics(

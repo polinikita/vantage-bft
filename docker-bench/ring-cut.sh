@@ -1,18 +1,6 @@
 #!/usr/bin/env bash
-# ring-cut.sh -- rotationally symmetric DIRECTIONAL degradation: every node x
-# loses its outgoing application connections to the next K peers on the ring,
-# (x+1 .. x+K) mod n, where K = ceil(pct% of its n-1 peer links) -- at n=20 and
-# the default pct=10 that is K=2, i.e. ~10% of every node's connections.
-#
-# Directionality: the rules REJECT (tcp-reset) x's egress to the target peers'
-# LISTENING ports only (primary_to_primary and worker_to_worker from
-# manifest.json). x -> y application connections die immediately and cannot
-# reconnect; y -> x connections keep working, because x's packets on those
-# sockets carry an ephemeral destination port and pass. Every node therefore
-# has exactly K dead outgoing and K dead incoming links (from x-1..x-K), and
-# quorums remain available everywhere.
-#
-# Unlike blip.sh (single node <-> peer set), this installs rules on ALL nodes.
+# Apply directional cuts from each node to the next K peers in a ring.
+# Rules reject egress to peer listening ports while preserving quorum.
 #
 # Usage:
 #   docker-bench/ring-cut.sh apply [pct]      # install and leave in place
@@ -41,18 +29,12 @@ print(m['nodes'], m['node_ip_prefix'], m['node_ip_offset'],
       m['ports']['primary_to_primary'], m['ports']['worker_to_worker'])
 ")
 
-# K = ceil(pct% of the n-1 peer links of each node), never 0, never all peers.
+# K is the ceiling of pct% of each node's peer links, bounded to 1..n-1.
 K=$(( ((NODES - 1) * PCT + 99) / 100 ))
 [ "$K" -ge 1 ] || K=1
 [ "$K" -lt "$NODES" ] || { echo "ring-cut.sh: pct=$PCT cuts every peer" >&2; exit 2; }
 
-# RING_OFFSETS overrides which ring offsets are cut (comma-separated, e.g.
-# "7,13"). Default 1..K targets each node's immediate successors -- which is
-# maximally adversarial to round-robin leader succession (leader.rs walks
-# committee order, so slot s hands off to exactly the (x+1) edge). Distant
-# offsets keep the same loss fraction while leaving succession intact,
-# separating "tolerates asymmetric loss" from "tolerates loss aligned with
-# rotation".
+# RING_OFFSETS overrides the default offsets 1..K.
 if [ -n "${RING_OFFSETS:-}" ]; then
     IFS=',' read -r -a OFFSETS <<< "$RING_OFFSETS"
     for o in "${OFFSETS[@]}"; do
@@ -95,7 +77,7 @@ apply_all() {
     for (( x = 0; x < NODES; x++ )); do
         apply_node "$x"
     done
-    # Directional validation on the 0 -> (0+first-offset) edge.
+    # Check one cut edge and its reverse.
     local v=${OFFSETS[0]}
     if dexec 0 timeout 2 bash -c "echo > /dev/tcp/$(node_ip "$v")/$PORT_P2P" 2>/dev/null; then
         echo "ring-cut: VALIDATION FAILED -- node 0 can still reach node $v:$PORT_P2P" >&2

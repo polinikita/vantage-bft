@@ -1,12 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use super::panic;
 use super::*;
-use crate::{
-    common::{
-        certificate, committee, committee_with_base_port, header, header_from_cert, headers, keys,
-        listener, special_header, special_votes, votes,
-    },
-    header_waiter::HeaderWaiter,
+use crate::common::{
+    certificate, committee, committee_with_base_port, header, header_from_cert, headers, keys,
+    listener, votes,
 };
 use config::Parameters;
 use crypto::Hash;
@@ -14,8 +10,7 @@ use serial_test::serial;
 use std::{fs, time::Duration};
 use tokio::{sync::mpsc::channel, time::sleep};
 
-/// Returns a fresh metrics handle for tests that
-/// don't care about wire counters, matching every other `Core::spawn` caller's shape.
+/// Returns a fresh metrics handle for tests without wire-counter assertions.
 fn test_metrics() -> std::sync::Arc<Metrics> {
     Metrics::new(&prometheus::Registry::new()).0
 }
@@ -31,7 +26,6 @@ async fn process_header_missing_parent() {
     let committee = committee_with_base_port(13_000);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
-    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
@@ -42,18 +36,15 @@ async fn process_header_missing_parent() {
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
-    // Create a new test store.
     let path = ".db_test_process_header";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
-    // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
         name,
         &committee,
         store.clone(),
         /* tx_header_waiter */ tx_sync_headers,
-        /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
@@ -61,7 +52,6 @@ async fn process_header_missing_parent() {
 
     let parameters = Parameters::default();
 
-    // Spawn the core.
     Core::spawn(
         name,
         committee,
@@ -90,17 +80,11 @@ async fn process_header_missing_parent() {
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
-        // No latency injection.
         HashMap::new(),
-        // No data-plane withholding.
         None,
-        // No time-windowed withholding.
         None,
-        // Keep metrics last in the constructor argument list.
         test_metrics(),
         BatchConfig::default(),
-        // KNOB 2 (measurement ablation): appended last, same convention as
-        // `Core::spawn`'s own doc comment for this param.
         parameters.retry_backoff_max_ms,
     );
 
@@ -120,13 +104,11 @@ async fn process_header_missing_parent() {
     };
     let id = header_two.digest().clone();
 
-    // Send a header to the core.
     tx_primary_messages
         .send(PrimaryMessage::Header(header_two, false))
         .await
         .unwrap();
 
-    // Ensure the header is not stored.
     assert!(store.read(id.to_vec()).await.unwrap().is_none());
 }
 
@@ -137,7 +119,6 @@ async fn process_header_invalid_height() {
     let signature_service = SignatureService::new(secret);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
-    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
@@ -148,18 +129,15 @@ async fn process_header_invalid_height() {
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
-    // Create a new test store.
     let path = ".db_test_process_header_missing_parent";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
-    // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
         name,
         &committee(),
         store.clone(),
         /* tx_header_waiter */ tx_sync_headers,
-        /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
     let leader_elector = LeaderElector::new(committee().clone());
@@ -167,7 +145,6 @@ async fn process_header_invalid_height() {
 
     let parameters = Parameters::default();
 
-    // Spawn the core.
     Core::spawn(
         name,
         committee(),
@@ -196,22 +173,14 @@ async fn process_header_invalid_height() {
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
-        // Optional latency injection; empty keeps the default behavior.
-        // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
-        // No data-plane withholding.
         None,
-        // No time-windowed withholding.
         None,
-        // Keep metrics last in the constructor argument list.
         test_metrics(),
         BatchConfig::default(),
-        // KNOB 2 (measurement ablation): appended last, same convention as
-        // `Core::spawn`'s own doc comment for this param.
         parameters.retry_backoff_max_ms,
     );
 
-    // Send a header to the core.
     let header = Header {
         parent_cert: Certificate::genesis_cert(&committee()), //[Digest::default()].iter().cloned().collect(),
         height: 2,
@@ -223,10 +192,8 @@ async fn process_header_invalid_height() {
         .await
         .unwrap();
 
-    // Sleep to ensure header is processed
     sleep(Duration::from_millis(1000)).await;
 
-    // Ensure the header is not stored.
     assert!(store.read(id.to_vec()).await.unwrap().is_none());
 }
 
@@ -237,7 +204,6 @@ async fn process_header_missing_payload() {
     let signature_service = SignatureService::new(secret);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
-    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
@@ -248,18 +214,15 @@ async fn process_header_missing_payload() {
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
-    // Create a new test store.
     let path = ".db_test_process_header_missing_payload";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
-    // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
         name,
         &committee(),
         store.clone(),
         /* tx_header_waiter */ tx_sync_headers,
-        /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
     let leader_elector = LeaderElector::new(committee().clone());
@@ -267,7 +230,6 @@ async fn process_header_missing_payload() {
 
     let parameters = Parameters::default();
 
-    // Spawn the core.
     Core::spawn(
         name,
         committee(),
@@ -296,22 +258,14 @@ async fn process_header_missing_payload() {
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
-        // Optional latency injection; empty keeps the default behavior.
-        // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
-        // No data-plane withholding.
         None,
-        // No time-windowed withholding.
         None,
-        // Keep metrics last in the constructor argument list.
         test_metrics(),
         BatchConfig::default(),
-        // KNOB 2 (measurement ablation): appended last, same convention as
-        // `Core::spawn`'s own doc comment for this param.
         parameters.retry_backoff_max_ms,
     );
 
-    // Send a header to the core.
     let header = Header {
         payload: [(Digest::default(), 0)].iter().cloned().collect(),
         ..header()
@@ -322,7 +276,6 @@ async fn process_header_missing_payload() {
         .await
         .unwrap();
 
-    // Ensure the header is not stored.
     assert!(store.read(id.to_vec()).await.unwrap().is_none());
 }
 
@@ -335,7 +288,6 @@ async fn process_votes() {
     let committee = committee_with_base_port(13_100);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
-    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (tx_headers, rx_headers) = channel(1);
@@ -346,18 +298,15 @@ async fn process_votes() {
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
-    // Create a new test store.
     let path = ".db_test_process_vote";
     let _ = fs::remove_dir_all(path);
     let store = Store::new(path).unwrap();
 
-    // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
         name,
         &committee,
         store.clone(),
         /* tx_header_waiter */ tx_sync_headers,
-        /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
@@ -365,7 +314,6 @@ async fn process_votes() {
 
     let parameters = Parameters::default();
 
-    // Spawn the core.
     Core::spawn(
         name,
         committee.clone(),
@@ -394,33 +342,22 @@ async fn process_votes() {
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
-        // Optional latency injection; empty keeps the default behavior.
-        // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
-        // No data-plane withholding.
         None,
-        // No time-windowed withholding.
         None,
-        // Keep metrics last in the constructor argument list.
         test_metrics(),
         BatchConfig::default(),
-        // KNOB 2 (measurement ablation): appended last, same convention as
-        // `Core::spawn`'s own doc comment for this param.
         parameters.retry_backoff_max_ms,
     );
 
-    // Receive geneis parent cert from the proposer
     rx_parents.recv().await.unwrap();
 
     let header = header();
-    // Make the certificate we expect to receive.
     let expected = certificate(&header);
 
-    //Note: core uses Header::genesis instead of Header::default now
     tx_headers.send(header.clone()).await.unwrap();
     sleep(Duration::from_millis(500)).await;
 
-    // Send a votes to the core.
     for vote in votes(&header) {
         tx_primary_messages
             .send(PrimaryMessage::Vote(vote))
@@ -441,7 +378,6 @@ async fn process_certificates() {
     let signature_service = SignatureService::new(secret);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
-    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(3);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
@@ -452,18 +388,15 @@ async fn process_certificates() {
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
-    // Create a new test store.
     let path = ".db_test_process_certificates";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
-    // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
         name,
         &committee(),
         store.clone(),
         /* tx_header_waiter */ tx_sync_headers,
-        /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
     let leader_elector = LeaderElector::new(committee().clone());
@@ -471,7 +404,6 @@ async fn process_certificates() {
 
     let parameters = Parameters::default();
 
-    // Spawn the core.
     Core::spawn(
         name,
         committee(),
@@ -500,25 +432,16 @@ async fn process_certificates() {
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
-        // Optional latency injection; empty keeps the default behavior.
-        // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
-        // No data-plane withholding.
         None,
-        // No time-windowed withholding.
         None,
-        // Keep metrics last in the constructor argument list.
         test_metrics(),
         BatchConfig::default(),
-        // KNOB 2 (measurement ablation): appended last, same convention as
-        // `Core::spawn`'s own doc comment for this param.
         parameters.retry_backoff_max_ms,
     );
 
-    // Send enough certificates to the core.
     let certificates: Vec<Certificate> = headers().iter().map(certificate).collect();
 
-    // Send enough headers to the core.
     let headers_from_certs: Vec<Header> = certificates.iter().map(header_from_cert).collect();
 
     for x in headers().iter() {
@@ -535,7 +458,6 @@ async fn process_certificates() {
             .unwrap();
     }
 
-    // Ensure the certificates are stored.
     for x in &certificates {
         let stored = store.read(x.digest().to_vec()).await.unwrap();
         let serialized = bincode::serialize(x).unwrap();
@@ -554,7 +476,6 @@ async fn local_timeout_view() {
     let committee = committee_with_base_port(13_000);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
-    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (_tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
@@ -565,25 +486,21 @@ async fn local_timeout_view() {
     let (tx_info, _rx_info) = channel(1);
     let (_tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
 
-    // Create a new test store.
     let path = ".db_test_process_header";
     let _ = fs::remove_dir_all(path);
     let store = Store::new(path).unwrap();
 
-    // Spawn a listener to receive the vote.
     let address = committee
         .primary(&header().author)
         .unwrap()
         .primary_to_primary;
     let _handle = listener(address);
 
-    // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
         name,
         &committee,
         store.clone(),
         /* tx_header_waiter */ tx_sync_headers,
-        /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
     let leader_elector = LeaderElector::new(committee.clone());
@@ -591,7 +508,6 @@ async fn local_timeout_view() {
 
     let parameters = Parameters::default();
 
-    // Spawn the core.
     Core::spawn(
         name,
         committee.clone(),
@@ -620,19 +536,23 @@ async fn local_timeout_view() {
         parameters.simulate_asynchrony,
         parameters.asynchrony_start,
         parameters.asynchrony_duration,
-        // Optional latency injection; empty keeps the default behavior.
-        // (zero injected delay), matching every OTHER existing test's expectations.
         HashMap::new(),
-        // No data-plane withholding.
         None,
-        // No time-windowed withholding.
         None,
-        // Keep metrics last in the constructor argument list.
         test_metrics(),
         BatchConfig::default(),
-        // KNOB 2 (measurement ablation): appended last, same convention as
-        // `Core::spawn`'s own doc comment for this param.
         parameters.retry_backoff_max_ms,
     );
+}
 
+#[test]
+fn slot_period_gc_removes_only_committed_periods() {
+    let committed = 4;
+    let k = 3;
+
+    assert!(!keep_after_slot_period_gc(1, committed, k));
+    assert!(!keep_after_slot_period_gc(4, committed, k));
+    assert!(keep_after_slot_period_gc(2, committed, k));
+    assert!(keep_after_slot_period_gc(3, committed, k));
+    assert!(keep_after_slot_period_gc(7, committed, k));
 }

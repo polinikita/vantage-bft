@@ -3,13 +3,12 @@ mod avail_tests;
 mod chain_tests;
 mod claim_tests;
 mod common;
+mod install_tests;
 mod metrics_tests;
 mod registers_tests;
 mod repair_tests;
 mod retention_tests;
 mod sequence_tests;
-// Installation of verified sequence state.
-mod install_tests;
 
 mod agb_echo_tests;
 mod completion_tests;

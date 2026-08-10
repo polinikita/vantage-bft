@@ -18,7 +18,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[path = "tests/receiver_tests.rs"]
 pub mod receiver_tests;
 
-/// Convenient alias for the writer end of the TCP channel.
+/// Writer half of a framed TCP connection.
 pub type Writer = SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>;
 
 #[async_trait]
@@ -31,7 +31,7 @@ pub trait MessageHandler: Clone + Send + Sync + 'static {
 pub struct Receiver<Handler: MessageHandler> {
     /// Address to listen to.
     address: SocketAddr,
-    /// Struct responsible to define how to handle received messages.
+    /// Message handler.
     handler: Handler,
     /// Optional wire metrics. Received bytes include the four-byte frame length.
     metrics: Option<Arc<Metrics>>,
@@ -46,13 +46,12 @@ pub struct Receiver<Handler: MessageHandler> {
 }
 
 impl<Handler: MessageHandler> Receiver<Handler> {
-    /// Spawn a new network receiver handling connections from any incoming peer.
+    /// Spawns a receiver for incoming peer connections.
     pub fn spawn(address: SocketAddr, handler: Handler) {
         Self::spawn_full(address, handler, None, false, false, "unlabeled");
     }
 
-    /// Same as `spawn`, plus a `bytes_received_total` observation for every frame this
-    /// receiver's connections read (a no-op if `metrics` is `None`).
+    /// Spawns a receiver with optional per-frame byte metrics.
     pub fn spawn_with_metrics(
         address: SocketAddr,
         handler: Handler,
@@ -61,8 +60,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         Self::spawn_full(address, handler, metrics, false, false, "unlabeled");
     }
 
-    /// Full form with metrics, acknowledgement, batching, and listener settings.
-    /// `batch` must match the sender setting. `listener` labels inbound connections.
+    /// Full receiver configuration. Sender and receiver batching must match.
     pub fn spawn_full(
         address: SocketAddr,
         handler: Handler,
@@ -87,7 +85,6 @@ impl<Handler: MessageHandler> Receiver<Handler> {
 
     /// Accept connections and spawn one runner per connection.
     async fn run(&self) {
-        //println!("receiver address {}", self.address.clone().to_string());
         let listener = TcpListener::bind(&self.address)
             .await
             .expect("Failed to bind TCP port");
@@ -117,8 +114,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         }
     }
 
-    /// Spawn a new runner to handle a specific TCP connection. It receives messages and process them
-    /// using the provided handler.
+    /// Spawn a runner for one TCP connection.
     async fn spawn_runner(
         socket: TcpStream,
         peer: SocketAddr,
@@ -142,7 +138,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                         }
                         let payload = message.freeze();
 
-                        // Send the frame acknowledgement before dispatch.
+                        // Acknowledge before dispatching the frame.
                         if acks {
                             let _ = writer.send(Bytes::from("Ack")).await;
                         }

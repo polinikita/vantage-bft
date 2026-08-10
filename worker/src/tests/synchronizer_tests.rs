@@ -13,12 +13,10 @@ async fn synchronize() {
     let id = 0;
     let committee = committee_with_base_port(9_000);
 
-    // Create a new test store.
     let path = ".db_test_synchronize";
     let _ = fs::remove_dir_all(path);
     let store = Store::new(path).unwrap();
 
-    // Spawn a `Synchronizer` instance.
     let registry = prometheus::Registry::new();
     let (metrics, _reporter) = Metrics::new(&registry);
     Synchronizer::spawn(
@@ -26,16 +24,15 @@ async fn synchronize() {
         id,
         committee.clone(),
         store.clone(),
-        /* gc_depth */ 50, // Not used in this test.
-        /* sync_retry_delay */ 1_000_000, // Ensure it is not triggered.
-        /* sync_retry_nodes */ 3, // Not used in this test.
+        50,
+        1_000_000,
+        3,
         rx_message,
-        /* latency_map */ std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
         metrics,
         BatchConfig::default(),
     );
 
-    // Spawn a listener to receive our batch requests.
     let (target, _) = keys.pop().unwrap();
     let address = committee.worker(&target, &id).unwrap().worker_to_worker;
     let missing = vec![batch_digest()];
@@ -43,15 +40,13 @@ async fn synchronize() {
     let serialized = bincode::serialize(&message).unwrap();
     let handle = listener(address, Some(Bytes::from(serialized)));
 
-    // Send a sync request.
     let message = PrimaryWorkerMessage::Synchronize(missing, target);
     tx_message.send(message).await.unwrap();
 
-    // Ensure the target receives the sync request.
     assert!(handle.await.is_ok());
 }
 
-// Deferred misses are retried once and stale entries are evicted.
+/// Deferred misses are retried and stale entries are evicted.
 #[cfg(feature = "benchmark")]
 mod benchmark_metrics_tests {
     use super::*;
@@ -59,12 +54,7 @@ mod benchmark_metrics_tests {
     use crypto::Blake3Hasher;
     use metrics::Metrics;
 
-    /// Builds a `Synchronizer` directly, bypassing `::spawn` (which moves it into a
-    /// detached task and never hands ownership back) so a test can call
-    /// `observe_committed`/`finish_deferred_retry`/`metrics_waiter` and inspect
-    /// `pending_misses`/`observed_commits`/`observed_commits_order` directly. Same
-    /// child-module privacy as the rest of this file (`synchronizer_tests` is a
-    /// descendant of `synchronizer`, so its private fields are visible here).
+    /// Build a synchronizer directly so its metric state can be inspected.
     fn new_test_synchronizer(store: Store, metrics: Arc<Metrics>) -> Synchronizer {
         let mut keys = keys();
         let (name, _) = keys.pop().unwrap();
@@ -89,8 +79,7 @@ mod benchmark_metrics_tests {
         }
     }
 
-    /// §4 wire format: [1 B marker][8 B id, BE][8 B submission timestamp, LE] +
-    /// payload -- matches `node::client::Client::send`'s layout exactly.
+    /// Build a transaction using the client wire format.
     fn make_tx(id: u64, submitted_millis: u64, payload: &[u8]) -> Bytes {
         let mut tx = Vec::with_capacity(17 + payload.len());
         tx.push(1u8);
@@ -100,21 +89,14 @@ mod benchmark_metrics_tests {
         Bytes::from(tx)
     }
 
-    /// Content-addressed digest, mirroring `Processor::spawn`'s own
-    /// hash-the-wire-bytes convention exactly (not that these tests require a real
-    /// hash -- they fully control both what a digest "means" and what bytes get
-    /// written under it -- just that reusing the real convention costs nothing).
+    /// Compute the content-addressed digest used by the processor.
     fn digest_of(bytes: &[u8]) -> Digest {
         let mut hasher = Blake3Hasher::new();
         hasher.update(bytes);
         Digest(hasher.finalize().into())
     }
 
-    /// Reads one `v`-labeled quantile/stat gauge from a histogram family (the same
-    /// shape `HistogramReporter::report` publishes) directly off the registry --
-    /// mirrors `metrics::read_latency_snapshot`'s own private gauge-reading closure,
-    /// generalized to any metric name/label pair instead of the one hard-coded
-    /// family that function reads.
+    /// Read one labeled histogram statistic from the registry.
     fn read_histogram_gauge(
         registry: &prometheus::Registry,
         metric: &str,
@@ -161,8 +143,6 @@ mod benchmark_metrics_tests {
         let wire_bytes = bincode::serialize(&WorkerMessage::Batch(vec![tx.clone()])).unwrap();
         let digest = digest_of(&wire_bytes);
 
-        // --- MISS: the primary reports this digest as committed, but the batch has
-        // not yet arrived in this worker's store.
         let deferred = synchronizer
             .observe_committed(commit_millis, vec![digest.clone()])
             .await;
@@ -182,16 +162,11 @@ mod benchmark_metrics_tests {
             "the miss must be recorded with its ORIGINAL commit instant"
         );
 
-        // --- The batch subsequently lands in the store (mirrors `Processor::
-        // spawn`'s write, for either an own or a gossiped-others' batch -- both
-        // write through the same `Store`).
         store
             .clone()
             .write(digest.to_vec(), wire_bytes.clone())
             .await;
 
-        // --- Drive the retry exactly as `run`'s select loop would: `metrics_waiter`
-        // resolves once `store.notify_read` observes the write above. Never polled.
         let miss = deferred.into_iter().next().unwrap();
         let (resolved_digest, resolved_commit_millis) = Synchronizer::metrics_waiter(
             miss.digest,
@@ -207,7 +182,6 @@ mod benchmark_metrics_tests {
             .await;
         let materialise_upper_bound = now_millis();
 
-        // --- Counted exactly once.
         assert_eq!(metrics.committed_transactions.get(), 1);
         assert_eq!(metrics.committed_bytes.get(), tx.len() as u64);
         assert_eq!(metrics.latency_misses_resolved.get(), 1);
@@ -221,16 +195,12 @@ mod benchmark_metrics_tests {
             .pending_misses
             .contains_key(&(commit_millis, digest.clone())));
 
-        // --- The committed-latency series used the ORIGINAL commit instant...
         reporter.force_report();
         let committed_p50_micros =
             read_histogram_gauge(&registry, "transaction_committed_latency", "p50")
                 .expect("one observation must produce a p50");
         assert_eq!(committed_p50_micros, committed_latency_ms * 1_000);
 
-        // --- ...while the materialised-latency series used the LATER retry
-        // instant: strictly greater than the committed one, and bounded by the
-        // wall-clock window this test actually ran in.
         let materialised_p50_micros =
             read_histogram_gauge(&registry, "transaction_materialised_latency", "p50")
                 .expect("one observation must produce a p50");
@@ -248,7 +218,6 @@ mod benchmark_metrics_tests {
              [{materialised_lower}, {materialised_upper}] us"
         );
 
-        // --- Re-delivering the same digest (defensive dedup) must not double-count.
         let deferred_again = synchronizer
             .observe_committed(commit_millis + 1, vec![digest.clone()])
             .await;
@@ -296,8 +265,6 @@ mod benchmark_metrics_tests {
             .observed_commits_order
             .contains(&(old_commit_millis, old_hit_digest.clone())));
 
-        // Advance well past the retention window with a fresh, unrelated commit --
-        // pruning runs unconditionally at the top of every `observe_committed` call.
         let new_commit_millis = old_commit_millis + BENCHMARK_METRICS_RETENTION_MILLIS + 1;
         let fresh_tx = make_tx(3, new_commit_millis - 5, b"fresh");
         let fresh_bytes = bincode::serialize(&WorkerMessage::Batch(vec![fresh_tx])).unwrap();
@@ -312,17 +279,13 @@ mod benchmark_metrics_tests {
             .await;
         assert!(deferred_again.is_empty());
 
-        // The old miss and the old observed-digest bookkeeping are both evicted...
         assert!(synchronizer.pending_misses.is_empty());
         assert!(!synchronizer.observed_commits.contains(&old_hit_digest));
         assert!(!synchronizer
             .observed_commits_order
             .contains(&(old_commit_millis, old_hit_digest)));
-        // ...while the fresh digest just observed is unaffected.
         assert!(synchronizer.observed_commits.contains(&fresh_digest));
 
-        // The pruned miss's waiter was actually canceled (not just forgotten):
-        // driving it now resolves to `None`, exactly like a genuinely canceled wait.
         let miss = deferred.into_iter().next().unwrap();
         let resolved = Synchronizer::metrics_waiter(
             miss.digest,

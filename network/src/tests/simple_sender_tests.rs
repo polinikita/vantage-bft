@@ -5,16 +5,13 @@ use futures::future::try_join_all;
 
 #[tokio::test]
 async fn simple_send() {
-    // Run a TCP server.
     let address = "127.0.0.1:6100".parse::<SocketAddr>().unwrap();
     let message = "Hello, world!";
     let handle = listener(address, message.to_string());
 
-    // Make the network sender and send the message.
     let mut sender = SimpleSender::new();
     sender.send(address, Bytes::from(message)).await;
 
-    // Ensure the server received the message (ie. it did not panic).
     assert!(handle.await.is_ok());
 }
 
@@ -34,7 +31,6 @@ async fn sender_reconnects_once_the_peer_appears() {
 
     let message = "delivered after the peer came up";
     let handle = listener(address, message.to_string());
-    // Resend until the listener receives a frame.
     let delivered = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             sender.send(address, Bytes::from(message)).await;
@@ -58,7 +54,6 @@ async fn sends_to_an_unreachable_peer_do_not_block_the_caller() {
 
     let mut sender = SimpleSender::new();
     let flood = async {
-        // Exceed the channel capacity to exercise the drain path.
         for _ in 0..110_000 {
             sender.send(address, Bytes::from_static(b"x")).await;
         }
@@ -70,7 +65,6 @@ async fn sends_to_an_unreachable_peer_do_not_block_the_caller() {
 
 #[tokio::test]
 async fn broadcast() {
-    // Run 3 TCP servers.
     let message = "Hello, world!";
     let (handles, addresses): (Vec<_>, Vec<_>) = (0..3)
         .map(|x| {
@@ -83,10 +77,8 @@ async fn broadcast() {
         .into_iter()
         .unzip();
 
-    // Make the network sender and send the message.
     let mut sender = SimpleSender::new();
     sender.broadcast(addresses, Bytes::from(message)).await;
 
-    // Ensure all servers received the broadcast.
     assert!(try_join_all(handles).await.is_ok());
 }

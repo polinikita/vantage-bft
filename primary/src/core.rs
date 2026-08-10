@@ -20,13 +20,13 @@ use futures::{Future, StreamExt};
 use log::{debug, error, warn};
 use metrics::Metrics;
 use network::{BatchConfig, CancelHandler, ReliableSender};
+use std::cmp::max;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use std::cmp::max;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -34,80 +34,44 @@ use tokio::sync::mpsc::{Receiver, Sender};
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
 
-/// clippy::type_complexity: named alias for the pinned boxed timer-future type shared
-/// by `timer_futures`/`async_timer_futures` below (both resolve to `(Slot, View)`).
+/// Timer future shared by normal and injected-asynchrony paths.
 type SlotViewTimerFuture = Pin<Box<dyn Future<Output = (Slot, View)> + Send>>;
 
+fn keep_after_slot_period_gc(candidate: Slot, committed: Slot, k: Slot) -> bool {
+    debug_assert!(k > 0);
+    candidate > committed || candidate % k != committed % k
+}
+
 pub struct Core {
-    /// The public key of this primary.
     name: PublicKey,
-    /// The committee information.
     committee: Committee,
-    /// The persistent storage.
     store: Store,
-    /// Handles synchronization with other nodes and our workers.
     synchronizer: Synchronizer,
-    /// Service to sign headers.
     signature_service: SignatureService,
-    /// The current consensus round (used for cleanup).
     consensus_round: Arc<AtomicU64>,
-    /// The depth of the garbage collector.
     gc_depth: Height,
 
-    /// Receiver for dag messages (headers, votes, certificates).
     rx_primaries: Receiver<PrimaryMessage>,
-    /// Receives loopback headers from the `HeaderWaiter`.
     rx_header_waiter: Receiver<Header>,
-    /// Receives loopback instances from the 'HeaderWaiter'
     rx_header_waiter_instances: Receiver<(ConsensusMessage, Header)>,
-    /// Receives our newly created headers from the `Proposer`.
     rx_proposer: Receiver<Header>,
-    // Output all certificates to the consensus Dag view
     tx_committer: Sender<ConsensusMessage>,
-
-    /// Send a valid parent certificate to the `Proposer`
     tx_proposer: Sender<Certificate>,
-    // Receive sync requests for headers required at the consensus layer
     rx_request_header_sync: Receiver<Digest>,
 
-    /// The last garbage collected round.
     gc_round: Height,
-
-    /// The authors of the last voted headers. (Ensures only voting for one header per round)
+    /// Authors voted for in each height.
     last_voted: HashMap<Height, HashSet<PublicKey>>,
-    /// The last header we proposed (for which we are waiting votes).
     current_header: Header,
-    // Whether we have already sent certificate to proposer
     sent_cert_to_proposer: bool,
-
-    // /// Aggregates votes into a certificate.
     votes_aggregator: VotesAggregator,
 
     network: ReliableSender,
-    /// Data-plane withholding fault injector (`Parameters::withhold_senders`),
-    /// resolved once by the caller (`Primary::spawn`, via `config::
-    /// withheld_destinations`) -- same "doesn't otherwise take a `Parameters`"
-    /// reasoning as `network`'s own `latency_map` argument at `spawn`. `None` (the
-    /// default, and always the case when `--withhold` is 0) means this node's header
-    /// broadcasts are untouched: `process_own_header`'s address list is built exactly
-    /// as before. `Some(blocked)` means this node IS a withholding sender -- its own
-    /// header-broadcast address list excludes every peer in `blocked`.
+    /// Header recipients blocked by fault injection.
     withheld_header_dests: Option<HashSet<PublicKey>>,
-    /// Data-plane withholding fault injector, TIME-WINDOWED variant
-    /// (`Parameters::withhold_window`), resolved once by the caller (`Primary::
-    /// spawn`, a plain clone of `parameters.withhold_window`) -- same
-    /// resolved-by-caller convention as `withheld_header_dests` just above. Consulted
-    /// (via `config::withhold_active`) once per header in `process_own_header`, ONLY
-    /// when `withheld_header_dests` is `Some` -- see that method's own comment.
+    /// Optional active window for withholding.
     withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
-    /// This node's metrics handle, kept
-    /// (not just handed to `network`'s `with_metrics` below) so `process_own_header`
-    /// can observe `proposed_header_size_bytes` at the same publish point Vantage's
-    /// `vantage::wire::Wire::broadcast_message` does. A bare `Arc`, not
-    /// `Option<Arc<_>>` (unlike `Wire`'s): `Core::spawn` always receives a real
-    /// handle and there is no unit-test construction path here that omits one.
     metrics: Arc<Metrics>,
-    /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Height, Vec<CancelHandler>>,
     consensus_cancel_handlers: HashMap<Slot, Vec<CancelHandler>>,
 
@@ -120,10 +84,9 @@ pub struct Core {
     last_voted_consensus: HashSet<(Slot, View)>,
     timer_futures: FuturesUnordered<SlotViewTimerFuture>,
     high_proposals: HashMap<Slot, ConsensusMessage>,
-    high_qcs: HashMap<Slot, ConsensusMessage>, // NOTE: Store the latest QC for each slot
+    /// Latest quorum certificate per slot.
+    high_qcs: HashMap<Slot, ConsensusMessage>,
     qc_makers: HashMap<(Slot, Digest), QCMaker>,
-    // pqc_makers: HashMap<(Slot, View), QCMaker>,
-    // cqc_makers: HashMap<(Slot, View), QCMaker>,
     current_qcs_formed: usize,
     tc_makers: HashMap<(Slot, View), TCMaker>,
     prepare_tickets: VecDeque<ConsensusMessage>,
@@ -131,58 +94,27 @@ pub struct Core {
     tx_info: Sender<ConsensusMessage>,
     leader_elector: LeaderElector,
     timeout_delay: u64,
-    // GC the vote aggregators and current headers
-    // gc_map: HashMap<Round, Digest>,
     committed_slots: HashMap<Slot, CommitQC>,
     last_committed_slot: u64,
-    // If we just check that s-k is committed, but all it's predecessors are not, then we may still open an arbitrary number of instances in the absolute worst case
-    // E.g. s-1 has not committed, but s has, so we can open s+k
 
-    use_fast_path: bool,          // Autobahn only; default = true
+    use_fast_path: bool,
     use_optimistic_tips: bool,
     use_parallel_proposals: bool,
-    k: u64, //limit k on number of open honest instances (k+f instances can be open) => if require QC, then hard limit to k.
+    /// Maximum number of open honest instances.
+    k: u64,
     fast_path_timeout: u64,
 
     use_ride_share: bool,
     car_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Vote> + Send>>>,
-    fast_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ConsensusVote> + Send>>>, // Use this one for Fast Path on external Consensus case
+    fast_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ConsensusVote> + Send>>>,
 
-    /// Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: on the external path,
-    /// replicas broadcast Prepare-Votes/Confirm-Acks and assemble PrepareQC/ConfirmQC
-    /// locally instead of unicasting votes to the leader. `false` (default) is
-    /// The flag controls the guarded branch.
+    /// Whether replicas broadcast votes and assemble certificates locally.
     all_to_all: bool,
-    /// All-to-all only: votes for a consensus instance that arrived before this node
-    /// registered that instance locally (it hasn't yet received/processed the
-    /// leader's Prepare, or hasn't yet locally formed the PrepareQC that synthesizes
-    /// the Confirm instance). Dropping these outright (as the leader-collected path
-    /// safely does, since only the leader -- who always has the instance -- ever
-    /// collects votes) would risk never reaching 2f+1/3f+1 under all-to-all, i.e. a
-    /// liveness bug. Drained into `process_consensus_vote` as soon as the matching
-    /// instance is registered (`process_consensus_request`'s Prepare registration,
-    /// and the synthesized-Confirm registration in `all_to_all_synthesize_confirm`).
-    ///
-    /// Keyed `Slot -> Digest -> Author` (see `buffer_pending_consensus_vote`) so it is
-    /// bounded on FOUR independent axes against a Byzantine sender, not just the
-    /// slot: (1) the slot window `is_sane_pending_vote_slot` enforces (O(k)); (2) a
-    /// cap on the number of DISTINCT digests buffered per slot
-    /// (`pending_vote_digest_cap`, O(n)) -- without this a single Byzantine author
-    /// emitting endless fresh, self-signed-but-garbage digests for one slot would
-    /// grow this map without bound; (3) a real-committee-member check on `vote.author`
-    /// before ever buffering (`process_consensus_vote`'s buffering branch) -- without
-    /// this an attacker could mint unlimited throwaway keypairs and self-sign each as
-    /// a distinct "author" of one already-admitted digest (`sig.verify` alone only
-    /// checks the signature against whatever pubkey is claimed, not committee
-    /// membership), which axis (4) alone would not catch; (4) per-author dedup within
-    /// a `(slot, digest)` bucket (at most one buffered vote per REAL author, mirroring
-    /// `QCMaker::append`'s `used`-author-set) -- bounds each digest bucket to
-    /// `committee.size()` entries given (3). Overall worst case is O(k * n * n)
-    /// buffered votes. GC'd alongside `consensus_instances` in `clean_slot_periods`.
-    /// Always empty when `all_to_all` is false.
+    /// Early all-to-all votes, bounded by slot, digest, and committee author.
+    /// Entries are drained when the matching consensus instance is registered.
     pending_consensus_votes: HashMap<Slot, HashMap<Digest, HashMap<PublicKey, ConsensusVote>>>,
 
-    //asynchrony simulation,
+    /// Asynchrony fault-injection settings.
     simulate_asynchrony: bool,
     asynchrony_start: u64,
     asynchrony_duration: u64,
@@ -193,7 +125,6 @@ pub struct Core {
 }
 
 impl Core {
-    // clippy::too_many_arguments: see `Committer::spawn`'s identical justification.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -225,23 +156,16 @@ impl Core {
         asynchrony_start: u64,
         asynchrony_duration: u64,
 
-        // Per-destination latency, resolved by the caller. Empty means disabled.
         latency_map: HashMap<SocketAddr, Duration>,
-        // Data-plane withholding destinations, resolved by the caller.
         withheld_header_dests: Option<HashSet<PublicKey>>,
-        // Time-windowed data-plane withholding, resolved by the caller.
         withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
-        // Wire-metrics handle attached to the network sender.
         metrics: Arc<Metrics>,
-        // Transport-level batching.
         batch: BatchConfig,
-        // Transport retry backoff, resolved by the caller.
         retry_backoff_max_ms: u64,
     ) {
         tokio::spawn(async move {
             Self {
                 name,
-                //current_header: Header::genesis(&committee),
                 committee,
                 store,
                 synchronizer,
@@ -268,9 +192,6 @@ impl Core {
                     .with_latency(latency_map)
                     .with_metrics(metrics)
                     .with_batching(batch)
-                    // KNOB 2 (measurement ablation): applies to Autobahn's own
-                    // primary-to-primary pool too -- see `retry_backoff_max_ms`'s
-                    // own doc comment on this fn's signature.
                     .with_retry_backoff_max_ms(retry_backoff_max_ms),
                 withheld_header_dests,
                 withhold_window,
@@ -286,17 +207,14 @@ impl Core {
                 high_qcs: HashMap::with_capacity(2 * gc_depth as usize),
                 high_proposals: HashMap::with_capacity(2 * gc_depth as usize),
                 qc_makers: HashMap::with_capacity(2 * gc_depth as usize),
-                // pqc_makers: HashMap::with_capacity(2 * gc_depth as usize),
-                // cqc_makers: HashMap::with_capacity(2 * gc_depth as usize),
                 tc_makers: HashMap::with_capacity(2 * gc_depth as usize),
                 prepare_tickets: VecDeque::with_capacity(2 * gc_depth as usize),
                 timeout_delay,
                 timer_futures: FuturesUnordered::new(),
-                //gc_map: HashMap::with_capacity(2 * gc_depth as usize),
                 committed_slots: HashMap::with_capacity(2 * gc_depth as usize),
                 last_committed_slot: 0,
 
-                use_fast_path,          //default = true
+                use_fast_path,
                 use_optimistic_tips,
                 use_parallel_proposals,
                 k,
@@ -326,17 +244,12 @@ impl Core {
             header.consensus_messages.len()
         );
 
-
-        // Update the current header we are collecting votes for
         self.current_header = header.clone();
-        // Indicate that we haven't sent a cert yet for this header
         self.sent_cert_to_proposer = false;
-
-        // Reset the votes aggregator.
         self.votes_aggregator = VotesAggregator::new();
 
         match self.use_optimistic_tips {
-            //Add early here, so that enough coverage will include leader tip.
+            // Include the leader tip in the coverage check.
             true => self.current_proposal_tips.insert(
                 header.origin(),
                 Proposal {
@@ -353,12 +266,10 @@ impl Core {
             ),
         };
 
-        // Augment consensus messages with latest prepares
         for consensus in header.consensus_messages.values_mut() {
             self.set_consensus_proposal(consensus);
         }
 
-        //Set all consensus instances
         for (dig, consensus) in &header.consensus_messages {
             match consensus {
                 ConsensusMessage::Prepare {
@@ -384,15 +295,7 @@ impl Core {
             };
         }
 
-        // Broadcast the new header in a reliable manner. Data-plane withholding fault
-        // injector: `withheld_header_dests` is `None` unless THIS node is a
-        // withholding sender (`--withhold`), so the `is_none_or` below is a single
-        // cheap branch -- no allocation, no perturbation -- on the default path. When
-        // it IS `Some`, whether the filter actually excludes anyone additionally
-        // depends on `withhold_window` (`--withhold-at`/`--withhold-for`) -- see
-        // `config::withhold_active`'s own doc comment. `--withhold` without
-        // `--withhold-at` (`withhold_window: None`) is always active, so this
-        // reproduces c35fc4a's original whole-run filtering exactly.
+        // Exclude fault-injection targets only while withholding is active.
         let withhold_active =
             config::withhold_active(self.withhold_window.as_deref(), Instant::now());
         let addresses = self
@@ -417,21 +320,12 @@ impl Core {
             .or_default()
             .extend(handlers);
 
-        // Record the serialized header size at publish time, separately from
-        // serialized header size at publish time -- separate from the wire-envelope
-        // bytes just broadcast above (`PrimaryMessage::Header(_, false)` adds a
-        // small enum tag plus the `sync` bool on top of the header itself). Mirrors
-        // `vantage::wire::Wire::broadcast_message`'s own `proposed_header_size_bytes`
-        // observation, the shared instrumentation point for Vantage/Simple-IT's own
-        // `Header` publish; this call site is the equivalent shared point for both
-        // Autobahn variants (`process_own_header` is not specialized by
-        // `use_optimistic_tips`/`use_parallel_proposals` etc.).
+        // Measure the header without its wire envelope.
         let header_bytes = bincode::serialize(&header).expect("Failed to serialize header");
         self.metrics
             .proposed_header_size_bytes
             .observe(header_bytes.len());
 
-        // Process the header.
         self.process_header(header, false).await
     }
 
@@ -440,8 +334,7 @@ impl Core {
         debug!("Processing Header:  {:?}", header);
         debug!("Processing the header with height {:?}", header.height);
 
-        // Check the parent certificate. Ensure the certificate contains a quorum of votes and is
-        // at the preivous height
+        // The parent certificate must precede this header and meet quorum.
         let stake: Stake = header
             .parent_cert
             .votes
@@ -461,14 +354,13 @@ impl Core {
         );
         debug!("Past header parent cert stake check");
 
-        // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
-        // reschedule processing of this header once we have it.
+        // Retry the header after its payload arrives.
         if self.synchronizer.missing_payload(&header, sync).await? {
             debug!("Processing of {} suspended: missing payload", header);
             return Ok(());
         }
 
-        // By FIFO should have parent of this header (and recursively all ancestors), reschedule for processing if we don't
+        // Retry the header after its parent arrives.
         if self
             .synchronizer
             .get_parent_header(&header)
@@ -479,10 +371,8 @@ impl Core {
             return Ok(());
         }
 
-        // Check whether we can seamlessly vote for all consensus messages, if not reschedule
+        // Wait until every embedded consensus message is ready.
         if !self.is_consensus_ready(&header).await {
-            // NOTE: This blocks if prepare tips are not available, the leader of the prepare takes
-            // on the responsibility of possible blocking i.e. its lane won't continue
             debug!("Can't vote for prepare, need to sync on missing tips, suspending processing");
             return Ok(());
         }
@@ -493,7 +383,7 @@ impl Core {
         let bytes = bincode::serialize(&header).expect("Failed to serialize header");
         self.store.write(header.digest().to_vec(), bytes).await;
 
-        // If the header received is at a greater height then add it to our local tips and proposals
+        // Update local tips and proposals for a higher header.
         if self.use_optimistic_tips
             && header.height()
                 > self
@@ -511,7 +401,7 @@ impl Core {
             );
             debug!("updating tip");
 
-            // Since we received a new tip, check if any of our pending tickets are ready
+            // Recheck pending tickets after receiving a tip.
             self.try_prepare_waiting_slots().await?;
         }
 
@@ -532,33 +422,29 @@ impl Core {
             );
             debug!("updating tip");
 
-            // Since we received a new tip, check if any of our pending tickets are ready
+            // Recheck pending tickets after receiving a tip.
             self.try_prepare_waiting_slots().await?;
         }
 
         debug!("after tip height check");
 
-        // Process the parent certificate
         self.process_certificate(header.clone().parent_cert).await?;
 
-        //If Header has no consensus messages (i.e. is pure car) then only 2f+1 replicas need to vote and reply.
+        // Pure dissemination headers require only the selected quorum.
         if header.consensus_messages.is_empty() && !self.check_cast_vote(&header) {
             return Ok(());
         }
 
-        // Check if we can vote for this header.
         if self
             .last_voted
             .entry(header.height())
             .or_default()
             .insert(header.author)
         {
-            // Process the consensus instances contained in the header (if any)
             let consensus_votes = self.process_consensus_messages(&header).await?;
 
             debug!("Consensus sigs length {:?}", consensus_votes.len());
 
-            // Create a vote for the header and any valid consensus instances
             let vote = Vote::new(
                 &header,
                 &self.name,
@@ -594,17 +480,17 @@ impl Core {
     }
 
     fn check_cast_vote(&self, header: &Header) -> bool {
-        //Only 2f+1 replicas need to vote for cars; i.e. skip f //Alternatively: Consider yourself a voter if name within 2f+1 after author
+        // Select 2f+1 voters following the header author in committee order.
         let mut start = false;
-        let mut count = 1; //start at 1, f do not need to vote.
+        let mut count = 1;
 
         let mut iter = self.committee.authorities.iter();
 
-        //find origin position. After that identify first f that should not send.
+        // Find the author's position.
         while count < self.committee.validity_threshold() {
             let x = iter.next();
             if x.is_none() {
-                iter = self.committee.authorities.iter(); //wrap around
+                iter = self.committee.authorities.iter();
                 continue;
             }
             let (id, _) = x.unwrap();
@@ -622,41 +508,25 @@ impl Core {
         }
         debug!("CAST VOTE for header: {}", header.id);
         true
-
-        //Alternatively: Count 2f+1 that should send.
-        //         iter = self.committee.authorities.iter(); //wrap around
-        //         continue;
-        //         start = true;
-        //         count += 1;
     }
 
     #[async_recursion]
     async fn process_vote(&mut self, vote: Vote, is_loopback: bool) -> DagResult<()> {
         debug!("Processing Vote {:?}", vote);
 
-        // NOTE: If sending externally then need map of open consensus instances
+        let consensus_loopback = is_loopback && !vote.consensus_votes.is_empty();
 
-        //If consensus vote loopback => Look up digest directly instead of via current instance.
-        let consensus_loopback = is_loopback && !vote.consensus_votes.is_empty(); //vote.consensus_instance.is_some();
-
-        // Only process votes for the current header (or loopbacks for consensus)
+        // Process only current-header votes and consensus loopbacks.
         if vote.id != self.current_header.id || consensus_loopback {
             return Ok(());
         }
 
-        //Invariant: All votes contain the same content (i.e. it's not the case that some of them carry things like timeouts etc)
-        //Wait to form num_active instance many QCs
-
-        //Car should still vote even if consensus says No.
-
         let num_active_consensus_messages = self.current_header.num_active_instances;
         debug!("num active instances {:?}", num_active_consensus_messages);
 
-        // Iterate through vote for each consensus instance
         for (slot, digest, sig) in vote.consensus_votes.iter() {
             debug!("current header {:?}", self.current_header);
             debug!("digest is {:?}", digest);
-            //Get vote type of the instance: Prepare/Confirm-vote
 
             let opt_curr_instance = self.consensus_instances.get(&(*slot, digest.clone()));
             if opt_curr_instance.is_none() {
@@ -666,7 +536,6 @@ impl Core {
             let current_instance = opt_curr_instance.unwrap();
 
             if !is_loopback && vote.author != self.name {
-                //Verify signature. Could optimize performance by only verifying after forming a batch, and use parallel batch_verification
                 sig.verify(&current_instance.digest(), &vote.author)?;
             }
 
@@ -674,15 +543,8 @@ impl Core {
                 .qc_makers
                 .entry((*slot, digest.clone()))
                 .or_insert(QCMaker::new());
-            //     _ => unreachable!("Should never try and fetch a qc_maker for Commit"),
 
-            //    // If not already a qc maker for this consensus instance message, create one
-            //         Some(_) => {
-            //         None => {
-
-            //     // Otherwise get the qc maker for this instance
-
-            //Configure qc_maker to try to use Fast Path
+            // Configure fast-path quorum collection.
             qc_maker.try_fast = match current_instance {
                 ConsensusMessage::Prepare {
                     slot: _,
@@ -690,54 +552,36 @@ impl Core {
                     tc: _,
                     qc_ticket: _,
                     proposals: _,
-                } => self.use_fast_path, //Only PrepareQC should try to compute a FastQC
+                } => self.use_fast_path,
                 _ => false,
             };
 
-
-            // Add vote to qc maker, if a QC forms then create a new consensus instance
-            // external messages
-
-            //If qc_ready, but qc_opt = None => This is first Slow QC;
-            //If qc_ready and qc_opt => This is FastQC or Consumption of Loopback to fetch SlowQC
             let (qc_ready, qc_opt) = match is_loopback {
                 false => {
                     qc_maker.append(vote.author, (digest.clone(), sig.clone()), &self.committee)?
                 }
                 true => {
-                    qc_maker.try_fast = false; //turn back to normal path handling
+                    qc_maker.try_fast = false;
                     qc_maker.get_qc()?
                 }
             };
 
             if qc_ready {
                 if qc_opt.is_none() && self.use_fast_path {
-                    // Slow QC is available but we should wait for Fast
-                    //Start timer for Fast:
-                    //Creates a dummy vote with the same id as this vote, but only the waiting digest as consensus sigs
-                    //Upon triggering timer, it will call loopback again, which will get the QC and proceed.
-                    //By including only the digest of the missing instance we avoid duplicates.
-                    //Alternatively could modify QCMaker such that it wipes the QC after first use
-
+                    // Recheck the slow quorum after the fast-path timeout.
                     let t_vote = Vote {
-                        id: Digest::default(), //vote.id.clone(),
+                        id: Digest::default(),
                         height: 0,
                         origin: PublicKey::default(),
                         author: PublicKey::default(),
                         signature: Signature::default(),
                         consensus_votes: vec![(*slot, digest.clone(), Signature::default())],
-                        //consensus_instance: Some(current_instance.clone()), //Buffer instance. Current header could've advanced in the meantime and thus no longer include this instance by the time timer triggers
                     };
                     let fast_timer = CarTimer::new(t_vote, self.fast_path_timeout);
                     self.car_timer_futures.push(Box::pin(fast_timer));
                 } else if let Some(qc) = qc_opt {
-                    //If QC = some (i.e. FastPathQC succeed, or SlowPathQC suceed if running without FP)
                     self.current_qcs_formed += 1;
 
-                    //     .current_header
-                    //     .consensus_messages
-                    //     .get(&digest)
-                    //     .unwrap();
                     match current_instance {
                         ConsensusMessage::Prepare {
                             slot,
@@ -753,13 +597,6 @@ impl Core {
                                 view,
                                 current_instance.digest()
                             );
-
-                            // Create a tip proposal for the header which contains the prepare message, so that it can be committed as part of the proposals
-                            /*let leader_tip_proposal: Proposal = Proposal {header_digest: self.current_header.digest(), height: self.current_header.height(),};
-                            // Add this cert to the proposals for this instance
-                            let mut new_proposals = proposals.clone();
-                            new_proposals.insert(self.name, leader_tip_proposal);*/
-
                             let new_consensus_message = match qc_maker.try_fast {
                                 true => {
                                     debug!("taking fast path!");
@@ -769,7 +606,7 @@ impl Core {
                                         qc,
                                         proposals: proposals.clone(),
                                     }
-                                } // Create Commit if we have FastPrepareQC
+                                }
                                 false => ConsensusMessage::Confirm {
                                     slot: *slot,
                                     view: *view,
@@ -778,7 +615,6 @@ impl Core {
                                 },
                             };
 
-                            // Send this new instance to the proposer
                             self.tx_info
                                 .send(new_consensus_message)
                                 .await
@@ -798,7 +634,6 @@ impl Core {
                                 proposals: proposals.clone(),
                             };
 
-                            // Send this new instance to the proposer
                             self.tx_info
                                 .send(new_consensus_message)
                                 .await
@@ -815,31 +650,25 @@ impl Core {
             }
         }
 
-        // If there are some consensus instances in the header then wait for 2f+1 votes to form QCs
-        //NEW: Consider consensus ready if there is nothing we need to wait for either!
+        // Wait for every active consensus instance.
         let consensus_ready: bool = self.current_header.consensus_messages.is_empty()
             || self.current_qcs_formed == num_active_consensus_messages;
 
-        //Next: Check whether Car is ready to go
         let vote_id = vote.id.clone();
         let car_timeout = is_loopback && vote.consensus_votes.is_empty();
 
-        // Add the vote to the votes aggregator for the actual header
-        //Note: car_cert_ready is true if QC exists (f+1 votes); first = true when QC is formed the first time (this starts timer only once)
-        //=> aggregator will ignore new votes after (in particular it will ignore the fake loopback vote)
+        // Add the vote to the header certificate.
         let (car_cert_ready, first) =
             self.votes_aggregator
                 .append(vote, &self.committee, &self.current_header)?;
 
-        //Consider consensus "ready" if we timed out (i.e. just move on without waiting for consensus)
+        // A timeout stops waiting for embedded consensus.
         let consensus_ready = consensus_ready || car_timeout;
-        //only take the dissemination QC if consensus is ready, or we have timed out (this avoids needless copies)
         let dissemination_cert = match car_cert_ready && consensus_ready {
-            true => self.votes_aggregator.get()?, //Get will only return Cert ONCE. I.e. if timer loopbacks after it's already been used, then nothing happens.
+            true => self.votes_aggregator.get()?,
             false => None,
         };
 
-        //New: dissemination ready as soon as
         let dissemination_ready: bool = car_cert_ready && dissemination_cert.is_some();
 
         debug!(
@@ -847,24 +676,21 @@ impl Core {
             self.sent_cert_to_proposer, dissemination_ready, consensus_ready
         );
 
-        //If ready to disseminate car (dissemination cert exists) but waiting for consensus
+        // Start one timeout while the dissemination certificate waits for consensus.
         if dissemination_ready && !consensus_ready && first {
-            //first => start only one Timer
             let t_vote = Vote {
                 id: vote_id,
                 height: 0,
                 origin: PublicKey::default(),
                 author: PublicKey::default(),
                 signature: Signature::default(),
-                consensus_votes: vec![], //Create dummy vote with no sigs => this indicates its the Car timeout
-                                         //consensus_instance: None
+                consensus_votes: vec![],
             };
             let fast_timer = CarTimer::new(t_vote, self.fast_path_timeout);
             self.car_timer_futures.push(Box::pin(fast_timer));
         }
 
         if !self.sent_cert_to_proposer && (dissemination_ready && consensus_ready) {
-
             self.tx_proposer
                 .send(dissemination_cert.unwrap())
                 .await
@@ -874,20 +700,10 @@ impl Core {
             self.current_qcs_formed = 0;
         }
 
-        // will add this when the fast path is added
         Ok(())
     }
 
-    // P3-1 fix: deliberately NOT `#[async_recursion]` -- that macro boxes/heap-
-    // allocates this fn's future on EVERY call, including the entire flag-off path
-    // (the leader-collected baseline this flag is benchmarked against), which is a
-    // real perf regression versus today. The one place this fn needs to call back
-    // into itself (all-to-all's synthesized Confirm-vote, Change 2) is isolated in
-    // `all_to_all_synthesize_confirm` below and boxed only at ITS call site
-    // (`Box::pin(...)`, all-to-all only) -- `Box<T>` is pointer-sized regardless of
-    // `T`, so that single boxed edge is enough to give this fn's own future a finite
-    // size without needing `#[async_recursion]` here. Flag-off never takes that path,
-    // so it stays a plain, unboxed `async fn` exactly like before this flag existed.
+    // The recursive all-to-all call is boxed at its call site.
     async fn process_consensus_vote(
         &mut self,
         vote: ConsensusVote,
@@ -899,27 +715,9 @@ impl Core {
             .consensus_instances
             .get(&(vote.slot, vote.digest.clone()));
         if opt_curr_instance.is_none() {
-            // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: unlike the
-            // leader-collected path (only the leader, who always already has the
-            // instance, ever collects votes), a peer's vote can race ahead of this
-            // node's own instance registration. Buffer instead of dropping so a
-            // straggling-but-honest vote can't cost the 2f+1/3f+1 needed for liveness.
-            // See `buffer_pending_consensus_vote` for the bounds that keep this safe
-            // against a Byzantine sender.
+            // All-to-all votes may arrive before local instance registration.
             if self.all_to_all && !is_loopback {
-                // P2-1 fix: require a real committee author before buffering (mirrors
-                // `ConsensusVote::verify`, which this inline check otherwise doesn't
-                // fully replicate). Without this, an attacker can mint an unlimited
-                // number of throwaway keypairs, self-sign each one as a distinct
-                // "author" of the SAME already-admitted digest, and pass
-                // `sig.verify` trivially (it only checks the signature against
-                // whatever pubkey is claimed, not committee membership) -- defeating
-                // the per-author dedup below, which only bounds REPEATS by the SAME
-                // author, not the number of distinct (fake) authors. Rejecting
-                // non-members up front bounds the per-digest author axis to
-                // `committee.size()` real authorities, which is what makes the
-                // O(n^2 * window) bound in `pending_consensus_votes`'s doc comment
-                // actually hold.
+                // Membership bounds the buffered author set.
                 if self.committee.stake(&vote.author) == 0 {
                     debug!(
                         "dropping all-to-all pending vote from unknown authority {}",
@@ -928,7 +726,6 @@ impl Core {
                     return Ok(());
                 }
                 if vote.author != self.name {
-                    //Verify signature before buffering untrusted data.
                     vote.sig.verify(&vote.digest, &vote.author)?;
                 }
                 if self.is_sane_pending_vote_slot(vote.slot) {
@@ -941,20 +738,16 @@ impl Core {
         }
 
         if !is_loopback && vote.author != self.name {
-            //Verify signature. Could optimize performance by only verifying after forming a batch, and use parallel batch_verification
             vote.sig.verify(&vote.digest, &vote.author)?;
         }
 
         let current_instance = opt_curr_instance.unwrap();
-        //Invariant: All votes contain the same content (i.e. it's not the case that some of them carry things like timeouts etc)
-        //Wait to form num_active instance many QCs
-
         let qc_maker = self
             .qc_makers
             .entry((vote.slot, vote.digest.clone()))
             .or_insert(QCMaker::new());
 
-        //Configure qc_maker to try to use Fast Path
+        // Configure fast-path quorum collection.
         qc_maker.try_fast = match current_instance {
             ConsensusMessage::Prepare {
                 slot: _,
@@ -962,14 +755,11 @@ impl Core {
                 tc: _,
                 qc_ticket: _,
                 proposals: _,
-            } => self.use_fast_path, //Only PrepareQC should try to compute a FastQC
+            } => self.use_fast_path,
             _ => false,
         };
 
-        // Add vote to qc maker, if a QC forms then create a new consensus instance
-
-        //If qc_ready, but qc_opt = None => This is first Slow QC;
-        //If qc_ready and qc_opt => This is FastQC or Consumption of Loopback to fetch SlowQC
+        // A missing QC means the fast-path timer must complete first.
         let (qc_ready, qc_opt) = match is_loopback {
             false => qc_maker.append(
                 vote.author,
@@ -977,7 +767,7 @@ impl Core {
                 &self.committee,
             )?,
             true => {
-                qc_maker.try_fast = false; //turn back to normal path handling
+                qc_maker.try_fast = false;
                 qc_maker.get_qc()?
             }
         };
@@ -986,18 +776,10 @@ impl Core {
 
         if qc_ready {
             if qc_opt.is_none() && self.use_fast_path {
-                // Slow QC is available but we should wait for Fast
-                //Start timer for Fast:
-                //Creates a dummy vote with the same id as this vote, but only the waiting digest as consensus sigs
-                //Upon triggering timer, it will call loopback again, which will get the QC and proceed.
-                //By including only the digest of the missing instance we avoid duplicates.
-                //Alternatively could modify QCMaker such that it wipes the QC after first use
-
+                // Wait for the fast-path timer before using the slow QC.
                 let fast_timer = FastTimer::new(vote.clone(), self.fast_path_timeout);
                 self.fast_timer_futures.push(Box::pin(fast_timer));
             } else if let Some(qc) = qc_opt {
-                //If QC = some (i.e. FastPathQC succeed, or SlowPathQC suceed if running without FP)
-
                 match current_instance {
                     ConsensusMessage::Prepare {
                         slot,
@@ -1014,14 +796,7 @@ impl Core {
                             current_instance.digest()
                         );
 
-                        // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: form
-                        // and act on the next step LOCALLY from our own just-assembled
-                        // PrepareQC, instead of unicasting it to the leader via
-                        // `send_consensus_req` for it to assemble/re-broadcast. Copy
-                        // everything we need out of `current_instance`/`qc_maker`
-                        // (borrows of `self.consensus_instances`/`self.qc_makers`)
-                        // before any `&mut self` method call, exactly as the unchanged
-                        // `send_consensus_req` branch below already has to.
+                        // Advance locally in all-to-all mode.
                         if self.all_to_all {
                             let slot = *slot;
                             let view = *view;
@@ -1029,11 +804,7 @@ impl Core {
                             let try_fast = qc_maker.try_fast;
 
                             if try_fast {
-                                // FastPrepareQC (3f+1): commit locally on the fast path --
-                                // this is exactly the local-commit path the leader already
-                                // takes for its own vote at the `send_consensus_req` local
-                                // `process_consensus_request` call site; mirrored here so
-                                // any replica, not just the leader, can take it.
+                                // A fast quorum commits locally.
                                 debug!("taking fast path! (all-to-all)");
                                 let commit_message = ConsensusMessage::Commit {
                                     slot,
@@ -1047,12 +818,7 @@ impl Core {
                                 };
                                 self.process_commit_message(commit_message, &header).await?;
                             } else {
-                                // SlowPrepareQC (2f+1): synthesize the Confirm instance
-                                // and feed our own Confirm-Ack back into
-                                // `process_consensus_vote` -- self-recursion, so this
-                                // step lives in its own fn boxed at this ONE call site
-                                // (P3-1 fix; see `all_to_all_synthesize_confirm`'s doc
-                                // comment and `process_consensus_vote`'s own).
+                                // A slow quorum advances to Confirm.
                                 Box::pin(
                                     self.all_to_all_synthesize_confirm(slot, view, qc, proposals),
                                 )
@@ -1068,7 +834,7 @@ impl Core {
                                         qc,
                                         proposals: proposals.clone(),
                                     }
-                                } // Create Commit if we have FastPrepareQC
+                                }
                                 false => ConsensusMessage::Confirm {
                                     slot: *slot,
                                     view: *view,
@@ -1077,7 +843,6 @@ impl Core {
                                 },
                             };
 
-                            // Continue with the next consensus step.
                             self.send_consensus_req(new_consensus_message).await?;
                         }
                     }
@@ -1096,12 +861,7 @@ impl Core {
                         };
 
                         if self.all_to_all {
-                            // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all:
-                            // ConfirmQC formed locally (2f+1 Confirm-Acks) -- commit
-                            // locally instead of unicasting to the leader for it to
-                            // assemble/re-broadcast Commit. `process_commit_message`/
-                            // `committed_slots` already dedup per slot, so this is
-                            // idempotent with any other path that might also reach it.
+                            // All-to-all replicas commit their local Confirm quorum.
                             let header = Header {
                                 author: self.name,
                                 ..Header::default()
@@ -1109,7 +869,6 @@ impl Core {
                             self.process_commit_message(new_consensus_message, &header)
                                 .await?;
                         } else {
-                            // Continue with the next consensus step.
                             self.send_consensus_req(new_consensus_message).await?;
                         }
                     }
@@ -1128,23 +887,7 @@ impl Core {
         Ok(())
     }
 
-    /// All-to-all only (Change 2, SlowPrepareQC branch): synthesize the Confirm
-    /// instance from our own just-formed (2f+1) PrepareQC, register it (and its
-    /// `high_qcs` entry -- REQUIRED for correct view-change winning-proposal
-    /// recovery, since `process_confirm_message` no longer runs on a broadcast
-    /// Confirm we never send), sign our own Confirm-Ack, broadcast it, and feed our
-    /// own copy back into `process_consensus_vote`.
-    ///
-    /// P3-1 fix: split out of `process_consensus_vote` specifically so the boxing
-    /// needed to break its self-recursion (the `process_consensus_vote` call below)
-    /// happens at THIS fn's call site (`Box::pin(self.all_to_all_synthesize_confirm(
-    /// ..)).await` in `process_consensus_vote`) rather than via `#[async_recursion]`
-    /// on `process_consensus_vote` itself, which would box/heap-allocate on every
-    /// call including the entire flag-off path. `Box<T>` is pointer-sized regardless
-    /// of `T`'s own size, so boxing this ONE edge in the
-    /// process_consensus_vote -> all_to_all_synthesize_confirm -> process_consensus_vote
-    /// cycle is sufficient to give both fns' futures a finite size -- this fn itself
-    /// does not need `#[async_recursion]` (only its call site boxes).
+    /// Registers and broadcasts an all-to-all Confirm after a slow Prepare quorum.
     async fn all_to_all_synthesize_confirm(
         &mut self,
         slot: Slot,
@@ -1194,51 +937,25 @@ impl Core {
 
         self.process_consensus_vote(confirm_vote, false).await?;
 
-        // Drain any Confirm-votes that raced ahead of this registration (Change 3).
+        // Process Confirm votes that arrived before registration.
         self.drain_pending_consensus_votes(slot, confirm_digest)
             .await;
 
         Ok(())
     }
 
-    /// All-to-all only (Change 3 bound): whether a vote for `slot` is close enough to
-    /// what we've already committed to be worth buffering. Mirrors the same k-wide
-    /// open-instance window `try_prepare_waiting_slots`/`is_valid` already enforce for
-    /// honest Prepare tickets (at most `k` consecutive instances open at a time, gated
-    /// by `committed_slots`) so a Byzantine vote for a wildly out-of-range slot is
-    /// dropped rather than buffered. This bounds the SLOT axis only; see
-    /// `buffer_pending_consensus_vote` for the digest/author axes.
+    /// Accepts pending votes only within the open-instance window.
     fn is_sane_pending_vote_slot(&self, slot: Slot) -> bool {
         slot > self.last_committed_slot.saturating_sub(self.k)
             && slot <= self.last_committed_slot + self.k + 1
     }
 
-    /// P2-1 fix: the cap on distinct digests buffered per slot (see
-    /// `buffer_pending_consensus_vote`). Honest replicas only ever produce O(1) real
-    /// instances per slot (the genuine Prepare + Confirm), so `2 * committee.size()`
-    /// is generous headroom above any legitimate digest while still keeping the
-    /// bound O(n) per slot rather than unbounded.
+    /// Bounds distinct pending digests per slot to O(n).
     fn pending_vote_digest_cap(&self) -> usize {
         2 * self.committee.size()
     }
 
-    /// All-to-all only (Change 3 buffer / P2-1 fix): buffer `vote`, keyed
-    /// `slot -> digest -> author`. Callers MUST have already rejected non-committee
-    /// authors (see `process_consensus_vote`'s buffering branch) -- this fn alone
-    /// only enforces the other two axes:
-    ///  (a) per-author dedup: at most one buffered vote per author per
-    ///      `(slot, digest)` (the inner `HashMap<PublicKey, _>`'s `or_insert` --
-    ///      mirrors `QCMaker::append`'s `used`-author-set idea) -- a single author
-    ///      repeat-flooding votes for the SAME digest can't grow that bucket past 1.
-    ///      Combined with the caller's committee-membership check, this bounds each
-    ///      digest's bucket to at most `committee.size()` entries.
-    ///  (b) a cap on the number of DISTINCT digests buffered per slot
-    ///      (`pending_vote_digest_cap`) -- without this, one Byzantine author
-    ///      emitting votes with endless fresh, self-signed (but garbage) digests for
-    ///      one slot would otherwise grow this map without bound (each such vote
-    ///      passes `sig.verify` trivially, since it verifies against its own
-    ///      attacker-chosen digest). Once a slot is at the cap, a vote for a digest
-    ///      not already tracked for that slot is dropped.
+    /// Buffers one vote per committee author and caps digests per slot.
     fn buffer_pending_consensus_vote(&mut self, vote: ConsensusVote) {
         let slot = vote.slot;
         let digest = vote.digest.clone();
@@ -1260,18 +977,8 @@ impl Core {
             .or_insert(vote);
     }
 
-    /// All-to-all only (Change 3 drain): feed every vote buffered for `(slot, digest)`
-    /// -- i.e. that arrived before this node had registered that consensus instance --
-    /// through `process_consensus_vote` now that it has. Called right after each place
-    /// an instance is registered: the Prepare registration in
-    /// `process_consensus_request`, and the synthesized-Confirm registration in
-    /// `all_to_all_synthesize_confirm`.
-    ///
-    /// Errors from a single buffered vote (e.g. a Byzantine duplicate) are logged, not
-    /// propagated: this runs nested inside the processing of whatever just registered
-    /// the instance (an incoming Prepare/ConsensusRequest, or our own locally-formed
-    /// PrepareQC), and one bad buffered vote must not abort that unrelated, otherwise
-    /// perfectly valid, processing.
+    /// Processes votes buffered before instance registration.
+    /// Invalid buffered votes are ignored.
     async fn drain_pending_consensus_votes(&mut self, slot: Slot, digest: Digest) {
         let votes = self
             .pending_consensus_votes
@@ -1287,7 +994,6 @@ impl Core {
                 }
             }
         }
-        // Avoid leaking an empty inner map once a slot's last buffered digest drains.
         if self
             .pending_consensus_votes
             .get(&slot)
@@ -1308,17 +1014,13 @@ impl Core {
         } = consensus_message
         {
             let set_proposal = tc.is_none() || proposals.is_empty();
-            //Set tips to propose if it is a new proposal (empty by default), or winning_proposal = empty. => if there is a winning prop proposals will not be empty
             if set_proposal {
                 debug!("UPDATING HEADER for slot {}", slot);
-                // Add new proposal tips
-
                 *proposals = match self.use_optimistic_tips {
                     true => self.current_proposal_tips.clone(),
                     false => self.current_certified_tips.clone(),
                 };
 
-                // Leader tip proposal
                 proposals.insert(
                     self.name,
                     Proposal {
@@ -1327,11 +1029,7 @@ impl Core {
                     },
                 );
 
-                // Under autobahn-seamless,
-                // every proposal entering a cut -- other than our own tip, which an author
-                // always trusts ahead of its own certificate (see the early insert in
-                // process_own_header) -- references a height no greater than that author's
-                // last *certified* height. No uncertified tip may ever enter consensus.
+                // Seamless cuts contain only certified peer tips.
                 if !self.use_optimistic_tips {
                     debug_assert!(
                         proposals.iter().all(|(pk, proposal)| {
@@ -1346,7 +1044,6 @@ impl Core {
                 for proposal in proposals.values_mut() {
                     debug!("new proposal height is {:?}", proposal.height);
                 }
-
             }
         }
     }
@@ -1377,15 +1074,13 @@ impl Core {
                 view: _,
                 qc: _,
                 proposals: _,
-            } => {
-            }
+            } => {}
             ConsensusMessage::Commit {
                 slot: _,
                 view: _,
                 qc: _,
                 proposals: _,
-            } => {
-            }
+            } => {}
         };
 
         debug!("Send req for Consensus message {}", consensus_message);
@@ -1393,7 +1088,6 @@ impl Core {
         let consensus_req =
             ConsensusRequest::new(self.name, consensus_message, &mut self.signature_service).await;
 
-        //send to all others
         let addresses = self
             .committee
             .others_primaries(&self.name)
@@ -1412,7 +1106,6 @@ impl Core {
             .or_default()
             .extend(handlers);
 
-        //process oneself
         self.process_consensus_request(consensus_req).await?;
 
         Ok(())
@@ -1422,30 +1115,21 @@ impl Core {
     async fn process_certificate(&mut self, certificate: Certificate) -> DagResult<()> {
         debug!("Processing {:?}", certificate);
 
-        // Store the certificate.
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");
         self.store.write(certificate.digest().to_vec(), bytes).await;
-
-
-        // If we receive a new certificate from ourself, then send to the proposer, so it can make
-        // a new header
 
         Ok(())
     }
 
     #[async_recursion]
     async fn try_prepare_waiting_slots(&mut self) -> DagResult<()> {
-        //Could there even be multiple prepares? Bounding l <= 4 should make it so that each replica can only be the original leader for one slot? VC leaders are not blocked on coverage (they just propose current tips)
-
         for _i in 0..self.prepare_tickets.len() {
-            // Get the first buffered prepare ticket
             let prepare_msg = self.prepare_tickets.pop_front().unwrap();
             self.is_prepare_ticket_ready(&prepare_msg).await?;
         }
 
         Ok(())
     }
-
 
     async fn is_prepare_ticket_ready(
         &mut self,
@@ -1461,39 +1145,16 @@ impl Core {
             } => {
                 let next_leader = self.leader_elector.get_leader(slot + 1, 1);
 
-                // If not the next leader
                 if self.name != next_leader {
-                    if false {
-                        let address = self
-                            .committee
-                            .primary(&next_leader)
-                            .expect("Author of valid header is not in the committee")
-                            .primary_to_primary;
-                        let bytes = bincode::serialize(&PrimaryMessage::ConsensusMessage(
-                            prepare_message.clone(),
-                        ))
-                        .expect("Failed to serialize prepare message");
-                        let handler = self
-                            .network
-                            .send_typed(address, Bytes::from(bytes), "ConsensusMessage")
-                            .await;
-                        self.cancel_handlers
-                            .entry(self.current_header.height())
-                            .or_default()
-                            .push(handler);
-                    }
                     return Ok(());
                 }
 
-                // If we are the leader of the next slot, view 1, and have already proposed in the next slot
-                // then don't process the prepare ticket, just return true
+                // Ignore tickets for a slot already proposed locally.
                 if self.already_proposed_slots.contains(&(slot + 1)) {
                     return Ok(());
                 }
 
-                //Check that we have bounded instances.
-                // => Wait for instance s - k to commit. This ensures that <= k consecutive instances are open at any time (since we also only start if have prepare ticket from s-1)
-
+                // Wait for slot s-k before opening another instance.
                 if *slot + 1 > self.k {
                     debug!("beyond init k");
                     if !self.committed_slots.contains_key(&(slot + 1 - self.k)) {
@@ -1503,8 +1164,7 @@ impl Core {
                     }
                 }
 
-                // If there is enough coverage and we haven't already proposed in the next slot then create a new
-                // prepare message if we are the leader of view 1 in the next slot
+                // Open the next slot after its proposals have enough coverage.
                 if self.enough_coverage(proposals) {
                     debug!("have enough coverage to start slot {}", slot + 1);
 
@@ -1514,7 +1174,7 @@ impl Core {
                                 .get(&(slot + 1 - self.k))
                                 .unwrap()
                                 .clone(),
-                        ), //Validate this QC at recipient. Only necessary if not local available. Process if new!
+                        ),
                         false => None,
                     };
 
@@ -1523,15 +1183,10 @@ impl Core {
                         view: 1,
                         tc: None,
                         qc_ticket,
-                        proposals: HashMap::new(), //new_proposals,
+                        proposals: HashMap::new(),
                     };
 
                     self.already_proposed_slots.insert(slot + 1);
-
-                    // #[cfg(feature = "benchmark")]
-                    // // NOTE: This log entry is used to compute performance.
-                    // info!("Started slot {}", slot + 1);
-                    //
 
                     if self.use_ride_share {
                         self.tx_info
@@ -1545,8 +1200,7 @@ impl Core {
 
                     Ok(())
                 } else {
-                    // Not enough coverage, add this prepare ticket to the pending queue
-                    // until enough new proposals have arrived
+                    // Retry when more proposals arrive.
                     self.prepare_tickets.push_back(prepare_message.clone());
                     Ok(())
                 }
@@ -1565,16 +1219,10 @@ impl Core {
                 qc_ticket,
                 proposals,
             } => {
-                // NOTE: There are two cases: view = 1, and view > 1
-                // For view = 1 the leader can propose "anything", coverage is
-                // enforced on a best effort basis
-                // For view > 1, the leader must justify its prepare message with
-                // a TC from the previous view, so that proposals that could have committed
-                // are recovered
+                // View 1 uses a QC ticket; later views require the previous TC.
                 let mut ticket_valid: bool = true;
                 match tc {
                     Some(tc) => {
-                        // Ensure tc is valid
                         if tc.view + 1 != *view {
                             return false;
                         }
@@ -1592,13 +1240,10 @@ impl Core {
                         if !self.use_parallel_proposals {
                             panic!("Parallel proposals should be true");
                         }
-                        //Check if QC_ticket valid:
                         if *slot > self.k {
                             debug!("Checking QC Ticket");
                             if !self.committed_slots.contains_key(&(slot - self.k)) {
-                                //If we have it locally don't need to verify
                                 debug!("Verify QC Ticket");
-                                //Process CommitMessage
                                 let commit_qc = qc_ticket.as_ref().unwrap();
                                 let commit_message = transform_commit_qc(commit_qc.clone());
                                 if commit_qc.slot + self.k != *slot {
@@ -1617,8 +1262,6 @@ impl Core {
                     self.views.insert(*slot, *view);
                 }
 
-                // Ensure that we haven't already voted in this slot, view, that the ticket is
-                // valid, and we are in the same view
                 !self.last_voted_consensus.contains(&(*slot, *view))
                     && ticket_valid
                     && self.views.get(slot).unwrap() == view
@@ -1636,22 +1279,14 @@ impl Core {
                     self.views.insert(*slot, *view);
                     return true;
                 }
-                return false;
-
-                // Ensure that the QC is valid, and that we are in the same view
-                //qc.verify(&self.committee).is_ok() && self.views.get(slot).unwrap() == view
+                false
             }
             ConsensusMessage::Commit {
                 slot: _,
                 view: _,
                 qc: _,
                 proposals: _,
-            } => {
-                verify_commit(consensus_message, &self.committee)
-
-                // Ensure that the QC is valid, and that we are in the same view
-                //qc.verify(&self.committee).is_ok() && self.views.get(slot).unwrap() == view
-            }
+            } => verify_commit(consensus_message, &self.committee),
         }
     }
 
@@ -1666,13 +1301,7 @@ impl Core {
                     qc_ticket: _,
                     proposals: _,
                 } => {
-                    // Consensus is ready if all proposals for all prepare messages in a car aren't
-                    // missing
-                    // NOTE: If view > 0 then don't have to call this, only the leader of first
-                    // view takes responsibility, only check for view > 0 so you don't need to
-                    // check whether winning proposals is correct
-                    // asynchronously, change synchronizer so that it write to the store without
-                    // earlier entries
+                    // Prepare proposals must be available before voting.
                     is_ready = is_ready
                         && !self
                             .synchronizer
@@ -1686,8 +1315,7 @@ impl Core {
                     view: _,
                     qc: _,
                     proposals: _,
-                } => {
-                }
+                } => {}
                 _ => {}
             };
         }
@@ -1699,8 +1327,6 @@ impl Core {
         &mut self,
         header: &Header,
     ) -> DagResult<Vec<(Slot, Digest, Signature)>> {
-        // Map between consensus instance digest and a signature indicating a vote for that
-        // instance
         let mut consensus_votes: Vec<(Slot, Digest, Signature)> = Vec::new();
 
         for consensus_message in header.consensus_messages.values() {
@@ -1731,7 +1357,6 @@ impl Core {
                             "processing confirm in slot {:?} with proposal {:?}",
                             slot, proposals
                         );
-                        // Start syncing on the proposals if we haven't already
                         self.synchronizer
                             .get_proposals(consensus_message, header)
                             .await?;
@@ -1806,8 +1431,7 @@ impl Core {
             } => {
                 self.consensus_instances
                     .insert((*slot, dig.clone()), consensus_message.clone());
-                // Change 3 drain: a peer's Prepare-vote may have raced ahead of our own
-                // registration of this Prepare instance.
+                // Process votes that arrived before this Prepare.
                 if self.all_to_all {
                     self.drain_pending_consensus_votes(*slot, dig.clone()).await;
                 }
@@ -1895,7 +1519,6 @@ impl Core {
                     "processing confirm in slot {:?} with proposal {:?}",
                     slot, proposals
                 );
-                // Start syncing on the proposals if we haven't already
                 self.synchronizer
                     .get_proposals(&consensus_message, &header)
                     .await?;
@@ -1920,11 +1543,9 @@ impl Core {
         );
 
         if consensus_votes.is_empty() {
-            //E.g. if it was a Commit, or if messages were invalid.
             return Ok(());
         }
 
-        //Broadcast the vote.
         let (slot, digest, sig) = consensus_votes.pop().unwrap();
         let vote = ConsensusVote {
             author: self.name,
@@ -1934,11 +1555,7 @@ impl Core {
         };
 
         if self.all_to_all {
-            // Autobahn (Giridharan et al., SOSP'24) §5.5.3 all-to-all: broadcast the
-            // Prepare-Vote/Confirm-Ack to every other replica (instead of unicasting it
-            // to `author`, the leader) so each replica can assemble its own QC locally;
-            // still process our own copy locally exactly as the leader-collected path
-            // does. Reuses the exact broadcast idiom `send_consensus_req` uses below.
+            // All-to-all replicas process and broadcast their own vote.
             debug!("Process own consensus vote (all-to-all)");
             self.process_consensus_vote(vote.clone(), false)
                 .await
@@ -1988,7 +1605,6 @@ impl Core {
         Ok(())
     }
 
-    //#[async_recursion]
     async fn process_prepare_message(
         &mut self,
         prepare_message: &ConsensusMessage,
@@ -2002,22 +1618,17 @@ impl Core {
             proposals,
         } = prepare_message
         {
-            // Check if this prepare message can be used for a ticket to propose in the next slot
-            let _x = self.is_prepare_ticket_ready(prepare_message).await;
+            let _ = self.is_prepare_ticket_ready(prepare_message).await;
 
-            // If we haven't already started the timer for the next slot, start it
-
-            if self.k > 1 {
-                //check whether a) we have already committed; and if not b) whether ticket is ready (prepare and QC)
-                if !self.committed_slots.contains_key(&(slot + 1))
-                    && !self.timers.contains(&(slot + 1, 1))
-                    && self.committed_slots.contains_key(&(slot + 1 - self.k))
-                {
-                    debug!("start timer for slot {}", slot + 1);
-                    let timer = Timer::new(slot + 1, 1, self.timeout_delay);
-                    self.timer_futures.push(Box::pin(timer));
-                    self.timers.insert((slot + 1, 1));
-                }
+            if self.k > 1
+                && !self.committed_slots.contains_key(&(slot + 1))
+                && !self.timers.contains(&(slot + 1, 1))
+                && self.committed_slots.contains_key(&(slot + 1 - self.k))
+            {
+                debug!("start timer for slot {}", slot + 1);
+                let timer = Timer::new(slot + 1, 1, self.timeout_delay);
+                self.timer_futures.push(Box::pin(timer));
+                self.timers.insert((slot + 1, 1));
             }
 
             for proposal in proposals.values() {
@@ -2028,11 +1639,9 @@ impl Core {
             }
             debug!("prepare vote in slot {:?}", slot);
 
-            // Ensure that we don't vote for another prepare in this slot, view
             self.last_voted_consensus.insert((*slot, *view));
 
             if self.use_fast_path {
-                // Already checked that we were in the right view from validity checks, so just insert into our local high_proposals map
                 self.high_proposals.insert(
                     *slot,
                     ConsensusMessage::Prepare {
@@ -2042,10 +1651,9 @@ impl Core {
                         qc_ticket: None,
                         proposals: proposals.clone(),
                     },
-                ); //Note: Don't need to store TC or QC's.
+                );
             }
 
-            // Indicate that we vote for this instance's prepare message
             let sig = self
                 .signature_service
                 .request_signature(prepare_message.digest())
@@ -2060,7 +1668,6 @@ impl Core {
         }
     }
 
-    //#[async_recursion]
     async fn process_confirm_message(
         &mut self,
         confirm_message: &ConsensusMessage,
@@ -2073,11 +1680,8 @@ impl Core {
             proposals: _,
         } = confirm_message
         {
-            // Already checked that we were in the right view from validity checks, so just
-            // insert into our local high_qc map
             self.high_qcs.insert(*slot, confirm_message.clone());
 
-            // Indicate that we vote for this instance's confirm message
             let sig = self
                 .signature_service
                 .request_signature(confirm_message.digest())
@@ -2093,17 +1697,12 @@ impl Core {
         }
     }
 
-    fn enough_coverage(
-        &mut self,
-        prepare_proposals: &HashMap<PublicKey, Proposal>,
-        //current_proposals: &HashMap<PublicKey, Proposal>,
-    ) -> bool {
+    fn enough_coverage(&mut self, prepare_proposals: &HashMap<PublicKey, Proposal>) -> bool {
         let current_proposals = match self.use_optimistic_tips {
             true => &self.current_proposal_tips,
             false => &self.current_certified_tips,
         };
 
-        // Checks whether there have been n-f new certs from the proposals from the ticket
         let new_tips: HashMap<&PublicKey, &Proposal> = current_proposals
             .iter()
             .filter(|(pk, proposal)| proposal.height > prepare_proposals.get(pk).unwrap().height)
@@ -2127,7 +1726,6 @@ impl Core {
         } = &commit_message
         {
             debug!("Try to commit slot {}", slot);
-            // Start simulating async once slot 1 is committed
             if self.simulate_asynchrony && *slot == 1 {
                 debug!("added async timers");
                 let async_start = Timer::new(0, 0, self.asynchrony_start);
@@ -2136,20 +1734,16 @@ impl Core {
                 self.async_timer_futures.push(Box::pin(async_end));
             }
 
-            //Stop timer for this slot/view //Note: Ideally stop all timers for this slot, but timers for older views are obsolete anyways.
             self.timers.remove(&(*slot, *view));
 
             let sl = *slot;
-            //update bounding heuristic
             self.last_committed_slot = max(sl, self.last_committed_slot);
             self.committed_slots.insert(
                 sl,
                 CommitQC::new(*slot, *view, qc.clone(), proposals.clone()).await,
             );
 
-
             if self.k == 1 {
-                //Start timer for next slot
                 if !self.timers.contains(&(slot + self.k, 1)) {
                     debug!("start timer for slot {}", slot + 1);
                     let timer = Timer::new(slot + self.k, 1, self.timeout_delay);
@@ -2157,7 +1751,6 @@ impl Core {
                     self.timers.insert((slot + self.k, 1));
                 }
             } else {
-                //If slot + k has ticket ready (Prepare from s+k-1 + QC in s)
                 if !self.timers.contains(&(slot + self.k, 1))
                     && self.views.contains_key(&(slot + self.k - 1))
                 {
@@ -2168,8 +1761,7 @@ impl Core {
                 }
             }
 
-            // Only send to committer if proposals and all ancestors are stored locally,
-            // otherwise sync will be triggered, and this commit message will be reprocessed
+            // Defer output until every proposal ancestor is available.
             if !self
                 .synchronizer
                 .get_proposals(&commit_message, header)
@@ -2184,45 +1776,27 @@ impl Core {
                     .expect("Failed to send headers");
             }
 
-            //Try waking any prepares that are waiting for a QC ticket
             self.try_prepare_waiting_slots().await?;
 
-            // Garbage collect (can be ascyn)
-            // This call constructs `clean_slot_periods`'s
-            // `async fn` future and immediately drops it without ever polling/`.await`ing
-            // it, so its body (GC of `consensus_instances`/`consensus_cancel_handlers`/
-            // `qc_makers`) never actually runs; this is a resource leak (unbounded growth
-            // over a long-running node). `let _ =`
-            // preserves the exact current (never-runs) behavior while silencing the lint.
-            #[allow(clippy::let_underscore_future)]
-            let _ = self.clean_slot_periods(sl);
+            self.clean_slot_periods(sl);
         }
 
         Ok(())
     }
 
-    #[async_recursion]
-    async fn clean_slot_periods(&mut self, slot: Slot) -> DagResult<()> {
-        //slot periodics
-        let slot_period = slot % self.k;
+    fn clean_slot_periods(&mut self, slot: Slot) {
         let k = self.k;
 
-        //GC Consensus instances
         self.consensus_instances
-            .retain(|(s, _), _| s % k != slot_period && s <= &slot);
+            .retain(|(s, _), _| keep_after_slot_period_gc(*s, slot, k));
         self.consensus_cancel_handlers
-            .retain(|s, _| s % k != slot_period && s <= &slot);
+            .retain(|s, _| keep_after_slot_period_gc(*s, slot, k));
 
-        //GC QC_Makers
         self.qc_makers
-            .retain(|(s, _), _| s % k != slot_period && s <= &slot);
+            .retain(|(s, _), _| keep_after_slot_period_gc(*s, slot, k));
 
-        //GC all-to-all pending votes (Change 3): no-op (always empty) when
-        //`all_to_all` is false.
         self.pending_consensus_votes
-            .retain(|s, _| s % k != slot_period && s <= &slot);
-
-        Ok(())
+            .retain(|s, _| keep_after_slot_period_gc(*s, slot, k));
     }
 
     #[async_recursion]
@@ -2241,11 +1815,9 @@ impl Core {
                 proposals: _,
             } => {
                 if self.use_ride_share {
-                    // Now that proposals are ready we can reprocess the header
                     self.process_header(header, false).await?;
                 } else {
                     if self.last_voted_consensus.contains(&(*slot, *view)) {
-                        //Don't prepare twice
                         return Ok(());
                     }
                     self.process_consensus_message(consensus_message, header.author)
@@ -2257,17 +1829,13 @@ impl Core {
                 view: _,
                 qc: _,
                 proposals: _,
-            } => {
-                // Don't need to do anything for the confirm case, since proposals will be
-                // sent to the committer once a commit message is received
-            }
+            } => {}
             ConsensusMessage::Commit {
                 slot: _,
                 view: _,
                 qc: _,
                 proposals: _,
             } => {
-                // Send the commit message to the committer to order everything
                 self.tx_committer
                     .send(consensus_message)
                     .await
@@ -2289,8 +1857,6 @@ impl Core {
                 qc_ticket: _,
                 proposals: _,
             } => {
-                // We have a ticket for instance (slot + 1, 1), so check if we have enough coverage
-                // to send a prepare message, otherwise buffer it
                 self.is_prepare_ticket_ready(&consensus_message).await?;
             }
             ConsensusMessage::Commit {
@@ -2299,18 +1865,9 @@ impl Core {
                 qc: _,
                 proposals: _,
             } => {
-                // Process any forwarded commit messages
-                // NOTE: Used "dummy header" for second argument for now, header doesn't matter since proposal syncing
-                // does not block processing the header, only prepare messages do
-                // This call constructs
-                // `process_commit_message`'s future and immediately drops it without
-                // ever polling/`.await`ing it, so a FORWARDED commit message is never
-                // actually processed by this path. NOT fixed here (a real protocol-
-                // behavior change). `let _ =`
-                // preserves the exact current (never-runs) behavior while silencing the
-                #[allow(clippy::let_underscore_future)]
-                let _ =
-                    self.process_commit_message(consensus_message, &self.current_header.clone());
+                let header = self.current_header.clone();
+                self.process_commit_message(consensus_message.clone(), &header)
+                    .await?;
             }
             _ => {}
         }
@@ -2328,7 +1885,6 @@ impl Core {
             return Ok(());
         }
 
-        // If timing out a smaller view than the current view, ignore
         if let Some(v) = self.views.get(&slot) {
             if *v > view {
                 debug!(
@@ -2339,7 +1895,6 @@ impl Core {
             }
         };
 
-        // If we have already committed then ignore the timeout
         if let Some(ConsensusMessage::Commit {
             slot: _,
             view: _,
@@ -2351,8 +1906,6 @@ impl Core {
         }
 
         debug!("Sending Timeout for slot {}, view {}", slot, view);
-        // Make a timeout message.for the slot, view, containing the highest QC this replica has
-        // seen
         let timeout = Timeout::new(
             slot,
             view,
@@ -2364,7 +1917,6 @@ impl Core {
         .await;
         debug!("Created Timeout: {:?}", timeout);
 
-        // Broadcast the timeout message.
         debug!("Broadcasting Timeout: {:?}", timeout);
         let addresses = self
             .committee
@@ -2384,15 +1936,12 @@ impl Core {
             .or_default()
             .extend(handlers);
 
-        // Process our message.
         self.handle_timeout(&timeout).await
     }
 
     async fn handle_timeout(&mut self, timeout: &Timeout) -> DagResult<()> {
         debug!("Processing timeout {:?}", timeout);
 
-
-        // Don't process timeout messages for old views
         if let Some(view) = self.views.get(&timeout.slot) {
             if timeout.view < *view {
                 return Ok(());
@@ -2403,66 +1952,38 @@ impl Core {
             return Ok(());
         }
 
-        // Ensure the timeout is well formed.
         timeout.verify(&self.committee)?;
 
-        // If we haven't seen a timeout for this slot, view, then create a new TC maker for it.
         self.tc_makers
             .entry((timeout.slot, timeout.view))
             .or_insert_with(TCMaker::new);
 
-        // Otherwise, get the TC maker for this slot, view.
         let tc_maker = self
             .tc_makers
             .get_mut(&(timeout.slot, timeout.view))
             .unwrap();
 
-
-        // Add the new vote to our aggregator and see if we have a quorum.
         if let Some(tc) = tc_maker.append(timeout.clone(), &self.committee)? {
             debug!("Assembled TimeoutCertificate {:?}", tc);
 
-            // Try to advance the view
             self.views.insert(timeout.slot, timeout.view + 1);
 
-            // Start the new view timer
             let timer = Timer::new(tc.slot, tc.view + 1, self.timeout_delay);
             self.timer_futures.push(Box::pin(timer));
             self.timers.insert((tc.slot, tc.view + 1));
 
-            // Broadcast the TC.
-
-            //     .committee
-            //     .others_primaries(&self.name)
-            //     .iter()
-            //     .map(|(_, x)| x.primary_to_primary)
-            //     .collect();
-            //     .expect("Failed to serialize timeout certificate");
-            //     .broadcast(addresses, Bytes::from(message))
-            //     .await;
-
-            //     .entry(slot)
-            //     .or_insert_with(Vec::new)
-            //     .extend(handlers);
-
-            // Generate a new prepare if we are the next leader.
             self.generate_prepare_from_tc(&tc).await?;
         }
         Ok(())
     }
 
     async fn generate_prepare_from_tc(&mut self, tc: &TC) -> DagResult<()> {
-        // Make a new prepare message if we are the next leader.
         if self.name == self.leader_elector.get_leader(tc.slot, tc.view + 1) {
             debug!("IsLeader. Start prepare from TC");
             let winning_proposals = tc.get_winning_proposals(&self.committee);
 
             debug!("winning proposals: {:?}", winning_proposals);
 
-            // If there is no QC we have to propose, then use our current tips for our proposal => happens later
-            //     winning_proposals = self.current_proposal_tips.clone();
-
-            // Create a prepare message for the next view, containing the ticket and proposals
             let prepare_message: ConsensusMessage = ConsensusMessage::Prepare {
                 slot: tc.slot,
                 view: tc.view + 1,
@@ -2478,34 +1999,12 @@ impl Core {
             } else {
                 self.send_consensus_req(prepare_message).await?;
             }
-
-            // A TC could be a ticket for the next slot
-            /*if !self.already_proposed_slots.contains(&(timeout.slot + 1))
-                && self.enough_coverage(&ticket.proposals, &winning_proposals)
-            {
-                let new_prepare_instance = ConsensusMessage::Prepare {
-                    slot: timeout.slot + 1,
-                    view: 1,
-                    tc: None,
-                    proposals: winning_proposals,
-                };
-                self.already_proposed_slots.insert(timeout.slot + 1);
-                self.tx_info
-                    .send(new_prepare_instance)
-                    .await
-                    .expect("failed to send info to proposer");
-            } else {
-                // Otherwise add the ticket to the queue, and wait later until there
-                // are enough new certificates to propose
-                self.prepare_tickets.push_back(prepare_instance);
-            }*/
         }
         Ok(())
     }
 
     async fn handle_tc(&mut self, tc: &TC) -> DagResult<()> {
         debug!("Processing TC {:?}", tc);
-        // Generate a new prepare if we are the next leader.
         self.generate_prepare_from_tc(tc).await?;
 
         Ok(())
@@ -2517,67 +2016,20 @@ impl Core {
             DagError::HeaderTooOld(header.id.clone(), header.height)
         );
 
-        // Verify the header's signature.
         header.verify(&self.committee)?;
-
-
         Ok(())
     }
 
     fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
-        /*ensure!(
-            self.current_headers.get(&vote.height) != None,
-            DagError::VoteTooOld(vote.digest(), vote.height)
-        );*/
-        // ensure!(
-        //     DagError::VoteTooOld(vote.digest(), vote.round)
-        // );
-
-        // Ensure we receive a vote on the expected header.
-        /*let current_header = self.current_headers.entry(vote.height).or_insert_with(HashMap::new).get(&vote.author);
-        ensure!(
-            current_header != None && current_header.unwrap().author == vote.origin,
-            DagError::UnexpectedVote(vote.id.clone())
-        );*/
-        // ensure!(
-        //     vote.id == self.current_header.id
-        //         && vote.origin == self.current_header.author
-        //         && vote.round == self.current_header.round,
-        //     DagError::UnexpectedVote(vote.id.clone())
-        // );
-
-        //Deprecated code for Invalid vote proofs
-        //         Some(tc) => { //invalidation proof = a TC that formed for the current view (or a future one). Implies one cannot vote in this view anymore.
-        //             ensure!(
-        //                 tc.view >= self.current_header.view,
-        //                 DagError::InvalidVoteInvalidation
-        //             );
-        //                 Ok(()) => {},
-        //                 _ => return Err(DagError::InvalidVoteInvalidation)
-
-        //         None => {
-        //                 Some(qc) => { //invalidation proof = a QC that formed for a future view (i.e. an extension of some TC in current view or future)
-        //                     ensure!( //proof is actually showing a conflict.
-        //                         qc.view > self.current_header.view,
-        //                         DagError::InvalidVoteInvalidation
-        //                     );
-        //                         Ok(()) => {},
-        //                         _ => return Err(DagError::InvalidVoteInvalidation)
-        //                 None => { return Err(DagError::InvalidVoteInvalidation)}
-
-        //Check:
-        //If vote has no consensus sigs and vote.aggregator already has QC => ignore vote.
+        // A completed header vote still accepts consensus votes carried by the message.
         if self.current_header.id.eq(&vote.id) && self.votes_aggregator.complete {
             if vote.consensus_votes.is_empty() {
-                //Note: If vote is empty, but self.current_header.consensus_messages is not we can still ignore processing this vote (since it requires no consensus processing)
                 return Err(DagError::CarAlreadySatisfied);
             } else {
-                //Don't need to check signature (won't use it), but do need to process vote for consensus contents
                 return Ok(());
             }
         }
 
-        // Verify the vote.
         vote.verify(&self.committee)
     }
 
@@ -2586,29 +2038,21 @@ impl Core {
             self.gc_round <= certificate.height(),
             DagError::CertificateTooOld(certificate.digest(), certificate.height())
         );
-
-
-        // Verify the certificate (and the embedded header).
         certificate.verify(&self.committee)
     }
 
-    // Main loop listening to incoming messages.
+    /// Processes primary events.
     pub async fn run(&mut self) {
-        //Simulate asynchrony duration:
-
-        // Initialize current proposals with the genesis tips
         self.current_proposal_tips = Header::genesis_proposals(&self.committee);
         self.current_certified_tips = Header::genesis_proposals(&self.committee);
         debug!("genesis tips are {:?}", self.current_proposal_tips);
 
-        // Start the timeout for slot 1, view 1
         debug!("start timer for slot {}", 1);
         let first_timer = Timer::new(1, 1, self.timeout_delay);
         self.timer_futures.push(Box::pin(first_timer));
         self.timers.insert((1, 1));
         self.views.insert(1, 1);
 
-        // If we are the first leader then create a prepare ticket for slot 1
         if self.name == self.leader_elector.get_leader(1, 1) {
             let new_prepare_instance = ConsensusMessage::Prepare {
                 slot: 0,
@@ -2621,7 +2065,6 @@ impl Core {
             self.already_proposed_slots.insert(0);
         }
 
-        // Initiate the proposer with a genesis parent
         let genesis_cert = Certificate::genesis_certs(&self.committee)
             .get(&self.name)
             .unwrap()
@@ -2633,7 +2076,6 @@ impl Core {
 
         loop {
             let result = tokio::select! {
-                // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {
                     match message {
                         PrimaryMessage::Header(header, sync) => {
@@ -2655,7 +2097,7 @@ impl Core {
                         },
                         PrimaryMessage::Certificate(certificate) => {
                             match self.sanitize_certificate(&certificate) {
-                                Ok(()) => self.process_certificate(certificate).await, //self.receive_certificate(certificate).await,
+                                Ok(()) => self.process_certificate(certificate).await,
                                 error => {
                                     error
                                 }
@@ -2664,46 +2106,33 @@ impl Core {
                         PrimaryMessage::Timeout(timeout) => self.handle_timeout(&timeout).await,
                         PrimaryMessage::TC(tc) => self.handle_tc(&tc).await,
 
-                        // We receive a forwarded prepare or commit message from another replica
                         PrimaryMessage::ConsensusMessage(consensus_message) => self.process_forwarded_message(consensus_message).await,
-
-
-                        // External Consensus implementation: Receive Consensus Requests (Prep/Confirm/Commit) or Votes (Prep-Vote/Confirm-Ack)
                         PrimaryMessage::ConsensusRequest(consensus_req) => self.process_consensus_request(consensus_req).await,
                         PrimaryMessage::ConsensusVote(consensus_vote) => self.process_consensus_vote(consensus_vote, false).await,
                         _ => panic!("Unexpected core message")
                     }
                 },
 
-                // We also receive here our new headers created by the `Proposer`.
+                // Process locally proposed headers.
                 Some(header) = self.rx_proposer.recv() => self.process_own_header(header).await,
 
-                // We receive here loopback headers from the `HeaderWaiter`. Those are headers for which we interrupted
-                // execution (we were missing some of their dependencies) and we are now ready to resume processing.
+                // Resume headers after their dependencies arrive.
                 Some(header) = self.rx_header_waiter.recv() => {
                     debug!("normal loopback for header");
                     self.process_header(header, true).await
                 },
 
-                // Loopback for committed instance that hasn't had all of it ancestors yet
+                // Resume committed instances after their ancestors arrive.
                 Some((consensus_message, header)) = self.rx_header_waiter_instances.recv() => self.process_loopback(consensus_message, header).await,
-                //Loopback for special headers that were validated by consensus layer.
-                //Some((header, consensus_sigs)) = self.rx_validation.recv() => self.create_vote(header, consensus_sigs).await,
-                //i.e. core requests validation from consensus (check if ticket valid; wait to receive ticket if we don't have it yet -- should arrive: using all to all or forwarding)
 
                 Some(header_digest) = self.rx_request_header_sync.recv() => self.synchronizer.fetch_header(header_digest).await,
 
-                // We receive here loopback certificates from the `CertificateWaiter`. Those are certificates for which
-                // we interrupted execution (we were missing some of their ancestors) and we are now ready to resume
-                // processing.
-                //Some(certificate) = self.rx_certificate_waiter.recv() => self.process_certificate(certificate).await,
-
-                // We receive an event that timer expired
+                // Process expired timers.
                 Some((slot, view)) = self.timer_futures.next() => self.local_timeout_round(slot, view).await,
 
                 Some(vote) = self.car_timer_futures.next() => self.process_vote(vote, true).await,
 
-                //Fast path loopback for external consensus
+                // Process delayed fast-path votes.
                 Some(vote) = self.fast_timer_futures.next() => self.process_consensus_vote(vote, true).await,
 
                 Some((_slot, _view)) = self.async_timer_futures.next() => {
@@ -2719,14 +2148,13 @@ impl Core {
                         self.async_timer_futures.push(Box::pin(async_start));
                         self.async_timer_futures.push(Box::pin(async_end));
 
-                        //
                         if self.async_delayed_prepare.is_some() {
                             let last_prop = self.async_delayed_prepare.clone().unwrap();
-                            let still_relevant = match &last_prop { //check whether we're still in a relevant view.
+                            let still_relevant = match &last_prop {
                                 ConsensusMessage::Prepare {slot, view, tc: _, qc_ticket: _, proposals: _} => view == self.views.get(slot).unwrap_or(&0),
                                 _ => false,
                             };
-                            if still_relevant { //try sending it now.
+                            if still_relevant {
                                 let _ = self.send_consensus_req(last_prop).await;
                             }
                             self.async_delayed_prepare = None;
@@ -2749,13 +2177,10 @@ impl Core {
                 Err(e) => warn!("{}", e),
             }
 
-            // Cleanup internal state.
             let round = self.consensus_round.load(Ordering::Relaxed);
             if round > self.gc_depth {
                 let gc_round = round - self.gc_depth;
                 self.last_voted.retain(|k, _| k >= &gc_round);
-
-
                 self.cancel_handlers.retain(|k, _| k >= &gc_round);
                 self.gc_round = gc_round;
                 debug!("GC round moved to {}", self.gc_round);

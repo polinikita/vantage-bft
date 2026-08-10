@@ -373,19 +373,6 @@ impl Repairer {
         }
     }
 
-    /// Returns the minimum confirmed height only after every other primary has reported.
-    pub fn universally_held_below(&self, author: &PublicKey) -> Option<Height> {
-        let by_peer = self.holders.get(author)?;
-        if by_peer.len() < self.peers.len() {
-            return None;
-        }
-        by_peer.values().copied().min()
-    }
-
-    pub fn known_lane_authors(&self) -> Vec<PublicKey> {
-        self.holders.keys().copied().collect()
-    }
-
     fn likely_holders(
         &self,
         author: &PublicKey,
@@ -554,24 +541,24 @@ impl Repairer {
                 break true;
             }
 
-            let cached = {
+            let parent_digest = {
                 let blocks = self.blocks.lock();
                 blocks.get(&h).and_then(|entry| {
                     let b = &entry.block;
-                    // Settlement requires the authorized exact coordinate and prior block validation.
+                    // Require the authorized coordinate and prior validation.
                     if b.author == author
                         && b.height == height
                         && b.id == h
                         && entry.block_ok_verified
                     {
-                        Some(b.clone())
+                        Some(b.parent_cert.header_digest.clone())
                     } else {
                         None
                     }
                 })
             };
 
-            let Some(block) = cached else {
+            let Some(parent_h) = parent_digest else {
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_repair_fanout_loops_total.inc();
                 }
@@ -604,13 +591,11 @@ impl Repairer {
                         self.begin_fanout(&h, author, height, effects);
                     }
                 }
-                let mut waiting = frames.clone();
-                waiting.push(cur.clone());
-                self.record_blocked(&waiting, &h);
+                frames.push(cur.clone());
+                self.record_blocked(&frames, &h);
                 break false;
             };
 
-            let parent_h = block.parent_cert.header_digest.clone();
             if height == 1 {
                 // Height one must link directly to the configured genesis digest.
                 if parent_h != self.genesis {

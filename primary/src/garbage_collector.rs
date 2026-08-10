@@ -13,7 +13,7 @@ use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-/// Receives the highest round reached by consensus and update it for all tasks.
+/// Propagates the latest committed round and triggers cleanup.
 pub struct GarbageCollector {
     /// The persistent storage.
     store: Store,
@@ -30,7 +30,6 @@ pub struct GarbageCollector {
 }
 
 impl GarbageCollector {
-    // clippy::too_many_arguments: see `Committer::spawn`'s identical justification.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: &PublicKey,
@@ -39,9 +38,7 @@ impl GarbageCollector {
         consensus_round: Arc<AtomicU64>,
         rx_consensus: Receiver<Certificate>,
         tx_loopback: Sender<Certificate>,
-        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
-        // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
         let addresses = committee
@@ -70,8 +67,7 @@ impl GarbageCollector {
     async fn run(&mut self) {
         let mut last_committed_round = 0;
         while let Some(certificate) = self.rx_consensus.recv().await {
-
-            // Loop back the certificate from HotStuff in case we haven't seen it.
+            // Return unseen certificates to the core.
             if self
                 .store
                 .read(certificate.digest().to_vec())
@@ -85,15 +81,12 @@ impl GarbageCollector {
                     .expect("Failed to loop back certificate to core");
             }
 
-            // Cleanup all the modules.
             let round = certificate.height();
             if round > last_committed_round {
                 last_committed_round = round;
 
-                // Trigger cleanup on the primary.
                 self.consensus_round.store(round, Ordering::Relaxed);
 
-                // Trigger cleanup on the workers..
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
                     .expect("Failed to serialize our own message");
                 self.network

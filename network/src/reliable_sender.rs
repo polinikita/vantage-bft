@@ -24,25 +24,19 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[path = "tests/reliable_sender_tests.rs"]
 pub mod reliable_sender_tests;
 
-/// Convenient alias for cancel handlers returned to the caller task.
+/// Cancellation receiver returned for a durable send.
 pub type CancelHandler = oneshot::Receiver<Bytes>;
 
-/// Shared per-destination map of the lowest dropped volatile key. Connection tasks
-/// write it when a session ends; the protocol task drains it. A missing map disables
-/// drop accounting.
+/// Per-destination minimum key dropped from a volatile session.
 pub type DirtyMap = Arc<parking_lot::Mutex<HashMap<SocketAddr, u64>>>;
 
-/// Reply targets for a buffered entry. A bundle has one target per constituent message;
-/// volatile entries have no targets.
+/// Reply targets for a buffered entry.
 type ReplyTargets = Vec<oneshot::Sender<Bytes>>;
 
-/// Key used to account for a volatile entry discarded at session end. A bundled entry
-/// stores the minimum key of its constituents.
+/// Minimum key used to account for a discarded volatile entry.
 type VolatileKey = Option<u64>;
 
-/// One buffered/in-flight/scheduled entry: the wire bytes (a lone message, or an
-/// already `encode_bundle`-framed bundle when batching is on), its reply targets
-/// (empty for a volatile entry/bundle), and its own filing key (`None` for durable).
+/// Wire bytes, reply targets, and the optional volatile key for one entry.
 type BufferedEntry = (Bytes, ReplyTargets, VolatileKey);
 
 /// Default maximum delay between reconnect attempts, in milliseconds.
@@ -67,8 +61,7 @@ pub struct ReliableSender {
     drop_map: Option<DirtyMap>,
     /// Maximum reconnect backoff, in milliseconds.
     retry_backoff_max_ms: u64,
-    /// Queue depth at which `send_volatile` records a drop instead of waiting. Zero
-    /// disables shedding. Dropped keys are recorded in `drop_map` when configured.
+    /// Queue depth at which volatile sends are shed. Zero disables shedding.
     volatile_soft_cap: usize,
 }
 
@@ -111,7 +104,7 @@ impl ReliableSender {
         self
     }
 
-    /// Attach a channel notified after a connection recovers from a failure.
+    /// Attach a recovery notification channel.
     pub fn with_reconnect_events(mut self, tx: Sender<SocketAddr>) -> Self {
         self.reconnect_events = Some(tx);
         self
@@ -129,14 +122,13 @@ impl ReliableSender {
         self
     }
 
-    /// Set the queue depth at which volatile messages are shed. A drop map is needed
-    /// to record shed keys.
+    /// Set the queue depth at which volatile messages are shed.
     pub fn with_volatile_soft_cap(mut self, cap: usize) -> Self {
         self.volatile_soft_cap = cap;
         self
     }
 
-    /// Helper function to spawn a new connection.
+    /// Spawn a connection task.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(100_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
@@ -172,8 +164,7 @@ impl ReliableSender {
         receiver
     }
 
-    /// Broadcast the message to all specified addresses in a reliable manner. It returns a vector of
-    /// cancel handlers ordered as the input `addresses` vector.
+    /// Broadcast reliably and return cancel handlers in address order.
     pub async fn broadcast(
         &mut self,
         addresses: Vec<SocketAddr>,
@@ -367,8 +358,7 @@ impl ReliableSender {
     }
 }
 
-/// Shared by `ReliableSender`/`SimpleSender`'s `*_typed` methods: increments the two
-/// typed counters if `metrics` is attached, a no-op otherwise.
+/// Updates typed wire metrics when metrics are enabled.
 pub(crate) fn record_typed_sent(
     metrics: &Option<Arc<Metrics>>,
     msg_type: &'static str,
@@ -377,7 +367,7 @@ pub(crate) fn record_typed_sent(
     record_typed_sent_n(metrics, msg_type, len, 1);
 }
 
-/// Record metrics for `n` identical destinations with one label lookup per metric.
+/// Records typed metrics for `n` destinations.
 pub(crate) fn record_typed_sent_n(
     metrics: &Option<Arc<Metrics>>,
     msg_type: &'static str,
@@ -399,8 +389,7 @@ pub(crate) fn record_typed_sent_n(
     }
 }
 
-/// Classifies durable messages with or without reply targets and volatile messages.
-/// Durable messages are retried; volatile messages are discarded when a session ends.
+/// Message delivery class.
 #[derive(Debug)]
 enum SendClass {
     Durable(oneshot::Sender<Bytes>),
@@ -408,22 +397,21 @@ enum SendClass {
     Volatile(u64),
 }
 
-/// Simple message used by `ReliableSender` to communicate with its connections.
+/// Message sent to a reliable connection task.
 #[derive(Debug)]
 struct InnerMessage {
     /// The data to transmit.
     data: Bytes,
-    /// This message's send class -- see `SendClass`'s own doc comment.
+    /// Delivery class.
     class: SendClass,
 }
 
-/// Returns true when a non-empty set of reply targets has all been dropped. Empty
-/// targets represent messages that must still be sent.
+/// Returns true when all non-empty reply targets are closed.
 fn all_closed(handlers: &ReplyTargets) -> bool {
     !handlers.is_empty() && handlers.iter().all(|h| h.is_closed())
 }
 
-/// Send acknowledgement bytes to every reply target.
+/// Sends acknowledgement bytes to all reply targets.
 fn notify_all(handlers: ReplyTargets, bytes: Bytes) {
     for handler in handlers {
         let _ = handler.send(bytes.clone());
@@ -435,13 +423,13 @@ fn merge_min_key(acc: &mut Option<u64>, key: u64) {
     *acc = Some(acc.map_or(key, |m| m.min(key)));
 }
 
-/// Maintains a reliable connection to one peer.
+/// Reliable connection to one peer.
 struct Connection {
     /// Destination address.
     address: SocketAddr,
     /// Incoming send commands.
     receiver: Receiver<InnerMessage>,
-    /// The initial delay to wait before re-attempting a connection (in ms).
+    /// Initial reconnect delay, in milliseconds.
     retry_delay: u64,
     /// Messages waiting for transmission or retry.
     buffer: VecDeque<BufferedEntry>,
@@ -462,7 +450,6 @@ struct Connection {
 }
 
 impl Connection {
-    // Keep the constructor arguments explicit because each option is independent.
     #[allow(clippy::too_many_arguments)]
     fn spawn(
         address: SocketAddr,
@@ -493,8 +480,7 @@ impl Connection {
         });
     }
 
-    /// Length-delimited-codec frame prefix: 4 bytes, fixed (`LengthDelimitedCodec::
-    /// new()`'s default `length_field_length`).
+    /// Length-delimited frame prefix size.
     const FRAME_PREFIX_LEN: u64 = 4;
 
     fn record_bytes_sent(&self, len: usize) {
@@ -523,7 +509,7 @@ impl Connection {
             .or_insert(key);
     }
 
-    /// Main loop trying to connect to the peer and transmit messages.
+    /// Connects and transmits messages until the session fails.
     async fn run(&mut self) {
         let mut delay = self.retry_delay;
         let mut retry = 0;
@@ -534,18 +520,15 @@ impl Connection {
                     let _ = stream.set_nodelay(true);
                     info!("Outgoing connection established with {}", self.address);
 
-                    // Notify the protocol task after a recovered connection.
                     if self.had_failure {
                         if let Some(tx) = &self.reconnect_events {
                             let _ = tx.try_send(self.address);
                         }
                     }
 
-                    // Reset the delay.
                     delay = self.retry_delay;
                     retry = 0;
 
-                    // Transmit buffered and incoming messages until the session fails.
                     let error = self.keep_alive(stream).await;
                     self.had_failure = true;
                     warn!("{}", error);
@@ -558,26 +541,20 @@ impl Connection {
 
                     'waiter: loop {
                         tokio::select! {
-                            // Wait an increasing delay before attempting to reconnect.
                             () = &mut timer => {
                                 delay = min(2*delay, self.retry_backoff_max_ms);
                                 retry +=1;
                                 break 'waiter;
                             },
 
-                            // Drain the channel while disconnected. Durable messages are
-                            // retained; volatile messages are accounted and discarded.
                             Some(InnerMessage{data, class}) = self.receiver.recv() => {
                                 match class {
                                     SendClass::Durable(h) => {
-                                        // Buffer entries must use bundle framing when
-                                        // batching is enabled.
                                         let data = if self.batch.enabled { encode_bundle(&[data]) } else { data };
                                         self.buffer.push_back((data, vec![h], None));
                                         self.buffer.retain(|(_, handlers, _)| !all_closed(handlers));
                                     }
                                     SendClass::DurableDetached => {
-                                        // Detached durable messages use the same framing.
                                         let data = if self.batch.enabled { encode_bundle(&[data]) } else { data };
                                         self.buffer.push_back((data, Vec::new(), None));
                                         self.buffer.retain(|(_, handlers, _)| !all_closed(handlers));
@@ -601,15 +578,12 @@ impl Connection {
         }
     }
 
-    /// The release instant for a message being scheduled right now: `now() +
-    /// extra_latency`.
+    /// Release instant for a newly scheduled message.
     fn scheduled_release(&self) -> Instant {
         Instant::now() + self.extra_latency
     }
 
-    /// Route an incoming message to its class-specific buffer or coalescer. Durable
-    /// and volatile messages use separate coalescers; detached durable messages are
-    /// buffered as individual entries.
+    /// Routes an incoming message to its class-specific buffer or coalescer.
     #[allow(clippy::too_many_arguments)]
     fn on_arrival(
         &mut self,
@@ -661,9 +635,7 @@ impl Connection {
 
     /// Transmit without an artificial delay. Batching occurs before this loop.
     async fn keep_alive_immediate(&mut self, stream: TcpStream) -> NetworkError {
-        // Entries written to the socket and awaiting acknowledgement.
         let mut pending_replies: VecDeque<BufferedEntry> = VecDeque::new();
-        // Durable and volatile messages use separate coalescers.
         let mut durable_coalescer: Coalescer<oneshot::Sender<Bytes>> = Coalescer::new();
         let mut durable_deadline: Option<Instant> = None;
         let mut volatile_coalescer: Coalescer<u64> = Coalescer::new();
@@ -671,23 +643,18 @@ impl Connection {
 
         let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
         let error = 'connection: loop {
-            // Try to send all messages of the buffer.
             while let Some((data, handlers, key)) = self.buffer.pop_front() {
-                // Skip entries whose reply targets were all cancelled.
                 if all_closed(&handlers) {
                     continue;
                 }
 
-                // Try to send the message.
                 match writer.send(data.clone()).await {
                     Ok(()) => {
-                        // Track the sent entry until its acknowledgement arrives.
                         self.record_bytes_sent(data.len());
                         self.record_frame_sent();
                         pending_replies.push_back((data, handlers, key));
                     }
                     Err(e) => {
-                        // We failed to send the message, we put it back into the buffer.
                         self.buffer.push_front((data, handlers, key));
                         break 'connection NetworkError::FailedToSendMessage(self.address, e);
                     }
@@ -697,7 +664,6 @@ impl Connection {
             let durable_due = sleep_until_or_pending(durable_deadline);
             let volatile_due = sleep_until_or_pending(volatile_deadline);
 
-            // Wait for a flush, an incoming message, or an acknowledgement.
             tokio::select! {
                 () = durable_due, if self.batch.enabled && !durable_coalescer.is_empty() => {
                     let (bundle, handlers) = durable_coalescer.flush();
@@ -719,12 +685,9 @@ impl Connection {
                     };
                     match response {
                         Some(Ok(bytes)) => {
-                            // Notify every reply target that the message has been successfully sent.
                             notify_all(handlers, bytes.freeze());
                         },
                         _ => {
-                            // Something has gone wrong (either the channel dropped or we failed to read from it).
-                            // Put the message back in the buffer, we will try to send it again.
                             pending_replies.push_front((data, handlers, key));
                             break 'connection NetworkError::FailedToReceiveAck(self.address);
                         }
@@ -733,8 +696,7 @@ impl Connection {
             }
         };
 
-        // Requeue durable entries and account for volatile entries from the failed
-        // session.
+        // Requeue durable entries and account for dropped volatile entries.
         let mut min_dropped_key: Option<u64> = None;
         while let Some((data, handlers, key)) = pending_replies.pop_back() {
             match key {
@@ -742,20 +704,17 @@ impl Connection {
                 None => self.buffer.push_front((data, handlers, None)),
             }
         }
-        // Re-encode unflushed durable messages before requeueing them. This preserves
-        // the bundle framing invariant and keeps their arrival order.
+        // Preserve bundle framing for unflushed durable messages.
         let durable_drained = durable_coalescer.drain();
         if !durable_drained.is_empty() {
             let (msgs, handlers): (Vec<Bytes>, ReplyTargets) = durable_drained.into_iter().unzip();
             self.buffer
                 .push_front((encode_bundle(&msgs), handlers, None));
         }
-        // Account for unflushed volatile messages.
         let volatile_drained = volatile_coalescer.drain();
         for (_, k) in volatile_drained {
             merge_min_key(&mut min_dropped_key, k);
         }
-        // Remove volatile entries left in the buffer after a send failure.
         self.buffer.retain(|(_, _, key)| match key {
             Some(k) => {
                 merge_min_key(&mut min_dropped_key, *k);
@@ -767,9 +726,7 @@ impl Connection {
         error
     }
 
-    /// Transmit with a fixed per-connection delay. The FIFO delay queue preserves
-    /// ordering while allowing multiple messages to be in flight. Bundles receive one
-    /// release time.
+    /// Transmit with a fixed per-connection delay.
     async fn keep_alive_delayed(&mut self, stream: TcpStream) -> NetworkError {
         let mut pending_replies: VecDeque<BufferedEntry> = VecDeque::new();
         let mut delay_queue: VecDeque<(Instant, Bytes, ReplyTargets, VolatileKey)> =
@@ -781,7 +738,6 @@ impl Connection {
 
         let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
         let error = 'connection: loop {
-            // Schedule buffered entries without blocking new arrivals.
             while let Some((data, handlers, key)) = self.buffer.pop_front() {
                 if all_closed(&handlers) {
                     continue;
@@ -847,8 +803,7 @@ impl Connection {
             }
         };
 
-        // Requeue durable entries and account for volatile entries that were awaiting
-        // acknowledgement or scheduled for transmission.
+        // Requeue durable entries and account for dropped volatile entries.
         let mut min_dropped_key: Option<u64> = None;
         while let Some((data, handlers, key)) = pending_replies.pop_back() {
             match key {
@@ -862,7 +817,6 @@ impl Connection {
                 None => self.buffer.push_front((data, handlers, None)),
             }
         }
-        // Re-encode unflushed durable messages before requeueing them.
         let durable_drained = durable_coalescer.drain();
         if !durable_drained.is_empty() {
             let (msgs, handlers): (Vec<Bytes>, ReplyTargets) = durable_drained.into_iter().unzip();
@@ -873,7 +827,6 @@ impl Connection {
         for (_, k) in volatile_drained {
             merge_min_key(&mut min_dropped_key, k);
         }
-        // Remove volatile entries left in the buffer after a send failure.
         self.buffer.retain(|(_, _, key)| match key {
             Some(k) => {
                 merge_min_key(&mut min_dropped_key, *k);

@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
-# End-to-end docker-bench orchestration: gen -> build -> up -> monitoring -> wait ->
-# run duration (live timeline, ending in a self-baselined summary) -> down validators.
+# Generate, build, run, monitor, and stop a docker-bench cluster.
 #
 # Usage:
 #   ./run.sh --nodes 4 --rate 200 --duration 60 --protocol vantage
-#   ./run.sh --nodes 4 --rate 200 --duration 90 --protocol vantage --withhold 1 --withhold-at 30 --withhold-for 20
+#   ./run.sh --nodes 4 --rate 200 --duration 90 --withhold 1 --withhold-at 30 \
+#       --withhold-for 20
 #
-# --nodes/--rate/--duration/--protocol are handled here (also needed by this script
-# itself, for the build/wait/timeline steps); every other flag (--tx-size, --mode,
-# --no-latency, --withhold*, --delta-ms, ...) is passed straight through to gen.py --
-# see `python3 gen.py --help` for the full list.
+# Core flags are handled here; other flags are passed to gen.py.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Resolved (no `..` segment) purely so the "stop monitoring later with:" hint at the
-# tail prints a path a human can read and paste; `$SCRIPT_DIR/../monitoring` worked
-# fine but echoed as `docker-bench/../monitoring/...`.
+# Use an absolute repository path in cleanup output.
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MONITORING_COMPOSE="$REPO_ROOT/monitoring/docker-compose.yml"
 MONITORING_OVERRIDE="$SCRIPT_DIR/monitoring-compose.yml"
@@ -46,7 +41,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Refuse overlapping runs because they share one Compose project.
+# Refuse overlapping runs; all runs share one Compose project.
 if docker compose -f "$SCRIPT_DIR/docker-compose.yml" ps -q 2>/dev/null | grep -q .; then
     echo "run.sh: a benchmark cluster is already up from another run.sh -- wait for it" \
          "to finish, or clear it with:" >&2
@@ -68,8 +63,7 @@ disconnect_monitoring_network() {
 }
 
 down_benchmark() {
-    # Prometheus stays up to retain this run's samples, but it must release the
-    # benchmark network before Compose can remove that network.
+    # Preserve Prometheus samples before removing the network.
     disconnect_monitoring_network
     docker compose -f docker-compose.yml down
     BENCHMARK_RUNNING=0
@@ -92,11 +86,7 @@ trap cleanup_on_interrupt INT TERM
 trap cleanup_on_exit EXIT
 
 echo "==> [1/7] gen (nodes=$NODES rate=$RATE duration=$DURATION protocol=$PROTOCOL)"
-# `${EXTRA[@]+"${EXTRA[@]}"}`, not a plain `"${EXTRA[@]}"`: EXTRA is empty in the
-# common case (no passthrough flags), and pre-4.4 bash treats `"${arr[@]}"` on a truly
-# empty array as an unbound-variable error under `set -u` -- macOS still ships bash 3.2
-# as /bin/bash, confirmed to actually hit this otherwise. This idiom expands to nothing
-# when empty and to the normal, word-split list when not, on bash 3.2 all the way to 5.x.
+# Preserve empty-array behavior across Bash versions.
 python3 gen.py --nodes "$NODES" --rate "$RATE" --duration "$DURATION" --protocol "$PROTOCOL" \
     "${EXTRA[@]+"${EXTRA[@]}"}"
 
@@ -110,11 +100,7 @@ BENCHMARK_RUNNING=1
 docker compose -f docker-compose.yml up -d
 
 echo "==> [4/7] starting Prometheus and Grafana"
-# gen.py deletes and recreates data/prometheus.yaml each run. A bind-mounted file in
-# an existing Prometheus container would otherwise retain the deleted inode and keep
-# scraping the previous run's targets, even though the source path looks unchanged to
-# Compose. Recreate Prometheus deliberately; its named TSDB volume preserves the
-# The named TSDB volume preserves samples across container recreation. Then start Grafana.
+# Recreate Prometheus with current targets; its volume preserves samples.
 monitoring_compose up -d --force-recreate prometheus
 monitoring_compose up -d grafana
 PROMETHEUS_CONTAINER_ID="$(monitoring_compose ps -q prometheus)"
@@ -181,13 +167,7 @@ echo "    Grafana dashboard: http://localhost:3003/d/vantage-local-benchmark"
 echo "    Prometheus targets: http://localhost:9095/targets"
 
 echo "==> [6/7] running for ${DURATION}s (live timeline -- run blip.sh in another terminal to inject a blip)"
-# --watch prints one TIMELINE: line every 10s (total/delta/tps + committee-median
-# p50 committed and materialised latency; the cadence matches the nodes' own
-# latency-gauge refresh), then its own SUMMARY (TPS self-baselined from this
-# watch's own first/last samples -- see results.py; a separate one-shot
-# `results.py` call afterwards would instead divide the CUMULATIVE committed_total,
-# which includes whatever was already committed during the "wait" step above, by
-# --duration, silently inflating the reported rate).
+# --watch reports progress and computes TPS over its measurement window.
 python3 results.py --watch --duration "$DURATION"
 
 echo "==> [7/7] stopping validators"

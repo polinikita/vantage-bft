@@ -48,6 +48,7 @@ pub struct SequenceInstall {
     target_head: Digest,
     views: BTreeMap<View, StagedView>,
     lane_tips: BTreeMap<PublicKey, BlockRef>,
+    installed_lane_tips: BTreeMap<PublicKey, Header>,
     /// Verified heads retained for rebase checks after staged views are removed.
     heads: BTreeMap<View, Digest>,
     next_admit: View,
@@ -104,6 +105,7 @@ impl SequenceInstall {
             target_head,
             views,
             lane_tips,
+            installed_lane_tips: BTreeMap::new(),
             heads,
             next_admit: base_view + 1,
             next_install: base_view + 1,
@@ -154,6 +156,11 @@ impl SequenceInstall {
 
     pub fn lane_tip(&self, author: &PublicKey) -> Option<BlockRef> {
         self.lane_tips.get(author).cloned()
+    }
+
+    /// Returns the highest header from verified output installed for `author`.
+    pub fn installed_lane_tip(&self, author: &PublicKey) -> Option<Header> {
+        self.installed_lane_tips.get(author).cloned()
     }
 
     pub fn views_total(&self) -> usize {
@@ -283,12 +290,30 @@ impl SequenceInstall {
         Some((&staged.outcome, Arc::clone(&staged.delta)))
     }
 
-    pub fn mark_installed(&mut self, view: View) {
+    pub fn mark_installed(&mut self, view: View, blocks: &SharedBlocks) {
         assert_eq!(
             view, self.next_install,
             "sequence install applied out of order"
         );
-        self.views.remove(&view);
+        let staged = self.views.remove(&view).expect("installed view is staged");
+        let cache = blocks.lock();
+        for digest in staged.delta.iter() {
+            let Some(entry) = cache.get(digest) else {
+                continue;
+            };
+            if !entry.block_ok_verified {
+                continue;
+            }
+            let header = &entry.block;
+            let replace = self
+                .installed_lane_tips
+                .get(&header.author)
+                .is_none_or(|current| header.height > current.height);
+            if replace {
+                self.installed_lane_tips
+                    .insert(header.author, header.clone());
+            }
+        }
         self.next_install += 1;
     }
 
@@ -297,7 +322,7 @@ impl SequenceInstall {
     }
 }
 
-/// Readiness requires a cached, block-verified header; payload retrieval is handled later.
+/// Readiness requires a cached, block-verified header; payload retrieval is separate.
 fn deliverable(cache: &BlockCache, digest: &Digest) -> bool {
     cache
         .get(digest)

@@ -1480,7 +1480,7 @@
           "refId": "B"
         }
       ],
-      "title": "Blocks published / received per node (Vantage / Simple-IT)",
+      "title": "Block flow/s by node",
       "type": "timeseries"
     },
     {
@@ -1522,7 +1522,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum by (node) (rate(vantage_acks_sent{node=~\"$node\",node=~\".*-primary$\"}[1m]))",
-          "legendFormat": "{{node}} ack confirms/s (N3)",
+          "legendFormat": "{{node}} direct confirms/s",
           "refId": "A"
         },
         {
@@ -1531,7 +1531,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum by (node) (rate(vantage_acks_received{node=~\"$node\",node=~\".*-primary$\"}[1m]))",
-          "legendFormat": "{{node}} acks recv/s",
+          "legendFormat": "{{node}} confirms received/s",
           "refId": "B"
         },
         {
@@ -1540,7 +1540,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum by (node) (rate(vantage_avail_sent{node=~\"$node\",node=~\".*-primary$\"}[1m]))",
-          "legendFormat": "{{node}} avail sent/s",
+          "legendFormat": "{{node}} watermark frames/s",
           "refId": "C"
         },
         {
@@ -1549,11 +1549,11 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum by (node) (rate(vantage_avail_credited_refs{node=~\"$node\",node=~\".*-primary$\"}[1m]))",
-          "legendFormat": "{{node}} avail credited/s",
+          "legendFormat": "{{node}} credited refs/s",
           "refId": "D"
         }
       ],
-      "title": "Ack census per node: per-block acks / watermark avail (Vantage / Simple-IT)",
+      "title": "Availability confirmations/s by node",
       "type": "timeseries",
       "description": "Logical confirmations remain active in every mode. Wire traffic uses per-block ACKs, periodic watermarks, or default echo claims."
     },
@@ -1655,7 +1655,7 @@
           "refId": "A"
         }
       ],
-      "title": "Batch messages sent/s per node (worker-to-worker, incl. broadcast fan-out)",
+      "title": "Worker batch fan-out/s by node",
       "type": "timeseries"
     },
     {
@@ -1711,7 +1711,7 @@
         }
       ],
       "description": "Submitted traffic is additive. Committed traffic is replicated, so the query uses max across worker-0 observations.",
-      "title": "Submitted vs. sequenced (committed) transactions/s",
+      "title": "Submitted / committed transactions/s",
       "type": "timeseries"
     },
     {
@@ -1753,7 +1753,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p50\"})",
-          "legendFormat": "p50 (worst node, cumulative)",
+          "legendFormat": "p50 (worst node)",
           "refId": "A"
         },
         {
@@ -1762,7 +1762,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p90\"})",
-          "legendFormat": "p90 (worst node, cumulative)",
+          "legendFormat": "p90 (worst node)",
           "refId": "B"
         },
         {
@@ -1771,7 +1771,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"p99\"})",
-          "legendFormat": "p99 (worst node, cumulative)",
+          "legendFormat": "p99 (worst node)",
           "refId": "C"
         },
         {
@@ -1780,11 +1780,11 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "max(proposed_block_size_bytes{node=~\"$node\",node=~\".*-primary$\",v=\"max\"})",
-          "legendFormat": "max (cumulative)",
+          "legendFormat": "max",
           "refId": "D"
         }
       ],
-      "title": "Proposed block size, cumulative since start (p50/p90/p99/max, bytes)",
+      "title": "Published block size (run-to-date)",
       "type": "timeseries",
       "description": "Run-cumulative block-size percentiles and maximum. The maximum never decreases."
     },
@@ -2046,7 +2046,7 @@
           "expr": "(100 * sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) / 1e6) and on(node) protocol_info{protocol=\"vantage\"}"
         }
       ],
-      "title": "VantageCore: CPU vs waiting (% of one core)",
+      "title": "Vantage core CPU / wait",
       "type": "timeseries",
       "description": "Estimated compute time is utilization minus measured store waits. Unmeasured network waits make compute an upper bound."
     },

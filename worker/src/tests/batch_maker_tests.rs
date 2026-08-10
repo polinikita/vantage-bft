@@ -9,25 +9,22 @@ async fn make_batch() {
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
-    // Spawn a `BatchMaker` instance.
     BatchMaker::spawn(
-        /* max_batch_size */ 200,
-        /* max_batch_delay */ 1_000_000, // Ensure the timer is not triggered.
+        200,
+        1_000_000,
         rx_transaction,
         tx_message,
-        /* workers_addresses */ dummy_addresses,
-        /* withheld_workers_addresses */ None,
-        /* withhold_window */ None,
-        /* latency_map */ std::collections::HashMap::new(),
+        dummy_addresses,
+        None,
+        None,
+        std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
     );
 
-    // Send enough transactions to seal a batch.
     tx_transaction.send(transaction()).await.unwrap();
     tx_transaction.send(transaction()).await.unwrap();
 
-    // Ensure the batch is as expected.
     let expected_batch = vec![transaction(), transaction()];
     let batch = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {
@@ -42,24 +39,21 @@ async fn batch_timeout() {
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
-    // Spawn a `BatchMaker` instance.
     BatchMaker::spawn(
-        /* max_batch_size */ 200,
-        /* max_batch_delay */ 50, // Ensure the timer is triggered.
+        200,
+        50,
         rx_transaction,
         tx_message,
-        /* workers_addresses */ dummy_addresses,
-        /* withheld_workers_addresses */ None,
-        /* withhold_window */ None,
-        /* latency_map */ std::collections::HashMap::new(),
+        dummy_addresses,
+        None,
+        None,
+        std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
     );
 
-    // Do not send enough transactions to seal a batch..
     tx_transaction.send(transaction()).await.unwrap();
 
-    // Ensure the batch is as expected.
     let expected_batch = vec![transaction()];
     let batch = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {

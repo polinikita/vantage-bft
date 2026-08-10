@@ -49,6 +49,10 @@ python3 docker-bench/gen.py --help
 Common options include `--tx-size`, `--mode`, `--no-latency`,
 `--delta-ms`, `--max-header-delay-ms`, and the state-sync controls.
 
+Vantage carries positional availability claims on AGB echoes by default.
+`--no-echo-avail-claims` selects periodic watermarks; `--no-ack-watermarks`
+selects per-block acknowledgements.
+
 ## Fault Injection
 
 Disrupt a link during an active run:

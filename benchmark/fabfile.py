@@ -23,7 +23,7 @@ def _log_cost(result):
 
 @task
 def create(ctx, nodes=6):
-    ''' Create a testbed'''
+    '''Create an AWS testbed.'''
     try:
         InstanceManager.make().create_instances(nodes)
     except BenchError as e:
@@ -55,7 +55,7 @@ def cost(ctx):
 
 @task
 def start(ctx, max=2):
-    ''' Start at most `max` machines per data center '''
+    '''Start at most `max` machines per data center.'''
     try:
         InstanceManager.make().start_instances(max)
     except BenchError as e:
@@ -64,7 +64,7 @@ def start(ctx, max=2):
 
 @task
 def stop(ctx):
-    ''' Stop all machines '''
+    '''Stop all machines.'''
     try:
         InstanceManager.make().stop_instances()
     except BenchError as e:
@@ -73,7 +73,7 @@ def stop(ctx):
 
 @task
 def info(ctx):
-    ''' Display connect information about all the available machines '''
+    '''Display connection information for available machines.'''
     try:
         InstanceManager.make().print_info()
     except BenchError as e:
@@ -82,9 +82,7 @@ def info(ctx):
 
 @task
 def install(ctx, source_build=False):
-    '''Install runtime binaries and dependencies on all machines.
-
-    `--source-build` uploads the working tree and builds on the hosts.'''
+    '''Install runtime dependencies; `--source-build` builds uploaded source.'''
     try:
         Bench(ctx, source_build=source_build).install()
     except BenchError as e:
@@ -103,12 +101,11 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         'co-locate': True,
         'rate': [50_000],
         'tx_size': 512,
-        # Use random transaction payloads for this smoke run.
+        # Use random transaction payloads.
         'tx_mode': 'random',
         'duration': 60,
         'runs': 1,
 
-        # Unused
         'simulate_partition': True,
         'partition_start': 5,
         'partition_duration': 5,
@@ -130,13 +127,12 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         'fast_path_timeout': 5_000,
         'use_ride_share': False,
         'car_timeout': 5_000,
-        'delta_ms': 150,  # ms, Vantage AGB/control-log delay unit
-        # `node run` converts a positive RTT value to one-way link latency.
+        'delta_ms': 150,  # ms, Vantage AGB/control-log delay
+        # `node run` interprets positive RTT as one-way link latency.
         'mimic_latency_ms': int(mimic_latency_ms),
-        # Enable with `--all-to-all` when every pair should communicate directly.
+        # `--all-to-all` enables direct communication between every pair.
         'all_to_all': all_to_all,
-        # Transport-level per-peer outbound batching: on by default (5 ms / 64 KiB);
-        # pass `fab remote --batch-messages=False` for an explicit unbatched run.
+        # Enable per-peer transport batching by default.
         'batch_messages': batch_messages,
         'batch_max_bytes': batch_max_bytes,
         'batch_max_delay_ms': batch_max_delay_ms,
@@ -156,11 +152,7 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
              nodes=20, duration=180, rates='50000,100000,150000,200000,250000',
              max_header_delay=50, batch_size=500_000, early_stop_margin=0.10,
              source_build=False):
-    '''Run a distributed throughput and latency sweep on AWS.
-
-    `rates` is a comma-separated list of transactions per second. `latency`
-    selects the AWS RTT matrix or a uniform RTT. `duration` is seconds per rate.
-    `--source-build` builds the uploaded working tree on each host.'''
+    '''Run an AWS throughput and latency sweep; rates are tx/s, duration is seconds per rate, and latency selects AWS or uniform RTT.'''
     try:
         if latency not in ('aws', 'uniform'):
             raise BenchError(
@@ -179,7 +171,7 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
             'runs': 1,
             'early_stop_margin': float(early_stop_margin),
 
-            # Partition simulation is disabled for this run.
+            # Disable partition simulation.
             'simulate_partition': False,
             'partition_start': 0,
             'partition_duration': 0,
@@ -202,13 +194,13 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
             'fast_path_timeout': 5_000,
             'use_ride_share': False,
             'car_timeout': 5_000,
-            'delta_ms': 150,  # ms -- Vantage AGB/control-log base delay unit
+            'delta_ms': 150,  # ms, Vantage AGB/control-log delay
             'simulate_asynchrony': False,
             'asynchrony_start': 15_000,  # ms
             'asynchrony_duration': 3_000,  # ms
         }
         if latency == 'uniform':
-            # The node converts RTT to one-way latency.
+            # Convert RTT to one-way latency.
             node_params['mimic_latency_ms'] = int(mimic_latency_ms)
         # AWS latency uses the default regional RTT matrix.
         Bench(ctx, source_build=source_build).run(bench_params, node_params, debug)
@@ -275,10 +267,7 @@ def monitor_collector(ctx):
 
 @task
 def fetch_metrics(ctx, start=None, end=None):
-    '''Fetch collector metrics into `collector-metrics/*.json`.
-
-    Pass both `start` and `end` as Unix seconds to run a range query; otherwise
-    fetch the current value for each series.'''
+    '''Fetch collector metrics; pass start and end as Unix seconds for a range query.'''
     try:
         if (start is None) != (end is None):
             raise BenchError(
@@ -295,7 +284,7 @@ def fetch_metrics(ctx, start=None, end=None):
 
 @task
 def plot(ctx):
-    ''' Plot performance using the logs generated by "fab remote" '''
+    '''Plot performance from `fab remote` logs.'''
     plot_params = {
         'faults': [0],
         'nodes': [4],
@@ -312,7 +301,7 @@ def plot(ctx):
 
 @task
 def kill(ctx):
-    ''' Stop execution on all machines '''
+    '''Stop all benchmark processes.'''
     try:
         Bench(ctx).kill()
     except BenchError as e:
@@ -321,7 +310,7 @@ def kill(ctx):
 
 @task
 def logs(ctx):
-    ''' Print a summary of the logs '''
+    '''Print a summary of benchmark logs.'''
     try:
         print(LogParser.process('./logs', faults='?').result())
     except ParseError as e:

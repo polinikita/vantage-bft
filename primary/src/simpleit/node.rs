@@ -1,16 +1,4 @@
-// Simple-IT wiring layer: `SimpleItCore` drives `simpleit::engine::CutEngine` over the
-// Shared data plane used by `vantage::node::VantageCore` (`LaneManager`/`Repairer`/`Wire`/
-// `PayloadIo`, reused verbatim) -- own separate instances, deliberately not shared
-// mutable state with any live Vantage assembly, since the two protocols are mutually
-// exclusive per node/run (`config::Protocol` selects exactly one). Simple-IT has no
-// separate `wire` submodule of its own the way Vantage does; this file is where its
-// gate/dispatch/effect-execution logic lives instead, mirroring the combined role
-// `vantage::node`+`vantage::wire` play for Vantage's own `Inbound`.
-//
-// Two oracles `CutEngine` needs from its caller (see engine.rs's own module doc
-// comment) are supplied here: the per-round `Cut` snapshot (`SimpleItCore::build_cut`,
-// from `LaneManager::c_candidate`) and the f+1 tip-availability gate
-// (`TipOracleAdapter`, over `LaneManager::is_q_available`).
+// Simple-IT wiring supplies cut snapshots and tip availability to `CutEngine`.
 
 use crate::messages::{Ack, Header, Proposal};
 use crate::primary::{Height, PrimaryMessage, CHANNEL_CAPACITY};
@@ -45,11 +33,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-/// Returns the sender identity declared by an inbound message.
-///
-/// Explicit authors and requesters are checked against committee membership. Local
-/// timers have no sender. Served proposals are authorized by pending fetch state
-/// because the proposal names its original proposer, not the serving peer.
+/// Returns the declared sender. Explicit senders require committee membership;
+/// served proposals require a pending fetch authorization.
 impl DeclaredSender for engine::Inbound {
     fn declared_sender(&self) -> Option<PublicKey> {
         match self {
@@ -66,40 +51,16 @@ impl DeclaredSender for engine::Inbound {
     }
 }
 
-/// Inbound messages routed to `SimpleItCore`, either from the network
-/// (`SimpleItReceiverHandler`) or -- for the wire-shared data-plane variants -- the
-/// exact same message shapes `vantage::node::Inbound` carries. Deliberately NOT
-/// `engine::Inbound` itself: that type is `CutEngine`'s own, cut-consensus-only
-/// message set (it has no way to carry a `Header`/ack/repair message at all); this
-/// wraps it in one variant (`Cut`) alongside the data-plane ones, mirroring how
-/// `vantage::node::Inbound` unifies Vantage's own data-plane and AGB-consensus
-/// messages into one channel type. `TimerFired` is deliberately never wrapped here --
-/// see `SimpleItCore::run`'s own timer branch, which calls `CutEngine::handle`
-/// directly instead of routing a locally-generated event through this wire-oriented
-/// type (mirroring `VantageCore::run`'s identical treatment of its own AGB/
-/// control-round timers).
+/// Data-plane and cut-consensus messages routed to `SimpleItCore`.
 #[derive(Debug, Clone)]
 pub enum Inbound {
-    /// `Header(h, false)`: publish path. Provenance is claimed-by-author, exactly as
-    /// `vantage::node::Inbound::Publish` -- there is no channel identity to compare
-    /// `h.author` against, so the dispatcher always passes `h.author` itself as the
-    /// trusted sender.
     Publish(PublicKey, Header),
-    /// `Header(h, true)`: serve path.
     Serve(Header),
     HeadersRequest(Vec<Digest>, PublicKey),
-    /// Production network ACKs are accumulated by `AckAggregator` before reaching the
-    /// core -- see `SimpleItReceiverHandler::dispatch`.
+    /// Availability threshold emitted by the shared ACK aggregator.
     AckAvailability(AckAvailability),
-    /// Optional ack-watermark front-end (`Parameters::ack_watermarks`), mirroring
-    /// `vantage::node::Inbound::Avail` exactly -- see `LaneManager::resolve_watermark`.
     Avail(Vec<AvailEntry>, PublicKey),
-    /// The five wire-received cut-consensus messages, forwarded to `CutEngine::handle`
-    /// verbatim.
     Cut(engine::Inbound),
-    /// Lane resume: a peer's
-    /// `VantageLaneResume(author, from, requester)` -- mirrors `vantage::node::
-    /// Inbound::LaneResume` exactly (same wire message, same data plane).
     LaneResume(PublicKey, Height, PublicKey),
 }
 
@@ -111,23 +72,17 @@ impl DeclaredSender for Inbound {
             Inbound::Serve(_) | Inbound::AckAvailability(_) => None,
             Inbound::Avail(_, s) => Some(*s),
             Inbound::Cut(cut_inbound) => cut_inbound.declared_sender(),
-            // Lane resume uses the same inbound representation as Vantage.
             Inbound::LaneResume(_, _, requester) => Some(*requester),
         }
     }
 }
 
-/// Network receiver handler for the Simple-IT assembly's `primary_to_primary` port.
-/// Deliberately a distinct type from `VantageReceiverHandler` (which stays untouched)
-/// -- the two assemblies never share a handler -- but mirrors it closely: same
-/// ack-aggregator behaviour, same frame acking (moved into `network::Receiver` itself,
-/// once per received frame -- see `VantageReceiverHandler`'s own doc comment for why).
+/// Handles Simple-IT primary-to-primary messages.
 #[derive(Clone)]
 pub struct SimpleItReceiverHandler {
     pub tx: Sender<Inbound>,
     pub ack_aggregator: SharedAckAggregator,
-    /// `None` only in tests that construct this handler directly without wiring
-    /// metrics; production (`Primary::spawn`) always passes `Some`.
+    /// Optional metrics for direct unit tests.
     pub metrics: Option<Arc<Metrics>>,
 }
 
@@ -177,19 +132,14 @@ impl MessageHandler for SimpleItReceiverHandler {
             PrimaryMessage::SimpleItTimeoutAccept(a) => {
                 Inbound::Cut(engine::Inbound::TimeoutAccept(a))
             }
-            // Bracha variant.
             PrimaryMessage::SimpleItCutReady(r) => Inbound::Cut(engine::Inbound::CutReady(r)),
             PrimaryMessage::SimpleItCutFetch(round, digest, requester) => {
                 Inbound::Cut(engine::Inbound::CutFetch(round, digest, requester))
             }
             PrimaryMessage::SimpleItCutServe(p) => Inbound::Cut(engine::Inbound::CutServe(p)),
-            // Lane resume.
             PrimaryMessage::VantageLaneResume(author, from, requester) => {
                 Inbound::LaneResume(author, from, requester)
             }
-            // Autobahn-only and Vantage-AGB-only variants never reach the Simple-IT
-            // assembly's port; ignore rather than panic (defense in depth against a
-            // misrouted message).
             _ => return Ok(()),
         };
         self.tx
@@ -200,17 +150,7 @@ impl MessageHandler for SimpleItReceiverHandler {
     }
 }
 
-/// The f+1 tip-availability oracle `CutEngine::handle` needs (deviation 3 in
-/// engine.rs), over `LaneManager::is_q_available`. A small adapter borrowing
-/// `&LaneManager`/`&Committee` directly, rather than `impl TipOracle for
-/// SimpleItCore` -- `SimpleItCore`'s own dispatch needs `&mut self.cut` (for
-/// `CutEngine::handle`'s receiver) live AT THE SAME TIME as the oracle argument, and
-/// `impl TipOracle for SimpleItCore` would tie the oracle's borrow to `&self` as a
-/// whole (conflicting with that `&mut self.cut`); borrowing only the two disjoint
-/// fields it actually needs, via direct field-projection at each construction site,
-/// avoids that conflict entirely (the same reason `VantageCore`'s own dispatch always
-/// threads `&mut self.lm`/`&mut self.rep` as explicit arguments rather than calling
-/// back through `self`).
+/// Reads tip availability without borrowing the entire core.
 struct TipOracleAdapter<'a> {
     lm: &'a LaneManager,
     committee: &'a Committee,
@@ -224,48 +164,21 @@ impl TipOracle for TipOracleAdapter<'_> {
     }
 }
 
-/// Every in-flight `CutEffect::ArmTimer` deadline, as a boxed future resolving to the
-/// round it was armed for once its deadline elapses -- fed back as
-/// `engine::Inbound::TimerFired(round)` by `SimpleItCore::run`'s own select branch.
-/// `CutEngine::process_cut_timer` already no-ops a stale/redundant firing (round no
-/// longer current, already certified, or already timed out -- see its own doc
-/// comment), so this queue needs no cancellation/dedup of its own: every armed timer
-/// simply fires once, for whatever `TimerFired` is worth by the time it does.
+/// One-shot cut timers; stale firings are rejected by `CutEngine`.
 type PendingTimers = FuturesUnordered<Pin<Box<dyn Future<Output = CutRound> + Send>>>;
 
-/// `try_expand_commit`'s success payload: the same `(by_worker, headers)` shape
-/// `PayloadIo::notify_committed` takes, factored into a name (clippy::type_complexity)
-/// rather than repeated inline.
+/// Materialized worker batches and headers for one commit.
 type CommitBatch = (Vec<(WorkerId, Vec<Digest>)>, Vec<Header>);
 
-/// The Simple-IT cut-consensus wiring task: owns its OWN instances of the same
-/// data-plane types Vantage uses (`lm`, `ack_aggregator`, `rep`, `wire`, `payload`) --
-/// deliberately separate state, not shared mutable state, since the two protocols are
-/// mutually exclusive per node/run (identical data-plane logic either way, because it
-/// is the same code, not merely the same configuration). Drives `cut: CutEngine`
-/// (Simple-IT's own state machine) over that data plane, supplying both oracles its
-/// `handle` method needs (`build_cut`, `TipOracleAdapter`).
 pub struct SimpleItCore {
     name: PublicKey,
-    /// Uses the same trusted member set as `VantageCore::members`:
-    /// committee-membership set `dispatch_inbound`'s gate checks every wire-declared
-    /// sender against before any census/count path (here: `CutVoteAggregator`,
-    /// `TimeoutAggregator`, `TimeoutAcceptAggregator`, `DecideAggregator`) ever sees
-    /// the message.
+    /// Trusted wire senders.
     members: HashSet<PublicKey>,
-    /// Needed at this layer (unlike `VantageCore`, which never keeps a raw copy) --
-    /// `CutEngine::handle` takes `tips`/`oracle` as EXTERNAL parameters the caller
-    /// computes fresh each call (see engine.rs's own module doc comment on why), so
-    /// `build_cut`/`TipOracleAdapter` need direct committee access this level down.
     committee: Committee,
     lm: LaneManager,
     ack_aggregator: SharedAckAggregator,
     rep: Repairer,
-    /// Reused verbatim from Vantage (`vantage::wire::Wire`) -- own instance, own
-    /// network senders/cancel-handler bookkeeping.
     wire: Wire,
-    /// Reused verbatim from Vantage (`vantage::payload::PayloadIo`) -- own instance,
-    /// own D1 payload-sync bookkeeping and committed-output channel.
     payload: PayloadIo,
     cut: CutEngine,
     pending_timers: PendingTimers,
@@ -275,65 +188,29 @@ pub struct SimpleItCore {
     digests: Vec<(Digest, WorkerId)>,
     payload_size: usize,
 
-    /// `Parameters::ack_watermarks`: when `true`, per-block ack broadcasts are
-    /// suppressed at EXECUTION time (`execute`'s `Effect::BroadcastAck` arm), while
-    /// the local self-ack path (`record_local_ack`) still runs unconditionally either
-    /// way. `LaneManager` itself never sees this flag.
+    /// Suppresses per-block ACK broadcasts while retaining local ACKs.
     ack_watermarks: bool,
-    /// The ack-watermark broadcast period, ms -- irrelevant when `ack_watermarks` is
-    /// off.
     ack_watermark_period_ms: u64,
 
-    /// Lane-resume state. Every party runs this check.
     resume_trigger: ResumeTrigger,
     resume_serve: ResumeServe,
-    /// `Parameters::resume_check_period_ms` -- the `run` loop's `resume_tick` period.
     resume_check_period_ms: u64,
-    /// `Parameters::resume_backoff_ms` -- shared by both `resume_trigger` and
-    /// `resume_serve`.
     resume_backoff_ms: u64,
-    /// `Parameters::resume_batch` -- the maximum own blocks served per resume batch.
     resume_batch: u64,
 
-    /// Session id / genesis digest, computed once at `build` time (mirrors
-    /// `VantageCore::build`'s identical locals) -- kept as fields because
-    /// `try_expand_commit` needs `genesis` for a not-yet-committed author's default
-    /// watermark, and both are required (if unused) positional arguments to
-    /// `BlockCache::collect_verified_suffix`.
     sid: Digest,
     genesis: Digest,
     max_block_payload: usize,
-    /// Simple-IT's own minimal analogue of `vantage::Cursor`'s per-author
-    /// `watermarks` field -- see `try_expand_commit`'s doc comment for why a full
-    /// `Cursor` isn't reused. Absent entry means "nothing committed yet for this
-    /// author" (implicitly `(0, genesis)`). Only ever advanced once EVERY author in
-    /// a round has been proven locally resolvable -- see `drain_commit_queue`.
+    /// Last materialized block per author.
     committed_watermark: HashMap<PublicKey, (Height, Digest)>,
-    /// Committed-but-not-yet-fully-materialised rounds, in ascending round order
-    /// (`BTreeMap`, not `HashMap` -- standing project rule: prunable/ordered
-    /// structures are keyed for `split_off`/order, never scanned). A round can sit
-    /// here for a while under normal operation, not just under a fault: this node can
-    /// commit a round via reaching `safe` (its own `mint_threshold`-many first-hand
-    /// votes) plus a quorum of `Decide`s without ever having voted on (or gated via
-    /// `gate_tips`/gate on) that round's own tips --
-    /// `LaneManager::is_q_available` means 2f+1 PEERS acked a tip, not that THIS node
-    /// holds its bytes. See `drain_commit_queue`'s doc comment for the resulting
-    /// safety requirement (materialise strictly in round order, all authors of a
-    /// round atomically, or not at all).
+    /// Committed rounds awaiting local materialization, ordered by round.
     commit_queue: BTreeMap<CutRound, Cut>,
-    /// Simple-IT's own retention window (`Parameters::simpleit_gc_window_rounds`,
-    /// clamped to >= 1 by `build` -- see that field's doc comment), in cut ROUNDS,
-    /// mirroring `VantageCore::gc_window`'s role for Vantage's own views.
     gc_window: CutRound,
-    /// The floor `CutEngine::prune_below` was last called with (0 if never) --
-    /// mirrors `VantageCore::last_gc_floor`'s identical monotonic-guard role.
     last_gc_floor: CutRound,
 
     metrics: Option<Arc<Metrics>>,
 }
 
-/// `SimpleItCore::build`'s return shape -- mirrors `VantageCore::build`'s
-/// `BuildOutput` exactly.
 type BuildOutput = (
     SimpleItCore,
     Receiver<Inbound>,
@@ -343,8 +220,6 @@ type BuildOutput = (
 );
 
 impl SimpleItCore {
-    // clippy::too_many_arguments: see primary/src/committer.rs's identical
-    // justification (mirrors `VantageCore::spawn`'s own identical annotation).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -373,9 +248,6 @@ impl SimpleItCore {
         let (tx_simpleit, rx_simpleit) = channel(CHANNEL_CAPACITY);
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
 
-        // Capture the member set before consuming `committee` below.
-        // building the sub-components -- see `VantageCore::build`'s identical
-        // comment.
         let members: HashSet<PublicKey> = committee.authorities.keys().cloned().collect();
 
         let sid = block::session_id(&committee);
@@ -405,17 +277,6 @@ impl SimpleItCore {
             rep = rep.with_metrics(m);
         }
 
-        // Paper-faithful defaults: `gate_tips: true`, no crash-injection scaffolding.
-        // Neither is exposed via `Parameters` -- not asked for, and inventing a CLI
-        // knob for either is out of scope here. `variant` IS exposed, indirectly,
-        // through `parameters.protocol`: `Protocol::SimpleItBracha` selects
-        // `engine::Variant::Bracha`, every other `Protocol` value selects
-        // `engine::Variant::Opt` (the only one of the five `SimpleItCore::build` is
-        // ever ACTUALLY reached under in practice -- `primary.rs`'s own
-        // `Protocol::SimpleIt | Protocol::SimpleItBracha` match arm is this
-        // function's only caller; the other three arms are covered here anyway,
-        // matching this crate's own no-wildcard-match convention rather than relying
-        // on that external invariant).
         let variant = match parameters.protocol {
             Protocol::SimpleItBracha => engine::Variant::Bracha,
             Protocol::SimpleIt
@@ -434,9 +295,6 @@ impl SimpleItCore {
         let other_primary_addrs: Vec<SocketAddr> =
             other_primaries.iter().map(|(_, a)| *a).collect();
 
-        // Data-plane withholding fault injector (`--withhold`): mirrors
-        // `VantageCore::build`'s identical resolve-once-here treatment (same shared
-        // `Wire`, same field) -- see `Wire::withheld_header_dests`'s own doc comment.
         let withheld_header_dests: wire::WithheldHeaderDests =
             config::withheld_destinations(&committee, &name, parameters.withhold_senders).map(
                 |blocked| {
@@ -469,23 +327,6 @@ impl SimpleItCore {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
-        // Lane resume: this node's own
-        // dedicated off-run-loop sender -- mirrors `VantageCore::build`'s identical
-        // construction exactly (see `wire::spawn_resume_sender`'s doc comment for
-        // the full design/rationale). Built from the SAME `latency_map`/`batch`/
-        // `core_metrics` locals as `network`/`worker_network` just below -- cloned
-        // here (rather than moved) since both of those still need their own copies
-        // afterward.
-        //
-        // Durable replay is not used by SimpleIt; keep the shared sender setup
-        // constructs `Effect::Broadcast*`'s outbox-recorded path, never opens a
-        // replay episode, and never attaches `with_reconnect_events`/`with_drop_map`
-        // to `network` below -- "no volatile, no events, no episodes"): `in_flight`
-        // is a freshly constructed, permanently-unfed map (nothing here ever
-        // inserts into it, since `Wire::enqueue_replay` is never called on this
-        // assembly) and the chunk-pacing parameters are inert for the same reason --
-        // still threaded through because `spawn_resume_sender`/`Wire` are the SAME
-        // shared types Vantage uses.
         let in_flight: wire::InFlightMap = Arc::new(Mutex::new(HashMap::new()));
         let resume_senders = wire::spawn_resume_sender(
             latency_map.clone(),
@@ -495,10 +336,6 @@ impl SimpleItCore {
             parameters.replay_chunk_bytes,
             parameters.replay_chunk_interval_ms,
             parameters.replay_serve_max_bytes,
-            // KNOB 2 (measurement ablation, `config::Parameters::
-            // retry_backoff_max_ms`): transport-level, applies to Simple-IT's
-            // resume-sender pool too -- see `spawn_resume_sender`'s own doc
-            // comment.
             parameters.retry_backoff_max_ms,
         );
 
@@ -514,14 +351,6 @@ impl SimpleItCore {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
                         .with_batching(batch)
-                        // KNOB 2 (measurement ablation, `config::Parameters::
-                        // retry_backoff_max_ms`): transport-level, applies to
-                        // Simple-IT's main pool too -- see that field's own doc
-                        // comment. Unlike Vantage, Simple-IT never attaches
-                        // `with_reconnect_events`/`with_drop_map` here at all
-                        // Replay recovery is Vantage-only --
-                        // see the comment above `resume_senders`' own construction),
-                        // so this is the only new knob this pool needs.
                         .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms);
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
@@ -584,9 +413,6 @@ impl SimpleItCore {
             max_block_payload: parameters.max_block_payload,
             committed_watermark: HashMap::new(),
             commit_queue: BTreeMap::new(),
-            // Clamped to >= 1: a window of 0 would put the GC floor at the current
-            // round itself and prune state for the round being resolved -- mirrors
-            // `VantageCore::build`'s identical clamp on `vantage_gc_window_views`.
             gc_window: parameters.simpleit_gc_window_rounds.max(1),
             last_gc_floor: 1,
             metrics: core_metrics,
@@ -606,17 +432,8 @@ impl SimpleItCore {
         mut rx_our_digests: Receiver<(Digest, WorkerId)>,
         mut rx_payload_ready: Receiver<(Digest, Digest, WorkerId)>,
     ) {
-        // BEFORE anything can publish, for the same reason `VantageCore::run` does it:
-        // a process that restarts without its lane frontier re-signs a different block
-        // at a height it already used, forking its own lane. See
-        // `lanes::OWN_FRONTIER_KEY`.
         self.lm.restore_own_frontier().await;
-        // Boot: the round-1 leader proposes, and every party (leader included, in
-        // case IT then stalls after its own proposal) arms round 1's own fallback
-        // timeout -- see `CutEngine::schedule_cut_timer`'s doc comment for why round 1
-        // is the one round no other engine method ever arms a timer for (every other
-        // round's timer is armed as a side effect of the engine advancing INTO it,
-        // which by definition cannot happen for the first round).
+        // Start the round-1 proposal and fallback timer.
         let effects = {
             let tips = self.build_cut();
             let oracle = TipOracleAdapter {
@@ -632,16 +449,9 @@ impl SimpleItCore {
         let header_timer = tokio::time::sleep(Duration::from_millis(self.max_header_delay));
         tokio::pin!(header_timer);
 
-        // Use the shared cancellation-handler pruning path,
-        // reused verbatim here -- see `VantageCore::run`'s identical `metrics_tick`
-        // branch (minus the Vantage-specific progress-gauge sampling, which has no
-        // Simple-IT analogue).
         let mut prune_tick = tokio::time::interval(Duration::from_secs(1));
         prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Optional ack-watermark front-end (`Parameters::ack_watermarks`): mirrors
-        // `VantageCore::run`'s identical construction -- constructed ONLY when the
-        // flag is on, so no tick is ever scheduled when it's off.
         let mut avail_tick = if self.ack_watermarks {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(self.ack_watermark_period_ms));
@@ -651,10 +461,6 @@ impl SimpleItCore {
             None
         };
 
-        // Lane resume mirrors
-        // `VantageCore::run`'s identical construction -- unconditional (no flag),
-        // its own dedicated tick so `Parameters::resume_check_period_ms` is
-        // genuinely honored.
         let mut resume_tick =
             tokio::time::interval(Duration::from_millis(self.resume_check_period_ms));
         resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -687,11 +493,6 @@ impl SimpleItCore {
                     header_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(self.max_header_delay));
                 }
 
-                // Guarded exactly like `VantageCore::run`'s own `agb_sleep`/
-                // `control_sleep` branches (`if next_deadline.is_some()`): polling an
-                // EMPTY `FuturesUnordered` resolves `Ready(None)` immediately rather
-                // than pending, which would otherwise busy-loop this branch whenever
-                // no timer is currently armed.
                 Some(round) = self.pending_timers.next(), if !self.pending_timers.is_empty() => {
                     let effects = {
                         let tips = self.build_cut();
@@ -717,12 +518,6 @@ impl SimpleItCore {
                     }
                 }
 
-                // Lane resume mirrors `VantageCore::run`'s
-                // identical `resume_tick` branch -- the EPISODE DETECTOR/retry
-                // driver; ongoing drain of an established episode instead runs at
-                // receipt pace via `try_resume_request`'s other call sites
-                // (`Inbound::Publish`/`on_payload_ready` in `dispatch_inbound`/
-                // `on_payload_ready` below).
                 _ = resume_tick.tick() => {
                     let now = Instant::now();
                     let authors: Vec<PublicKey> =
@@ -740,10 +535,7 @@ impl SimpleItCore {
         }
     }
 
-    /// The cut snapshot `CutEngine::handle` needs (oracle 1, engine.rs's own module
-    /// doc comment): one entry per committee member with a certified tip
-    /// (`LaneManager::c_candidate`, which itself requires `DirectPub` + 2f+1 acks --
-    /// strictly stronger than upstream's certified-tips rule, intentionally).
+    /// Returns one certified tip per available committee lane.
     fn build_cut(&self) -> Cut {
         self.committee
             .authorities
@@ -762,12 +554,6 @@ impl SimpleItCore {
             .collect()
     }
 
-    /// Mirrors `VantageCore::dispatch_inbound`'s centralized
-    /// membership gate exactly, over the generic `sender_is_member`/`DeclaredSender`
-    /// gate. `Inbound::Cut(engine::Inbound::TimerFired(_))` never
-    /// reaches this function (see `run`'s own timer branch, which calls
-    /// `CutEngine::handle` directly), so the gate here only ever sees wire-originated
-    /// input.
     async fn dispatch_inbound(&mut self, inbound: Inbound) {
         if !wire::sender_is_member(&inbound, &self.members) {
             if let Some(metrics) = &self.metrics {
@@ -777,9 +563,6 @@ impl SimpleItCore {
         }
         match inbound {
             Inbound::Publish(sender, header) => {
-                // Lane-resume receipt continuation mirrors
-                // `VantageCore::dispatch_inbound`'s identical hook): this publish
-                // may have just advanced `frontier(author)`.
                 let author = header.author;
                 let before = self.lm.own_direct_frontier(&author);
                 let effects = self.lm.process_publish(sender, header).await;
@@ -822,9 +605,6 @@ impl SimpleItCore {
                 };
                 self.execute_cut(effects).await;
             }
-            // Lane resume mirrors `vantage::node::VantageCore::
-            // dispatch_inbound`'s own `Inbound::LaneResume` arm exactly (same clamp,
-            // dedup, and batch-cap decisions -- see that arm's own comments).
             Inbound::LaneResume(author, from, requester) => {
                 if author != self.name {
                     return;
@@ -890,10 +670,7 @@ impl SimpleItCore {
             .unwrap_or_default()
     }
 
-    /// Feeds `refs` through the shared `AckAggregator` and the same availability
-    /// path as per-block acknowledgements. `sender` is already a committee member
-    /// (`dispatch_inbound`'s centralized gate ran before `Inbound::Avail` is ever
-    /// reached).
+    /// Credits watermark references through the shared ACK aggregator.
     fn credit_refs(&mut self, sender: PublicKey, refs: Vec<BlockRef>) -> Vec<Effect> {
         let mut effects = Vec::new();
         for r in refs {
@@ -917,23 +694,7 @@ impl SimpleItCore {
         effects
     }
 
-    /// Drains `initial` and all effects it produces against real I/O. Only the
-    /// variants generated by the Simple-IT data plane are handled directly.
-    ///
-    /// Other protocol effects are matched explicitly and rejected in debug builds;
-    /// release builds count and drop them.
-    ///
-    /// `Effect::ResumeServeTo` is NOT in that list
-    /// below, unlike every other AGB-family variant: it IS genuinely producible on
-    /// this path, constructed directly by `dispatch_inbound`'s own `Inbound::
-    /// LaneResume` arm (not by `lm`/`rep`), so it gets a real arm just below.
-    /// `Effect::BroadcastSkipVote` joins this list -- `AgbEngine::
-    /// recheck_skip_vote_trigger`'s only caller-visible effect, equally unproducible
-    /// on this data-plane-only path.
-    /// `Effect::BodyFetchTo`/`Effect::BodyServeTo` join the list too; they are not
-    /// produced here because Simple-IT has no AGB engine.
-    /// (Simple-IT has no AGB engine, and `Parameters::digest_statements` is
-    /// Vantage-only).
+    /// Executes data-plane effects and rejects consensus-only variants.
     async fn execute(&mut self, initial: Vec<Effect>) {
         let mut queue: VecDeque<Effect> = initial.into();
         while let Some(effect) = queue.pop_front() {
@@ -944,9 +705,6 @@ impl SimpleItCore {
                         .await
                 }
                 Effect::BroadcastAck(ack) => {
-                    // Self-ack path always runs; only the wire broadcast is
-                    // suppressed when the watermark front-end replaces it -- mirrors
-                    // `vantage::node::VantageCore::execute`'s identical gating.
                     queue.extend(self.record_local_ack(&ack));
                     if !self.ack_watermarks {
                         self.wire
@@ -973,45 +731,16 @@ impl SimpleItCore {
                         .await
                 }
                 Effect::BlockCached(digest) => {
-                    // Ack-watermark front-end: retry any watermark pending on this
-                    // author before `on_block_available` consumes `digest` by value.
-                    // Extends the SAME queue this loop is draining (not a recursive
-                    // `self.execute` call -- this arm already runs inside `execute`'s
-                    // own drain loop).
+                    // Retry work waiting on this block.
                     for (sender, r) in self.lm.retry_pending_avail(&digest) {
                         queue.extend(self.credit_refs(sender, vec![r]));
                     }
                     queue.extend(self.rep.on_block_available(digest));
-                    // Re-attempt the commit-materialisation queue: a newly-cached
-                    // block (direct publish or repaired serve) is exactly the event
-                    // that can newly satisfy `drain_commit_queue`'s per-author suffix
-                    // check for whichever round is currently stuck at its head.
+                    // Retry commit materialization.
                     self.drain_commit_queue().await;
-                    // NOTE (a separate, benign liveness question, unrelated to the
-                    // commit path above): Simple-IT's own f+1 tip-availability gate
-                    // (`gate_tips` in `process_cut_proposal`) is evaluated fresh from
-                    // `LaneManager`'s CURRENT state on every `CutEngine::handle` call
-                    // (`build_cut`/`TipOracleAdapter`), not cached -- but a VOTE that
-                    // failed that gate on first arrival is not automatically
-                    // re-driven when the missing tip later becomes available (the
-                    // engine's own doc comment on `process_cut_proposal` says exactly
-                    // this: it "does not itself invent such a retry"). Unlike the
-                    // commit path, this is not a safety concern: a certificate/decide
-                    // quorum formed by OTHER parties still lets this node commit (see
-                    // `drain_commit_queue`'s doc comment), and this node's own missed
-                    // vote is covered by the round's timeout ladder. Deliberately not
-                    // addressed here since no retry mechanism was specified and
-                    // `CutEngine` exposes none for this specific case (unlike
-                    // `retry_pending_cut_proposals`, which the engine already invokes
-                    // internally for the unrelated SAFE-PARENT-blocked case).
                 }
 
-                // --- Lane resume ---
                 Effect::ResumeServeTo(requester, header) => {
-                    // Non-blocking hand-off onto the dedicated resume-sender task
-                    // (`Wire::enqueue_resume_header` -> `enqueue_resume`) -- never
-                    // `.await`ed, so this costs the effect-drain loop nothing
-                    // beyond the enqueue itself.
                     self.wire.enqueue_resume_header(requester, header);
                 }
                 other @ (Effect::BroadcastPropose(_)
@@ -1044,7 +773,7 @@ impl SimpleItCore {
                 | Effect::ApplyAnchor(_, _, _)
                 | Effect::BodyFetchTo(_, _, _)
                 | Effect::BodyServeTo(_, _, _)
-                // Availability claims are handled by the Vantage core.
+                // Vantage handles availability claims.
                 | Effect::AvailClaimed(_, _)) => {
                     debug_assert!(
                         false,
@@ -1061,9 +790,7 @@ impl SimpleItCore {
         }
     }
 
-    /// `CutEffect`s never chain back into more `CutEffect`s (unlike `Effect` above) --
-    /// none of the three variants' handling ever asks `cut` for further effects, so a
-    /// plain `for` loop suffices; no `VecDeque` needed.
+    /// Executes cut-consensus effects.
     async fn execute_cut(&mut self, effects: Vec<CutEffect>) {
         for effect in effects {
             match effect {
@@ -1074,7 +801,6 @@ impl SimpleItCore {
                         CutOut::Decide(d) => PrimaryMessage::SimpleItDecide(d),
                         CutOut::Timeout(t) => PrimaryMessage::SimpleItTimeout(t),
                         CutOut::TimeoutAccept(a) => PrimaryMessage::SimpleItTimeoutAccept(a),
-                        // Bracha variant.
                         CutOut::CutReady(r) => PrimaryMessage::SimpleItCutReady(r),
                     };
                     self.wire.broadcast_message(message).await;
@@ -1089,9 +815,7 @@ impl SimpleItCore {
                     self.pending_timers.push(fut);
                 }
                 CutEffect::Commit { round, proposals } => {
-                    // Queue rather than emit directly -- see `drain_commit_queue`'s
-                    // doc comment for why this cut's blocks may not be locally
-                    // materialised yet, and why draining must stay round-ordered.
+                    // Preserve round order while data is repaired.
                     self.commit_queue.insert(round, proposals);
                     self.drain_commit_queue().await;
                 }
@@ -1116,39 +840,9 @@ impl SimpleItCore {
         }
     }
 
-    /// Drains `commit_queue` in ascending round order. Safety depends on:
-    /// a round is emitted only when EVERY one of its authors' suffixes resolves --
-    /// atomically, all together -- and rounds are never reordered or skipped. Both
-    /// are required, not stylistic:
-    ///
-    /// A correct node can reach `CutEffect::Commit` for a round whose blocks it does
-    /// NOT hold: `try_commit_round`/`emit_commit_to_committer` fire once this node's
-    /// own `safe`-marking (first-hand `mint_threshold` votes) lines up with a quorum
-    /// of `Decide`s, none of which requires this node to have voted on (hence
-    /// `gate_tips`-gated on) that round's own tips, and
-    /// `record_cut_proposal` (which is what makes the cut's coordinates locally
-    /// knowable at all) runs unconditionally on receipt, before any tip-availability
-    /// check. So `try_expand_commit` returning `None` here is the COMMON case for a
-    /// node whose repair walk hasn't caught up for some author's lane, not a
-    /// corner case -- `LaneManager::is_q_available` (which is as far as `gate_tips`
-    /// itself ever checks) means 2f+1 PEERS acked a tip, never that THIS node holds
-    /// it.
-    ///
-    /// Given that, silently skipping an unresolved author (the previous version of
-    /// this code) is a safety bug: it advances that round's OTHER authors into the
-    /// output while leaving the unresolved author to be folded into whatever LATER
-    /// round first resolves it, alongside that later round's own authors. Two nodes
-    /// that resolve authors in a different order then interleave the SAME set of
-    /// blocks differently across rounds -- same eventual set, different total order,
-    /// which is exactly what a total-order broadcast must not do. Blocking the whole
-    /// round (and everything queued after it) until it resolves atomically is the
-    /// fix: every node emits the identical round-by-round, author-BTreeMap-order
-    /// sequence, differing only in WHEN (never in WHAT order).
     async fn drain_commit_queue(&mut self) {
         while let Some(&round) = self.commit_queue.keys().next() {
-            // Cloned out before calling `try_expand_commit` (which needs `&mut
-            // self`) -- `Cut` is small (bounded by committee size) and this is not a
-            // hot path (one commit's worth of coordinates per round, not per message).
+            // Release the map borrow before materialization.
             let proposals = self.commit_queue[&round].clone();
             let Some((by_worker, headers)) = self.try_expand_commit(&proposals) else {
                 break;
@@ -1166,40 +860,11 @@ impl SimpleItCore {
         }
     }
 
-    /// Simple-IT's own minimal analogue of `vantage::Cursor::expand`. `vantage::Cursor`
-    /// itself isn't reused here: its `on_completed`/`on_sealed`/`pump` machinery
-    /// exists to linearize AGB's ASYNCHRONOUS, out-of-order, View-keyed multi-input
-    /// completion model (a view can be `Completed` and `Sealed` in either order,
-    /// arbitrarily far apart) -- Simple-IT's `CutEffect::Commit` stream has no such
-    /// complexity of its OWN (`CutEngine`'s own `sent_commit_rounds` latch already
-    /// guarantees at most one `Commit` per round), so pulling in that whole state
-    /// machine would be a worse fit than this direct port of just the piece Simple-IT
-    /// actually needs. `Cursor` DOES also block until a manifest entry's chain is
-    /// locally materialised (`expand` returns `None` and the caller waits for a
-    /// `BlockCached` retry) -- that part IS needed here too, which is exactly
-    /// `drain_commit_queue`'s job one level up; this function is the single-round,
-    /// single-pass piece it calls.
-    ///
-    /// `proposals` (`CutEffect::Commit`'s cut) is a SNAPSHOT of per-author tips, not a
-    /// delta since the last commit -- reporting it naively (just the tip block, on
-    /// every round that still names it) would either silently drop every non-tip
-    /// ancestor block committed since the last round, or re-report a tip's batches on
-    /// every subsequent round that still names it (double-counting the worker-side
-    /// commit-latency metric). This expands each author's NEW suffix since its own
-    /// per-author watermark (mirroring `Cursor::expand`'s identical use of
-    /// `BlockCache::collect_verified_suffix`), skipping authors with nothing new.
-    ///
-    /// Two-pass, all-or-nothing: pass 1 resolves (read-only) every author's suffix,
-    /// bailing out via `?` -- mutating NOTHING -- the moment any one of them isn't
-    /// yet locally available; only once every author has resolved does pass 2 apply
-    /// the collected headers/batches and advance `committed_watermark`. This is what
-    /// lets `drain_commit_queue` above emit a round atomically or not at all, never
-    /// partially.
     fn try_expand_commit(&mut self, proposals: &Cut) -> Option<CommitBatch> {
         let blocks = self.lm.blocks_handle();
         let blocks = blocks.lock();
 
-        // Pass 1: resolve, but do not yet apply, every author's suffix.
+        // Resolve every suffix before updating any watermark.
         let mut resolved: Vec<(PublicKey, Height, Digest, Vec<Digest>)> =
             Vec::with_capacity(proposals.len());
         for (author, proposal) in proposals {
@@ -1209,15 +874,9 @@ impl SimpleItCore {
                 .cloned()
                 .unwrap_or_else(|| (0, self.genesis.clone()));
             if proposal.height <= stop_height {
-                continue; // nothing new for this author -- vacuously resolved
+                continue;
             }
-            // NOT a defensive/unreachable case: see `drain_commit_queue`'s doc
-            // comment for why a correct node routinely reaches a commit for a round
-            // whose blocks it hasn't yet locally verified all the way from its own
-            // watermark. `?` here aborts pass 1 with `None`, before pass 2 has
-            // mutated anything -- `drain_commit_queue` leaves this (and every later
-            // queued) round in place and retries on the next `BlockCached`/
-            // payload-ready trigger.
+            // A missing suffix leaves this and later rounds queued.
             let suffix = blocks.collect_verified_suffix(
                 &self.committee,
                 &self.sid,
@@ -1234,7 +893,6 @@ impl SimpleItCore {
             ));
         }
 
-        // Pass 2: every author resolved -- apply.
         let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
         let mut headers = Vec::new();
         for (author, height, tip_digest, suffix) in resolved {
@@ -1249,29 +907,14 @@ impl SimpleItCore {
                     headers.push(entry.block.clone());
                 }
             }
-            // `collect_verified_suffix` always pushes the walk's own starting digest
-            // (`tip_digest`, i.e. `proposal.header_digest`) first and reverses at the
-            // end, so `suffix.last()` (post-reverse) is provably `tip_digest` itself
-            // whenever `suffix` is non-empty -- which pass 1's `proposal.height >
-            // stop_height` guard guarantees (at least one step is taken before the
-            // walk can hit its own stop condition). `tip_digest` is used directly
-            // rather than re-deriving it from `suffix.last()`, so there is no
-            // `Option`/index to ever panic on here.
+            // Pass one verification for the exact tip.
             self.committed_watermark
                 .insert(author, (height, tip_digest));
         }
         Some((by_worker.into_iter().collect(), headers))
     }
 
-    /// Simple-IT's own analogue of `VantageCore::collect_internal_garbage`: prunes
-    /// `CutEngine`'s per-round state once it has advanced far enough past the
-    /// window's own floor. Unlike Vantage's resolver-driven floor, Simple-IT's
-    /// progress indicator is just `CutEngine::cut_round` itself -- there is no
-    /// separate resolved-watermark concept here. Deliberately independent of
-    /// `commit_queue`: a round sitting in `commit_queue` waiting on repair has
-    /// already had its `Cut` copied out (see `drain_commit_queue`'s doc comment), so
-    /// pruning `CutEngine`'s OWN internal per-round maps below the floor cannot
-    /// disturb it.
+    /// Prunes cut-engine state below the configured round window.
     fn collect_internal_garbage(&mut self) {
         let floor = self.cut.cut_round().saturating_sub(self.gc_window);
         if floor <= self.last_gc_floor {
@@ -1281,8 +924,7 @@ impl SimpleItCore {
         self.last_gc_floor = floor;
     }
 
-    /// Seals whatever's accumulated in `self.digests` into our own header via
-    /// `LaneManager::publish_own` -- mirrors `VantageCore::seal_own_header` exactly.
+    /// Seals accumulated worker digests into a local header.
     async fn seal_own_header(&mut self) {
         let payload = self.digests.drain(..).collect();
         self.payload_size = 0;
@@ -1302,27 +944,14 @@ impl SimpleItCore {
             set.remove(&(digest, worker_id));
             resolved = set.is_empty();
         }
-        // Republish here as well as in `sync_batches`: this is the SHRINK path, and a node
-        // that has caught up stops calling `sync_batches` entirely -- without this the
-        // gauges would freeze at their high-water mark and read as a permanent backlog.
         self.payload.publish_sizes();
         if resolved {
             self.payload.pending_payload.remove(&header_digest);
-            // Lane-resume receipt continuation mirrors
-            // `VantageCore::on_payload_ready`'s identical hook): the DELAYED half
-            // of "a resume-served header advances frontier(author)" -- taken
-            // BEFORE `set_payload_ready`, which is the call that may actually
-            // advance `own_direct_frontier` for it.
             let author = self.lm.author_of(&header_digest);
             let before = author.map(|a| self.lm.own_direct_frontier(&a));
             let effects = self.lm.set_payload_ready(&header_digest);
             self.execute(effects).await;
-            // Defensive trigger, mirroring `Effect::BlockCached`'s identical one:
-            // payload readiness does not currently change `collect_verified_suffix`'s
-            // own answer (that depends only on `block_ok_verified`, set the moment a
-            // header's CHAIN validity is confirmed, independent of its payload), but
-            // re-attempting here costs little and keeps this call site aligned with
-            // the other trigger point in case that independence ever changes.
+            // Retry commits after completing payload synchronization.
             self.drain_commit_queue().await;
             if let (Some(author), Some(before)) = (author, before) {
                 if self.lm.own_direct_frontier(&author) > before {
@@ -1332,13 +961,6 @@ impl SimpleItCore {
         }
     }
 
-    /// Lane resume mirrors
-    /// `VantageCore::try_resume_request` exactly, including its non-`async`
-    /// signature (see that function's own doc comment for why: once the send
-    /// itself became a non-blocking `try_send`, nothing in this body ever
-    /// awaits). Shared by the periodic `resume_tick` and both receipt-continuation
-    /// call sites (`dispatch_inbound`'s `Inbound::Publish` arm, `on_payload_ready`
-    /// above).
     fn try_resume_request(&mut self, author: PublicKey, now: Instant) {
         let frontier = self.lm.own_direct_frontier(&author);
         let avail = self.lm.avail_high(&author);
@@ -1358,9 +980,6 @@ impl SimpleItCore {
     }
 }
 
-/// `vantage::Cursor`'s own identical private helper, duplicated here rather than
-/// exposed from `cursor.rs` for one non-test call site -- a one-line, dependency-free
-/// wall-clock read.
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1370,11 +989,7 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    // Covers the commit-queue ordering invariant:
-    // must materialise committed rounds strictly in ascending order, atomically (every
-    // author of a round together or not at all), regardless of the order in which this
-    // node's own repair walk happens to resolve each author's blocks -- see
-    // `drain_commit_queue`'s own doc comment for the safety argument.
+    // Commit rounds materialize atomically in ascending order.
     use super::*;
     use crypto::Hash as _;
 
@@ -1382,8 +997,6 @@ mod tests {
         PublicKey([byte; 32])
     }
 
-    /// `n` committee members, `key(1)..=key(n)` -- mirrors
-    /// `simpleit::engine::tests::committee_of`.
     fn committee_of(n: u8) -> Committee {
         let keys: Vec<PublicKey> = (1..=n).map(key).collect();
         let info = keys
@@ -1400,14 +1013,6 @@ mod tests {
         Committee::new(info)
     }
 
-    /// A real `SimpleItCore`, built through the same `build` path `spawn` uses (only
-    /// skipping the final `tokio::spawn(core.run(..))`), mirroring `vantage::node::
-    /// tests::test_core`'s identical pattern. Returns `rx_output` too -- the channel
-    /// `PayloadIo::notify_committed` forwards each committed `Header` to, and the
-    /// observation point these tests use instead of a live worker/network listener
-    /// (this test committee's `Authority::workers` maps are empty, so `notify_committed`
-    /// harmlessly finds no worker address to also notify -- see that function's own
-    /// tolerant `if let Some(addr) = ..` guard).
     fn test_core(
         name: PublicKey,
         committee: Committee,
@@ -1504,9 +1109,7 @@ mod tests {
             .expect("payload-ready channel stays open");
         assert_eq!(arrived, (header.id.clone(), first_arrival.clone(), 0));
 
-        // Keep the first arrival unconsumed by `on_payload_ready`, then repeat the
-        // accepted serve. The pending set must be unioned, not replaced by the fresh
-        // store probe's one-key result.
+        // Repeat the serve while one payload remains missing.
         let effects = core.serve_effects(header.clone()).await;
         assert!(matches!(
             sync_effect(&effects),
@@ -1586,9 +1189,7 @@ mod tests {
         );
     }
 
-    /// `n` chain-linked headers for `author`, heights `1..=n`, NOT inserted into any
-    /// `BlockCache` -- callers insert whichever prefix they want "locally available"
-    /// via `insert` below.
+    /// Builds an uninserted chain of `n` headers.
     fn chain(author: PublicKey, n: Height, sid: &Digest, genesis: &Digest) -> Vec<Header> {
         let mut headers = Vec::new();
         let mut prev = genesis.clone();
@@ -1600,10 +1201,7 @@ mod tests {
         headers
     }
 
-    /// Seeds `core`'s `BlockCache` directly with `header`, bypassing the full
-    /// publish/repair pipeline -- `direct`/`payload_ok` are irrelevant to
-    /// `collect_verified_suffix` (only `block_ok_verified` and the pinned
-    /// author/height chain matter), so both are just set `true` for simplicity.
+    /// Inserts a fully verified test header.
     fn insert(core: &SimpleItCore, header: &Header) {
         core.lm
             .blocks_handle()
@@ -1635,11 +1233,6 @@ mod tests {
 
         let author = keys[1];
         let chain_a = chain(author, 1, &core.sid.clone(), &core.genesis.clone());
-        // Deliberately NOT inserted into BlockCache: chain_a[0] is "not yet available"
-        // -- exactly the case `drain_commit_queue`'s doc comment describes: this node
-        // may have recorded the committing round's proposal/certificate/decides
-        // without ever having downloaded/verified this author's own chain.
-
         core.commit_queue.insert(1, cut(&[(author, &chain_a[0])]));
         core.drain_commit_queue().await;
 
@@ -1663,9 +1256,7 @@ mod tests {
         );
     }
 
-    /// Once the missing blocks become available, the drain emits that round AND the
-    /// subsequent queued round, in ascending round order, with each round's authors
-    /// emitted together.
+    /// Unblocking the first round drains later ready rounds in order.
     #[tokio::test]
     async fn commit_queue_drains_in_round_order_once_unblocked_batching_authors_together() {
         let committee = committee_of(4);
@@ -1676,20 +1267,19 @@ mod tests {
         let genesis = core.genesis.clone();
         let author_a = keys[1];
         let author_b = keys[2];
-        let chain_a = chain(author_a, 2, &sid, &genesis); // A@1, A@2
-        let chain_b = chain(author_b, 1, &sid, &genesis); // B@1
+        let chain_a = chain(author_a, 2, &sid, &genesis);
+        let chain_b = chain(author_b, 1, &sid, &genesis);
 
         core.commit_queue
             .insert(1, cut(&[(author_a, &chain_a[0]), (author_b, &chain_b[0])]));
         core.commit_queue
             .insert(2, cut(&[(author_a, &chain_a[1]), (author_b, &chain_b[0])]));
 
-        // Nothing inserted into BlockCache yet -- both rounds must stay queued.
+        // Both rounds remain queued until their blocks arrive.
         core.drain_commit_queue().await;
         assert_eq!(core.commit_queue.len(), 2);
         assert!(rx_output.try_recv().is_err());
 
-        // Now the blocks arrive.
         insert(&core, &chain_a[0]);
         insert(&core, &chain_a[1]);
         insert(&core, &chain_b[0]);
@@ -1708,8 +1298,7 @@ mod tests {
             Some(&(1, chain_b[0].id.clone()))
         );
 
-        // Round 1: A@1 and B@1 emitted together (order within the round is
-        // BTreeMap-author-order by construction, but this only asserts "together").
+        // Round 1 emits both authors together.
         let mut round1 = vec![
             rx_output.try_recv().expect("round 1's first header").id,
             rx_output.try_recv().expect("round 1's second header").id,
@@ -1732,12 +1321,7 @@ mod tests {
         );
     }
 
-    /// Two nodes processing the same commit sequence but receiving payloads in
-    /// different orders produce the same emitted sequence -- the core safety property
-    /// the ordering invariant. Node Y's blocks arrive in an order that would, under
-    /// the old per-author-skip behaviour, have emitted round 3 (B's chain, fully
-    /// available early) interleaved before round 1 (A's chain, available late); the
-    /// fix instead blocks the whole queue on round 1 until it resolves.
+    /// Payload arrival order does not change commit output order.
     #[tokio::test]
     async fn commit_queue_emits_same_sequence_regardless_of_payload_arrival_order() {
         let committee = committee_of(4);
@@ -1762,7 +1346,7 @@ mod tests {
             node_y.commit_queue.insert(round, c);
         }
 
-        // Node X: blocks arrive strictly in causal/round order.
+        // Node X receives blocks in round order.
         node_x.drain_commit_queue().await;
         insert(&node_x, &chain_a[0]);
         node_x.drain_commit_queue().await;
@@ -1772,15 +1356,11 @@ mod tests {
         insert(&node_x, &chain_b[1]);
         node_x.drain_commit_queue().await;
 
-        // Node Y: B's ENTIRE chain arrives first (out of its own causal order too --
-        // height 2 lands before height 1), well before A's chain arrives at all.
         node_y.drain_commit_queue().await;
         insert(&node_y, &chain_b[1]);
         insert(&node_y, &chain_b[0]);
         node_y.drain_commit_queue().await;
-        // B is now fully resolvable (rounds 2 and 3 both only need B, or B+A), but
-        // round 1 (needing A@1) is still first in queue and still unresolved -- the
-        // fix must block everything behind it, not skip ahead to round 3.
+        // Node Y cannot skip unresolved round 1.
         assert!(
             rx_y.try_recv().is_err(),
             "round 1 blocking must suppress round 3 too, even though B is fully available"

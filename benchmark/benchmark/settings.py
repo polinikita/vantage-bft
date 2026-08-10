@@ -7,11 +7,10 @@ class SettingsError(Exception):
 
 
 class Settings:
-    '''Cloud-provider settings shared by AWS and GCP managers.'''
+    '''AWS benchmark settings.'''
 
     def __init__(self, key_name, key_path, base_port, repo_name, repo_url,
-                 branch, instance_type, aws_regions, project_id=None,
-                 templates=None, username='ubuntu', spot=False,
+                 branch, instance_type, aws_regions, username='ubuntu', spot=False,
                  monitor_instance_type=None, release_repo=None,
                  availability_zone=None):
         inputs_str = [
@@ -39,39 +38,15 @@ class Settings:
         self.branch = branch
 
         self.instance_type = instance_type
-        # Same list under both names: instance.py (AWS) reads aws_regions,
-        # gcp_instance.py reads gcp_zones.
         self.aws_regions = regions
-        self.gcp_zones = regions
-        self.project_id = project_id
-        self.templates = templates if templates is not None else []
         self.username = username
         # AWS EC2 Spot requests are enabled only when `spot` is true.
         self.spot = spot
         # Optional instance type for the metrics collector.
         self.monitor_instance_type = monitor_instance_type
-        # Build-once/deploy-prebuilt-binary (fetch mode, remote.py's default
-        # non-`--source-build` path): "<OWNER>/<REPO>" GitHub slug the
-        # `docker.yml` workflow publishes the rolling `nightly` release to.
-        # Optional -- None (absent from settings.json) means fetch mode has
-        # no release to download from and `Bench._update` raises a clear
-        # error telling the user to fill this in (or pass --source-build).
+        # Repository slug for fetch-mode nightly releases.
         self.release_repo = release_repo
-        # Single-AZ pinning (instance.py's create_instances/_resolve_az_subnet):
-        # the AWS availability zone every instance (validators AND the
-        # metrics-collector) in a region launches into, so intra-committee
-        # private-IP traffic stays intra-AZ (free) rather than merely
-        # intra-region (still billed cross-AZ). Either a plain string (e.g.
-        # "eu-west-1a"), applied to every region -- only sound for a
-        # single-region settings.json, since an AZ name is region-scoped and
-        # instance.py rejects a string that does not start with the region
-        # it's being applied to -- or a {region: az} dict for a multi-region
-        # settings.json (e.g. {"eu-west-1": "eu-west-1a"}), where a region
-        # missing from the dict falls back to auto-pick for that region only.
-        # Optional -- None (absent from settings.json, the default), or a
-        # dict/region combination that resolves to no entry, makes
-        # instance.py auto-pick the first 'available' ordinary AZ in that
-        # region instead.
+        # Optional region-to-AZ pinning. Missing entries use automatic selection.
         self.availability_zone = availability_zone
 
     @classmethod
@@ -89,8 +64,6 @@ class Settings:
                 data['repo']['branch'],
                 data['instances']['type'],
                 data['instances']['regions'],
-                data.get('project_id'),
-                data['instances'].get('templates'),
                 data.get('username', 'ubuntu'),
                 bool(data['instances'].get('spot', False)),
                 data['instances'].get('monitor_type'),

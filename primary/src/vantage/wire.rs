@@ -415,7 +415,7 @@ impl From<ReplaySend> for ReplayStream {
     }
 }
 
-// Separate bounded queues prevent one recovery class from consuming another class's capacity.
+// Each recovery class has a separate bounded queue.
 const SEQUENCE_SEND_CHANNEL_CAPACITY: usize = 256;
 const RESUME_LANE_CHANNEL_CAPACITY: usize = 4096;
 const REPLAY_SEND_CHANNEL_CAPACITY: usize = 64;
@@ -523,7 +523,7 @@ async fn run_replay_sender(
                 let Some(mut stream) = streams.pop_front() else {
                     continue;
                 };
-                // Detached sends must not create a cancellation handler that this task would drop.
+                // Detached sends must not create handlers owned by this task.
                 for bytes in take_replay_chunk(&mut stream, chunk_bytes) {
                     replay.send_detached_typed(stream.to, bytes, "Replay").await;
                 }

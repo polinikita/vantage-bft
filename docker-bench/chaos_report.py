@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""Score a chaos.sh run: did the committee stay live, and did each victim rejoin?
-
-Reads data/chaos-timeline.json (written by chaos.sh) and the local Prometheus, and
-answers the two questions the run exists to ask:
-
-  1. LIVENESS -- while one validator was down, did the REMAINING committee keep
-     committing? With one node down the fleet's own offered load also drops by 1/n
-     (each container runs its own client), so the honest comparison is the surviving
-     nodes' commit rate during the outage against their rate in the quiet window
-     just before it -- not total fleet throughput, which conflates the two.
-
-  2. REJOIN -- after the victim came back, did it catch up? A node that resumes
-     committing but never closes the view gap is the "connects to every peer and
-     then never participates" failure, and it is invisible in aggregate TPS.
-
-    python3 docker-bench/chaos_report.py [--prom http://localhost:9095]
-"""
+"""Score liveness and validator rejoin behavior after chaos runs."""
 
 import argparse
 import json
@@ -40,12 +24,7 @@ def q_range(prom, query, start_s, end_s, step="1s"):
 
 
 def by_node(series, role):
-    """Group on the `node` label, not `instance`.
-
-    Both processes register overlapping gauge names while only one of them ever sets
-    a given gauge; keying on the container would collapse the two and silently read
-    the wrong process's constant zero. Same trap as the AWS scrape splitting.
-    """
+    """Group samples by process-level node label."""
     out = {}
     for s in series:
         name = s["metric"].get("node", "")
@@ -62,11 +41,7 @@ def by_node(series, role):
 
 
 def rate_between(seq, t0, t1):
-    """Committed-counter delta / elapsed, over [t0, t1]. None if not enough samples.
-
-    A frozen (paused) process serves no scrapes at all, so its series simply has no
-    points in the window -- that absence is the signal, not an error.
-    """
+    """Return a counter rate, or None without two samples."""
     pts = [(t, v) for t, v in seq if t0 <= t <= t1]
     if len(pts) < 2:
         return None
@@ -105,13 +80,12 @@ def main():
         b = statistics.median(before) if before else 0.0
         du = statistics.median(during) if during else 0.0
         pct = f"{100 * du / b:.0f}%" if b > 0 else "-"
-        # Did the victim commit anything at all in the 15s after it was released?
+        # Check whether the victim committed after recovery.
         after = rate_between(committed.get(v, []), d1, d1 + 15)
         resumed = "-" if after is None else ("yes" if after > 0 else "NO")
         print(f"{ev['cycle']:>5} {v:>6} {b:>19.1f} {du:>9.1f} {pct:>9} {resumed:>15}")
 
-    # Convergence over the settle window: every primary should end within a view or
-    # two of the fleet. A victim that rejoined but stalled shows up as a wide spread.
+    # Flag nodes that remain behind the fleet after settling.
     finals = {}
     for i, seq in cursor.items():
         pts = [v for t, v in seq if t >= settle]
@@ -122,10 +96,7 @@ def main():
         med = statistics.median(finals.values())
         for i in sorted(finals):
             gap = finals[i] - med
-            # 2 views is inside the normal spread between nodes that are all keeping
-            # up (with an even committee the median sits between two of them, so a
-            # healthy node is routinely a few views off it). Flag only a gap big
-            # enough to mean a node is genuinely not tracking the fleet.
+            # Allow normal spread and flag substantial lag.
             flag = "  <-- LAGGING" if gap < -max(20, 0.01 * med) else ""
             print(f"  node {i:>2}: {finals[i]:>8.0f}  ({gap:+.0f} vs median){flag}")
         spread = max(finals.values()) - min(finals.values())

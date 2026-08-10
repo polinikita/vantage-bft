@@ -1,31 +1,5 @@
 #!/usr/bin/env python3
-"""Scrape every docker-bench container's published Prometheus endpoint and report
-committed TPS / latency, matching node/src/local_benchmark.rs's own summary formula
-(see that file's `print_results`/timeline loop). The TIMELINE line shares that
-printer's first three fields but samples every 10s (not 1 Hz) and appends
-tps/p50_ms/mat_p50_ms -- see `watch`'s own doc comment.
-
-stdlib only (urllib for HTTP, no `requests`; hand-rolled Prometheus text-exposition
-parser, no `prometheus_client`).
-
-What's actually exposed over HTTP (metrics/src/{metrics,snapshot}.rs), investigated so
-this tool does not have to guess:
-  - `committed_transactions` / `committed_bytes` / `submitted_transactions` /
-    `submitted_transactions_bytes`: plain unlabeled counters, on each WORKER's own
-    `/metrics` (not the primary's) -- exact values, always current.
-  - `transaction_committed_latency{v="p50"|"p90"|"p99"|"p25"|"p75"|"max"|"sum"|"count"}`:
-    an `IntGaugeVec` on the worker registry -- the EXACT precise-histogram percentiles
-    `node local-benchmark`'s own summary reads in-process, in microseconds. So p50 (and
-    p90/p99) genuinely are available over HTTP, not just in-process -- better than a
-    bucket-interpolated approximation.
-  - Caveat: these gauges are only refreshed every 10s by each node's own periodic
-    `MetricReporter` tick (metrics/src/metrics.rs `REPORT_INTERVAL`); the in-process
-    harness calls `force_report()` right before its own final read to avoid that lag,
-    which an external HTTP scraper structurally cannot do. So a one-shot `results.py`
-    read can be up to ~10s stale on the tail of a run -- `--watch` mode is the more
-    faithful way to see the true shape of a run for that reason, and the final summary
-    should be read as "as of the last periodic tick", not "at the exact instant asked".
-"""
+"""Scrape worker Prometheus endpoints and report committed totals and latency."""
 from __future__ import annotations
 
 import argparse
@@ -39,9 +13,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = SCRIPT_DIR / "data" / "manifest.json"
-# One source of truth for the link `watch` prints (run.sh echoes the same URL --
-# port from monitoring/docker-compose.yml's Grafana mapping, dashboard UID from the
-# provisioned vantage-local-benchmark dashboard).
+# Dashboard URL printed by watch and run.sh.
 GRAFANA_DASHBOARD_URL = "http://localhost:3003/d/vantage-local-benchmark"
 
 _LABEL_RE = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
@@ -54,8 +26,7 @@ def load_manifest() -> dict:
 
 
 def parse_prometheus_text(text: str) -> dict[str, list[tuple[dict[str, str], float]]]:
-    """metric name -> list of (labels, value). Handles both `name value` and
-    `name{k="v",...} value` lines; skips comments/blank lines."""
+    """Parse Prometheus text into metric names and labelled samples."""
     samples: dict[str, list[tuple[dict[str, str], float]]] = {}
     for line in text.splitlines():
         line = line.strip()
@@ -137,7 +108,7 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         s.p50 = gauge_by_label(samples, "transaction_committed_latency", "v", "p50")
         s.p90 = gauge_by_label(samples, "transaction_committed_latency", "v", "p90")
         s.p99 = gauge_by_label(samples, "transaction_committed_latency", "v", "p99")
-    # Stop the clock when the block's payload is locally in hand.
+    # Materialised latency ends when the payload is local.
     if gauge_by_label(samples, "transaction_materialised_latency", "v", "count"):
         s.m50 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p50")
         s.m90 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p90")
@@ -150,9 +121,7 @@ def snapshot_all(manifest: dict) -> list[NodeSnapshot]:
 
 
 def committed_total(snapshots: list[NodeSnapshot]) -> int:
-    # Matches local_benchmark.rs's `max_committed_transactions`: every node counts
-    # (approximately) the same replicated commit stream, so the cross-node figure is a
-    # max, not a sum.
+    # Each node counts the replicated stream; use the maximum.
     return max((s.committed_transactions for s in snapshots), default=0)
 
 
@@ -184,21 +153,13 @@ def materialised_line(snapshots: list[NodeSnapshot]) -> str:
 
 
 def median_p50_ms(snapshots: list[NodeSnapshot], attr: str) -> str:
-    """Committee-median p50 (`attr` is `p50` or `m50`), formatted for a TIMELINE
-    field -- `-` until the first reporter tick publishes the gauges."""
+    """Return the committee-median p50 for a timeline field."""
     values = [getattr(s, attr) for s in snapshots if s.reachable and getattr(s, attr) is not None]
     return f"{median(values) / 1000:.1f}" if values else "-"
 
 
 def print_summary(snapshots: list[NodeSnapshot], n_expected: int) -> None:
-    """Point-in-time read of the monotonic counters -- deliberately NOT a rate.
-    `committed_transactions` counts from container start, not from whenever this
-    command happens to be invoked, so `total / (a duration this command was merely
-    TOLD, with no way to verify)` silently over- or under-states throughput by
-    whatever gap exists between container start and invocation (measured: a run
-    invoked ~20s into an already-running cluster inflated TPS by >2x this way). Use
-    `--watch` for an actual rate -- it self-baselines from its own first and last
-    samples instead of trusting an externally supplied duration."""
+    """Print a counter snapshot, not a rate; use `--watch` for an interval rate."""
     reachable = [s for s in snapshots if s.reachable]
     total = committed_total(snapshots)
     submitted = sum(s.submitted_transactions for s in snapshots)
@@ -216,19 +177,7 @@ def print_summary(snapshots: list[NodeSnapshot], n_expected: int) -> None:
 
 
 def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
-    """Prints one `TIMELINE:` line per `interval` seconds (default 10 -- matching
-    the nodes' own `MetricReporter` gauge refresh, so the appended latency fields
-    are exactly one tick old, never mid-window noise; `node local-benchmark
-    --timeline`'s in-process printer stays at 1 Hz, so the two formats share the
-    first three fields but are no longer identical), then a SUMMARY computed
-    from THIS watch's own first and last samples -- self-baselined, so it is correct
-    regardless of how long the cluster had already been running before this call
-    started (unlike a one-shot cumulative-total/externally-given-duration division;
-    see `print_summary`).
-
-    Each line: `committed_delta` spans the whole interval (NOT per second -- `tps`
-    is the per-second rate), and `p50_ms`/`mat_p50_ms` are the committee-median p50
-    of the committed/materialised latency gauges (`-` until first published)."""
+    """Print interval rates and latency gauges, then a watch-window summary."""
     print(f"Grafana dashboard: {GRAFANA_DASHBOARD_URL}")
     sys.stdout.flush()
     prev_total = 0
@@ -259,7 +208,7 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         print()
 
     if not last_snapshots or first_total is None or elapsed <= first_elapsed:
-        return  # too short a window to derive a rate from (e.g. duration <= interval)
+        return  # Too short a window to derive a rate.
     window = elapsed - first_elapsed
     rate = (prev_total - first_total) / window
     print("-----------------------------------------")

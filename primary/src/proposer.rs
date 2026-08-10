@@ -6,8 +6,6 @@ use crate::primary::Height;
 use config::{Committee, WorkerId};
 use crypto::{Digest, Hash, PublicKey, SignatureService};
 use log::debug;
-#[cfg(feature = "benchmark")]
-use log::info;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -15,7 +13,7 @@ use tokio::time::{sleep, Duration, Instant};
 #[path = "tests/proposer_tests.rs"]
 pub mod proposer_tests;
 
-/// The proposer creates new headers and send them to the core for broadcasting and further processing.
+/// Creates headers and sends them to the core.
 pub struct Proposer {
     /// The public key of this primary.
     name: PublicKey,
@@ -26,20 +24,20 @@ pub struct Proposer {
     /// The maximum delay to wait for batches' digests.
     max_header_delay: u64,
 
-    /// Receives the parents to include in the next header (along with their round number).
+    /// Receives parent certificates for the next header.
     rx_core: Receiver<Certificate>,
     /// Receives the batches' digests from our workers.
     rx_workers: Receiver<(Digest, WorkerId)>,
-    // Receives new consensus instance
+    /// Receives consensus instances.
     rx_instance: Receiver<ConsensusMessage>,
     /// Sends newly created headers to the `Core`.
     tx_core: Sender<Header>,
 
-    /// The current height of this validator's chain
+    /// Current chain height.
     height: Height,
-    /// Holds the certificate waiting to be included in the next header
+    /// Parent certificate for the next header.
     last_parent: Option<Certificate>,
-    // Holds the consensus info for the last special header
+    /// Consensus information for the current header.
     consensus_instances: HashMap<Digest, ConsensusMessage>,
     /// Holds the batches' digests waiting to be included in the next header.
     digests: Vec<(Digest, WorkerId)>,
@@ -52,7 +50,6 @@ pub struct Proposer {
 }
 
 impl Proposer {
-    // clippy::too_many_arguments: see `Committer::spawn`'s identical justification.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -92,7 +89,7 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
-        // Make a new header.
+        // Build a new header.
         debug!("digests size before is {:?}", self.digests.len());
 
         let mut header = Header::new(
@@ -108,7 +105,6 @@ impl Proposer {
 
         if self.is_special {
             header.special = true;
-            // Instead of including Certificate as parent => include digest.
         }
 
         debug!("Created {:?}", header);
@@ -119,24 +115,21 @@ impl Proposer {
 
         #[cfg(feature = "benchmark")]
         for digest in header.payload.keys() {
-            // NOTE: This log entry is used to compute performance.
-            info!("Created {} -> {:?}", header, digest);
+            // Parsed by benchmark tooling.
+            debug!("Created {} -> {:?}", header, digest);
         }
 
-        // Reset last parent
         self.last_parent = None;
-        // Reset proposed consensus instances
         self.consensus_instances.clear();
         self.num_active_instances = 0;
 
-        // Send the new header to the `Core` that will broadcast and process it.
         self.tx_core
             .send(header)
             .await
             .expect("Failed to send header");
     }
 
-    // Main loop listening to incoming messages.
+    /// Processes incoming messages.
     pub async fn run(&mut self) {
         debug!("Dag starting at round {}", self.height);
 
@@ -145,15 +138,7 @@ impl Proposer {
         let mut current_time = Instant::now();
 
         loop {
-            // Check if we can propose a new header. We propose a new header when one of the following
-            // conditions is met:
-            // 1. We have a quorum of certificates from the previous round and enough batches' digests;
-            // 2. We have a quorum of certificates from the previous round and the specified maximum
-            // inter-header delay has passed.
-            // 3. If it is a special block opportunity. That is when either a QC or TC from the previous view forms,
-            // we have a ticket to propose a new block
-            // For both normal blocks and special blocks, delegate the actual sending to the consensus module
-            // in other words core should not be disseminating headers
+            // Propose when the parent, payload, timer, or special-block condition is ready.
             let enough_parent = self.last_parent.is_some();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
@@ -170,17 +155,15 @@ impl Proposer {
                 debug!("is special is {:?}", self.is_special);
                 current_time = Instant::now();
 
-                // Make a new header.
                 self.make_header().await;
                 self.payload_size = 0;
 
-                // Reschedule the timer.
                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                 timer.as_mut().reset(deadline);
             }
 
             tokio::select! {
-                // Received info from consensus
+                // Receive consensus information.
                 Some(info) = self.rx_instance.recv() => {
                     debug!("received consensus info");
 
@@ -204,7 +187,7 @@ impl Proposer {
                     self.consensus_instances.insert(info.digest(), info);
                 }
 
-                // Receive own certificate from core (we are the author)
+                // Receive the local parent certificate.
                 Some(parent) = self.rx_core.recv() => {
                     debug!("   received parent from height {:?}", parent.height);
 
@@ -212,11 +195,9 @@ impl Proposer {
                         continue;
                     }
 
-                    // Advance to the next height.
                     self.height += 1;
                     debug!("Chain moved to height {}", self.height);
 
-                    // Signal that we have a parent certificates to propose a new header.
                     self.last_parent = Some(parent.clone());
                 }
 
@@ -225,7 +206,7 @@ impl Proposer {
                     self.digests.push((digest, worker_id));
                 }
                 () = &mut timer => {
-                    // Nothing to do.
+                    // Timer expiration is handled at the top of the loop.
                 }
             }
         }

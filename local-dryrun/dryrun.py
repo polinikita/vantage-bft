@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Run a local `node local-benchmark` instance.
-
-Usage:
-    python3 dryrun.py                     # uses config.yml in this directory
-    python3 dryrun.py --config other.yml
-    python3 dryrun.py --no-build           # skip the cargo build step
-    python3 dryrun.py --down               # tear the monitoring stack down on exit
-
-Requires: Python 3, stdlib + pyyaml only (`pip install pyyaml` if missing).
-"""
+"""Run `node local-benchmark` with a YAML config and local monitoring."""
 import argparse
 import os
 import subprocess
@@ -60,19 +51,7 @@ def build(no_build: bool) -> None:
 
 
 def generate_prometheus_targets(data_dir: Path, nodes: int, workers: int, base_port: int = 4000) -> Path:
-    """Mirrors `config::Committee::local_benchmark`'s deterministic port allocation
-    (config/src/lib.rs) exactly, so this file has content before `node
-    local-benchmark` itself has ever run -- needed so `docker compose up` has
-    something real to bind-mount (an about-to-exist file, mounted read-only, would
-    otherwise make Docker create an empty directory in its place). `node
-    local-benchmark` regenerates the identical file on its own boot -- a harmless,
-    idempotent overwrite once it starts.
-
-    Port layout per node: 1 (consensus_to_consensus) + 3 (primary: primary_to_primary,
-    worker_to_primary, metrics) + `workers` * 4 (primary_to_worker, transactions,
-    worker_to_worker, metrics) -- primary metrics at node_base+3, worker j's metrics
-    at node_base+4+4*j+3.
-    """
+    """Write the deterministic Prometheus target file used by local-benchmark."""
     block = 4 + workers * 4
     lines = [
         "global:", "  scrape_interval: 1s", "scrape_configs:",
@@ -135,7 +114,7 @@ def open_dashboard() -> None:
     url = f"{GRAFANA_URL}/d/{DASHBOARD_UID}"
     print(f"[dryrun] dashboard: {url}")
     if sys.platform == "darwin":
-        subprocess.run(["open", url], check=False)  # Best effort.
+        subprocess.run(["open", url], check=False)  # Best-effort.
     else:
         print("[dryrun] (not macOS -- open the URL above manually)")
 
@@ -160,11 +139,9 @@ def build_local_benchmark_args(cfg: dict, binary: Path) -> list:
     if latency_table.lower() != "none":
         args += ["--latency-table", latency_table]
     else:
-        # Pass zero explicitly to select loopback latency.
+        # Zero selects loopback latency.
         args += ["--mimic-latency-ms", "0"]
-        # Transport-level batching is enabled by default. Emit the opt-out flag only
-        # when it is disabled.
-    batch_messages = cfg.get("batch_messages", True)
+        batch_messages = cfg.get("batch_messages", True)
     if not isinstance(batch_messages, bool):
         sys.exit("batch_messages must be true or false")
     if not batch_messages:
@@ -209,10 +186,7 @@ def main() -> None:
         proc = subprocess.Popen(cmd, cwd=REPO_ROOT)
         exit_code = proc.wait()
     except KeyboardInterrupt:
-        # `node local-benchmark` is in the same foreground process group, so it
-        # already received the same SIGINT and is doing its own clean shutdown
-        # (tokio::signal::ctrl_c(), node/src/local_benchmark.rs) -- just wait for its
-        # RESULTS block to print, don't send a second signal unless it hangs.
+        # Let the benchmark perform its own shutdown.
         print("\n[dryrun] Ctrl-C -- waiting for node local-benchmark's clean shutdown...")
         try:
             exit_code = proc.wait(timeout=30)

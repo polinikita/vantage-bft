@@ -13,7 +13,7 @@ use config::WorkerId;
 use crypto::Digest;
 use crypto::Hash as _;
 use crypto::PublicKey;
-use log::{debug, info};
+use log::debug;
 use metrics::Metrics;
 use network::BatchConfig;
 #[cfg(feature = "benchmark")]
@@ -28,14 +28,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-/// The state that needs to be persisted for crash-recovery.
+/// Commit state.
 struct State {
-    // Keeps the last committed height for each authority. This map is used to clean up the dag and
-    // ensure we don't commit twice the same certificate.
+    // Last executed height per authority.
     last_executed_heights: HashMap<PublicKey, Height>,
-    // Log containing slots and committed certificates
+    // Committed certificates by slot.
     log: HashMap<Slot, ConsensusMessage>,
-    // The last executed slot
+    // Last executed slot.
     last_executed_slot: Slot,
 }
 
@@ -69,14 +68,7 @@ pub struct Committer {
 }
 
 impl Committer {
-    // Each argument is a separate channel or task dependency.
     #[allow(clippy::too_many_arguments)]
-    // `name`/`metrics` are only read under `#[cfg(feature = "benchmark")]` below
-    // (worker-notification wiring), so they're unused on the default build;
-    // `store`/`gc_depth`/`rx_commit` are genuinely unused in every build (kept, not
-    // removed, to avoid touching the one call site in primary.rs for parameters with
-    // no correctness weight either way -- same reasoning as
-    // `Synchronizer::tx_certificate_waiter`).
     #[allow(unused_variables)]
     pub fn spawn(
         name: PublicKey,
@@ -88,15 +80,12 @@ impl Committer {
         rx_commit_message: Receiver<ConsensusMessage>,
         tx_output: Sender<Header>,
         synchronizer: Synchronizer,
-        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
-        // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
         let (_tx_deliver, rx_deliver) = channel(CHANNEL_CAPACITY);
 
         let genesis = Certificate::genesis(&committee);
-
 
         #[cfg(feature = "benchmark")]
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
@@ -143,7 +132,7 @@ impl Committer {
                 return;
             }
 
-            // Store the commit message if all proposals are ready to be processed
+            // Queue commits until slots are contiguous.
             state.log.insert(slot, commit_message);
 
             while state.log.contains_key(&(state.last_executed_slot + 1)) {
@@ -162,7 +151,7 @@ impl Committer {
                 {
                     for (pk, proposal) in proposals {
                         let stop_height = *state.last_executed_heights.get(pk).unwrap();
-                        // Don't execute proposals which are too old
+                        // Skip already executed proposals.
                         if proposal.height <= stop_height {
                             debug!("skipping this proposal because it's too old");
                             continue;
@@ -174,41 +163,27 @@ impl Committer {
                             .await
                             .expect("should have ancestors by now");
 
-                        // Update last executed height for the lane
                         if proposal.height > stop_height {
                             state.last_executed_heights.insert(*pk, proposal.height);
                         }
 
-                        // Commit all of the headers
                         for header in headers {
-                            info!("Committed {}", header);
+                            debug!("Committed {}", header);
                             #[cfg(feature = "benchmark")]
                             {
                                 for digest in header.payload.keys() {
-                                    // NOTE: This log entry is used to compute performance.
-                                    info!("Committed {} -> {:?}", header, digest);
+                                    // Parsed by benchmark tooling.
+                                    debug!("Committed {} -> {:?}", header, digest);
                                 }
 
-                                // Take the commit instant once per header at this log site,
-                                // and carried in the notification itself so the
-                                // worker's latency measurement is submission -> this
-                                // exact instant -- not submission -> whenever the
-                                // worker's queue got around to the notification.
+                                // Use this commit instant for worker latency measurement.
                                 let commit_millis = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .expect("Failed to measure time")
                                     .as_millis()
                                     as u64;
 
-                                // Notify our own local worker(s), grouped by
-                                // WorkerId, of the batches just committed so they
-                                // can extract real transaction latency
-                                // Route the notification to our worker with
-                                // the same id as the header author's -- batches are
-                                // gossiped worker-to-worker by matching id, so our
-                                // local worker likely holds a replica even for a
-                                // remote author's batch; a store miss is fine
-                                // (worker-side `latency_misses`, never blocks).
+                                // Notify local workers of committed batches.
                                 let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
                                 for (digest, worker_id) in header.payload.iter() {
                                     by_worker
@@ -231,7 +206,6 @@ impl Committer {
                                 }
                             }
                             debug!("Finished Commit");
-                            // Output the block to the top-level application.
                             if let Err(e) = self.tx_output.send(header.clone()).await {
                                 debug!("Failed to send block through the output channel: {}", e);
                             }
@@ -245,7 +219,7 @@ impl Committer {
     }
 
     async fn run(&mut self) {
-        // The consensus state (everything else is immutable).
+        // Mutable commit state.
         let mut state = State::new(self.genesis.clone());
 
         loop {

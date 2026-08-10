@@ -618,7 +618,9 @@ async fn entering_an_already_safe_round_votes_immediately() {
         control.curr_round_for_test()
     );
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::BroadcastControlCommit(2))),
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::BroadcastControlCommit(2))),
         "the transition into safe round 2 must emit its commit vote"
     );
 }

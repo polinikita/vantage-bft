@@ -1,4 +1,4 @@
-// This module defines Direct-AGB wire types and the per-view state machine.
+// Direct-AGB wire types and the per-view state machine.
 
 use crate::primary::View;
 use crate::vantage::block::{self, BlockRef};
@@ -516,6 +516,14 @@ enum EchoStatement {
 }
 
 #[derive(Clone, Debug)]
+struct EchoTally {
+    proposal: Arc<ProposalOut>,
+    grade_one: Stake,
+    grade_zero: Stake,
+    origin_ones: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 enum ReadyStatement {
     Graded(Arc<ProposalOut>, Digest, ReadyGrade),
     NoReady,
@@ -552,6 +560,7 @@ struct ViewState {
     entry_instant: Option<Instant>,
     first_proposal_instant: Option<Instant>,
     echo_statements: HashMap<PublicKey, EchoStatement>,
+    echo_tallies: HashMap<Digest, EchoTally>,
     ready_statements: HashMap<PublicKey, ReadyStatement>,
     lock: Option<Lock>,
     /// Caches canonical proposal bodies and digests by content within this view.
@@ -580,6 +589,7 @@ impl Default for ViewState {
             entry_instant: None,
             first_proposal_instant: None,
             echo_statements: HashMap::new(),
+            echo_tallies: HashMap::new(),
             ready_statements: HashMap::new(),
             lock: None,
             digest_cache: Vec::new(),
@@ -1122,7 +1132,7 @@ impl AgbEngine {
                 sender: self.name,
                 wish: 0, // Replaced with the sender's watermark during serialization.
                 origin: origin.into_iter().next().flatten(),
-                // The serialization layer inserts availability claims.
+                // Serialization inserts availability claims.
                 avail: None,
             }),
             ProposalOut::Batch(p) => EchoOut::Batch(EchoBatch {
@@ -1556,9 +1566,31 @@ impl AgbEngine {
         if self.is_pruned(view) {
             return false;
         }
+        let stake = self.committee.stake(&sender);
         let state = self.state_mut(view);
         if state.echo_statements.contains_key(&sender) {
             return false;
+        }
+        if let EchoStatement::Graded(proposal, digest, grade, origin) = &statement {
+            let tally = state
+                .echo_tallies
+                .entry(digest.clone())
+                .or_insert_with(|| EchoTally {
+                    proposal: Arc::clone(proposal),
+                    grade_one: 0,
+                    grade_zero: 0,
+                    origin_ones: vec![0; proposal.entries().len()],
+                });
+            if *grade == 1 {
+                tally.grade_one += stake;
+            } else {
+                tally.grade_zero += stake;
+            }
+            for (i, bit) in origin.iter().enumerate() {
+                if *bit == Some(1) {
+                    tally.origin_ones[i] += 1;
+                }
+            }
         }
         state.echo_statements.insert(sender, statement);
         true
@@ -1601,55 +1633,36 @@ impl AgbEngine {
         if self.state_mut(view).ready_sent {
             return effects;
         }
-        let mut tallies: HashMap<Digest, (Arc<ProposalOut>, Stake, Stake, Vec<usize>)> =
-            HashMap::new();
-        if let Some(state) = self.views.get(&view) {
-            for (sender, stmt) in &state.echo_statements {
-                if let EchoStatement::Graded(p, d, g, origin) = stmt {
-                    let stake = self.committee.stake(sender);
-                    let n_entries = p.entries().len();
-                    let entry = tallies
-                        .entry(d.clone())
-                        .or_insert_with(|| (Arc::clone(p), 0, 0, vec![0; n_entries]));
-                    if *g == 1 {
-                        entry.1 += stake;
-                    } else {
-                        entry.2 += stake;
-                    }
-                    for (i, bit) in origin.iter().enumerate() {
-                        if *bit == Some(1) {
-                            entry.3[i] += 1;
-                        }
-                    }
+        let candidate = self.views.get(&view).and_then(|state| {
+            state.echo_tallies.iter().find_map(|(digest, tally)| {
+                if tally.grade_one + tally.grade_zero < self.quorum {
+                    return None;
                 }
-            }
-        }
-        for (digest, (proposal, g1, g0, origin_ones)) in tallies {
-            if g1 + g0 < self.quorum {
-                continue;
-            }
-            // Each full or core entry requires `f + 1` matching origin bits;
-            // skip entries always pass.
-            let ready_ok = proposal
-                .entries()
-                .iter()
-                .enumerate()
-                .all(|(i, entry)| match entry {
-                    ResolutionEntry::Full(..) | ResolutionEntry::Core(..) => {
-                        origin_ones[i] >= self.f_plus_1_parties
-                    }
-                    ResolutionEntry::Skip(_) => true,
-                });
-            if !ready_ok {
-                continue;
-            }
-            let grade = if g1 >= self.quorum {
-                ReadyGrade::One
-            } else if g0 >= self.quorum {
-                ReadyGrade::Zero
-            } else {
-                ReadyGrade::Mix
-            };
+                let ready =
+                    tally
+                        .proposal
+                        .entries()
+                        .iter()
+                        .enumerate()
+                        .all(|(i, entry)| match entry {
+                            ResolutionEntry::Full(..) | ResolutionEntry::Core(..) => {
+                                tally.origin_ones[i] >= self.f_plus_1_parties
+                            }
+                            ResolutionEntry::Skip(_) => true,
+                        });
+                ready.then(|| {
+                    let grade = if tally.grade_one >= self.quorum {
+                        ReadyGrade::One
+                    } else if tally.grade_zero >= self.quorum {
+                        ReadyGrade::Zero
+                    } else {
+                        ReadyGrade::Mix
+                    };
+                    (digest.clone(), Arc::clone(&tally.proposal), grade)
+                })
+            })
+        });
+        if let Some((digest, proposal, grade)) = candidate {
             let name = self.name;
             self.state_mut(view).ready_sent = true;
             self.count_ready_statement(
@@ -1662,7 +1675,6 @@ impl AgbEngine {
                 self.build_ready_out(&proposal, grade),
             ));
             effects.extend(self.recheck_completion_and_direct(view, rep));
-            break; // At most one ready-stage statement is emitted per view.
         }
         effects
     }

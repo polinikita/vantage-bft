@@ -151,7 +151,7 @@ fn views_install_in_order_even_when_a_later_one_is_ready() {
     for view in 1..=4 {
         assert_eq!(install.installable(), Some(view));
         assert!(install.view_output(view).is_some());
-        install.mark_installed(view);
+        install.mark_installed(view, &blocks);
     }
     assert!(install.is_done());
     assert_eq!(install.installable(), None);
@@ -196,6 +196,34 @@ fn lane_tips_are_the_per_lane_maximum() {
     assert_eq!(height_of(b), Some(9));
     assert_eq!(install.lane_tip(&a), Some((a, 5, d(1))));
     assert_eq!(install.lane_tip(&b), Some((b, 9, d(4))));
+}
+
+#[test]
+fn installed_lane_tip_ignores_manifest_blocks_absent_from_output() {
+    let (author, _) = authors()[0];
+    let sid = test_sid();
+    let committed = tagged_header(author, 1, Digest::default(), sid.clone(), 1);
+    let rejected = tagged_header(author, 2, committed.id.clone(), sid, 2);
+    let blocks = empty_cache();
+    cache_insert(&blocks, &[committed.clone(), rejected.clone()]);
+
+    let staged = vec![(
+        1,
+        SequenceOutcome::Core {
+            c: vec![(author, rejected.height, rejected.id.clone())],
+        },
+        vec![committed.id.clone()],
+    )];
+    let mut install = SequenceInstall::new(0, 1, Digest::default(), staged, heads_for(1), 1, 4096);
+    install.admit(0);
+    install.refresh(&blocks);
+    install.mark_installed(1, &blocks);
+
+    assert_eq!(
+        install.lane_tip(&author),
+        Some((author, rejected.height, rejected.id))
+    );
+    assert_eq!(install.installed_lane_tip(&author), Some(committed));
 }
 
 #[test]

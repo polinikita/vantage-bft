@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restarts one validator after an outage and leaves time for state sync.
+# Restart one validator after an outage and allow state sync.
 #
 # Usage: ./late_joiner.sh [--nodes 10] [--rate 1000] [--down 60] [--settle 90]
 set -euo pipefail
@@ -21,7 +21,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 JOINER="vantage-node-$((NODES - 1))"
-# Keep clients active through startup, outage, and recovery.
+# Keep clients active for the full run.
 DURATION=$((15 + DOWN + SETTLE + 20))
 
 echo "==> late joiner: n=$NODES, $JOINER down for ${DOWN}s, ${SETTLE}s to catch up"
@@ -31,7 +31,7 @@ echo "==> late joiner: n=$NODES, $JOINER down for ${DOWN}s, ${SETTLE}s to catch 
     ${EXTRA[@]+"${EXTRA[@]}"} &
 RUN_PID=$!
 
-# Stop the joiner before the initial warm-up completes.
+# Stop the joiner during warm-up.
 until docker ps --format '{{.Names}}' | grep -qx "$JOINER"; do sleep 2; done
 sleep 5
 echo "==> stopping $JOINER at $(date +%T)"

@@ -5,8 +5,7 @@ use log::debug;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
-/// Receives batches' digests of other authorities. These are only needed to verify incoming
-/// headers (ie. make sure we have their payload).
+/// Stores remote batch digests used to validate headers.
 pub struct PayloadReceiver {
     /// The persistent storage.
     store: Store,

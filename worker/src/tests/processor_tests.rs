@@ -10,28 +10,18 @@ async fn hash_and_store() {
     let (tx_batch, rx_batch) = channel(1);
     let (tx_digest, mut rx_digest) = channel(1);
 
-    // Create a new test store.
     let path = ".db_test_hash_and_store";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
-    // Spawn a new `Processor` instance.
     let id = 0;
-    Processor::spawn(
-        id,
-        store.clone(),
-        rx_batch,
-        tx_digest,
-        /* own_batch */ true,
-    );
+    Processor::spawn(id, store.clone(), rx_batch, tx_digest, true);
 
-    // Send a batch to the `Processor`.
     let message = WorkerMessage::Batch(batch());
     let serialized = bincode::serialize(&message).unwrap();
     let bytes = Bytes::from(serialized.clone());
     tx_batch.send(bytes).await.unwrap();
 
-    // Ensure the `Processor` outputs the batch's digest.
     let output = rx_digest.recv().await.unwrap();
     let mut hasher = Blake3Hasher::new();
     hasher.update(&serialized);
@@ -39,7 +29,6 @@ async fn hash_and_store() {
     let expected = bincode::serialize(&WorkerPrimaryMessage::OurBatch(digest.clone(), id)).unwrap();
     assert_eq!(output, expected);
 
-    // Ensure the `Processor` correctly stored the batch.
     let stored_batch = store.read(digest.to_vec()).await.unwrap();
     assert!(stored_batch.is_some(), "The batch is not in the store");
     assert_eq!(stored_batch.unwrap(), serialized);

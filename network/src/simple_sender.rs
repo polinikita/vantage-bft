@@ -26,17 +26,17 @@ pub mod simple_sender_tests;
 const STARTUP_RETRY_DELAY_MS: u64 = 200;
 const STARTUP_RETRY_BACKOFF_MAX_MS: u64 = 2_000;
 
-/// Maintains one TCP connection per peer and sends through a per-peer channel.
+/// Maintains one TCP connection per peer.
 pub struct SimpleSender {
-    /// A map holding the channels to our connections.
+    /// Per-peer connection channels.
     connections: HashMap<SocketAddr, Sender<Bytes>>,
     /// RNG used to randomize broadcast destinations.
     rng: SmallRng,
     /// Optional fixed per-destination send latency.
     latency: HashMap<SocketAddr, Duration>,
-    /// same contract as `ReliableSender::metrics`.
+    /// Optional wire metrics.
     metrics: Option<Arc<Metrics>>,
-    /// Same contract as `ReliableSender::batch` (see `network::batch`'s module doc).
+    /// Outbound batching configuration.
     batch: BatchConfig,
 }
 
@@ -69,13 +69,13 @@ impl SimpleSender {
         self
     }
 
-    /// Same contract as `ReliableSender::with_batching`.
+    /// Sets outbound batching.
     pub fn with_batching(mut self, config: BatchConfig) -> Self {
         self.batch = config;
         self
     }
 
-    /// Helper function to spawn a new connection.
+    /// Spawns a connection task.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(100_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
@@ -83,31 +83,28 @@ impl SimpleSender {
         tx
     }
 
-    /// Try (best-effort) to send a message to a specific address.
-    /// This is useful to answer sync requests.
+    /// Best-effort send to one address.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
-        // Try to re-use an existing connection if possible.
         if let Some(tx) = self.connections.get(&address) {
             if tx.send(data.clone()).await.is_ok() {
                 return;
             }
         }
 
-        // Otherwise make a new connection.
         let tx = self.spawn_connection(address);
         if tx.send(data).await.is_ok() {
             self.connections.insert(address, tx);
         }
     }
 
-    /// Try (best-effort) to broadcast the message to all specified addresses.
+    /// Best-effort broadcast to all specified addresses.
     pub async fn broadcast(&mut self, addresses: Vec<SocketAddr>, data: Bytes) {
         for address in addresses {
             self.send(address, data.clone()).await;
         }
     }
 
-    /// Send to up to `nodes` randomly selected addresses.
+    /// Sends to up to `nodes` random addresses.
     pub async fn lucky_broadcast(
         &mut self,
         mut addresses: Vec<SocketAddr>,
@@ -125,7 +122,7 @@ impl SimpleSender {
         self.send(address, data).await;
     }
 
-    /// Typed variant of `broadcast`.
+    /// Broadcast with a message-type metric.
     pub async fn broadcast_typed(
         &mut self,
         addresses: Vec<SocketAddr>,
@@ -137,7 +134,7 @@ impl SimpleSender {
         }
     }
 
-    /// Typed variant of `lucky_broadcast`.
+    /// Random broadcast with a message-type metric.
     pub async fn lucky_broadcast_typed(
         &mut self,
         mut addresses: Vec<SocketAddr>,
@@ -155,13 +152,13 @@ impl SimpleSender {
 struct Connection {
     /// The destination address.
     address: SocketAddr,
-    /// Channel from which the connection receives its commands.
+    /// Outbound message channel.
     receiver: Receiver<Bytes>,
     /// Fixed one-way delay for this connection.
     extra_latency: Duration,
-    /// same contract as `ReliableSender::Connection::metrics`.
+    /// Optional wire metrics.
     metrics: Option<Arc<Metrics>>,
-    /// Same contract as `ReliableSender::Connection::batch`.
+    /// Outbound batching configuration.
     batch: BatchConfig,
 }
 
@@ -192,8 +189,7 @@ impl Connection {
         }
     }
 
-    /// Connects to the peer and selects the zero-delay or delayed send loop.
-    /// Connection attempts use capped exponential backoff.
+    /// Connects to the peer and selects the send loop.
     async fn run(&mut self) {
         if self.extra_latency.is_zero() {
             self.run_immediate().await
@@ -202,8 +198,7 @@ impl Connection {
         }
     }
 
-    /// The release instant for a message being scheduled right now -- same contract
-    /// as `ReliableSender::Connection::scheduled_release`.
+    /// Returns the release instant for a newly scheduled message.
     fn scheduled_release(&self) -> tokio::time::Instant {
         tokio::time::Instant::now() + self.extra_latency
     }
@@ -211,7 +206,6 @@ impl Connection {
     /// Wait between connection attempts while discarding queued best-effort messages.
     /// Returns false when the channel is closed and drained.
     async fn drain_until(&mut self, delay: Duration) -> bool {
-        // Clone metrics before borrowing the receiver in `select!`.
         let metrics = self.metrics.clone();
         let timer = tokio::time::sleep(delay);
         tokio::pin!(timer);
@@ -224,7 +218,6 @@ impl Connection {
                             metrics.network_connect_wait_discarded_total.inc();
                         }
                     }
-                    // `recv` returns buffered messages before `None`.
                     None => return false,
                 },
             }
@@ -264,7 +257,6 @@ impl Connection {
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
 
-        // Transmit messages after connecting.
         loop {
             let coalesce_due = sleep_until_or_pending(coalesce_deadline);
 
@@ -315,10 +307,8 @@ impl Connection {
                 response = reader.next() => {
                     match response {
                         Some(Ok(_)) => {
-                            // Sink the reply.
                         },
                         _ => {
-                            // The connection or acknowledgement stream failed.
                             warn!("{}", NetworkError::FailedToReceiveAck(self.address));
                             return;
                         }
@@ -328,20 +318,19 @@ impl Connection {
         }
     }
 
-    /// Send loop for a nonzero per-destination delay. Bundles receive one release time.
+    /// Sends with a fixed per-destination delay.
     async fn run_delayed(&mut self) {
         let Some(stream) = self.connect().await else {
             return;
         };
         let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
 
-        // A FIFO queue preserves per-connection ordering.
+        // Preserve per-connection ordering.
         let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> =
             std::collections::VecDeque::new();
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
 
-        // Transmit messages after connecting.
         loop {
             let due = async {
                 match delay_queue.front() {
@@ -351,7 +340,6 @@ impl Connection {
             };
             let coalesce_due = sleep_until_or_pending(coalesce_deadline);
 
-            // Wait for new messages, due messages, or acknowledgements.
             tokio::select! {
                 () = due, if !delay_queue.is_empty() => {
                     let (_, data) = delay_queue.pop_front().unwrap();
@@ -387,10 +375,8 @@ impl Connection {
                 response = reader.next() => {
                     match response {
                         Some(Ok(_)) => {
-                            // Sink the reply.
                         },
                         _ => {
-                            // The connection or acknowledgement stream failed.
                             warn!("{}", NetworkError::FailedToReceiveAck(self.address));
                             return;
                         }

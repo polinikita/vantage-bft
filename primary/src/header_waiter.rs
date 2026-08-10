@@ -19,22 +19,15 @@ use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
-/// The resolution of the timer that checks whether we received replies to our sync requests, and triggers
-/// new sync requests if we didn't.
+/// Timer resolution for retrying sync requests.
 const TIMER_RESOLUTION: u64 = 1_000;
 
-/// The commands that can be sent to the `Waiter`.
-// The shared `Sync` prefix is intentional.
-// (every variant IS a sync command, per the doc comment above) -- renaming would
-// touch 8 call sites across this file and synchronizer.rs for a pure naming-style
-// lint with no behavior implication; not done.
+/// Commands sent to the waiter.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub enum WaiterMessage {
     SyncBatches(HashMap<Digest, WorkerId>, Header, bool),
     SyncProposals(Vec<Proposal>, ConsensusMessage, Header),
-    // SyncProposalsC(Vec<Proposal>, ConsensusMessage), //Consensus is independent of header.
-    // SyncProposalsCAsync(Vec<Proposal>), //Consensus is independent of header.
     SyncParent(Digest, Header),
     SyncHeader(Digest),
 }
@@ -51,36 +44,32 @@ pub struct HeaderWaiter {
     consensus_round: Arc<AtomicU64>,
     /// The depth of the garbage collector.
     gc_depth: Height,
-    /// The delay to wait before re-trying sync requests.
+    /// Delay between sync-request retries.
     sync_retry_delay: u64,
-    /// Determine with how many nodes to sync when re-trying to send sync-request.
+    /// Number of nodes contacted when retrying a sync request.
     sync_retry_nodes: usize,
 
     /// Receives sync commands from the `Synchronizer`.
     rx_synchronizer: Receiver<WaiterMessage>,
     /// Loops back to the core headers for which we got all parents and batches.
     tx_core: Sender<Header>,
-    /// Loops back commit messages to the committer for reprocessing
+    /// Returns commit messages to the committer for reprocessing.
     tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
 
     /// Network driver allowing to send messages.
     network: SimpleSender,
 
-    /// Keeps the digests of the all certificates for which we sent a sync request,
-    /// along with a timestamp (`u128`) indicating when we sent the request.
+    /// Certificate requests and their retry timestamps.
     parent_requests: HashMap<Digest, (Height, u128)>,
-    //same, but for special parents
+    /// Requests for special parents.
     header_requests: HashMap<Digest, (Height, u128)>,
-    /// Keeps the digests of the all tx batches for which we sent a sync request,
-    /// similarly to `header_requests`.
+    /// Batch requests and their heights.
     batch_requests: HashMap<Digest, Height>,
-    /// List of digests (either certificates, headers or tx batch) that are waiting
-    /// to be processed. Their processing will resume when we get all their dependencies.
+    /// Pending items and cancellation handles.
     pending: HashMap<Digest, (Height, Sender<()>)>,
 }
 
 impl HeaderWaiter {
-    // clippy::too_many_arguments: see `Committer::spawn`'s identical justification.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -93,9 +82,7 @@ impl HeaderWaiter {
         rx_synchronizer: Receiver<WaiterMessage>,
         tx_core: Sender<Header>,
         tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
-        // Keep metrics last in the constructor argument list.
         metrics: Arc<Metrics>,
-        // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
@@ -123,8 +110,7 @@ impl HeaderWaiter {
         });
     }
 
-    /// Helper function. It waits for particular data to become available in the storage
-    /// and then delivers the specified header.
+    /// Waits for storage entries or cancellation.
     async fn waiter(
         mut missing: Vec<(Vec<u8>, Store)>,
         deliver: Header,
@@ -177,13 +163,12 @@ impl HeaderWaiter {
                             let round = header.height;
                             let author = header.author;
 
-                            // Ensure we sync only once per header.
+                            // Deduplicate requests for the same header.
                             if self.pending.contains_key(&header_id) {
                                 continue;
                             }
 
-                            // Add the header to the waiter pool. The waiter will return it to when all
-                            // its parents are in the store.
+                            // Wait for all batches.
                             let wait_for = missing
                                 .iter()
                                 .map(|(digest, worker_id)| {
@@ -197,7 +182,6 @@ impl HeaderWaiter {
                             waiting.push(fut);
 
                             if force_sync {
-                                // Ensure we didn't already send a sync request for these parents.
                                 let mut requires_sync = HashMap::new();
                                 for (digest, worker_id) in missing.into_iter() {
                                     self.batch_requests.entry(digest.clone()).or_insert_with(|| {
@@ -242,7 +226,12 @@ impl HeaderWaiter {
 
                                 let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.lucky_broadcast_typed(addresses, Bytes::from(bytes), self.sync_retry_nodes, "HeadersRequest").await; //after timeout, re-broadcast again (technically not necessary)
+                                self.network.lucky_broadcast_typed(
+                                    addresses,
+                                    Bytes::from(bytes),
+                                    self.sync_retry_nodes,
+                                    "HeadersRequest",
+                                ).await;
                             }
                         }
 
@@ -252,22 +241,19 @@ impl HeaderWaiter {
                             let height = header.height();
                             let author = header.author;
 
-                            // Ensure we sync only once per header.
+                            // Deduplicate requests for the same header.
                             if self.pending.contains_key(&header_id) {
                                 continue;
                             }
 
-                            // Add the header to the waiter pool. The waiter will return it to us
-                            // when all its parents are in the store.
+                            // Wait for the missing parent.
                             let wait_for = vec![(missing.to_vec(), self.store.clone())];
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (height, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 
-                            // Ensure we didn't already sent a sync request for these parents.
-                            // Optimistically send the sync request to the node that created the certificate.
-                            // If this fails (after a timeout), we broadcast the sync request.
+                            // Contact the header author first.
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .expect("Failed to measure time")
@@ -294,13 +280,12 @@ impl HeaderWaiter {
                             let author = header.author;
                             let id = proposal_digest(&consensus_message);
 
-                            // Ensure we sync only once per proposal
+                            // Deduplicate requests for the same proposal.
                             if self.pending.contains_key(&id) {
                                 continue;
                             }
 
-                            // Add the header to the waiter pool. The waiter will return it to us
-                            // when all its parents are in the store.
+                            // Wait for all referenced headers.
                             let wait_for = missing
                                 .iter()
                                 .map(|x| (x.header_digest.to_vec(), self.store.clone()))
@@ -310,9 +295,7 @@ impl HeaderWaiter {
                             let fut = Self::proposal_waiter(wait_for, (consensus_message, header), rx_cancel);
                             proposal_waiting.push(fut);
 
-                            // Ensure we didn't already sent a sync request for these parents.
-                            // Optimistically send the sync request to the node that created the certificate.
-                            // If this fails (after a timeout), we broadcast the sync request.
+                            // Contact the header author first.
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .expect("Failed to measure time")
@@ -348,9 +331,7 @@ impl HeaderWaiter {
 
                         self.tx_core.send(header).await.expect("Failed to send header");
                     },
-                    Ok(None) => {
-                        // This request has been canceled.
-                    },
+                    Ok(None) => {},
                     Err(e) => {
                         error!("{}", e);
                         panic!("Storage failure: killing node.");
@@ -376,9 +357,7 @@ impl HeaderWaiter {
 
                         self.tx_consensus_loopback.send(deliver).await.expect("Failed to send header");
                     },
-                    Ok(None) => {
-                        // This request has been canceled.
-                    },
+                    Ok(None) => {},
                     Err(e) => {
                         error!("{}", e);
                         panic!("Storage failure: killing node.");
@@ -386,18 +365,13 @@ impl HeaderWaiter {
                 },
 
                 () = &mut timer => {
-                    // We optimistically sent sync requests to a single node. If this timer triggers,
-                    // it means we were wrong to trust it. We are done waiting for a reply and we now
-                    // broadcast the request to all nodes.
+                    // Broadcast requests whose targeted retry timed out.
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .expect("Failed to measure time")
                         .as_millis();
 
-                    //Retry HeaderRequests  -- We don't use this
-                    //         retry.push(digest.clone());
-
-                    //Retry CertificateRequests
+                    // Header requests use a separate retry path.
                     let mut retry = Vec::new();
                     for (digest, (_, timestamp)) in &self.parent_requests {
                         if timestamp + (self.sync_retry_delay as u128) < now {

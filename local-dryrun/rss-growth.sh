@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Measure RSS growth of a local n-node committee -- a leak detector, not a benchmark.
-#
-# Why local: `local-benchmark` runs every node in one process, so per-node growth is
-# amplified in one RSS series.
-#
-# Reports MB/s over the second half of the run only: the first half includes RocksDB
-# warm-up and allocator growth, which are one-off and would flatter or spoil the slope.
+# Measure RSS growth as a leak check.
+# local-benchmark runs all nodes in one process; report the second-half slope.
 #
 # Usage: rss-growth.sh [seconds] [nodes] [rate]
 set -uo pipefail
@@ -24,10 +19,7 @@ mkdir -p "$DATA_DIR"
 trap 'kill "${PID:-}" 2>/dev/null; rm -rf "$DATA_DIR" "$DATA_DIR/../rss-run.log"' EXIT
 
 echo "==> n=$NODES @ $RATE tx/s for ${SECS}s, sampling RSS every 1s"
-# `--protocol vantage` is NOT optional: without it `local-benchmark` runs an Autobahn
-# path, no `VantageCore` is ever constructed, and every vantage gauge stays 0 forever.
-# Omitting it once already produced a bogus A/B -- an AckAggregator change measured as
-# "no effect" in a process that never built an AckAggregator.
+# Vantage is required for VantageCore metrics.
 RUST_LOG=error ./target/release/node local-benchmark \
     --nodes "$NODES" --workers 1 --rate "$RATE" --tx-size 512 \
     --protocol vantage --mode random \
@@ -37,21 +29,17 @@ RUST_LOG=error ./target/release/node local-benchmark \
     --data-dir "$DATA_DIR" --mimic-latency-ms 0 >"$DATA_DIR/../rss-run.log" 2>&1 &
 PID=$!
 
-# ATTRIBUTION comes from the --timeline log, NOT from the HTTP metrics endpoints:
-# `local-benchmark` serves those from a registry the core never writes to, so every gauge
-# reads 0 there (including `entered_view`, while the same run's in-process registry shows
-# thousands of views). Sampling a monotone collection size next to RSS gives
-# bytes-per-entry, which is what decides whether a collection is the leak.
+# Read cache growth from the timeline.
 SAMPLES=()
 for _ in $(seq 1 "$SECS"); do
     sleep 1
     kill -0 "$PID" 2>/dev/null || break
-    # ps reports RSS in KiB on macOS and Linux alike.
+    # ps reports RSS in KiB on macOS and Linux.
     KB=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
     [ -n "$KB" ] && SAMPLES+=("$KB")
 done
 
-# Pull node-0's block-cache series out of the timeline the run just wrote.
+# Read node-0 block-cache values from the run timeline.
 CACHE=()
 while read -r v; do CACHE+=("$v"); done < <(
     grep -E "node-0 " "$DATA_DIR/../rss-run.log" 2>/dev/null \
@@ -94,13 +82,10 @@ if cspan:
     cache_rate = (clast - cfirst) / cspan
     print(f" block_cache_len     : {cfirst:8,} -> {clast:,}  (+{cache_rate:,.0f} entries/s, node 0)")
     if cache_rate <= 0:
-        # Eviction is holding the cache flat, so per-entry attribution is meaningless
-        # (dividing by ~0). Whatever growth remains is in some OTHER collection.
+        # A flat cache does not explain RSS growth.
         print(" => cache is BOUNDED; residual growth is elsewhere")
     if cache_rate > 0:
-        # Per-node RSS growth attributed to one block-cache entry. If this lands in a
-        # plausible header-plus-index range (roughly 0.3-1.5 KB) the cache accounts for
-        # the leak; far above it means something else dominates.
+        # Estimate RSS growth per cache entry.
         print(f" => {per_node*1e6/cache_rate:8.0f} bytes of per-node RSS growth per cache entry")
 print("-----------------------------------------")
 print("LEAK" if per_node > 1.0 else "OK (sub-1 MB/s per node)")

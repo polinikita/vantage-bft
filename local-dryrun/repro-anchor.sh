@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
-# Deterministic local reproduction of the anchor/resolution liveness gap.
-#
-# Exercise the anchor path for views that cannot be sealed directly or skipped.
-#
-# `--withhold k` is the designed injector: the first k committee
-# indices withhold payload dissemination from a *staggered half* of the committee, so
-# roughly half cannot grade-1 echo those views while the other half can -- neither
-# quorum forms, which is exactly the split condition, on a comfortable machine.
-# Consensus, acks and every repair path are untouched, so the blocked half is supposed
-# to recover via repair; if it does, views seal normally and this script passes.
+# Reproduce the anchor/resolution liveness condition locally.
+# `--withhold k` withholds payloads from k nodes.
 #
 # Usage:  ./local-dryrun/repro-anchor.sh [duration_s] [nodes] [rate] [withhold]
-# Exit 0 = the anchor path works (or was not needed). Exit 1 = reproduced the wedge.
+# Exit 0 means the anchor path works or was not needed; exit 1 means liveness failed.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,8 +14,7 @@ DURATION="${1:-60}"
 NODES="${2:-30}"
 RATE="${3:-100}"
 WITHHOLD="${4:-5}"
-# Withholding payloads and using a shorter control delay produces split views.
-# (207/node), i.e. the anchor path is exercised and DOES seal.
+# Withholding payloads and a short control delay produce split views.
 DELTA_MS="${5:-20}"
 LATENCY_MS="${6:-50}"
 MAX_CURSOR_LAG=50
@@ -79,7 +70,7 @@ printf ' wedged nodes    : %s\n' "$STUCK"
 printf ' %s\n' "${ROUTES:-seal routes: (not printed)}"
 echo "-----------------------------------------"
 
-# A large cursor lag indicates that the anchor path did not keep up.
+# Large cursor lag indicates a stalled anchor path.
 anchor=0
 case "${ROUTES:-}" in *anchor_full*|*anchor_skip*) anchor=1 ;; esac
 

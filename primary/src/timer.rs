@@ -6,7 +6,6 @@ use tokio::time::{sleep, Duration, Instant, Sleep};
 use crate::messages::{ConsensusVote, Vote};
 use crate::primary::{Slot, View};
 
-
 pub struct Timer {
     slot: Slot,
     view: View,
@@ -43,7 +42,7 @@ impl Future for Timer {
     }
 }
 
-// This timer supports fast-path and CAR scheduling.
+// Timer used by fast-path and CAR scheduling.
 pub struct CarTimer {
     vote: Vote,
     duration: u64,

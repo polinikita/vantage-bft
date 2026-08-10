@@ -1,10 +1,5 @@
-// Simple-IT cut-consensus state machine.
-//
-// Network-free cut-consensus state machine. Methods return effects for the caller to
-// execute. Round-indexed state is pruned by `prune_below`.
-//
-// Safety requires an available proposal, individually verified quorum messages, and a
-// first-hand `Decide` quorum. The Bracha variant adds a ready echo.
+// Simple-IT cut-consensus state machine. The caller executes returned effects.
+// Safety requires an available proposal and verified quorum messages.
 
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
@@ -31,13 +26,12 @@ pub enum Inbound {
     Decide(Decide),
     Timeout(Timeout),
     TimeoutAccept(TimeoutAccept),
-    /// Bracha variant only: the second echo round.
-    /// Never constructed under `Variant::Opt`; see `CutEngine::process_cut_ready`.
+    /// Bracha-only second echo round.
     CutReady(CutReady),
     /// A scheduled deadline for this round has elapsed.
     TimerFired(CutRound),
     /// A peer requests the `CutProposal` identified by `(round, cut_id)`.
-    CutFetch(CutRound, Digest, /* requester */ PublicKey),
+    CutFetch(CutRound, Digest, PublicKey),
     /// A peer answers a fetch request.
     CutServe(CutProposal),
 }
@@ -88,7 +82,6 @@ pub struct CutEngine {
     /// Proposals by round and cut. Round-prunable.
     cut_proposals: BTreeMap<(CutRound, Digest), CutProposal>,
     /// Proposals waiting for their parent, keyed by child round and parent cut.
-    /// Round-prunable.
     pending_cut_children: BTreeMap<(CutRound, Digest), Vec<CutProposal>>,
     /// Maps a cut id to its round. Entries are removed with their proposals.
     cut_round_by_id: BTreeMap<Digest, CutRound>,
@@ -98,73 +91,30 @@ pub struct CutEngine {
     safe: BTreeMap<CutRound, Digest>,
     /// Decide aggregators by round and cut. Round-prunable.
     decide_aggregators: BTreeMap<(CutRound, Digest), DecideAggregator>,
-    /// Upstream `decides_by_round: HashMap<u64, Decide>`, renamed `committed` -- Fig.
-    /// 2's `committed[r]` state variable: key presence IS `committed[r] = true`; the
-    /// value is the quorum-crossing `Decide` itself, needed by `try_commit_round`'s
-    /// cut-id comparison against `leader_cut_by_round`. Already round-keyed.
-    /// Round-prunable; covered.
+    /// Quorum-crossing decide by round. Presence marks the round committed.
     committed: BTreeMap<CutRound, Decide>,
-    /// Upstream `voted_cut_rounds: HashSet<u64>`, renamed `sent_cut_votes`. NOT Fig.
-    /// 2's `voted` (that is the field below, `voted`) -- this is this engine's OWN
-    /// CutVote-sent latch, standing in for RBC-echo participation, a step the paper's
-    /// `rb-broadcast` primitive absorbs and never names. It is separate from
-    /// colliding with the real `voted` below now that the Fig.-2 alignment makes the
-    /// distinction required -- see the module doc comment's field-mapping table.
-    /// Round-prunable; covered.
+    /// Records whether this node sent its cut vote for each round.
     sent_cut_votes: BTreeSet<CutRound>,
-    /// Bracha variant (`Variant::Bracha` only): this party's own one-shot
-    /// `CutReady`-broadcast latch per round, mirroring `sent_cut_votes` immediately
-    /// above exactly (same per-round-not-per-current-round-bool shape, same
-    /// rationale). Never populated under `Variant::Opt`. Round-prunable; covered.
+    /// Bracha-only latch for this node's one-shot ready broadcast per round.
     sent_cut_ready: BTreeSet<CutRound>,
-    /// Upstream `proposed_cut_rounds: HashSet<u64>`. Round-prunable; covered.
+    /// Records whether this node proposed a cut for each round.
     proposed_cut_rounds: BTreeSet<CutRound>,
-    /// Upstream `sent_decide_rounds: HashSet<u64>`, renamed `voted` -- Fig. 2's `voted`
-    /// flag ("has this party sent its own `⟨commit, r⟩` yet"; `Decide` IS the paper's
-    /// commit message, per messages.rs's own doc comment on `Decide`). Fig. 2 resets
-    /// this to `false` on every round entry (it is a single per-current-round bool
-    /// there); here it is one persistent latch per round, for the same reason
-    /// `timed_out` below is (this engine tracks many rounds' in-flight messages
-    /// concurrently, not only `curr_round`). Round-prunable; covered.
+    /// Records whether this node sent its decide for each round.
     voted: BTreeSet<CutRound>,
-    /// Upstream `sent_commit_rounds: HashSet<u64>`. Fig. 2 names no flag for this at
-    /// all -- it is the **Deliver** action's own one-shot local latch (guards
-    /// `emit_commit_to_committer`), distinct from `committed[r]` itself (this engine's
-    /// `committed`, above): a round can be `committed` for a while before this engine
-    /// has locally resolved enough to deliver it (see `node.rs`'s `commit_queue`).
-    /// Round-prunable; covered.
+    /// Records whether a committed round was delivered locally.
     sent_commit_rounds: BTreeSet<CutRound>,
-    /// Upstream `sent_timeouts: HashSet<u64>`, renamed `timed_out` -- Fig. 2's
-    /// `timed_out` flag ("has this party raised its own timeout flag for the current
-    /// round"). Same per-round-latch-vs.-per-current-round-bool distinction as `voted`
-    /// above. Round-prunable; covered.
+    /// Records whether this node sent a timeout for each round.
     timed_out: BTreeSet<CutRound>,
-    /// Upstream `sent_timeout_accepts: HashSet<u64>`. Round-prunable; covered.
+    /// Records whether this node sent a timeout accept for each round.
     sent_timeout_accepts: BTreeSet<CutRound>,
-    /// Upstream `certified_timed_out: HashSet<u64>`. Closest Fig.-2 analogue:
-    /// `disabled[r]` (set upon `rn_confirm(⟨timeout, r⟩)`, i.e. exactly this engine's
-    /// own timeout-CERTIFIED state) -- deliberately NOT renamed to `disabled`: the
-    /// task's paper-alignment list names `safe`/`voted`/`timed_out`/`committed`
-    /// specifically, not `disabled`, and this name already says precisely what it
-    /// tracks (the TimeoutCert-backed certified state, as opposed to `timed_out`
-    /// above, this party's own un-certified raised flag) without the risk of a
-    /// same-named-but-not-quite field pair the `voted`/`sent_cut_votes` split above
-    /// was written to avoid. Round-prunable; covered.
+    /// Records rounds certified as timed out.
     certified_timed_out: BTreeSet<CutRound>,
-    /// Upstream `scheduled_cut_timers: HashSet<u64>`. Round-prunable; covered.
+    /// Records rounds with an armed cut timer.
     scheduled_cut_timers: BTreeSet<CutRound>,
 
-    // --- Cut-proposal repair (not upstream -- see the module doc comment) ---
-    /// Outstanding `CutProposal` fetches, mapped to the cut round (this engine's own
-    /// retry clock, `self.cut_round`) we last fanned the request out in. Mirrors
-    /// `control::ControlLog::pending_fetch` exactly -- see that field's doc comment
-    /// for why this must be retryable (a one-shot latch left a request permanently
-    /// stuck if its one round of targets never answered) -- keyed by `(CutRound,
-    /// Digest)` so `split_off` prunes it in `prune_below`, same as every other
-    /// round-keyed field above.
+    /// Outstanding proposal fetches and the cut round when they were last sent.
     pending_cut_fetch: BTreeMap<(CutRound, Digest), CutRound>,
-    /// Per-requester fetch-answered dedup, mirroring `control::ControlLog::
-    /// fetch_answered` exactly. Round-prunable; covered.
+    /// Per-requester deduplication for fetch responses.
     fetch_answered: BTreeSet<(CutRound, Digest, PublicKey)>,
 }
 
@@ -204,30 +154,19 @@ impl CutEngine {
         }
     }
 
-    /// Deviation 3's switch. Defaults to `true` (paper-faithful); pass `false` to
-    /// reproduce upstream's blind-vote behavior.
+    /// Enables or disables the f+1 tip-availability gate before voting.
     pub fn with_gate_tips(mut self, gate_tips: bool) -> Self {
         self.gate_tips = gate_tips;
         self
     }
 
-    /// Bracha variant's switch -- see `Variant`'s own doc comment. Defaults
-    /// to `Variant::Opt` (byte-for-byte the engine as it existed before this method
-    /// was added); pass `Variant::Bracha` to run the Bracha-RBC variant instead.
+    /// Selects the cut-consensus variant.
     pub fn with_variant(mut self, variant: Variant) -> Self {
         self.variant = variant;
         self
     }
 
-    /// Single dispatch entry point over `Inbound` -- not itself one of the 25 ported
-    /// methods (upstream has no equivalent single function; its `run()` select-loop,
-    /// not ported, plays this role there), but required by the "engine consumes
-    /// `Inbound`" architecture. Mirrors upstream's own dispatch shape exactly:
-    /// `TimeoutAccept` is `sanitize_timeout_accept`-checked before `process_timeout_
-    /// accept` (matching upstream's sanitize-then-process pattern), a wire `Timeout`
-    /// goes through `handle_timeout` (not `process_timeout` directly -- that direct
-    /// path is reserved for `process_cut_timer`'s own locally-generated timeout,
-    /// exactly as upstream keeps the two named entry points distinct).
+    /// Dispatches one wire message or timer event.
     pub fn handle(
         &mut self,
         inbound: Inbound,
@@ -254,57 +193,17 @@ impl CutEngine {
         }
     }
 
-    /// Deviation 1: upstream's `leader.rs`/`LeaderElector`/`fixed_leader_order` are not
-    /// ported; every leader lookup in this engine goes through this one function.
-    ///
-    /// The mapping: `agb::proposer(committee, view)` computes `names[(view - 1) % n]`
-    /// over `committee.authorities.keys()` (`BTreeMap` order, i.e. raw `PublicKey`
-    /// byte order) and requires `view >= 1`. Upstream computes `leaders[round % n]`
-    /// over a *separately sorted* `Vec` (by `node_id` if every authority has one, else
-    /// also raw `PublicKey` order -- `fixed_leader_order`), with `round` always >= 1 in
-    /// practice (confirmed by reading upstream's `Core::spawn`: `cut_round: 1`, and it
-    /// only ever increases; `round` is never 0 for an actual contested round, only as
-    /// `safe_cut_parent`'s parent-round sentinel).
-    ///
-    /// Choosing `view = round + 1` makes `(view - 1) % n == round % n` an *identity*
-    /// (not merely mod-equivalent -- `view - 1` is literally `round`), for every
-    /// `round >= 0`. So for every round upstream would ever actually query, this
-    /// reproduces the exact same 0-indexed slot into whichever list is in play -- only
-    /// the list's *ordering* differs (raw key order here vs upstream's node-id-aware
-    /// order there), which is exactly deviation 1's "use ours, not theirs" instruction,
-    /// never the arithmetic. `View` (upstream's `u64` alias, from `primary::primary`)
-    /// never appears as a named type anywhere in this module -- `round + 1` is a
-    /// `CutRound` (`= u64`) value that coerces to `agb::proposer`'s `View` (`= u64`)
-    /// parameter because the two are the same underlying type; this call site is the
-    /// only place that coercion ever happens.
+    /// Returns the committee leader for `round`.
     fn leader_for_round(&self, round: CutRound) -> PublicKey {
         agb::proposer(&self.committee, round + 1)
     }
 
-    /// `pub` (production wiring, `simpleit::node::SimpleItCore`): a read-only accessor
-    /// so the wiring layer can compute its own GC floor (`cut_round.saturating_sub
-    /// (gc_window)`) for `prune_below` below -- neither `cut_round` itself nor any
-    /// other progress indicator was otherwise exposed. Not one of the 25 ported
-    /// methods; upstream has no equivalent (its own GC, if any, would have lived
-    /// inside the un-ported `run()` loop with direct field access).
+    /// Returns the current cut round.
     pub fn cut_round(&self) -> CutRound {
         self.cut_round
     }
 
-    /// GC floor: `split_off`-prune every round-prunable structure at `floor`. No-op if
-    /// `floor` is at or behind the current floor (matching `AgbEngine::gc_below`/
-    /// `ControlLog::gc_below`'s own monotonic-guard shape). Not one of the 25 ported
-    /// methods -- upstream has no GC for this state at all; this is the standing
-    /// project rule ("prunable structures... `split_off` at floor, never `retain`
-    /// scans") applied proactively.
-    ///
-    /// `cut_round_by_id` is the one field with no `split_off` of its own (see that
-    /// field's doc comment for why: it is keyed by `Digest`, needed for
-    /// `safe_cut_parent`'s digest -> round lookup). Instead of a `.retain` scan over
-    /// it, this reads the digests `cut_proposals`' own split_off is about to discard --
-    /// `record_cut_proposal` populates both maps together for the same cut_id, so the
-    /// two are always in lockstep -- and removes exactly those keys: cost proportional
-    /// to what is being dropped, not to what survives.
+    /// Removes round-indexed state below `floor`.
     pub fn prune_below(&mut self, floor: CutRound) {
         if floor <= self.gc_floor {
             return;
@@ -319,10 +218,6 @@ impl CutEngine {
         self.cut_vote_aggregators = self
             .cut_vote_aggregators
             .split_off(&(floor, Digest::default()));
-        // Bracha variant: always spliced, even under `Variant::Opt` (where
-        // both maps/sets stay empty the whole run) -- a no-op `split_off` on an empty
-        // map, mirroring how every OTHER round-prunable field here is unconditional
-        // regardless of which upstream deviation populates it.
         self.cut_ready_aggregators = self
             .cut_ready_aggregators
             .split_off(&(floor, Digest::default()));
@@ -358,19 +253,8 @@ impl CutEngine {
         self.gc_floor = floor;
     }
 
-    /// Re-fan an unanswered `CutProposal` fetch every this many cut rounds -- mirrors
-    /// `control::ControlLog::FETCH_RETRY_ROUNDS` exactly: cut rounds are this
-    /// engine's own natural clock (`self.cut_round`), exactly as control rounds are
-    /// `ControlLog`'s, and the identical retry rationale applies verbatim (a
-    /// one-shot latch left a request permanently unanswered if its one round of
-    /// targets never answered -- re-asking is cheap next to that).
     const FETCH_RETRY_ROUNDS: CutRound = 8;
 
-    /// Every other committee member (never `self.name`) -- the fallback fetch-target
-    /// set for `process_cut_proposal`'s "parent unknown" trigger, which (unlike
-    /// `mark_cut_safe`'s vote-driven trigger, which asks exactly the witnesses it
-    /// counted) has no per-voter evidence to narrow to. See that call site's own
-    /// comment for the full justification.
     fn all_other_committee_members(&self) -> Vec<PublicKey> {
         self.committee
             .authorities
@@ -380,15 +264,7 @@ impl CutEngine {
             .collect()
     }
 
-    /// Request the `CutProposal` identified by `(round, cut_id)` from every one of
-    /// `targets`, at most once every `FETCH_RETRY_ROUNDS` cut rounds for that exact
-    /// pair -- mirrors `control::ControlLog::ensure_fetch` exactly (see its doc
-    /// comment for the retry rationale). No-op if we already hold the proposal
-    /// (`cut_round_by_id`) or `round` is already pruned. Called from both repair
-    /// triggers: `mark_cut_safe` (an exact round, read directly off the just-crossed
-    /// vote threshold, with `targets` the exact witnesses counted) and
-    /// `process_cut_proposal`'s buffering branch (a best-effort round guess -- see
-    /// that call site for why an exact round isn't available there).
+    /// Requests a missing proposal at most once per retry window.
     fn ensure_cut_fetch(
         &mut self,
         round: CutRound,
@@ -416,21 +292,8 @@ impl CutEngine {
             .collect()
     }
 
-    /// The mark-safe step counts individually verified votes. Once this party's
-    /// vote weight crosses `mint_threshold`, it transitions to `mark_cut_safe`.
-    /// Mark-safe step, evaluated FIRST-HAND: every `CutVote` is individually verified
-    /// (`vote.verify`) and fed to this party's OWN `CutVoteAggregator` -- never a
-    /// peer's relayed claim. No certificate is minted or accepted.
-    ///
-    /// Bracha variant: this is its first echo round, using the same
-    /// `CutVoteAggregator` map,
-    /// just thresholded at plain `quorum_threshold` (see `CutVoteAggregator::append`'s
-    /// `threshold` parameter) rather than `mint_threshold`, and crossing it broadcasts
-    /// a `CutReady` (`broadcast_cut_ready`) rather than calling `mark_cut_safe`
-    /// directly -- `witnesses` (the vote senders) are not used as a fetch-witness set
-    /// at this step; see `broadcast_cut_ready`/`process_cut_ready` below for the
-    /// second echo round that actually reaches `mark_cut_safe`. See the module doc
-    /// comment above for the variant rules.
+    /// Counts each verified vote once.
+    /// Opt marks the cut safe at `mint_threshold`; Bracha broadcasts `CutReady` at quorum.
     pub fn process_cut_vote(
         &mut self,
         vote: CutVote,
@@ -457,26 +320,6 @@ impl CutEngine {
         }
     }
 
-    /// Bracha variant (`Variant::Bracha` only): reached when this party's own
-    /// first-hand `CutVote` census (`process_cut_vote` above) crosses
-    /// `quorum_threshold` -- Bracha-RBC's own first echo-to-ready transition (arXiv:
-    /// 2606.14404 Table 1/2 + Corollary 5, variant S). One-shot per round
-    /// (`sent_cut_ready`), mirroring `sent_cut_votes`'s identical latch shape exactly
-    /// -- upstream has the identical one-shot guard on its own `broadcast_cut_ready`
-    /// (`sent_ready_rounds.insert(round)`, primary/src/core.rs:436-438 there), so this
-    /// part is faithfully mirrored, not a deviation. Broadcasts, then immediately
-    /// processes its own `CutReady` locally through the SAME
-    /// first-hand path a peer's `CutReady` would take (`process_cut_ready`) -- mirrors
-    /// `process_cut_proposal`'s own self-vote dispatch and `mark_cut_safe`'s own
-    /// self-Decide dispatch: never a shortcut that credits this party's own message
-    /// without also counting it.
-    ///
-    /// Upstream (`simpleit/Bracha-Mempool-Simple-IT` branch) primary/src/core.rs:
-    /// 435-459 (`broadcast_cut_ready`) is the direct ancestor of this method plus
-    /// `process_cut_ready` below combined -- upstream inlines the self-processing call
-    /// at the end of its own `broadcast_cut_ready`; split here only by which method
-    /// each half lives in, mirroring this port's existing `mark_cut_safe`/
-    /// `process_decide` split for the identical self-Decide pattern.
     fn broadcast_cut_ready(
         &mut self,
         round: CutRound,
@@ -497,26 +340,6 @@ impl CutEngine {
         effects
     }
 
-    /// Bracha variant: `Inbound::CutReady`'s entry point -- Bracha-RBC's own
-    /// second echo round (see `broadcast_cut_ready`'s doc comment for the first).
-    /// Mirrors `process_cut_vote`'s shape exactly: individually verifies, dedups via
-    /// this party's OWN first-hand `CutReadyAggregator`, and on crossing
-    /// `quorum_threshold` transitions straight into `mark_cut_safe` with the exact
-    /// `CutReady` senders counted as the fetch-witness set -- see `mark_cut_safe`'s
-    /// own doc comment for how `witnesses` is used there (`ensure_cut_fetch`'s target
-    /// set). No certificate is minted or broadcast anywhere -- see the module doc
-    /// comment's "safety rules" paragraph; this is that identical fix applied to
-    /// the separate soundness gap upstream's OWN Bracha branch has at this exact
-    /// point (`Core::process_cut_ready`, primary/src/core.rs:646-679 there, which
-    /// minted+broadcast a `CutCertificate` on crossing `quorum_threshold` -- see the
-    /// module doc comment's "BRACHA VARIANT" paragraph for the upstream citation and
-    /// the "NOT reproduced" note on upstream's own missing f+1-ready amplification).
-    ///
-    /// No-op for `Variant::Opt` (defensive: an Opt-configured engine never constructs
-    /// a `CutReady` itself, and no correct Bracha-configured peer ever sends one to an
-    /// Opt-configured committee -- `config::Protocol` selects exactly one variant for
-    /// an entire run -- but a stray/Byzantine `CutReady` should not be able to make an
-    /// Opt engine take a Bracha-shaped path it was never configured to run).
     pub fn process_cut_ready(
         &mut self,
         ready: CutReady,
@@ -539,34 +362,6 @@ impl CutEngine {
         self.mark_cut_safe(round, cut_id, witnesses, tips, oracle)
     }
 
-    /// Upstream primary/src/core.rs:480-544.
-    ///
-    /// Deviation 4: upstream's `while let Some(proposal) = queue.pop_front()` uses
-    /// `?`/`ensure!` inside the loop for the verify check and the leader-authenticity
-    /// check. Either failing aborts `process_cut_proposal` entirely via `Err`, which
-    /// (since `queue` was already extended with every sibling `pending_cut_children`
-    /// had buffered for the cut that just became known, and `record_cut_proposal`
-    /// already ran for the just-recorded parent before the loop even reaches a bad
-    /// sibling) silently drops every valid sibling still sitting in `queue` -- they are
-    /// simply never dequeued. Fixed by rejecting a bad proposal individually (`continue`)
-    /// without discarding the rest of the queue; no check below accepts anything
-    /// upstream would have rejected, or rejects anything upstream would have accepted --
-    /// only the "one bad item takes the whole batch down with it" failure mode is gone.
-    /// (`retry_pending_cut_proposals`'s own `for proposal in ready { ...await?... }`
-    /// loop had the identical failure mode one level up; making this function infallible
-    /// fixes that call site too, for free, as a consequence of the effect-returning
-    /// design rather than a second, separate fix.)
-    ///
-    /// Deviation 3: the f+1 tip-availability gate sits immediately before the one
-    /// voting decision (`sent_cut_votes.insert`), gating only the vote -- recording
-    /// the proposal and reparenting its own pending children happen unconditionally,
-    /// exactly as upstream does, since the paper's gate is about "casting a vote", not
-    /// about learning of/relaying a proposal. A gate failure does not consume the
-    /// per-round vote latch (`sent_cut_votes`), unlike upstream's original passing
-    /// case (which always consumes it): this is deliberate, so a proposal that fails
-    /// the gate leaves the round eligible to vote later if some other satisfying event
-    /// re-drives processing for it -- this engine does not itself invent such a retry
-    /// (none was asked for), it only avoids permanently foreclosing one.
     pub fn process_cut_proposal(
         &mut self,
         proposal: CutProposal,
@@ -589,27 +384,7 @@ impl CutEngine {
 
             if !self.safe_cut_parent(round, &proposal.parent_cut) {
                 let parent_cut = proposal.parent_cut.clone();
-                // REPAIR (see the module doc comment): fetch only when the parent is
-                // genuinely UNKNOWN (never recorded) -- NOT when it's known but
-                // simply not yet safe (an in-flight pipeline wait on intermediate
-                // rounds' own timeout certification, or a malformed parent_round >=
-                // round), which `safe_cut_parent` would also reject but which
-                // fetching cannot help. Target set: unlike `mark_cut_safe`'s trigger,
-                // no per-voter evidence exists for this specific digest (if it did,
-                // this party would itself already have crossed `mint_threshold` for
-                // it, which would already have triggered a fetch) -- there is no
-                // narrower evidence than "ask everyone", so this asks the full
-                // committee. Round guess: `round - 1`, exact whenever no
-                // timeout-skipped round sits between parent and child (the
-                // common/optimistic case: `make_cut_proposal` always cites
-                // `highest_safe_cut`, which a leader updates only immediately upon
-                // marking safe the round it then builds on). A wrong guess (a skipped
-                // round sits between them) is not fatal: `ensure_cut_fetch` simply
-                // never matches a genuine answer for the true parent's real round, so
-                // it goes unanswered rather than corrupting state, and
-                // `mark_cut_safe`'s own trigger remains the fully general backstop --
-                // it fires with the EXACT round once this party independently crosses
-                // `mint_threshold` for the true parent itself.
+                // Request the parent in the preceding round; later votes can refine it.
                 if parent_cut != Digest::default()
                     && !self.cut_round_by_id.contains_key(&parent_cut)
                 {
@@ -643,9 +418,7 @@ impl CutEngine {
                 .entry(round)
                 .or_insert_with(|| cut_id.clone());
 
-            // Reparent: any proposals buffered while `cut_id` was unknown, across
-            // whichever round(s) named it as `parent_cut` -- see `pending_cut_children`'s
-            // doc comment for why this is a bounded scan rather than a single removal.
+            // Retry children that named this proposal as their parent.
             let waiting_rounds: Vec<CutRound> = self
                 .pending_cut_children
                 .keys()
@@ -673,7 +446,6 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:546-576.
     pub fn retry_pending_cut_proposals(
         &mut self,
         tips: &Cut,
@@ -710,15 +482,10 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:609-615. Upstream builds a fresh `BTreeMap` from
-    /// `self.current_certified_tips` (a `HashMap`); since the caller now hands us the
-    /// cut directly as a `BTreeMap` already (see the module doc comment's oracle-1),
-    /// this is just that value, cloned.
     fn current_cut(&self, tips: &Cut) -> Cut {
         tips.clone()
     }
 
-    /// Upstream primary/src/core.rs:617-624.
     fn make_cut_proposal(&self, round: CutRound, parent_cut: Digest, tips: &Cut) -> CutProposal {
         CutProposal {
             round,
@@ -728,10 +495,6 @@ impl CutEngine {
         }
     }
 
-    /// Upstream primary/src/core.rs:632-639. Upstream also writes
-    /// `self.cut_parents.insert(cut_id, proposal.parent_cut)` here -- `cut_parents` is
-    /// dead (write-only upstream; read only from code already commented out there) and
-    /// is deliberately not ported at all, per the task brief.
     fn record_cut_proposal(&mut self, proposal: CutProposal) -> Digest {
         let cut_id = proposal.id();
         let round = proposal.round;
@@ -740,18 +503,8 @@ impl CutEngine {
         cut_id
     }
 
-    /// Was upstream primary/src/core.rs:652-687 (`process_cut_certificate`, verifying
-    /// and accepting a RECEIVED `CutCertificate`). Now Fig. 2's Mark-safe step
-    /// immediately followed by Vote ("send `⟨commit, curr_round⟩` to all parties"),
-    /// reached ONLY from `process_cut_vote` -- exclusively when THIS party's own
-    /// `CutVoteAggregator` crosses `mint_threshold` on votes it individually verified.
-    /// There is no longer a verify step here (there is nothing left to verify: every
-    /// vote that got `round`/`cut_id`/`witnesses` here already passed `CutVote::
-    /// verify` and the aggregator's own dedup, one at a time, in `process_cut_vote`).
-    /// `witnesses` is `CutVoteAggregator::append`'s own returned voter list -- this
-    /// party's first-hand record of who it received a vote from, used below only as
-    /// `ensure_cut_fetch`'s target set (see the module doc comment's REPAIR
-    /// paragraph), never transmitted anywhere.
+    /// Marks a cut safe after a local threshold crossing and broadcasts this node's decide.
+    /// `witnesses` are used only to fetch a missing proposal.
     fn mark_cut_safe(
         &mut self,
         round: CutRound,
@@ -770,15 +523,7 @@ impl CutEngine {
         self.cut_round = self.cut_round.max(round + 1);
         self.advance_timed_out_cut_rounds();
 
-        // REPAIR (see the module doc comment): crossing `mint_threshold` names only a
-        // `cut_id` -- if we never independently received/recorded round `round`'s own
-        // `CutProposal`, nothing else will ever ask for it (`safe_cut_parent`'s
-        // "parent unknown" branch only BUFFERS a citing child, it never fetches on
-        // its own -- that is `process_cut_proposal`'s OWN, separate trigger, for when
-        // a child arrives before this party ever crosses the threshold itself). Every
-        // one of `witnesses` sent us a `CutVote` naming this `cut_id`, i.e. claimed,
-        // by voting, to have seen the proposal -- see `ensure_cut_fetch`'s doc
-        // comment.
+        // The vote quorum may identify a proposal this node has not received.
         let mut effects = self.ensure_cut_fetch(round, &cut_id, witnesses);
         if self.voted.insert(round) {
             let decide = Decide {
@@ -795,11 +540,6 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:689-712. `Decide` is Fig. 2's `⟨commit, r⟩`; this
-    /// is the **Commit** step ("Upon receiving `⟨commit, r⟩` from n - f parties for
-    /// some round r, set `committed[r] ← true`"), counted FIRST-HAND exactly like
-    /// `process_cut_vote` above -- every `Decide` is individually verified
-    /// (`decide.verify`) and fed to this party's OWN `DecideAggregator`.
     pub fn process_decide(&mut self, decide: Decide) -> Vec<CutEffect> {
         if decide.verify(&self.committee).is_err() {
             return Vec::new();
@@ -818,7 +558,6 @@ impl CutEngine {
         self.try_commit_round(round)
     }
 
-    /// Upstream primary/src/core.rs:714-727.
     fn try_commit_round(&mut self, round: CutRound) -> Vec<CutEffect> {
         let Some(decide) = self.committed.get(&round) else {
             return Vec::new();
@@ -834,12 +573,6 @@ impl CutEngine {
         Vec::new()
     }
 
-    /// Upstream primary/src/core.rs:729-751. Upstream only marks `sent_commit_rounds`
-    /// after a successful `self.tx_committer.send(...).await` (skipping it on a send
-    /// error, e.g. a dropped receiver); there is no channel here to fail, so once this
-    /// engine decides to emit the effect it is unconditionally considered sent -- the
-    /// caller's own delivery of the effect is outside the state machine's concern,
-    /// exactly as every other `CutEffect::Broadcast` already is.
     fn emit_commit_to_committer(&mut self, round: CutRound, cut_id: &Digest) -> Vec<CutEffect> {
         if self.sent_commit_rounds.contains(&round) {
             return Vec::new();
@@ -852,7 +585,6 @@ impl CutEngine {
         vec![CutEffect::Commit { round, proposals }]
     }
 
-    /// Upstream primary/src/core.rs:753-788.
     pub fn try_propose_cut_for_current_round(
         &mut self,
         tips: &Cut,
@@ -876,25 +608,10 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:808-822. `ArmTimer`'s deadline is computed here
-    /// (`Instant::now() + timeout_delay`), matching `control::ControlLog::
-    /// enter_round_core`'s own `Effect::ArmControlTimer(r, Instant::now() + ...)` style
-    /// -- not `agb::AgbEngine`'s threaded-`now` parameter style -- because upstream's own
-    /// `schedule_cut_timer(&mut self, round: u64)` took no `now`-like parameter either;
-    /// this preserves that signature exactly rather than introducing one upstream never
-    /// had.
-    ///
-    /// `pub` (production wiring, `simpleit::node::SimpleItCore`): every OTHER caller of
-    /// this method is internal (`mark_cut_safe`/`handle_timeout_accept_action`,
-    /// both only ever reachable after `cut_round` has already advanced PAST round 1), so
-    /// round 1 itself never gets a timer armed this way -- the production wiring calls
-    /// this directly, once, at boot (`schedule_cut_timer(1)`), exactly mirroring how
-    /// `try_propose_cut_for_current_round` (already `pub`) must also be called directly
-    /// at boot for the round-1 leader to ever propose. Zero behavior change: same
-    /// one-shot-per-round latch (`scheduled_cut_timers`), same effect.
+    /// Arms one deadline per round.
     pub fn schedule_cut_timer(&mut self, round: CutRound) -> Vec<CutEffect> {
         if self.scheduled_cut_timers.insert(round) {
-            log::info!(
+            log::debug!(
                 "BENCH event=round_start round={} leader={:?} node={:?}",
                 round,
                 self.leader_for_round(round),
@@ -906,7 +623,6 @@ impl CutEngine {
         Vec::new()
     }
 
-    /// Upstream primary/src/core.rs:824-838.
     fn safe_cut_parent(&self, round: CutRound, parent_cut: &Digest) -> bool {
         let parent_round = if *parent_cut == Digest::default() {
             0
@@ -923,7 +639,6 @@ impl CutEngine {
         ((parent_round + 1)..round).all(|r| self.certified_timed_out.contains(&r))
     }
 
-    /// Upstream primary/src/core.rs:840-848.
     fn advance_timed_out_cut_rounds(&mut self) -> bool {
         let old_cut_round = self.cut_round;
         while self.certified_timed_out.contains(&self.cut_round)
@@ -934,7 +649,6 @@ impl CutEngine {
         self.cut_round != old_cut_round
     }
 
-    /// Upstream primary/src/core.rs:850-878.
     pub fn process_cut_timer(
         &mut self,
         round: CutRound,
@@ -949,7 +663,7 @@ impl CutEngine {
             return Vec::new();
         }
 
-        log::info!(
+        log::debug!(
             "BENCH event=timeout_sent round={} node={:?}",
             round,
             self.name
@@ -963,7 +677,6 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:880-900.
     pub fn process_timeout(
         &mut self,
         timeout: Timeout,
@@ -996,16 +709,10 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:902-917.
     fn broadcast_timeout_accept(&self, accept: &TimeoutAccept) -> Vec<CutEffect> {
         vec![CutEffect::Broadcast(CutOut::TimeoutAccept(accept.clone()))]
     }
 
-    /// Upstream primary/src/core.rs:919-930. Returns the broadcast effect (if this call
-    /// is the first-ever send for `round` -- upstream's `sent_timeout_accepts.insert`
-    /// one-shot latch) alongside the `(weight, maybe-cert)` `record_timeout_accept`
-    /// produced for our own accept; `None` in the second position exactly when upstream
-    /// would have returned `Ok(None)` (already sent).
     fn send_timeout_accept(
         &mut self,
         round: CutRound,
@@ -1022,7 +729,6 @@ impl CutEngine {
         (effects, Some(result))
     }
 
-    /// Upstream primary/src/core.rs:932-950.
     fn record_timeout_accept(&mut self, accept: TimeoutAccept) -> (Stake, Option<TimeoutCert>) {
         if accept.verify(&self.committee).is_err() {
             return (0, None);
@@ -1038,7 +744,6 @@ impl CutEngine {
             .unwrap_or((0, None))
     }
 
-    /// Upstream primary/src/core.rs:952-957.
     pub fn process_timeout_accept(
         &mut self,
         accept: TimeoutAccept,
@@ -1050,7 +755,6 @@ impl CutEngine {
         self.handle_timeout_accept_action(round, weight, timeout_cert, tips, oracle)
     }
 
-    /// Upstream primary/src/core.rs:959-982.
     fn handle_timeout_accept_action(
         &mut self,
         round: CutRound,
@@ -1083,9 +787,6 @@ impl CutEngine {
         effects
     }
 
-    /// Upstream primary/src/core.rs:1015-1017. A thin wrapper, kept distinct from
-    /// `process_timeout` because upstream keeps it distinct -- see `handle`'s doc
-    /// comment for which call site uses which name.
     pub fn handle_timeout(
         &mut self,
         timeout: Timeout,
@@ -1095,12 +796,7 @@ impl CutEngine {
         self.process_timeout(timeout, tips, oracle)
     }
 
-    /// Upstream primary/src/core.rs:1023-1029. Upstream checks `self.gc_round <=
-    /// accept.round`, where `gc_round: Height` is an Autobahn header-height GC floor --
-    /// a different unit entirely from a cut round, and not ported (see `gc_floor`'s
-    /// doc comment on `CutEngine`). This checks the same shape of thing
-    /// (`accept.round` is not older than our own GC floor) against `gc_floor`, this
-    /// engine's own analogous floor.
+    /// Rejects timeout accepts below the cut-round GC floor.
     pub fn sanitize_timeout_accept(&self, accept: &TimeoutAccept) -> DagResult<()> {
         ensure!(
             self.gc_floor <= accept.round,
@@ -1109,22 +805,6 @@ impl CutEngine {
         Ok(())
     }
 
-    // ============================================================ Cut-proposal repair
-    //
-    // Not upstream -- upstream has no equivalent. Closes the liveness gap where a
-    // party locally marks round r safe (crossing `mint_threshold` on votes naming only
-    // a `cut_id`) without ever having received round r's own `CutProposal` -- see the
-    // module doc comment and `mark_cut_safe`/`process_cut_proposal` for the two
-    // triggers that call `ensure_cut_fetch` above. Mirrors `control::ControlLog`'s own
-    // carrier-body fetch/serve (`on_control_fetch`/`on_control_serve`) exactly.
-
-    /// A peer's request for `(round, cut_id)` -- answer with our own held
-    /// `CutProposal` if we have it and haven't already answered this requester for
-    /// this exact pair. Gated on `gc_floor`, this engine's one and only retention
-    /// floor (unlike `ControlLog`'s split `min_live_view`/`min_serve_view`:
-    /// `CutEngine::prune_below` drops `cut_proposals` at the same floor as every
-    /// other round-keyed field, so there is no wider serve-only window to gate on
-    /// separately here).
     pub fn on_cut_fetch(
         &mut self,
         requester: PublicKey,
@@ -1149,21 +829,6 @@ impl CutEngine {
         }]
     }
 
-    /// A peer's answer to our own fetch -- accept only if it hash-matches a pair we
-    /// actually requested: `proposal.id()` (`== CutProposal::digest()`, which hashes
-    /// `round` among its other fields) keyed together with `proposal.round` against
-    /// `pending_cut_fetch` is exactly that pair, so this single lookup checks BOTH
-    /// "is this cut_id one we asked for" AND "at the round we asked for it" in one
-    /// step. Mirrors `control::ControlLog::on_control_serve`'s RS1-class defense:
-    /// "valid" means hash-matching a REQUESTED pair, not merely well-formed.
-    /// Structural verification (leader authenticity, safety, dedup, the f+1 tip
-    /// gate, ...) is deliberately NOT duplicated here -- accepting hands off
-    /// entirely to `process_cut_proposal`, which already performs every one of
-    /// those checks for a directly-received proposal, so recording, reparenting of
-    /// `pending_cut_children`, voting, and `try_commit_round` all happen exactly as
-    /// they would have. Every rejecting path below changes no state
-    /// (`pending_cut_fetch` is only ever removed on the accepting path, after the
-    /// hash-match check has already passed).
     pub fn on_cut_serve(
         &mut self,
         proposal: CutProposal,
@@ -1172,7 +837,7 @@ impl CutEngine {
     ) -> Vec<CutEffect> {
         let key = (proposal.round, proposal.id());
         if !self.pending_cut_fetch.contains_key(&key) {
-            return Vec::new(); // unsolicited, or answers a pair we never requested
+            return Vec::new();
         }
         self.pending_cut_fetch.remove(&key);
         self.process_cut_proposal(proposal, tips, oracle)
@@ -1187,9 +852,6 @@ mod tests {
         PublicKey([byte; 32])
     }
 
-    /// `n` committee members, `key(1)..=key(n)`, equal stake -- ascending byte value so
-    /// `committee.authorities.keys()` (BTreeMap order) yields exactly `key(1), key(2),
-    /// ..., key(n)`, letting tests reason about `leader_for_round`'s output directly.
     fn committee_of(n: u8) -> (Committee, Vec<PublicKey>) {
         let keys: Vec<PublicKey> = (1..=n).map(key).collect();
         let info = keys
@@ -1283,8 +945,6 @@ mod tests {
             .collect()
     }
 
-    /// Bracha variant: mirrors `find_vote_for_round`/`find_decide_for_round`
-    /// exactly, for the new `CutOut::CutReady` broadcast.
     fn find_ready_for_round(effects: &[CutEffect], round: CutRound) -> Option<CutReady> {
         effects.iter().find_map(|e| match e {
             CutEffect::Broadcast(CutOut::CutReady(r)) if r.round == round => Some(r.clone()),
@@ -1292,22 +952,16 @@ mod tests {
         })
     }
 
-    /// Test 1: happy path end to end, at both n=4 and n=10 -- proposal -> votes to
-    /// `mint_threshold` -> this party marks the round `safe` (and, in the SAME step,
-    /// sends its own `Decide` -- no certificate round-trip in between: one fewer
-    /// message delay than the removed certificate-broadcast design) -> decides to
-    /// `quorum_threshold` -> commit emitted exactly once for the round.
     fn happy_path_commit(n: u8) {
         let (committee, keys) = committee_of(n);
         let tips = sample_tips(&keys);
         let oracle = AllAvailable;
         let round: CutRound = 1;
-        let leader = agb::proposer(&committee, 2); // round 1 -> view 2, see leader_for_round
+        let leader = agb::proposer(&committee, 2);
 
         let mut engine = CutEngine::new(leader, committee, 1_000);
 
-        // Propose: the leader broadcasts its own proposal and immediately self-votes
-        // (upstream: the leader also processes its own proposal locally).
+        // The leader broadcasts and self-votes.
         let mut effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
         let proposal = find_proposal(&effects).expect("leader broadcasts a cut proposal");
         let cut_id = proposal.id();
@@ -1317,9 +971,7 @@ mod tests {
         );
         assert!(!engine.safe.contains_key(&round));
 
-        // Votes: bring in other committee members' votes for the same cut_id until
-        // this party's own count crosses `mint_threshold` and it marks the round safe
-        // locally -- no certificate is minted or broadcast anywhere on this path.
+        // Add votes until the cut is safe.
         let mut others = keys.iter().filter(|k| **k != leader);
         loop {
             if engine.safe.contains_key(&round) {
@@ -1343,9 +995,7 @@ mod tests {
              certificate-broadcast design"
         );
 
-        // Decides: bring in other committee members' decides for the same (round,
-        // cut_id) until commit appears. The safe-crossing call above already produced
-        // our own self-decide.
+        // Add decides until the cut commits.
         let mut others = keys.iter().filter(|k| **k != leader);
         let mut commits = find_commits(&effects, round);
         while commits.is_empty() {
@@ -1368,8 +1018,7 @@ mod tests {
         );
         assert_eq!(commits[0].1, proposal.tips);
 
-        // Re-delivering the same decide-quorum-crossing event again must not emit a
-        // second commit (the per-round `sent_commit_rounds` latch).
+        // Commit output is one-shot per round.
         let repeat = engine.try_commit_round(round);
         assert!(find_commits(&repeat, round).is_empty());
     }
@@ -1384,11 +1033,6 @@ mod tests {
         happy_path_commit(10);
     }
 
-    /// Bracha variant -- Test 1's Bracha analogue, at both n=4 and n=10:
-    /// proposal -> votes to `quorum_threshold` -> this party broadcasts+self-processes
-    /// its own `CutReady` -> readys to `quorum_threshold` -> safe (and, in the SAME
-    /// step, this party's own `Decide`) -> decides to `quorum_threshold` -> commit
-    /// emitted exactly once for the round.
     fn happy_path_commit_bracha(n: u8) {
         let (committee, keys) = committee_of(n);
         let tips = sample_tips(&keys);
@@ -1411,10 +1055,7 @@ mod tests {
         );
         assert!(!engine.safe.contains_key(&round));
 
-        // Votes: bring in other committee members' votes until this party's own
-        // CutVote census crosses quorum_threshold -- this broadcasts (and
-        // self-processes) our own CutReady in the SAME step, but does NOT yet mark
-        // the round safe.
+        // A CutVote quorum broadcasts CutReady but does not mark the cut safe.
         let mut others = keys.iter().filter(|k| **k != leader);
         loop {
             if find_ready_for_round(&effects, round).is_some() {
@@ -1436,10 +1077,7 @@ mod tests {
              does not mark the round safe directly"
         );
 
-        // Readys: bring in other committee members' CutReadys until this party's own
-        // CutReady census crosses quorum_threshold and it marks the round safe
-        // locally. The vote-threshold crossing above already produced our own
-        // self-ready.
+        // A CutReady quorum marks the cut safe.
         let mut others = keys.iter().filter(|k| **k != leader);
         while !engine.safe.contains_key(&round) {
             let author = *others
@@ -1459,9 +1097,6 @@ mod tests {
              Decide in the SAME step, exactly like the Opt variant's mark_cut_safe"
         );
 
-        // Decides: bring in other committee members' decides for the same (round,
-        // cut_id) until commit appears -- identical to the Opt variant (DecideAggregator
-        // is shared, unmodified by the variant).
         let mut others = keys.iter().filter(|k| **k != leader);
         let mut commits = find_commits(&effects, round);
         while commits.is_empty() {
@@ -1498,11 +1133,6 @@ mod tests {
         happy_path_commit_bracha(10);
     }
 
-    /// Bracha variant: `broadcast_cut_ready` broadcasts at most once per
-    /// round, even if the internal trigger (crossing `quorum_threshold` on the vote
-    /// census) somehow fires again for a DIFFERENT `cut_id` in the same round (e.g. an
-    /// equivocating leader) -- `sent_cut_ready` is a per-ROUND latch, mirroring
-    /// `sent_cut_votes`'s identical round-only shape, not a per-(round, cut_id) one.
     #[test]
     fn bracha_cut_ready_broadcasts_at_most_once_per_round() {
         let (committee, keys) = committee_of(4);
@@ -1531,12 +1161,6 @@ mod tests {
         );
     }
 
-    /// Bracha variant: `process_cut_ready`'s own `CutReadyAggregator` census
-    /// dedups by author exactly like `CutVoteAggregator` does (see
-    /// `safe_is_reached_only_by_counting_distinct_votes_never_below_quorum`'s
-    /// identical final assertion for votes) -- `safe` is reached at exactly
-    /// `quorum_threshold` distinct `CutReady`s, and a replay from an already-counted
-    /// author manufactures no additional weight.
     #[test]
     fn bracha_cut_ready_census_dedups_by_author_and_reaches_safe_at_quorum() {
         let (committee, keys) = committee_of(10);
@@ -1591,15 +1215,13 @@ mod tests {
         );
     }
 
-    /// Bracha variant: `process_cut_ready` is a no-op under `Variant::Opt` --
-    /// a stray/Byzantine `CutReady` cannot make an Opt-configured engine take the
-    /// Bracha-shaped path it was never configured to run.
+    /// Ignores `CutReady` messages when the variant is `Opt`.
     #[test]
     fn bracha_cut_ready_is_a_no_op_under_variant_opt() {
         let (committee, keys) = committee_of(4);
         let tips = sample_tips(&keys);
         let oracle = AllAvailable;
-        let mut engine = CutEngine::new(keys[0], committee, 1_000); // Variant::Opt (default)
+        let mut engine = CutEngine::new(keys[0], committee, 1_000);
 
         let effects = engine.process_cut_ready(
             CutReady {
@@ -1615,14 +1237,6 @@ mod tests {
         assert!(!engine.safe.contains_key(&1));
     }
 
-    /// Bracha variant -- the motivating case: at n=20, Opt's own
-    /// `mint_threshold` (15) exceeds the number of live authors in this scenario (14),
-    /// so no Opt-variant engine could ever reach `safe` here, no matter how long it
-    /// waited. Bracha's own threshold (plain `quorum_threshold`, 14 at n=20) is exactly
-    /// the number of live authors -- a round reaches `safe` and commits under Bracha
-    /// using ONLY messages from those 14 live authors (which include the round-1
-    /// leader); the other 6 committee members ("crashed") never contribute a single
-    /// message anywhere in this test.
     #[test]
     fn bracha_reaches_safe_and_commits_with_only_fourteen_of_twenty_live_authors() {
         let (committee, keys) = committee_of(20);
@@ -1656,8 +1270,7 @@ mod tests {
         let proposal = find_proposal(&effects).expect("leader broadcasts a cut proposal");
         let cut_id = proposal.id();
 
-        // Votes from the 13 OTHER live authors (the leader's own self-vote already
-        // landed above) -- never from any of the 6 crashed authors.
+        // Add votes from the other live authors.
         for author in live.iter().filter(|k| **k != leader) {
             effects = engine.process_cut_vote(
                 CutVote {
@@ -1676,9 +1289,6 @@ mod tests {
         );
         assert!(!engine.safe.contains_key(&round));
 
-        // Readys from the same 13 other live authors (our own self-ready already
-        // landed via broadcast_cut_ready's self-processing) -- again, never from a
-        // crashed author.
         for author in live.iter().filter(|k| **k != leader) {
             if engine.safe.contains_key(&round) {
                 break;
@@ -1699,9 +1309,6 @@ mod tests {
             "14 live authors are exactly quorum_threshold under Bracha"
         );
 
-        // Decides from live authors only, until commit (quorum_threshold = 14, exactly
-        // the number of live authors -- the leader's own self-decide already landed
-        // via mark_cut_safe above).
         let mut commits = find_commits(&effects, round);
         for author in live.iter().filter(|k| **k != leader) {
             if !commits.is_empty() {
@@ -1724,20 +1331,6 @@ mod tests {
         assert_eq!(commits[0].1, proposal.tips);
     }
 
-    /// Test, see `aggregators::mint_threshold`); ADAPTED for the
-    /// Fig.-2 rewrite -- was `minted_certificate_passes_its_own_verify_at_small_
-    /// committees`. There is no certificate to verify anymore: each party marks a
-    /// round safe by counting its OWN `CutVote`s to `mint_threshold =
-    /// max(optimistic_threshold, quorum_threshold)`, with no separate verify step
-    /// downstream. Before the clamp, `optimistic_threshold` alone was strictly
-    /// smaller for f <= 2 (n = 4, 5, 6, 8, 9, 12 -- and n=4 is `fab remote`'s
-    /// default); under the OLD certificate design that meant the minting party
-    /// rejected the certificate it had just built (mint < verify), so no `Decide` was
-    /// ever sent and the round could never commit. Under THIS design there is no
-    /// verify step to catch an unclamped threshold at all -- `mint_threshold` alone
-    /// stands between "some party thinks it's safe" and actual safety -- so this
-    /// sweeps exactly the sizes where an unclamped threshold would fail silently
-    /// rather than loudly.
     #[test]
     fn party_reaches_safe_at_the_correctly_clamped_local_vote_threshold() {
         for n in [4u8, 5, 6, 8, 9] {
@@ -1782,12 +1375,7 @@ mod tests {
         }
     }
 
-    /// REQUIRED (task): a party reaches `safe[r]` purely by counting votes, with no
-    /// certificate message ever crossing the wire -- proved at the type level, not
-    /// merely asserted at run time. `mint_threshold` (n=10: quorum_threshold = 7) is
-    /// never reached below `quorum_threshold` distinct votes -- so there is no
-    /// shortcut that marks a round safe on fewer than a quorum's worth of
-    /// first-hand-counted, individually-verified votes.
+    /// Safety requires at least a quorum of distinct, verified votes.
     #[test]
     fn safe_is_reached_only_by_counting_distinct_votes_never_below_quorum() {
         let (committee, keys) = committee_of(10);
@@ -1804,7 +1392,7 @@ mod tests {
         );
 
         let quorum = committee.quorum_threshold();
-        let mut voted = 1u32; // the leader's own self-vote, above
+        let mut voted = 1u32;
         for author in keys.iter().filter(|k| **k != leader) {
             if engine.safe.contains_key(&1) {
                 break;
@@ -1839,11 +1427,7 @@ mod tests {
              ({quorum}) -- mint_threshold's clamp is not holding"
         );
 
-        // A single corrupt (or merely noisy) party resending its OWN already-counted
-        // vote cannot manufacture additional weight: `CutVoteAggregator`'s dedup
-        // (`used: HashSet<PublicKey>`) rejects a repeat from the same author, so
-        // crossing `mint_threshold` categorically requires that many DISTINCT
-        // authors, never fewer authors voting more times.
+        // A repeated author adds no weight.
         let repeat_author = keys[0];
         let before = engine.safe.get(&1).cloned();
         engine.process_cut_vote(
@@ -1862,30 +1446,13 @@ mod tests {
         );
     }
 
-    /// REQUIRED (task): a forged notarization is impossible -- there is no message a
-    /// party can send that makes ANOTHER party mark a round safe without that party
-    /// itself counting `mint_threshold` distinct votes. This is asserted
-    /// STRUCTURALLY, not merely at run time: `Inbound` is `CutEngine`'s entire
-    /// message surface (see `handle`'s own match over it), and the match below has NO
-    /// wildcard arm -- if a certificate-shaped variant is ever added back to
-    /// `Inbound`, this test module fails to COMPILE, not merely to pass, until it is
-    /// explicitly handled here. The only path that ever populates `safe` is
-    /// `process_cut_vote` -> `mark_cut_safe`, reached exclusively by this party's own
-    /// `CutVoteAggregator` crossing `mint_threshold` (see the two tests above) --
-    /// never by trusting a relayed aggregate asserted by another party.
+    /// Keeps the inbound surface free of relayed certificate messages.
     #[test]
     fn inbound_has_no_certificate_shaped_variant() {
         fn assert_exhaustive_with_no_certificate_arm(inbound: Inbound) {
             match inbound {
                 Inbound::CutProposal(_)
                 | Inbound::CutVote(_)
-                // Bracha variant: `Inbound::CutReady` is exactly the kind of
-                // new variant this test's own doc comment describes -- adding it here
-                // is REQUIRED (the match would fail to COMPILE otherwise, per this
-                // test's stated purpose), not a behavior change to the test itself.
-                // Same single-named-author shape as `CutVote`, so it belongs on this
-                // side of the match, not a certificate-shaped arm this test would need
-                // to reject.
                 | Inbound::CutReady(_)
                 | Inbound::Decide(_)
                 | Inbound::Timeout(_)
@@ -1895,18 +1462,9 @@ mod tests {
                 | Inbound::CutServe(_) => {}
             }
         }
-        // Any one instance suffices: the exhaustiveness check above is performed by
-        // the compiler against the LIVE `Inbound` definition, not by this call.
         assert_exhaustive_with_no_certificate_arm(Inbound::TimerFired(0));
     }
 
-    /// Test for the Fig.-2 rewrite -- the trigger was a hand-built
-    /// `CutCertificate`, now `mint_threshold`-many `CutVote`s): what actually happens
-    /// to a party that counts enough votes to mark round r safe LOCALLY but never
-    /// itself received round r's own PROPOSAL. Establishes whether the failure mode
-    /// is a divergent commit order (unsafe) or a stall (a liveness gap) -- unchanged
-    /// by the rewrite, since a `CutVote` names only a `round` and `cut_id`, exactly
-    /// as a `CutCertificate` did.
     #[test]
     fn missing_proposal_stalls_the_chain_rather_than_skipping_a_round() {
         let (committee, keys) = committee_of(4);
@@ -1914,16 +1472,14 @@ mod tests {
         let oracle = AllAvailable;
         let round1_leader = agb::proposer(&committee, 2);
         let round2_leader = agb::proposer(&committee, 3);
-        // An observer that leads neither round, so it only ever *receives*.
+        // Use a node that leads neither round.
         let observer = *keys
             .iter()
             .find(|k| **k != round1_leader && **k != round2_leader)
             .expect("n=4 has a non-leader");
         let mut engine = CutEngine::new(observer, committee.clone(), 1_000);
 
-        // Round 1's cut, as some other party would have built it. This engine never
-        // sees the proposal itself -- only enough of its peers' CutVotes to cross
-        // mint_threshold locally.
+        // Reach safety from votes without receiving the round-1 proposal.
         let round1_cut = CutProposal {
             round: 1,
             proposer: round1_leader,
@@ -1933,7 +1489,7 @@ mod tests {
         let round1_id = round1_cut.id();
         let voters: Vec<PublicKey> = keys
             .iter()
-            .take(committee.quorum_threshold() as usize) // == mint_threshold at n=4
+            .take(committee.quorum_threshold() as usize)
             .copied()
             .collect();
         let mut effects = Vec::new();
@@ -1960,8 +1516,7 @@ mod tests {
             "reaching safe locally produces a Decide for round 1"
         );
 
-        // Round 2's proposal chains onto round 1's cut, whose digest this engine has
-        // never recorded (`record_cut_proposal` is the only writer of cut_round_by_id).
+        // The round-2 parent remains unknown locally.
         let round2 = CutProposal {
             round: 2,
             proposer: round2_leader,
@@ -1978,9 +1533,7 @@ mod tests {
             "round 2 is buffered pending round 1's proposal"
         );
 
-        // Even a full quorum of Decides for round 2 cannot commit it, because
-        // try_commit_round requires leader_cut_by_round[2], set only when the proposal
-        // is recorded. So the chain STALLS -- it never emits round 2 ahead of round 1.
+        // Decides cannot commit a proposal that was never recorded.
         for author in keys.iter().copied() {
             let effects = engine.process_decide(Decide {
                 id: round2_leader_cut_id(&tips, round2_leader),
@@ -2004,15 +1557,6 @@ mod tests {
         .id()
     }
 
-    /// Test (cut-proposal repair; ADAPTED for the Fig.-2 rewrite -- was
-    /// `certificate_with_unknown_proposal_triggers_fetch_to_its_voters`): the same
-    /// missing-proposal scenario as `missing_proposal_stalls_the_chain_rather_than_
-    /// skipping_a_round` above, now asserting the repair fix -- locally crossing
-    /// `mint_threshold` for round 1's cut_id emits a fetch for its own `(round,
-    /// cut_id)` addressed to exactly the witnesses THIS party itself counted (every
-    /// one of them sent a `CutVote` naming this cut_id, i.e. claimed, by voting, to
-    /// have seen the proposal -- see `mark_cut_safe`'s own call to `ensure_cut_fetch`
-    /// and `CutVoteAggregator::append`'s returned voter list).
     #[test]
     fn local_safe_with_unknown_proposal_triggers_fetch_to_its_witnesses() {
         let (committee, keys) = committee_of(4);
@@ -2035,7 +1579,7 @@ mod tests {
         let round1_id = round1_cut.id();
         let voters: Vec<PublicKey> = keys
             .iter()
-            .take(committee.quorum_threshold() as usize) // == mint_threshold at n=4
+            .take(committee.quorum_threshold() as usize)
             .copied()
             .collect();
 
@@ -2076,12 +1620,6 @@ mod tests {
         );
     }
 
-    /// Test (cut-proposal repair, additional coverage beyond the task's
-    /// required list -- see the report): the OTHER trigger -- a proposal citing a
-    /// parent this engine has never heard of AT ALL (no certificate either) still
-    /// gets buffered exactly as before, but now ALSO fans a fetch out to the full
-    /// committee, since there is no narrower evidence available for who holds it
-    /// (see `process_cut_proposal`'s own comment at this call site).
     #[test]
     fn buffered_child_with_unknown_parent_triggers_fetch_to_committee() {
         let (committee, keys) = committee_of(4);
@@ -2123,10 +1661,6 @@ mod tests {
         );
     }
 
-    /// A served proposal that hash-matches an outstanding request unblocks a
-    /// buffered child: the parent is recorded, the buffered round-2 child is
-    /// reparented and voted, and (its Decide quorum already in, exactly as in the
-    /// stall scenario) round 2 now commits.
     #[test]
     fn served_proposal_matching_request_unblocks_reparents_and_commits() {
         let (committee, keys) = committee_of(4);
@@ -2155,13 +1689,7 @@ mod tests {
         };
         let round2_id = round2_cut.id();
 
-        // Seed the exact state the stall scenario reaches (see
-        // `missing_proposal_stalls_the_chain_rather_than_skipping_a_round`): round 2
-        // buffered pending round 1's still-unknown proposal, and an outstanding
-        // fetch for it (as `mark_cut_safe`'s own trigger would have set up -- seeded
-        // directly here to isolate `on_cut_serve`'s own accept/dispatch behavior,
-        // mirroring `queue_with_invalid_sibling_still_processes_valid_one`'s
-        // identical direct-seeding style).
+        // Seed a pending child and its parent fetch.
         engine
             .pending_cut_children
             .insert((2, round1_id.clone()), vec![round2_cut.clone()]);
@@ -2169,10 +1697,6 @@ mod tests {
             .pending_cut_fetch
             .insert((1, round1_id.clone()), engine.cut_round());
 
-        // A full quorum of round-2 Decides, exactly as the stall scenario feeds --
-        // these land BEFORE the parent is ever known and (per that scenario) cannot
-        // commit yet, since `leader_cut_by_round[2]` isn't set until the proposal is
-        // recorded.
         for author in keys.iter().copied() {
             let effects = engine.process_decide(Decide {
                 id: round2_id.clone(),
@@ -2183,7 +1707,6 @@ mod tests {
         }
         assert!(engine.committed.contains_key(&2));
 
-        // The serve arrives.
         let effects = engine.on_cut_serve(round1_cut, &tips, &oracle);
 
         assert_eq!(
@@ -2212,11 +1735,7 @@ mod tests {
         );
     }
 
-    /// A served proposal that does NOT hash-match any outstanding request is
-    /// rejected and changes no engine state -- including when a DIFFERENT pending
-    /// fetch happens to share the same digest but a different round (`CutProposal::
-    /// id()` hashes `round` too, so `(2, cut_id)` and `(1, cut_id)` are distinct
-    /// pairs).
+    /// Rejects a served proposal that matches no outstanding request.
     #[test]
     fn served_proposal_not_matching_any_request_is_rejected() {
         let (committee, keys) = committee_of(4);
@@ -2233,7 +1752,7 @@ mod tests {
         };
         let cut_id = proposal.id();
 
-        // An outstanding request exists, but for a DIFFERENT round.
+        // The outstanding request is for another round.
         engine.pending_cut_fetch.insert((2, cut_id.clone()), 1);
 
         let effects = engine.on_cut_serve(proposal, &tips, &oracle);
@@ -2253,9 +1772,7 @@ mod tests {
         );
     }
 
-    /// `on_cut_fetch` answers when the proposal is held, answers a given requester
-    /// only once for the same pair, and answers nothing once the round has been
-    /// pruned below the GC floor.
+    /// Serves a held proposal once per requester and rejects pruned rounds.
     #[test]
     fn on_cut_fetch_answers_when_held_once_per_requester_and_respects_gc_floor() {
         let (committee, keys) = committee_of(4);
@@ -2270,7 +1787,7 @@ mod tests {
             tips: tips.clone(),
         };
         let cut_id = proposal.id();
-        engine.record_cut_proposal(proposal); // held directly -- isolates on_cut_fetch
+        engine.record_cut_proposal(proposal);
 
         let requester = keys[1];
         let effects = engine.on_cut_fetch(requester, 3, cut_id.clone());
@@ -2285,14 +1802,12 @@ mod tests {
             other => panic!("expected exactly one ServeTo effect, got {other:?}"),
         }
 
-        // Same requester, same pair -- already answered, no repeat.
         let effects = engine.on_cut_fetch(requester, 3, cut_id.clone());
         assert!(
             effects.is_empty(),
             "the same requester must not be answered twice"
         );
 
-        // A DIFFERENT requester for the same pair is still owed its own answer.
         let other_requester = keys[2];
         let effects = engine.on_cut_fetch(other_requester, 3, cut_id.clone());
         assert_eq!(
@@ -2301,7 +1816,6 @@ mod tests {
             "a different requester gets its own answer"
         );
 
-        // Below the GC floor: nothing, even for a still-fresh requester.
         engine.prune_below(4);
         let fresh_requester = keys[3];
         let effects = engine.on_cut_fetch(fresh_requester, 3, cut_id);
@@ -2311,9 +1825,7 @@ mod tests {
         );
     }
 
-    /// Retry backoff: `ensure_cut_fetch` does not re-emit a fetch for the same
-    /// `(round, cut_id)` pair before `FETCH_RETRY_ROUNDS` cut rounds have elapsed
-    /// since the last fan-out, and does re-emit once they have.
+    /// Proposal fetches retry only after `FETCH_RETRY_ROUNDS`.
     #[test]
     fn cut_fetch_retry_backoff_holds_until_the_window_elapses() {
         let (committee, keys) = committee_of(4);
@@ -2324,12 +1836,11 @@ mod tests {
         let first = engine.ensure_cut_fetch(1, &cut_id, targets.clone());
         assert_eq!(first.len(), 2, "the first call fans out to every target");
 
-        // Immediately retried (still within FETCH_RETRY_ROUNDS of cut_round==1):
-        // no-op.
+        // An immediate retry is suppressed.
         let again = engine.ensure_cut_fetch(1, &cut_id, targets.clone());
         assert!(again.is_empty(), "retried too soon -- must not re-fan");
 
-        // Advance the engine's own retry clock short of the threshold: still no-op.
+        // Stay below the retry threshold.
         engine.cut_round = 1 + CutEngine::FETCH_RETRY_ROUNDS - 1;
         let still_too_soon = engine.ensure_cut_fetch(1, &cut_id, targets.clone());
         assert!(
@@ -2337,26 +1848,20 @@ mod tests {
             "one round short of the window -- still no-op"
         );
 
-        // Advance to exactly the threshold: re-fans.
         engine.cut_round = 1 + CutEngine::FETCH_RETRY_ROUNDS;
         let retried = engine.ensure_cut_fetch(1, &cut_id, targets);
         assert_eq!(retried.len(), 2, "past the retry window -- fans out again");
     }
 
-    /// Test 2: timeout path -- leader silent, timer fires, `Timeout` reaches quorum,
-    /// `TimeoutAccept` amplifies at f+1 and certifies at quorum, the round is marked
-    /// timed-out, `cut_round` advances, and a pending child whose parent was skipped is
-    /// retried.
+    /// A certified timeout advances the round and retries pending children.
     #[test]
     fn timeout_path_advances_round_and_retries_pending_child() {
         let (committee, keys) = committee_of(4);
         let tips = sample_tips(&keys);
         let oracle = AllAvailable;
 
-        // An observer distinct from round 2's leader (see the assertions below for
-        // why that separation matters).
-        let observer = agb::proposer(&committee, 2); // round 1's leader, used only as
-                                                     // this engine's own identity
+        // Use distinct leaders for the two rounds.
+        let observer = agb::proposer(&committee, 2);
         let round2_leader = agb::proposer(&committee, 3);
         assert_ne!(
             observer, round2_leader,
@@ -2365,11 +1870,9 @@ mod tests {
 
         let mut engine = CutEngine::new(observer, committee.clone(), 1_000);
 
-        // Round 1's leader stays silent: nobody ever calls try_propose/process_cut_proposal
-        // for round 1 on this engine.
+        // The round-1 leader stays silent.
 
-        // Before round 1 certifies as timed out, a round-2 proposal citing the
-        // (still-genesis) parent is not yet `safe_cut_parent` -- it gets buffered.
+        // Buffer round 2 until round 1 is certified as timed out.
         let pending_child = CutProposal {
             round: 2,
             proposer: round2_leader,
@@ -2386,14 +1889,13 @@ mod tests {
             "the round-2 proposal should be buffered pending round 1's resolution"
         );
 
-        // The round-1 timer fires.
         let mut effects = engine.process_cut_timer(1, &tips, &oracle);
         assert!(matches!(
             effects.as_slice(),
             [CutEffect::Broadcast(CutOut::Timeout(t))] if t.round == 1
         ));
 
-        // Bring in other committee members' timeouts until quorum_threshold.
+        // Reach the timeout threshold.
         let mut others = keys.iter().filter(|k| **k != observer);
         loop {
             if effects.iter().any(
@@ -2407,8 +1909,7 @@ mod tests {
         }
         assert!(!engine.certified_timed_out.contains(&1));
 
-        // Bring in other committee members' timeout-accepts. f+1 should amplify our own
-        // accept (already sent above, so a no-op) and quorum should certify.
+        // Reach the timeout-accept threshold.
         let mut others = keys.iter().filter(|k| **k != observer);
         let mut saw_cert = false;
         while !saw_cert {
@@ -2436,8 +1937,7 @@ mod tests {
         );
     }
 
-    /// Test 3: the f+1 gate. With `gate_tips: true` and one tip unavailable, no vote is
-    /// emitted; with `gate_tips: false`, a vote IS emitted for the same input.
+    /// The tip gate blocks voting when any proposal tip is unavailable.
     #[test]
     fn gate_tips_blocks_vote_when_tip_unavailable() {
         let (committee, keys) = committee_of(4);
@@ -2469,21 +1969,6 @@ mod tests {
         );
     }
 
-    /// Test 4: deviation-4's fix. A `pending_cut_children` bucket with one invalid and
-    /// one valid sibling still processes the valid one once the shared parent becomes
-    /// known.
-    ///
-    /// Note on construction: upstream's verify()/leader-authenticity checks both
-    /// precede the "is the parent known yet" buffering step, so an item that would
-    /// fail either check is rejected on first contact and never actually reaches
-    /// `pending_cut_children` organically -- anything that *is* buffered has, by
-    /// construction, already passed both checks once, and since neither depends on
-    /// anything that can change while this engine runs (the proposal's own fields, and
-    /// the fixed committee), it will pass them again when dequeued. This test isolates
-    /// the loop's own per-item-rejection behavior (what deviation 4 actually changes)
-    /// from that fact by seeding the pending bucket directly -- exactly as
-    /// `prune_below_is_exact` seeds other fields directly -- rather than relying on
-    /// two separate `process_cut_proposal` calls to organically buffer both siblings.
     #[test]
     fn queue_with_invalid_sibling_still_processes_valid_one() {
         let (committee, keys) = committee_of(4);
@@ -2506,7 +1991,7 @@ mod tests {
 
         let invalid_child = CutProposal {
             round: 2,
-            proposer: not_round2_leader, // wrong leader for round 2 -- rejected at dequeue
+            proposer: not_round2_leader,
             parent_cut: parent_id.clone(),
             tips: tips.clone(),
         };
@@ -2522,10 +2007,7 @@ mod tests {
             .pending_cut_children
             .insert((2, parent_id.clone()), vec![invalid_child, valid_child]);
 
-        // The parent arrives: both seeded children move into the internal queue,
-        // invalid one first (insertion order). Without the deviation-4 fix, rejecting
-        // the invalid one would abort the whole call and the valid sibling -- already
-        // removed from `pending_cut_children` at that point -- would be lost.
+        // Process both children after their parent arrives.
         let effects = engine.process_cut_proposal(parent, &tips, &oracle);
 
         assert!(
@@ -2537,8 +2019,6 @@ mod tests {
         assert_eq!(vote.cut_id, valid_child_id);
     }
 
-    /// Test 5: `prune_below` removes exactly the entries strictly below the floor and
-    /// nothing at or above it, across every round-prunable field.
     #[test]
     fn prune_below_is_exact() {
         let (committee, _keys) = committee_of(4);
@@ -2666,7 +2146,7 @@ mod tests {
             assert!(set.contains(&2));
         }
 
-        // gc_floor moved with it -- sanitize_timeout_accept now rejects round 1.
+        // The new floor rejects round 1.
         assert!(engine
             .sanitize_timeout_accept(&TimeoutAccept {
                 round: 1,
@@ -2680,15 +2160,11 @@ mod tests {
             })
             .is_ok());
 
-        // Idempotent / monotonic: pruning to an earlier-or-equal floor is a no-op.
+        // Pruning to an earlier floor has no effect.
         engine.prune_below(1);
         assert!(engine.safe.contains_key(&2));
     }
 
-    /// Bracha variant: `prune_below` covers the two new round-prunable
-    /// fields (`cut_ready_aggregators`, `sent_cut_ready`) exactly like
-    /// `prune_below_is_exact` above covers every pre-existing one -- a separate test
-    /// (rather than an addition to that one) so no pre-existing test is modified.
     #[test]
     fn prune_below_covers_bracha_ready_state() {
         let (committee, _keys) = committee_of(4);
@@ -2712,7 +2188,6 @@ mod tests {
         assert!(!engine.sent_cut_ready.contains(&1));
         assert!(engine.sent_cut_ready.contains(&2));
 
-        // Idempotent / monotonic, mirroring `prune_below_is_exact`'s identical check.
         engine.prune_below(1);
         assert!(engine.sent_cut_ready.contains(&2));
     }

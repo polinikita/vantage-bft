@@ -62,7 +62,7 @@ Monitoring remains active by default so the completed run can be inspected. See
 ## Regression Check
 
 The fault-free regression guard checks throughput, latency, misses, and cursor
-progress against fixed thresholds:
+progress with 10 validators at 1,000 tx/s for 60 seconds:
 
 ```bash
 ./local-dryrun/regress.sh

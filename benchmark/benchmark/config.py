@@ -21,10 +21,10 @@ class Key:
 
 
 class Committee:
-    '''Store committee addresses and public SSH host mappings.'''
+    '''Store committee wire addresses and public SSH hosts.'''
 
     def __init__(self, addresses, base_port, public_hosts=None):
-        '''Build a committee from private wire addresses and optional public hosts.'''
+        '''Build a committee from wire addresses and optional public hosts.'''
         assert isinstance(addresses, OrderedDict)
         assert all(isinstance(x, str) for x in addresses.keys())
         assert all(
@@ -48,17 +48,8 @@ class Committee:
         self.public_hosts = public_hosts
 
         for name, hosts in addresses.items():
-            # `metrics` is never dialed by a peer node -- only scraped by an
-            # external observer (this orchestrator's own `scrape_metrics()`,
-            # or a real Prometheus pointed at `fab monitor`'s generated
-            # prometheus-remote.yaml, which is explicitly built from public
-            # IPs -- see fabfile.py's `monitor` task). The node itself always
-            # binds its metrics server on 0.0.0.0 regardless of the address
-            # text here (see primary::Primary::spawn), so this field is free
-            # to be the PUBLIC ip while every peer-dialed field below (
-            # consensus/primary/worker addresses) is the PRIVATE one. Use a
-            # local, poppable copy so `self.public_hosts` (consumed by the
-            # public_ip accessors below) is left intact.
+            # Use public hosts for metrics and private hosts for peers.
+            # Copy the public list before consuming it.
             pub_hosts = list(public_hosts[name]) if public_hosts is not None else None
 
             host = hosts.pop(0)
@@ -94,7 +85,6 @@ class Committee:
             }
 
     def primary_addresses(self, faults=0):
-        ''' Returns an ordered list of primaries' addresses. '''
         assert faults < self.size()
         addresses = []
         good_nodes = self.size() - faults
@@ -103,7 +93,6 @@ class Committee:
         return addresses
 
     def workers_addresses(self, faults=0):
-        ''' Returns an ordered list of list of workers' addresses. '''
         assert faults < self.size()
         addresses = []
         good_nodes = self.size() - faults
@@ -115,7 +104,6 @@ class Committee:
         return addresses
 
     def primary_metrics_addresses(self, faults=0):
-        ''' Returns an ordered list of primaries' Prometheus metrics addresses. '''
         assert faults < self.size()
         addresses = []
         good_nodes = self.size() - faults
@@ -124,8 +112,6 @@ class Committee:
         return addresses
 
     def workers_metrics_addresses(self, faults=0):
-        ''' Returns an ordered list of list of (id, metrics address) per authority's
-        workers. '''
         assert faults < self.size()
         addresses = []
         good_nodes = self.size() - faults
@@ -137,11 +123,7 @@ class Committee:
         return addresses
 
     def primary_public_ip(self, name):
-        ''' The physical (public) host running authority `name`'s primary --
-        the SSH/rsync/tmux connection target, as opposed to the (private)
-        wire address `primary_addresses()` returns. Falls back to the
-        private address when this committee has no public/private
-        distinction (`public_hosts` unset at construction). '''
+        '''Return the primary's public host, or its wire host without a mapping.'''
         if self.public_hosts is None:
             return self.ip(
                 self.json['authorities'][name]['primary']['primary_to_primary']
@@ -149,8 +131,7 @@ class Committee:
         return self.public_hosts[name][0]
 
     def worker_public_ip(self, name, worker_id):
-        ''' The physical (public) host running authority `name`'s worker
-        `worker_id`. See `primary_public_ip`. '''
+        '''Return a worker's public host, or its wire host without a mapping.'''
         if self.public_hosts is None:
             return self.ip(
                 self.json['authorities'][name]['workers'][worker_id]['transactions']
@@ -158,17 +139,12 @@ class Committee:
         return self.public_hosts[name][worker_id + 1]
 
     def primary_public_ips(self, faults=0):
-        ''' Public-host mirror of `primary_addresses()`: same order/slicing,
-        one entry per (non-faulty) authority. '''
         assert faults < self.size()
         good_nodes = self.size() - faults
         names = list(self.json['authorities'].keys())[:good_nodes]
         return [self.primary_public_ip(name) for name in names]
 
     def workers_public_ips(self, faults=0):
-        ''' Public-host mirror of `workers_addresses()`: same order/shape,
-        i.e. a list (per non-faulty authority) of list of
-        (worker_id, public_ip). '''
         assert faults < self.size()
         good_nodes = self.size() - faults
         result = []
@@ -180,19 +156,11 @@ class Committee:
         return result
 
     def public_ips(self, name=None):
-        ''' Returns all the physical (public) host ip(s) associated with an
-        authority (in any order) -- the SSH/rsync/tmux connection targets,
-        as opposed to `ips()` which returns the (private) committee/wire
-        addresses. Falls back to `ips()` when this committee has no
-        public/private distinction (`public_hosts` unset at construction). '''
+        '''Return public hosts for live authorities, or wire hosts without a mapping.'''
         if self.public_hosts is None:
             return self.ips(name)
 
-        # Scope to the LIVE authorities (self.json), not all of
-        # self.public_hosts -- remove_nodes() trims the former (e.g. per
-        # `committee_copy` in remote.py's `run()`, one per swept node count)
-        # but leaves the latter untouched, so using public_hosts' own keys
-        # here would resurrect already-removed authorities' hosts.
+        # Use live authorities; public_hosts also contains removed authorities.
         names = [name] if name is not None else list(self.json['authorities'].keys())
         ips = set()
         for n in names:
@@ -200,7 +168,6 @@ class Committee:
         return list(ips)
 
     def ips(self, name=None):
-        ''' Returns all the ips associated with an authority (in any order). '''
         if name is None:
             names = list(self.json['authorities'].keys())
         else:
@@ -225,17 +192,14 @@ class Committee:
         return list(ips)
 
     def remove_nodes(self, nodes):
-        ''' remove the `nodes` last nodes from the committee. '''
         assert nodes < self.size()
         for _ in range(nodes):
             self.json['authorities'].popitem()
 
     def size(self):
-        ''' Returns the number of authorities. '''
         return len(self.json['authorities'])
 
     def workers(self):
-        ''' Returns the total number of workers (all authorities altogether). '''
         return sum(len(x['workers']) for x in self.json['authorities'].values())
 
     def print(self, filename):
@@ -252,10 +216,7 @@ class Committee:
 def generate_collector_scrape_config(
     committee_json, faults=0, scrape_interval='1s', job_name='vantage-collector'
 ):
-    '''Build Prometheus scrape configuration from a committee dictionary.
-
-    Targets use private addresses and retain the metrics ports from the
-    committee. Labels identify both the process and the host.'''
+    '''Build Prometheus scrape configuration from committee wire addresses.'''
     assert faults >= 0
     authorities = committee_json['authorities']
     names = list(authorities.keys())
@@ -306,7 +267,7 @@ class NodeParameters:
         if not all(isinstance(x, int) for x in inputs):
             raise ConfigError('Invalid parameters type')
 
-        # Validate optional protocol and latency settings before deployment.
+        # Validate optional protocol and latency settings.
         if 'protocol' in json and json['protocol'] not in (
             'autobahn-optimistic', 'autobahn-seamless', 'vantage'
         ):
@@ -348,7 +309,6 @@ class BenchParameters:
             rate = rate if isinstance(rate, list) else [rate]
             if not rate:
                 raise ConfigError('Missing input rate')
-            # Run rate sweeps in ascending order.
             self.rate = sorted(int(x) for x in rate)
 
             self.workers = int(json['workers'])
@@ -360,9 +320,9 @@ class BenchParameters:
 
             self.tx_size = int(json['tx_size'])
 
-            # Omit `tx_mode` to use the all-zero payload default.
+            # Omit `tx_mode` for the all-zero payload default.
             self.tx_mode = str(json['tx_mode']) if 'tx_mode' in json else 'all_zero'
-            # Accept the hyphenated spelling as an alias and normalize it once.
+            # Normalize hyphens to underscores.
             self.tx_mode = self.tx_mode.replace('-', '_')
             if self.tx_mode not in ('all_zero', 'random'):
                 raise ConfigError(
@@ -378,7 +338,7 @@ class BenchParameters:
             self.partition_start = int(json['partition_start'])
             self.partition_duration = int(json['partition_duration'])
 
-            # Stop a sweep when committed TPS falls below the running peak.
+            # Stop when committed TPS falls below the running peak.
             self.early_stop_margin = (
                 float(json['early_stop_margin'])
                 if 'early_stop_margin' in json else 0.10
@@ -386,7 +346,7 @@ class BenchParameters:
             if self.early_stop_margin < 0:
                 raise ConfigError('early_stop_margin must be non-negative')
 
-            # Allow a release SHA mismatch only when explicitly requested.
+            # Permit a release SHA mismatch only when explicitly requested.
             self.allow_stale_binary = (
                 bool(json['allow_stale_binary'])
                 if 'allow_stale_binary' in json else False

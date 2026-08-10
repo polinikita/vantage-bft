@@ -11,42 +11,29 @@ use tokio::sync::mpsc::{Receiver, Sender};
 #[path = "tests/processor_tests.rs"]
 pub mod processor_tests;
 
-/// Indicates a serialized `WorkerMessage::Batch` message.
-/// `Bytes` rather than `Vec<u8>` -- both `BatchMaker::seal` (our own
-/// batches) and `WorkerReceiverHandler::dispatch` (others' batches) already hold the
-/// wire bytes as a `Bytes` and can hand it here without copying. `Store::write` still
-/// needs an owned `Vec<u8>` for storage.
+/// Serialized `WorkerMessage::Batch` bytes.
 pub type SerializedBatchMessage = Bytes;
 
-/// Hashes and stores batches, it then outputs the batch's digest.
+/// Hashes and stores batches, then sends their digests to the primary.
 pub struct Processor;
 
 impl Processor {
     pub fn spawn(
-        // Our worker's id.
         id: WorkerId,
-        // The persistent storage.
         mut store: Store,
-        // Input channel to receive batches.
         mut rx_batch: Receiver<SerializedBatchMessage>,
-        // Output channel to send out batches' digests.
-        tx_digest: Sender<SerializedBatchDigestMessage>, //sender channel connects to PrimaryConnector
-        // Whether we are processing our own batches or the batches of other nodes.
+        tx_digest: Sender<SerializedBatchDigestMessage>,
+        // Distinguish local batches from peer batches in the primary message.
         own_digest: bool,
     ) {
         tokio::spawn(async move {
             while let Some(batch) = rx_batch.recv().await {
-                // Hash the batch.
                 let mut hasher = Blake3Hasher::new();
                 hasher.update(&batch);
                 let digest = Digest(hasher.finalize().into());
 
-                // Store the batch. `Store::write` needs an owned `Vec<u8>` -- this is
-                // the one owned copy `batch: Bytes` truly can't avoid (see
-                // `SerializedBatchMessage`'s doc comment above).
                 store.write(digest.to_vec(), batch.to_vec()).await;
 
-                // Deliver the batch's digest.
                 let message = match own_digest {
                     true => WorkerPrimaryMessage::OurBatch(digest, id),
                     false => WorkerPrimaryMessage::OthersBatch(digest, id),

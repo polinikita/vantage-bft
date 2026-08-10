@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs and scores the late-joiner recovery regression.
+# Run and score the late-joiner recovery regression.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

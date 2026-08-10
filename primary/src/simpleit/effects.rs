@@ -1,13 +1,11 @@
-// Effects returned by `CutEngine`. The caller performs network, timer, and
-// committer actions.
+// Effects returned by `CutEngine` for the caller to execute.
 use crate::simpleit::messages::{
     Cut, CutProposal, CutReady, CutRound, CutVote, Decide, Timeout, TimeoutAccept,
 };
 use crypto::{Digest, PublicKey};
 use std::time::Instant;
 
-/// Wire messages emitted by the state machine. `TimeoutCert` and safe state are local;
-/// only individually verified votes and ready messages can advance them.
+/// Wire messages emitted by the state machine.
 #[derive(Clone, Debug)]
 pub enum CutOut {
     CutProposal(CutProposal),

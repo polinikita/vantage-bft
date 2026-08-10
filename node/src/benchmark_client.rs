@@ -53,7 +53,6 @@ async fn main() -> Result<()> {
                 .value_name("MODE")
                 .required(false)
                 .default_value("random")
-                // Accept both spellings for compatibility.
                 .value_parser(["all_zero", "all-zero", "random"])
                 .action(ArgAction::Set)
                 .help(
@@ -108,10 +107,8 @@ async fn main() -> Result<()> {
 
     info!("Node address: {}", target);
 
-    // NOTE: This log entry is used to compute performance.
     info!("Transactions size: {} B", size);
 
-    // NOTE: This log entry is used to compute performance.
     info!("Transactions rate: {} tx/s", rate);
 
     info!("Transaction mode: {:?}", mode);
@@ -135,9 +132,7 @@ async fn main() -> Result<()> {
         activate_at_ms,
     };
 
-    // Wait for all nodes to be online and synchronized.
     client.wait().await;
 
-    // Start the benchmark.
     client.send().await.context("Failed to submit transactions")
 }

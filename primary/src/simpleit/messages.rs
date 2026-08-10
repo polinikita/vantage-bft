@@ -1,7 +1,4 @@
 // Simple-IT cut-consensus wire types.
-//
-// The protocol counts individually verified votes and commits. No certificate
-// message is defined. `CutReady` is used only by the Bracha variant.
 use crate::error::{DagError, DagResult};
 use crate::messages::Proposal;
 use config::Committee;
@@ -25,7 +22,6 @@ impl Timeout {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
@@ -67,7 +63,6 @@ impl TimeoutAccept {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
@@ -106,7 +101,6 @@ pub struct Decide {
 }
 
 impl Decide {
-    /// Creates a commit message.
     pub async fn new(header_id: Digest, round: CutRound, author: &PublicKey) -> Self {
         Self {
             id: header_id,
@@ -116,7 +110,6 @@ impl Decide {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
@@ -138,9 +131,7 @@ impl fmt::Debug for Decide {
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct TimeoutCert {
     pub round: CutRound,
-    /// The authors of the timeouts certified here (unsigned protocol: reaching
-    /// `quorum_threshold` distinct, committee-recognized authors *is* the
-    /// certificate -- cf. `Ack`/`CutVote` elsewhere in this crate).
+    /// Distinct committee authors in the timeout certificate.
     pub timeouts: Vec<PublicKey>,
 }
 
@@ -152,9 +143,7 @@ impl TimeoutCert {
         }
     }
 
-    /// Adds a timeout to the certificate.
     pub fn add_timeout(&mut self, author: PublicKey) -> DagResult<()> {
-        // Ensure this public key hasn't already submitted a timeout for this round.
         if self.timeouts.contains(&author) {
             return Err(DagError::AuthorityReuse(author));
         }
@@ -162,8 +151,7 @@ impl TimeoutCert {
         Ok(())
     }
 
-    /// Verifies the timeout certificate against the committee. Requires
-    /// `quorum_threshold` (2f+1 at n=3f+1) distinct, committee-recognized authors.
+    /// Requires a quorum of distinct committee authors.
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
         let mut weight = 0;
 
@@ -176,7 +164,6 @@ impl TimeoutCert {
             weight += voting_rights;
         }
 
-        // Check if the accumulated weight meets the quorum threshold.
         ensure!(
             weight >= committee.quorum_threshold(),
             DagError::CertificateRequiresQuorum
@@ -203,7 +190,6 @@ impl CutProposal {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the proposer has voting rights.
         ensure!(
             committee.stake(&self.proposer) > 0,
             DagError::UnknownAuthority(self.proposer)
@@ -249,7 +235,6 @@ pub struct CutVote {
 
 impl CutVote {
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
@@ -278,7 +263,6 @@ pub struct CutReady {
 
 impl CutReady {
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)

@@ -1,8 +1,8 @@
-use crate::Height;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
-use crate::messages::{Certificate, ConsensusMessage, Header, Proposal};
+use crate::messages::{ConsensusMessage, Header, Proposal};
+use crate::Height;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -11,8 +11,7 @@ use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::Sender;
 
-/// The `Synchronizer` checks if we have all batches and parents referenced by a header. If we don't, it sends
-/// a command to the `Waiter` to request the missing data.
+/// Checks header dependencies and requests missing data.
 #[derive(Clone)]
 pub struct Synchronizer {
     /// The public key of this primary.
@@ -21,18 +20,7 @@ pub struct Synchronizer {
     store: Store,
     /// Send commands to the `HeaderWaiter`.
     tx_header_waiter: Sender<WaiterMessage>,
-    /// Send commands to the `CertificateWaiter`. Currently never sent on (no call site
-    /// in this file constructs a message for it) -- kept as a stored, live channel
-    /// handle rather than deleted: dropping it here would drop the sole `Sender` this
-    /// constructor is handed at the one call site (`primary.rs`), closing
-    /// `CertificateWaiter`'s receiver early. Since the channel is genuinely never fed
-    /// either way, this is a no-op-preserving choice, not a functional change; removing
-    /// the field cleanly would mean also removing the parameter and its call site
-    /// plumbing, which is outside this module (touches cross-file wiring for a
-    /// field with no correctness weight either way).
-    #[allow(dead_code)]
-    tx_certificate_waiter: Sender<Certificate>,
-    /// Genesis header
+    /// Genesis headers by authority.
     genesis_headers: HashMap<PublicKey, Header>,
 }
 
@@ -42,20 +30,16 @@ impl Synchronizer {
         committee: &Committee,
         store: Store,
         tx_header_waiter: Sender<WaiterMessage>,
-        tx_certificate_waiter: Sender<Certificate>,
     ) -> Self {
         Self {
             name,
             store,
             tx_header_waiter,
-            tx_certificate_waiter,
             genesis_headers: Header::genesis_headers(committee),
         }
     }
 
-    /// Returns `true` if we have all transactions of the payload. If we don't, we return false,
-    /// synchronize with other nodes (through our workers), and re-schedule processing of the
-    /// header for when we will have its complete payload.
+    /// Returns whether payload synchronization was scheduled.
     pub async fn missing_payload(&mut self, header: &Header, force_sync: bool) -> DagResult<bool> {
         // We don't store the payload of our own workers.
         if header.author == self.name {
@@ -64,17 +48,7 @@ impl Synchronizer {
 
         let mut missing = HashMap::new();
         for (digest, worker_id) in header.payload.iter() {
-            // Check whether we have the batch. If one of our worker has the batch, the primary stores the pair
-            // (digest, worker_id) in its own storage. It is important to verify that we received the batch
-            // from the correct worker id to prevent the following attack:
-            //      1. A Bad node sends a batch X to 2f good nodes through their worker #0.
-            //      2. The bad node proposes a malformed block containing the batch X and claiming it comes
-            //         from worker #1.
-            //      3. The 2f good nodes do not need to sync and thus don't notice that the header is malformed.
-            //         The bad node together with the 2f good nodes thus certify a block containing the batch X.
-            //      4. The last good node will never be able to sync as it will keep sending its sync requests
-            //         to workers #1 (rather than workers #0). Also, clients will never be able to retrieve batch
-            //         X as they will be querying worker #1.
+            // Bind each digest to its declared worker.
             let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
             if self.store.read(key).await?.is_none() {
                 debug!(
@@ -108,9 +82,7 @@ impl Synchronizer {
         Ok(())
     }
 
-    /// Returns the proposals of a consensus message if we have them all. If at least one parent is missing,
-    /// we return an empty vector, synchronize with other nodes, and re-schedule processing
-    /// of the header for when we will have all the parents.
+    /// Returns all referenced proposals, or schedules synchronization if any are missing.
     pub async fn get_proposals(
         &mut self,
         consensus_message: &ConsensusMessage,
@@ -128,7 +100,6 @@ impl Synchronizer {
                 proposals,
             } => {
                 for (pk, proposal) in proposals {
-
                     if proposal.header_digest == self.genesis_headers.get(pk).unwrap().digest() {
                         proposals_vector.push(self.genesis_headers.get(pk).unwrap().clone());
                         continue;
@@ -210,11 +181,9 @@ impl Synchronizer {
         proposal: Proposal,
         stop_height: Height,
     ) -> DagResult<Vec<Header>> {
-        // The list of blocks for this proposal
+        // Collect ancestors down to the committed height.
         let mut ancestors: Vec<Header> = Vec::new();
 
-        // NOTE: Before calling, must check if proposal is ready, assumes that proposal is ready
-        // before calling
         debug!("proposal height is {:?}", proposal.height);
         let mut header: Header = self
             .get_header(proposal.header_digest)
@@ -222,7 +191,6 @@ impl Synchronizer {
             .expect("already synced should have header")
             .unwrap();
 
-        // Otherwise we have the header and all of its ancestors
         let mut current_height = proposal.height;
         while current_height > stop_height {
             debug!(

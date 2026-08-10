@@ -1,45 +1,15 @@
 #!/usr/bin/env bash
-# chaos.sh -- rolling single-validator outages against a running local cluster.
+# Run rolling single-validator outages against a running local cluster.
+# One node is down at a time; the final settle window is measured.
+# Modes: stop, pause, or cut traffic in both directions.
 #
-# Takes ONE validator down at a time for `--outage` seconds, brings it back, waits
-# `--gap`, repeats `--cycles` times, then leaves the whole committee up for a final
-# `--settle` window. The settle window is the measurement: a protocol that is merely
-# degraded catches up inside it, one that is broken does not.
-#
-# Never more than one node down at once, so the committee stays inside its own
-# fault budget (f = floor((n-1)/3) >= 1 for n >= 4) throughout -- any loss of
-# liveness is then a protocol/implementation property, not an over-provisioned
-# adversary.
-#
-# THREE MEANINGS OF "DOWN", because they exercise completely different code:
-#
-#   stop  -- `docker stop -t 0` + `docker start`. SIGKILL, so the process dies with
-#            no graceful shutdown, and comes back re-reading its persisted store
-#            from ./data/node-N. This is true CRASH RECOVERY: new PID, new TCP
-#            sockets, cold in-memory state, and `entrypoint.sh` re-applies this
-#            node's netem on the way up. `-t 0` matters: plain `docker stop` waits
-#            up to 10s for SIGTERM to be honoured, which would silently swallow a
-#            10s outage window.
-#
-#            A restarted node must rejoin through state sync. Use `pause` to test a
-#            temporary stall without removing the node from the committee.
-#   pause -- `docker pause`/`unpause` (cgroup freezer). The process keeps its
-#            memory AND its established TCP connections; peers see a peer that has
-#            simply stopped reading. Models a long GC/scheduler stall, and isolates
-#            "can the protocol absorb a stalled peer" from "can a node rejoin".
-#   cut   -- delegates to blip.sh's `cut` mode: iptables REJECT with tcp-reset in
-#            both directions. The process stays alive and keeps making progress on
-#            its own; only the links die. Isolates reconnect from restart.
-#
-# Usage (against an ALREADY-RUNNING cluster -- start `run.sh` in another shell, or
-# use its --duration to outlive this script):
+# Usage against an already-running cluster:
 #
 #   docker-bench/chaos.sh                                  # 6 x 10s pause, 20s gaps
 #   docker-bench/chaos.sh --mode pause --outage 10
 #   docker-bench/chaos.sh --cycles 10 --outage 5 --gap 30 --seed 7
 #
-# Writes a timeline to data/chaos-timeline.json with epoch-millisecond stamps so
-# every outage can be lined up against Prometheus after the fact.
+# Writes epoch-millisecond outage events to data/chaos-timeline.json.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,10 +18,7 @@ TIMELINE="$SCRIPT_DIR/data/chaos-timeline.json"
 
 MODE=pause
 OUTAGE=10
-# At least 20s between outages. A gap shorter than recovery lets the next victim go
-# down while the committee is still re-converging from the last one, so a failure at
-# cycle N is really a failure of N stacked partial recoveries and cannot be read as
-# "one node paused once". 20s is the floor, not a tuning knob.
+# Keep 20 seconds between outages for independent recovery measurements.
 GAP=20
 CYCLES=6
 SETTLE=30
@@ -89,8 +56,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$MODE" in stop|pause|cut) ;; *) echo "chaos.sh: bad --mode '$MODE'" >&2; usage ;; esac
-# Flag name spelled out rather than derived with ${v,,}: that is a bash-4 expansion,
-# and blip.sh already documents that macOS ships bash 3.2 as /bin/bash.
+# Keep Bash 3.2 compatibility.
 for pair in "outage:OUTAGE" "gap:GAP" "cycles:CYCLES" "settle:SETTLE"; do
     flag="${pair%%:*}"; v="${pair##*:}"
     case "${!v}" in ''|*[!0-9]*)
@@ -99,21 +65,18 @@ for pair in "outage:OUTAGE" "gap:GAP" "cycles:CYCLES" "settle:SETTLE"; do
 done
 [ "$CYCLES" -ge 1 ] || { echo "chaos.sh: --cycles must be >= 1" >&2; exit 2; }
 [ "$OUTAGE" -ge 1 ] || { echo "chaos.sh: --outage must be >= 1" >&2; exit 2; }
-# Enforced, not advisory: below this the run measures stacked partial recoveries
-# rather than the response to a single outage, and nothing about the result would
-# say so. See GAP's own comment.
+# Require a recovery gap between outages.
 [ "$CYCLES" -eq 1 ] || [ "$GAP" -ge 20 ] || {
     echo "chaos.sh: --gap must be >= 20 so the committee re-converges between" \
          "outages (got $GAP)" >&2; exit 2; }
 [ -f "$MANIFEST" ] || { echo "chaos.sh: $MANIFEST not found -- run gen.py/run.sh first" >&2; exit 1; }
 
 NODES="$(python3 -c "import json;print(json.load(open('$MANIFEST'))['nodes'])")"
-# f = floor((n-1)/3). One victim at a time needs f >= 1, i.e. n >= 4. Below that a
-# single outage is already a quorum loss and the run would measure nothing.
+# Require at least four nodes for a one-node outage.
 [ "$NODES" -ge 4 ] || { echo "chaos.sh: need n >= 4 to hold one node down (n=$NODES)" >&2; exit 1; }
 FAULT_BUDGET=$(( (NODES - 1) / 3 ))
 
-# Candidate victims: every index, minus --exclude.
+# Exclude nodes listed by --exclude from victim selection.
 CANDIDATES=()
 for ((i = 0; i < NODES; i++)); do
     skip=0
@@ -132,9 +95,7 @@ running() {
     [ "$(docker inspect -f '{{.State.Running}}' "$(container "$1")" 2>/dev/null)" = "true" ]
 }
 
-# Whatever is down when we die -- Ctrl-C, TERM, or a failed docker command under
-# `set -e` -- must come back up. A chaos harness that strands a stopped validator
-# turns every later measurement on this cluster into a silent lie.
+# Restore the current node on exit.
 DOWN_NODE=""
 DOWN_MODE=""
 restore_current() {
@@ -168,9 +129,7 @@ bring_up() {
         cut)   wait "$BLIP_PID" 2>/dev/null || true; BLIP_PID="" ;;  # blip.sh self-restores
     esac
     DOWN_NODE=""
-    # Assert the node is actually back before the next cycle. Without this a failed
-    # restart is invisible until the end, and every later cycle silently runs with a
-    # permanently missing validator -- i.e. against a shrinking committee.
+    # Confirm that the node is running.
     for _ in $(seq 1 30); do
         running "$n" && return 0
         sleep 1
@@ -183,8 +142,7 @@ echo "chaos.sh: n=$NODES f=$FAULT_BUDGET mode=$MODE outage=${OUTAGE}s gap=${GAP}
      "cycles=$CYCLES settle=${SETTLE}s seed=${SEED:-<unseeded>}"
 echo "chaos.sh: victims drawn from ${#CANDIDATES[@]} candidate(s); one down at a time"
 
-# Refuse to start against a cluster that is already degraded -- otherwise cycle 1
-# takes the committee to two nodes down and the run measures the wrong thing.
+# Require all candidate nodes to be running.
 for i in "${CANDIDATES[@]}"; do
     running "$i" || { echo "chaos.sh: node $i is not running; start the cluster first" >&2; exit 1; }
 done
@@ -211,7 +169,7 @@ echo "chaos.sh: all $NODES up; settling for ${SETTLE}s -- this window is the mea
 sleep "$SETTLE"
 END_MS="$(now_ms)"
 
-# Report nodes that are not running at the end.
+# Check for nodes that remain down.
 DEAD=()
 for ((i = 0; i < NODES; i++)); do running "$i" || DEAD+=("$i"); done
 

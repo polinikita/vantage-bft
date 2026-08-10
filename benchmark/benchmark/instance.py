@@ -19,22 +19,15 @@ class AWSError(Exception):
 
 class InstanceManager:
     INSTANCE_NAME = 'dag-node'
-    # Keep the metrics collector separate from validator instances.
+    # Keep the metrics collector separate from validators.
     COLLECTOR_NAME = 'metrics-collector'
     SECURITY_GROUP_NAME = 'dag'
-    # Prometheus HTTP API port on the metrics-collector instance -- scraped targets
-    # dial validators (see config.py's committee 'metrics' addresses); this is the
-    # port the *collector itself* listens on, queried by the coordinator laptop
-    # after a run (remote.py's fetch_collector_metrics).
+    # Prometheus API port.
     MONITOR_PORT = 9090
-    # Grafana UI port on the metrics-collector instance (remote.py's
-    # `deploy_monitoring`), provisioned against the same collector-local
-    # Prometheus above -- same collector-only convention as MONITOR_PORT
-    # (validators get the ingress rule too, but nothing ever listens on
-    # their :3000).
+    # Grafana UI port.
     GRAFANA_PORT = 3000
 
-    # Static fallback prices used when Spot pricing is unavailable.
+    # Fallback prices when Spot pricing is unavailable.
     ON_DEMAND_FALLBACK_PRICE = {
         'c5.xlarge': 0.192,  # eu-west-1
         'c5d.xlarge': 0.216,  # eu-west-1
@@ -56,25 +49,8 @@ class InstanceManager:
             raise BenchError('Failed to load settings', e)
 
     def _get(self, state, name=None):
-        # Possible states are: 'pending', 'running', 'shutting-down',
-        # 'terminated', 'stopping', and 'stopped'.
-        #
-        # `name`: a single tag:Name value to filter on (INSTANCE_NAME or
-        # COLLECTOR_NAME). None (the default) matches BOTH -- every instance
-        # this harness owns, validator or collector alike -- which is what
-        # terminate_instances/_wait (teardown, boot-wait) want: the collector
-        # must be included in both. hosts()/internal_hosts() pass
-        # name=INSTANCE_NAME explicitly so the committee/host-selection logic
-        # never sees the collector; collector_host() passes name=COLLECTOR_NAME.
-        #
-        # Collects PUBLIC and PRIVATE IPs side by side (single
-        # describe_instances call per region) so the two stay index-aligned
-        # per instance. `None` is recorded (not dropped) when an instance
-        # transiently lacks one of the two (e.g. still 'pending' and not yet
-        # assigned an address) -- dropping it here would desync `ids`/
-        # `public_ips`/`private_ips` against each other; callers that need a
-        # complete pair (the committee vs. SSH-connection host lists) filter
-        # `None`s out themselves, see `_paired_hosts`.
+        # With no name, include validators and the metrics collector.
+        # Keep public and private IP lists aligned.
         ids = defaultdict(list)
         public_ips, private_ips = defaultdict(list), defaultdict(list)
         tag_values = [name] if name is not None else [self.INSTANCE_NAME, self.COLLECTOR_NAME]
@@ -99,12 +75,7 @@ class InstanceManager:
         return ids, public_ips, private_ips
 
     def _paired_hosts(self, state, name=None):
-        ''' Per-region list of (public_ip, private_ip) pairs for instances in
-        `state` (optionally restricted to tag:Name == `name`, see `_get`),
-        built from a single `_get()` snapshot so the two addresses stay tied
-        to the same physical instance. Any instance missing either address is
-        dropped (with a warning) rather than left to silently shift the
-        pairing of every instance after it -- see `_get`. '''
+        '''Return per-region public/private pairs; skip incomplete instances.'''
         _, public_ips, private_ips = self._get(state, name)
         pairs = defaultdict(list)
         for region in public_ips:
@@ -119,8 +90,6 @@ class InstanceManager:
         return pairs
 
     def _wait(self, state, name=None):
-        # Possible states are: 'pending', 'running', 'shutting-down',
-        # 'terminated', 'stopping', and 'stopped'.
         while True:
             sleep(1)
             ids, _, _ = self._get(state, name)
@@ -166,7 +135,7 @@ class InstanceManager:
                 }],
             },
             {
-                # Prometheus API access for the metrics collector.
+                # Prometheus API access.
                 'IpProtocol': 'tcp',
                 'FromPort': self.MONITOR_PORT,
                 'ToPort': self.MONITOR_PORT,
@@ -180,10 +149,7 @@ class InstanceManager:
                 }],
             },
             {
-                # Same rationale/posture as the MONITOR_PORT rule directly
-                # above: the metrics-collector's Grafana UI (remote.py's
-                # `deploy_monitoring`), browsed directly by the coordinator
-                # from a laptop, not just queried programmatically.
+                # Grafana UI access.
                 'IpProtocol': 'tcp',
                 'FromPort': self.GRAFANA_PORT,
                 'ToPort': self.GRAFANA_PORT,
@@ -208,31 +174,17 @@ class InstanceManager:
                     raise
 
     def _resolve_az_subnet(self, client, region):
-        '''Return a region's availability zone, subnet, and VPC.
-
-        Use the configured zone when valid; otherwise choose the first ordinary
-        available zone by name. The result keeps validators and the collector
-        in one zone.'''
+        '''Resolve an AZ, default subnet, and VPC; keep instances in one zone.'''
         configured_az = getattr(self.settings, 'availability_zone', None)
         az = None
         mapping_form = isinstance(configured_az, dict)
         if mapping_form:
-            # Per-region mapping form: a region with no entry falls through
-            # to auto-pick below -- not an error.
+            # Omitted regions use automatic selection.
             az = configured_az.get(region)
         elif configured_az:
             az = configured_az
 
-        # Region-scope check, applied to BOTH forms: an AZ name is
-        # region-scoped ("eu-west-1a" does not exist in us-east-1), so a
-        # configured value that does not name an AZ in THIS region is a
-        # configuration error. Checking the mapping form too matters because a
-        # typo'd entry ({"eu-west-1": "us-east-1a"}) would otherwise fail
-        # exactly as confusingly as the un-validated string form did -- late,
-        # at `describe_subnets`, with a "No default-for-az subnet found"
-        # message that names the wrong-region AZ without saying why it is
-        # wrong, and only after earlier regions' instances are already
-        # launched and accruing cost.
+        # The availability zone must belong to the selected region.
         if az is not None and not az.startswith(region):
             hint = (
                 f"entry for '{region}' in the instances.availability_zone "
@@ -255,11 +207,7 @@ class InstanceManager:
             r = client.describe_availability_zones(
                 Filters=[
                     {'Name': 'state', 'Values': ['available']},
-                    # Exclude Local Zones/Wavelength Zones: they have no
-                    # default-for-az subnet, so one of them sorting first
-                    # (possible once an account is opted into one, regardless
-                    # of alphabetical position among ordinary AZ names) would
-                    # fail the describe_subnets lookup below.
+                    # Exclude zones without a default subnet.
                     {'Name': 'zone-type', 'Values': ['availability-zone']},
                     {'Name': 'opt-in-status', 'Values': ['opt-in-not-required']},
                 ]
@@ -315,13 +263,11 @@ class InstanceManager:
             )
         return groups[0]['GroupId']
 
-    # Canonical's official AWS account id (stable across regions/time).
+    # Canonical Ubuntu owner account.
     CANONICAL_OWNER_ID = '099720109477'
 
     def _get_ami(self, client):
-            # Select the newest compatible Ubuntu amd64 HVM/EBS image.
-        # glob matches both `hvm-ssd/` (pre-24.04 path) and the newer
-        # `hvm-ssd-gp3/` Canonical publishes 24.04+ server images under.
+        # Select the newest matching Ubuntu amd64 HVM/EBS image.
         response = client.describe_images(
             Owners=[self.CANONICAL_OWNER_ID],
             Filters=[
@@ -349,11 +295,7 @@ class InstanceManager:
     def create_instances(self, instances):
         assert isinstance(instances, int) and instances > 0
 
-        # Create (or, if it already existed, re-authorize the ingress rules
-        # of) the security group in every region -- see
-        # `_create_security_group`'s docstring: it now swallows both
-        # 'InvalidGroup.Duplicate' and per-rule 'InvalidPermission.Duplicate'
-        # itself, so any ClientError reaching here is a genuine failure.
+        # Create or update the security group in every region.
         for client in self.clients.values():
             try:
                 self._create_security_group(client)
@@ -450,9 +392,7 @@ class InstanceManager:
                     'DeviceName': '/dev/sda1',
                     'Ebs': {
                         'VolumeType': 'gp2',
-                        # The collector only runs a single Prometheus container
-                        # (scrape data for one benchmark run, not a fleet of
-                        # them) -- far less storage than a validator's 200GB.
+                        # The collector stores one benchmark run.
                         'VolumeSize': 50,
                         'DeleteOnTermination': True
                     }
@@ -466,7 +406,7 @@ class InstanceManager:
             raise BenchError('Failed to create AWS instances', AWSError(e))
 
     def _spot_price(self, client, instance_type):
-        '''Return the latest Spot price, or `None` when unavailable.'''
+        '''Return the latest Spot price, or `None` if unavailable.'''
         try:
             r = client.describe_spot_price_history(
                 InstanceTypes=[instance_type],
@@ -510,10 +450,7 @@ class InstanceManager:
         return '\n'.join(lines)
 
     def estimate_cost(self, states=('pending', 'running')):
-        '''Estimate EC2 cost for instances in `states`.
-
-        The estimate excludes EBS, internet egress, and public IPv4 charges.
-        Call it before termination so launch times are available.'''
+        '''Estimate EC2 cost, excluding EBS, internet egress, and public IPv4 charges.'''
         now = datetime.now(timezone.utc)
         spot_price_cache = {}  # (region, instance_type) -> float or None
         # (region, instance_type, approximate) -> {'count', 'instance_hours', 'price'}
@@ -588,10 +525,7 @@ class InstanceManager:
         }
 
     def terminate_instances(self):
-        ''' Terminates every instance this harness owns -- validators AND the
-        dedicated metrics-collector alike. `_get`'s default `name=None` matches
-        both INSTANCE_NAME and COLLECTOR_NAME, so no separate collector-teardown
-        step is needed here. '''
+        '''Terminate all validator and metrics-collector instances owned by this harness.'''
         try:
             ids, _, _ = self._get(['pending', 'running', 'stopping', 'stopped'])
             size = sum(len(x) for x in ids.values())
@@ -642,14 +576,7 @@ class InstanceManager:
             raise BenchError(AWSError(e))
 
     def hosts(self, flat=False):
-        ''' PUBLIC (internet-routable) IPs -- the SSH/rsync/tmux connection
-        targets used from the coordinator laptop. NOT for the Committee
-        (node<->node/client<->node): see `internal_hosts()`.
-
-        Validators ONLY (tag:Name == INSTANCE_NAME) -- the dedicated
-        metrics-collector instance (COLLECTOR_NAME) is deliberately excluded so
-        `_select_hosts`/the committee never see it; use `collector_host()` to
-        reach the collector itself. '''
+        '''Return validator public IPs for coordinator access; exclude the collector.'''
         try:
             pairs = self._paired_hosts(['pending', 'running'], name=self.INSTANCE_NAME)
             ips = {region: [pub for pub, _ in v] for region, v in pairs.items()}
@@ -658,10 +585,7 @@ class InstanceManager:
             raise BenchError('Failed to gather instances IPs', AWSError(e))
 
     def internal_hosts(self, flat=False):
-        '''Return validator private IPs, aligned with `hosts()` by region.
-
-        These addresses are used for node and client traffic. The collector is
-        excluded.'''
+        '''Return validator private IPs for node and client traffic.'''
         try:
             pairs = self._paired_hosts(['pending', 'running'], name=self.INSTANCE_NAME)
             ips = {region: [priv for _, priv in v] for region, v in pairs.items()}
@@ -670,16 +594,7 @@ class InstanceManager:
             raise BenchError('Failed to gather instances private IPs', AWSError(e))
 
     def collector_host(self):
-        ''' (public_ip, private_ip) of the dedicated metrics-collector instance
-        (tag:Name == COLLECTOR_NAME), or None if it hasn't been created yet (an
-        older testbed predating this feature, or the instance is still booting
-        and lacks one of its two addresses -- see `_paired_hosts`).
-        `create_instances` creates exactly one, in the first configured region,
-        so the first match across regions is it. Public ip: the coordinator's
-        SSH/deploy target for installing + running Prometheus, and later for
-        querying its HTTP API. Private ip: informational here (the collector
-        doesn't need to know its own address to scrape outward), but returned
-        for symmetry/completeness. '''
+        '''Return the collector's public/private IP pair, or `None` if unavailable.'''
         try:
             pairs = self._paired_hosts(['pending', 'running'], name=self.COLLECTOR_NAME)
         except ClientError as e:

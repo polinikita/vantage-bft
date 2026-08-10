@@ -48,7 +48,7 @@ def last_all_up(prom, expected, start, end):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prom", default="http://localhost:9095")
-    ap.add_argument("--joiner", default="node-20-primary")
+    ap.add_argument("--joiner")
     ap.add_argument("--nodes", type=int)
     ap.add_argument("--window", type=int, default=600)
     a = ap.parse_args()
@@ -57,7 +57,12 @@ def main():
     sel = '{node=~".*-primary$"}'
     nodes = a.nodes
     if nodes is None:
-        nodes = int(a.joiner.removeprefix("node-").removesuffix("-primary")) + 1
+        nodes = (
+            int(a.joiner.removeprefix("node-").removesuffix("-primary")) + 1
+            if a.joiner
+            else 10
+        )
+    joiner_name = a.joiner or f"node-{nodes - 1}-primary"
     expected = {f"node-{index}-primary" for index in range(nodes)}
     sample_time = last_all_up(a.prom, expected, start, end)
 
@@ -69,10 +74,10 @@ def main():
     if not cursors:
         print("FAIL: no vantage_cursor_next_view series", file=sys.stderr)
         return 1
-    joiner = cursors.get(a.joiner)
-    peers = sorted(v for n, v in cursors.items() if n != a.joiner)
+    joiner = cursors.get(joiner_name)
+    peers = sorted(v for n, v in cursors.items() if n != joiner_name)
     if joiner is None or not peers:
-        print(f"FAIL: joiner {a.joiner} absent from {sorted(cursors)}", file=sys.stderr)
+        print(f"FAIL: joiner {joiner_name} absent from {sorted(cursors)}", file=sys.stderr)
         return 1
     median = peers[len(peers) // 2]
 
@@ -98,7 +103,7 @@ def main():
     header_in_flight = metric("vantage_sequence_install_header_requests_in_flight")
     obsolete = metric("vantage_sequence_install_obsolete_inbound_dropped_total")
 
-    j = lambda d: int(d.get(a.joiner, 0))
+    j = lambda d: int(d.get(joiner_name, 0))
     lag = median - joiner
     print(f"{'common live sample':<28} {time.strftime('%H:%M:%S', time.localtime(sample_time)):>10}")
     print(f"{'joiner cursor':<28} {joiner:>10.0f}")

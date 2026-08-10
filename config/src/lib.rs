@@ -43,7 +43,7 @@ pub trait Import: DeserializeOwned {
 pub trait Export: Serialize {
     fn export(&self, path: &str) -> Result<(), ConfigError> {
         let writer = || -> Result<(), std::io::Error> {
-            // Truncate the file so a shorter serialization cannot leave trailing data.
+            // Truncate before writing the new serialization.
             let file = OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -70,22 +70,21 @@ pub type WorkerId = u32;
 #[serde(rename_all = "kebab-case")]
 #[derive(Default)]
 pub enum Protocol {
-    /// Autobahn as shipped/evaluated (`use_optimistic_tips = true`).
+    /// Autobahn with optimistic tips.
     #[default]
     AutobahnOptimistic,
-    /// Autobahn with certified-tips-only cut formation (`use_optimistic_tips = false`).
+    /// Autobahn with certified tips only.
     AutobahnSeamless,
-    /// Signature-free AGB protocol.
+    /// Signature-free AGB.
     Vantage,
-    /// Simple-IT cut consensus using `simpleit::CutEngine`.
+    /// Simple-IT cut consensus.
     SimpleIt,
-    /// Simple-IT using the Bracha RBC variant.
+    /// Simple-IT with Bracha RBC.
     SimpleItBracha,
 }
 
 impl Protocol {
-    /// Returns the optimistic-tip setting for protocols that use Autobahn.
-    /// Returns `None` for Vantage and Simple-IT.
+    /// Returns the Autobahn optimistic-tip setting, or `None` otherwise.
     pub fn implied_optimistic_tips(&self) -> Option<bool> {
         match self {
             Protocol::AutobahnOptimistic => Some(true),
@@ -108,37 +107,31 @@ impl Protocol {
     }
 }
 
-/// Default value for `use_optimistic_tips` when a parameter file omits it.
-/// `reconcile_protocol` derives the effective value from `protocol`.
+/// Default for `use_optimistic_tips` when omitted.
 fn default_use_optimistic_tips() -> bool {
     true
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Parameters {
-    /// The timeout delay of the consensus protocol.
+    /// Consensus timeout, in milliseconds.
     pub timeout_delay: u64,
-    /// The preferred header size. The primary creates a new header when it has enough parents and
-    /// enough batches' digests to reach `header_size`. Denominated in bytes.
+    /// Preferred header size, in bytes.
     pub header_size: usize,
-    /// The maximum delay that the primary waits between generating two headers, even if the header
-    /// did not reach `max_header_size`. Denominated in ms.
+    /// Maximum header delay, in milliseconds.
     pub max_header_delay: u64,
-    /// The depth of the garbage collection (Denominated in number of rounds).
+    /// Garbage-collection depth, in rounds.
     pub gc_depth: u64,
-    /// The delay after which the synchronizer retries to send sync requests. Denominated in ms.
+    /// Sync retry delay, in milliseconds.
     pub sync_retry_delay: u64,
-    /// Determine with how many nodes to sync when re-trying to send sync-request. These nodes
-    /// are picked at random from the committee.
+    /// Number of random peers used for sync retries.
     pub sync_retry_nodes: usize,
-    /// The preferred batch size. The workers seal a batch of transactions when it reaches this size.
-    /// Denominated in bytes.
+    /// Preferred worker batch size, in bytes.
     pub batch_size: usize,
-    /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
-    /// is not reached. Denominated in ms.
+    /// Maximum worker batch delay, in milliseconds.
     pub max_batch_delay: u64,
 
-    // Autobahn protocol parameters.
+    // Autobahn parameters.
     #[serde(default = "default_use_optimistic_tips")]
     pub use_optimistic_tips: bool, // Default true.
 
@@ -151,69 +144,55 @@ pub struct Parameters {
     pub use_ride_share: bool,
     pub car_timeout: u64,
 
-    /// Autobahn (Giridharan et al., SOSP'24) §5.5.3 "All-to-all communication":
-    /// On the external-consensus path, broadcast prepare and confirm votes and
-    /// assemble the corresponding certificates locally.
+    /// Use all-to-all vote dissemination on the external-consensus path.
     #[serde(default)]
     pub all_to_all: bool,
 
-    // Asynchrony simulation.
+    // Asynchrony parameters.
     pub simulate_asynchrony: bool,
     pub asynchrony_start: u64,
     pub asynchrony_duration: u64,
 
-    /// The consensus protocol assembly to run. Authoritative over
-    /// `use_optimistic_tips` (see `reconcile_protocol`).
+    /// Consensus protocol. Overrides `use_optimistic_tips`.
     #[serde(default)]
     pub protocol: Protocol,
 
-    /// Transaction-generation mode supplied by the load generator, when known.
-    /// `None` means the mode is unknown.
+    /// Transaction-generation mode, when known.
     #[serde(default)]
     pub tx_mode: Option<String>,
 
-    /// Vantage-only maximum number of payload entries in one data block.
-    /// The value is part of `BlockOK`.
+    /// Maximum payload entries in one Vantage data block.
     #[serde(default = "default_max_block_payload")]
     pub max_block_payload: usize,
 
-    /// Vantage-only AGB base delay unit in milliseconds. Fallback deadlines are
-    /// derived from this value.
+    /// Vantage AGB base delay unit, in milliseconds.
     #[serde(default = "default_delta_ms")]
     pub delta_ms: u64,
 
-    /// Benchmark-only epoch-millisecond instant at which commit metrics become active.
-    /// Transactions submitted before this instant are excluded from rate and latency
-    /// metrics. `None` disables the gate.
+    /// Epoch-millisecond start time for commit metrics. `None` counts all transactions.
     #[serde(default)]
     pub metrics_active_at_ms: Option<u64>,
 
-    /// Vantage-only number of views retained behind the resolved prefix before internal
-    /// garbage collection. Carrier bodies remain available for the configured service
-    /// margin. The value is clamped to at least 1.
+    /// Vantage views retained behind the resolved prefix before garbage collection.
     #[serde(default = "default_vantage_gc_window_views")]
     pub vantage_gc_window_views: u64,
 
-    /// Simple-IT-only number of rounds retained before `CutEngine::prune_below` runs.
-    /// The value is clamped to at least 1.
+    /// Simple-IT rounds retained before pruning.
     #[serde(default = "default_simpleit_gc_window_rounds")]
     pub simpleit_gc_window_rounds: u64,
 
-    /// Enables periodic per-author digest-bound availability watermarks. Each watermark
-    /// identifies a verified lane prefix by height and digest before aggregation.
+    /// Enables per-author availability watermarks.
     #[serde(default = "default_ack_watermarks")]
     pub ack_watermarks: bool,
-    /// Ack-watermark broadcast period in milliseconds.
+    /// Availability watermark period, in milliseconds.
     #[serde(default = "default_ack_watermark_period_ms")]
     pub ack_watermark_period_ms: u64,
 
-    /// Enables digest-named AGB statements. Proposals are still sent by value;
-    /// digest statements identify them and use the body-fetch path when needed.
+    /// Enables digest-named AGB statements and body fetches.
     #[serde(default = "default_digest_statements")]
     pub digest_statements: bool,
 
-    /// Builds the local hash-chained sequence log and checkpoint heads. State sync can
-    /// announce, certify, download, verify, and install remote sequence data.
+    /// Enables sequence checkpoints and state synchronization.
     #[serde(default = "default_sequence_checkpoints")]
     pub sequence_checkpoints: bool,
 
@@ -221,197 +200,152 @@ pub struct Parameters {
     #[serde(default = "default_sequence_checkpoint_interval_views")]
     pub sequence_checkpoint_interval_views: u64,
 
-    /// How often the announce timer fires. An announcement
-    /// is sent when the local boundary has advanced, or when
-    /// `sequence_announce_repeat_ms` has elapsed for the current one.
+    /// Sequence announcement timer period, in milliseconds.
     #[serde(default = "default_sequence_announce_period_ms")]
     pub sequence_announce_period_ms: u64,
 
-    /// Re-send interval for an unchanged boundary. Repetition lets a late joiner collect
-    /// the required `f+1` announcements.
+    /// Repeat interval for an unchanged sequence boundary, in milliseconds.
     #[serde(default = "default_sequence_announce_repeat_ms")]
     pub sequence_announce_repeat_ms: u64,
 
-    /// Records per served chunk. Chunked by ITEM COUNT rather than bytes because records
-    /// are fixed-width, so an item cap is already an exact byte cap.
+    /// Sequence records per served chunk.
     #[serde(default = "default_sequence_sync_chunk_records")]
     pub sequence_sync_chunk_records: usize,
 
-    /// Maximum terminal outcome views per served range. This bounds runs of `Skip`
-    /// outcomes; manifest-carrying outcomes use `sequence_sync_chunk_outcome_items`.
+    /// Maximum terminal outcomes per served range.
     #[serde(default = "default_sequence_sync_chunk_outcomes")]
     pub sequence_sync_chunk_outcomes: usize,
 
-    /// Maximum manifest references in one served outcome range.
+    /// Maximum manifest references per served outcome range.
     #[serde(default = "default_sequence_sync_chunk_outcome_items")]
     pub sequence_sync_chunk_outcome_items: usize,
 
-    /// Delta digests per served chunk (32 B each).
+    /// Delta digests per served chunk. Each digest is 32 bytes.
     #[serde(default = "default_sequence_sync_chunk_digests")]
     pub sequence_sync_chunk_digests: usize,
 
-    /// Run state sync while a certified checkpoint is at least this many terminal views
-    /// beyond the local sequence cursor. A staged install may continue to drain below it.
+    /// Sequence gap that starts state synchronization, in views.
     #[serde(default = "default_sequence_sync_min_gap_views")]
     pub sequence_sync_min_gap_views: u64,
 
-    /// Gap above which ordinary consensus/control traffic is dropped before entering the
-    /// core queue. This is independent of the sync threshold.
+    /// Sequence gap that sheds ordinary consensus and control traffic.
     #[serde(default = "default_sequence_sync_shed_gap_views")]
     pub sequence_sync_shed_gap_views: u64,
 
-    /// Gap at which a recovered node re-arms state sync. The gap must represent a new
-    /// outage so normal participation remains active after recovery.
+    /// Sequence gap that re-arms state synchronization after recovery.
     #[serde(default = "default_sequence_sync_rearm_gap_views")]
     pub sequence_sync_rearm_gap_views: u64,
 
-    /// Matching announcers queried concurrently for one outstanding chunk.
+    /// Concurrent sources queried for one sequence chunk.
     #[serde(default = "default_sequence_sync_max_sources")]
     pub sequence_sync_max_sources: usize,
 
-    /// Per-request deadline before failing over to the NEXT source.
+    /// Sequence source request timeout, in milliseconds.
     #[serde(default = "default_sequence_sync_request_timeout_ms")]
     pub sequence_sync_request_timeout_ms: u64,
 
-    /// Bounded ingress for state-sync responses. Overflow drops the newest frame;
-    /// responses are idempotent and can be requested again.
+    /// State-sync response queue capacity. Overflow drops the newest frame.
     #[serde(default = "default_sequence_sync_inbound_capacity")]
     pub sequence_sync_inbound_capacity: usize,
 
-    /// Verified target views admitted into the block-fetch window at once.
+    /// Verified target views admitted to the block-fetch window.
     #[serde(default = "default_sequence_install_window_views")]
     pub sequence_install_window_views: usize,
 
-    /// Retained for configuration compatibility. Install admission uses
+    /// Deprecated compatibility setting; install admission uses
     /// `sequence_install_window_views`.
     #[serde(default = "default_sequence_install_settle_ceiling")]
     pub sequence_install_settle_ceiling: usize,
 
-    /// Apply verified checkpoint state to the cursor.
+    /// Enables installation of verified checkpoint state.
     #[serde(default = "default_sequence_install_enabled")]
     pub sequence_install_enabled: bool,
 
-    /// Views applied per install pass. The limit prevents one target from monopolizing
-    /// the consensus core.
+    /// Views applied per install pass.
     #[serde(default = "default_sequence_install_views_per_tick")]
     pub sequence_install_views_per_tick: usize,
 
     /// Block digests emitted per install pass.
-    ///
-    /// `Cursor::install` leaves a view open when the budget is exhausted.
     #[serde(default = "default_sequence_install_digests_per_tick")]
     pub sequence_install_digests_per_tick: usize,
 
-    /// Carries positional availability bits on AGB echoes instead of periodic
-    /// `VantageAvail` messages. Requires `ack_watermarks`.
+    /// Carries positional availability bits on AGB echoes. Requires `ack_watermarks`.
     #[serde(default = "default_echo_avail_claims")]
     pub echo_avail_claims: bool,
 
-    /// Optional local-run one-way latency table for primary-to-primary
-    /// connections. CLI handlers populate it; library code does not.
-    /// The field is skipped by serde and is unset by `Parameters::default()`.
-    /// `node run` uses an explicit `mimic_latency_ms` value or AWS RTT.
-    /// `node local-benchmark` gives the CSV table precedence, then the explicit
-    /// mimic value, then AWS RTT. An explicit zero requests no injected latency.
+    /// Optional local-run one-way latency table. This field is not serialized.
     #[serde(skip)]
     pub latency_table: Option<Arc<LatencyTable>>,
 
-    /// Deployable uniform-RTT setting corresponding to
-    /// `node local-benchmark --mimic-latency-ms`. This field is serialized in
-    /// `parameters.json`.
-    ///
-    /// `node run` treats this field as an explicit override to a uniform scalar:
-    /// `Some(rtt)` (including `Some(0)`) always wins and expands to
-    /// `LatencyTable::uniform(committee.size(), rtt)` at spawn time (one-way = rtt/2).
-    /// When `None`, `node run` uses `LatencyTable::aws_rtt`.
+    /// Optional uniform RTT override, in milliseconds. Serialized in parameters.
     #[serde(default)]
     pub mimic_latency_ms: Option<u64>,
 
-    /// Enables transport-level per-peer outbound message batching. Client-facing
-    /// transaction traffic is not batched.
+    /// Enables per-peer outbound message batching. Client traffic is unbatched.
     #[serde(default = "default_batch_messages")]
     pub batch_messages: bool,
-    /// Hybrid flush size cap in bytes (see `network::BatchConfig::max_bytes`).
-    /// Irrelevant when `batch_messages` is off.
+    /// Batch flush size cap, in bytes.
     #[serde(default = "default_batch_max_bytes")]
     pub batch_max_bytes: usize,
-    /// Hybrid flush delay in milliseconds (see `network::BatchConfig::max_delay_ms`).
-    /// Irrelevant when `batch_messages` is off.
+    /// Batch flush delay, in milliseconds.
     #[serde(default = "default_batch_max_delay_ms")]
     pub batch_max_delay_ms: u64,
 
-    /// Data-plane withholding fault injector. The first `withhold_senders` committee
-    /// indices withhold payload dissemination from a staggered half of the committee.
-    /// Other message types are unaffected. Zero disables withholding.
+    /// Number of staggered payload-withholding senders. Zero disables withholding.
     #[serde(default)]
     pub withhold_senders: usize,
 
-    /// Start offset in milliseconds for the time-windowed withholding injector.
-    /// `None` enables withholding for the whole run. Set by `node local-benchmark`.
+    /// Withholding start offset, in milliseconds. `None` enables it for the full run.
     #[serde(default)]
     pub withhold_at_ms: Option<u64>,
-    /// Withholding window duration in milliseconds when `withhold_at_ms` is set.
+    /// Withholding duration, in milliseconds.
     #[serde(default = "default_withhold_for_ms")]
     pub withhold_for_ms: u64,
-    /// Shared in-process window state used by the withholding filters. It is not
-    /// serialized and is initialized by `node local-benchmark`.
+    /// In-process withholding window state. This field is not serialized.
     #[serde(skip)]
     pub withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 
-    /// Period for checking gaps between a local verified lane prefix and the highest
-    /// attested height for another author. Shared by Vantage and Simple-IT.
+    /// Lane-resume gap check period, in milliseconds.
     #[serde(default = "default_resume_check_period_ms")]
     pub resume_check_period_ms: u64,
-    /// Minimum spacing between resume requests or resume batches for the same lane
-    /// author and gap height.
+    /// Minimum spacing between resume requests, in milliseconds.
     #[serde(default = "default_resume_backoff_ms")]
     pub resume_backoff_ms: u64,
-    /// Maximum number of blocks served in one lane-resume batch. The requester asks
-    /// for the next batch after its frontier advances. `resume_max_concurrent` limits
-    /// concurrent resume episodes; zero means unlimited.
+    /// Maximum blocks per lane-resume batch.
     #[serde(default = "default_resume_max_concurrent")]
     pub resume_max_concurrent: usize,
 
     #[serde(default = "default_resume_batch")]
     pub resume_batch: u64,
 
-    /// Per-destination outbound queue depth at which a volatile send is shed and
-    /// recorded for reconnect replay. Zero disables the limit. Used only when
-    /// `reconnect_replay` is enabled.
+    /// Queue depth at which volatile sends are shed. Zero disables shedding.
     #[serde(default = "default_volatile_soft_cap")]
     pub volatile_soft_cap: usize,
 
-    /// Enables reconnect replay for volatile one-shot messages. When disabled,
-    /// broadcasts use the ordinary durable path and replay messages are ignored.
+    /// Enables reconnect replay for volatile messages.
     #[serde(default = "default_reconnect_replay")]
     pub reconnect_replay: bool,
 
-    /// Reconnect-waiter's exponential-backoff ceiling in milliseconds.
-    /// Applied to every primary-to-primary `ReliableSender`.
+    /// Reconnect backoff ceiling, in milliseconds.
     #[serde(default = "default_retry_backoff_max_ms")]
     pub retry_backoff_max_ms: u64,
 
-    /// Number of views of one-shot messages retained by `Outbox` behind
-    /// `own_watermark` before `prune_below` evicts them. `outbox_max_bytes` is an
-    /// additional byte cap.
+    /// Views of one-shot messages retained behind the local watermark.
     #[serde(default = "default_replay_history_views")]
     pub replay_history_views: u64,
-    /// Resume task payload size per chunk in bytes.
+    /// Resume payload size per chunk, in bytes.
     #[serde(default = "default_replay_chunk_bytes")]
     pub replay_chunk_bytes: usize,
-    /// Delay between resume-task round-robin rotations. Together with
-    /// `replay_chunk_bytes`, this bounds replay throughput.
+    /// Delay between replay rotations, in milliseconds.
     #[serde(default = "default_replay_chunk_interval_ms")]
     pub replay_chunk_interval_ms: u64,
-    /// Per-peer served-byte budget per `resume_backoff_ms` window. A single key larger
-    /// than the budget is served as one unit.
+    /// Per-peer replay byte budget per backoff window.
     #[serde(default = "default_replay_serve_max_bytes")]
     pub replay_serve_max_bytes: usize,
-    /// Outbox total byte cap. Eviction removes whole oldest views and preserves the
-    /// newest key.
+    /// Outbox byte cap. Eviction preserves the newest key.
     #[serde(default = "default_outbox_max_bytes")]
     pub outbox_max_bytes: usize,
-    /// Replay episode expiry and author-side in-flight stream TTL in milliseconds.
+    /// Replay episode and in-flight stream lifetime, in milliseconds.
     #[serde(default = "default_replay_episode_max_ms")]
     pub replay_episode_max_ms: u64,
 }
@@ -420,7 +354,7 @@ fn default_batch_messages() -> bool {
     true
 }
 
-/// Availability watermarks are enabled by default. `--no-ack-watermarks` disables them.
+/// Enables compressed availability by default.
 fn default_ack_watermarks() -> bool {
     true
 }
@@ -429,18 +363,17 @@ fn default_echo_avail_claims() -> bool {
     true
 }
 
-/// Digest-named AGB statements are enabled by default.
-/// `--no-digest-statements` disables them.
+/// Enables digest statements by default.
 fn default_digest_statements() -> bool {
     true
 }
 
-/// On by default: sequence checkpoints and state sync provide Vantage recovery.
+/// Default sequence-checkpoint setting.
 fn default_sequence_checkpoints() -> bool {
     true
 }
 
-/// Default checkpoint interval below the state-sync entry threshold.
+/// Default checkpoint interval, in views.
 fn default_sequence_checkpoint_interval_views() -> u64 {
     20
 }
@@ -458,7 +391,7 @@ fn default_sequence_sync_chunk_records() -> usize {
     256
 }
 
-/// Secondary bound for long runs of `Skip` outcomes, which consume no manifest items.
+/// Secondary bound for `Skip` outcomes.
 fn default_sequence_sync_chunk_outcomes() -> usize {
     256
 }
@@ -488,7 +421,7 @@ fn default_sequence_sync_rearm_gap_views() -> u64 {
     800
 }
 
-/// `f+1` at the smallest committee this targets.
+/// Minimum number of sequence sources.
 fn default_sequence_sync_max_sources() -> usize {
     3
 }
@@ -501,12 +434,12 @@ fn default_sequence_sync_inbound_capacity() -> usize {
     1_024
 }
 
-/// Default verified views admitted into the install window.
+/// Default install window, in views.
 fn default_sequence_install_window_views() -> usize {
     64
 }
 
-/// Default install settle ceiling.
+/// Default install settle ceiling, in views.
 fn default_sequence_install_settle_ceiling() -> usize {
     2_048
 }
@@ -537,51 +470,51 @@ fn default_max_block_payload() -> usize {
 }
 
 fn default_delta_ms() -> u64 {
-    // The default covers the largest one-way delay in the configured RTT matrix.
+    // Covers the largest configured one-way delay.
     200
 }
 
-/// Default Vantage internal-state retention window in views.
+/// Default Vantage retention window, in views.
 fn default_vantage_gc_window_views() -> u64 {
     200
 }
 
-/// Default Simple-IT internal-state retention window in rounds.
+/// Default Simple-IT retention window, in rounds.
 fn default_simpleit_gc_window_rounds() -> u64 {
     50
 }
 
-/// `ack_watermarks`'s own doc comment.
+/// Default availability-watermark period, in milliseconds.
 fn default_ack_watermark_period_ms() -> u64 {
     50
 }
 
-/// Default withholding window duration in milliseconds.
+/// Default withholding duration, in milliseconds.
 fn default_withhold_for_ms() -> u64 {
     30_000
 }
 
-/// `Parameters::resume_check_period_ms`'s own doc comment.
+/// Default lane-resume check period, in milliseconds.
 fn default_resume_check_period_ms() -> u64 {
     1_000
 }
 
-/// `Parameters::resume_backoff_ms`'s own doc comment.
+/// Default lane-resume backoff, in milliseconds.
 fn default_resume_backoff_ms() -> u64 {
     4_000
 }
 
-/// `Parameters::resume_batch`'s own doc comment.
+/// Default lane-resume batch size.
 fn default_resume_batch() -> u64 {
     64
 }
 
-/// `Parameters::volatile_soft_cap`'s own doc comment.
+/// Default volatile queue soft cap.
 fn default_volatile_soft_cap() -> usize {
     1_024
 }
 
-/// `Parameters::reconnect_replay`'s own doc comment.
+/// Default reconnect-replay setting.
 fn default_reconnect_replay() -> bool {
     true
 }
@@ -591,7 +524,7 @@ fn default_retry_backoff_max_ms() -> u64 {
     2_000
 }
 
-/// Default maximum concurrent resume episodes.
+/// Default concurrent resume episodes.
 fn default_resume_max_concurrent() -> usize {
     8
 }
@@ -600,27 +533,27 @@ fn default_replay_history_views() -> u64 {
     512
 }
 
-/// `Parameters::replay_chunk_bytes`'s own doc comment.
+/// Default replay chunk size, in bytes.
 fn default_replay_chunk_bytes() -> usize {
     65_536
 }
 
-/// `Parameters::replay_chunk_interval_ms`'s own doc comment.
+/// Default replay rotation interval, in milliseconds.
 fn default_replay_chunk_interval_ms() -> u64 {
     5
 }
 
-/// `Parameters::replay_serve_max_bytes`'s own doc comment.
+/// Default replay byte budget.
 fn default_replay_serve_max_bytes() -> usize {
     8 << 20
 }
 
-/// `Parameters::outbox_max_bytes`'s own doc comment.
+/// Default outbox size, in bytes.
 fn default_outbox_max_bytes() -> usize {
     64 << 20
 }
 
-/// `Parameters::replay_episode_max_ms`'s own doc comment.
+/// Default replay lifetime, in milliseconds.
 fn default_replay_episode_max_ms() -> u64 {
     60_000
 }
@@ -654,18 +587,15 @@ const RTT_LATENCY_TABLE: [[u32; 10]; 10] = [
     [146, 142, 238, 254, 101, 108, 199, 245, 140, 1],
 ];
 
-/// Optional n x n one-way inter-authority latency table. Rows and columns use committee
-/// order. The table is fixed; it has no per-call jitter.
+/// Optional fixed n × n one-way latency table in committee order.
 #[derive(Clone, Debug)]
 pub struct LatencyTable {
-    /// `one_way_ms[i][j]` = one-way latency (ms) from committee-order index `i` to
-    /// `j`. Symmetric by construction (halved from an RTT matrix), diagonal 0.
+    /// `one_way_ms[i][j]` is the one-way latency from index `i` to `j`, in milliseconds.
     one_way_ms: Vec<Vec<f64>>,
 }
 
 impl LatencyTable {
-    /// Builds a uniform table from an RTT value. Off-diagonal entries are `rtt_ms / 2`;
-    /// diagonal entries are zero.
+    /// Builds a uniform table. Off-diagonal entries are `rtt_ms / 2`; diagonal entries are zero.
     pub fn uniform(n: usize, rtt_ms: f64) -> Self {
         let one_way = rtt_ms / 2.0;
         let mut t = vec![vec![one_way; n]; n];
@@ -675,8 +605,7 @@ impl LatencyTable {
         Self { one_way_ms: t }
     }
 
-    /// Parses an n x n comma-separated RTT matrix in committee order and stores half
-    /// of each value as one-way latency. The matrix must have exactly n rows and columns.
+    /// Parses an n × n comma-separated RTT matrix and stores one-way latencies.
     pub fn from_rtt_csv(path: &str, n: usize) -> Result<Self, ConfigError> {
         let err = |message: String| ConfigError::ImportError {
             file: path.to_string(),
@@ -710,8 +639,7 @@ impl LatencyTable {
         Ok(Self { one_way_ms })
     }
 
-    /// Builds an n x n table by mapping committee indices cyclically to the ten regions
-    /// in `RTT_LATENCY_TABLE`. Entries are halved for one-way latency; the diagonal is 0.
+    /// Builds a table by mapping committee indices cyclically to the AWS RTT matrix.
     pub fn aws_rtt(n: usize) -> Self {
         let mut t = vec![vec![0.0; n]; n];
         for (i, row) in t.iter_mut().enumerate() {
@@ -725,8 +653,7 @@ impl LatencyTable {
         Self { one_way_ms: t }
     }
 
-    /// Returns one-way latency between committee-order indices. Out-of-range indices
-    /// return `Duration::ZERO`.
+    /// Returns one-way latency between committee-order indices, or zero if out of range.
     pub fn one_way(&self, i: usize, j: usize) -> Duration {
         self.one_way_ms
             .get(i)
@@ -787,7 +714,7 @@ impl Default for Parameters {
             batch_size: 500_000,
             max_batch_delay: 100,
 
-            // Autobahn parameters.
+            // Autobahn defaults.
             use_optimistic_tips: true,
             use_parallel_proposals: true,
             k: 4,
@@ -797,17 +724,17 @@ impl Default for Parameters {
             car_timeout: 2000,
             all_to_all: false,
 
-            // Asynchrony simulation.
+            // Asynchrony defaults.
             simulate_asynchrony: false,
-            asynchrony_start: 20_000,    // Start after 20 seconds.
-            asynchrony_duration: 10_000, // Run for 10 seconds.
+            asynchrony_start: 20_000,    // 20 seconds.
+            asynchrony_duration: 10_000, // 10 seconds.
 
             protocol: Protocol::default(),
 
             tx_mode: None,
             max_block_payload: default_max_block_payload(),
             delta_ms: default_delta_ms(),
-            // No gate by default: every observation counts.
+            // Count every observation by default.
             metrics_active_at_ms: None,
             latency_table: None,
             mimic_latency_ms: None,
@@ -839,7 +766,7 @@ impl Import for Parameters {}
 impl Export for Parameters {}
 
 impl Parameters {
-    /// Reconcile `use_optimistic_tips` with `protocol`. `protocol` is authoritative.
+    /// Reconcile `use_optimistic_tips` with the selected protocol.
     pub fn reconcile_protocol(&mut self) {
         if let Some(implied) = self.protocol.implied_optimistic_tips() {
             if self.use_optimistic_tips != implied {
@@ -920,8 +847,7 @@ impl Parameters {
             self.digest_statements
         );
         info!(
-            "Lane-resume (Mechanism A: sender-side resume triggered by an ack-census \
-             gap) check period {} ms, backoff {} ms, batch {} blocks",
+            "Lane resume: check period {} ms, backoff {} ms, batch {} blocks",
             self.resume_check_period_ms, self.resume_backoff_ms, self.resume_batch
         );
         info!(
@@ -963,31 +889,29 @@ impl Parameters {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ConsensusAddresses {
-    /// Address to receive messages from other consensus nodes (WAN).
+    /// Consensus listener address.
     pub consensus_to_consensus: SocketAddr,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PrimaryAddresses {
-    /// Address to receive messages from other primaries (WAN).
+    /// Primary listener address.
     pub primary_to_primary: SocketAddr,
-    /// Address to receive messages from our workers (LAN).
+    /// Worker-to-primary listener address.
     pub worker_to_primary: SocketAddr,
-    /// Address serving this primary's Prometheus metrics (LAN; scraped by the
-    /// benchmark harness at run end).
+    /// Prometheus metrics address.
     pub metrics: SocketAddr,
 }
 
 #[derive(Clone, Serialize, Deserialize, Eq, Hash, PartialEq)]
 pub struct WorkerAddresses {
-    /// Address to receive client transactions (WAN).
+    /// Client transaction listener address.
     pub transactions: SocketAddr,
-    /// Address to receive messages from other workers (WAN).
+    /// Worker-to-worker listener address.
     pub worker_to_worker: SocketAddr,
-    /// Address to receive messages from our primary (LAN).
+    /// Primary-to-worker listener address.
     pub primary_to_worker: SocketAddr,
-    /// Address serving this worker's Prometheus metrics (LAN; scraped by the
-    /// benchmark harness at run end).
+    /// Prometheus metrics address.
     pub metrics: SocketAddr,
 }
 
@@ -1006,7 +930,6 @@ pub struct Authority {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
-    //pub id_map: HashMap<PublicKey, u64>, //position
 }
 
 impl Import for Committee {}
@@ -1036,8 +959,7 @@ impl Committee {
         }
     }
 
-    /// Generates an in-memory committee for `node local-benchmark`. Keys are sorted by
-    /// public key so vector indices match committee order and latency-table rows.
+    /// Generates an in-memory committee for `node local-benchmark`.
     pub fn local_benchmark(nodes: usize, workers: usize, base_port: u16) -> (Self, Vec<KeyPair>) {
         let mut authorities = BTreeMap::new();
         let mut keypairs = Vec::with_capacity(nodes);
@@ -1084,7 +1006,7 @@ impl Committee {
             keypairs.push(keypair);
         }
 
-        // Match the BTreeMap order used by committee indices.
+        // Match committee index order.
         keypairs.sort_by_key(|k| k.name);
 
         (Self { authorities }, keypairs)
@@ -1095,12 +1017,12 @@ impl Committee {
         self.authorities.len()
     }
 
-    /// Return the stake of a specific authority.
+    /// Returns the stake of one authority.
     pub fn stake(&self, name: &PublicKey) -> Stake {
         self.authorities.get(name).map_or_else(|| 0, |x| x.stake)
     }
 
-    /// Returns the stake of all authorities except `myself`.
+    /// Returns stakes excluding `myself`.
     pub fn others_stake(&self, myself: &PublicKey) -> Vec<(PublicKey, Stake)> {
         self.authorities
             .iter()
@@ -1109,13 +1031,13 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the stake required to reach a quorum (2f+1).
+    /// Returns the quorum stake (2f+1).
     pub fn quorum_threshold(&self) -> Stake {
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         2 * total_votes / 3 + 1
     }
 
-    /// Returns the stake required to reach availability (f+1).
+    /// Returns the availability stake (f+1).
     pub fn validity_threshold(&self) -> Stake {
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         total_votes.div_ceil(3)
@@ -1126,7 +1048,7 @@ impl Committee {
         total_votes
     }
 
-    /// Returns the consensus addresses of the target consensus node.
+    /// Returns the target consensus address.
     pub fn consensus(&self, to: &PublicKey) -> Result<ConsensusAddresses, ConfigError> {
         self.authorities
             .get(to)
@@ -1134,7 +1056,7 @@ impl Committee {
             .ok_or(ConfigError::NotInCommittee(*to))
     }
 
-    /// Returns the addresses of all consensus nodes except `myself`.
+    /// Returns consensus addresses excluding `myself`.
     pub fn others_consensus(&self, myself: &PublicKey) -> Vec<(PublicKey, ConsensusAddresses)> {
         self.authorities
             .iter()
@@ -1143,7 +1065,7 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the primary addresses of the target primary.
+    /// Returns the target primary addresses.
     pub fn primary(&self, to: &PublicKey) -> Result<PrimaryAddresses, ConfigError> {
         self.authorities
             .get(to)
@@ -1151,7 +1073,7 @@ impl Committee {
             .ok_or(ConfigError::NotInCommittee(*to))
     }
 
-    /// Returns the addresses of all primaries except `myself`.
+    /// Returns primary addresses excluding `myself`.
     pub fn others_primaries(&self, myself: &PublicKey) -> Vec<(PublicKey, PrimaryAddresses)> {
         self.authorities
             .iter()
@@ -1160,12 +1082,12 @@ impl Committee {
             .collect()
     }
 
-    /// Returns `name`'s position in the committee's deterministic BTreeMap order.
+    /// Returns `name`'s deterministic committee index.
     pub fn index_of(&self, name: &PublicKey) -> Option<usize> {
         self.authorities.keys().position(|k| k == name)
     }
 
-    /// Returns every socket address used by `name`'s authority.
+    /// Returns every socket address for `name`.
     pub fn addresses_of(&self, name: &PublicKey) -> Vec<SocketAddr> {
         let Some(a) = self.authorities.get(name) else {
             return Vec::new();
@@ -1187,8 +1109,7 @@ impl Committee {
         out
     }
 
-    /// Builds per-destination one-way latency entries for all other authorities.
-    /// Returns an empty map when `myself` is not a committee member.
+    /// Builds one-way latency entries for every other authority.
     pub fn latency_map(
         &self,
         myself: &PublicKey,
@@ -1210,7 +1131,7 @@ impl Committee {
         out
     }
 
-    /// Returns the addresses of a specific worker (`id`) of a specific authority (`to`).
+    /// Returns worker `id`'s addresses for authority `to`.
     pub fn worker(&self, to: &PublicKey, id: &WorkerId) -> Result<WorkerAddresses, ConfigError> {
         self.authorities
             .iter()
@@ -1224,7 +1145,7 @@ impl Committee {
             .ok_or(ConfigError::NotInCommittee(*to))
     }
 
-    /// Returns the addresses of all our workers.
+    /// Returns all worker addresses for `myself`.
     pub fn our_workers(&self, myself: &PublicKey) -> Result<Vec<WorkerAddresses>, ConfigError> {
         self.authorities
             .iter()
@@ -1238,9 +1159,7 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the addresses of all our workers, keyed by `WorkerId` (unlike
-    /// `our_workers`, which discards the id). Used to route a message to a specific
-    /// local worker.
+    /// Returns local worker addresses keyed by `WorkerId`.
     pub fn our_workers_by_id(
         &self,
         myself: &PublicKey,
@@ -1251,8 +1170,7 @@ impl Committee {
             .ok_or(ConfigError::NotInCommittee(*myself))
     }
 
-    /// Returns the addresses of all workers with a specific id except the ones of the authority
-    /// specified by `myself`.
+    /// Returns worker `id` addresses excluding `myself`.
     pub fn others_workers(
         &self,
         myself: &PublicKey,
@@ -1286,13 +1204,9 @@ impl Committee {
     }
 }
 
-/// Returns the destinations withheld by a local data-plane fault injector.
+/// Returns destinations withheld by the local data-plane injector.
 ///
-/// The first `withhold_senders` committee indices are withholding senders. Sender `i`
-/// withholds from destinations `(i + 1)..=(i + n/2)` modulo `n`.
-///
-/// Returns `None` when withholding is disabled, `self_pk` is not a withholding sender,
-/// or `self_pk` is not a committee member.
+/// Sender `i` withholds destinations `(i + 1)..=(i + n/2)` modulo `n`.
 pub fn withheld_destinations(
     committee: &Committee,
     self_pk: &PublicKey,
@@ -1311,8 +1225,8 @@ pub fn withheld_destinations(
     Some((1..=half).map(|offset| order[(i + offset) % n]).collect())
 }
 
-/// Returns whether withholding is active at `now`. An unset window means active for
-/// the whole run. A set window is active on `[start, end)`.
+/// Returns whether withholding is active at `now`. An unset window is always active;
+/// a set window is active on `[start, end)`.
 pub fn withhold_active(window: Option<&OnceLock<(Instant, Instant)>>, now: Instant) -> bool {
     match window {
         None => true,
@@ -1350,8 +1264,7 @@ impl Default for KeyPair {
 mod tests {
     use super::*;
 
-    /// A generated Vantage parameter file must deserialize and retain the protocol,
-    /// timing, and latency settings.
+    /// Generated Vantage parameters retain protocol and latency settings.
     #[test]
     fn deserializes_fab_vantage_parameters_json_with_mimic_latency() {
         let json = r#"{
@@ -1379,34 +1292,26 @@ mod tests {
 
         let mut params: Parameters =
             serde_json::from_str(json).expect("fab-generated Vantage parameters.json must parse");
-        // Imported parameters are reconciled before use.
         params.reconcile_protocol();
 
         assert_eq!(params.protocol, Protocol::Vantage);
         assert_eq!(params.delta_ms, 150);
         assert_eq!(params.mimic_latency_ms, Some(100));
-        // Omitted batching settings use the enabled default.
         assert!(params.batch_messages);
-        // An omitted Vantage GC window uses its default.
         assert_eq!(params.vantage_gc_window_views, 200);
-        // Vantage views and Autobahn rounds use separate parameters.
         assert_ne!(params.vantage_gc_window_views, params.gc_depth);
         assert_eq!(
             params.gc_depth, 50,
             "the Autobahn GC parameter is unchanged"
         );
-        // `latency_table` is not serialized; `node run` builds it at spawn.
         assert!(params.latency_table.is_none());
-        // Omitted replay settings use their defaults.
         assert!(params.reconnect_replay);
         assert_eq!(params.retry_backoff_max_ms, 2000);
 
-        // Prove the spawn-time expansion `node run` performs yields a well-formed
-        // uniform NxN table with the RTT/2 one-way convention.
         let n = 20;
         let table = LatencyTable::uniform(n, params.mimic_latency_ms.unwrap() as f64);
-        assert_eq!(table.one_way(0, 0), Duration::ZERO); // diagonal
-        assert_eq!(table.one_way(0, 1), Duration::from_millis(50)); // 100ms RTT / 2
+        assert_eq!(table.one_way(0, 0), Duration::ZERO);
+        assert_eq!(table.one_way(0, 1), Duration::from_millis(50));
         assert_eq!(table.one_way(19, 3), Duration::from_millis(50));
     }
 
@@ -1423,8 +1328,7 @@ mod tests {
         assert_eq!(blocked, expected);
     }
 
-    /// `--withhold 0` (the default): every node gets `None`, regardless of committee
-    /// size or its own position.
+    /// Zero withholding disables the injector for every node.
     #[test]
     fn withheld_destinations_zero_is_none_for_everyone() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
@@ -1433,7 +1337,7 @@ mod tests {
         }
     }
 
-    /// `--withhold <nodes>`: every single node is a withholding sender.
+    /// Withholding count equal to committee size makes every node a sender.
     #[test]
     fn withheld_destinations_k_equals_n_every_sender_withholds() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
@@ -1442,7 +1346,7 @@ mod tests {
         }
     }
 
-    /// Odd `n` uses `floor(n/2)`, not a rounded-up half: n=7 blocks exactly 3.
+    /// Odd committees withhold from `floor(n/2)` destinations.
     #[test]
     fn withheld_destinations_odd_committee_floors() {
         let (committee, keypairs) = Committee::local_benchmark(7, 1, 9000);
@@ -1455,8 +1359,7 @@ mod tests {
         assert_eq!(blocked, expected);
     }
 
-    /// A node past the first `withhold_senders` indices does not withhold at all, even
-    /// though other nodes do.
+    /// Nodes outside the sender prefix do not withhold.
     #[test]
     fn withheld_destinations_non_sender_index_is_none() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
@@ -1488,17 +1391,17 @@ mod tests {
         let end = base + Duration::from_secs(20);
         cell.set((start, end)).unwrap();
 
-        assert!(!withhold_active(Some(&cell), base + Duration::from_secs(5))); // before start
-        assert!(withhold_active(Some(&cell), start)); // at start (inclusive)
-        assert!(withhold_active(Some(&cell), base + Duration::from_secs(15))); // inside
-        assert!(!withhold_active(Some(&cell), end)); // at end (exclusive)
+        assert!(!withhold_active(Some(&cell), base + Duration::from_secs(5)));
+        assert!(withhold_active(Some(&cell), start));
+        assert!(withhold_active(Some(&cell), base + Duration::from_secs(15)));
+        assert!(!withhold_active(Some(&cell), end));
         assert!(!withhold_active(
             Some(&cell),
             base + Duration::from_secs(25)
-        )); // after end
+        ));
     }
 
-    /// Replay is enabled and uses the configured default backoff ceiling.
+    /// Reconnect replay defaults are enabled with a 2-second backoff ceiling.
     #[test]
     fn reconnect_replay_and_retry_backoff_default_to_todays_behavior() {
         let params = Parameters::default();

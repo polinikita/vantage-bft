@@ -1,4 +1,4 @@
-# Local benchmark configuration. Copy this file to create another run profile.
+# Local benchmark configuration.
 
 # Consensus protocol: vantage | autobahn-optimistic | autobahn-seamless
 protocol: vantage
@@ -7,44 +7,35 @@ protocol: vantage
 nodes: 10
 workers: 1
 
-# Aggregate offered load across the whole committee.
+# Aggregate offered load across the committee.
 rate: 1000          # tx/s
 tx_size: 512        # bytes
 
 # Transaction payload mode: all_zero | random.
 mode: random
 
-# Run duration in seconds. 0 = run until Ctrl-C (clean shutdown, RESULTS still
-# printed).
+# Duration in seconds. 0 runs until Ctrl-C.
 duration: 0
 
-# Vantage AGB base delay unit (ms); irrelevant to the two Autobahn paths.
+# Vantage AGB delay unit, in milliseconds.
 delta_ms: 150
 
-# Worker max batch seal delay / primary max header (car) creation delay, ms.
+# Worker batch and primary header delays, in milliseconds.
 max_batch_delay_ms: 20
 max_header_delay_ms: 50
 
-# Transport-level per-peer message batching is ON by default. It flushes at either
-# 64 KiB or 5 ms. Set this false only for an explicit unbatched comparison.
+# Per-peer transport batching and flush limits.
 batch_messages: true
 batch_max_bytes: 65536
 batch_max_delay_ms: 5
 
-# Number of trailing nodes to leave unspawned.
-# (committee membership unchanged). 0 = fault-free.
+# Number of trailing nodes to leave unspawned; 0 means no crash.
 crash: 0
 
-# Optional NxN RTT-ms matrix for WAN-shaped runs.
-# (relative to the repository root), or the literal string `none` for zero injected
-# latency (pure loopback; measures machine capacity, not geography). dryrun.py passes an explicit
-# `--mimic-latency-ms 0` for this case, so it really means zero). The commented
-# default below is the n=10 latency experiment's own table. Note: `node
-# local-benchmark` itself defaults to the real 10-AWS-region RTT matrix
-# (`LatencyTable::aws_rtt`) whenever both `--latency-table` and `--mimic-latency-ms`
-# are omitted; dryrun.py always passes one or the other.
+# NxN RTT matrix in milliseconds, relative to the repository root.
+# Use `none` for loopback.
 latency_table: local-dryrun/latency/wan-rtt-10.csv
 # latency_table: none
 
-# Where `node local-benchmark` writes its per-node stores + prometheus.yaml.
+# Per-node stores and Prometheus target output directory.
 data_dir: local-dryrun/data

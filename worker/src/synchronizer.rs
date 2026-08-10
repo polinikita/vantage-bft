@@ -23,25 +23,14 @@ use tokio::time::{sleep, Duration, Instant};
 #[path = "tests/synchronizer_tests.rs"]
 pub mod synchronizer_tests;
 
-/// Resolution of the timer managing retrials of sync requests (in ms).
+/// Sync retry timer resolution, in milliseconds.
 const TIMER_RESOLUTION: u64 = 1_000;
 
-/// See `Synchronizer::prune_stale`'s doc comment. No spec gives an exact figure for
-/// how long a commit-metrics deferral should be retried before being treated as a
-/// permanent loss; this is generous relative to the default `sync_retry_delay` (the
-/// worker-to-worker `BatchRequest` retry cadence a miss is expected to resolve
-/// within, 5s) and typical sync latency, so a legitimately in-flight sync is never
-/// pruned out from under itself, while still bounding memory over a long-running
-/// validator. Flagged as an open question in this change's own report rather than
-/// asserted as the "correct" figure -- pick a different value if a given run's sync/
-/// GC timing calls for one.
+/// Deferred benchmark metric retention, in milliseconds.
 #[cfg(feature = "benchmark")]
 const BENCHMARK_METRICS_RETENTION_MILLIS: u64 = 10 * 60 * 1_000;
 
-/// A digest whose batch missed the local store at commit time, deferred rather than
-/// dropped by `Synchronizer::observe_committed` -- returned to its caller (`run`),
-/// which starts a `Synchronizer::metrics_waiter` retry for it. Carries the cancel
-/// handle `prune_stale` uses to stop that wait early if the entry goes stale first.
+/// A committed digest whose batch is not yet in the local store.
 #[cfg(feature = "benchmark")]
 struct DeferredMiss {
     digest: Digest,
@@ -49,10 +38,7 @@ struct DeferredMiss {
     cancel: Receiver<()>,
 }
 
-/// Per-batch (or, in `observe_committed`'s hot loop, accumulated across every batch
-/// in one `Committed` notification) latency totals, folded into the shared counters
-/// by `Synchronizer::flush_totals` -- see `Synchronizer::read_and_observe_batch`'s
-/// doc comment for why this is split out.
+/// Latency totals accumulated before they are flushed to shared counters.
 #[cfg(feature = "benchmark")]
 #[derive(Default)]
 struct BatchLatencyTotals {
@@ -76,11 +62,7 @@ impl BatchLatencyTotals {
     }
 }
 
-/// Outcome of a single digest's store lookup + deserialize, for
-/// `Synchronizer::observe_committed`/`Synchronizer::finish_deferred_retry` to react
-/// to differently: `Miss` defers and retries; `Error` (a store error, or bytes that
-/// don't deserialize -- both already logged at the point of failure) drops for good,
-/// matching this code's pre-existing treatment of that case.
+/// Result of reading and decoding one committed batch.
 #[cfg(feature = "benchmark")]
 enum BatchReadOutcome {
     Hit(BatchLatencyTotals),
@@ -88,10 +70,7 @@ enum BatchReadOutcome {
     Error,
 }
 
-/// `SystemTime`-since-epoch milliseconds -- the same clock/units `commit_millis`
-/// (stamped once at the primary's own "Committed" log site) and the client-embedded
-/// per-transaction submission timestamp both use, so subtracting across them is
-/// meaningful.
+/// Current epoch time in milliseconds, matching commit and submission timestamps.
 #[cfg(feature = "benchmark")]
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -100,7 +79,6 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-// The `Synchronizer` is responsible to keep the worker in sync with the others.
 pub struct Synchronizer {
     /// The public key of this authority.
     name: PublicKey,
@@ -108,57 +86,32 @@ pub struct Synchronizer {
     id: WorkerId,
     /// The committee information.
     committee: Committee,
-    // The persistent storage.
+    /// Persistent storage.
     store: Store,
     /// The depth of the garbage collection.
     gc_depth: Round,
-    /// The delay to wait before re-trying to send sync requests.
+    /// Delay between sync retries, in milliseconds.
     sync_retry_delay: u64,
-    /// Determine with how many nodes to sync when re-trying to send sync-requests. These nodes
-    /// are picked at random from the committee.
+    /// Number of random peers used for sync retries.
     sync_retry_nodes: usize,
-    /// Input channel to receive the commands from the primary.
+    /// Commands from the primary.
     rx_message: Receiver<PrimaryWorkerMessage>,
-    /// A network sender to send requests to the other workers.
+    /// Sends requests to other workers.
     network: SimpleSender,
-    /// Loosely keep track of the primary's round number (only used for cleanup).
+    /// Primary round used for cleanup.
     round: Round,
-    /// Keeps the digests (of batches) that are waiting to be processed by the primary. Their
-    /// processing will resume when we get the missing batches in the store or we no longer need them.
-    /// It also keeps the round number and a timestamp (`u128`) of each request we sent.
+    /// Digests awaiting their batches, with cleanup round and request time.
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
-    /// Real transaction latency. Always present
-    /// (the metrics server and its registered gauge shape are always on), but only
-    /// observed into under the `benchmark` feature -- genuinely unused (not dead
-    /// code to delete) on the default build, hence the feature-scoped allow.
+    /// Transaction latency metrics.
     #[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
     metrics: Arc<Metrics>,
-    /// Batch digests already counted into `metrics` (after a genuinely successful
-    /// read+deserialize -- see `observe_committed`'s doc comment), so a `Committed`
-    /// notification for the same digest (should one ever arrive twice) is not
-    /// double-counted. Bounded by `observed_commits_order` below, which carries the
-    /// age information this plain set doesn't.
+    /// Batch digests already counted in the benchmark metrics.
     #[cfg(feature = "benchmark")]
     observed_commits: HashSet<Digest>,
-    /// Age index for `observed_commits`, keyed `(commit_millis, digest)` -- the
-    /// commit instant the digest was actually counted at -- so it can be pruned by
-    /// `split_off` at a wall-clock floor instead of a `retain` scan of
-    /// `observed_commits` itself (project convention for anything keyed by a
-    /// monotonically increasing quantity; mirrors e.g.
-    /// `vantage::control::ControlLog`'s `delivered_set`/`pending_fetch`, same
-    /// `(u64, Digest)` key shape for the same reason). `prune_stale` evicts both
-    /// together: it `split_off`s this one, then removes exactly the digests that
-    /// came back from `observed_commits` -- an O(pruned) targeted removal, never a
-    /// scan of the live set.
+    /// Commit-time index for pruning `observed_commits`.
     #[cfg(feature = "benchmark")]
     observed_commits_order: BTreeSet<(u64, Digest)>,
-    /// Digests the primary reported as committed but that missed the local store.
-    /// Maps `(commit_millis, digest)` --
-    /// the ORIGINAL commit instant, preserved so a later retry still measures true
-    /// commit -> materialise latency, not lookup-time latency -- to the cancel
-    /// handle for that digest's `metrics_waiter` wait (see `run`). Same
-    /// `(u64, Digest)`-keyed, `split_off`-pruned shape as `observed_commits_order`
-    /// above, for the identical reason: bounded by wall-clock age, never scanned.
+    /// Committed digests missing from local storage, keyed by commit time.
     #[cfg(feature = "benchmark")]
     pending_misses: BTreeMap<(u64, Digest), Sender<()>>,
 }
@@ -175,10 +128,8 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
-        // Per-destination network latency.
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
-        // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
@@ -210,8 +161,7 @@ impl Synchronizer {
         });
     }
 
-    /// Helper function. It waits for a batch to become available in the storage
-    /// and then delivers its digest.
+    /// Wait for a batch to become available and return its digest.
     async fn waiter(
         missing: Digest,
         mut store: Store,
@@ -226,47 +176,13 @@ impl Synchronizer {
         }
     }
 
-    /// Main loop listening to the primary's messages.
+    /// Main loop for primary synchronization requests.
     ///
-    /// # Waiters are SPAWNED TASKS, not `FuturesUnordered` residents
-    ///
-    /// Both waiter families used to live in `FuturesUnordered` polled by the `select!`
-    /// below. That deadlocks this task against the store, and it is the confirmed cause
-    /// of the 2026-08-08 n=50 netem wedge (nodes stopped committing entirely while their
-    /// store actor sat IDLE with its command channel reading "full"):
-    ///
-    /// 1. `tokio::sync::mpsc` accounts a bounded channel's occupancy as permits, and
-    ///    releasing one ASSIGNS it to the front waiter of the semaphore's FIFO and pops
-    ///    that waiter from the queue -- it does not merely wake it. A `send()` future
-    ///    holding an assigned permit that is never polled again never completes the send
-    ///    and never returns the permit.
-    /// 2. A `FuturesUnordered` resident is polled only when its owning task returns to
-    ///    this `select!`. The `Synchronize` arm awaits the store mid-arm, so while it is
-    ///    suspended there NONE of the waiters can be polled.
-    /// 3. So every permit the store actor released went to a waiter that could not run.
-    ///    At >= 100 such futures (the store channel's bound) ahead of it in the FIFO, the
-    ///    arm's own store operation could never acquire a permit -- this task waiting on
-    ///    itself -- and `Processor`/`Helper` starved behind the same queue.
-    ///
-    /// A spawned task is scheduled independently, so an assigned permit is always
-    /// consumed and the deadlock class disappears at any channel capacity. The primary
-    /// already used this shape (`vantage::payload`'s per-key waiters) and never exhibited
-    /// the wedge. Cancellation is unchanged: dropping the `tx_cancel` in `self.pending`
-    /// makes the waiter's `handler.recv()` resolve, which ends the task, so nothing leaks.
-    ///
-    /// Results come back over a bounded channel. A waiter parked on that send holds no
-    /// store permit -- `notify_read` has already completed its own send by then -- so the
-    /// back-pressure here cannot recreate (1).
+    /// Waiters run in separate tasks so store operations and waiter sends cannot block
+    /// this loop. Results return through a bounded channel.
     async fn run(&mut self) {
         let (tx_waiter, mut rx_waiter) =
             channel::<Result<Option<Digest>, StoreError>>(CHANNEL_CAPACITY);
-        // Real transaction latency metrics use deferred retry waiters.
-        // metrics-only retry waiters for deferred misses (see `observe_committed`'s doc
-        // comment) -- structurally the same "wait for `store.notify_read` or be canceled"
-        // shape as the waiters above, just for a different consumer
-        // (`finish_deferred_retry` instead of `self.pending.remove`). Declared
-        // unconditionally so `run` stays well-typed on a non-`benchmark` build, where
-        // nothing ever sends into it.
         let (tx_metrics_waiter, mut rx_metrics_waiter) =
             channel::<Option<(Digest, u64)>>(CHANNEL_CAPACITY);
         #[cfg(not(feature = "benchmark"))]
@@ -277,7 +193,6 @@ impl Synchronizer {
 
         loop {
             tokio::select! {
-                // Handle primary's messages.
                 Some(message) = self.rx_message.recv() => match message {
                     PrimaryWorkerMessage::Synchronize(digests, target) => {
                         let now = SystemTime::now()
@@ -285,28 +200,11 @@ impl Synchronizer {
                             .expect("Failed to measure time")
                             .as_millis();
 
-                        // Drop already-pending digests BEFORE touching the store: dedup
-                        // needs no I/O, and every entry skipped here is one fewer store
-                        // round trip.
                         let candidates: Vec<Digest> = digests
                             .into_iter()
                             .filter(|digest| !self.pending.contains_key(digest))
                             .collect();
 
-                        // ONE store round trip for the whole message, not one per digest.
-                        // The sequential form suspended this arm D times per Synchronize,
-                        // and every suspension was a window in which the waiters could not
-                        // be polled -- the amplifier of the deadlock described on `run`.
-                        // At the measured 793-958 Synchronize/s on a wedged node, with
-                        // multi-digest messages, that was thousands of suspensions/s.
-                        //
-                        // Deviation from the per-key form: `read_many` reports an
-                        // unreadable key as `None`, indistinguishable from absent (it logs
-                        // per key -- see `StoreCommand::ReadMany`), where a single
-                        // `continue`d and created no waiter. Treating an error as missing
-                        // is the safe direction: re-requesting a batch we may already hold
-                        // wastes bandwidth, whereas failing to request one we lack is a
-                        // liveness bug.
                         let present = if candidates.is_empty() {
                             Vec::new()
                         } else {
@@ -318,13 +216,11 @@ impl Synchronizer {
                         let mut missing = Vec::new();
                         for (digest, found) in candidates.into_iter().zip(present) {
                             if found.is_some() {
-                                // The batch arrived in the meantime: no need to request it.
                                 continue;
                             }
                             missing.push(digest.clone());
                             debug!("Requesting sync for batch {}", digest);
 
-                            // SPAWNED, not pushed onto a `FuturesUnordered` -- see `run`.
                             let (tx_cancel, rx_cancel) = channel(1);
                             let store = self.store.clone();
                             let tx_result = tx_waiter.clone();
@@ -338,8 +234,6 @@ impl Synchronizer {
                             self.pending.insert(digest, (self.round, tx_cancel, now));
                         }
 
-                        // Send sync request to a single node. If this fails, we will send it
-                        // to other nodes when a timer times out.
                         let address = match self.committee.worker(&target, &self.id) {
                             Ok(address) => address.worker_to_worker,
                             Err(e) => {
@@ -352,10 +246,8 @@ impl Synchronizer {
                         self.network.send_typed(address, Bytes::from(serialized), "BatchRequest").await;
                     },
                     PrimaryWorkerMessage::Cleanup(round) => {
-                        // Keep track of the primary's round number.
                         self.round = round;
 
-                        // Cleanup internal state.
                         if self.round < self.gc_depth {
                             continue;
                         }
@@ -368,20 +260,10 @@ impl Synchronizer {
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
                     }
-                    // Benchmark-only: extracting/observing per-tx timestamps on every
-                    // committed batch is pure overhead outside instrumented runs --
-                    // both parameters genuinely go unused on the default build, hence
-                    // the feature-scoped allow (not dead code to delete).
                     #[cfg_attr(not(feature = "benchmark"), allow(unused_variables))]
                     PrimaryWorkerMessage::Committed(commit_millis, digests) => {
-                        // Record real transaction latency when benchmarking is enabled.
                         #[cfg(feature = "benchmark")]
                         for miss in self.observe_committed(commit_millis, digests).await {
-                            // SPAWNED, for the same reason as the sync waiters -- see
-                            // `run`. These are the more dangerous of the two families:
-                            // there is one per deferred commit miss, so a node that is
-                            // behind accumulates them exactly when it can least afford an
-                            // unpollable permit holder.
                             let store = self.store.clone();
                             let tx_result = tx_metrics_waiter.clone();
                             tokio::spawn(async move {
@@ -398,21 +280,14 @@ impl Synchronizer {
                     }
                 },
 
-                // A sync waiter finished (batch landed, or the wait was canceled).
                 Some(result) = rx_waiter.recv() => match result {
                     Ok(Some(digest)) => {
-                        // We got the batch, remove it from the pending list.
                         self.pending.remove(&digest);
                     },
-                    Ok(None) => {
-                        // The sync request for this batch has been canceled.
-                    },
+                    Ok(None) => {},
                     Err(e) => error!("{}", e)
                 },
 
-                // A deferred commit-metrics miss either resolved (its batch landed in
-                // the store) or was canceled (pruned as stale by `prune_stale`) --
-                // see `observe_committed`'s doc comment and `metrics_waiter`.
                 Some(resolved) = rx_metrics_waiter.recv() => {
                     #[cfg(feature = "benchmark")]
                     if let Some((digest, commit_millis)) = resolved {
@@ -422,11 +297,7 @@ impl Synchronizer {
                     let _ = resolved;
                 },
 
-                // Triggers on timer's expiration.
                 () = &mut timer => {
-                    // We optimistically sent sync requests to a single node. If this timer triggers,
-                    // it means we were wrong to trust it. We are done waiting for a reply and we now
-                    // broadcast the request to a bunch of other nodes (selected at random).
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .expect("Failed to measure time")
@@ -439,15 +310,6 @@ impl Synchronizer {
                             retry.push(digest.clone());
                         }
                     }
-                    // REFRESH the timestamps of everything just retried, or this is not a
-                    // retry timer -- it is a re-broadcast-everything-forever timer. The
-                    // timestamp is set once at `pending.insert` and was never updated here,
-                    // so a digest that went one `sync_retry_delay` without arriving was
-                    // re-broadcast on EVERY subsequent tick for as long as it stayed
-                    // pending: unbounded request amplification, growing with the size of the
-                    // backlog, aimed at a worker that is by definition already behind.
-                    // Measured on the 2026-08-08 n=50 @200k netem run alongside the
-                    // primary-side twin in `vantage::payload::sync_batches`.
                     for digest in &retry {
                         if let Some((_, _, timestamp)) = self.pending.get_mut(digest) {
                             *timestamp = now;
@@ -465,54 +327,15 @@ impl Synchronizer {
                             .await;
                     }
 
-                    // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
                 },
             }
         }
     }
 
-    /// For each
-    /// batch the primary just told us was committed, read it from our local store and
-    /// observe every contained transaction's TWO latency series --
-    /// `transaction_committed_latency` (`commit_millis`, the primary's own instant
-    /// taken once at its "Committed" log site and carried in the notification, minus
-    /// the embedded submission timestamp -- never `SystemTime::now()` read here,
-    /// which would additionally include the primary->worker notification hop and
-    /// this task's own queueing delay under load) and `transaction_materialised_
-    /// latency` (this call's own "now" minus the same submission timestamp; see that
-    /// field's doc comment on `Metrics` for the reference-comparable semantics this
-    /// adds). The two are nearly identical for an immediate hit; for a digest that
-    /// missed and was later resolved by `finish_deferred_retry`, `commit_millis`
-    /// stays the ORIGINAL instant while the materialised series uses the LATER retry
-    /// instant -- the gap between the two series is exactly the payload-availability
-    /// cost a miss represents.
-    ///
-    /// Fixes a measurement bug: a miss (possible even for our own batches under GC,
-    /// and EXPECTED for a remote author's batch that hasn't yet arrived via
-    /// worker-to-worker gossip -- the normal case the primary commits ahead of) used
-    /// to be dropped, via an `observed_commits.insert` that ran BEFORE the store read
-    /// -- so a digest that missed was permanently marked "observed" and could never
-    /// be counted even once it actually arrived, silently undercounting
-    /// `committed_transactions`/`committed_bytes` and both latency histograms. Fixed
-    /// by deferring instead of dropping: `observed_commits` is only inserted into
-    /// after a genuinely successful read+deserialize (`mark_observed`, called from
-    /// either this function's hot loop or `finish_deferred_retry`'s later
-    /// resolution -- never from a failed attempt of any kind), and a miss is
-    /// recorded in `pending_misses` (keyed by this digest's ORIGINAL `commit_millis`)
-    /// instead. This function returns the newly-deferred misses so its caller
-    /// (`run`) can start an event-driven `metrics_waiter` retry for each -- backed by
-    /// `store.notify_read`, which resolves exactly when the batch lands, whichever of
-    /// `Processor`'s two spawned instances (own or others' batches; both write
-    /// through the same `Store`) performs that write. Never polled.
-    ///
-    /// Gated on `Metrics::metrics_active`:
-    /// `RealCommitHandler::transaction_observer`'s identical early return) -- late
-    /// commits during warmup/wind-down would otherwise skew TPS, the latency
-    /// distribution, and the bandwidth-efficiency denominator, exactly as they would
-    /// for reference. `prune_stale` runs unconditionally, BEFORE the gate: bounding
-    /// memory is not a rate metric and must keep working even while inactive (e.g. a
-    /// deployment that never activates metrics at all).
+    /// Record committed transaction metrics and defer missing batches until they arrive.
+    /// The committed latency uses the primary's commit time; materialised latency uses
+    /// the local read time. Both are collected only while metrics are active.
     #[cfg(feature = "benchmark")]
     async fn observe_committed(
         &mut self,
@@ -525,22 +348,12 @@ impl Synchronizer {
             return Vec::new();
         }
 
-        // Captured once per call (not once per digest/transaction), same discipline
-        // as `commit_millis` itself -- see this function's own doc comment.
         let materialised_now_millis = now_millis();
 
-        // Accumulated locally and flushed once at the end of the call (one atomic
-        // `inc_by` per counter instead of one per transaction) -- at 240k tx/s that's
-        // the difference between a handful of atomic ops per `Committed` message and
-        // one per transaction. Only the histogram observations are inherently
-        // per-transaction (each has its own latency value); they're already a
-        // lock-free channel push, not an atomic increment, so batching them
-        // wouldn't help -- see `read_and_observe_batch`.
         let mut totals = BatchLatencyTotals::default();
         let mut deferred = Vec::new();
 
         for digest in digests {
-            // Dedup: a digest we've already counted is a no-op.
             if self.observed_commits.contains(&digest) {
                 continue;
             }
@@ -564,9 +377,7 @@ impl Synchronizer {
                         cancel: cancel_rx,
                     });
                 }
-                BatchReadOutcome::Error => {
-                    // Already logged inside `read_and_observe_batch`.
-                }
+                BatchReadOutcome::Error => {}
             }
         }
 
@@ -574,18 +385,11 @@ impl Synchronizer {
         deferred
     }
 
-    /// Resolution side of a deferred miss (see `observe_committed`'s doc comment):
-    /// called once `metrics_waiter` confirms `digest`'s batch landed in the store.
-    /// `commit_millis` is the ORIGINAL instant preserved in `pending_misses` and
-    /// carried by the waiter future, never this call's own time.
+    /// Record metrics after a deferred batch arrives in the store.
     #[cfg(feature = "benchmark")]
     async fn finish_deferred_retry(&mut self, digest: Digest, commit_millis: u64) {
-        // Bookkeeping cleanup happens regardless of the dedup/active-window outcome
-        // below -- an entry that resolved is no longer pending, full stop.
         self.pending_misses.remove(&(commit_millis, digest.clone()));
 
-        // Defensive dedup (see `observed_commits`'s doc comment): a no-op unless the
-        // same digest was somehow committed twice.
         if self.observed_commits.contains(&digest) {
             return;
         }
@@ -604,17 +408,6 @@ impl Synchronizer {
                 self.flush_totals(&totals);
             }
             BatchReadOutcome::Miss => {
-                // `metrics_waiter` only resolves `Some` after `store.notify_read`
-                // confirms the write happened -- immediately re-reading the same key
-                // through the same single-threaded store actor (`store::Store`'s
-                // internal command queue is strictly FIFO: `NotifyRead`'s pending
-                // senders are drained synchronously inside the SAME `Write` command
-                // that unblocks them, before the actor moves on to whatever is queued
-                // after our subsequent `Read`) should always see it. Not re-deferred:
-                // a second `notify_read` on the same key could only resolve on a
-                // SECOND write to it, which nothing in this codebase ever does --
-                // re-deferring would risk a wait that never resolves rather than
-                // self-heal.
                 log::warn!(
                     "Deferred batch {} still missing immediately after its store \
                      write notification fired; dropping (will not retry again)",
@@ -625,15 +418,7 @@ impl Synchronizer {
         }
     }
 
-    /// Wall-clock GC for the two benchmark-only bookkeeping structures this fix adds
-    /// (`observed_commits`/`observed_commits_order`, and `pending_misses`), run on
-    /// every `Committed` notification -- never a background poll. Evicts entries
-    /// older than `now_millis - BENCHMARK_METRICS_RETENTION_MILLIS` via `split_off`
-    /// at that floor (never a `retain` scan -- see `observed_commits_order`'s doc
-    /// comment). A pruned pending-miss's waiter is explicitly canceled (mirrors
-    /// `PrimaryWorkerMessage::Cleanup`'s identical cancellation of stale `pending`
-    /// sync-waiters just above in this file) rather than left to wait on a
-    /// `notify_read` that may now never resolve.
+    /// Prune old benchmark metric state and cancel its waiters.
     #[cfg(feature = "benchmark")]
     async fn prune_stale(&mut self, now_millis: u64) {
         let floor = now_millis.saturating_sub(BENCHMARK_METRICS_RETENTION_MILLIS);
@@ -653,22 +438,14 @@ impl Synchronizer {
         }
     }
 
-    /// Marks `digest` as counted, keyed by the commit instant it was actually
-    /// counted at -- see `observed_commits_order`'s doc comment for why both
-    /// structures are always updated together.
+    /// Mark a digest as counted and index it by commit time.
     #[cfg(feature = "benchmark")]
     fn mark_observed(&mut self, digest: Digest, commit_millis: u64) {
         self.observed_commits.insert(digest.clone());
         self.observed_commits_order.insert((commit_millis, digest));
     }
 
-    /// Reads+deserializes `digest`'s batch and computes every contained
-    /// transaction's committed/materialised latency contribution, WITHOUT touching
-    /// the shared counters itself -- the caller decides how to accumulate/flush
-    /// those (batched across a whole `Committed` message in `observe_committed`'s
-    /// hot loop, or immediately for `finish_deferred_retry`'s single resolved
-    /// digest). The histogram observations themselves (already a lock-free channel
-    /// push) happen here either way, since batching those wouldn't help.
+    /// Read a batch, record its transaction latency, and return aggregate counters.
     #[cfg(feature = "benchmark")]
     async fn read_and_observe_batch(
         &mut self,
@@ -693,34 +470,19 @@ impl Synchronizer {
             }
         };
         let WorkerMessage::Batch(transactions) = message else {
-            // Genuinely deserialized, just not the variant expected at this key --
-            // still a "successful read+deserialize" (see `observe_committed`'s doc
-            // comment), so the caller still marks it observed; nothing to add to the
-            // totals.
             return BatchReadOutcome::Hit(BatchLatencyTotals::default());
         };
 
         let mut totals = BatchLatencyTotals::default();
         for tx in transactions {
-            // §4 wire format: [1 B marker][8 B id, BE][8 B submission timestamp, LE].
-            // A transaction shorter than the header (should not happen once every
-            // client is on the current format) is skipped rather than indexed into.
+            // Format: marker, big-endian ID, little-endian submission timestamp.
             if tx.len() < 17 {
                 continue;
             }
             let submitted_millis = u64::from_le_bytes(tx[9..17].try_into().unwrap());
-            // Metrics-active window (see `Metrics::active_from_millis`): a transaction
-            // SUBMITTED before the window opened is skipped outright -- it contributes
-            // to neither latency series nor the committed counters. Gating on the
-            // submission instant rather than the commit instant is the point: the
-            // startup transient is exactly the population that was submitted while the
-            // committee was still forming, and those are the observations that pinned
-            // p99 near 3.5s. A no-op (`from == 0`) unless the harness set the window.
             if !self.metrics.counts_toward_metrics(submitted_millis) {
                 continue;
             }
-            // saturating_sub: tolerate any clock skew between client and node
-            // instead of panicking (NTP-grade sync is assumed, not enforced).
             let committed_latency =
                 Duration::from_millis(commit_millis.saturating_sub(submitted_millis));
             let materialised_latency =
@@ -747,10 +509,7 @@ impl Synchronizer {
         BatchReadOutcome::Hit(totals)
     }
 
-    /// Flushes one batch's (or one call's accumulated multi-batch) totals into the
-    /// shared counters -- see `read_and_observe_batch`'s doc comment for why this is
-    /// split out from it. A no-op when `totals.tx_count == 0` (nothing observed),
-    /// matching the pre-existing `if tx_count > 0` guard this replaced.
+    /// Flush accumulated transaction totals into shared counters.
     #[cfg(feature = "benchmark")]
     fn flush_totals(&self, totals: &BatchLatencyTotals) {
         if totals.tx_count == 0 {
@@ -766,12 +525,7 @@ impl Synchronizer {
         self.metrics.committed_bytes.inc_by(totals.tx_bytes);
     }
 
-    /// Mirrors `waiter` (this file's existing primary-sync retry-wait) for a
-    /// deferred commit-metrics miss: waits for `digest`'s batch to land in the
-    /// store, or for its own cancellation (the entry was pruned as stale by
-    /// `prune_stale`), carrying `digest` and its ORIGINAL `commit_millis` forward on
-    /// success so `finish_deferred_retry` needs no separate index to recover them.
-    /// `None` on cancellation, exactly like `waiter`'s own `Ok(None)`.
+    /// Wait for a deferred batch or cancellation.
     #[cfg(feature = "benchmark")]
     async fn metrics_waiter(
         digest: Digest,

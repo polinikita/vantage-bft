@@ -35,7 +35,6 @@ class LogParser:
             self.committee_size = '?'
             self.workers = '?'
 
-        # Parse the clients logs.
         try:
             with Pool() as p:
                 results = p.map(self._parse_clients, clients)
@@ -45,7 +44,6 @@ class LogParser:
             = zip(*results)
         self.misses = sum(misses)
 
-        # Parse the primaries logs.
         try:
             with Pool() as p:
                 results = p.map(self._parse_primaries, primaries)
@@ -55,7 +53,6 @@ class LogParser:
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
 
-        # Parse the workers logs.
         try:
             with Pool() as p:
                 results = p.map(self._parse_workers, workers)
@@ -120,9 +117,6 @@ class LogParser:
 
         configs = {
             'protocol': search(r'Protocol: (\w+)', log).group(1),
-            #'timeout_delay': int(
-            #    search(r'Timeout delay .* (\d+)', log).group(1)
-            #),
             'header_size': int(
                 search(r'Header size .* (\d+)', log).group(1)
             ),
@@ -165,9 +159,7 @@ class LogParser:
         return sizes, samples, ip
 
     def _parse_worker_metrics(self, text):
-        '''Extract latency gauges and counters from a Prometheus scrape.
-
-        Return `None` when the worker has not recorded a transaction.'''
+        '''Extract latency metrics from a Prometheus scrape.'''
         def gauge(name, label):
             m = search(name + r'\{v="' + label + r'"\} (\d+)', text, MULTILINE)
             return int(m.group(1)) if m else None
@@ -191,10 +183,7 @@ class LogParser:
         }
 
     def _real_transaction_latency(self):
-        '''Aggregate latency metrics across workers.
-
-        Counts and misses use the maximum. Averages use summed moments, and
-        percentiles use the median of the worker values.'''
+        '''Aggregate worker metrics using summed moments and median percentiles.'''
         if not self.real_latency:
             return None
 
@@ -223,10 +212,7 @@ class LogParser:
         }
 
     def _prometheus_committed_tps(self):
-        '''Return committed transactions per second from Prometheus metrics.
-
-        Use the configured duration, or the observed end-to-end window when
-        the configured duration is unavailable.'''
+        '''Return committed TPS using the configured duration or observed run window.'''
         real_latency = self._real_transaction_latency()
         if real_latency is None:
             return None
@@ -240,7 +226,7 @@ class LogParser:
         return real_latency['count'] / duration
 
     def committed_tps(self):
-        '''Return Prometheus-derived committed TPS, or `None` if unavailable.'''
+        '''Return Prometheus-derived committed TPS.'''
         return self._prometheus_committed_tps()
 
     def _to_posix(self, string):
@@ -279,7 +265,7 @@ class LogParser:
         for sent, received in zip(self.sent_samples, self.received_samples):
             for tx_id, batch_id in received.items():
                 if batch_id in self.commits:
-                    assert tx_id in sent  # We receive txs that we sent.
+                    assert tx_id in sent  # Only benchmark-submitted transactions count.
                     start = sent[tx_id]
                     end = self.commits[batch_id]
                     if set_first:
@@ -363,7 +349,6 @@ class LogParser:
             f' Transaction size: {self.size[0]:,} B\n'
             f' Execution time: {round(duration):,} s\n'
             '\n'
-            #f' Timeout delay: {timeout_delay:,} ms\n'
             f' Header size: {header_size:,} B\n'
             f' Max header delay: {max_header_delay:,} ms\n'
             f' GC depth: {gc_depth:,} round(s)\n'

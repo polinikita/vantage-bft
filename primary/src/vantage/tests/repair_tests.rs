@@ -657,52 +657,6 @@ async fn recovery_budget_defers_requests_instead_of_dropping_them() {
 }
 
 #[tokio::test]
-async fn eviction_floor_is_unknown_until_every_peer_has_reported() {
-    let (committee, keys) = Committee::local_benchmark(10, 1, 31_000);
-    let (watcher, author) = (keys[0].name, keys[1].name);
-    let n_peers = committee.others_primaries(&watcher).len();
-    let mut rep = wide_repairer(watcher, &committee);
-
-    assert_eq!(
-        rep.universally_held_below(&author),
-        None,
-        "no reports at all"
-    );
-
-    for k in keys.iter().skip(1).take(n_peers - 1) {
-        rep.note_holder(k.name, author, 500);
-    }
-    assert_eq!(
-        rep.universally_held_below(&author),
-        None,
-        "one silent peer must pin the lane, not be treated as height 0"
-    );
-}
-
-#[tokio::test]
-async fn eviction_floor_is_the_slowest_peer_not_a_quorum() {
-    let (committee, keys) = Committee::local_benchmark(10, 1, 32_000);
-    let (watcher, author) = (keys[0].name, keys[1].name);
-    let n_peers = committee.others_primaries(&watcher).len();
-    let mut rep = wide_repairer(watcher, &committee);
-
-    let laggard = keys[1].name;
-    for (i, k) in keys.iter().skip(1).take(n_peers).enumerate() {
-        let height = if k.name == laggard {
-            7
-        } else {
-            1000 + i as u64
-        };
-        rep.note_holder(k.name, author, height);
-    }
-    assert_eq!(
-        rep.universally_held_below(&author),
-        Some(7),
-        "the floor must be the minimum across peers, not a quorum or a median"
-    );
-}
-
-#[tokio::test]
 async fn eviction_drops_only_below_the_cut_and_only_that_author() {
     use crate::vantage::lanes::BlockCache;
     let all = authors();
@@ -861,12 +815,6 @@ async fn sustained_core_queue_pressure_does_not_throttle_recovery_ceiling() {
         RECOVERY_EMIT_MAX,
         "core-queue pressure is not an attributed emit-ceiling signal in this arm"
     );
-    assert_eq!(
-        metrics.vantage_repair_ceiling_halved_by_queue.get(),
-        0,
-        "legacy counter must prove queue backoff is disabled"
-    );
-
     metrics.vantage_bulk_inbound_dropped_total.inc();
     rep.retry_requests();
     assert_eq!(

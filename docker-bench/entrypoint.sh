@@ -1,16 +1,8 @@
 #!/usr/bin/env bash
-# docker-bench container entrypoint: applies this node's tc netem latency, then runs
-# one primary + one worker (id 0) + one benchmark_client, all three backgrounded and
-# logging to the per-node volume. Exits nonzero the moment any of the three dies
-# (see the supervisor loop at the bottom) so `docker compose ps` / `docker inspect`
-# reports a crash instead of silently limping along on two remaining processes.
+# Start one primary, worker, and benchmark client with optional tc netem latency.
+# Exit nonzero if any process exits unexpectedly.
 #
-# Addressing scheme -- NODE_IP_PREFIX/NODE_IP_OFFSET come from the environment
-# (gen.py-generated compose file), NOT hardcoded here, so a `gen.py --subnet-base`
-# override actually takes effect at runtime and not just in committee.json/the
-# compose file's own IPs. The transactions port itself IS a fixed constant (every
-# container uses the identical 8-port layout -- see docker-bench/gen.py's module
-# docstring), since distinct container IPs already make that safe.
+# Node addresses come from the generated environment; the transaction port is fixed.
 set -euo pipefail
 
 : "${NODE_INDEX:?NODE_INDEX must be set}"
@@ -83,10 +75,6 @@ graceful_stop() {
 trap graceful_stop INT TERM
 trap cleanup EXIT
 
-# Supervisor: as long as primary, worker AND client are all still alive, keep looping.
-# The moment any one of them exits (crash, or an unhandled error) fall through to the
-# nonzero exit below -- `docker compose down`/SIGTERM take the graceful_stop path
-# above instead, which exits 0.
 while kill -0 "$PRIMARY_PID" 2>/dev/null && kill -0 "$WORKER_PID" 2>/dev/null && kill -0 "$CLIENT_PID" 2>/dev/null; do
     sleep 1
 done

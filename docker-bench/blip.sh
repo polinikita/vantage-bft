@@ -1,27 +1,5 @@
 #!/usr/bin/env bash
-# blip.sh <i> <j|all> <seconds> drop|cut
-#
-# Host-side link-disruption orchestrator: for `seconds`, isolates node i from node j
-# (or from every other node, with `all`) by `docker exec`-ing iptables rules into
-# container i, then removes them (idempotent cleanup via trap -- Ctrl-C mid-blip still
-# cleans up).
-#
-#   drop  -- iptables ... -j DROP: packets to/from the peer are silently discarded.
-#            No RST, no ICMP unreachable. Existing TCP connections do not get an
-#            explicit teardown signal -- they just stop getting ACKs, so peers see
-#            retransmits/timeouts and eventually the OS-level keepalive/retry gives up.
-#            This is "pause" semantics: if the outage ends before either side's
-#            retransmission gives up, the SAME TCP connection resumes as if nothing
-#            happened (no reconnect, no lost socket state).
-#   cut   -- iptables ... -j REJECT --reject-with tcp-reset: an immediate RST is sent
-#            for both directions, actively tearing down any open TCP connection between
-#            the two nodes right away. This exercises the disconnect/reconnect path
-#            (new TCP handshake, `network` crate's own retry/backoff) rather than a
-#            silent pause.
-#
-# Usage:
-#   docker-bench/blip.sh 0 1 5 drop     # isolate node 0 <-> node 1 for 5s, pause semantics
-#   docker-bench/blip.sh 2 all 10 cut   # isolate node 2 from everyone for 10s, reset semantics
+# Drop or reject traffic between two nodes. Restore rules on exit.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,45 +49,21 @@ else
     [ "$J" -ne "$I" ] || { echo "blip.sh: i and j must differ" >&2; exit 2; }
     PEER_IPS=("$(node_ip "$J")")
 fi
-# Guards every "${PEER_IPS[@]}" expansion below against bash's own long-standing
-# nounset-vs-empty-array quirk (pre-4.4 bash treats "${arr[@]}" on a truly empty array
-# as an unbound-variable error under `set -u`; macOS still ships bash 3.2 as /bin/bash)
-# -- rather than relying on a `${arr[@]+"${arr[@]}"}` idiom at every use site, just
-# reject the one input combination (a single-node cluster with `all`) that could ever
-# make this array empty, since there is nothing meaningful to blip there anyway.
+# Require at least one peer.
 [ "${#PEER_IPS[@]}" -gt 0 ] || { echo "blip.sh: no peer(s) to disrupt (single-node cluster?)" >&2; exit 2; }
 
-# `iptables_rule <-I|-D> <INPUT|OUTPUT> <-s|-d> <ip>`: branches on $MODE directly
-# rather than building a shared "extra args" array, so no call site needs to expand a
-# possibly-empty array under `set -u` (same bash-3.2 concern as above).
-#
-# In cut mode, apply the rule in both directions: the INPUT
-# REJECT generates an RST toward the peer, but that RST is a locally-generated
-# packet and traverses THIS node's OUTPUT chain -- where the plain OUTPUT REJECT
-# ate it. Peers therefore never learned their connections died: from their side
-# the "cut" silently degraded to `drop` (pause) semantics -- TCP retransmitted
-# into the void and the SAME socket resumed after restore, so only this node's
-# own outbound sockets ever saw a reset (local RSTs from the OUTPUT REJECT).
-# The `--tcp-flags RST RST -j ACCEPT` rule, inserted ABOVE the OUTPUT REJECT,
-# lets outbound RSTs (and only RSTs -- a bare RST carries no payload, so this
-# leaks no data) through, making the cut symmetric: both sides' established
-# connections reset promptly, both sides' reconnect SYNs are refused fast, and
-# both sides exercise the reconnect path the `cut` mode exists to test.
+# Build mode-specific rules without empty arrays under `set -u`.
+# In cut mode, allow local RSTs before rejecting other output.
 iptables_rule() {
     if [ "$MODE" = drop ]; then
         dexec iptables "$1" "$2" "$3" "$4" -j DROP
     else
-        # `--reject-with tcp-reset` is only valid on a rule that matches TCP
-        # (`-p tcp`) -- without it, nf_tables iptables refuses the insert with
-        # "RULE_INSERT failed (Invalid argument)". All inter-node protocol
-        # traffic is TCP, so matching `-p tcp` loses nothing.
+        # `--reject-with tcp-reset` requires a TCP match on nf_tables iptables.
         dexec iptables "$1" "$2" "$3" "$4" -p tcp -j REJECT --reject-with tcp-reset
     fi
 }
 
-# The RST-passthrough exception for cut mode (see the block comment above). Only
-# ever installed/removed on OUTPUT, above the REJECT rule (`-I OUTPUT` after the
-# REJECT was inserted puts this at position 1, in front of it).
+# Allow locally generated RST packets.
 rst_passthrough() {
     dexec iptables "$1" OUTPUT -d "$2" -p tcp --tcp-flags RST RST -j ACCEPT
 }
@@ -142,5 +96,3 @@ echo "blip.sh: ${MODE} node ${I} (${CONTAINER}) <-> ${J} [${PEER_IPS[*]}] for ${
 apply
 sleep "$SECONDS_ARG"
 echo "blip.sh: restoring node ${I} <-> ${J}"
-# Cleanup itself runs via the EXIT trap (fires exactly once, on normal completion,
-# Ctrl-C, or TERM alike) -- not called again here.

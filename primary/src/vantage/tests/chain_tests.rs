@@ -350,17 +350,18 @@ async fn checkpoint_reconciliation_replaces_an_uncommitted_local_fork() {
         "the recovered chain is valid"
     );
     let blocks = recovering.blocks_handle();
-    let cache = blocks.lock();
-    let next_entry = cache.get(&next.id).expect("new block is cached");
-    let anchor_entry = cache
-        .get(&committed_two.id)
-        .expect("recovered anchor is cached");
-    assert!(
-        next_entry.direct && next_entry.payload_ok && next_entry.direct_prefix_verified,
-        "new block must pass the seeded direct-prefix gate"
-    );
-    assert!(anchor_entry.direct_prefix_verified);
-    drop(cache);
+    {
+        let cache = blocks.lock();
+        let next_entry = cache.get(&next.id).expect("new block is cached");
+        let anchor_entry = cache
+            .get(&committed_two.id)
+            .expect("recovered anchor is cached");
+        assert!(
+            next_entry.direct && next_entry.payload_ok && next_entry.direct_prefix_verified,
+            "new block must pass the seeded direct-prefix gate"
+        );
+        assert!(anchor_entry.direct_prefix_verified);
+    }
     assert!(
         recovering.direct_pub(&next_ref),
         "the recovered anchor enables direct publication"

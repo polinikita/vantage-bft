@@ -1,30 +1,6 @@
 #!/usr/bin/env bash
-# Host-side (macOS) provisioning for running docker-bench on a native-arm64
-# Colima Linux VM instead of Docker Desktop.
-#
-# WHY THIS EXISTS. Docker Desktop's VM defaults to a small slice of the host
-# (measured here: 4 CPUs / 15.6 GB on a 14-core / 48 GB machine). A docker-bench
-# cluster runs 3 processes per node (primary + worker + client), so even n=4
-# oversubscribes 4 CPUs threefold -- and the symptom is not a clean slowdown but
-# nondeterministic protocol stalls: consensus timeouts are wall-clock, so a
-# descheduled primary looks exactly like a crashed one to its peers. Runs on the
-# starved VM produced 68 tx/s outliers and multi-second dead windows that never
-# reproduced with adequate CPU. Any measurement taken there is worthless for
-# protocol comparison. This script provisions a VM sized for the real workload.
-#
-# Modeled on dev-tools/iota-private-network/experiments/colima-up.sh in the iota
-# repo (same author, same host): native aarch64, vz + virtiofs.
-#
-# UNLIKE that script, nothing is cloned into the VM and no experiment runs inside
-# it. Colima mounts $HOME read-WRITE under virtiofs (verified), and `colima start`
-# points the host docker CLI at this VM's daemon -- so `docker-bench/run.sh` is
-# driven from macOS exactly as before and only the daemon moves. That matters
-# because gen.py shells out to a native `cargo`/`node` binary for key generation,
-# which exists on the Mac and not in the VM. Everything the experiment needs on
-# Linux (tc netem, iptables) runs INSIDE the containers, which already ship
-# iproute2/iptables and hold NET_ADMIN, so the VM itself needs no provisioning.
-# Per-node RocksDB bind mounts land on the Mac filesystem over virtiofs; fine at
-# these rates, revisit if an I/O-heavy configuration says otherwise.
+# Start a native-arm64 Colima VM for Docker benchmarks on macOS.
+# Containers provide Linux networking tools and store RocksDB data through virtiofs.
 #
 # Usage:   ./colima-up.sh      (idempotent; reuses a running VM)
 # Verify:  docker context ls   -> colima-<profile> should be CURRENT
@@ -49,8 +25,7 @@ else
         --vm-type vz --mount-type virtiofs
 fi
 
-# `colima start` already switches the active docker context; make it explicit so a
-# re-run against an already-running VM also leaves the CLI pointed at it.
+# Select the active Docker context.
 docker context use "colima-$PROFILE" >/dev/null
 
 say "Active docker daemon"

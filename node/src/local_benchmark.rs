@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Run primaries, workers, and clients in one process and generate Prometheus targets.
+// Run a complete local benchmark in one process.
 
 use crate::client::{Client, TransactionMode};
 use crate::CHANNEL_CAPACITY;
@@ -20,9 +20,7 @@ use store::{Store, StoreProfile};
 use tokio::sync::mpsc::channel;
 use worker::Worker;
 
-/// clippy::type_complexity: named alias for `spawn_node_primary`/`spawn_node_workers`'s
-/// shared return shape -- (this node's metrics registry, its periodic reporter, and
-/// its own (label, address) scrape target for `prometheus.yaml`).
+/// Metrics registry, reporter, and Prometheus target for one node component.
 type NodeMetricsHandle = (
     prometheus::Registry,
     Arc<MetricReporter>,
@@ -75,8 +73,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         nodes
     );
     let live_nodes = nodes - crash;
-    // Load-skew: absent defaults to every live node. The loaded set is the first
-    // `load_nodes` live indices; crashed nodes are outside this range.
     let load_nodes: usize = match matches.get_one::<String>("load-nodes") {
         Some(s) => s
             .parse()
@@ -94,12 +90,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         load_nodes,
         live_nodes
     );
-    // Data-plane withholding fault injector: indexed over the FULL committee (0-based,
-    // sorted order), the same universe `--crash`/`--load-nodes` share -- not clamped to
-    // `live_nodes`, since a withholding sender index that happens to fall in the
-    // crashed (trailing) range is simply never spawned at all, a harmless no-op rather
-    // than an error (see `withheld_destinations`'s own doc comment for the derivation
-    // every node performs locally).
     let withhold: usize = matches
         .get_one::<String>("withhold")
         .unwrap()
@@ -111,8 +101,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold,
         nodes
     );
-    // An absent withholding window applies for the full run. `--withhold-at 0`
-    // starts withholding at the measurement start.
     let withhold_at_secs: Option<u64> = matches
         .get_one::<String>("withhold-at")
         .map(|s| {
@@ -161,10 +149,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .context("--ack-watermark-period-ms must be a non-negative integer")?;
     let ack_watermarks = !matches.get_flag("no-ack-watermarks");
     let echo_avail_claims = ack_watermarks && !matches.get_flag("no-echo-avail-claims");
-    // Enable the timeline when requested or when a withholding window is configured.
     let timeline: bool = matches.get_flag("timeline") || withhold_at_secs.is_some();
-    // A latency table takes precedence over a uniform value. An explicit zero
-    // selects loopback latency; omitting both options selects the AWS RTT table.
     let mimic_latency_ms: u64 = matches
         .get_one::<String>("mimic-latency-ms")
         .unwrap()
@@ -259,7 +244,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         );
     }
     if withhold > 0 {
-        // Report the reachable half, including the withholding sender.
         let reachable = nodes - nodes / 2;
         match withhold_at_secs {
             Some(at) => println!(
@@ -280,64 +264,39 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     }
     println!("======================================\n");
 
-    // Recreate the benchmark data directory.
     let _ = fs::remove_dir_all(&data_dir);
     fs::create_dir_all(&data_dir).context("Failed to create --data-dir")?;
 
-    // Committee + parameters generated in-memory (config::Committee::local_benchmark);
-    // written to --data-dir for reference/debugging only -- nothing re-reads them, they
-    // are not the source of truth the way committee.json/parameters.json are for `fab`.
     let (committee, keypairs) = Committee::local_benchmark(nodes, workers, base_port);
     committee
         .export(data_dir.join("committee.json").to_str().unwrap())
         .context("Failed to write committee.json")?;
 
-    // Data-plane withholding fault injector, time-windowed variant: the shared,
-    // in-process "has the window opened yet" cell (see `Parameters::withhold_window`'s
-    // own doc comment) -- created empty here, BEFORE any node spawns, and cloned into
-    // every node's own `Parameters` below; armed (via `.set(..)`) once `run_start` is
-    // known, further down. `None` whenever `--withhold-at` isn't given, so no cell is
-    // even allocated on the default (unwindowed or disabled) path.
     let withhold_window_cell: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>> =
         withhold_at_secs.map(|_| Arc::new(OnceLock::new()));
 
     let mut parameters = Parameters {
         protocol,
         delta_ms,
-        // Use the same delay base for Simple-IT and Vantage.
-        // theta_E/theta_R rather than leaving it on Autobahn's unrelated 5s default.
-        // The timer is inactive on the fault-free path. The factors match the
-        // protocol delay bounds.
         timeout_delay: match protocol {
             Protocol::SimpleIt => delta_ms.saturating_mul(8),
-            // The Bracha variant uses a five-delay timeout.
             Protocol::SimpleItBracha => delta_ms.saturating_mul(5),
             _ => Parameters::default().timeout_delay,
         },
         max_batch_delay: max_batch_delay_ms,
         max_header_delay: max_header_delay_ms,
-        // Transport-level batching: ON by default (5 ms / 64 KB per-destination
-        // coalescing); --no-batch-messages restores unbatched framing.
         batch_messages: !matches.get_flag("no-batch-messages"),
         batch_max_bytes,
         batch_max_delay_ms,
-        // Enable all-to-all transport only when requested.
         all_to_all: matches.get_flag("all-to-all"),
         ack_watermarks,
         echo_avail_claims,
         ack_watermark_period_ms,
         digest_statements: !matches.get_flag("no-digest-statements"),
         withhold_senders: withhold,
-        // Data-plane withholding fault injector, time-windowed variant:
-        // `withhold_at_ms`/`withhold_for_ms` are meaningless/unused whenever
-        // `withhold_at_secs` is absent (whole-run withholding -- see
-        // `config::withhold_active`'s own doc comment). `withhold_window` is the
-        // shared cell created just above -- `#[serde(skip)]`, same
-        // never-round-trips-through-JSON treatment as `latency_table` below.
         withhold_at_ms: withhold_at_secs.map(|secs| secs * 1000),
         withhold_for_ms: withhold_for_secs * 1000,
         withhold_window: withhold_window_cell.clone(),
-        // This field is in-memory only and is not exported to parameters.json.
         latency_table: latency_table.map(Arc::new),
         ..Parameters::default()
     };
@@ -352,13 +311,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             .context("Failed to write node keypair")?;
     }
 
-    // Keep the full committee and spawn only the live prefix.
     let live_keypairs = &keypairs[..live_nodes];
 
-    // Every LIVE worker's client-facing address -- every client task waits for all of
-    // these before sending (mirrors `benchmark_client --nodes`); a crashed node's
-    // address must NOT appear here, or every client would wait forever on an address
-    // nobody is listening on.
     let all_worker_addresses: Vec<SocketAddr> = live_keypairs
         .iter()
         .flat_map(|keypair| {
@@ -366,30 +320,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             authority.workers.values().map(|w| w.transactions)
         })
         .collect();
-    // Offered rate scaled to the LOADED clients only (R2 + load-skew): the same
-    // aggregate --rate is divided among however many senders actually exist --
-    // `load_nodes` of them, not `live_nodes` -- so each loaded client's own
-    // per-client rate rises to compensate; the aggregate offered load is unchanged by
-    // which nodes crashed OR by how many live nodes are unloaded. `load_nodes ==
-    // live_nodes` (the default) recovers the original divisor exactly.
     let rate_share = rate.div_ceil((load_nodes * workers).max(1) as u64);
 
-    // Spawn every primary and every worker natively, in this one process -- only for
-    // the live nodes (R2).
-    // Keep metrics grouped by node. With `--workers >
-    // 1`, each worker's own registry only ever observes the slice of the committed
-    // stream tagged with ITS OWN worker id (`Synchronizer::observe_committed`), so
-    // summing every worker belonging to the same node recovers that node's true
-    // committed total; only THEN is it comparable across nodes (see `print_results`).
     let mut worker_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
-    // `vantage_seals` lives on each primary's own
-    // registry (distinct from `worker_metrics` above) -- kept per node index so the
-    // RESULTS block can print each node's own route breakdown (they can legitimately
-    // differ across nodes) plus a summed total.
     let mut primary_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
-    let mut metrics_targets: Vec<(String, SocketAddr)> = Vec::new(); // (label, addr) for prometheus.yaml
-                                                                     // Client task handles for shutdown.
-                                                                     // before the final, drained re-read -- see the end of this fn.
+    let mut metrics_targets: Vec<(String, SocketAddr)> = Vec::new();
     let mut client_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     for (i, keypair) in keypairs.into_iter().take(live_nodes).enumerate() {
@@ -402,10 +337,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         primary_metrics.push((i, primary_registry, primary_reporter));
         metrics_targets.push(primary_target);
 
-        // Load-skew: `i` ranges over live node indices only (`.take(live_nodes)`
-        // below), so "first `load_nodes` of these" is exactly the loaded set --
-        // already disjoint from the crashed (trailing) indices by construction; see
-        // the `load_nodes` validation above for the same interplay spelled out.
         let client_rate_share = (i < load_nodes).then_some(rate_share);
         let (workers_spawned, workers_client_handles) = spawn_node_workers(
             i,
@@ -426,8 +357,6 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         client_handles.extend(workers_client_handles);
     }
 
-    // Generate prometheus.yaml for the optional monitoring stack:
-    // native nodes reachable from the dockerized prometheus via host.docker.internal.
     write_prometheus_config(&data_dir, &metrics_targets)?;
     println!(
         "Prometheus target file: {}",
@@ -438,23 +367,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     );
     println!("Grafana (once up): http://localhost:3003\n");
 
-    // `--duration 0` runs until Ctrl-C. Track elapsed wall-clock time so
-    // separately from the configured `duration` so RESULTS' TPS/BPS figures are
-    // correct whether the run went the full configured length, was interrupted
-    // early, or (duration 0) has no configured length at all.
     if duration == 0 {
         println!("Running benchmark (until Ctrl-C)...");
     } else {
         println!("Running benchmark ({} sec)...", duration);
     }
     let run_start = tokio::time::Instant::now();
-    // Data-plane withholding fault injector, time-windowed variant: the window is
-    // anchored to THIS benchmark's own measurement start (`run_start`, just captured)
-    // rather than to process-spawn time (which happened earlier, in the loop above) --
-    // `--withhold-at` is defined as an offset from measurement start, and every node's
-    // own `Parameters::withhold_window` clone (set at spawn time, before this point)
-    // observes this `.set(..)` the instant it happens, since they all share the same
-    // `Arc`.
     if let (Some(cell), Some(at)) = (&withhold_window_cell, withhold_at_secs) {
         let start = run_start.into_std() + std::time::Duration::from_secs(at);
         let end = start + std::time::Duration::from_secs(withhold_for_secs);
@@ -468,26 +386,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         );
     }
     if timeline {
-        // Print a once-per-second progress line per live
-        // primary, for the whole run -- reads the same registries `print_results`
-        // reads below, just every second instead of once at the end. Diagnostic only;
-        // does not touch the client/committer/execute path in any way.
+        // Print one diagnostic line per live primary each second.
         println!(
             " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume   wish   target   omega_q"
         );
         let mut elapsed: u64 = 0;
-        // Committed-throughput series (grep-parseable `TIMELINE:` lines): matches
-        // `print_results`' own `max_committed_transactions` formula exactly -- sum
-        // `committed_transactions` within each node's own workers (handles
-        // `--workers > 1`, where each worker registry only sees its own worker-id
-        // slice of the replicated commit stream), then take the MAX across live
-        // nodes (every node counts ~the same replicated stream once summed, not a
-        // disjoint partition of it). `committed_transactions` is a plain `IntCounter`
-        // incremented directly at commit time (`worker::synchronizer::Synchronizer::
-        // observe_committed`) -- reading it needs no `MetricReporter::force_report`
-        // (that only flushes the separate, buffered histogram gauges) and doesn't
-        // perturb anything: a lock-free atomic read, once per second, same source the
-        // final summary's own "Sequenced (committed)" line uses.
+        // Sum each node's worker counters, then use the highest replicated total.
         let mut prev_committed_total: u64 = 0;
         'timeline: loop {
             tokio::select! {
@@ -501,12 +405,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                                 p.control_delivered_len, p.control_consume_pos,
                                 p.own_watermark, p.entry_target, p.omega_q, p.block_cache_len
                             );
-                            // Walk-step totals, on their own grep-parseable line so the
-                            // existing timeline parser is untouched. These are the three
-                            // O(gap) prefix walks (`vantage_walk_steps_total`); a victim's
-                            // rate exploding while a peer's stays flat is what confirms
-                            // the un-memoized-negative-walk hypothesis, and a victim whose
-                            // rate does NOT rise refutes it.
+                            // Keep walk counters on a separate parseable line.
                             let w = read_counter_vec(registry, "vantage_walk_steps_total", "family");
                             println!(
                                 "WALK: sec={} node={} chain={} direct={} settle={} blocks={}",
@@ -559,24 +458,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     // Read results while clients and commits may still be progressing.
     print_results(&worker_metrics, &primary_metrics, actual_secs, protocol, "").await;
 
-    // The first RESULTS block can under- or
-    // over-count the tail of the run, since client tasks are never stopped and the
-    // registries are read while commits are still non-atomically advancing. Rather
-    // than changing the numbers above (which would move already-recorded headline
-    // numbers for every config, including the default gate config), stop every
-    // client task now (so no NEW transaction is submitted), give already-in-flight
-    // transactions a bounded chance to actually land in the registries, and re-report
-    // the same duration/numbers from that settled state as a clearly separate,
-    // additional block. This is the "at least stop the client/benchmark tasks before
-    // reading final RESULTS" alternative this item calls out; `duration` (the
-    // denominator) is intentionally NOT extended by the drain below, only the
-    // registry read is delayed.
-    //
-    // NOT done here (would change existing numbers, so out of scope without a STOP):
-    // trimming `run_start`'s own ramp-up (ports/synchronization warm-up before the
-    // first real commit) out of the measured window -- that would shrink the
-    // denominator and raise every reported TPS/BPS, including the default gate
-    // config's.
+    // Stop clients, allow in-flight work to settle, and print a final snapshot.
     for handle in &client_handles {
         handle.abort();
     }
@@ -601,20 +483,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
-/// Map each wire type to a traffic category, one per
-/// protocol family (Vantage's wire variants are entirely disjoint from Autobahn's,
-/// but both protocols share a few names -- e.g. `Header`, `Synchronize`,
-/// `BatchRequest`, `Committed` -- with different category meanings per protocol, so
-/// the map is protocol-scoped rather than global).
-///
-/// Known simplification (documented, not a metrics bug): `Header` is a single wire
-/// variant carrying a bool (publish vs. serve/sync) that the `type` label does not
-/// distinguish (the label is the wire variant name, per §1) -- so `Header` is folded
-/// entirely into `dissemination` here, even though a (typically small) share of it is
-/// actually repair/sync traffic (Vantage `Header(serve)`, Autobahn `Header(sync)`).
-/// Every wire type not named below (e.g. `OurBatch`/`OthersBatch`, worker-to-primary
-/// digest notifications) falls into `other` -- this keeps totals conserved (every
-/// sent message lands in exactly one bucket) rather than silently under-counting.
+/// Map each protocol's wire types to dashboard traffic categories.
 fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
     match protocol {
         Protocol::Vantage => match msg_type {
@@ -622,25 +491,10 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             "VantageAck" | "VantageAvail" => "acks",
             "VantagePropose" | "VantageEcho" | "VantageEchoSkip" | "VantageReady"
             | "VantageNoReady" | "VantageSkipVote"
-            // signature-free.tex sec.8.3 "Digest-named AGB statements": the same
-            // logical ECHO/READY statements, just a compact encoding -- same
-            // category as their by-value counterparts above.
+            // Digest-named AGB statements use the same category as their by-value forms.
             | "VantageEchoDigest" | "VantageReadyDigest" => "agb",
             "VantageWish" => "pacemaker",
-            // "repair": recovers already-identified missing data given only a
-            // reference/digest -- `HeadersRequest`/`Synchronize`/`BatchRequest`'s own
-            // role (see this function's "known simplification" doc comment: the
-            // ANSWER side of that pair is miscategorized as "dissemination" purely
-            // because it shares the `Header` wire variant with the publish path --
-            // `VantageBodyFetch`/`VantageBodyServe` have no such sharing accident, so
-            // both ends of this pair land in "repair" cleanly).
-            // Lane resume uses the repair category.
-            // category as the fetch/serve pairs above -- it recovers already-
-            // identified missing data (a peer's own ack-census gap) given only a
-            // height, same role as `HeadersRequest`/`VantageBodyFetch` for their own
-            // gap classes. The served answer rides the ordinary `Header` wire
-            // variant (already categorized "dissemination" above), same accepted
-            // miscategorization noted for `HeadersRequest`'s own answer.
+            // Repair messages recover data identified by a reference or height.
             "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageBodyFetch"
             | "VantageBodyServe" | "VantageLaneResume" => "repair",
             "CompReport"
@@ -669,12 +523,7 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             "Committed" => "metricsplumbing",
             _ => "other",
         },
-        // Bracha-RBC variant (`--protocol simple-it-bracha`, arXiv:2606.14404 Table
-        // 1/2 + Corollary 5, variant S): identical wire vocabulary to `SimpleIt`
-        // above, plus its own extra echo-round message (`SimpleItCutReady`) -- kept
-        // as its own arm for the same reason `SimpleIt` is kept separate from
-        // `Protocol::Vantage` just above (so neither protocol's dashboard ever shows
-        // a msg_type the OTHER one can produce but it can't).
+        // Bracha-RBC adds the `SimpleItCutReady` message.
         Protocol::SimpleItBracha => match msg_type {
             "Header" | "Batch" => "dissemination",
             "VantageAck" | "VantageAvail" => "acks",
@@ -706,12 +555,7 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
     }
 }
 
-/// Spawns one live node's primary in-process -- the exact same `Primary::spawn`
-/// wiring `node run ... primary` uses. The `tx_output`/
-/// `rx_output` channel is a same-process no-op consumer, matching
-/// `node/src/main.rs::analyze` (there is no separate application here). Returns
-/// the primary's metrics registry/reporter and its own metrics-scrape target
-/// (label, address) for `prometheus.yaml`.
+/// Spawn one live primary in-process and return its metrics target.
 fn spawn_node_primary(
     i: usize,
     keypair: KeyPair,
@@ -763,17 +607,8 @@ fn spawn_node_primary(
     Ok((primary_registry, primary_reporter, target))
 }
 
-/// Spawns one live node's `workers` workers in-process -- the exact same
-/// `Worker::spawn` wiring `node run ... worker` uses standalone -- plus, when
-/// `rate_share` is `Some` (this node is in the `--load-nodes` loaded set), one
-/// client task per worker, waiting for every live node's worker addresses before
-/// sending (mirrors `benchmark_client --nodes`); when `None`, this node's workers
-/// still spawn and still listen, they just get no client task. Returns each
-/// worker's metrics registry/reporter alongside its own metrics-scrape target for
-/// `prometheus.yaml` (in worker-id order), plus every spawned client task's own
-/// `JoinHandle` for each client task, empty when `rate_share` is `None`.
-// clippy::too_many_arguments: see primary/src/committer.rs's identical justification
-// (this local helper mirrors Worker::spawn's own wiring one-for-one).
+/// Spawn one node's workers and optional client tasks.
+// The explicit arguments mirror `Worker::spawn`.
 #[allow(clippy::too_many_arguments)]
 fn spawn_node_workers(
     i: usize,
@@ -812,11 +647,7 @@ fn spawn_node_workers(
         );
         spawned.push((registry, reporter, target));
 
-        // --load-nodes: unloaded live nodes (`rate_share == None`) already ran
-        // `Worker::spawn` above and already listen on their transactions port --
-        // still included in every client's `all_worker_addresses` wait-list -- they
-        // just never get a client task of their own below, so their lane carries no
-        // payload.
+        // Unloaded nodes still listen but do not run a client task.
         if let Some(rate_share) = rate_share {
             let target_addr = committee.worker(&name, &worker_id).unwrap().transactions;
             let client = Client {
@@ -940,9 +771,7 @@ async fn print_results(
         }
     }
 
-    // The starfish-comparable series: submit -> ordered AND materialised. The line above
-    // stops at the primary's ordering decision; this one stops when the batch's bytes are
-    // actually in hand locally, so the gap between them IS the payload-availability cost.
+    // Report latency after ordered payloads are available locally.
     match aggregate_latency_snapshots(&materialised) {
         Some(agg) => {
             println!(
@@ -963,11 +792,7 @@ async fn print_results(
         }
     }
 
-    // Compute goodput (submitted versus sequenced) and wire categories
-    // breakdown, computed here (not stored) from the §1 counters. Submitted/wire
-    // counters are SUMMED across every node (each node's own independent traffic,
-    // additive) -- unlike the replicated-commit-stream latency snapshot above, which
-    // uses max/median across nodes because every node counts the same global stream.
+    // Sum submitted traffic and network usage across nodes.
     let submitted_transactions: u64 = worker_metrics
         .iter()
         .map(|(_, r, _)| read_counter(r, "submitted_transactions"))
@@ -1019,9 +844,7 @@ async fn print_results(
             " Messages per committed tx: {:.3}",
             total_messages_sent as f64 / max_committed_transactions as f64
         );
-        // Starfish's own formula (metrics.rs:1077-1083): bytes sent per committed tx,
-        // normalized to a 512 B transaction -- 1.0 means exactly 512 B of wire traffic
-        // per committed tx at this run's tx size; higher means more relative overhead.
+        // Normalize bytes sent per committed transaction to 512 bytes.
         println!(
             " Bandwidth efficiency (512B-normalized): {:.3}",
             total_bytes_sent as f64 / max_committed_transactions as f64 / 512.0
@@ -1051,7 +874,7 @@ async fn print_results(
         }
     }
 
-    // Read lane-resume counters from each primary registry.
+    // Sum lane-resume counters across primaries.
     let resume_requests_sent: u64 = primary_metrics
         .iter()
         .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_requests_sent"))
@@ -1065,20 +888,16 @@ async fn print_results(
         .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_send_drops"))
         .sum();
     println!(
-        " Mechanism A (lane resume): {} requests sent, {} blocks served, {} sends dropped (channel full/closed)",
+        " Lane resume: {} requests sent, {} blocks served, {} sends dropped",
         resume_requests_sent, resume_blocks_served, resume_send_drops
     );
     println!();
 
-    // Per-node seal-route breakdown (near-idle/absent
-    // on the two Autobahn paths, which never observe into `vantage_seals` at all).
+    // Report Vantage seal routes by node.
     let mut per_route_totals: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
     let mut any_route_observed = false;
     for (i, registry, _reporter) in primary_metrics {
-        // No `force_report()` needed here (unlike the latency histogram above):
-        // `vantage_seals` is a plain counter, always current, with no periodic-report
-        // buffering to flush.
         let routes = metrics::read_seal_route_counts(registry);
         if routes.is_empty() {
             continue;

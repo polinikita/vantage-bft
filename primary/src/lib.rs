@@ -2,7 +2,6 @@
 #[macro_use]
 pub mod error;
 mod aggregators;
-mod certificate_waiter;
 pub mod committer;
 mod core;
 mod garbage_collector;

@@ -13,13 +13,11 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-// Fixture
 pub fn keys() -> Vec<(PublicKey, SecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
     (0..4).map(|_| generate_keypair(&mut rng)).collect()
 }
 
-// Fixture
 pub fn committee() -> Committee {
     Committee {
         authorities: keys()
@@ -60,7 +58,6 @@ pub fn committee() -> Committee {
     }
 }
 
-// Fixture.
 pub fn committee_with_base_port(base_port: u16) -> Committee {
     let mut committee = committee();
     for authority in committee.authorities.values_mut() {
@@ -92,30 +89,25 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
     committee
 }
 
-// Fixture
 pub fn transaction() -> Transaction {
     Bytes::from(vec![0; 100])
 }
 
-// Fixture
 pub fn batch() -> Batch {
     vec![transaction(), transaction()]
 }
 
-// Fixture
 pub fn serialized_batch() -> Vec<u8> {
     let message = WorkerMessage::Batch(batch());
     bincode::serialize(&message).unwrap()
 }
 
-// Fixture
 pub fn batch_digest() -> Digest {
     let mut hasher = Blake3Hasher::new();
     hasher.update(&serialized_batch());
     Digest(hasher.finalize().into())
 }
 
-// Fixture
 pub fn listener(address: SocketAddr, expected: Option<Bytes>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let listener = TcpListener::bind(&address).await.unwrap();

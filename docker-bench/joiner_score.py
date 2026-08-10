@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Judge late-joiner recovery and contribution.
-
-Usage: joiner_score.py <start HH:MM:SS> <end HH:MM:SS> [date]
-
-Prints one PASS or FAIL result per condition.
-"""
+"""Judge late-joiner recovery and contribution."""
 import datetime
 import json
 import os
@@ -16,7 +11,7 @@ import urllib.request
 
 PROM = "http://localhost:9095"
 DATA = Path(__file__).resolve().parent / "data"
-# The joiner is the last node of the committee; match joiner_verify.sh's NODES.
+# The joiner is the last committee node.
 JOINER = f"node-{int(os.environ.get('NODES', 10)) - 1}-primary"
 
 
@@ -48,8 +43,7 @@ def counter_delta(metric, s, e):
 
 
 def author_of(node):
-    """Map a node label like 'node-20-primary' to the 16-char base64 key prefix used as the
-    metric's author label, read from the generated committee."""
+    """Map a node label to its generated committee author prefix."""
     import re
     idx = int(re.search(r"node-(\d+)-", node).group(1))
     path = DATA / f"node-{idx}/key.json"
@@ -61,16 +55,18 @@ def author_of(node):
 
 
 def main():
-    day = sys.argv[3] if len(sys.argv) > 3 else "2026-08-10"
+    day = sys.argv[3] if len(sys.argv) > 3 else datetime.date.today().isoformat()
     fmt = "%Y-%m-%d %H:%M:%S"
     s = datetime.datetime.strptime(f"{day} {sys.argv[1]}", fmt).timestamp()
     e = datetime.datetime.strptime(f"{day} {sys.argv[2]}", fmt).timestamp()
+    if e < s:
+        e += datetime.timedelta(days=1).total_seconds()
 
     fleet = one('max(vantage_cursor_next_view{node=~".*-primary$"})', s, e)
     join = one(f'vantage_cursor_next_view{{node="{JOINER}"}}', s, e)
     rec = one(f'vantage_sequence_sync_recovered{{node="{JOINER}"}}', s, e)
     tr = one(f'rate(vantage_sequence_sync_verified_total{{node="{JOINER}"}}[20s])', s, e)
-    # Exclude the joiner from the reference spread.
+    # Exclude the joiner from the peer spread.
     peer_sel = '{node=~".*-primary$",node!="%s"}' % JOINER
     spread = one(f'max(vantage_cursor_next_view{peer_sel}) - '
                  f'min(vantage_cursor_next_view{peer_sel})', s, e)
@@ -82,7 +78,7 @@ def main():
         print("  ", datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S"),
               f"{lag:>9,.0f} {rec.get(t, -1):>10.0f} {tr.get(t, -1):>12.2f}")
 
-    # Judge stable behavior on the last third of the run.
+    # Score the final third of the run.
     tail = times[len(times) * 2 // 3:]
     if not tail:
         print("\nno samples")
@@ -96,7 +92,7 @@ def main():
     contribution_end = tail[-1]
     seconds = max(contribution_end - contribution_start, 1)
 
-    # Read committed blocks from a caught-up peer.
+    # Read committed blocks from a peer.
     pub = counter_delta("vantage_blocks_published", contribution_start, contribution_end)
     by_author = {}
     for ser in rng(
@@ -117,19 +113,23 @@ def main():
     pr = statistics.median(peer_ratios) if peer_ratios else 0.0
     print(f"  (tail data blocks, peer-observed: joiner committed {jc:,.0f} of {jp:,.0f})")
 
-    # Count proposals after recovery; installed turns include the outage.
-    made = counter_delta(
-        "vantage_own_proposals_made_total", contribution_start, contribution_end)
-    turns = counter_delta(
-        "vantage_own_proposer_turns_total", contribution_start, contribution_end)
-    prop_com = counter_delta(
-        "vantage_own_proposals_committed_total", contribution_start, contribution_end)
-    jt, jm, jpc = turns.get(JOINER, 0), made.get(JOINER, 0), prop_com.get(JOINER, 0)
-    peer_prop = [(prop_com.get(n, 0) / t) for n, t in turns.items() if n != JOINER and t]
-    ppr = statistics.median(peer_prop) if peer_prop else 0.0
-    jpr = (jpc / jt) if jt else 0.0
-    print(f"  tail proposals: joiner made {jm:,.0f}, turns {jt:,.0f}, committed {jpc:,.0f} "
-          f"-> {jpr:.2f} vs peer median {ppr:.2f}")
+    # Score proposals only after recovery, using the same tail as the CPU checks.
+    jm = counter_delta(
+        "vantage_own_proposals_made_total", contribution_start, contribution_end
+    ).get(JOINER, 0.0)
+    jt = counter_delta(
+        "vantage_own_proposer_turns_total", contribution_start, contribution_end
+    ).get(JOINER, 0.0)
+    jpc = counter_delta(
+        "vantage_own_proposals_committed_total", contribution_start, contribution_end
+    ).get(JOINER, 0.0)
+    skipped = counter_delta(
+        "vantage_own_proposals_skipped_total", contribution_start, contribution_end
+    )
+    # Derive skipped outcomes when the direct metric is absent.
+    js = skipped.get(JOINER, max(jt - jpc, 0.0))
+    print(f"  tail proposals: made {jm:,.0f}, turns {jt:,.0f}, "
+          f"committed {jpc:,.0f}, skipped {js:,.0f}")
 
     direct = series_delta(
         'vantage_walk_steps_total{family="direct",node=~".*-primary$"}',
@@ -161,8 +161,8 @@ def main():
          f"median lag {statistics.median(tail_lag):.0f} vs PEER-ONLY spread {peer_spread:.0f}"),
         ("4 data blocks committed", jr >= 0.8 * pr if pr else False,
          f"joiner ratio {jr:.2f} vs peer median {pr:.2f}"),
-        ("5 all terminal proposals", jt > 0 and jpc == jt,
-         f"joiner {jpr:.2f} vs peer median {ppr:.2f} ({jpc:.0f}/{jt:.0f} turns)"),
+        ("5 all proposals committed", jm > 0 and js == 0,
+         f"joiner made {jm:.0f}, committed {jpc:.0f}, skipped {js:.0f} across {jt:.0f} turns"),
         ("6 direct-walk CPU", direct_p > 0 and direct_j <= 1.5 * direct_p,
          f"joiner {direct_j:.0f}/s vs peer median {direct_p:.0f}/s"),
         ("7 inbound utilization", inbound_p > 0 and inbound_j <= 1.5 * inbound_p,

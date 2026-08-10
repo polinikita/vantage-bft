@@ -1,6 +1,4 @@
-// Vote and timeout aggregators for Simple-IT.
-//
-// Aggregators deduplicate authors and return a threshold crossing to the engine.
+// Simple-IT vote and timeout aggregators.
 
 use crate::error::{DagError, DagResult};
 use crate::simpleit::messages::{
@@ -10,12 +8,11 @@ use config::{Committee, Stake};
 use crypto::{Digest, PublicKey};
 use std::collections::HashSet;
 
-/// Aggregates individually verified cut votes and returns the authors counted when
-/// the caller-supplied threshold is reached.
+/// Aggregates verified cut votes until the threshold is reached.
 pub struct CutVoteAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
-    /// Distinct authors counted in arrival order. Returned when the threshold is met.
+    /// Distinct authors counted in arrival order.
     voters: Vec<PublicKey>,
 }
 
@@ -53,14 +50,12 @@ impl CutVoteAggregator {
     }
 }
 
-/// Uses the maximum of the optimistic and quorum thresholds so safety always requires
-/// a quorum.
+/// Returns the greater of the optimistic and quorum thresholds.
 pub(super) fn mint_threshold(committee: &Committee) -> Stake {
     optimistic_threshold(committee).max(committee.quorum_threshold())
 }
 
-/// Computes the optimistic threshold with signed intermediate arithmetic so degenerate
-/// committees do not underflow.
+/// Computes the optimistic threshold without unsigned underflow.
 fn optimistic_threshold(committee: &Committee) -> Stake {
     let total_stake: i64 = committee
         .authorities
@@ -72,11 +67,11 @@ fn optimistic_threshold(committee: &Committee) -> Stake {
     ((numerator + 1) / 2) as Stake
 }
 
-/// Aggregates individually verified `CutReady` messages for the Bracha variant.
+/// Aggregates verified `CutReady` messages for Bracha.
 pub struct CutReadyAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
-    /// Distinct authors counted in arrival order. Returned when quorum is met.
+    /// Distinct authors counted in arrival order.
     voters: Vec<PublicKey>,
 }
 
@@ -112,7 +107,7 @@ impl CutReadyAggregator {
     }
 }
 
-/// Aggregates `Decide` messages for one round and cut until quorum.
+/// Aggregates `Decide` messages until quorum.
 pub struct DecideAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
@@ -162,10 +157,7 @@ impl DecideAggregator {
     }
 }
 
-/// Aggregates timeout votes for a cut round into an accept trigger. Upstream
-/// primary/src/aggregators.rs:106-129.
-///
-/// Threshold: `quorum_threshold` (2f+1 at n=3f+1).
+/// Aggregates timeout votes until quorum.
 pub struct TimeoutAggregator {
     weight: Stake,
     used: HashSet<PublicKey>,
@@ -197,10 +189,7 @@ impl TimeoutAggregator {
     }
 }
 
-/// Aggregates timeout accepts for a cut round into a timeout certificate. Upstream
-/// primary/src/aggregators.rs:132-168.
-///
-/// Threshold: `quorum_threshold` (2f+1 at n=3f+1).
+/// Aggregates timeout accepts until quorum.
 pub struct TimeoutAcceptAggregator {
     weight: Stake,
     accepts: Vec<PublicKey>,

@@ -1,4 +1,4 @@
-// One task owns mutable protocol state; only the block cache is shared.
+// Mutable protocol state has one owner; the block cache is shared.
 
 use crate::messages::{Ack, Header};
 use crate::primary::{Height, PrimaryMessage, View, CHANNEL_CAPACITY};
@@ -53,11 +53,11 @@ use crate::vantage::resume::{
     ResumeTrigger, ServeBudget,
 };
 use crate::vantage::sequence::{
-    genesis_head, head_hex, CheckpointCollector, SequenceAnnouncement,
-    SequenceDeltaChunk, SequenceDeltaRangeChunk, SequenceDeltaRangeRequest, SequenceDeltaRequest,
-    SequenceOutcome, SequenceOutcomeRequest, SequenceOutcomeServe, SequenceRecordChunk,
-    SequenceRequest, SequenceStore, SequenceTransfer, SequenceUnavailable, SequenceWant,
-    TransferState, SEQUENCE_VERSION,
+    genesis_head, head_hex, CheckpointCollector, SequenceAnnouncement, SequenceDeltaChunk,
+    SequenceDeltaRangeChunk, SequenceDeltaRangeRequest, SequenceDeltaRequest, SequenceOutcome,
+    SequenceOutcomeRequest, SequenceOutcomeServe, SequenceRecordChunk, SequenceRequest,
+    SequenceStore, SequenceTransfer, SequenceUnavailable, SequenceWant, TransferState,
+    SEQUENCE_VERSION,
 };
 use crate::vantage::wire::{self, Wire};
 
@@ -162,7 +162,7 @@ pub enum Inbound {
     /// Contains the end key, completion flag, clamp flag, and declared sender.
     ReplayDone(View, bool, bool, PublicKey),
 
-    // Each sequence message carries a separate declared sender that is checked for membership.
+    // Sequence messages carry a declared sender.
     SequenceAnnounce(SequenceAnnouncement, PublicKey),
     SequenceAnnounceBatch(Vec<SequenceAnnouncement>, PublicKey),
     SequenceRequest(SequenceRequest, PublicKey),
@@ -408,7 +408,6 @@ impl MessageHandler for VantageReceiverHandler {
                 Inbound::SequenceHeaders(headers, sender)
             }
 
-            // Ignore message variants that do not belong to the Vantage assembly.
             _ => return Ok(()),
         };
         if self.sequence_large_gap_drop.load(Ordering::Relaxed)
@@ -422,7 +421,7 @@ impl MessageHandler for VantageReceiverHandler {
             return Ok(());
         }
 
-        // Sequence and bulk queues are best effort; retries recover dropped inputs.
+        // Sequence and bulk queues are best effort; retries recover drops.
         if inbound.is_sequence_sync() {
             if self.tx_sequence.try_send(inbound).is_err() {
                 if let Some(metrics) = &self.metrics {
@@ -440,7 +439,7 @@ impl MessageHandler for VantageReceiverHandler {
             return Ok(());
         }
 
-        // Recheck after reserving because the drop policy may change while waiting.
+        // Recheck after reservation because the drop policy may change.
         let permit = self
             .tx
             .reserve()
@@ -711,7 +710,7 @@ impl VantageCore {
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
         let sequence_large_gap_drop = Arc::new(AtomicBool::new(false));
 
-        // Capture the trusted membership set before constructing protocol components.
+        // Capture membership before constructing protocol state.
         let members: HashSet<PublicKey> = committee.authorities.keys().cloned().collect();
 
         let sid = block::session_id(&committee);
@@ -763,7 +762,7 @@ impl VantageCore {
             let n = committee.size();
             let f = n.saturating_sub(1) / 3;
 
-            // The bounded map accepts any future boundary, but certification requires matching members.
+            // Certification still requires matching members.
             CheckpointCollector::new(f + 1, SEQUENCE_CANDIDATE_WINDOWS, View::MAX)
         });
         let control = ControlLog::new(name, committee.clone(), sid, parameters.delta_ms);
@@ -940,7 +939,7 @@ impl VantageCore {
             serve_budget: ServeBudget::new(),
             nudge_memo: NudgeMemo::new(),
 
-            // A zero window would prune a broadcast in the tick that records it.
+            // Keep the current broadcast when the window is zero.
             replay_history_views: parameters.replay_history_views.max(1),
             replay_serve_max_bytes: parameters.replay_serve_max_bytes,
             replay_episode_max_ms: parameters.replay_episode_max_ms,
@@ -957,7 +956,7 @@ impl VantageCore {
                 metrics: core_metrics.clone(),
             },
 
-            // A zero window would prune state for the view currently being resolved.
+            // Keep state for the current view when the window is zero.
             gc_window: parameters.vantage_gc_window_views.max(1),
             last_gc_floor: 1,
             metrics: core_metrics,
@@ -1000,11 +999,11 @@ impl VantageCore {
     ) {
         let boot = Instant::now();
 
-        // Restore the persisted lane frontier before any new block can be published.
+        // Restore the lane frontier before publishing.
         self.lm.restore_own_frontier().await;
 
         let mut effects = Vec::new();
-        // Republish a persisted anchor whose original send may not have completed.
+        // Republish an anchor whose initial send may not have completed.
         if let Some(anchor) = self.lm.take_seeded_anchor() {
             effects.push(Effect::BroadcastPublish(anchor));
         }
@@ -1072,7 +1071,7 @@ impl VantageCore {
 
             self.queue_len_peak = self.queue_len_peak.max(rx_vantage.len());
 
-            // Fair selection checks timers even while a queue remains ready.
+            // Check timers even while a queue is ready.
             tokio::select! {
                 Some(inbound) = rx_vantage.recv() => {
                     let now = Instant::now();
@@ -1166,7 +1165,7 @@ impl VantageCore {
                         None => std::future::pending::<()>().await,
                     }
                 }, if sequence_install_tick.is_some() => {
-                    // Installation uses independent view, digest, and in-flight budgets.
+                    // Installation has independent view, digest, and in-flight budgets.
                     let now = Instant::now();
                     let install_effects = self.drive_sequence_install(now).await;
                     if !install_effects.is_empty() {
@@ -1178,7 +1177,7 @@ impl VantageCore {
                     let now = Instant::now();
                     let _resume_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_resume_tick, "resume_tick");
 
-                    // Refresh authoritative drop state before replay episode and nudge checks.
+                    // Refresh drop state before replay and nudge checks.
                     if self.reconnect_replay {
                         self.sweep_dirty_map();
                     }
@@ -1188,14 +1187,14 @@ impl VantageCore {
                     let episode_backoff = Duration::from_millis(self.resume_backoff_ms);
                     let episode_max_age = Duration::from_millis(self.replay_episode_max_ms);
                     for author in authors {
-                        // Lane resume remains enabled independently of reconnect replay.
+                        // Lane resume is independent of reconnect replay.
                         self.try_resume_request(author, now);
 
                         self.resume_tick_replay_effects(author, now, episode_backoff, episode_max_age).await;
                     }
                 }
 
-                // Reconnect events are best-effort prompts; periodic ticks retry replay episodes.
+                // Reconnect events prompt replay; periodic ticks retry it.
                 Some(addr) = reconnect_rx.recv() => {
                     let now = Instant::now();
                     let resolved = self.wire.addr_to_peer.get(&addr).copied();
@@ -1353,7 +1352,7 @@ impl VantageCore {
         self.maybe_nudge(author, now, backoff).await;
     }
 
-    /// Records a one-shot message before volatile broadcast, or sends it durably when replay is disabled.
+    /// Records replayable broadcasts; uses durable sends when replay is disabled.
     async fn broadcast_recorded(&mut self, message: PrimaryMessage) {
         if !self.reconnect_replay {
             self.wire.broadcast_message(message).await;
@@ -1510,7 +1509,7 @@ impl VantageCore {
 
         let done = PrimaryMessage::VantageReplayDone(end_key, complete, clamped, self.name);
 
-        // Insert before enqueue so immediate task completion can remove this generation.
+        // Insert before enqueue so immediate completion can remove this generation.
         let generation = self.wire.next_replay_generation();
         self.wire.in_flight.lock().insert(
             sender,
@@ -1522,7 +1521,7 @@ impl VantageCore {
         let enqueued = self.wire.enqueue_replay(sender, generation, msgs, done);
 
         if !enqueued {
-            // Failed admission leaves the peer floor unchanged and removes only this marker.
+            // Failed admission leaves the peer floor unchanged.
             wire::remove_in_flight_generation(&self.wire.in_flight, sender, generation);
             log::debug!(
                 "vantage node: resume serve suppressed: sender={} served_from={} gate=enqueue-failed",
@@ -1631,32 +1630,6 @@ impl VantageCore {
             effects.extend(self.control.on_control_round_timer(round));
         }
         effects
-    }
-
-    /// Do not call: peer holdings do not prove that local or unsettled blocks are dispensable.
-    #[allow(dead_code)]
-    fn evict_universally_held_blocks(&mut self) {
-        const KEEP_HEIGHTS: crate::primary::Height = 64;
-        let mut dropped = 0usize;
-        let mut blocked = 0u64;
-        for author in self.rep.known_lane_authors() {
-            match self.rep.universally_held_below(&author) {
-                Some(floor) => {
-                    dropped += self.lm.evict_universally_held(&author, floor, KEEP_HEIGHTS);
-                }
-                None => blocked += 1,
-            }
-        }
-        if let Some(metrics) = &self.metrics {
-            if dropped > 0 {
-                metrics
-                    .vantage_block_cache_evicted_total
-                    .inc_by(dropped as u64);
-            }
-            metrics
-                .vantage_block_cache_evict_blocked
-                .set(blocked as i64);
-        }
     }
 
     fn sample_metrics(&mut self) {
@@ -1768,7 +1741,7 @@ impl VantageCore {
     }
 
     fn collect_internal_garbage(&mut self) {
-        // Outbox retention advances independently of the resolver GC floor.
+        // Outbox retention is independent of the resolver GC floor.
         let outbox_floor = self
             .pacemaker
             .own_watermark()
@@ -1776,7 +1749,7 @@ impl VantageCore {
             .max(1);
         self.outbox.prune_below(outbox_floor);
 
-        // Floors below retained history can no longer be served and must advance.
+        // Advance floors below retained history.
         for pending in self.pending_low.values_mut() {
             if *pending < outbox_floor {
                 *pending = outbox_floor;
@@ -1813,6 +1786,12 @@ impl VantageCore {
 
     /// Proposes eligible owned views in increasing order through the early-wish bound.
     fn try_propose_effects(&mut self, now: Instant) -> Vec<Effect> {
+        if self.sequence_sync_recovery_active
+            || self.sequence_install.is_some()
+            || self.large_sequence_sync_target().is_some()
+        {
+            return Vec::new();
+        }
         let mut effects = Vec::new();
         let bound = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
         let mut view = self.frontier.a_i() + 1;
@@ -1879,7 +1858,11 @@ impl VantageCore {
             );
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_own_proposer_turns_total.inc();
-                if !matches!(outcome, SequenceOutcome::Skip) {
+                if matches!(outcome, SequenceOutcome::Skip) {
+                    if self.frontier.already_proposed(view) {
+                        metrics.vantage_own_proposals_skipped_total.inc();
+                    }
+                } else {
                     metrics.vantage_own_proposals_committed_total.inc();
                 }
             }
@@ -2285,7 +2268,7 @@ impl VantageCore {
             scheduled += 1;
         }
 
-        // Refill only after half the request window drains to preserve batching.
+        // Refill after half the request window drains to preserve batching.
         if self.sequence_block_requests.len() <= SEQUENCE_BLOCK_REFILL_AT {
             let room =
                 SEQUENCE_BLOCK_MAX_IN_FLIGHT.saturating_sub(self.sequence_block_requests.len());
@@ -2416,10 +2399,11 @@ impl VantageCore {
                         }
                         break;
                     }
+                    let blocks = self.rep.blocks();
                     self.sequence_install
                         .as_mut()
                         .expect("present")
-                        .mark_installed(view);
+                        .mark_installed(view, &blocks);
                     applied += 1;
                 }
                 Err(e) => {
@@ -2459,18 +2443,7 @@ impl VantageCore {
             if done {
                 let install = self.sequence_install.as_ref().expect("present");
                 let target = install.target().0;
-                let own_anchor = install
-                    .lane_tip(&self.name)
-                    .and_then(|(_, height, digest)| {
-                        let blocks = self.rep.blocks();
-                        let cache = blocks.lock();
-                        cache.get(&digest).and_then(|entry| {
-                            (entry.block_ok_verified
-                                && entry.block.author == self.name
-                                && entry.block.height == height)
-                                .then(|| entry.block.clone())
-                        })
-                    });
+                let own_anchor = install.installed_lane_tip(&self.name);
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_sequence_install_completed_total.inc();
                     metrics
@@ -2484,7 +2457,7 @@ impl VantageCore {
                     effects.push(Effect::RecoverOwnLane(anchor));
                 }
 
-                // Enter only the first live view; installed history must not replay entry effects.
+                // Enter only the first live view; installed history must not replay effects.
                 let next_live = target.saturating_add(1);
                 self.pacemaker.fast_forward_installed_entry(next_live);
                 effects.extend(self.enter_view_effects(next_live, now));
@@ -2557,7 +2530,7 @@ impl VantageCore {
         self.sequence_last_want = Some(want);
     }
 
-    /// Accepts responses only for the active transfer and advances requests only when the want changes.
+    /// Accepts selected-source responses for the active request.
     fn on_sequence_response(&mut self, response: SequenceResponse, from: &PublicKey) {
         let Some(transfer) = self.sequence_transfer.as_mut() else {
             if let Some(metrics) = &self.metrics {
@@ -3463,8 +3436,8 @@ impl VantageCore {
         );
         let mut queue: VecDeque<Effect> = initial.into();
 
-        // Rechecks run only after queued lane and repair effects drain. Effects that set
-        // `recheck_pending` must not mutate AGB gate state before this point.
+        // Run rechecks after queued lane and repair effects drain. Do not mutate AGB gate
+        // state before this point.
         loop {
             while let Some(effect) = queue.pop_front() {
                 match effect {
@@ -4433,7 +4406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_install_enters_next_live_view_and_serves_owned_turn() {
+    async fn completed_install_waits_to_propose_until_recovery_finishes() {
         let mut core = test_core(0, "sequence_install_enters_live_view");
         let next_live = (2..=32)
             .find(|view| core.agb.proposer(*view) == core.name)
@@ -4477,11 +4450,28 @@ mod tests {
         );
         assert!(core.frontier.is_active(next_live));
         assert!(
-            effects.iter().any(|effect| matches!(
+            !effects.iter().any(|effect| matches!(
                 effect,
                 Effect::BroadcastPropose(proposal) if proposal.view() == next_live
             )),
-            "an owned first-live view must be proposed immediately after install"
+            "a staged install must not emit a proposal"
+        );
+
+        core.sequence_install = None;
+        core.sequence_sync_recovery_active = false;
+        let effects = core.try_propose_effects(Instant::now());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::BroadcastPropose(proposal) if proposal.view() == next_live
+        )));
+        core.record_sequence(next_live, &SequenceOutcome::Skip, &[]);
+        assert_eq!(
+            core.metrics
+                .as_ref()
+                .expect("test core has metrics")
+                .vantage_own_proposals_skipped_total
+                .get(),
+            1
         );
     }
 
@@ -5632,9 +5622,7 @@ mod tests {
         assert_eq!(
             nudges_before + 1,
             nudges_sent(&core),
-            "A3: backoff since the last serve-or-nudge has elapsed, and pending_low \
-             is still set -- the nudge must fire regardless of the earlier serve \
-             or the forged Done"
+            "the nudge must fire after backoff while the peer gap remains"
         );
     }
 
@@ -5656,7 +5644,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_recorded_with_replay_disabled_skips_outbox_and_goes_durable() {
-        let mut core = test_core(0, "knob1_broadcast_recorded_disabled");
+        let mut core = test_core(0, "broadcast_recorded_replay_disabled");
         core.reconnect_replay = false;
         assert!(core.wire.cancel_handlers.is_empty());
         let other_primaries = core.wire.other_primaries.len();
@@ -5670,7 +5658,7 @@ mod tests {
 
         assert!(
             core.outbox.slice_from(0).next().is_none(),
-            "the outbox must stay empty when the mechanism is disabled"
+            "the outbox must stay empty when replay is disabled"
         );
         assert_eq!(
             core.wire.cancel_handlers.len(),
@@ -5682,7 +5670,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_hello_is_a_no_op_when_replay_is_disabled() {
-        let mut core = test_core(0, "knob1_resume_hello_disabled");
+        let mut core = test_core(0, "resume_hello_replay_disabled");
         core.reconnect_replay = false;
         let (peer, _) = crate::common::keys()[1];
         core.outbox.record(5, Bytes::from_static(b"five"));
@@ -5693,7 +5681,7 @@ mod tests {
 
         assert!(
             rx.try_recv().is_err(),
-            "no Replay must ever be enqueued while the mechanism is disabled"
+            "replay must not be enqueued while replay is disabled"
         );
         assert!(
             !core.pending_low.contains_key(&peer),
@@ -5707,7 +5695,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_done_is_a_no_op_when_replay_is_disabled() {
-        let mut core = test_core(0, "knob1_replay_done_disabled");
+        let mut core = test_core(0, "replay_done_replay_disabled");
         core.reconnect_replay = false;
         let (author, _) = crate::common::keys()[1];
 
@@ -5725,7 +5713,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_tick_replay_effects_are_inert_when_disabled() {
-        let mut core = test_core(0, "knob1_resume_tick_disabled");
+        let mut core = test_core(0, "resume_tick_replay_disabled");
         core.reconnect_replay = false;
         let (author, _) = crate::common::keys()[1];
         core.pending_low.insert(author, 5);

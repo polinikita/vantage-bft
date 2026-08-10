@@ -24,9 +24,9 @@ pub struct Helper {
     committee: Committee,
     /// The persistent storage.
     store: Store,
-    /// Input channel to receive batch requests.
+    /// Batch requests from other workers.
     rx_request: Receiver<(Vec<Digest>, PublicKey)>,
-    /// A network sender to send the batches to the other workers.
+    /// Sends batches to other workers.
     network: SimpleSender,
 }
 
@@ -38,11 +38,8 @@ impl Helper {
         committee: Committee,
         store: Store,
         rx_request: Receiver<(Vec<Digest>, PublicKey)>,
-        // Per-destination network latency.
         latency_map: HashMap<SocketAddr, Duration>,
-        // Metrics registry.
         metrics: Arc<Metrics>,
-        // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
@@ -63,9 +60,6 @@ impl Helper {
 
     async fn run(&mut self) {
         while let Some((digests, origin)) = self.rx_request.recv().await {
-            // TODO [issue #7]: Do some accounting to prevent bad nodes from monopolizing our resources.
-
-            // get the requestors address.
             let address = match self.committee.worker(&origin, &self.id) {
                 Ok(x) => x.worker_to_worker,
                 Err(e) => {
@@ -74,7 +68,6 @@ impl Helper {
                 }
             };
 
-            // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
                     Ok(Some(data)) => {

@@ -18,7 +18,6 @@ async fn propose_empty() {
     let (tx_headers, mut rx_headers) = channel(1);
     let (_tx_ticket, rx_ticket) = channel(1);
 
-    // Spawn the proposer.
     Proposer::spawn(
         name,
         committee(),
@@ -40,7 +39,6 @@ async fn propose_empty() {
         .await
         .expect("failed to send cert to proposer");
 
-    // Ensure the proposer makes a correct empty header.
     let header = rx_headers.recv().await.unwrap();
     assert_eq!(header.height, 1);
     assert!(header.payload.is_empty());
@@ -58,7 +56,6 @@ async fn propose_payload() {
     let (tx_headers, mut rx_headers) = channel(1);
     let (_tx_ticket, rx_ticket) = channel(1);
 
-    // Spawn the proposer.
     Proposer::spawn(
         name,
         committee(),
@@ -82,7 +79,6 @@ async fn propose_payload() {
 
     sleep(Duration::from_millis(500)).await;
 
-    // Send enough digests for the header payload.
     let digest = Digest(name.0);
     let worker_id = 0;
     tx_our_digests
@@ -90,7 +86,6 @@ async fn propose_payload() {
         .await
         .unwrap();
 
-    // Ensure the proposer makes a correct header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
     assert_eq!(header.height, 1);
     assert_eq!(header.payload.get(&digest), Some(&worker_id));
@@ -108,7 +103,6 @@ async fn propose_normal() {
     let (tx_headers, mut rx_headers) = channel(1);
     let (_tx_ticket, rx_ticket) = channel(1);
 
-    // Spawn the proposer.
     Proposer::spawn(
         name,
         committee(),
@@ -132,7 +126,6 @@ async fn propose_normal() {
 
     sleep(Duration::from_millis(500)).await;
 
-    // Send enough digests for the header payload.
     let digest = Digest(name.0);
     let worker_id = 0;
     tx_our_digests
@@ -140,7 +133,6 @@ async fn propose_normal() {
         .await
         .unwrap();
 
-    // Ensure the proposer makes a correct header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
 
     assert_eq!(header.height, 1);
@@ -177,7 +169,6 @@ async fn propose_normal() {
     assert_eq!(header1.parent_cert.header_digest, header.digest());
 }
 
-// Special header tests
 #[tokio::test]
 #[serial]
 async fn propose_special_ticket_first() {
@@ -189,7 +180,6 @@ async fn propose_special_ticket_first() {
     let (tx_headers, mut rx_headers) = channel(1);
     let (_tx_ticket, rx_ticket) = channel(1);
 
-    // Spawn the proposer.
     Proposer::spawn(
         name,
         committee(),
@@ -213,9 +203,8 @@ async fn propose_special_ticket_first() {
 
     let _gen_header = Header::genesis(&committee());
 
-    sleep(Duration::from_secs(1)).await; //just to guarantee ticket arrives before digest (else normal block can be triggered.)
+    sleep(Duration::from_secs(1)).await;
 
-    // Send enough digests for the header payload.
     let digest = Digest(name.0);
     let worker_id = 0;
     tx_our_digests
@@ -223,9 +212,7 @@ async fn propose_special_ticket_first() {
         .await
         .unwrap();
 
-    // Ensure the proposer makes a correct special header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
-
 
     assert_eq!(header.height, 1);
     assert_eq!(header.payload.get(&digest), Some(&worker_id));
@@ -243,7 +230,6 @@ async fn propose_confirm_message() {
     let (tx_headers, mut rx_headers) = channel(1);
     let (_tx_ticket, rx_ticket) = channel(1);
 
-    // Spawn the proposer.
     Proposer::spawn(
         name,
         committee(),
@@ -267,9 +253,8 @@ async fn propose_confirm_message() {
 
     let _gen_header = Header::genesis(&committee());
 
-    sleep(Duration::from_secs(1)).await; //just to guarantee ticket arrives before digest (else normal block can be triggered.)
+    sleep(Duration::from_secs(1)).await;
 
-    // Send enough digests for the header payload.
     let digest = Digest(name.0);
     let worker_id = 0;
     tx_our_digests
@@ -277,9 +262,7 @@ async fn propose_confirm_message() {
         .await
         .unwrap();
 
-    // Ensure the proposer makes a correct special header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
-
 
     assert_eq!(header.height, 1);
     assert_eq!(header.payload.get(&digest), Some(&worker_id));

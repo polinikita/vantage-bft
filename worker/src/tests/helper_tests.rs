@@ -11,36 +11,30 @@ async fn batch_reply() {
     let id = 0;
     let committee = committee_with_base_port(8_000);
 
-    // Create a new test store.
     let path = ".db_test_batch_reply";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
-    // Add a batch to the store.
     store
         .write(batch_digest().to_vec(), serialized_batch())
         .await;
 
-    // Spawn an `Helper` instance.
     Helper::spawn(
         id,
         committee.clone(),
         store,
         rx_request,
-        /* latency_map */ std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
     );
 
-    // Spawn a listener to receive the batch reply.
     let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;
     let expected = Bytes::from(serialized_batch());
     let handle = listener(address, Some(expected));
 
-    // Send a batch request.
     let digests = vec![batch_digest()];
     tx_request.send((digests, requestor)).await.unwrap();
 
-    // Ensure the requestor received the batch (ie. it did not panic).
     assert!(handle.await.is_ok());
 }

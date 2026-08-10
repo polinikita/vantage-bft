@@ -1,23 +1,6 @@
-# Optional monitoring stack for `node local-benchmark`, docker-bench, and remote runs.
-# The compose file starts Prometheus and Grafana; node metrics are reached through
-# the generated target file.
-#
-# Local mode usage (from the repository root, after starting `node local-benchmark` in
-# another terminal so `.local-bench/prometheus.yaml` exists):
-#   docker compose -f monitoring/docker-compose.yml up -d
-# Grafana: http://localhost:3003 (anonymous admin, no login needed).
-# Prometheus: http://localhost:9095
-#
-# Orchestration mode (AWS, after `fab remote` has written benchmark/.committee.json):
-#   cd benchmark && fab monitor   # writes ../monitoring/prometheus-remote.yaml
-#   PROMETHEUS_CONFIG=../monitoring/prometheus-remote.yaml \
-#       docker compose -f monitoring/docker-compose.yml up -d
-# Same containers, same dashboard, same ports -- only which target list prometheus
-# scrapes changes (`PROMETHEUS_CONFIG` defaults to the local-benchmark path below, so
-# plain `docker compose up -d` with no env var is unchanged local-mode behavior). See
-# monitoring/README.md for the full walkthrough of all three flows.
-#
-# Host ports 3003/9095 avoid the ports used by the local-dryrun stack.
+# Monitoring for local, Docker, and remote benchmarks.
+# PROMETHEUS_CONFIG selects the generated scrape configuration.
+# Grafana uses port 3003; Prometheus uses port 9095.
 
 services:
   prometheus:

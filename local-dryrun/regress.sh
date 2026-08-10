@@ -1,69 +1,41 @@
 #!/usr/bin/env bash
-# Regression guard: run after EVERY improvement iteration, before spending on AWS.
-#
-# Default n=30 @ 100 tx/s. Sized to the dev machine, deliberately:
-#   - n=30 is the ceiling for a comfortable local run (n=40 oversubscribes a 14-core
-#     box: 40 primaries + 40 workers + clients, and views start going split purely
-#     from CPU starvation -- see repro-anchor.sh, which exploits that on purpose).
-#   - 100 tx/s, not 1000: at n=30/1000 the machine is loaded enough to degrade latency,
-#     which makes the p50/p99 thresholds below track the laptop rather than the code.
-#     The guard's job is to catch behaviour changes, not to benchmark throughput.
-#
-# What it asserts, and why each one exists:
-#   TPS / misses / p50 / p99   -- the run still commits at the offered rate.
-#   cursor lag                 -- entered_view minus cursor_next_view.
-#   no node with cursor <= 1   -- a wedged cursor, the same failure's terminal state.
-#
-# Budget: under a MINUTE end to end (30s run + a cached build). Long enough for the
-# cursor/seal-route signals to be meaningful, short enough to run on every iteration
-# without thinking about it.
-#
-# RTT MODE (4th arg, default `wan`). `wan` omits --mimic-latency-ms entirely, which makes
-# `local-benchmark` default to `LatencyTable::aws_rtt(n)` -- the SAME 10-region AWS matrix the
-# AWS mimic runs use, since wanbench passes `mimic_latency_ms: None` in mimic mode and the
-# node expands it identically. So local latency percentiles are directly comparable to a
-# recorded AWS sweep; under `loopback` they are not, and were quietly ~5x lower (75ms p50
-# local against 414-421ms on AWS at the same n and rate). `loopback` remains available as the
-# fast shape-only smoke test, with its own thresholds.
+# Check throughput, latency, misses, and cursor progress.
+# Defaults: 10 validators, 1,000 tx/s, 60 seconds, and the AWS RTT matrix.
 #
 # Usage:  ./local-dryrun/regress.sh [duration_s] [nodes] [rate] [wan|loopback]
-# Exits non-zero on regression, naming the threshold that failed.
+# Exit nonzero when a threshold fails.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-DURATION="${1:-30}"
-NODES="${2:-30}"
-RATE="${3:-100}"
+DURATION="${1:-60}"
+NODES="${2:-10}"
+RATE="${3:-1000}"
 TX_SIZE=512
-DELTA_MS=200          # mirrors configs/sweep20-vantage.yaml / sweep100-vantage.yaml
+DELTA_MS=200
 MAX_BATCH_DELAY_MS=20
-# Keep the block-delay setting fixed so thresholds remain comparable across runs.
+# Keep the header delay fixed for comparable thresholds.
 MAX_HEADER_DELAY_MS=50
 
 RTT_MODE="${4:-wan}"
 
-MIN_TPS=$(( RATE * 85 / 100 ))   # 85% of offered
-MAX_CURSOR_LAG=50                # healthy is 1-2; 50 is a wide net for a laptop hiccup
+MIN_TPS=$(( RATE * 85 / 100 ))
+MAX_CURSOR_LAG=50
 if [ "$RTT_MODE" = "loopback" ]; then
-    LATENCY_FLAG="--mimic-latency-ms 0"   # explicit 0 is the only way to get pure loopback
+    LATENCY_FLAG="--mimic-latency-ms 0"
     MAX_P50_MS=250
     MAX_P99_MS=800
 else
-    # No flag at all -> local-benchmark defaults to aws_rtt(n), the same table the AWS mimic
-    # runs use. Thresholds sized from the recorded AWS sweeps (n=10/20/50 all landed at p50
-    # 406-434ms, p99 550-611ms across every rate), with laptop headroom on top -- the mimic
-    # only adds delay, it does not make the box faster.
+    # No flag selects the AWS RTT matrix.
     LATENCY_FLAG=""
     MAX_P50_MS=900
     MAX_P99_MS=2000
 fi
 
 DATA_DIR="${TMPDIR:-/tmp}/vantage-regress-$$"
-# Outside --data-dir on purpose: local-benchmark clears that directory on boot, which
-# deleted a log written into it and made a successful run look like it produced nothing.
+# Keep the log outside the cleared data directory.
 LOG="${TMPDIR:-/tmp}/vantage-regress-$$.log"
 
 echo "==> building (release, --features benchmark)"
@@ -107,7 +79,7 @@ if [ -z "${TPS:-}" ] || [ -z "${LAT:-}" ]; then
     exit 1
 fi
 
-# Cursor lag from the last --timeline row per node.
+# Read cursor lag from the last timeline row per node.
 read -r LAG_MED LAG_MAX STUCK < <(python3 - "$LOG" <<'PY'
 import re, sys, statistics as st
 last = {}

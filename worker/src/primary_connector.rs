@@ -8,13 +8,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
-// Send batches' digests to the primary.
+/// Sends batch digests to the primary.
 pub struct PrimaryConnector {
     /// The primary network address.
     primary_address: SocketAddr,
-    /// Input channel to receive the digests to send to the primary.
+    /// Batch digests to send.
     rx_digest: Receiver<SerializedBatchDigestMessage>,
-    /// A network sender to send the baches' digests to the primary.
+    /// Sends digests to the primary.
     network: SimpleSender,
 }
 
@@ -22,9 +22,7 @@ impl PrimaryConnector {
     pub fn spawn(
         primary_address: SocketAddr,
         rx_digest: Receiver<SerializedBatchDigestMessage>,
-        // Metrics registry.
         metrics: Arc<Metrics>,
-        // Transport-level batching: appended last, same convention.
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
@@ -42,13 +40,10 @@ impl PrimaryConnector {
 
     async fn run(&mut self) {
         while let Some(digest) = self.rx_digest.recv().await {
-            // Deserialize once per batch to label network metrics.
-            // Falls back to a generic label rather than panicking if that ever isn't
-            // true (defense in depth, matching this crate's existing tolerance style).
+            // Use a fallback label for malformed messages.
             let msg_type = bincode::deserialize::<WorkerPrimaryMessage>(&digest)
                 .map(|m| m.type_name())
                 .unwrap_or("WorkerPrimaryMessage");
-            // Send the digest through the network.
             self.network
                 .send_typed(self.primary_address, Bytes::from(digest), msg_type)
                 .await;

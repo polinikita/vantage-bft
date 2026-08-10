@@ -54,7 +54,7 @@ class Ploter:
 
     def _natural_keys(self, text):
         def try_cast(text): return int(text) if text.isdigit() else text
-        return [try_cast(c) for c in split('(\d+)', text)]
+        return [try_cast(c) for c in split(r'(\d+)', text)]
 
     def _tps(self, data):
         values = findall(r' TPS: (\d+) \+/- (\d+)', data)
@@ -165,10 +165,8 @@ class Ploter:
         except ConfigError as e:
             raise PlotError(e)
 
-        # Aggregate the logs.
         LogAggregator(params.max_latency).print()
 
-        # Make the latency, tps, and robustness graphs.
         iterator = params.workers if params.scalability() else params.nodes
         latency_files, tps_files = [], []
         for f in params.faults:

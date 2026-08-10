@@ -846,22 +846,6 @@ impl LaneManager {
         self.blocks.lock().len()
     }
 
-    /// Evicts blocks below `floor - keep` and returns the number deleted.
-    ///
-    /// `floor` must be confirmed by every other primary; local progress alone is not safe.
-    pub fn evict_universally_held(
-        &mut self,
-        author: &PublicKey,
-        floor: Height,
-        keep: Height,
-    ) -> usize {
-        let cut = floor.saturating_sub(keep);
-        if cut == 0 {
-            return 0;
-        }
-        self.blocks.lock().evict_author_below(author, cut)
-    }
-
     pub fn blocks_handle(&self) -> SharedBlocks {
         self.blocks.clone()
     }
@@ -1282,13 +1266,10 @@ impl LaneManager {
             )
         };
         let mut effects = Vec::new();
-        match direct_ready {
-            Some(r) => {
-                let author = r.0;
-                self.enqueue_pending_direct(r);
-                effects.extend(self.refresh_author(author));
-            }
-            None => {}
+        if let Some(r) = direct_ready {
+            let author = r.0;
+            self.enqueue_pending_direct(r);
+            effects.extend(self.refresh_author(author));
         }
         if gate_ready {
             effects.extend(self.refresh_woken_pending_direct(digest));
