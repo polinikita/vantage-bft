@@ -2521,6 +2521,20 @@ impl VantageCore {
         // -- a node that lags simply misses its turns, and the view then seals without its
         // proposal (or skips), which is invisible in any data-block measure.
         if self.agb.proposer(view) == self.name {
+            // Diagnostic-only observational log (same convention as the resolver's
+            // recovery-attachment line): lets a run correlate exactly WHICH owned views
+            // sealed empty with the sender-side events around them -- the 2026-08-10
+            // late-joiner diagnosis needed precisely this and had to infer it from
+            // peers' echo logs.
+            log::info!(
+                "vantage sequence: own proposer turn view={} outcome={}",
+                view,
+                if matches!(outcome, SequenceOutcome::Skip) {
+                    "skip"
+                } else {
+                    "committed"
+                }
+            );
             if let Some(metrics) = &self.metrics {
                 metrics.vantage_own_proposer_turns_total.inc();
                 if !matches!(outcome, SequenceOutcome::Skip) {

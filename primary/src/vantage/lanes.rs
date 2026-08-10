@@ -245,6 +245,34 @@ impl BlockCache {
         }
     }
 
+    /// Boot-time restore (`LaneManager::restore_own_frontier`): admit `block` as a
+    /// TRUSTED, fully-verified anchor of this node's OWN lane. Sets `chain_verified`
+    /// and `direct_prefix_verified` so both prefix walks terminate here instead of
+    /// failing forever at the pre-restart prefix this memory-only cache lost.
+    ///
+    /// Soundness: both flags memoize facts that are monotone and immutable once true
+    /// (see their field doc comments), and for the node's own lane they WERE true in
+    /// the process that persisted this header -- `publish_own` only ever extends a
+    /// self-published (direct, own-payload) chain, so by induction from the first boot
+    /// every persisted frontier had a direct, payload-ready, chain-valid prefix through
+    /// genesis. Restoring the memo across a restart of the same session (the caller
+    /// checks the sid, re-runs `block_ok`, and pins author/digest) claims nothing the
+    /// previous process had not genuinely verified. Only ever call this for a header
+    /// this party authored itself.
+    ///
+    /// Also marked `retained` (N8): the pre-restart process retained it on the ack
+    /// path, and peers may still repair against it -- with the rest of the lane gone,
+    /// this entry is what lets a peer fetch the tip this node builds on.
+    pub(crate) fn seed_own_anchor(&mut self, block: Header) {
+        let digest = block.id.clone();
+        self.upsert(block, true, false, true, true);
+        if let Some(entry) = self.by_digest.get_mut(&digest) {
+            entry.chain_verified = true;
+            entry.direct_prefix_verified = true;
+            entry.retained = true;
+        }
+    }
+
     /// Returns `true` iff this call is the one that newly retained `h` (idempotent).
     pub fn mark_retained(&mut self, h: &Digest) -> bool {
         match self.by_digest.get_mut(h) {
@@ -982,6 +1010,19 @@ pub struct LaneManager {
 /// 36-byte `[digest || worker_id]` payload keys, so it cannot collide with either.
 const OWN_FRONTIER_KEY: &[u8] = b"vantage/own_frontier";
 
+/// Companion record to `OWN_FRONTIER_KEY` carrying the frontier HEADER itself, so a
+/// restart can seed the (memory-only) `BlockCache` with a verified anchor of its own
+/// lane. Without it the restarted process holds NO entry for its own tip: every
+/// `direct_prefix_ok`/`verified_prefix_through_genesis` walk from any post-restart
+/// own-lane reference fails at that missing block -- and nothing ever refills it
+/// (self-published blocks are not re-delivered, repair's settle fan-out is only
+/// triggered by served blocks, and an uncommitted tip is in no install manifest).
+/// Measured on docker-bench (n=21 late-joiner): 4.0M failing chain-walk steps/s and
+/// 0.59M direct-walk steps/s, 26x/775x a healthy peer, saturating the core loop.
+///
+/// 27 bytes, distinct in length from every other key shape in this store.
+const OWN_FRONTIER_HEADER_KEY: &[u8] = b"vantage/own_frontier_header";
+
 /// `direct_pub` walks toward genesis twice, and `refresh_author` runs on every publish, so
 /// the number of candidate refs re-tested per call must be bounded independently of how many
 /// are pending. 8 keeps a publish cheap while still draining a backlog within a few calls at
@@ -995,6 +1036,16 @@ struct PersistedFrontier {
     sid: Digest,
     height: Height,
     digest: Digest,
+}
+
+/// `OWN_FRONTIER_HEADER_KEY`'s value. Same sid discipline as `PersistedFrontier`; the
+/// header is re-verified (`block_ok`, author, digest-vs-frontier match) on restore, so a
+/// corrupted or split-write record degrades to the old no-anchor behavior rather than
+/// admitting an unverified block.
+#[derive(Serialize, Deserialize)]
+struct PersistedFrontierHeader {
+    sid: Digest,
+    header: Header,
 }
 
 impl LaneManager {
@@ -1129,7 +1180,12 @@ impl LaneManager {
     /// Persist the frontier we are about to build on. WRITE-AHEAD: this must complete
     /// before the block that advances the frontier reaches the network, so a restart can
     /// never observe a frontier lower than one a peer has already seen.
-    async fn persist_own_frontier(&mut self) {
+    ///
+    /// `header` is the frontier block itself (`header.height`/`header.id` equal
+    /// `own_frontier` by construction at the only call site). It is persisted under its
+    /// own key so `restore_own_frontier` can seed the block cache with a verified
+    /// anchor -- see `OWN_FRONTIER_HEADER_KEY` for why the anchor matters.
+    async fn persist_own_frontier(&mut self, header: &Header) {
         let (height, digest) = self.own_frontier.clone();
         let record = PersistedFrontier {
             sid: self.sid.clone(),
@@ -1141,6 +1197,18 @@ impl LaneManager {
             // Not fatal on its own -- it costs durability of THIS height, and the next
             // published block rewrites the key -- but it is never expected.
             Err(e) => log::error!("vantage lanes: cannot serialize own lane frontier: {e}"),
+        }
+        let record = PersistedFrontierHeader {
+            sid: self.sid.clone(),
+            header: header.clone(),
+        };
+        match bincode::serialize(&record) {
+            Ok(bytes) => {
+                self.store
+                    .write(OWN_FRONTIER_HEADER_KEY.to_vec(), bytes)
+                    .await
+            }
+            Err(e) => log::error!("vantage lanes: cannot serialize own frontier header: {e}"),
         }
     }
 
@@ -1183,6 +1251,62 @@ impl LaneManager {
             self.own_frontier.0
         );
         self.own_frontier = (record.height, record.digest);
+        self.seed_own_anchor_from_store().await;
+    }
+
+    /// Seed the block cache with the restored frontier's HEADER as a verified anchor of
+    /// our own lane (see `OWN_FRONTIER_HEADER_KEY`). Every failure mode degrades to the
+    /// pre-anchor behavior (frontier restored, cache unseeded) -- never to adopting an
+    /// unverified block: the record must decode, carry this session's sid, be authored
+    /// by US, pass `block_ok`, and name exactly the digest the frontier record restored
+    /// (a split write across the two keys shows up as that mismatch).
+    async fn seed_own_anchor_from_store(&mut self) {
+        let bytes = match self.store.read(OWN_FRONTIER_HEADER_KEY.to_vec()).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return, // store predates the anchor record
+            Err(e) => {
+                log::error!("vantage lanes: cannot read own frontier header: {e}");
+                return;
+            }
+        };
+        let record: PersistedFrontierHeader = match bincode::deserialize(&bytes) {
+            Ok(record) => record,
+            Err(e) => {
+                log::error!("vantage lanes: cannot decode own frontier header: {e}");
+                return;
+            }
+        };
+        if record.sid != self.sid {
+            return; // same reason `restore_own_frontier` ignores a foreign-session record
+        }
+        let header = record.header;
+        if header.author != self.name
+            || (header.height, &header.id) != (self.own_frontier.0, &self.own_frontier.1)
+        {
+            log::warn!(
+                "vantage lanes: persisted frontier header does not match the restored \
+                 frontier (author={} height={}); cache left unseeded",
+                header.author,
+                header.height,
+            );
+            return;
+        }
+        if !block_ok(&header, &self.committee, &self.sid, self.max_block_payload) {
+            log::error!("vantage lanes: persisted frontier header fails block_ok; not seeded");
+            return;
+        }
+        let r = (header.author, header.height, header.id.clone());
+        log::info!(
+            "vantage lanes: seeded own lane anchor at height={} into the block cache",
+            header.height
+        );
+        self.blocks.lock().seed_own_anchor(header);
+        // Re-enter the tip into the ack pipeline: `acked` is memory-only too, so the
+        // next `refresh_author(self.name)` (the first own publish) re-confirms it via
+        // the now-succeeding walk, re-acks it (peers dedupe by watermark), and -- the
+        // part that matters -- re-admits our own lane into the N5 registers so our
+        // proposals can vouch for it again.
+        self.pending_direct.insert(r);
     }
 
     /// N1: create and self-publish our own next block. Height advances immediately on
@@ -1200,7 +1324,7 @@ impl LaneManager {
         self.own_frontier = (next_height, header.id.clone());
         // Before `process_publish_inner` and before the `BroadcastPublish` effect the
         // caller executes -- the whole point is that the write precedes the send.
-        self.persist_own_frontier().await;
+        self.persist_own_frontier(&header).await;
         if let Some(metrics) = &self.metrics {
             metrics.vantage_blocks_published.inc();
         }

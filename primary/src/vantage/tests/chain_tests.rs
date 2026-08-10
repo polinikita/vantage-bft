@@ -241,6 +241,49 @@ async fn restart_continues_the_lane_instead_of_forking_it() {
     );
 }
 
+/// A restart must also restore the lane's PROVABILITY, not just its coordinates. The
+/// block cache is memory-only, so without seeding the persisted frontier header back
+/// into it, every `direct_pub`/`holds_prefix` walk from a post-restart own block fails
+/// at the missing pre-restart tip -- forever (self-published blocks are never
+/// re-delivered, and repair never asks for them). Measured on docker-bench (n=21
+/// late-joiner): millions of failing walk steps/s, the node never re-acks or vouches
+/// for its own lane, and its proposer turns seal empty.
+#[tokio::test]
+async fn restart_can_still_prove_its_own_lane() {
+    let (author, _) = authors()[0];
+    let (mut lm, store) = new_lane_manager(author, ".db_test_vantage_restart_anchor");
+    let (first, _) = lm.publish_own(BTreeMap::new()).await;
+
+    let mut restarted = crate::vantage::lanes::LaneManager::new(
+        author,
+        test_committee(),
+        MAX_BLOCK_PAYLOAD,
+        store.clone(),
+    );
+    restarted.restore_own_frontier().await;
+
+    // The restored tip itself is provable again...
+    let tip = (author, first.height, first.id.clone());
+    assert!(
+        restarted.direct_pub(&tip),
+        "the restored frontier header must be seeded as a verified anchor"
+    );
+    assert!(restarted.holds_prefix(&tip));
+
+    // ...and so is everything published on top of it, which is what N3's ack and the
+    // N5 registers (this party vouching for its own lane in its proposals) hang off.
+    let (second, effects) = restarted.publish_own(BTreeMap::new()).await;
+    let r = (author, second.height, second.id.clone());
+    assert!(
+        restarted.direct_pub(&r),
+        "a post-restart block must verify through the seeded anchor"
+    );
+    assert!(
+        is_acked(&effects),
+        "the post-restart publish must re-arm the ack pipeline"
+    );
+}
+
 /// A store carried across a committee change describes a lane in a DIFFERENT session.
 /// Chaining onto it would produce blocks whose prefix no peer in the new session can
 /// walk, so the frontier is ignored and this session's lane starts at genesis.
