@@ -2145,14 +2145,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "network_connections{node=~\"$node\",node=~\".*-primary$\"}",
-          "legendFormat": "{{node}} {{listener}}",
+          "expr": "network_connections{node=~\"$node\",node=~\".*-primary$\",listener=\"primary_to_primary\"}",
+          "legendFormat": "{{node}}",
           "refId": "A"
         }
       ],
-      "title": "Primary inbound TCP connections",
+      "title": "Primary-to-primary TCP connections",
       "type": "timeseries",
-      "description": "Open inbound sessions on primary listeners."
+      "description": "Open inbound validator connections on the primary-to-primary listener."
     },
     {
       "datasource": {
@@ -2193,14 +2193,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "network_connections{node=~\"$node\",node=~\".*-worker-[0-9]+$\"}",
-          "legendFormat": "{{node}} {{listener}}",
+          "expr": "network_connections{node=~\"$node\",node=~\".*-worker-[0-9]+$\",listener=\"worker_to_worker\"}",
+          "legendFormat": "{{node}}",
           "refId": "A"
         }
       ],
-      "title": "Worker inbound TCP connections",
+      "title": "Worker-to-worker TCP connections",
       "type": "timeseries",
-      "description": "Open inbound sessions on worker listeners."
+      "description": "Open inbound validator connections on the worker-to-worker listener."
     },
     {
       "datasource": {
@@ -2347,7 +2347,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
-          "legendFormat": "node-local/LAN",
+          "legendFormat": "primary-worker",
           "refId": "L"
         },
         {
@@ -2509,7 +2509,7 @@
             "uid": "Fixed-UID-vantage"
           },
           "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
-          "legendFormat": "node-local/LAN",
+          "legendFormat": "primary-worker",
           "refId": "L"
         },
         {
