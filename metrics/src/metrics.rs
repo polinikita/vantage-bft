@@ -213,7 +213,7 @@ impl UtilizationTimerVecExt for IntCounterVec {
     }
 }
 
-use crate::stat::{histogram, DivUsize, HistogramSender, PreciseHistogram};
+use crate::stat::{histogram, DivUsize, HistogramSender, MulUsize, PreciseHistogram};
 
 /// Transaction latency and protocol metrics.
 #[derive(Clone)]
@@ -597,7 +597,9 @@ impl AsPrometheusMetric for usize {
     }
 }
 
-impl<T: Ord + AddAssign + DivUsize + Copy + Default + AsPrometheusMetric> HistogramReporter<T> {
+impl<T: Ord + AddAssign + DivUsize + MulUsize + Copy + Default + AsPrometheusMetric>
+    HistogramReporter<T>
+{
     pub fn new_in_registry(
         histogram: PreciseHistogram<T>,
         registry: &Registry,

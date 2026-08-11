@@ -24,7 +24,7 @@ RUST_LOG=error ./target/release/node local-benchmark \
     --nodes "$NODES" --workers 1 --rate "$RATE" --tx-size 512 \
     --protocol vantage --mode random \
     --duration "$((SECS + 10))" --delta-ms 200 \
-    --max-batch-delay-ms 5 --max-header-delay-ms 50 --crash 0 \
+    --max-batch-delay-ms 5 --max-header-delay-ms 100 --crash 0 \
     --batch-max-bytes 65536 --batch-max-delay-ms 5 --timeline \
     --data-dir "$DATA_DIR" --mimic-latency-ms 0 >"$DATA_DIR/../rss-run.log" 2>&1 &
 PID=$!

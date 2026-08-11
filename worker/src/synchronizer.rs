@@ -46,6 +46,8 @@ struct BatchLatencyTotals {
     tx_bytes: u64,
     committed_squared_micros: u64,
     materialised_squared_micros: u64,
+    committed_latency_counts: BTreeMap<Duration, usize>,
+    materialised_latency_counts: BTreeMap<Duration, usize>,
 }
 
 #[cfg(feature = "benchmark")]
@@ -59,6 +61,15 @@ impl BatchLatencyTotals {
         self.materialised_squared_micros = self
             .materialised_squared_micros
             .saturating_add(other.materialised_squared_micros);
+        for (latency, count) in &other.committed_latency_counts {
+            *self.committed_latency_counts.entry(*latency).or_default() += *count;
+        }
+        for (latency, count) in &other.materialised_latency_counts {
+            *self
+                .materialised_latency_counts
+                .entry(*latency)
+                .or_default() += *count;
+        }
     }
 }
 
@@ -102,17 +113,19 @@ pub struct Synchronizer {
     round: Round,
     /// Digests awaiting their batches, with cleanup round and request time.
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
-    /// Transaction latency metrics.
-    #[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
+}
+
+/// Processes benchmark commit metrics without blocking batch synchronization.
+#[cfg(feature = "benchmark")]
+pub(crate) struct CommitObserver {
+    store: Store,
+    rx_committed: Receiver<(u64, Vec<Digest>)>,
     metrics: Arc<Metrics>,
     /// Batch digests already counted in the benchmark metrics.
-    #[cfg(feature = "benchmark")]
     observed_commits: HashSet<Digest>,
     /// Commit-time index for pruning `observed_commits`.
-    #[cfg(feature = "benchmark")]
     observed_commits_order: BTreeSet<(u64, Digest)>,
     /// Committed digests missing from local storage, keyed by commit time.
-    #[cfg(feature = "benchmark")]
     pending_misses: BTreeMap<(u64, Digest), Sender<()>>,
 }
 
@@ -148,13 +161,6 @@ impl Synchronizer {
                     .with_batching(batch),
                 round: Round::default(),
                 pending: HashMap::new(),
-                metrics,
-                #[cfg(feature = "benchmark")]
-                observed_commits: HashSet::new(),
-                #[cfg(feature = "benchmark")]
-                observed_commits_order: BTreeSet::new(),
-                #[cfg(feature = "benchmark")]
-                pending_misses: BTreeMap::new(),
             }
             .run()
             .await;
@@ -183,10 +189,6 @@ impl Synchronizer {
     async fn run(&mut self) {
         let (tx_waiter, mut rx_waiter) =
             channel::<Result<Option<Digest>, StoreError>>(CHANNEL_CAPACITY);
-        let (tx_metrics_waiter, mut rx_metrics_waiter) =
-            channel::<Option<(Digest, u64)>>(CHANNEL_CAPACITY);
-        #[cfg(not(feature = "benchmark"))]
-        let _ = &tx_metrics_waiter;
 
         let timer = sleep(Duration::from_millis(TIMER_RESOLUTION));
         tokio::pin!(timer);
@@ -260,24 +262,7 @@ impl Synchronizer {
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
                     }
-                    #[cfg_attr(not(feature = "benchmark"), allow(unused_variables))]
-                    PrimaryWorkerMessage::Committed(commit_millis, digests) => {
-                        #[cfg(feature = "benchmark")]
-                        for miss in self.observe_committed(commit_millis, digests).await {
-                            let store = self.store.clone();
-                            let tx_result = tx_metrics_waiter.clone();
-                            tokio::spawn(async move {
-                                let resolved = Self::metrics_waiter(
-                                    miss.digest,
-                                    miss.commit_millis,
-                                    store,
-                                    miss.cancel,
-                                )
-                                .await;
-                                let _ = tx_result.send(resolved).await;
-                            });
-                        }
-                    }
+                    PrimaryWorkerMessage::Committed(..) => {}
                 },
 
                 Some(result) = rx_waiter.recv() => match result {
@@ -286,15 +271,6 @@ impl Synchronizer {
                     },
                     Ok(None) => {},
                     Err(e) => error!("{}", e)
-                },
-
-                Some(resolved) = rx_metrics_waiter.recv() => {
-                    #[cfg(feature = "benchmark")]
-                    if let Some((digest, commit_millis)) = resolved {
-                        self.finish_deferred_retry(digest, commit_millis).await;
-                    }
-                    #[cfg(not(feature = "benchmark"))]
-                    let _ = resolved;
                 },
 
                 () = &mut timer => {
@@ -332,6 +308,59 @@ impl Synchronizer {
             }
         }
     }
+}
+
+#[cfg(feature = "benchmark")]
+impl CommitObserver {
+    pub(crate) fn spawn(
+        store: Store,
+        rx_committed: Receiver<(u64, Vec<Digest>)>,
+        metrics: Arc<Metrics>,
+    ) {
+        tokio::spawn(async move {
+            Self {
+                store,
+                rx_committed,
+                metrics,
+                observed_commits: HashSet::new(),
+                observed_commits_order: BTreeSet::new(),
+                pending_misses: BTreeMap::new(),
+            }
+            .run()
+            .await;
+        });
+    }
+
+    async fn run(&mut self) {
+        let (tx_waiter, mut rx_waiter) = channel::<Option<(Digest, u64)>>(CHANNEL_CAPACITY);
+
+        loop {
+            tokio::select! {
+                Some((commit_millis, digests)) = self.rx_committed.recv() => {
+                    for miss in self.observe_committed(commit_millis, digests).await {
+                        let store = self.store.clone();
+                        let tx_result = tx_waiter.clone();
+                        tokio::spawn(async move {
+                            let resolved = Self::metrics_waiter(
+                                miss.digest,
+                                miss.commit_millis,
+                                store,
+                                miss.cancel,
+                            )
+                            .await;
+                            let _ = tx_result.send(resolved).await;
+                        });
+                    }
+                }
+
+                Some(resolved) = rx_waiter.recv() => {
+                    if let Some((digest, commit_millis)) = resolved {
+                        self.finish_deferred_retry(digest, commit_millis).await;
+                    }
+                }
+            }
+        }
+    }
 
     /// Record committed transaction metrics and defer missing batches until they arrive.
     /// The committed latency uses the primary's commit time; materialised latency uses
@@ -352,16 +381,22 @@ impl Synchronizer {
 
         let mut totals = BatchLatencyTotals::default();
         let mut deferred = Vec::new();
+        let mut unique = HashSet::new();
+        let candidates: Vec<Digest> = digests
+            .into_iter()
+            .filter(|digest| {
+                !self.observed_commits.contains(digest) && unique.insert(digest.clone())
+            })
+            .collect();
+        let present = self
+            .store
+            .read_many(candidates.iter().map(|digest| digest.to_vec()).collect())
+            .await;
 
-        for digest in digests {
-            if self.observed_commits.contains(&digest) {
-                continue;
-            }
-
-            match self
-                .read_and_observe_batch(&digest, commit_millis, materialised_now_millis)
-                .await
-            {
+        for (digest, bytes) in candidates.into_iter().zip(present) {
+            match bytes.map_or(BatchReadOutcome::Miss, |bytes| {
+                self.observe_batch_bytes(&digest, &bytes, commit_millis, materialised_now_millis)
+            }) {
                 BatchReadOutcome::Hit(batch_totals) => {
                     self.mark_observed(digest, commit_millis);
                     totals.accumulate(&batch_totals);
@@ -462,7 +497,18 @@ impl Synchronizer {
             }
         };
 
-        let message: WorkerMessage = match bincode::deserialize(&bytes) {
+        self.observe_batch_bytes(digest, &bytes, commit_millis, materialised_now_millis)
+    }
+
+    #[cfg(feature = "benchmark")]
+    fn observe_batch_bytes(
+        &self,
+        digest: &Digest,
+        bytes: &[u8],
+        commit_millis: u64,
+        materialised_now_millis: u64,
+    ) -> BatchReadOutcome {
+        let message: WorkerMessage = match bincode::deserialize(bytes) {
             Ok(message) => message,
             Err(e) => {
                 error!("Failed to deserialize committed batch {}: {}", digest, e);
@@ -488,12 +534,14 @@ impl Synchronizer {
             let materialised_latency =
                 Duration::from_millis(materialised_now_millis.saturating_sub(submitted_millis));
 
-            self.metrics
-                .transaction_committed_latency
-                .observe(committed_latency);
-            self.metrics
-                .transaction_materialised_latency
-                .observe(materialised_latency);
+            *totals
+                .committed_latency_counts
+                .entry(committed_latency)
+                .or_default() += 1;
+            *totals
+                .materialised_latency_counts
+                .entry(materialised_latency)
+                .or_default() += 1;
 
             let committed_micros = committed_latency.as_micros() as u64;
             let materialised_micros = materialised_latency.as_micros() as u64;
@@ -514,6 +562,16 @@ impl Synchronizer {
     fn flush_totals(&self, totals: &BatchLatencyTotals) {
         if totals.tx_count == 0 {
             return;
+        }
+        for (latency, count) in &totals.committed_latency_counts {
+            self.metrics
+                .transaction_committed_latency
+                .observe_n(*latency, *count);
+        }
+        for (latency, count) in &totals.materialised_latency_counts {
+            self.metrics
+                .transaction_materialised_latency
+                .observe_n(*latency, *count);
         }
         self.metrics
             .transaction_committed_latency_squared_micros

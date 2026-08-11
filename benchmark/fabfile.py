@@ -150,7 +150,7 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
 @task
 def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_ms=100,
              nodes=20, duration=180, rates='50000,100000,150000,200000,250000',
-             max_header_delay=50, batch_size=500_000, early_stop_margin=0.10,
+             max_header_delay=100, batch_size=500_000, early_stop_margin=0.10,
              source_build=False):
     '''Run an AWS throughput and latency sweep; rates are tx/s, duration is seconds per rate, and latency selects AWS or uniform RTT.'''
     try:

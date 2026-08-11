@@ -17,6 +17,9 @@ pub type SerializedBatchMessage = Bytes;
 /// Hashes and stores batches, then sends their digests to the primary.
 pub struct Processor;
 
+/// Maximum batches handled per store submission.
+const PROCESS_BATCH_LIMIT: usize = 64;
+
 impl Processor {
     pub fn spawn(
         id: WorkerId,
@@ -27,23 +30,39 @@ impl Processor {
         own_digest: bool,
     ) {
         tokio::spawn(async move {
-            while let Some(batch) = rx_batch.recv().await {
-                let mut hasher = Blake3Hasher::new();
-                hasher.update(&batch);
-                let digest = Digest(hasher.finalize().into());
+            while let Some(first) = rx_batch.recv().await {
+                let mut batches = Vec::with_capacity(PROCESS_BATCH_LIMIT);
+                batches.push(first);
+                while batches.len() < PROCESS_BATCH_LIMIT {
+                    match rx_batch.try_recv() {
+                        Ok(batch) => batches.push(batch),
+                        Err(_) => break,
+                    }
+                }
 
-                store.write(digest.to_vec(), batch.to_vec()).await;
+                let mut writes = Vec::with_capacity(batches.len());
+                let mut digests = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    let mut hasher = Blake3Hasher::new();
+                    hasher.update(&batch);
+                    let digest = Digest(hasher.finalize().into());
+                    writes.push((digest.to_vec(), batch.to_vec()));
+                    digests.push(digest);
+                }
+                store.write_many(writes).await;
 
-                let message = match own_digest {
-                    true => WorkerPrimaryMessage::OurBatch(digest, id),
-                    false => WorkerPrimaryMessage::OthersBatch(digest, id),
-                };
-                let message = bincode::serialize(&message)
-                    .expect("Failed to serialize our own worker-primary message");
-                tx_digest
-                    .send(message)
-                    .await
-                    .expect("Failed to send digest");
+                for digest in digests {
+                    let message = match own_digest {
+                        true => WorkerPrimaryMessage::OurBatch(digest, id),
+                        false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                    };
+                    let message = bincode::serialize(&message)
+                        .expect("Failed to serialize our own worker-primary message");
+                    tx_digest
+                        .send(message)
+                        .await
+                        .expect("Failed to send digest");
+                }
             }
         });
     }

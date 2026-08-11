@@ -405,7 +405,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="protocol round timeout in milliseconds (default 1000; "
                         "Simple-IT with Opt-RBC requires 8 * --delta-ms)")
     p.add_argument("--max-batch-delay-ms", type=int, default=20)
-    p.add_argument("--max-header-delay-ms", type=int, default=50)
+    p.add_argument("--max-header-delay-ms", type=int, default=100)
     p.add_argument("--no-batch-messages", action="store_true")
     p.add_argument("--batch-max-bytes", type=int, default=65536)
     p.add_argument("--batch-max-delay-ms", type=int, default=5)

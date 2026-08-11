@@ -31,7 +31,7 @@ echo "==> n=$NODES @ $RATE tx/s, ${DURATION}s, withhold=$WITHHOLD delta=${DELTA_
 RUST_LOG=warn ./target/release/node local-benchmark \
     --nodes "$NODES" --workers 1 --rate "$RATE" --tx-size 512 \
     --protocol vantage --mode random --duration "$DURATION" \
-    --delta-ms "$DELTA_MS" --max-batch-delay-ms 20 --max-header-delay-ms 50 --crash 0 \
+    --delta-ms "$DELTA_MS" --max-batch-delay-ms 20 --max-header-delay-ms 100 --crash 0 \
     --withhold "$WITHHOLD" \
     --data-dir "$DATA_DIR" --mimic-latency-ms "$LATENCY_MS" \
     --batch-max-bytes 65536 --batch-max-delay-ms 5 --timeline > "$LOG" 2>&1

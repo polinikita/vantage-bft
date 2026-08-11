@@ -235,7 +235,7 @@ async fn main() -> Result<()> {
                     Arg::new("max-header-delay-ms")
                         .long("max-header-delay-ms")
                         .value_name("INT")
-                        .default_value("50")
+                        .default_value("100")
                         .action(ArgAction::Set)
                         .help("Primary max header/car creation delay, ms"),
                 )

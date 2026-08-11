@@ -16,8 +16,8 @@ RATE="${3:-1000}"
 TX_SIZE=512
 DELTA_MS=200
 MAX_BATCH_DELAY_MS=20
-# Keep the header delay fixed for comparable thresholds.
-MAX_HEADER_DELAY_MS=50
+# Production header cadence.
+MAX_HEADER_DELAY_MS=100
 
 RTT_MODE="${4:-wan}"
 

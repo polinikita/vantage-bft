@@ -3290,24 +3290,15 @@ impl VantageCore {
         let was_recovering = self.sequence_sync_recovery_active;
         let shed_active = self.large_sequence_sync_target().is_some();
         let shed_released = self.sequence_shed_was_active && !shed_active;
-        let sync_work_active = self.sequence_transfer.is_some() || self.sequence_install.is_some();
-        let track_live_floor = shed_released
-            || (was_recovering
-                && !shed_active
-                && sync_work_active
-                && self.sequence_live_intake_floor > 0);
-        if track_live_floor {
+        if shed_released {
             let intake_edge = self.frontier.a_i() + 1;
             let covered_edge = target.unwrap_or(0).max(intake_edge);
             let floor = covered_edge.saturating_add(SEQUENCE_LIVE_INTAKE_MARGIN);
             if floor > self.sequence_live_intake_floor {
                 self.sequence_live_intake_floor = floor;
-                if shed_released {
-                    log::debug!(
-                        "vantage sequence sync: shed released; live-intake floor set to \
-                         view={floor}"
-                    );
-                }
+                log::debug!(
+                    "vantage sequence sync: shed released; live-intake floor set to view={floor}"
+                );
             }
         }
         self.sequence_shed_was_active = shed_active;
@@ -4218,8 +4209,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_intake_floor_tracks_active_recovery_work() {
-        let mut core = test_core(0, "sequence_sync_moving_live_floor");
+    async fn live_intake_floor_does_not_chase_active_recovery_work() {
+        let mut core = test_core(0, "sequence_sync_fixed_live_floor");
         core.sequence_sync_min_gap_views = 100;
         core.sequence_sync_shed_gap_views = 300;
         core.sequence_sync_rearm_gap_views = 800;
@@ -4274,24 +4265,18 @@ mod tests {
         core.refresh_sequence_large_gap_drop();
         assert_eq!(
             core.sequence_live_intake_floor,
-            700 + SEQUENCE_LIVE_INTAKE_MARGIN
+            520 + SEQUENCE_LIVE_INTAKE_MARGIN,
+            "live traffic received after shedding stops uses the ordinary path"
         );
-        assert!(core.sequence_sync_recovery_active);
+        assert!(!core.sequence_sync_recovery_active);
         assert!(!core.sequence_sync_recovered);
 
         core.sequence_install = None;
         core.frontier.enter(800);
-        for view in 520 + SEQUENCE_LIVE_INTAKE_MARGIN + 1..=700 + SEQUENCE_LIVE_INTAKE_MARGIN {
-            core.sequence
-                .as_mut()
-                .unwrap()
-                .record(view, &SequenceOutcome::Skip, &[])
-                .unwrap();
-        }
         core.refresh_sequence_large_gap_drop();
         assert_eq!(
             core.sequence_live_intake_floor,
-            700 + SEQUENCE_LIVE_INTAKE_MARGIN
+            520 + SEQUENCE_LIVE_INTAKE_MARGIN
         );
         assert!(!core.sequence_sync_recovery_active);
         assert!(core.sequence_sync_recovered);

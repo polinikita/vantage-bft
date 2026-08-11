@@ -10,9 +10,9 @@ use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 use tokio::time::{interval, Duration};
 
-/// Pending writes flush every 50 ms. The interval bounds write frequency and batches
+/// Pending writes flush every 100 ms. The interval bounds write frequency and batches
 /// writes from all store commands received since the previous flush.
-const FLUSH_INTERVAL_MS: u64 = 50;
+const FLUSH_INTERVAL_MS: u64 = 100;
 
 /// Maximum pending write bytes per store instance. This bounds memory between flushes.
 const MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
@@ -40,6 +40,7 @@ pub enum StoreProfile {
 
 pub enum StoreCommand {
     Write(Key, Value),
+    WriteMany(Vec<(Key, Value)>),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
     /// Batched lookup preserving input order. Per-key read errors are returned as
     /// missing values so one failure does not invalidate the full request.
@@ -111,21 +112,33 @@ impl Store {
                         };
                         match command {
                             StoreCommand::Write(key, value) => {
-                                // Resolve waiters before inserting the value. This arm
-                                // has no await point, so a follow-up read remains behind
-                                // the write in the channel.
-                                if let Some(mut senders) = obligations.remove(&key) {
-                                    while let Some(s) = senders.pop_front() {
-                                        let _ = s.send(Ok(value.clone()));
-                                    }
-                                }
-                                pending_bytes += key.len() + value.len();
-                                pending.insert(key, value);
-                                // Flush early if the pending memory bound is reached.
+                                stage_write(
+                                    &mut obligations,
+                                    &mut pending,
+                                    &mut pending_bytes,
+                                    key,
+                                    value,
+                                );
                                 if pending_bytes >= MAX_PENDING_BYTES {
                                     flush_pending(
                                         &db, &mut pending, &mut pending_bytes, &write_opts,
                                     );
+                                }
+                            }
+                            StoreCommand::WriteMany(entries) => {
+                                for (key, value) in entries {
+                                    stage_write(
+                                        &mut obligations,
+                                        &mut pending,
+                                        &mut pending_bytes,
+                                        key,
+                                        value,
+                                    );
+                                    if pending_bytes >= MAX_PENDING_BYTES {
+                                        flush_pending(
+                                            &db, &mut pending, &mut pending_bytes, &write_opts,
+                                        );
+                                    }
                                 }
                             }
                             StoreCommand::Read(key, sender) => {
@@ -228,6 +241,15 @@ impl Store {
         }
     }
 
+    pub async fn write_many(&mut self, entries: Vec<(Key, Value)>) {
+        if entries.is_empty() {
+            return;
+        }
+        if let Err(e) = self.channel.send(StoreCommand::WriteMany(entries)).await {
+            panic!("Failed to send WriteMany command to store: {}", e);
+        }
+    }
+
     pub async fn read(&mut self, key: Key) -> StoreResult<Option<Value>> {
         let (sender, receiver) = oneshot::channel();
         if let Err(e) = self.channel.send(StoreCommand::Read(key, sender)).await {
@@ -270,6 +292,28 @@ impl Store {
             .await
             .expect("Failed to receive reply to NotifyRead command from store")
     }
+}
+
+/// Add one write to the read overlay and resolve matching waiters.
+fn stage_write(
+    obligations: &mut HashMap<Key, VecDeque<oneshot::Sender<StoreResult<Value>>>>,
+    pending: &mut HashMap<Key, Value>,
+    pending_bytes: &mut usize,
+    key: Key,
+    value: Value,
+) {
+    if let Some(mut senders) = obligations.remove(&key) {
+        while let Some(sender) = senders.pop_front() {
+            let _ = sender.send(Ok(value.clone()));
+        }
+    }
+
+    let key_len = key.len();
+    let value_len = value.len();
+    if let Some(previous) = pending.insert(key, value) {
+        *pending_bytes = pending_bytes.saturating_sub(key_len + previous.len());
+    }
+    *pending_bytes = pending_bytes.saturating_add(key_len + value_len);
 }
 
 /// Flush pending writes as one atomic RocksDB batch. A failed write aborts the process

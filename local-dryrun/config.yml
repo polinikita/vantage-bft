@@ -22,7 +22,7 @@ delta_ms: 150
 
 # Worker batch and primary header delays, in milliseconds.
 max_batch_delay_ms: 20
-max_header_delay_ms: 50
+max_header_delay_ms: 100
 
 # Per-peer transport batching and flush limits.
 batch_messages: true

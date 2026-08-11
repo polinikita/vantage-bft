@@ -85,6 +85,34 @@ async fn read_many_preserves_order_and_gaps() {
 }
 
 #[tokio::test]
+async fn write_many_updates_reads_and_waiters() {
+    let path = ".db_test_write_many";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+
+    let notify_key = vec![2u8];
+    let expected_notify = vec![20u8];
+    let mut waiter_store = store.clone();
+    let waiter_key = notify_key.clone();
+    let waiter = tokio::spawn(async move { waiter_store.notify_read(waiter_key).await.unwrap() });
+    tokio::task::yield_now().await;
+
+    store
+        .write_many(vec![
+            (vec![1u8], vec![10u8]),
+            (notify_key.clone(), expected_notify.clone()),
+            (vec![1u8], vec![11u8]),
+        ])
+        .await;
+
+    assert_eq!(waiter.await.unwrap(), expected_notify);
+    assert_eq!(
+        store.read_many(vec![vec![1u8], notify_key]).await,
+        vec![Some(vec![11u8]), Some(vec![20u8])]
+    );
+}
+
+#[tokio::test]
 async fn batched_writes_survive_the_flush() {
     // Values must be readable before and after the pending batch flushes.
     let path = ".db_test_batched_flush";

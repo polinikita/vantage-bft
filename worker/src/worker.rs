@@ -3,6 +3,8 @@ use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
+#[cfg(feature = "benchmark")]
+use crate::synchronizer::CommitObserver;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -204,6 +206,13 @@ impl Worker {
     fn handle_primary_messages(&self) -> Vec<QueueProbe> {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
         let probes = vec![probe("synchronizer", tx_synchronizer.clone())];
+        #[cfg(feature = "benchmark")]
+        let (mut probes, tx_committed, rx_committed) = {
+            let (tx_committed, rx_committed) = channel(CHANNEL_CAPACITY);
+            (probes, tx_committed, rx_committed)
+        };
+        #[cfg(feature = "benchmark")]
+        probes.push(probe("commit_observer", tx_committed.clone()));
 
         let mut address = self
             .committee
@@ -215,6 +224,8 @@ impl Worker {
             address,
             PrimaryReceiverHandler {
                 tx_synchronizer,
+                #[cfg(feature = "benchmark")]
+                tx_committed,
                 metrics: self.metrics.clone(),
             },
             Some(self.metrics.clone()),
@@ -223,6 +234,9 @@ impl Worker {
             self.parameters.batch_messages,
             "primary_to_worker",
         );
+
+        #[cfg(feature = "benchmark")]
+        CommitObserver::spawn(self.store.clone(), rx_committed, self.metrics.clone());
 
         Synchronizer::spawn(
             self.name,
@@ -455,6 +469,8 @@ impl MessageHandler for WorkerReceiverHandler {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
+    #[cfg(feature = "benchmark")]
+    tx_committed: Sender<(u64, Vec<Digest>)>,
     metrics: Arc<Metrics>,
 }
 
@@ -468,18 +484,31 @@ impl MessageHandler for PrimaryReceiverHandler {
         match bincode::deserialize::<PrimaryWorkerMessage>(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
             Ok(message) => {
+                let kind = message.type_name();
                 self.metrics
                     .network_messages_received_total
-                    .with_label_values(&[message.type_name()])
+                    .with_label_values(&[kind])
                     .inc();
                 self.metrics
                     .network_bytes_received_total
-                    .with_label_values(&[message.type_name()])
+                    .with_label_values(&[kind])
                     .inc_by(serialized.len() as u64);
-                self.tx_synchronizer
-                    .send(message)
-                    .await
-                    .expect("Failed to send transaction")
+                match message {
+                    PrimaryWorkerMessage::Committed(commit_millis, digests) => {
+                        #[cfg(feature = "benchmark")]
+                        self.tx_committed
+                            .send((commit_millis, digests))
+                            .await
+                            .expect("Failed to send committed batches");
+                        #[cfg(not(feature = "benchmark"))]
+                        let _ = (commit_millis, digests);
+                    }
+                    message => self
+                        .tx_synchronizer
+                        .send(message)
+                        .await
+                        .expect("Failed to send primary message"),
+                }
             }
         }
         Ok(())

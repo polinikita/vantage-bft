@@ -50,28 +50,14 @@ async fn synchronize() {
 #[cfg(feature = "benchmark")]
 mod benchmark_metrics_tests {
     use super::*;
-    use crate::common::{committee_with_base_port, keys};
     use crypto::Blake3Hasher;
     use metrics::Metrics;
 
-    /// Build a synchronizer directly so its metric state can be inspected.
-    fn new_test_synchronizer(store: Store, metrics: Arc<Metrics>) -> Synchronizer {
-        let mut keys = keys();
-        let (name, _) = keys.pop().unwrap();
-        let committee = committee_with_base_port(9_200);
-        let (_tx_message, rx_message) = channel(1);
-        Synchronizer {
-            name,
-            id: 0,
-            committee,
+    fn new_test_observer(store: Store, metrics: Arc<Metrics>) -> CommitObserver {
+        let (_tx_committed, rx_committed) = channel(1);
+        CommitObserver {
             store,
-            gc_depth: 50,                // Not used by these tests.
-            sync_retry_delay: 1_000_000, // Ensure it is not triggered.
-            sync_retry_nodes: 3,         // Not used by these tests.
-            rx_message,
-            network: SimpleSender::new(),
-            round: Round::default(),
-            pending: HashMap::new(),
+            rx_committed,
             metrics,
             observed_commits: HashSet::new(),
             observed_commits_order: BTreeSet::new(),
@@ -133,7 +119,7 @@ mod benchmark_metrics_tests {
 
         let registry = prometheus::Registry::new();
         let (metrics, reporter) = Metrics::new(&registry);
-        let mut synchronizer = new_test_synchronizer(store.clone(), metrics.clone());
+        let mut observer = new_test_observer(store.clone(), metrics.clone());
 
         let commit_millis = 1_700_000_000_000u64;
         let committed_latency_ms = 250u64;
@@ -143,7 +129,7 @@ mod benchmark_metrics_tests {
         let wire_bytes = bincode::serialize(&WorkerMessage::Batch(vec![tx.clone()])).unwrap();
         let digest = digest_of(&wire_bytes);
 
-        let deferred = synchronizer
+        let deferred = observer
             .observe_committed(commit_millis, vec![digest.clone()])
             .await;
         assert_eq!(
@@ -154,9 +140,9 @@ mod benchmark_metrics_tests {
         assert_eq!(metrics.latency_misses.get(), 1);
         assert_eq!(metrics.latency_misses_resolved.get(), 0);
         assert_eq!(metrics.committed_transactions.get(), 0);
-        assert!(!synchronizer.observed_commits.contains(&digest));
+        assert!(!observer.observed_commits.contains(&digest));
         assert!(
-            synchronizer
+            observer
                 .pending_misses
                 .contains_key(&(commit_millis, digest.clone())),
             "the miss must be recorded with its ORIGINAL commit instant"
@@ -168,7 +154,7 @@ mod benchmark_metrics_tests {
             .await;
 
         let miss = deferred.into_iter().next().unwrap();
-        let (resolved_digest, resolved_commit_millis) = Synchronizer::metrics_waiter(
+        let (resolved_digest, resolved_commit_millis) = CommitObserver::metrics_waiter(
             miss.digest,
             miss.commit_millis,
             store.clone(),
@@ -177,7 +163,7 @@ mod benchmark_metrics_tests {
         .await
         .expect("notify_read must resolve once the batch is written");
         let materialise_lower_bound = now_millis();
-        synchronizer
+        observer
             .finish_deferred_retry(resolved_digest, resolved_commit_millis)
             .await;
         let materialise_upper_bound = now_millis();
@@ -190,8 +176,8 @@ mod benchmark_metrics_tests {
             1,
             "the original deferral must not be double-counted"
         );
-        assert!(synchronizer.observed_commits.contains(&digest));
-        assert!(!synchronizer
+        assert!(observer.observed_commits.contains(&digest));
+        assert!(!observer
             .pending_misses
             .contains_key(&(commit_millis, digest.clone())));
 
@@ -218,7 +204,7 @@ mod benchmark_metrics_tests {
              [{materialised_lower}, {materialised_upper}] us"
         );
 
-        let deferred_again = synchronizer
+        let deferred_again = observer
             .observe_committed(commit_millis + 1, vec![digest.clone()])
             .await;
         assert!(deferred_again.is_empty());
@@ -233,7 +219,7 @@ mod benchmark_metrics_tests {
 
         let registry = prometheus::Registry::new();
         let (metrics, _reporter) = Metrics::new(&registry);
-        let mut synchronizer = new_test_synchronizer(store.clone(), metrics.clone());
+        let mut observer = new_test_observer(store.clone(), metrics.clone());
 
         let old_commit_millis = 1_000_000_000_000u64;
 
@@ -250,18 +236,18 @@ mod benchmark_metrics_tests {
             .write(old_hit_digest.to_vec(), old_hit_bytes)
             .await;
 
-        let deferred = synchronizer
+        let deferred = observer
             .observe_committed(
                 old_commit_millis,
                 vec![old_missing_digest.clone(), old_hit_digest.clone()],
             )
             .await;
         assert_eq!(deferred.len(), 1);
-        assert!(synchronizer
+        assert!(observer
             .pending_misses
             .contains_key(&(old_commit_millis, old_missing_digest.clone())));
-        assert!(synchronizer.observed_commits.contains(&old_hit_digest));
-        assert!(synchronizer
+        assert!(observer.observed_commits.contains(&old_hit_digest));
+        assert!(observer
             .observed_commits_order
             .contains(&(old_commit_millis, old_hit_digest.clone())));
 
@@ -274,20 +260,20 @@ mod benchmark_metrics_tests {
             .write(fresh_digest.to_vec(), fresh_bytes)
             .await;
 
-        let deferred_again = synchronizer
+        let deferred_again = observer
             .observe_committed(new_commit_millis, vec![fresh_digest.clone()])
             .await;
         assert!(deferred_again.is_empty());
 
-        assert!(synchronizer.pending_misses.is_empty());
-        assert!(!synchronizer.observed_commits.contains(&old_hit_digest));
-        assert!(!synchronizer
+        assert!(observer.pending_misses.is_empty());
+        assert!(!observer.observed_commits.contains(&old_hit_digest));
+        assert!(!observer
             .observed_commits_order
             .contains(&(old_commit_millis, old_hit_digest)));
-        assert!(synchronizer.observed_commits.contains(&fresh_digest));
+        assert!(observer.observed_commits.contains(&fresh_digest));
 
         let miss = deferred.into_iter().next().unwrap();
-        let resolved = Synchronizer::metrics_waiter(
+        let resolved = CommitObserver::metrics_waiter(
             miss.digest,
             miss.commit_millis,
             store.clone(),

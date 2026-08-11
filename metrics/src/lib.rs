@@ -15,4 +15,4 @@ pub use crate::snapshot::{
     read_materialised_latency_snapshot, read_seal_route_counts, read_vantage_progress,
     AggregatedLatency, LatencySnapshot, VantageProgress,
 };
-pub use crate::stat::{histogram, DivUsize, HistogramSender, PreciseHistogram};
+pub use crate::stat::{histogram, DivUsize, HistogramSender, MulUsize, PreciseHistogram};
