@@ -87,7 +87,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use store::Store;
@@ -252,6 +252,18 @@ impl Inbound {
     }
 }
 
+fn ingress_replaces_inbound(
+    inbound: &Inbound,
+    large_gap_drop: bool,
+    install_drop_through: View,
+) -> bool {
+    (large_gap_drop && !inbound.keep_during_large_sequence_sync())
+        || (install_drop_through > 0
+            && inbound
+                .install_obsolete_view()
+                .is_some_and(|view| view <= install_drop_through))
+}
+
 fn author_label(author: &PublicKey) -> String {
     author.to_string()
 }
@@ -269,10 +281,23 @@ pub struct VantageReceiverHandler {
 
     /// Set while stale view-scoped traffic must be rejected before enqueueing.
     pub sequence_large_gap_drop: Arc<AtomicBool>,
+
+    /// Highest view replaced by the active install.
+    pub sequence_install_drop_through: Arc<AtomicU64>,
     pub ack_aggregator: SharedAckAggregator,
 
     /// Metrics may be absent in directly constructed test handlers.
     pub metrics: Option<Arc<Metrics>>,
+}
+
+impl VantageReceiverHandler {
+    fn recovery_replaces(&self, inbound: &Inbound) -> bool {
+        ingress_replaces_inbound(
+            inbound,
+            self.sequence_large_gap_drop.load(Ordering::Relaxed),
+            self.sequence_install_drop_through.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[async_trait]
@@ -399,9 +424,7 @@ impl MessageHandler for VantageReceiverHandler {
 
             _ => return Ok(()),
         };
-        if self.sequence_large_gap_drop.load(Ordering::Relaxed)
-            && !inbound.keep_during_large_sequence_sync()
-        {
+        if self.recovery_replaces(&inbound) {
             if let Some(metrics) = &self.metrics {
                 metrics
                     .vantage_sequence_install_obsolete_inbound_dropped_total
@@ -434,9 +457,7 @@ impl MessageHandler for VantageReceiverHandler {
             .reserve()
             .await
             .expect("Failed to reserve vantage message slot");
-        if self.sequence_large_gap_drop.load(Ordering::Relaxed)
-            && !inbound.keep_during_large_sequence_sync()
-        {
+        if self.recovery_replaces(&inbound) {
             if let Some(metrics) = &self.metrics {
                 metrics
                     .vantage_sequence_install_obsolete_inbound_dropped_total
@@ -473,6 +494,7 @@ pub struct VantageCore {
     sequence_sync_shed_gap_views: View,
     sequence_sync_rearm_gap_views: View,
     sequence_large_gap_drop: Arc<AtomicBool>,
+    sequence_install_drop_through: Arc<AtomicU64>,
 
     /// Remains active until the installed cursor crosses the live intake floor.
     sequence_sync_recovery_active: bool,
@@ -635,7 +657,17 @@ type BuildOutput = (
     Sender<Inbound>,
     SharedAckAggregator,
     Arc<AtomicBool>,
+    Arc<AtomicU64>,
     Receiver<SocketAddr>,
+);
+
+pub type VantageSpawnOutput = (
+    Sender<Inbound>,
+    Sender<Inbound>,
+    Sender<Inbound>,
+    SharedAckAggregator,
+    Arc<AtomicBool>,
+    Arc<AtomicU64>,
 );
 
 impl VantageCore {
@@ -648,13 +680,7 @@ impl VantageCore {
         metrics: Option<Arc<Metrics>>,
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
-    ) -> (
-        Sender<Inbound>,
-        Sender<Inbound>,
-        Sender<Inbound>,
-        SharedAckAggregator,
-        Arc<AtomicBool>,
-    ) {
+    ) -> VantageSpawnOutput {
         let (
             core,
             rx_vantage,
@@ -666,6 +692,7 @@ impl VantageCore {
             tx_sequence,
             ack_aggregator,
             sequence_large_gap_drop,
+            sequence_install_drop_through,
             reconnect_rx,
         ) = Self::build(name, committee, parameters, store, metrics, tx_output);
         tokio::spawn(core.run(
@@ -682,6 +709,7 @@ impl VantageCore {
             tx_sequence,
             ack_aggregator,
             sequence_large_gap_drop,
+            sequence_install_drop_through,
         )
     }
 
@@ -701,6 +729,7 @@ impl VantageCore {
         let (tx_sequence, rx_sequence) = channel(sequence_capacity);
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
         let sequence_large_gap_drop = Arc::new(AtomicBool::new(false));
+        let sequence_install_drop_through = Arc::new(AtomicU64::new(0));
 
         // Capture membership before constructing protocol state.
         let members: HashSet<PublicKey> = committee.authorities.keys().cloned().collect();
@@ -840,6 +869,7 @@ impl VantageCore {
             sequence_sync_shed_gap_views: parameters.sequence_sync_shed_gap_views,
             sequence_sync_rearm_gap_views: parameters.sequence_sync_rearm_gap_views,
             sequence_large_gap_drop: sequence_large_gap_drop.clone(),
+            sequence_install_drop_through: sequence_install_drop_through.clone(),
             sequence_sync_recovery_active: false,
             sequence_sync_recovered: false,
             sequence_live_intake_floor: 0,
@@ -968,6 +998,7 @@ impl VantageCore {
             tx_sequence,
             ack_aggregator,
             sequence_large_gap_drop,
+            sequence_install_drop_through,
             reconnect_rx,
         )
     }
@@ -3325,6 +3356,17 @@ impl VantageCore {
             self.large_sequence_sync_target().is_some(),
             Ordering::Relaxed,
         );
+        let install_drop_through =
+            if self.sequence_install_enabled && self.sequence_sync_recovery_active {
+                self.sequence_install
+                    .as_ref()
+                    .map(|install| install.target().0)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        self.sequence_install_drop_through
+            .store(install_drop_through, Ordering::Relaxed);
     }
 
     /// Drops view-scoped traffic replaced by active recovery.
@@ -3779,6 +3821,7 @@ mod tests {
             _tx_sequence,
             _ack_aggregator,
             _sequence_large_gap_drop,
+            _sequence_install_drop_through,
             _reconnect_rx,
         ) = VantageCore::build(
             name,
@@ -3925,6 +3968,7 @@ mod tests {
             core.install_replaces_inbound(&future_echo),
             "large-gap install must not park future-view AGB traffic"
         );
+        assert!(ingress_replaces_inbound(&future_echo, true, 0));
 
         let control = Inbound::ControlEcho(
             member,
@@ -4006,6 +4050,14 @@ mod tests {
             core.install_replaces_inbound(&covered_echo),
             "the staged target still replaces messages for views it covers"
         );
+        core.refresh_sequence_large_gap_drop();
+        assert_eq!(
+            core.sequence_install_drop_through.load(Ordering::Relaxed),
+            target
+        );
+        assert!(ingress_replaces_inbound(&covered_echo, false, target));
+        assert!(!ingress_replaces_inbound(&future_echo, false, target));
+        assert!(!ingress_replaces_inbound(&announcement, false, target));
     }
 
     #[tokio::test]
@@ -5008,6 +5060,7 @@ mod tests {
             tx_bulk,
             tx_sequence,
             sequence_large_gap_drop: Arc::new(AtomicBool::new(false)),
+            sequence_install_drop_through: Arc::new(AtomicU64::new(0)),
             ack_aggregator,
             metrics: None,
         };

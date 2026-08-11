@@ -418,7 +418,7 @@ fn default_sequence_sync_shed_gap_views() -> u64 {
 
 /// Gap threshold for re-arming state sync after recovery.
 fn default_sequence_sync_rearm_gap_views() -> u64 {
-    800
+    300
 }
 
 /// Minimum number of sequence sources.
@@ -1414,6 +1414,7 @@ mod tests {
         let params = Parameters::default();
         assert_eq!(params.sequence_sync_min_gap_views, 100);
         assert_eq!(params.sequence_sync_shed_gap_views, 300);
+        assert_eq!(params.sequence_sync_rearm_gap_views, 300);
         assert_eq!(params.sequence_sync_request_timeout_ms, 1_000);
         assert_eq!(params.sequence_sync_inbound_capacity, 1_024);
     }

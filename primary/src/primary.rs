@@ -367,6 +367,7 @@ impl Primary {
                     tx_vantage_sequence,
                     ack_aggregator,
                     sequence_large_gap_drop,
+                    sequence_install_drop_through,
                 ) = crate::vantage::VantageCore::spawn(
                     name,
                     committee.clone(),
@@ -391,6 +392,7 @@ impl Primary {
                         tx_bulk: tx_vantage_bulk,
                         tx_sequence: tx_vantage_sequence,
                         sequence_large_gap_drop,
+                        sequence_install_drop_through,
                         ack_aggregator,
                         metrics: Some(metrics.clone()),
                     },
