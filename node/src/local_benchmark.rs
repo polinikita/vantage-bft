@@ -810,14 +810,22 @@ async fn print_results(
         std::collections::BTreeMap::new();
     let mut sent_bytes_by_type: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
+    let mut sent_bytes_by_node: std::collections::BTreeMap<usize, u64> =
+        std::collections::BTreeMap::new();
     let mut total_bytes_sent: u64 = 0;
     let mut total_bytes_received: u64 = 0;
     let all_registries = worker_metrics
         .iter()
-        .map(|(_, r, _)| r)
-        .chain(primary_metrics.iter().map(|(_, r, _)| r));
-    for registry in all_registries {
-        total_bytes_sent += read_counter(registry, "bytes_sent_total");
+        .map(|(node, registry, _)| (*node, registry))
+        .chain(
+            primary_metrics
+                .iter()
+                .map(|(node, registry, _)| (*node, registry)),
+        );
+    for (node, registry) in all_registries {
+        let bytes_sent = read_counter(registry, "bytes_sent_total");
+        total_bytes_sent += bytes_sent;
+        *sent_bytes_by_node.entry(node).or_default() += bytes_sent;
         total_bytes_received += read_counter(registry, "bytes_received_total");
         for (t, c) in read_counter_vec(registry, "network_messages_sent_total", "type") {
             *sent_by_type.entry(t).or_insert(0) += c;
@@ -841,6 +849,26 @@ async fn print_results(
         println!(
             " Overhead bytes per sequenced byte: {:.3}",
             total_bytes_sent as f64 / max_committed_bytes as f64
+        );
+    }
+    let mut validator_efficiency: Vec<f64> = sent_bytes_by_node
+        .iter()
+        .filter_map(|(node, sent)| {
+            let committed = committed_by_node.get(node)?.1;
+            (committed > 0).then_some(*sent as f64 / committed as f64)
+        })
+        .collect();
+    validator_efficiency.sort_by(f64::total_cmp);
+    if let (Some(min), Some(max)) = (validator_efficiency.first(), validator_efficiency.last()) {
+        let middle = validator_efficiency.len() / 2;
+        let median = if validator_efficiency.len().is_multiple_of(2) {
+            (validator_efficiency[middle - 1] + validator_efficiency[middle]) / 2.0
+        } else {
+            validator_efficiency[middle]
+        };
+        println!(
+            " Per-validator outbound bytes per sequenced byte: min/median/max {:.4}/{:.4}/{:.4}",
+            min, median, max
         );
     }
     if max_committed_transactions > 0 {
