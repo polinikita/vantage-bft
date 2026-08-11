@@ -77,6 +77,8 @@ cargo test --workspace
 
 An explicit `--mimic-latency-ms 0` selects loopback latency. If no latency
 option is provided, the benchmark uses the built-in AWS RTT matrix.
+Vantage uses one-byte committee identifiers on its primary wire by default for
+committees of at most 256 validators; `--no-compact-ids` selects full keys.
 
 Run `./target/release/node local-benchmark --help` for all options.
 

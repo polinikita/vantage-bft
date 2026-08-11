@@ -272,6 +272,7 @@ fn author_label(author: &PublicKey) -> String {
 #[derive(Clone)]
 pub struct VantageReceiverHandler {
     pub tx: Sender<Inbound>,
+    pub(crate) codec: wire::VantageWireCodec,
 
     /// Full bulk queues drop requests that the requester can retry.
     pub tx_bulk: Sender<Inbound>,
@@ -307,7 +308,7 @@ impl MessageHandler for VantageReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        let message: PrimaryMessage = bincode::deserialize(&serialized)?;
+        let message = self.codec.deserialize(&serialized)?;
 
         if let Some(metrics) = &self.metrics {
             crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
@@ -839,11 +840,15 @@ impl VantageCore {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        let wire_codec = wire::VantageWireCodec::new(&committee, parameters.vantage_compact_ids)
+            .unwrap_or_else(|error| panic!("invalid Vantage wire configuration: {error}"));
+
         let resume_senders = wire::spawn_resume_sender(
             latency_map.clone(),
             batch,
             core_metrics.clone(),
             in_flight.clone(),
+            wire_codec.clone(),
             parameters.replay_chunk_bytes,
             parameters.replay_chunk_interval_ms,
             parameters.replay_serve_max_bytes,
@@ -900,6 +905,7 @@ impl VantageCore {
             control,
             digest_stmts,
             wire: Wire {
+                codec: wire_codec,
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
@@ -1374,7 +1380,7 @@ impl VantageCore {
             return;
         }
         let msg_type = message.type_name();
-        let bytes = Bytes::from(bincode::serialize(&message).expect("serializes"));
+        let bytes = Bytes::from(self.wire.serialize_message(&message));
         let key = self.pacemaker.own_watermark();
         self.outbox.record(key, bytes.clone());
         self.wire.broadcast_volatile(bytes, msg_type, key).await;
@@ -5040,8 +5046,10 @@ mod tests {
 
         let (tx_bulk, _rx_bulk) = channel(4);
         let (tx_sequence, _rx_sequence) = channel(4);
+        let codec = wire::VantageWireCodec::new(&committee, true).unwrap();
         let handler = VantageReceiverHandler {
             tx: tx_vantage,
+            codec: codec.clone(),
             tx_bulk,
             tx_sequence,
             sequence_large_gap_drop: Arc::new(AtomicBool::new(false)),
@@ -5055,7 +5063,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let ack = Ack::new(reference.0, reference.1, reference.2.clone(), sender);
-        let payload = bincode::serialize(&PrimaryMessage::VantageAck(ack)).unwrap();
+        let payload = codec.serialize(&PrimaryMessage::VantageAck(ack)).unwrap();
 
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
@@ -5272,13 +5280,13 @@ mod tests {
     }
 
     fn intercept_resume_channel(core: &mut VantageCore) -> Receiver<wire::ReplaySend> {
-        let (tx, rx) = wire::ReplaySender::channel(usize::MAX);
+        let (tx, rx) = wire::ReplaySender::channel(usize::MAX, core.wire.codec.clone());
         core.wire.replay_tx = tx;
         rx
     }
 
     fn break_resume_channel(core: &mut VantageCore) {
-        let (tx, rx) = wire::ReplaySender::channel(usize::MAX);
+        let (tx, rx) = wire::ReplaySender::channel(usize::MAX, core.wire.codec.clone());
         drop(rx);
         core.wire.replay_tx = tx;
     }

@@ -317,11 +317,14 @@ impl SimpleItCore {
         };
 
         let in_flight: wire::InFlightMap = Arc::new(Mutex::new(HashMap::new()));
+        let wire_codec = wire::VantageWireCodec::new(&committee, false)
+            .expect("legacy primary wire supports any committee size");
         let resume_senders = wire::spawn_resume_sender(
             latency_map.clone(),
             batch,
             core_metrics.clone(),
             in_flight.clone(),
+            wire_codec.clone(),
             parameters.replay_chunk_bytes,
             parameters.replay_chunk_interval_ms,
             parameters.replay_serve_max_bytes,
@@ -336,6 +339,7 @@ impl SimpleItCore {
             ack_aggregator: ack_aggregator.clone(),
             rep,
             wire: Wire {
+                codec: wire_codec,
                 network: {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())

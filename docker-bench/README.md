@@ -52,6 +52,8 @@ Common options include `--tx-size`, `--mode`, `--no-latency`,
 Vantage carries positional availability claims on AGB echoes by default.
 `--no-echo-avail-claims` selects periodic watermarks; `--no-ack-watermarks`
 selects per-block acknowledgements.
+Vantage also uses one-byte committee identifiers by default;
+`--no-compact-ids` selects full public keys.
 
 ## Fault Injection
 

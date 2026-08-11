@@ -192,6 +192,10 @@ pub struct Parameters {
     #[serde(default = "default_digest_statements")]
     pub digest_statements: bool,
 
+    /// Uses one-byte committee indices on the Vantage primary wire.
+    #[serde(default = "default_vantage_compact_ids")]
+    pub vantage_compact_ids: bool,
+
     /// Enables sequence checkpoints and state synchronization.
     #[serde(default = "default_sequence_checkpoints")]
     pub sequence_checkpoints: bool,
@@ -365,6 +369,10 @@ fn default_echo_avail_claims() -> bool {
 
 /// Enables digest statements by default.
 fn default_digest_statements() -> bool {
+    true
+}
+
+fn default_vantage_compact_ids() -> bool {
     true
 }
 
@@ -689,6 +697,7 @@ impl Default for Parameters {
             ack_watermarks: default_ack_watermarks(),
             ack_watermark_period_ms: default_ack_watermark_period_ms(),
             digest_statements: default_digest_statements(),
+            vantage_compact_ids: default_vantage_compact_ids(),
             sequence_checkpoints: default_sequence_checkpoints(),
             sequence_checkpoint_interval_views: default_sequence_checkpoint_interval_views(),
             sequence_announce_period_ms: default_sequence_announce_period_ms(),
@@ -845,6 +854,10 @@ impl Parameters {
             "Digest-named AGB statements (ECHO/READY name their proposal by hash \
              instead of by value) enabled? {}",
             self.digest_statements
+        );
+        info!(
+            "Vantage one-byte committee identifiers enabled? {}",
+            self.vantage_compact_ids
         );
         info!(
             "Lane resume: check period {} ms, backoff {} ms, batch {} blocks",
@@ -1434,5 +1447,21 @@ mod tests {
         let decoded: Parameters =
             serde_json::from_value(object.into()).expect("legacy parameters deserialize");
         assert!(decoded.echo_avail_claims);
+    }
+
+    #[test]
+    fn vantage_compact_ids_default_on() {
+        let defaults = Parameters::default();
+        assert!(defaults.vantage_compact_ids);
+
+        let encoded = serde_json::to_value(defaults).expect("parameters serialize");
+        let mut object = encoded
+            .as_object()
+            .expect("parameters are an object")
+            .clone();
+        object.remove("vantage_compact_ids");
+        let decoded: Parameters =
+            serde_json::from_value(object.into()).expect("legacy parameters deserialize");
+        assert!(decoded.vantage_compact_ids);
     }
 }

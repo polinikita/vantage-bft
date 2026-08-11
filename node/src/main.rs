@@ -325,6 +325,12 @@ async fn main() -> Result<()> {
                         .long("no-digest-statements")
                         .action(ArgAction::SetTrue)
                         .help("Send full proposals in AGB ECHO and READY messages"),
+                )
+                .arg(
+                    Arg::new("no-compact-ids")
+                        .long("no-compact-ids")
+                        .action(ArgAction::SetTrue)
+                        .help("Send full committee identifiers on the Vantage primary wire"),
                 ),
         )
         .subcommand_required(true)

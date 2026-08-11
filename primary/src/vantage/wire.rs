@@ -3,11 +3,12 @@ use crate::primary::PrimaryMessage;
 use crate::vantage::node::Inbound;
 use crate::vantage::resume::InFlightEntry;
 use bytes::Bytes;
-use config::WorkerId;
-use crypto::PublicKey;
+use config::{Committee, WorkerId};
+use crypto::{with_public_key_index_codec, PublicKey, PublicKeyIndexCodec, PublicKeyIndexError};
 use metrics::Metrics;
 use network::{BatchConfig, CancelHandler, DirtyMap, ReliableSender, SimpleSender};
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,6 +18,84 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot::error::TryRecvError;
 
 pub(crate) type InFlightMap = Arc<Mutex<HashMap<PublicKey, InFlightEntry>>>;
+
+const COMPACT_ID_PREFIX: &[u8; 4] = b"VCI1";
+
+/// Encodes Vantage primary messages with committee indices and reads legacy frames.
+#[derive(Clone, Debug)]
+pub(crate) struct VantageWireCodec {
+    compact_outbound: bool,
+    public_keys: Option<PublicKeyIndexCodec>,
+}
+
+impl VantageWireCodec {
+    pub(crate) fn new(
+        committee: &Committee,
+        compact_outbound: bool,
+    ) -> Result<Self, PublicKeyIndexError> {
+        let public_keys = match PublicKeyIndexCodec::new(committee.authorities.keys().copied()) {
+            Ok(codec) => Some(codec),
+            Err(_) if !compact_outbound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            compact_outbound,
+            public_keys,
+        })
+    }
+
+    pub(crate) fn serialize(&self, message: &PrimaryMessage) -> bincode::Result<Vec<u8>> {
+        if !self.compact_outbound {
+            return bincode::serialize(message);
+        }
+        let codec = self.compact_codec()?;
+        let body_len = with_public_key_index_codec(codec, || bincode::serialized_size(message))?;
+        let body_len =
+            usize::try_from(body_len).map_err(|_| Box::new(bincode::ErrorKind::SizeLimit))?;
+        let capacity = COMPACT_ID_PREFIX
+            .len()
+            .checked_add(body_len)
+            .ok_or_else(|| Box::new(bincode::ErrorKind::SizeLimit))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(COMPACT_ID_PREFIX);
+        with_public_key_index_codec(codec, || bincode::serialize_into(&mut bytes, message))?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn deserialize(&self, bytes: &[u8]) -> bincode::Result<PrimaryMessage> {
+        let Some(body) = bytes.strip_prefix(COMPACT_ID_PREFIX) else {
+            return bincode::deserialize(bytes);
+        };
+        let codec = self.compact_codec()?;
+        with_public_key_index_codec(codec, || bincode::deserialize(body))
+    }
+
+    fn serialized_value_size<T: Serialize>(&self, value: &T) -> bincode::Result<u64> {
+        if !self.compact_outbound {
+            return bincode::serialized_size(value);
+        }
+        let codec = self.compact_codec()?;
+        with_public_key_index_codec(codec, || bincode::serialized_size(value))
+    }
+
+    fn serialized_message_size(&self, message: &PrimaryMessage) -> bincode::Result<u64> {
+        let size = self.serialized_value_size(message)?;
+        if self.compact_outbound {
+            size.checked_add(COMPACT_ID_PREFIX.len() as u64)
+                .ok_or_else(|| Box::new(bincode::ErrorKind::SizeLimit))
+        } else {
+            Ok(size)
+        }
+    }
+
+    fn compact_codec(&self) -> bincode::Result<&PublicKeyIndexCodec> {
+        self.public_keys.as_ref().ok_or_else(|| {
+            Box::new(bincode::ErrorKind::Custom(
+                "compact Vantage frame requires at most 256 committee members".to_owned(),
+            ))
+        })
+    }
+}
 
 /// Returns the sender identity claimed by a message, when the message carries one.
 pub trait DeclaredSender {
@@ -84,6 +163,7 @@ pub fn sender_is_member<M: DeclaredSender>(m: &M, members: &HashSet<PublicKey>) 
 pub(crate) type WithheldHeaderDests = Option<(Vec<SocketAddr>, Vec<(PublicKey, SocketAddr)>)>;
 
 pub struct Wire {
+    pub(crate) codec: VantageWireCodec,
     pub(crate) network: ReliableSender,
     pub(crate) worker_network: SimpleSender,
     pub(crate) resume_lane_tx: mpsc::Sender<LaneSend>,
@@ -109,6 +189,10 @@ pub struct Wire {
 }
 
 impl Wire {
+    pub(crate) fn serialize_message(&self, message: &PrimaryMessage) -> Vec<u8> {
+        self.codec.serialize(message).expect("serializes")
+    }
+
     /// Removes only handlers that resolved or closed; dropping a pending handler cancels retries.
     pub(crate) fn prune_cancel_handlers(&mut self) {
         self.cancel_handlers
@@ -124,11 +208,14 @@ impl Wire {
 
     pub(crate) async fn broadcast_message(&mut self, message: PrimaryMessage) {
         let msg_type = message.type_name();
-        let bytes = bincode::serialize(&message).expect("serializes");
+        let bytes = self.serialize_message(&message);
         if let PrimaryMessage::Header(header, false) = &message {
             if let Some(metrics) = &self.metrics {
                 metrics.proposed_block_size_bytes.observe(bytes.len());
-                let header_len = bincode::serialized_size(header).expect("serializes") as usize;
+                let header_len = self
+                    .codec
+                    .serialized_value_size(header)
+                    .expect("serializes") as usize;
                 metrics.proposed_header_size_bytes.observe(header_len);
             }
             if let Some((addrs, _)) = self.withheld_header_dests.clone() {
@@ -143,7 +230,7 @@ impl Wire {
 
     pub(crate) async fn send_message(&mut self, peer: PublicKey, message: PrimaryMessage) {
         let msg_type = message.type_name();
-        let bytes = bincode::serialize(&message).expect("serializes");
+        let bytes = self.serialize_message(&message);
         self.send_to(peer, bytes, msg_type).await;
     }
 
@@ -173,7 +260,7 @@ impl Wire {
             return;
         };
         let msg_type = message.type_name();
-        let bytes = Bytes::from(bincode::serialize(&message).expect("serializes"));
+        let bytes = Bytes::from(self.serialize_message(&message));
         self.network
             .send_volatile_typed(addr, bytes, key, msg_type)
             .await;
@@ -341,16 +428,21 @@ pub(crate) struct ReplaySender {
     tx: mpsc::Sender<ReplaySend>,
     reserved_bytes: Arc<AtomicUsize>,
     max_reserved_bytes: usize,
+    codec: VantageWireCodec,
 }
 
 impl ReplaySender {
-    pub(crate) fn channel(max_reserved_bytes: usize) -> (Self, mpsc::Receiver<ReplaySend>) {
+    pub(crate) fn channel(
+        max_reserved_bytes: usize,
+        codec: VantageWireCodec,
+    ) -> (Self, mpsc::Receiver<ReplaySend>) {
         let (tx, rx) = mpsc::channel(REPLAY_SEND_CHANNEL_CAPACITY);
         (
             Self {
                 tx,
                 reserved_bytes: Arc::new(AtomicUsize::new(0)),
                 max_reserved_bytes: max_reserved_bytes.max(1),
+                codec,
             },
             rx,
         )
@@ -358,7 +450,7 @@ impl ReplaySender {
 
     /// Admits work within the global byte bound, except for one oversized stream when idle.
     fn try_send(&self, mut item: ReplaySend) -> bool {
-        let reserved_bytes = replay_reserved_size(&item.msgs, &item.done);
+        let reserved_bytes = replay_reserved_size(&item.msgs, &item.done, &self.codec);
         let reserved =
             self.reserved_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -384,12 +476,12 @@ impl ReplaySender {
     }
 }
 
-fn replay_reserved_size(msgs: &[Bytes], done: &PrimaryMessage) -> usize {
+fn replay_reserved_size(msgs: &[Bytes], done: &PrimaryMessage, codec: &VantageWireCodec) -> usize {
     let payload_bytes = msgs
         .iter()
         .fold(0usize, |total, msg| total.saturating_add(msg.len()));
-    let done_bytes =
-        usize::try_from(bincode::serialized_size(done).expect("serializes")).unwrap_or(usize::MAX);
+    let done_bytes = usize::try_from(codec.serialized_message_size(done).expect("serializes"))
+        .unwrap_or(usize::MAX);
     payload_bytes.saturating_add(done_bytes).max(1)
 }
 
@@ -436,6 +528,7 @@ pub(crate) fn spawn_resume_sender(
     batch: BatchConfig,
     metrics: Option<Arc<Metrics>>,
     in_flight: InFlightMap,
+    codec: VantageWireCodec,
     chunk_bytes: usize,
     chunk_interval_ms: u64,
     replay_serve_max_bytes: usize,
@@ -443,7 +536,7 @@ pub(crate) fn spawn_resume_sender(
 ) -> ResumeSenders {
     let (lane_tx, lane_rx) = mpsc::channel(RESUME_LANE_CHANNEL_CAPACITY);
     let max_reserved_bytes = replay_serve_max_bytes.saturating_mul(2).max(1);
-    let (replay_tx, replay_rx) = ReplaySender::channel(max_reserved_bytes);
+    let (replay_tx, replay_rx) = ReplaySender::channel(max_reserved_bytes, codec.clone());
     let sequence_latency = latency_map.clone();
     let sequence_metrics = metrics.clone();
     let mut messages = SimpleSender::new()
@@ -458,7 +551,7 @@ pub(crate) fn spawn_resume_sender(
         replay = replay.with_metrics(m);
     }
     let chunk_interval = Duration::from_millis(chunk_interval_ms.max(1));
-    tokio::spawn(run_lane_sender(lane_rx, messages));
+    tokio::spawn(run_lane_sender(lane_rx, messages, codec.clone()));
     tokio::spawn(run_replay_sender(
         replay_rx,
         replay,
@@ -466,6 +559,7 @@ pub(crate) fn spawn_resume_sender(
         replay_tx.reserved_bytes.clone(),
         chunk_bytes.max(1),
         chunk_interval,
+        codec.clone(),
     ));
     let (sequence_tx, sequence_rx) = mpsc::channel(SEQUENCE_SEND_CHANNEL_CAPACITY);
     let mut sequence_messages = SimpleSender::new()
@@ -474,7 +568,7 @@ pub(crate) fn spawn_resume_sender(
     if let Some(m) = sequence_metrics {
         sequence_messages = sequence_messages.with_metrics(m);
     }
-    tokio::spawn(run_sequence_sender(sequence_rx, sequence_messages));
+    tokio::spawn(run_sequence_sender(sequence_rx, sequence_messages, codec));
     ResumeSenders {
         lane: lane_tx,
         replay: replay_tx,
@@ -483,18 +577,26 @@ pub(crate) fn spawn_resume_sender(
     }
 }
 
-async fn run_sequence_sender(mut rx: mpsc::Receiver<SequenceSend>, mut messages: SimpleSender) {
+async fn run_sequence_sender(
+    mut rx: mpsc::Receiver<SequenceSend>,
+    mut messages: SimpleSender,
+    codec: VantageWireCodec,
+) {
     while let Some(SequenceSend(to, message)) = rx.recv().await {
         let msg_type = message.type_name();
-        let bytes = bincode::serialize(&message).expect("serializes");
+        let bytes = codec.serialize(&message).expect("serializes");
         messages.send_typed(to, Bytes::from(bytes), msg_type).await;
     }
 }
 
-async fn run_lane_sender(mut rx: mpsc::Receiver<LaneSend>, mut messages: SimpleSender) {
+async fn run_lane_sender(
+    mut rx: mpsc::Receiver<LaneSend>,
+    mut messages: SimpleSender,
+    codec: VantageWireCodec,
+) {
     while let Some(LaneSend(to, message)) = rx.recv().await {
         let msg_type = message.type_name();
-        let bytes = bincode::serialize(&message).expect("serializes");
+        let bytes = codec.serialize(&message).expect("serializes");
         messages.send_typed(to, Bytes::from(bytes), msg_type).await;
     }
 }
@@ -509,6 +611,7 @@ async fn run_replay_sender(
     reserved_bytes: Arc<AtomicUsize>,
     chunk_bytes: usize,
     chunk_interval: Duration,
+    codec: VantageWireCodec,
 ) {
     let mut streams: VecDeque<ReplayStream> = VecDeque::new();
     let mut ticker = tokio::time::interval(chunk_interval);
@@ -529,7 +632,7 @@ async fn run_replay_sender(
                 }
                 if stream.msgs.is_empty() {
                     let msg_type = stream.done.type_name();
-                    let done_bytes = bincode::serialize(&stream.done).expect("serializes");
+                    let done_bytes = codec.serialize(&stream.done).expect("serializes");
                     replay
                         .send_detached_typed(stream.to, Bytes::from(done_bytes), msg_type)
                         .await;
@@ -609,10 +712,15 @@ pub(crate) fn remove_in_flight_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::Digest;
     use futures::FutureExt as _;
 
     fn key(index: usize) -> PublicKey {
         crate::common::keys()[index].0
+    }
+
+    fn codec() -> VantageWireCodec {
+        VantageWireCodec::new(&crate::common::committee(), true).unwrap()
     }
 
     fn replay_item(peer: PublicKey, generation: u64, payloads: &[&'static [u8]]) -> ReplaySend {
@@ -630,11 +738,67 @@ mod tests {
     }
 
     #[test]
+    fn compact_codec_roundtrips_large_proposals_and_reads_legacy_frames() {
+        let (committee, _) = Committee::local_benchmark(100, 1, 10_000);
+        let manifest: Vec<_> = committee
+            .authorities
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(index, author)| (author, index as u64, Digest([index as u8; 32])))
+            .collect();
+        let proposal = crate::vantage::ViewProposal {
+            view: 7,
+            c: manifest.clone(),
+            t: manifest,
+            m: None,
+        };
+        let message = PrimaryMessage::VantagePropose(proposal.clone());
+        let compact = VantageWireCodec::new(&committee, true).unwrap();
+        let legacy = VantageWireCodec::new(&committee, false).unwrap();
+
+        let compact_bytes = compact.serialize(&message).unwrap();
+        let legacy_bytes = legacy.serialize(&message).unwrap();
+        assert!(compact_bytes.starts_with(COMPACT_ID_PREFIX));
+        assert_eq!(legacy_bytes, bincode::serialize(&message).unwrap());
+        assert_eq!(legacy_bytes.len() - compact_bytes.len(), 51 * 200 - 4);
+
+        for decoder in [&compact, &legacy] {
+            for bytes in [&compact_bytes, &legacy_bytes] {
+                let PrimaryMessage::VantagePropose(decoded) = decoder.deserialize(bytes).unwrap()
+                else {
+                    panic!("decoded the wrong message variant");
+                };
+                assert_eq!(decoded, proposal);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_codec_rejects_unknown_indices_and_oversized_committees() {
+        let committee = crate::common::committee();
+        let codec = VantageWireCodec::new(&committee, true).unwrap();
+        let sender = *committee.authorities.keys().next().unwrap();
+        let mut bytes = codec
+            .serialize(&PrimaryMessage::VantageWish(9, sender))
+            .unwrap();
+        *bytes.last_mut().unwrap() = committee.size() as u8;
+        assert!(codec.deserialize(&bytes).is_err());
+
+        let (oversized, _) = Committee::local_benchmark(257, 1, 20_000);
+        assert!(matches!(
+            VantageWireCodec::new(&oversized, true),
+            Err(PublicKeyIndexError::TooManyKeys(257))
+        ));
+        assert!(VantageWireCodec::new(&oversized, false).is_ok());
+    }
+
+    #[test]
     fn replay_byte_cap_covers_queued_and_active_until_completion() {
         let peer = key(0);
         let first = replay_item(peer, 1, &[b"payload"]);
-        let footprint = replay_reserved_size(&first.msgs, &first.done);
-        let (sender, mut rx) = ReplaySender::channel(footprint);
+        let footprint = replay_reserved_size(&first.msgs, &first.done, &codec());
+        let (sender, mut rx) = ReplaySender::channel(footprint, codec());
 
         assert!(sender.try_send(first));
         assert!(
@@ -663,7 +827,7 @@ mod tests {
 
     #[test]
     fn failed_replay_channel_send_refunds_reservation_immediately() {
-        let (sender, rx) = ReplaySender::channel(usize::MAX);
+        let (sender, rx) = ReplaySender::channel(usize::MAX, codec());
         drop(rx);
 
         assert!(!sender.try_send(replay_item(key(0), 1, &[b"payload"])));
@@ -672,7 +836,7 @@ mod tests {
 
     #[test]
     fn one_oversized_stream_is_admitted_only_when_alone() {
-        let (sender, mut rx) = ReplaySender::channel(1);
+        let (sender, mut rx) = ReplaySender::channel(1, codec());
         let first_peer = key(0);
         assert!(sender.try_send(replay_item(first_peer, 1, &[b"oversized"])));
         assert!(!sender.try_send(replay_item(key(1), 2, &[b"also oversized"])));
@@ -703,7 +867,7 @@ mod tests {
             ))
             .is_err());
 
-        let (replay_tx, mut replay_rx) = ReplaySender::channel(usize::MAX);
+        let (replay_tx, mut replay_rx) = ReplaySender::channel(usize::MAX, codec());
         assert!(replay_tx.try_send(replay_item(key(1), 1, &[b"replay"])));
         assert!(replay_rx.try_recv().is_ok());
     }
@@ -753,7 +917,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn due_tick_has_priority_and_first_tick_is_immediate() {
-        let (sender, mut rx) = ReplaySender::channel(usize::MAX);
+        let (sender, mut rx) = ReplaySender::channel(usize::MAX, codec());
         assert!(sender.try_send(replay_item(key(0), 1, &[b"first"])));
         let mut ticker = tokio::time::interval(Duration::from_millis(10));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -793,7 +957,8 @@ mod tests {
 
     #[tokio::test]
     async fn closed_replay_ingress_drains_all_accepted_streams() {
-        let (sender, rx) = ReplaySender::channel(usize::MAX);
+        let codec = codec();
+        let (sender, rx) = ReplaySender::channel(usize::MAX, codec.clone());
         let reserved_bytes = sender.reserved_bytes.clone();
         let first = key(0);
         let second = key(1);
@@ -826,6 +991,7 @@ mod tests {
                 reserved_bytes.clone(),
                 1,
                 Duration::from_millis(1),
+                codec,
             ),
         )
         .await

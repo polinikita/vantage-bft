@@ -231,6 +231,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             "Digest-named AGB statements: ON (Vantage ECHO/READY name their proposal by hash instead of by value)"
         );
     }
+    if protocol == Protocol::Vantage && !matches.get_flag("no-compact-ids") {
+        println!("Vantage committee identifiers: one-byte indices (default)");
+    }
     if crash > 0 {
         println!(
             "Crash fault: {} of {} nodes never spawned (committee unchanged; live = {})",
@@ -293,6 +296,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         echo_avail_claims,
         ack_watermark_period_ms,
         digest_statements: !matches.get_flag("no-digest-statements"),
+        vantage_compact_ids: !matches.get_flag("no-compact-ids"),
         withhold_senders: withhold,
         withhold_at_ms: withhold_at_secs.map(|secs| secs * 1000),
         withhold_for_ms: withhold_for_secs * 1000,

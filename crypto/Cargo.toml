@@ -15,3 +15,6 @@ blake3 = { workspace = true }
 serde = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }

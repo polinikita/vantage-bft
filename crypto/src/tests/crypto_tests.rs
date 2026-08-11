@@ -48,6 +48,56 @@ fn import_export_secret_key() {
 }
 
 #[test]
+fn public_key_index_encoding_is_scoped_and_roundtrips() {
+    let public_keys: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let codec = PublicKeyIndexCodec::new(public_keys.iter().copied()).unwrap();
+    let key = public_keys[2];
+
+    let legacy = bincode::serialize(&key).unwrap();
+    assert_eq!(legacy.len(), 52);
+
+    let compact = with_public_key_index_codec(&codec, || bincode::serialize(&key)).unwrap();
+    assert_eq!(compact, vec![2]);
+    let decoded: PublicKey =
+        with_public_key_index_codec(&codec, || bincode::deserialize(&compact)).unwrap();
+    assert_eq!(decoded, key);
+
+    assert_eq!(bincode::serialize(&key).unwrap(), legacy);
+}
+
+#[test]
+fn public_key_index_encoding_rejects_unknown_values() {
+    let codec = PublicKeyIndexCodec::new([PublicKey([1; 32])]).unwrap();
+
+    let encode = with_public_key_index_codec(&codec, || bincode::serialize(&PublicKey([2; 32])));
+    assert!(encode.is_err());
+
+    let decode: bincode::Result<PublicKey> =
+        with_public_key_index_codec(&codec, || bincode::deserialize(&[1]));
+    assert!(decode.is_err());
+}
+
+#[test]
+fn public_key_index_encoding_supports_exactly_256_keys() {
+    let keys_256 = (0..=u8::MAX).map(|index| {
+        let mut key = [0; 32];
+        key[0] = index;
+        PublicKey(key)
+    });
+    assert_eq!(PublicKeyIndexCodec::new(keys_256).unwrap().len(), 256);
+
+    let keys_257 = (0..257).map(|index| {
+        let mut key = [0; 32];
+        key[..2].copy_from_slice(&(index as u16).to_le_bytes());
+        PublicKey(key)
+    });
+    assert_eq!(
+        PublicKeyIndexCodec::new(keys_257).unwrap_err(),
+        PublicKeyIndexError::TooManyKeys(257)
+    );
+}
+
+#[test]
 fn verify_valid_signature() {
     // Get a keypair.
     let (public_key, secret_key) = keys().pop().unwrap();

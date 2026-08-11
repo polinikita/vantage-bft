@@ -389,6 +389,13 @@ impl Primary {
                     /* handler */
                     crate::vantage::node::VantageReceiverHandler {
                         tx: tx_vantage,
+                        codec: crate::vantage::wire::VantageWireCodec::new(
+                            &committee,
+                            parameters.vantage_compact_ids,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("invalid Vantage wire configuration: {error}")
+                        }),
                         tx_bulk: tx_vantage_bulk,
                         tx_sequence: tx_vantage_sequence,
                         sequence_large_gap_drop,

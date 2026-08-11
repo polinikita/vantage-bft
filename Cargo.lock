@@ -383,6 +383,7 @@ name = "crypto"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bincode",
  "blake3",
  "ed25519-dalek",
  "rand",

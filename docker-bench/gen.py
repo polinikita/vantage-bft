@@ -197,6 +197,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
             not args.no_ack_watermarks and not args.no_echo_avail_claims
         ),
         "digest_statements": not args.no_digest_statements,
+        "vantage_compact_ids": not args.no_compact_ids,
         # Disable checkpointing and installation with --no-state-sync.
         "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
@@ -368,6 +369,7 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
         "echo_avail_claims": (
             not args.no_ack_watermarks and not args.no_echo_avail_claims
         ),
+        "vantage_compact_ids": not args.no_compact_ids,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -431,6 +433,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="maximum manifest references per outcome response (default 1600)")
     p.add_argument("--no-digest-statements", action="store_true",
                help="disable digest-named AGB statements (ON by default)")
+    p.add_argument("--no-compact-ids", action="store_true",
+                   help="use full Vantage public keys on the primary wire")
     p.add_argument("--no-reconnect-replay", action="store_true",
                    help="disable volatile message replay after reconnect (Vantage only)")
     p.add_argument("--retry-backoff-max-ms", type=int, default=2000,

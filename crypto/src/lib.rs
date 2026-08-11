@@ -7,8 +7,11 @@ use rand::rngs::OsRng;
 use rand::{CryptoRng, RngCore};
 use serde::{de, ser, Deserialize, Serialize};
 use std::array::TryFromSliceError;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
+use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 
@@ -70,6 +73,106 @@ pub trait Hash {
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
 pub struct PublicKey(pub [u8; 32]);
 
+#[derive(Debug)]
+struct PublicKeyIndexInner {
+    keys: Vec<PublicKey>,
+    indices: HashMap<PublicKey, u8>,
+}
+
+/// Maps committee public keys to one-byte wire identifiers.
+#[derive(Clone, Debug)]
+pub struct PublicKeyIndexCodec(Arc<PublicKeyIndexInner>);
+
+/// Invalid committee mapping for one-byte identifiers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicKeyIndexError {
+    TooManyKeys(usize),
+    DuplicateKey(PublicKey),
+}
+
+impl fmt::Display for PublicKeyIndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyKeys(count) => {
+                write!(
+                    f,
+                    "one-byte committee identifiers support at most 256 keys, got {count}"
+                )
+            }
+            Self::DuplicateKey(key) => write!(f, "duplicate committee key {key}"),
+        }
+    }
+}
+
+impl std::error::Error for PublicKeyIndexError {}
+
+impl PublicKeyIndexCodec {
+    pub fn new(keys: impl IntoIterator<Item = PublicKey>) -> Result<Self, PublicKeyIndexError> {
+        let keys: Vec<_> = keys.into_iter().collect();
+        if keys.len() > u8::MAX as usize + 1 {
+            return Err(PublicKeyIndexError::TooManyKeys(keys.len()));
+        }
+        let mut indices = HashMap::with_capacity(keys.len());
+        for (index, key) in keys.iter().copied().enumerate() {
+            if indices.insert(key, index as u8).is_some() {
+                return Err(PublicKeyIndexError::DuplicateKey(key));
+            }
+        }
+        Ok(Self(Arc::new(PublicKeyIndexInner { keys, indices })))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.keys.is_empty()
+    }
+
+    pub fn index(&self, key: &PublicKey) -> Option<u8> {
+        self.0.indices.get(key).copied()
+    }
+
+    pub fn key(&self, index: u8) -> Option<PublicKey> {
+        self.0.keys.get(index as usize).copied()
+    }
+}
+
+thread_local! {
+    static PUBLIC_KEY_INDEX_SCOPES: RefCell<Vec<PublicKeyIndexCodec>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+struct PublicKeyIndexScope;
+
+impl Drop for PublicKeyIndexScope {
+    fn drop(&mut self) {
+        PUBLIC_KEY_INDEX_SCOPES.with(|scopes| {
+            scopes.borrow_mut().pop();
+        });
+    }
+}
+
+/// Applies one-byte public-key encoding only during `operation`.
+///
+/// The operation must be synchronous: the scope is local to the current thread.
+pub fn with_public_key_index_codec<T>(
+    codec: &PublicKeyIndexCodec,
+    operation: impl FnOnce() -> T,
+) -> T {
+    PUBLIC_KEY_INDEX_SCOPES.with(|scopes| scopes.borrow_mut().push(codec.clone()));
+    let _scope = PublicKeyIndexScope;
+    operation()
+}
+
+fn active_public_key_index(key: &PublicKey) -> Option<Option<u8>> {
+    PUBLIC_KEY_INDEX_SCOPES.with(|scopes| scopes.borrow().last().map(|codec| codec.index(key)))
+}
+
+fn active_public_key(index: u8) -> Option<Option<PublicKey>> {
+    PUBLIC_KEY_INDEX_SCOPES.with(|scopes| scopes.borrow().last().map(|codec| codec.key(index)))
+}
+
 impl PublicKey {
     pub fn encode_base64(&self) -> String {
         BASE64_STANDARD.encode(&self.0[..])
@@ -101,6 +204,12 @@ impl Serialize for PublicKey {
     where
         S: ser::Serializer,
     {
+        if let Some(index) = active_public_key_index(self) {
+            return serializer
+                .serialize_u8(index.ok_or_else(|| {
+                    ser::Error::custom("public key is not in the wire committee")
+                })?);
+        }
         serializer.serialize_str(&self.encode_base64())
     }
 }
@@ -110,6 +219,12 @@ impl<'de> Deserialize<'de> for PublicKey {
     where
         D: de::Deserializer<'de>,
     {
+        if PUBLIC_KEY_INDEX_SCOPES.with(|scopes| !scopes.borrow().is_empty()) {
+            let index = u8::deserialize(deserializer)?;
+            return active_public_key(index)
+                .flatten()
+                .ok_or_else(|| de::Error::custom(format!("unknown committee index {index}")));
+        }
         let s = String::deserialize(deserializer)?;
         let value = Self::decode_base64(&s).map_err(|e| de::Error::custom(e.to_string()))?;
         Ok(value)
