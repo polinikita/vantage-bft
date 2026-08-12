@@ -30,7 +30,9 @@ usage: blackout.sh --nodes i,j,... [--at S] [--down S] [--settle S]
   --nodes    validator indices to kill together (required)
   --at       seconds to wait before the blackout      (default 20)
   --down     seconds the victims stay down together   (default 20)
-  --settle   all-up observation window, in seconds    (default 60)
+             0 = permanent: victims stay down through the settle window
+             and are restored only on script exit
+  --settle   observation window, in seconds           (default 60)
 EOF
     exit 2
 }
@@ -54,7 +56,6 @@ for pair in "at:AT" "down:DOWN" "settle:SETTLE"; do
         echo "blackout.sh: --$flag must be a non-negative integer" >&2; usage ;;
     esac
 done
-[ "$DOWN" -ge 1 ] || { echo "blackout.sh: --down must be >= 1" >&2; exit 2; }
 [ -f "$MANIFEST" ] || { echo "blackout.sh: $MANIFEST not found -- run gen.py/run.sh first" >&2; exit 1; }
 
 NODES="$(python3 -c "import json;print(json.load(open('$MANIFEST'))['nodes'])")"
@@ -99,27 +100,36 @@ START_MS="$(now_ms)"
 [ "$AT" -gt 0 ] && sleep "$AT"
 
 down_ms="$(now_ms)"
-echo "blackout.sh: SIGKILL nodes [${VICTIMS[*]}] for ${DOWN}s"
+if [ "$DOWN" -gt 0 ]; then
+    echo "blackout.sh: SIGKILL nodes [${VICTIMS[*]}] for ${DOWN}s"
+else
+    echo "blackout.sh: SIGKILL nodes [${VICTIMS[*]}] permanently (restored on exit)"
+fi
 for i in "${VICTIMS[@]}"; do
     docker kill --signal=KILL "$(container "$i")" >/dev/null
 done
-sleep "$DOWN"
 
-echo "blackout.sh: restarting nodes [${VICTIMS[*]}]"
-for i in "${VICTIMS[@]}"; do
-    docker start "$(container "$i")" >/dev/null
-done
-up_ms="$(now_ms)"
-for i in "${VICTIMS[@]}"; do
-    for _ in $(seq 1 30); do
-        running "$i" && break
-        sleep 1
+if [ "$DOWN" -gt 0 ]; then
+    sleep "$DOWN"
+    echo "blackout.sh: restarting nodes [${VICTIMS[*]}]"
+    for i in "${VICTIMS[@]}"; do
+        docker start "$(container "$i")" >/dev/null
     done
-    running "$i" || { echo "blackout.sh: node $i did NOT come back after 30s" >&2; exit 1; }
-done
-
-SETTLE_START_MS="$up_ms"
-echo "blackout.sh: all victims restarted; observing for ${SETTLE}s"
+    up_ms="$(now_ms)"
+    for i in "${VICTIMS[@]}"; do
+        for _ in $(seq 1 30); do
+            running "$i" && break
+            sleep 1
+        done
+        running "$i" || { echo "blackout.sh: node $i did NOT come back after 30s" >&2; exit 1; }
+    done
+    SETTLE_START_MS="$up_ms"
+    echo "blackout.sh: all victims restarted; observing for ${SETTLE}s"
+else
+    up_ms="null"
+    SETTLE_START_MS="$down_ms"
+    echo "blackout.sh: observing the degraded committee for ${SETTLE}s"
+fi
 sleep "$SETTLE"
 END_MS="$(now_ms)"
 
@@ -146,8 +156,10 @@ json.dump({
 print(f"blackout.sh: timeline -> {path}")
 PYEOF
 
-if [ "${#DEAD[@]}" -gt 0 ]; then
+if [ "$DOWN" -eq 0 ]; then
+    echo "blackout.sh: permanent mode -- victims restored on exit"
+elif [ "${#DEAD[@]}" -gt 0 ]; then
     echo "blackout.sh: ${#DEAD[@]} node(s) not running at the end: ${DEAD[*]}" >&2
     exit 1
 fi
-echo "blackout.sh: all $NODES nodes running at the end"
+echo "blackout.sh: done"
