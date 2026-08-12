@@ -285,7 +285,8 @@ impl SimpleItCore {
             other_primaries.iter().map(|(_, a)| *a).collect();
 
         let withheld_header_dests: wire::WithheldHeaderDests =
-            config::withheld_destinations(&committee, &name, parameters.withhold_senders).map(
+            config::withheld_destinations(&committee, &name, parameters.withhold_senders,
+                                          parameters.withhold_count).map(
                 |blocked| {
                     let full: Vec<(PublicKey, SocketAddr)> = other_primaries
                         .iter()

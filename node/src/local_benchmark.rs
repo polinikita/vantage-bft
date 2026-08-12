@@ -103,6 +103,17 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold,
         nodes
     );
+    let withhold_count: Option<usize> = matches
+        .get_one::<String>("withhold-count")
+        .map(|s| {
+            s.parse()
+                .context("--withhold-count must be a non-negative integer")
+        })
+        .transpose()?;
+    anyhow::ensure!(
+        withhold_count.is_none_or(|count| count < nodes),
+        "--withhold-count must be below --nodes"
+    );
     let withhold_at_secs: Option<u64> = matches
         .get_one::<String>("withhold-at")
         .map(|s| {
@@ -300,6 +311,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         digest_statements: !matches.get_flag("no-digest-statements"),
         vantage_compact_ids: !matches.get_flag("no-compact-ids"),
         withhold_senders: withhold,
+        withhold_count,
         withhold_at_ms: withhold_at_secs.map(|secs| secs * 1000),
         withhold_for_ms: withhold_for_secs * 1000,
         withhold_window: withhold_window_cell.clone(),

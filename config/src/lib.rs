@@ -299,6 +299,12 @@ pub struct Parameters {
     #[serde(default)]
     pub withhold_senders: usize,
 
+    /// Destinations each withholding sender excludes. `None` keeps the legacy
+    /// half-committee width; values below `n - quorum` keep the withheld blocks
+    /// able to reach the availability quorum, exercising the mixed-grade path.
+    #[serde(default)]
+    pub withhold_count: Option<usize>,
+
     /// Withholding start offset, in milliseconds. `None` enables it for the full run.
     #[serde(default)]
     pub withhold_at_ms: Option<u64>,
@@ -751,6 +757,7 @@ impl Default for Parameters {
             batch_max_bytes: default_batch_max_bytes(),
             batch_max_delay_ms: default_batch_max_delay_ms(),
             withhold_senders: 0,
+            withhold_count: None,
             withhold_at_ms: None,
             withhold_for_ms: default_withhold_for_ms(),
             withhold_window: None,
@@ -882,18 +889,23 @@ impl Parameters {
             self.volatile_soft_cap
         );
         if self.withhold_senders > 0 {
+            let width = match self.withhold_count {
+                Some(count) => format!("{count} staggered peer(s)"),
+                None => "a staggered half of the committee".to_string(),
+            };
             match self.withhold_at_ms {
                 Some(at) => info!(
                     "Data-plane withholding: first {} node(s) withhold payload dissemination \
-                     from a staggered half of the committee, active [{}, {}) ms after start",
+                     from {}, active [{}, {}) ms after start",
                     self.withhold_senders,
+                    width,
                     at,
                     at + self.withhold_for_ms
                 ),
                 None => info!(
                     "Data-plane withholding: first {} node(s) withhold payload dissemination \
-                     from a staggered half of the committee",
-                    self.withhold_senders
+                     from {}",
+                    self.withhold_senders, width
                 ),
             }
         }
@@ -1219,11 +1231,13 @@ impl Committee {
 
 /// Returns destinations withheld by the local data-plane injector.
 ///
-/// Sender `i` withholds destinations `(i + 1)..=(i + n/2)` modulo `n`.
+/// Sender `i` withholds destinations `(i + 1)..=(i + count)` modulo `n`;
+/// `count = None` keeps the legacy half-committee width `n/2`.
 pub fn withheld_destinations(
     committee: &Committee,
     self_pk: &PublicKey,
     withhold_senders: usize,
+    count: Option<usize>,
 ) -> Option<HashSet<PublicKey>> {
     let n = committee.size();
     if withhold_senders == 0 || n == 0 {
@@ -1234,8 +1248,8 @@ pub fn withheld_destinations(
         return None;
     }
     let order: Vec<PublicKey> = committee.authorities.keys().copied().collect();
-    let half = n / 2;
-    Some((1..=half).map(|offset| order[(i + offset) % n]).collect())
+    let width = count.unwrap_or(n / 2).min(n.saturating_sub(1));
+    Some((1..=width).map(|offset| order[(i + offset) % n]).collect())
 }
 
 /// Returns whether withholding is active at `now`. An unset window is always active;
@@ -1332,7 +1346,7 @@ mod tests {
     #[test]
     fn withheld_destinations_stagger_wraps_around() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
-        let blocked = withheld_destinations(&committee, &keypairs[15].name, 16)
+        let blocked = withheld_destinations(&committee, &keypairs[15].name, 16, None)
             .expect("index 15 is one of the first 16 withholding senders");
         let expected: HashSet<PublicKey> = [16, 17, 18, 19, 0, 1, 2, 3, 4, 5]
             .into_iter()
@@ -1346,7 +1360,7 @@ mod tests {
     fn withheld_destinations_zero_is_none_for_everyone() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         for keypair in &keypairs {
-            assert!(withheld_destinations(&committee, &keypair.name, 0).is_none());
+            assert!(withheld_destinations(&committee, &keypair.name, 0, None).is_none());
         }
     }
 
@@ -1355,7 +1369,7 @@ mod tests {
     fn withheld_destinations_k_equals_n_every_sender_withholds() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         for keypair in &keypairs {
-            assert!(withheld_destinations(&committee, &keypair.name, 20).is_some());
+            assert!(withheld_destinations(&committee, &keypair.name, 20, None).is_some());
         }
     }
 
@@ -1363,7 +1377,7 @@ mod tests {
     #[test]
     fn withheld_destinations_odd_committee_floors() {
         let (committee, keypairs) = Committee::local_benchmark(7, 1, 9000);
-        let blocked = withheld_destinations(&committee, &keypairs[0].name, 1)
+        let blocked = withheld_destinations(&committee, &keypairs[0].name, 1, None)
             .expect("index 0 is the sole withholding sender");
         let expected: HashSet<PublicKey> = [1, 2, 3]
             .into_iter()
@@ -1376,8 +1390,8 @@ mod tests {
     #[test]
     fn withheld_destinations_non_sender_index_is_none() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
-        assert!(withheld_destinations(&committee, &keypairs[2].name, 3).is_some());
-        assert!(withheld_destinations(&committee, &keypairs[3].name, 3).is_none());
+        assert!(withheld_destinations(&committee, &keypairs[2].name, 3, None).is_some());
+        assert!(withheld_destinations(&committee, &keypairs[3].name, 3, None).is_none());
     }
 
     /// No configured window keeps withholding active.

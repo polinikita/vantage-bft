@@ -811,7 +811,8 @@ impl VantageCore {
         let (reconnect_tx, reconnect_rx) = channel(committee.size().max(1));
 
         let withheld_header_dests: wire::WithheldHeaderDests =
-            config::withheld_destinations(&committee, &name, parameters.withhold_senders).map(
+            config::withheld_destinations(&committee, &name, parameters.withhold_senders,
+                                          parameters.withhold_count).map(
                 |blocked| {
                     let full: Vec<(PublicKey, SocketAddr)> = other_primaries
                         .iter()

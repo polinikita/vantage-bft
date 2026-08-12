@@ -201,6 +201,13 @@ async fn main() -> Result<()> {
                         .help("Number of leading nodes that withhold payload broadcasts from half the committee"),
                 )
                 .arg(
+                    Arg::new("withhold-count")
+                        .long("withhold-count")
+                        .value_name("INT")
+                        .action(ArgAction::Set)
+                        .help("Peers each withholding node excludes (default: half the committee)"),
+                )
+                .arg(
                     Arg::new("withhold-at")
                         .long("withhold-at")
                         .value_name("SEC")

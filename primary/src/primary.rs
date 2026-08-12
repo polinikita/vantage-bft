@@ -629,7 +629,8 @@ impl Primary {
                         .map(|table| committee.latency_map(&name, table))
                         .unwrap_or_default(),
                     // Data-plane withholding destinations.
-                    config::withheld_destinations(&committee, &name, parameters.withhold_senders),
+                    config::withheld_destinations(&committee, &name, parameters.withhold_senders,
+                                                  parameters.withhold_count),
                     // Time-windowed withholding.
                     parameters.withhold_window.clone(),
                     metrics.clone(),

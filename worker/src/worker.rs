@@ -144,7 +144,8 @@ impl Worker {
             .unwrap_or_default();
 
         let withheld_destinations =
-            config::withheld_destinations(&committee, &name, parameters.withhold_senders);
+            config::withheld_destinations(&committee, &name, parameters.withhold_senders,
+                                          parameters.withhold_count);
 
         let withhold_window = parameters.withhold_window.clone();
 
