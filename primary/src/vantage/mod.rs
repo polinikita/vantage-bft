@@ -10,6 +10,8 @@ pub mod node;
 pub mod outbox;
 pub mod pacemaker;
 pub mod payload;
+#[cfg(feature = "pipeline-tracing")]
+mod pipeline;
 pub mod repair;
 pub mod resolve;
 pub mod resume;

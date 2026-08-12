@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use clap::ArgMatches;
 use config::{Committee, Export as _, KeyPair, LatencyTable, Parameters, Protocol, WorkerId};
 use crypto::{PublicKey, SignatureService};
+#[cfg(feature = "pipeline-tracing")]
+use metrics::read_duration_snapshot;
 use metrics::{
     aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot,
     read_materialised_latency_snapshot, read_vantage_progress, LatencySnapshot, MetricReporter,
@@ -491,16 +493,41 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
 fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
     match protocol {
         Protocol::Vantage => match msg_type {
-            "Header" | "Batch" => "dissemination",
-            "VantageAck" | "VantageAvail" => "acks",
-            "VantagePropose" | "VantageEcho" | "VantageEchoSkip" | "VantageReady"
-            | "VantageNoReady" | "VantageSkipVote"
-            // Digest-named AGB statements use the same category as their by-value forms.
-            | "VantageEchoDigest" | "VantageReadyDigest" => "agb",
+            "Batch" => "payload",
+            "Header" => "data-blocks",
+            "Replay" => "reconnect-replay",
+            "VantageAck" | "VantageAvail" => "availability",
+            "VantagePropose"
+            | "VantageEcho"
+            | "VantageEchoSkip"
+            | "VantageReady"
+            | "VantageNoReady"
+            | "VantageSkipVote"
+            | "VantageEchoDigest"
+            | "VantageReadyDigest"
+            | "VantageProposeBatch"
+            | "VantageEchoBatch"
+            | "VantageReadyBatch" => "agb",
             "VantageWish" => "pacemaker",
-            // Repair messages recover data identified by a reference or height.
-            "HeadersRequest" | "Synchronize" | "BatchRequest" | "VantageBodyFetch"
-            | "VantageBodyServe" | "VantageLaneResume" => "repair",
+            "OurBatch" | "OthersBatch" | "Committed" | "Cleanup" => "primary-worker",
+            "Synchronize" | "BatchRequest" => "payload-repair",
+            "HeadersRequest" | "VantageBodyFetch" | "VantageBodyServe" | "VantageLaneResume" => {
+                "protocol-repair"
+            }
+            "VantageResumeHello" | "VantageReplayDone" => "reconnect-replay",
+            "VantageSequenceAnnounce"
+            | "VantageSequenceAnnounceBatch"
+            | "VantageSequenceRequest"
+            | "VantageSequenceRecords"
+            | "VantageSequenceDeltaRequest"
+            | "VantageSequenceDelta"
+            | "VantageSequenceDeltaRangeRequest"
+            | "VantageSequenceDeltaRange"
+            | "VantageSequenceOutcomeRequest"
+            | "VantageSequenceOutcome"
+            | "VantageSequenceUnavailable"
+            | "VantageSequenceHeadersRequest"
+            | "VantageSequenceHeaders" => "state-sync",
             "CompReport"
             | "ControlInit"
             | "ControlEcho"
@@ -509,9 +536,10 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             | "ControlTimeoutAccept"
             | "ControlCommit"
             | "ControlFetch"
-            | "ControlServe" => "control",
-            "Committed" => "metricsplumbing",
-            _ => "other",
+            | "ControlServe"
+            | "ControlInitBatch"
+            | "ControlServeBatch" => "control",
+            _ => "uncategorized",
         },
         // Simple-IT shares the Vantage data plane and adds cut-consensus messages.
         Protocol::SimpleIt => match msg_type {
@@ -556,6 +584,88 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             "Committed" => "metricsplumbing",
             _ => "other",
         },
+    }
+}
+
+#[cfg(feature = "pipeline-tracing")]
+fn print_pipeline_latencies(
+    worker_metrics: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
+    primary_metrics: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
+    protocol: Protocol,
+) {
+    if protocol != Protocol::Vantage {
+        return;
+    }
+
+    println!(" Pipeline latency (pooled average; median node percentiles):");
+    let stages = [
+        (
+            "tx submission -> batch seal",
+            "transaction_to_batch_seal_latency",
+            worker_metrics,
+        ),
+        (
+            "ordered commit -> materialization",
+            "transaction_commit_to_materialised_latency",
+            worker_metrics,
+        ),
+        (
+            "worker batch hash + durable store",
+            "batch_processing_latency",
+            worker_metrics,
+        ),
+        (
+            "first batch digest -> block publication",
+            "vantage_digest_to_block_publish_latency",
+            primary_metrics,
+        ),
+        (
+            "block publication -> quorum availability",
+            "vantage_block_publish_to_quorum_latency",
+            primary_metrics,
+        ),
+        (
+            "block publication -> first proposal inclusion",
+            "vantage_block_publish_to_proposal_latency",
+            primary_metrics,
+        ),
+        (
+            "proposal receipt -> local AGB seal",
+            "vantage_proposal_to_seal_latency",
+            primary_metrics,
+        ),
+        (
+            "local AGB seal -> ordered view finalization",
+            "vantage_seal_to_finalize_latency",
+            primary_metrics,
+        ),
+        (
+            "block publication -> ordered block commit",
+            "vantage_block_publish_to_commit_latency",
+            primary_metrics,
+        ),
+    ];
+
+    for (label, metric, registries) in stages {
+        let snapshots: Vec<_> = registries
+            .iter()
+            .filter_map(|(_, registry, reporter)| {
+                reporter.force_report();
+                read_duration_snapshot(registry, metric)
+            })
+            .collect();
+        match aggregate_latency_snapshots(&snapshots) {
+            Some(agg) => println!(
+                "   {:<49} avg {:>7.2} ms  p50/p90/p99 {:>7.2}/{:>7.2}/{:>7.2} ms  ({} nodes)",
+                label,
+                agg.avg_micros / 1_000.0,
+                agg.p50_micros as f64 / 1_000.0,
+                agg.p90_micros as f64 / 1_000.0,
+                agg.p99_micros as f64 / 1_000.0,
+                agg.nodes_reporting,
+            ),
+            None => println!("   {:<49} no observations", label),
+        }
     }
 }
 
@@ -796,6 +906,9 @@ async fn print_results(
         }
     }
 
+    #[cfg(feature = "pipeline-tracing")]
+    print_pipeline_latencies(worker_metrics, primary_metrics, protocol);
+
     // Sum submitted traffic and network usage across nodes.
     let submitted_transactions: u64 = worker_metrics
         .iter()
@@ -902,6 +1015,16 @@ async fn print_results(
             println!(
                 "   {:<16} {:>10} msgs  {:>12} B  ({:.1}%)",
                 category, count, bytes, pct
+            );
+        }
+        println!(" Traffic by message type (category, messages, serialized bytes):");
+        for (message_type, bytes) in &sent_bytes_by_type {
+            println!(
+                "   {:<34} {:<16} {:>10} msgs  {:>12} B",
+                message_type,
+                categorize(protocol, message_type),
+                sent_by_type.get(message_type).copied().unwrap_or(0),
+                bytes,
             );
         }
     }

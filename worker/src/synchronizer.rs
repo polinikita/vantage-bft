@@ -48,6 +48,8 @@ struct BatchLatencyTotals {
     materialised_squared_micros: u64,
     committed_latency_counts: BTreeMap<Duration, usize>,
     materialised_latency_counts: BTreeMap<Duration, usize>,
+    #[cfg(feature = "pipeline-tracing")]
+    commit_to_materialised_latency_counts: BTreeMap<Duration, usize>,
 }
 
 #[cfg(feature = "benchmark")]
@@ -67,6 +69,13 @@ impl BatchLatencyTotals {
         for (latency, count) in &other.materialised_latency_counts {
             *self
                 .materialised_latency_counts
+                .entry(*latency)
+                .or_default() += *count;
+        }
+        #[cfg(feature = "pipeline-tracing")]
+        for (latency, count) in &other.commit_to_materialised_latency_counts {
+            *self
+                .commit_to_materialised_latency_counts
                 .entry(*latency)
                 .or_default() += *count;
         }
@@ -533,6 +542,9 @@ impl CommitObserver {
                 Duration::from_millis(commit_millis.saturating_sub(submitted_millis));
             let materialised_latency =
                 Duration::from_millis(materialised_now_millis.saturating_sub(submitted_millis));
+            #[cfg(feature = "pipeline-tracing")]
+            let commit_to_materialised_latency =
+                Duration::from_millis(materialised_now_millis.saturating_sub(commit_millis));
 
             *totals
                 .committed_latency_counts
@@ -542,6 +554,13 @@ impl CommitObserver {
                 .materialised_latency_counts
                 .entry(materialised_latency)
                 .or_default() += 1;
+            #[cfg(feature = "pipeline-tracing")]
+            {
+                *totals
+                    .commit_to_materialised_latency_counts
+                    .entry(commit_to_materialised_latency)
+                    .or_default() += 1;
+            }
 
             let committed_micros = committed_latency.as_micros() as u64;
             let materialised_micros = materialised_latency.as_micros() as u64;
@@ -571,6 +590,13 @@ impl CommitObserver {
         for (latency, count) in &totals.materialised_latency_counts {
             self.metrics
                 .transaction_materialised_latency
+                .observe_n(*latency, *count);
+        }
+        #[cfg(feature = "pipeline-tracing")]
+        for (latency, count) in &totals.commit_to_materialised_latency_counts {
+            self.metrics
+                .pipeline
+                .transaction_commit_to_materialised_latency
                 .observe_n(*latency, *count);
         }
         self.metrics

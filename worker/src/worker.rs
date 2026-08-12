@@ -320,7 +320,15 @@ impl Worker {
             self.batch,
         );
 
-        Processor::spawn(self.id, self.store.clone(), rx_processor, tx_primary, true);
+        Processor::spawn(
+            self.id,
+            self.store.clone(),
+            rx_processor,
+            tx_primary,
+            true,
+            #[cfg(feature = "pipeline-tracing")]
+            self.metrics.clone(),
+        );
 
         info!(
             "Worker {} listening to client transactions on {}",
@@ -372,7 +380,15 @@ impl Worker {
             self.batch,
         );
 
-        Processor::spawn(self.id, self.store.clone(), rx_processor, tx_primary, false);
+        Processor::spawn(
+            self.id,
+            self.store.clone(),
+            rx_processor,
+            tx_primary,
+            false,
+            #[cfg(feature = "pipeline-tracing")]
+            self.metrics.clone(),
+        );
 
         info!(
             "Worker {} listening to worker messages on {}",

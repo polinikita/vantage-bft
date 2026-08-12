@@ -1,5 +1,7 @@
 // Transaction latency, protocol, queue, and utilization metrics.
 
+#[cfg(feature = "pipeline-tracing")]
+use crate::pipeline::{PipelineMetrics, PipelineReporter};
 use std::{
     ops::AddAssign,
     sync::{
@@ -215,9 +217,10 @@ impl UtilizationTimerVecExt for IntCounterVec {
 
 use crate::stat::{histogram, DivUsize, HistogramSender, MulUsize, PreciseHistogram};
 
-/// Transaction latency and protocol metrics.
 #[derive(Clone)]
 pub struct Metrics {
+    #[cfg(feature = "pipeline-tracing")]
+    pub pipeline: PipelineMetrics,
     /// Submit-to-commit latency observations.
     pub transaction_committed_latency: HistogramSender<Duration>,
     /// Sum of squared submit-to-commit latencies in microseconds.
@@ -568,6 +571,8 @@ pub struct Metrics {
 
 /// Owns latency histogram receivers and publishes labeled gauges.
 pub struct MetricReporter {
+    #[cfg(feature = "pipeline-tracing")]
+    pipeline: PipelineReporter,
     transaction_committed_latency: Mutex<HistogramReporter<Duration>>,
     transaction_materialised_latency: Mutex<HistogramReporter<Duration>>,
     proposed_block_size_bytes: Mutex<HistogramReporter<usize>>,
@@ -668,6 +673,8 @@ impl Metrics {
         ))) {
             log::warn!("could not register metrics_active_seconds: {e}");
         }
+        #[cfg(feature = "pipeline-tracing")]
+        let (pipeline, pipeline_reporter) = PipelineMetrics::new(registry);
         let (transaction_committed_latency_hist, transaction_committed_latency) = histogram();
         let (transaction_materialised_latency_hist, transaction_materialised_latency) = histogram();
         let (proposed_block_size_bytes_hist, proposed_block_size_bytes) = histogram();
@@ -675,6 +682,8 @@ impl Metrics {
         let (proposed_transaction_size_bytes_hist, proposed_transaction_size_bytes) = histogram();
 
         let reporter = MetricReporter {
+            #[cfg(feature = "pipeline-tracing")]
+            pipeline: pipeline_reporter,
             transaction_committed_latency: Mutex::new(HistogramReporter::new_in_registry(
                 transaction_committed_latency_hist,
                 registry,
@@ -703,6 +712,8 @@ impl Metrics {
         };
 
         let metrics = Self {
+            #[cfg(feature = "pipeline-tracing")]
+            pipeline,
             transaction_committed_latency,
             transaction_committed_latency_squared_micros: register_int_counter_with_registry!(
                 "transaction_committed_latency_squared_micros",
@@ -1716,6 +1727,9 @@ impl MetricReporter {
 
     /// Drains histogram receivers and publishes current gauges immediately.
     pub fn force_report(&self) {
+        #[cfg(feature = "pipeline-tracing")]
+        self.pipeline.force_report();
+
         let mut latency = self.transaction_committed_latency.lock().unwrap();
         latency.receive_all();
         latency.report();
@@ -1835,6 +1849,36 @@ mod tests {
             });
 
         assert_eq!(p95, Some(96));
+    }
+
+    #[cfg(not(feature = "pipeline-tracing"))]
+    #[test]
+    fn pipeline_metrics_are_absent_by_default() {
+        let registry = Registry::new();
+        let _ = Metrics::new(&registry);
+        assert!(!registry
+            .gather()
+            .iter()
+            .any(|family| { family.get_name() == "vantage_block_publish_to_commit_latency" }));
+    }
+
+    #[cfg(feature = "pipeline-tracing")]
+    #[test]
+    fn pipeline_metrics_are_opt_in() {
+        let registry = Registry::new();
+        let (metrics, reporter) = Metrics::new(&registry);
+        metrics
+            .pipeline
+            .vantage_block_publish_to_commit_latency
+            .observe(Duration::from_millis(7));
+        reporter.force_report();
+        let snapshot = crate::snapshot::read_duration_snapshot(
+            &registry,
+            "vantage_block_publish_to_commit_latency",
+        )
+        .expect("pipeline metric");
+        assert_eq!(snapshot.count, 1);
+        assert_eq!(snapshot.p50_micros, 7_000);
     }
 
     /// The hook records a panic and remains idempotent when installed twice.

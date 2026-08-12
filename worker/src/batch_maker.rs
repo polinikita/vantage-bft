@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+#[cfg(feature = "pipeline-tracing")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -141,6 +143,9 @@ impl BatchMaker {
     async fn seal(&mut self) {
         let size = self.current_batch_size;
 
+        #[cfg(feature = "pipeline-tracing")]
+        self.observe_transaction_to_batch_seal();
+
         // Record payload size for batches created by this worker.
         self.metrics.proposed_transaction_size_bytes.observe(size);
 
@@ -205,5 +210,28 @@ impl BatchMaker {
             .send(bytes)
             .await
             .expect("Failed to deliver batch");
+    }
+
+    #[cfg(feature = "pipeline-tracing")]
+    fn observe_transaction_to_batch_seal(&self) {
+        let sealed_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        for transaction in &self.current_batch {
+            if transaction.len() < 17 {
+                continue;
+            }
+            let submitted_millis =
+                u64::from_le_bytes(transaction[9..17].try_into().expect("checked length"));
+            if submitted_millis > 0 && self.metrics.counts_toward_metrics(submitted_millis) {
+                self.metrics
+                    .pipeline
+                    .transaction_to_batch_seal_latency
+                    .observe(Duration::from_millis(
+                        sealed_millis.saturating_sub(submitted_millis),
+                    ));
+            }
+        }
     }
 }

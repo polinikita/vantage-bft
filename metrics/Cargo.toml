@@ -12,3 +12,6 @@ tokio = { workspace = true, features = ["rt", "net", "time", "sync"] }
 prometheus = { workspace = true }
 axum = { workspace = true }
 log = { workspace = true }
+
+[features]
+pipeline-tracing = []

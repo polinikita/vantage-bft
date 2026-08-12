@@ -561,6 +561,8 @@ pub struct VantageCore {
     max_header_delay: u64,
     digests: Vec<(Digest, WorkerId)>,
     payload_size: usize,
+    #[cfg(feature = "pipeline-tracing")]
+    pipeline: crate::vantage::pipeline::PipelineTrace,
 
     /// Suppresses network acknowledgments but never local self-acknowledgment.
     ack_watermarks: bool,
@@ -952,6 +954,8 @@ impl VantageCore {
             max_header_delay: parameters.max_header_delay,
             digests: Vec::new(),
             payload_size: 0,
+            #[cfg(feature = "pipeline-tracing")]
+            pipeline: Default::default(),
             ack_watermarks: parameters.ack_watermarks,
             ack_watermark_period_ms: parameters.ack_watermark_period_ms,
             digest_statements: parameters.digest_statements,
@@ -1112,6 +1116,8 @@ impl VantageCore {
                 }
 
                 Some((digest, worker_id)) = rx_our_digests.recv() => {
+                    #[cfg(feature = "pipeline-tracing")]
+                    self.pipeline.note_digest(self.digests.is_empty(), Instant::now());
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                     if self.payload_size >= self.header_size {
@@ -1271,13 +1277,24 @@ impl VantageCore {
         {
             self.digests.clear();
             self.payload_size = 0;
+            #[cfg(feature = "pipeline-tracing")]
+            {
+                self.pipeline.clear_header();
+            }
             return;
         }
         let seal_timer =
             Self::cached_utilization_timer(&self.metrics, &mut self.ut_header_seal, "header_seal");
         let payload = self.digests.drain(..).collect();
         self.payload_size = 0;
-        let (_, effects) = self.lm.publish_own(payload).await;
+        let (header, effects) = self.lm.publish_own(payload).await;
+
+        #[cfg(feature = "pipeline-tracing")]
+        if let Some(metrics) = &self.metrics {
+            self.pipeline.note_publish(&header, &metrics.pipeline);
+        }
+        #[cfg(not(feature = "pipeline-tracing"))]
+        let _ = header;
 
         drop(seal_timer);
         self.execute(effects, now).await;
@@ -1795,6 +1812,8 @@ impl VantageCore {
         self.control.gc_below(floor, serve_floor);
         self.resolver.gc_below(floor);
         self.timers.retain(|Reverse((_, view, _))| *view >= floor);
+        #[cfg(feature = "pipeline-tracing")]
+        self.pipeline.gc_below(floor);
         self.last_gc_floor = floor;
         log::debug!(
             "vantage node: internal GC floor advanced to {} (serve floor {}, resolved_watermark={}, gc_window={})",
@@ -2856,8 +2875,29 @@ impl VantageCore {
 
     /// Schedules an AGB recheck even when availability processing emits no effects.
     fn on_ack_availability(&mut self, availability: AckAvailability, _now: Instant) -> Vec<Effect> {
+        #[cfg(feature = "pipeline-tracing")]
+        if availability.threshold == crate::vantage::lanes::AckThreshold::Quorum
+            && availability.reference.0 == self.name
+        {
+            let elapsed = self.pipeline.note_quorum(&availability.reference);
+            if let (Some(metrics), Some(elapsed)) = (&self.metrics, elapsed) {
+                metrics
+                    .pipeline
+                    .vantage_block_publish_to_quorum_latency
+                    .observe(elapsed);
+            }
+        }
         self.recheck_pending = true;
         self.lm.process_ack_availability(availability)
+    }
+
+    #[cfg(feature = "pipeline-tracing")]
+    fn observe_own_blocks_in_proposal(&mut self, proposal: &ProposalOut) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        self.pipeline
+            .note_proposal(self.name, proposal, &metrics.pipeline);
     }
 
     fn record_local_ack(&mut self, ack: &Ack, now: Instant) -> Vec<Effect> {
@@ -3538,6 +3578,12 @@ impl VantageCore {
                             .await;
                     }
                     Effect::Fixed(view, well_formed) => {
+                        #[cfg(feature = "pipeline-tracing")]
+                        if well_formed {
+                            if let Some((proposal, _)) = self.agb.fixed_proposal(view) {
+                                self.observe_own_blocks_in_proposal(&proposal);
+                            }
+                        }
                         let activated = self.frontier.record_fixed(view, well_formed);
                         for v in activated {
                             queue.extend(self.agb.activate(v, &mut self.lm, &mut self.rep));
@@ -3554,12 +3600,19 @@ impl VantageCore {
                         queue.extend(self.cursor.on_completed(view, c, t));
                     }
                     Effect::Sealed(view, outcome) => {
+                        #[cfg(feature = "pipeline-tracing")]
+                        self.pipeline.note_sealed(view);
                         queue.extend(self.cursor.on_sealed(view, outcome));
                     }
                     Effect::ArmTimer(view, kind, deadline) => {
                         self.timers.push(Reverse((deadline, view, kind)));
                     }
                     Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
+                        #[cfg(feature = "pipeline-tracing")]
+                        if let Some(metrics) = &self.metrics {
+                            self.pipeline
+                                .note_committed(&headers, self.name, &metrics.pipeline);
+                        }
                         if let Some(sequence) = self.sequence.as_mut() {
                             sequence.retain_verified_headers(headers.iter().cloned());
                         }
@@ -3604,6 +3657,15 @@ impl VantageCore {
                         outcome,
                         output_delta,
                     } => {
+                        #[cfg(feature = "pipeline-tracing")]
+                        if let (Some(metrics), Some(elapsed)) =
+                            (&self.metrics, self.pipeline.note_finalized(view))
+                        {
+                            metrics
+                                .pipeline
+                                .vantage_seal_to_finalize_latency
+                                .observe(elapsed);
+                        }
                         self.record_sequence(view, &outcome, &output_delta);
                     }
                     Effect::RecoverOwnLane(header) => {

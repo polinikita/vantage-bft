@@ -34,6 +34,12 @@ pub fn read_materialised_latency_snapshot(registry: &Registry) -> Option<Latency
     read_latency_snapshot_for(registry, "transaction_materialised_latency")
 }
 
+/// Reads an exact duration histogram exported by `MetricReporter`.
+#[cfg(feature = "pipeline-tracing")]
+pub fn read_duration_snapshot(registry: &Registry, name: &str) -> Option<LatencySnapshot> {
+    read_latency_snapshot_for(registry, name)
+}
+
 /// Shared reader for the two latency gauge families.
 fn read_latency_snapshot_for(registry: &Registry, base: &str) -> Option<LatencySnapshot> {
     let families = registry.gather();

@@ -15,7 +15,15 @@ async fn hash_and_store() {
     let mut store = Store::new(path).unwrap();
 
     let id = 0;
-    Processor::spawn(id, store.clone(), rx_batch, tx_digest, true);
+    Processor::spawn(
+        id,
+        store.clone(),
+        rx_batch,
+        tx_digest,
+        true,
+        #[cfg(feature = "pipeline-tracing")]
+        Metrics::new(&prometheus::Registry::new()).0,
+    );
 
     let message = WorkerMessage::Batch(batch());
     let serialized = bincode::serialize(&message).unwrap();

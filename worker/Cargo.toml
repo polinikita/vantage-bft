@@ -30,3 +30,4 @@ prometheus = { workspace = true }
 
 [features]
 benchmark = []
+pipeline-tracing = ["benchmark", "metrics/pipeline-tracing"]

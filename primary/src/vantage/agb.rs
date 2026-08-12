@@ -1845,22 +1845,28 @@ impl AgbEngine {
             return;
         }
         let state = self.state_mut(view);
-        match &state.sealed {
-            None => {
-                state.sealed = Some(outcome.clone());
-                effects.push(Effect::Sealed(view, outcome));
-                if let Some(metrics) = &self.metrics {
-                    metrics.vantage_seals.with_label_values(&[route]).inc();
-                }
-            }
-            Some(existing) => {
-                debug_assert!(
-                    Self::outcomes_compatible(existing, &outcome),
-                    "try-seal arbiter: incompatible outcomes submitted for view {}: {:?} vs {:?}",
-                    view,
-                    existing,
-                    outcome
-                );
+        if let Some(existing) = &state.sealed {
+            debug_assert!(
+                Self::outcomes_compatible(existing, &outcome),
+                "try-seal arbiter: incompatible outcomes submitted for view {}: {:?} vs {:?}",
+                view,
+                existing,
+                outcome
+            );
+            return;
+        }
+        #[cfg(feature = "pipeline-tracing")]
+        let proposal_start = state.first_proposal_instant;
+        state.sealed = Some(outcome.clone());
+        effects.push(Effect::Sealed(view, outcome));
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_seals.with_label_values(&[route]).inc();
+            #[cfg(feature = "pipeline-tracing")]
+            if let Some(start) = proposal_start {
+                metrics
+                    .pipeline
+                    .vantage_proposal_to_seal_latency
+                    .observe(start.elapsed());
             }
         }
     }

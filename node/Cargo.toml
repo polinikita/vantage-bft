@@ -31,6 +31,12 @@ prometheus = { workspace = true }
 
 [features]
 benchmark = ["worker/benchmark", "primary/benchmark"]
+pipeline-tracing = [
+    "benchmark",
+    "metrics/pipeline-tracing",
+    "primary/pipeline-tracing",
+    "worker/pipeline-tracing",
+]
 
 [[bin]]
 name = "benchmark_client"
