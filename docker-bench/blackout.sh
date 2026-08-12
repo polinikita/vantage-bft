@@ -126,7 +126,8 @@ if [ "$DOWN" -gt 0 ]; then
     SETTLE_START_MS="$up_ms"
     echo "blackout.sh: all victims restarted; observing for ${SETTLE}s"
 else
-    up_ms="null"
+    # Interpolated into the Python heredoc below, so the literal is None.
+    up_ms="None"
     SETTLE_START_MS="$down_ms"
     echo "blackout.sh: observing the degraded committee for ${SETTLE}s"
 fi
