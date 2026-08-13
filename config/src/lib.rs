@@ -318,6 +318,12 @@ pub struct Parameters {
     #[serde(default)]
     pub withhold_receivers: Vec<PublicKey>,
 
+    /// Whether permanent withholding also suppresses original lane headers.
+    /// Disable this to drop only the heavy worker batches while retaining the
+    /// metadata path needed for a load-scaling repair experiment.
+    #[serde(default = "default_withhold_headers")]
+    pub withhold_headers: bool,
+
     /// Byzantine authors whose original header publication is delayed to a
     /// fixed receiver subset. Repair traffic is never delayed.
     #[serde(default)]
@@ -532,6 +538,10 @@ fn default_ack_watermark_period_ms() -> u64 {
 /// Default withholding duration, in milliseconds.
 fn default_withhold_for_ms() -> u64 {
     30_000
+}
+
+fn default_withhold_headers() -> bool {
+    true
 }
 
 /// Default lane-resume check period, in milliseconds.
@@ -786,6 +796,7 @@ impl Default for Parameters {
             withhold_publishers: Vec::new(),
             withhold_count: None,
             withhold_receivers: Vec::new(),
+            withhold_headers: default_withhold_headers(),
             late_header_publishers: Vec::new(),
             late_header_receivers: Vec::new(),
             late_header_delay_ms: 0,
@@ -925,6 +936,11 @@ impl Parameters {
             } else {
                 format!("{} fixed node(s)", self.withhold_publishers.len())
             };
+            let traffic = if self.withhold_headers {
+                "payload batches and lane headers"
+            } else {
+                "payload batches only"
+            };
             let width = if self.withhold_receivers.is_empty() {
                 match self.withhold_count {
                     Some(count) => format!("{count} staggered peer(s)"),
@@ -935,17 +951,17 @@ impl Parameters {
             };
             match self.withhold_at_ms {
                 Some(at) => info!(
-                    "Data-plane withholding: {} withhold payload dissemination \
-                     from {}, active [{}, {}) ms after start",
+                    "Data-plane withholding: {} withhold {} from {}, active [{}, {}) ms \
+                     after start",
                     publishers,
+                    traffic,
                     width,
                     at,
                     at + self.withhold_for_ms
                 ),
                 None => info!(
-                    "Data-plane withholding: {} withhold payload dissemination \
-                     from {}",
-                    publishers, width
+                    "Data-plane withholding: {} withhold {} from {}",
+                    publishers, traffic, width
                 ),
             }
         }
@@ -1514,6 +1530,7 @@ mod tests {
         assert!(params.latency_table.is_none());
         assert!(params.reconnect_replay);
         assert_eq!(params.retry_backoff_max_ms, 2000);
+        assert!(params.withhold_headers);
 
         let n = 20;
         let table = LatencyTable::uniform(n, params.mimic_latency_ms.unwrap() as f64);
@@ -1734,5 +1751,21 @@ mod tests {
         let decoded: Parameters =
             serde_json::from_value(object.into()).expect("legacy parameters deserialize");
         assert!(decoded.vantage_compact_ids);
+    }
+
+    #[test]
+    fn withheld_headers_default_on_for_legacy_parameters() {
+        let defaults = Parameters::default();
+        assert!(defaults.withhold_headers);
+
+        let encoded = serde_json::to_value(defaults).expect("parameters serialize");
+        let mut object = encoded
+            .as_object()
+            .expect("parameters are an object")
+            .clone();
+        object.remove("withhold_headers");
+        let decoded: Parameters =
+            serde_json::from_value(object.into()).expect("legacy parameters deserialize");
+        assert!(decoded.withhold_headers);
     }
 }

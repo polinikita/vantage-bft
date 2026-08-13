@@ -636,14 +636,19 @@ impl Primary {
                         .map(|table| committee.latency_map(&name, table))
                         .unwrap_or_default(),
                     // Data-plane withholding destinations.
-                    config::withheld_destinations(
-                        &committee,
-                        &name,
-                        parameters.withhold_senders,
-                        &parameters.withhold_publishers,
-                        parameters.withhold_count,
-                        &parameters.withhold_receivers,
-                    ),
+                    parameters
+                        .withhold_headers
+                        .then(|| {
+                            config::withheld_destinations(
+                                &committee,
+                                &name,
+                                parameters.withhold_senders,
+                                &parameters.withhold_publishers,
+                                parameters.withhold_count,
+                                &parameters.withhold_receivers,
+                            )
+                        })
+                        .flatten(),
                     // Finite-delay original-header destinations.
                     config::late_header_destinations(
                         &committee,

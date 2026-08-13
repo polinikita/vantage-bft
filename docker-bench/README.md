@@ -50,6 +50,9 @@ Common options include `--tx-size`, `--mode`, `--no-latency`,
 `--delta-ms`, `--max-header-delay-ms`, and the state-sync controls.
 Use `--withhold N --withhold-count K` to make the first `N` validators omit
 each payload broadcast to `K` staggered peers.
+Add `--withhold-fixed-receivers` to use one disjoint receiver group and
+`--withhold-batches-only` to keep lane headers flowing while permanently
+dropping only the heavy transaction batches on those links.
 
 Vantage carries positional availability claims on AGB echoes by default.
 `--no-echo-avail-claims` selects periodic watermarks; `--no-ack-watermarks`

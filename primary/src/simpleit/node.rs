@@ -284,23 +284,28 @@ impl SimpleItCore {
         let other_primary_addrs: Vec<SocketAddr> =
             other_primaries.iter().map(|(_, a)| *a).collect();
 
-        let withheld_header_dests: wire::WithheldHeaderDests = config::withheld_destinations(
-            &committee,
-            &name,
-            parameters.withhold_senders,
-            &parameters.withhold_publishers,
-            parameters.withhold_count,
-            &parameters.withhold_receivers,
-        )
-        .map(|blocked| {
-            let full: Vec<(PublicKey, SocketAddr)> = other_primaries
-                .iter()
-                .filter(|(pk, _)| !blocked.contains(pk))
-                .copied()
-                .collect();
-            let addrs: Vec<SocketAddr> = full.iter().map(|(_, a)| *a).collect();
-            (addrs, full)
-        });
+        let withheld_header_dests: wire::WithheldHeaderDests = parameters
+            .withhold_headers
+            .then(|| {
+                config::withheld_destinations(
+                    &committee,
+                    &name,
+                    parameters.withhold_senders,
+                    &parameters.withhold_publishers,
+                    parameters.withhold_count,
+                    &parameters.withhold_receivers,
+                )
+            })
+            .flatten()
+            .map(|blocked| {
+                let full: Vec<(PublicKey, SocketAddr)> = other_primaries
+                    .iter()
+                    .filter(|(pk, _)| !blocked.contains(pk))
+                    .copied()
+                    .collect();
+                let addrs: Vec<SocketAddr> = full.iter().map(|(_, a)| *a).collect();
+                (addrs, full)
+            });
 
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
             .our_workers_by_id(&name)

@@ -162,9 +162,18 @@ def build_committee(pubkeys: list[str]) -> dict:
     return {"authorities": authorities}
 
 
-def build_parameters(args: argparse.Namespace) -> dict:
+def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
     # Seamless Autobahn disables optimistic tips.
     use_optimistic_tips = args.protocol != "autobahn-seamless"
+    fixed_publishers = []
+    fixed_receivers = []
+    withhold_senders = args.withhold
+    if args.withhold_fixed_receivers:
+        fixed_publishers = pubkeys[:args.withhold]
+        fixed_receivers = pubkeys[
+            args.withhold:args.withhold + args.withhold_count
+        ]
+        withhold_senders = 0
     return {
         "timeout_delay": args.timeout_delay_ms,
         "header_size": 1000,
@@ -211,8 +220,11 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "batch_messages": not args.no_batch_messages,
         "batch_max_bytes": args.batch_max_bytes,
         "batch_max_delay_ms": args.batch_max_delay_ms,
-        "withhold_senders": args.withhold,
+        "withhold_senders": withhold_senders,
+        "withhold_publishers": fixed_publishers,
         "withhold_count": args.withhold_count,
+        "withhold_receivers": fixed_receivers,
+        "withhold_headers": not args.withhold_batches_only,
         "withhold_at_ms": None if args.withhold_at is None else args.withhold_at * 1000,
         "withhold_for_ms": args.withhold_for * 1000,
         "resume_check_period_ms": 1000,
@@ -373,6 +385,8 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
         "vantage_compact_ids": not args.no_compact_ids,
         "withhold_senders": args.withhold,
         "withhold_count": args.withhold_count,
+        "withhold_fixed_receivers": args.withhold_fixed_receivers,
+        "withhold_batches_only": args.withhold_batches_only,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -445,6 +459,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--withhold", type=int, default=0)
     p.add_argument("--withhold-count", type=int, default=None,
                    help="peers each withholding node excludes (default: half the committee)")
+    p.add_argument("--withhold-fixed-receivers", action="store_true",
+                   help="bind every withholding publisher to the same disjoint receiver set")
+    p.add_argument("--withhold-batches-only", action="store_true",
+                   help="drop heavy worker batches but continue original lane headers")
     p.add_argument("--withhold-at", type=int, default=None)
     p.add_argument("--withhold-for", type=int, default=30)
     p.add_argument("--rust-log", default=None, metavar="FILTER",
@@ -465,6 +483,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--withhold-count must be between 0 and --nodes - 1")
     if args.withhold_count is not None and args.withhold == 0:
         p.error("--withhold-count requires --withhold > 0")
+    if args.withhold_fixed_receivers and args.withhold_count is None:
+        p.error("--withhold-fixed-receivers requires --withhold-count")
+    if (args.withhold_fixed_receivers and
+            args.withhold + args.withhold_count > args.nodes):
+        p.error("fixed withholding publishers and receivers must be disjoint and fit --nodes")
+    if args.withhold_batches_only and args.withhold == 0:
+        p.error("--withhold-batches-only requires --withhold > 0")
     if args.withhold_at is not None and args.withhold == 0:
         p.error("--withhold-at requires --withhold > 0")
     if args.sequence_checkpoint_interval < 1:
@@ -503,7 +528,7 @@ def main(argv=None) -> None:
     print("-- writing committee.json / parameters.json")
     committee = build_committee(pubkeys)
     (DATA_DIR / "committee.json").write_text(json.dumps(committee, indent=2) + "\n")
-    parameters = build_parameters(args)
+    parameters = build_parameters(args, pubkeys)
     (DATA_DIR / "parameters.json").write_text(json.dumps(parameters, indent=2) + "\n")
 
     print("-- writing per-node tc netem scripts")
