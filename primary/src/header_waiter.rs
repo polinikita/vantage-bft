@@ -4,7 +4,7 @@ use crate::messages::{proposal_digest, ConsensusMessage, Header, Proposal};
 use crate::primary::{Height, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
-use crypto::{Digest, PublicKey};
+use crypto::{Blake3Hasher, Digest, Hash as _, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
@@ -21,6 +21,37 @@ use tokio::time::{sleep, Duration, Instant};
 
 /// Timer resolution for retrying sync requests.
 const TIMER_RESOLUTION: u64 = 1_000;
+
+type BatchRequestGroups = HashMap<WorkerId, Vec<Digest>>;
+
+fn register_batch_requests(
+    tracked: &mut HashMap<Digest, Height>,
+    missing: &HashMap<Digest, WorkerId>,
+    height: Height,
+) -> BatchRequestGroups {
+    let mut groups = HashMap::new();
+    for (digest, worker_id) in missing {
+        if tracked.contains_key(digest) {
+            continue;
+        }
+        tracked.insert(digest.clone(), height);
+        groups
+            .entry(*worker_id)
+            .or_insert_with(Vec::new)
+            .push(digest.clone());
+    }
+    groups
+}
+
+fn proposal_waiter_id(message: &ConsensusMessage) -> Digest {
+    let phase = message.digest();
+    let proposals = proposal_digest(message);
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(b"autobahn-proposal-waiter");
+    hasher.update(&phase.0);
+    hasher.update(&proposals.0);
+    Digest(hasher.finalize().into())
+}
 
 /// Commands sent to the waiter.
 #[allow(clippy::enum_variant_names)]
@@ -148,6 +179,27 @@ impl HeaderWaiter {
         }
     }
 
+    async fn send_batch_requests(&mut self, author: PublicKey, requests: BatchRequestGroups) {
+        for (worker_id, digests) in requests {
+            let address = self
+                .committee
+                .worker(&self.name, &worker_id)
+                .expect("Author of valid header is not in the committee")
+                .primary_to_worker;
+            debug!(
+                "Requesting {} missing batch(es) from header author {}",
+                digests.len(),
+                author
+            );
+            let message = PrimaryWorkerMessage::Synchronize(digests, author);
+            let bytes =
+                bincode::serialize(&message).expect("Failed to serialize batch sync request");
+            self.network
+                .send_typed(address, Bytes::from(bytes), "Synchronize")
+                .await;
+        }
+    }
+
     /// Main loop listening to the `Synchronizer` messages.
     async fn run(&mut self) {
         let mut waiting = FuturesUnordered::new();
@@ -166,7 +218,21 @@ impl HeaderWaiter {
                             let round = header.height;
                             let author = header.author;
 
-                            // Deduplicate requests for the same header.
+                            // A served copy must be allowed to upgrade an
+                            // existing direct-header wait into a fetch before
+                            // the waiter itself is deduplicated below.
+                            if force_sync {
+                                let requests = register_batch_requests(
+                                    &mut self.batch_requests,
+                                    &missing,
+                                    round,
+                                );
+                                self.send_batch_requests(author, requests).await;
+                            }
+
+                            // A served copy upgrades an existing direct wait to
+                            // an immediate fetch above, but must not install a
+                            // second waiter for the same header.
                             if self.pending.contains_key(&header_id) {
                                 continue;
                             }
@@ -183,27 +249,6 @@ impl HeaderWaiter {
                             self.pending.insert(header_id, (round, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
-
-                            if force_sync {
-                                let mut requires_sync = HashMap::new();
-                                for (digest, worker_id) in missing.into_iter() {
-                                    self.batch_requests.entry(digest.clone()).or_insert_with(|| {
-                                        requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
-                                        round
-                                    });
-                                }
-                                for (worker_id, digests) in requires_sync {
-                                    let address = self.committee
-                                        .worker(&self.name, &worker_id)
-                                        .expect("Author of valid header is not in the committee")
-                                        .primary_to_worker;
-                                    debug!("Sent syncbatches message for height {}", round);
-                                    let message = PrimaryWorkerMessage::Synchronize(digests, author);
-                                    let bytes = bincode::serialize(&message)
-                                        .expect("Failed to serialize batch sync request");
-                                    self.network.send_typed(address, Bytes::from(bytes), "Synchronize").await;
-                                }
-                            }
                         }
 
                         WaiterMessage::SyncHeader(missing) => {
@@ -281,7 +326,11 @@ impl HeaderWaiter {
                         WaiterMessage::SyncProposals(missing, consensus_message, header) => {
                             let height = header.height();
                             let author = header.author;
-                            let id = proposal_digest(&consensus_message);
+                            // Prepare, Confirm, and Commit can reference the
+                            // same proposal vector while it is unavailable.
+                            // Keep one waiter per consensus message so a later
+                            // phase is not discarded behind an earlier one.
+                            let id = proposal_waiter_id(&consensus_message);
 
                             // Deduplicate requests for the same proposal.
                             if self.pending.contains_key(&id) {
@@ -357,7 +406,7 @@ impl HeaderWaiter {
                         self.metrics
                             .autobahn_prepare_sync_wait_micros_total
                             .inc_by(elapsed.as_micros().min(u64::MAX as u128) as u64);
-                        let id = proposal_digest(&deliver.0);
+                        let id = proposal_waiter_id(&deliver.0);
                         let _ = self.pending.remove(&id);
                         for x in deliver.1.payload.keys() {
                             let _ = self.batch_requests.remove(x);
@@ -422,5 +471,49 @@ impl HeaderWaiter {
                 self.header_requests.retain(|_, (r, _)| r > &mut gc_round);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_requests_group_by_worker_and_deduplicate() {
+        let a = Digest([1; 32]);
+        let b = Digest([2; 32]);
+        let c = Digest([3; 32]);
+        let missing = HashMap::from([(a.clone(), 0), (b.clone(), 0), (c.clone(), 1)]);
+        let mut tracked = HashMap::from([(a, 4)]);
+
+        let mut groups = register_batch_requests(&mut tracked, &missing, 7);
+        let mut worker_zero = groups.remove(&0).unwrap();
+        worker_zero.sort();
+        assert_eq!(worker_zero, vec![b]);
+        assert_eq!(groups.remove(&1), Some(vec![c]));
+        assert!(groups.is_empty());
+        assert!(register_batch_requests(&mut tracked, &missing, 8).is_empty());
+        assert_eq!(tracked.values().copied().min(), Some(4));
+        assert_eq!(tracked.values().copied().max(), Some(7));
+    }
+
+    #[test]
+    fn proposal_waiters_do_not_merge_prepare_and_commit() {
+        let proposals = HashMap::new();
+        let prepare = ConsensusMessage::Prepare {
+            slot: 4,
+            view: 2,
+            tc: None,
+            qc_ticket: None,
+            proposals: proposals.clone(),
+        };
+        let commit = ConsensusMessage::Commit {
+            slot: 4,
+            view: 2,
+            qc: Default::default(),
+            proposals,
+        };
+
+        assert_ne!(proposal_waiter_id(&prepare), proposal_waiter_id(&commit));
     }
 }
