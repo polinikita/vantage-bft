@@ -72,17 +72,22 @@ def main():
     print("-" * 76)
 
     for ev in tl["events"]:
-        v, d0, d1 = ev["node"], ev["down_ms"] / 1000, ev["up_ms"] / 1000
+        # A permanent blackout (up_ms null) is measured through the run end.
+        v, d0 = ev["node"], ev["down_ms"] / 1000
+        permanent = ev["up_ms"] is None
+        d1 = end if permanent else ev["up_ms"] / 1000
         others = [i for i in committed if i != v]
+        window = tl["outage_s"] if tl["outage_s"] > 0 else d1 - d0
         before = [r for i in others
-                  if (r := rate_between(committed[i], d0 - tl["outage_s"], d0)) is not None]
+                  if (r := rate_between(committed[i], d0 - window, d0)) is not None]
         during = [r for i in others if (r := rate_between(committed[i], d0, d1)) is not None]
         b = statistics.median(before) if before else 0.0
         du = statistics.median(during) if during else 0.0
         pct = f"{100 * du / b:.0f}%" if b > 0 else "-"
         # Check whether the victim committed after recovery.
-        after = rate_between(committed.get(v, []), d1, d1 + 15)
-        resumed = "-" if after is None else ("yes" if after > 0 else "NO")
+        after = None if permanent else rate_between(committed.get(v, []), d1, d1 + 15)
+        resumed = "n/a" if permanent else \
+            ("-" if after is None else ("yes" if after > 0 else "NO"))
         print(f"{ev['cycle']:>5} {v:>6} {b:>19.1f} {du:>9.1f} {pct:>9} {resumed:>15}")
 
     # Flag nodes that remain behind the fleet after settling.
@@ -91,7 +96,8 @@ def main():
         pts = [v for t, v in seq if t >= settle]
         if pts:
             finals[i] = pts[-1]
-    print(f"\nsettle window ({tl['settle_s']}s, all {n} up) -- final cursor_next_view:")
+    up = n - len(tl["victims"]) if tl["outage_s"] == 0 else n
+    print(f"\nsettle window ({tl['settle_s']}s, {up}/{n} up) -- final cursor_next_view:")
     if finals:
         med = statistics.median(finals.values())
         for i in sorted(finals):
