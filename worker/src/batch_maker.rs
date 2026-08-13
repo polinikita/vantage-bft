@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::processor::SerializedBatchMessage;
+use crate::transaction_counts_toward_goodput;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
 use crypto::PublicKey;
@@ -107,8 +108,10 @@ impl BatchMaker {
         loop {
             tokio::select! {
                 Some(transaction) = self.rx_transaction.recv() => {
-                    self.metrics.submitted_transactions.inc();
-                    self.metrics.submitted_transactions_bytes.inc_by(transaction.len() as u64);
+                    if transaction_counts_toward_goodput(&transaction) {
+                        self.metrics.submitted_transactions.inc();
+                        self.metrics.submitted_transactions_bytes.inc_by(transaction.len() as u64);
+                    }
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
@@ -219,7 +222,7 @@ impl BatchMaker {
             .unwrap_or_default()
             .as_millis() as u64;
         for transaction in &self.current_batch {
-            if transaction.len() < 17 {
+            if transaction.len() < 17 || !transaction_counts_toward_goodput(transaction) {
                 continue;
             }
             let submitted_millis =

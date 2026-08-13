@@ -1,4 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+#[cfg(feature = "benchmark")]
+use crate::transaction_counts_toward_goodput;
 use crate::worker::{Round, WorkerMessage, CHANNEL_CAPACITY};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -120,8 +122,10 @@ pub struct Synchronizer {
     network: SimpleSender,
     /// Primary round used for cleanup.
     round: Round,
-    /// Digests awaiting their batches, with cleanup round and request time.
-    pending: HashMap<Digest, (Round, Sender<()>, u128)>,
+    /// Digests awaiting their batches, with cleanup round, request time, and
+    /// current target. A new Prepare leader must be able to supersede a
+    /// silent leader without waiting for the generic broadcast retry.
+    pending: HashMap<Digest, (Round, Sender<()>, u128, PublicKey)>,
 }
 
 /// Processes benchmark commit metrics without blocking batch synchronization.
@@ -191,6 +195,86 @@ impl Synchronizer {
         }
     }
 
+    async fn synchronize(
+        &mut self,
+        digests: Vec<Digest>,
+        target: PublicKey,
+        optimistic_leader_repair: bool,
+        tx_waiter: &Sender<Result<Option<Digest>, StoreError>>,
+    ) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Failed to measure time")
+            .as_millis();
+
+        let candidates: Vec<Digest> = digests;
+
+        let present = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            self.store
+                .read_many(candidates.iter().map(|d| d.to_vec()).collect())
+                .await
+        };
+
+        let mut missing = Vec::new();
+        for (digest, found) in candidates.into_iter().zip(present) {
+            if found.is_some() {
+                continue;
+            }
+
+            if let Some((_, _, timestamp, previous_target)) = self.pending.get_mut(&digest) {
+                if optimistic_leader_repair && *previous_target != target {
+                    *timestamp = now;
+                    *previous_target = target;
+                    missing.push(digest);
+                }
+                continue;
+            }
+
+            missing.push(digest.clone());
+            debug!("Requesting sync for batch {}", digest);
+
+            let (tx_cancel, rx_cancel) = channel(1);
+            let store = self.store.clone();
+            let tx_result = tx_waiter.clone();
+            let deliver = digest.clone();
+            let missing_key = digest.clone();
+            tokio::spawn(async move {
+                let result = Self::waiter(missing_key, store, deliver, rx_cancel).await;
+                let _ = tx_result.send(result).await;
+            });
+            self.pending
+                .insert(digest, (self.round, tx_cancel, now, target));
+        }
+
+        if missing.is_empty() {
+            return;
+        }
+        let address = match self.committee.worker(&target, &self.id) {
+            Ok(address) => address.worker_to_worker,
+            Err(e) => {
+                error!("The primary asked us to sync with an unknown node: {}", e);
+                return;
+            }
+        };
+        let (message, kind) = if optimistic_leader_repair {
+            (
+                WorkerMessage::OptimisticBatchRequest(missing, self.name),
+                "OptimisticBatchRequest",
+            )
+        } else {
+            (
+                WorkerMessage::BatchRequest(missing, self.name),
+                "BatchRequest",
+            )
+        };
+        let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
+        self.network
+            .send_typed(address, Bytes::from(serialized), kind)
+            .await;
+    }
+
     /// Main loop for primary synchronization requests.
     ///
     /// Waiters run in separate tasks so store operations and waiter sends cannot block
@@ -206,55 +290,10 @@ impl Synchronizer {
             tokio::select! {
                 Some(message) = self.rx_message.recv() => match message {
                     PrimaryWorkerMessage::Synchronize(digests, target) => {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .expect("Failed to measure time")
-                            .as_millis();
-
-                        let candidates: Vec<Digest> = digests
-                            .into_iter()
-                            .filter(|digest| !self.pending.contains_key(digest))
-                            .collect();
-
-                        let present = if candidates.is_empty() {
-                            Vec::new()
-                        } else {
-                            self.store
-                                .read_many(candidates.iter().map(|d| d.to_vec()).collect())
-                                .await
-                        };
-
-                        let mut missing = Vec::new();
-                        for (digest, found) in candidates.into_iter().zip(present) {
-                            if found.is_some() {
-                                continue;
-                            }
-                            missing.push(digest.clone());
-                            debug!("Requesting sync for batch {}", digest);
-
-                            let (tx_cancel, rx_cancel) = channel(1);
-                            let store = self.store.clone();
-                            let tx_result = tx_waiter.clone();
-                            let deliver = digest.clone();
-                            let missing_key = digest.clone();
-                            tokio::spawn(async move {
-                                let result =
-                                    Self::waiter(missing_key, store, deliver, rx_cancel).await;
-                                let _ = tx_result.send(result).await;
-                            });
-                            self.pending.insert(digest, (self.round, tx_cancel, now));
-                        }
-
-                        let address = match self.committee.worker(&target, &self.id) {
-                            Ok(address) => address.worker_to_worker,
-                            Err(e) => {
-                                error!("The primary asked us to sync with an unknown node: {}", e);
-                                continue;
-                            }
-                        };
-                        let message = WorkerMessage::BatchRequest(missing, self.name);
-                        let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-                        self.network.send_typed(address, Bytes::from(serialized), "BatchRequest").await;
+                        self.synchronize(digests, target, false, &tx_waiter).await;
+                    },
+                    PrimaryWorkerMessage::SynchronizeOptimistic(digests, target) => {
+                        self.synchronize(digests, target, true, &tx_waiter).await;
                     },
                     PrimaryWorkerMessage::Cleanup(round) => {
                         self.round = round;
@@ -264,12 +303,12 @@ impl Synchronizer {
                         }
 
                         let mut gc_round = self.round - self.gc_depth;
-                        for (r, handler, _) in self.pending.values() {
+                        for (r, handler, _, _) in self.pending.values() {
                             if r <= &gc_round {
                                 let _ = handler.send(()).await;
                             }
                         }
-                        self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
+                        self.pending.retain(|_, (r, _, _, _)| r > &mut gc_round);
                     }
                     PrimaryWorkerMessage::Committed(..) => {}
                 },
@@ -289,14 +328,14 @@ impl Synchronizer {
                         .as_millis();
 
                     let mut retry = Vec::new();
-                    for (digest, (_, _, timestamp)) in &self.pending {
+                    for (digest, (_, _, timestamp, _)) in &self.pending {
                         if timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting sync for batch {} (retry)", digest);
                             retry.push(digest.clone());
                         }
                     }
                     for digest in &retry {
-                        if let Some((_, _, timestamp)) = self.pending.get_mut(digest) {
+                        if let Some((_, _, timestamp, _)) = self.pending.get_mut(digest) {
                             *timestamp = now;
                         }
                     }
@@ -531,7 +570,7 @@ impl CommitObserver {
         let mut totals = BatchLatencyTotals::default();
         for tx in transactions {
             // Format: marker, big-endian ID, little-endian submission timestamp.
-            if tx.len() < 17 {
+            if tx.len() < 17 || !transaction_counts_toward_goodput(&tx) {
                 continue;
             }
             let submitted_millis = u64::from_le_bytes(tx[9..17].try_into().unwrap());

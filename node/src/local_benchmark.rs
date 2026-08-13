@@ -205,6 +205,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold_count.is_none_or(|count| count < nodes),
         "--withhold-count must be below --nodes"
     );
+    let withhold_stride: usize = matches
+        .get_one::<String>("withhold-stride")
+        .unwrap()
+        .parse()
+        .context("--withhold-stride must be a positive integer")?;
+    anyhow::ensure!(withhold_stride > 0, "--withhold-stride must be positive");
     let withhold_fixed_receivers = matches.get_flag("withhold-fixed-receivers");
     anyhow::ensure!(
         !withhold_fixed_receivers || withhold > 0,
@@ -216,6 +222,16 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     anyhow::ensure!(
         !withhold_fixed_receivers || withhold + withhold_width <= live_nodes,
         "fixed withholding publishers and receivers must be disjoint and fit within the live nodes"
+    );
+    anyhow::ensure!(
+        !withhold_fixed_receivers || withhold_stride == 1,
+        "--withhold-stride is only meaningful for staggered receivers"
+    );
+    let withhold_batches_only = matches.get_flag("withhold-batches-only");
+    let withhold_repair = matches.get_flag("withhold-repair");
+    anyhow::ensure!(
+        (!withhold_batches_only && !withhold_repair) || withhold > 0,
+        "--withhold-batches-only and --withhold-repair require --withhold > 0"
     );
     let late_header_publishers: usize = matches
         .get_one::<String>("late-header-publishers")
@@ -414,30 +430,39 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         let reachable = nodes - withhold_width;
         let shape = if withhold_fixed_receivers {
             format!(
-                "fixed receiver group node-{}..node-{}; repair paths unaffected",
+                "fixed receiver group node-{}..node-{}",
                 withhold,
                 withhold + withhold_width - 1
             )
         } else if withhold_count.is_some() {
-            format!("staggered width {withhold_width}; repair paths unaffected")
+            format!("staggered width {withhold_width}, stride {withhold_stride}")
         } else {
-            "staggered halves; repair paths unaffected".to_string()
+            format!("staggered halves, stride {withhold_stride}")
+        };
+        let repair = if withhold_repair {
+            "Byzantine authors remain silent on repair"
+        } else {
+            "authors serve repair"
+        };
+        let traffic = if withhold_batches_only {
+            "payload batches only"
+        } else {
+            "payload batches and lane headers"
         };
         match withhold_at_secs {
             Some(at) => println!(
                 "Withhold: first {} node(s) disseminate payload to only {} of {} nodes \
-                 ({}), active T+{}s..T+{}s",
+                 ({traffic}; {shape}; {repair}), active T+{}s..T+{}s",
                 withhold,
                 reachable,
                 nodes,
-                shape,
                 at,
                 at + withhold_for_secs
             ),
             None => println!(
                 "Withhold: first {} node(s) disseminate payload to only {} of {} nodes \
-                 ({})",
-                withhold, reachable, nodes, shape
+                 ({traffic}; {shape}; {repair})",
+                withhold, reachable, nodes
             ),
         }
     }
@@ -497,7 +522,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold_senders: withhold,
         withhold_publishers: Vec::new(),
         withhold_count,
+        withhold_stride,
         withhold_receivers,
+        withhold_repair,
+        withhold_headers: !withhold_batches_only,
         late_header_publishers: keypairs
             .iter()
             .take(late_header_publishers)
@@ -1041,6 +1069,7 @@ fn spawn_node_workers(
                 rate: rate_share,
                 nodes: all_worker_addresses.to_vec(),
                 mode,
+                counted: true,
                 // Every node in a local benchmark boots in ONE process, so there is no
                 // multi-second deploy spread to ride out and no window to align to.
                 // The AWS harness is what sets this (see `Client::activate_at_ms`).

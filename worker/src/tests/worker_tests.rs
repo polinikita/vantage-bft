@@ -18,7 +18,15 @@ fn worker_message_routing_matches_wire_format() {
     let bytes = bincode::serialize(&request).unwrap();
     assert!(matches!(
         route_worker_message(&bytes).unwrap(),
-        WorkerMessageRoute::BatchRequest(missing, requestor)
+        WorkerMessageRoute::BatchRequest(missing, requestor, false)
+            if missing == vec![batch_digest()] && requestor == keys()[0].0
+    ));
+
+    let request = WorkerMessage::OptimisticBatchRequest(vec![batch_digest()], keys()[0].0);
+    let bytes = bincode::serialize(&request).unwrap();
+    assert!(matches!(
+        route_worker_message(&bytes).unwrap(),
+        WorkerMessageRoute::BatchRequest(missing, requestor, true)
             if missing == vec![batch_digest()] && requestor == keys()[0].0
     ));
 }

@@ -46,6 +46,114 @@ async fn synchronize() {
     assert!(handle.await.is_ok());
 }
 
+#[tokio::test]
+async fn optimistic_synchronize_targets_the_proposal_leader() {
+    let (tx_message, rx_message) = channel(1);
+
+    let mut keys = keys();
+    let (name, _) = keys.pop().unwrap();
+    let id = 0;
+    let committee = committee_with_base_port(9_100);
+
+    let path = ".db_test_optimistic_synchronize";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    Synchronizer::spawn(
+        name,
+        id,
+        committee.clone(),
+        store,
+        50,
+        1_000_000,
+        3,
+        rx_message,
+        std::collections::HashMap::new(),
+        Metrics::new(&prometheus::Registry::new()).0,
+        BatchConfig::default(),
+    );
+
+    let (leader, _) = keys.pop().unwrap();
+    let address = committee.worker(&leader, &id).unwrap().worker_to_worker;
+    let missing = vec![batch_digest()];
+    let expected = WorkerMessage::OptimisticBatchRequest(missing.clone(), name);
+    let handle = listener(
+        address,
+        Some(Bytes::from(bincode::serialize(&expected).unwrap())),
+    );
+
+    tx_message
+        .send(PrimaryWorkerMessage::SynchronizeOptimistic(missing, leader))
+        .await
+        .unwrap();
+
+    assert!(handle.await.is_ok());
+}
+
+#[tokio::test]
+async fn optimistic_synchronize_retargets_a_pending_batch_to_the_new_leader() {
+    let (tx_message, rx_message) = channel(2);
+
+    let mut keys = keys();
+    let (name, _) = keys.pop().unwrap();
+    let (first_leader, _) = keys.pop().unwrap();
+    let (second_leader, _) = keys.pop().unwrap();
+    let id = 0;
+    let committee = committee_with_base_port(9_200);
+
+    let path = ".db_test_optimistic_retarget";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    Synchronizer::spawn(
+        name,
+        id,
+        committee.clone(),
+        store,
+        50,
+        1_000_000,
+        3,
+        rx_message,
+        std::collections::HashMap::new(),
+        Metrics::new(&prometheus::Registry::new()).0,
+        BatchConfig::default(),
+    );
+
+    let missing = vec![batch_digest()];
+    let expected = WorkerMessage::OptimisticBatchRequest(missing.clone(), name);
+    let serialized = Bytes::from(bincode::serialize(&expected).unwrap());
+
+    let first = listener(
+        committee
+            .worker(&first_leader, &id)
+            .unwrap()
+            .worker_to_worker,
+        Some(serialized.clone()),
+    );
+    tx_message
+        .send(PrimaryWorkerMessage::SynchronizeOptimistic(
+            missing.clone(),
+            first_leader,
+        ))
+        .await
+        .unwrap();
+    assert!(first.await.is_ok());
+
+    let second = listener(
+        committee
+            .worker(&second_leader, &id)
+            .unwrap()
+            .worker_to_worker,
+        Some(serialized),
+    );
+    tx_message
+        .send(PrimaryWorkerMessage::SynchronizeOptimistic(
+            missing,
+            second_leader,
+        ))
+        .await
+        .unwrap();
+    assert!(second.await.is_ok());
+}
+
 /// Deferred misses are retried and stale entries are evicted.
 #[cfg(feature = "benchmark")]
 mod benchmark_metrics_tests {
@@ -67,12 +175,45 @@ mod benchmark_metrics_tests {
 
     /// Build a transaction using the client wire format.
     fn make_tx(id: u64, submitted_millis: u64, payload: &[u8]) -> Bytes {
+        make_tx_with_marker(1, id, submitted_millis, payload)
+    }
+
+    fn make_tx_with_marker(marker: u8, id: u64, submitted_millis: u64, payload: &[u8]) -> Bytes {
         let mut tx = Vec::with_capacity(17 + payload.len());
-        tx.push(1u8);
+        tx.push(marker);
         tx.extend_from_slice(&id.to_be_bytes());
         tx.extend_from_slice(&submitted_millis.to_le_bytes());
         tx.extend_from_slice(payload);
         Bytes::from(tx)
+    }
+
+    #[tokio::test]
+    async fn adversarial_background_batch_contributes_no_committed_goodput() {
+        let path = ".db_test_uncounted_background";
+        let _ = fs::remove_dir_all(path);
+        let store = Store::new(path).unwrap();
+        let registry = prometheus::Registry::new();
+        let (metrics, _) = Metrics::new(&registry);
+        let observer = new_test_observer(store, metrics);
+        let submitted = now_millis().saturating_sub(5);
+        let batch = WorkerMessage::Batch(vec![make_tx_with_marker(
+            2,
+            7,
+            submitted,
+            b"adversarial-background",
+        )]);
+        let bytes = bincode::serialize(&batch).unwrap();
+
+        let outcome =
+            observer.observe_batch_bytes(&digest_of(&bytes), &bytes, submitted + 3, submitted + 4);
+
+        let BatchReadOutcome::Hit(totals) = outcome else {
+            panic!("valid adversarial batch should deserialize");
+        };
+        assert_eq!(totals.tx_count, 0);
+        assert_eq!(totals.tx_bytes, 0);
+        drop(observer);
+        let _ = fs::remove_dir_all(path);
     }
 
     /// Compute the content-addressed digest used by the processor.

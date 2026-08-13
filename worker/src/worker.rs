@@ -64,17 +64,21 @@ pub type SerializedBatchDigestMessage = Vec<u8>;
 pub enum WorkerMessage {
     Batch(Batch),
     BatchRequest(Vec<Digest>, PublicKey),
+    /// Batch request on the optimistic proposal's critical path. The current
+    /// consensus leader, rather than the lane author, serves this request.
+    OptimisticBatchRequest(Vec<Digest>, PublicKey),
 }
 
 #[derive(Deserialize)]
 enum BorrowedWorkerMessage<'a> {
     Batch(#[serde(borrow)] Vec<&'a [u8]>),
     BatchRequest(Vec<Digest>, PublicKey),
+    OptimisticBatchRequest(Vec<Digest>, PublicKey),
 }
 
 enum WorkerMessageRoute {
     Batch,
-    BatchRequest(Vec<Digest>, PublicKey),
+    BatchRequest(Vec<Digest>, PublicKey, bool),
 }
 
 fn route_worker_message(serialized: &[u8]) -> bincode::Result<WorkerMessageRoute> {
@@ -84,7 +88,10 @@ fn route_worker_message(serialized: &[u8]) -> bincode::Result<WorkerMessageRoute
             Ok(WorkerMessageRoute::Batch)
         }
         BorrowedWorkerMessage::BatchRequest(missing, requestor) => {
-            Ok(WorkerMessageRoute::BatchRequest(missing, requestor))
+            Ok(WorkerMessageRoute::BatchRequest(missing, requestor, false))
+        }
+        BorrowedWorkerMessage::OptimisticBatchRequest(missing, requestor) => {
+            Ok(WorkerMessageRoute::BatchRequest(missing, requestor, true))
         }
     }
 }
@@ -149,6 +156,7 @@ impl Worker {
             parameters.withhold_senders,
             &parameters.withhold_publishers,
             parameters.withhold_count,
+            parameters.withhold_stride,
             &parameters.withhold_receivers,
         );
 
@@ -384,6 +392,7 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.batch,
+            self.parameters.withhold_repair && self.withheld_destinations.is_some(),
         );
 
         Processor::spawn(
@@ -439,7 +448,7 @@ impl MessageHandler for TxReceiverHandler {
 /// Handles batches and batch requests from workers.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_helper: Sender<(Vec<Digest>, PublicKey)>,
+    tx_helper: Sender<(Vec<Digest>, PublicKey, bool)>,
     tx_processor: Sender<SerializedBatchMessage>,
     metrics: Arc<Metrics>,
 }
@@ -467,17 +476,22 @@ impl MessageHandler for WorkerReceiverHandler {
                     .await
                     .expect("Failed to send batch")
             }
-            Ok(WorkerMessageRoute::BatchRequest(missing, requestor)) => {
+            Ok(WorkerMessageRoute::BatchRequest(missing, requestor, optimistic_leader_repair)) => {
+                let kind = if optimistic_leader_repair {
+                    "OptimisticBatchRequest"
+                } else {
+                    "BatchRequest"
+                };
                 self.metrics
                     .network_messages_received_total
-                    .with_label_values(&["BatchRequest"])
+                    .with_label_values(&[kind])
                     .inc();
                 self.metrics
                     .network_bytes_received_total
-                    .with_label_values(&["BatchRequest"])
+                    .with_label_values(&[kind])
                     .inc_by(serialized.len() as u64);
                 self.tx_helper
-                    .send((missing, requestor))
+                    .send((missing, requestor, optimistic_leader_repair))
                     .await
                     .expect("Failed to send batch request")
             }

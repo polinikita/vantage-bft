@@ -114,7 +114,7 @@ impl Synchronizer {
                         Some(header) => {
                             proposals_vector.push(bincode::deserialize(&header)?);
                         }
-                        None => missing.push(proposal.clone()),
+                        None => missing.push((*pk, proposal.clone())),
                     }
                 }
             }
@@ -132,7 +132,7 @@ impl Synchronizer {
 
                     match self.store.read(proposal.header_digest.to_vec()).await? {
                         Some(header) => proposals_vector.push(bincode::deserialize(&header)?),
-                        None => missing.push(proposal.clone()),
+                        None => missing.push((*pk, proposal.clone())),
                     }
                 }
             }
@@ -153,7 +153,7 @@ impl Synchronizer {
 
                     match self.store.read(proposal.header_digest.to_vec()).await? {
                         Some(header) => proposals_vector.push(bincode::deserialize(&header)?),
-                        None => missing.push(proposal.clone()),
+                        None => missing.push((*pk, proposal.clone())),
                     }
                 }
             }

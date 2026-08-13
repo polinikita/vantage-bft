@@ -27,6 +27,7 @@ async fn batch_reply() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        false,
     );
 
     let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;
@@ -34,7 +35,46 @@ async fn batch_reply() {
     let handle = listener(address, Some(expected));
 
     let digests = vec![batch_digest()];
-    tx_request.send((digests, requestor)).await.unwrap();
+    tx_request.send((digests, requestor, false)).await.unwrap();
 
     assert!(handle.await.is_ok());
+}
+
+#[tokio::test]
+async fn byzantine_author_does_not_reply_to_repair_requests() {
+    let (tx_request, rx_request) = channel(1);
+    let (requestor, _) = keys().pop().unwrap();
+    let id = 0;
+    let committee = committee_with_base_port(8_100);
+
+    let path = ".db_test_silent_batch_reply";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+    store
+        .write(batch_digest().to_vec(), serialized_batch())
+        .await;
+
+    Helper::spawn(
+        id,
+        committee.clone(),
+        store,
+        rx_request,
+        std::collections::HashMap::new(),
+        Metrics::new(&prometheus::Registry::new()).0,
+        BatchConfig::default(),
+        true,
+    );
+
+    let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;
+    let handle = listener(address, None);
+    tx_request
+        .send((vec![batch_digest()], requestor, false))
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), handle)
+            .await
+            .is_err()
+    );
 }

@@ -50,9 +50,17 @@ Common options include `--tx-size`, `--mode`, `--no-latency`,
 `--delta-ms`, `--max-header-delay-ms`, and the state-sync controls.
 Use `--withhold N --withhold-count K` to make the first `N` validators omit
 each payload broadcast to `K` staggered peers.
+Use `--withhold-publisher-stride S` to spread those Byzantine publishers over
+committee order instead of selecting a consecutive prefix.
 Add `--withhold-fixed-receivers` to use one disjoint receiver group and
 `--withhold-batches-only` to keep lane headers flowing while permanently
 dropping only the heavy transaction batches on those links.
+Add `--withhold-repair` to make the selected Byzantine publishers ignore
+payload repair requests after narrowcasting.
+Use `--correct-load-only --adversarial-rate R` for a leader-relay experiment:
+the counted offered load is distributed over correct authors, while the
+selected Byzantine authors generate `R` tx/s of uncounted background payload.
+Those bytes use the complete data path but do not inflate goodput metrics.
 
 Vantage carries positional availability claims on AGB echoes by default.
 `--no-echo-avail-claims` selects periodic watermarks; `--no-ack-watermarks`

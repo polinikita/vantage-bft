@@ -31,6 +31,35 @@ repeated three times. The harness also produces a receiver-width sweep for
 Both Autobahn variants use the deployment configuration's 5-second consensus
 and fast-path timeouts.
 
+## Local Leader-Relay Stress
+
+The leader-relay experiment keeps useful demand fixed on correct lanes while
+silent Byzantine authors add uncounted, narrowcast payload. The background
+transactions traverse the complete data path but are excluded from offered and
+committed goodput. For the `n=20` mapping used in the study, six publishers are
+spread with publisher stride 7; each omits six receivers with stride 19. Every
+correct leader therefore holds four faulty lanes and must recover two.
+
+One point can be reproduced with:
+
+```bash
+docker-bench/run.sh \
+  --nodes 20 --rate 5000 --duration 40 \
+  --protocol autobahn-optimistic --all-to-all \
+  --withhold 6 --withhold-publisher-stride 7 \
+  --withhold-count 6 --withhold-stride 19 \
+  --withhold-batches-only --withhold-repair \
+  --correct-load-only --adversarial-rate 20000
+```
+
+Use `--protocol vantage` or `--protocol simple-it --timeout-delay-ms 1600`
+for the matched controls. Plot a CSV containing `protocol`,
+`adversarial_tps`, `useful_tps`, `p50_ms`, and `p99_ms` with:
+
+```bash
+python3 benchmark/plot_leader_burden.py measurements.csv
+```
+
 After a run, generate the presentation-oriented capacity/latency summary with:
 
 ```bash

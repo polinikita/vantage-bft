@@ -10,6 +10,7 @@ set -euo pipefail
 : "${NODE_IP_PREFIX:?NODE_IP_PREFIX must be set}"
 : "${NODE_IP_OFFSET:?NODE_IP_OFFSET must be set}"
 : "${TX_RATE_SHARE:?TX_RATE_SHARE must be set}"
+: "${ADVERSARIAL_TX_RATE_SHARE:=0}"
 : "${TX_SIZE:?TX_SIZE must be set}"
 : "${TX_MODE:?TX_MODE must be set}"
 
@@ -64,8 +65,19 @@ echo "entrypoint: node $NODE_INDEX/$N_NODES starting client -> $(own_addr), rate
     >"$LOGDIR/client.log" 2>&1 &
 CLIENT_PID=$!
 
+ADVERSARIAL_CLIENT_PID=""
+if [ "$ADVERSARIAL_TX_RATE_SHARE" -gt 0 ]; then
+    echo "entrypoint: node $NODE_INDEX/$N_NODES starting uncounted adversarial client -> $(own_addr), rate ${ADVERSARIAL_TX_RATE_SHARE} tx/s"
+    /usr/local/bin/benchmark_client "$(own_addr)" \
+        --size "$TX_SIZE" --rate "$ADVERSARIAL_TX_RATE_SHARE" --mode "$TX_MODE" \
+        --uncounted --nodes "${PEER_ADDRS[@]}" \
+        >"$LOGDIR/adversarial-client.log" 2>&1 &
+    ADVERSARIAL_CLIENT_PID=$!
+fi
+
 cleanup() {
-    kill "$PRIMARY_PID" "$WORKER_PID" "$CLIENT_PID" >/dev/null 2>&1 || true
+    kill "$PRIMARY_PID" "$WORKER_PID" "$CLIENT_PID" ${ADVERSARIAL_CLIENT_PID:+"$ADVERSARIAL_CLIENT_PID"} \
+        >/dev/null 2>&1 || true
 }
 graceful_stop() {
     echo "entrypoint: received stop signal, shutting down"
@@ -75,7 +87,9 @@ graceful_stop() {
 trap graceful_stop INT TERM
 trap cleanup EXIT
 
-while kill -0 "$PRIMARY_PID" 2>/dev/null && kill -0 "$WORKER_PID" 2>/dev/null && kill -0 "$CLIENT_PID" 2>/dev/null; do
+while kill -0 "$PRIMARY_PID" 2>/dev/null && kill -0 "$WORKER_PID" 2>/dev/null \
+    && kill -0 "$CLIENT_PID" 2>/dev/null \
+    && { [ -z "$ADVERSARIAL_CLIENT_PID" ] || kill -0 "$ADVERSARIAL_CLIENT_PID" 2>/dev/null; }; do
     sleep 1
 done
 

@@ -74,6 +74,15 @@ async fn main() -> Result<()> {
                      latency distribution)",
                 ),
         )
+        .arg(
+            Arg::new("uncounted")
+                .long("uncounted")
+                .action(ArgAction::SetTrue)
+                .help(concat!(
+                    "Generate real payload traffic marked as adversarial background; it uses ",
+                    "the full data path but is excluded from offered/committed TPS metrics"
+                )),
+        )
         .arg_required_else_help(true)
         .get_matches();
 
@@ -129,6 +138,7 @@ async fn main() -> Result<()> {
         rate,
         nodes,
         mode,
+        counted: !matches.get_flag("uncounted"),
         activate_at_ms,
     };
 

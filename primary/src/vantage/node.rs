@@ -819,6 +819,7 @@ impl VantageCore {
                     parameters.withhold_senders,
                     &parameters.withhold_publishers,
                     parameters.withhold_count,
+                    parameters.withhold_stride,
                     &parameters.withhold_receivers,
                 )
             })

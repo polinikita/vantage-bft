@@ -49,6 +49,9 @@ pub struct Client {
     pub rate: u64,
     pub nodes: Vec<SocketAddr>,
     pub mode: TransactionMode,
+    /// Whether generated transactions count as benchmark goodput. Uncounted
+    /// payload still traverses and consumes the complete protocol data path.
+    pub counted: bool,
     /// Epoch-millisecond time before which the client submits no transactions.
     /// Use the same value as `Parameters::metrics_active_at_ms`.
     pub activate_at_ms: Option<u64>,
@@ -130,7 +133,11 @@ impl Client {
             };
 
             for x in 0..this_tick_count {
-                if x == counter % this_tick_count {
+                if !self.counted {
+                    random_id = random_id.wrapping_add(1);
+                    tx.put_u8(2u8);
+                    tx.put_u64(random_id);
+                } else if x == counter % this_tick_count {
                     debug!("Sending sample transaction {}", counter);
 
                     tx.put_u8(0u8);

@@ -216,12 +216,32 @@ async fn main() -> Result<()> {
                         .help("Peers each withholding node excludes (default: half the committee)"),
                 )
                 .arg(
+                    Arg::new("withhold-stride")
+                        .long("withhold-stride")
+                        .value_name("INT")
+                        .default_value("1")
+                        .action(ArgAction::Set)
+                        .help("Coprime committee-index stride used to spread omitted payloads"),
+                )
+                .arg(
                     Arg::new("withhold-fixed-receivers")
                         .long("withhold-fixed-receivers")
                         .action(ArgAction::SetTrue)
                         .help(
                             "Make every withholding sender exclude the same following receiver group",
                         ),
+                )
+                .arg(
+                    Arg::new("withhold-batches-only")
+                        .long("withhold-batches-only")
+                        .action(ArgAction::SetTrue)
+                        .help("Drop heavy worker batches while continuing original lane headers"),
+                )
+                .arg(
+                    Arg::new("withhold-repair")
+                        .long("withhold-repair")
+                        .action(ArgAction::SetTrue)
+                        .help("Make selected Byzantine publishers ignore payload repair requests"),
                 )
                 .arg(
                     Arg::new("late-header-publishers")

@@ -2,7 +2,7 @@
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
-use log::{error, warn};
+use log::{debug, error, warn};
 use metrics::Metrics;
 use network::{BatchConfig, SimpleSender};
 use std::collections::HashMap;
@@ -25,9 +25,12 @@ pub struct Helper {
     /// The persistent storage.
     store: Store,
     /// Batch requests from other workers.
-    rx_request: Receiver<(Vec<Digest>, PublicKey)>,
+    rx_request: Receiver<(Vec<Digest>, PublicKey, bool)>,
     /// Sends batches to other workers.
     network: SimpleSender,
+    /// Benchmark-only Byzantine behavior: narrowcast original batches, then
+    /// remain silent when peers ask for repair.
+    suppress_repair: bool,
 }
 
 impl Helper {
@@ -37,10 +40,11 @@ impl Helper {
         id: WorkerId,
         committee: Committee,
         store: Store,
-        rx_request: Receiver<(Vec<Digest>, PublicKey)>,
+        rx_request: Receiver<(Vec<Digest>, PublicKey, bool)>,
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        suppress_repair: bool,
     ) {
         tokio::spawn(async move {
             Self {
@@ -52,6 +56,7 @@ impl Helper {
                     .with_latency(latency_map)
                     .with_metrics(metrics)
                     .with_batching(batch),
+                suppress_repair,
             }
             .run()
             .await;
@@ -59,7 +64,14 @@ impl Helper {
     }
 
     async fn run(&mut self) {
-        while let Some((digests, origin)) = self.rx_request.recv().await {
+        while let Some((digests, origin, optimistic_leader_repair)) = self.rx_request.recv().await {
+            if self.suppress_repair {
+                debug!(
+                    "Suppressing Byzantine repair response for {} requested batch(es)",
+                    digests.len()
+                );
+                continue;
+            }
             let address = match self.committee.worker(&origin, &self.id) {
                 Ok(x) => x.worker_to_worker,
                 Err(e) => {
@@ -71,8 +83,13 @@ impl Helper {
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
                     Ok(Some(data)) => {
+                        let kind = if optimistic_leader_repair {
+                            "OptimisticBatch"
+                        } else {
+                            "Batch"
+                        };
                         self.network
-                            .send_typed(address, Bytes::from(data), "Batch")
+                            .send_typed(address, Bytes::from(data), kind)
                             .await
                     }
                     Ok(None) => (),

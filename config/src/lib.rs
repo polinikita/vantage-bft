@@ -312,11 +312,23 @@ pub struct Parameters {
     #[serde(default)]
     pub withhold_count: Option<usize>,
 
+    /// Committee-index stride between destinations omitted by consecutive
+    /// withholding senders. A coprime stride spreads missing payloads across
+    /// the committee so every correct leader holds some tips and lacks others.
+    #[serde(default = "default_withhold_stride")]
+    pub withhold_stride: usize,
+
     /// Optional fixed destination set excluded by every withholding sender.
     /// An empty set keeps the staggered mapping selected by `withhold_count`.
-    /// Repair and control traffic are unaffected in either mode.
+    /// Repair and control traffic are unaffected unless `withhold_repair` is
+    /// set for the selected Byzantine publishers.
     #[serde(default)]
     pub withhold_receivers: Vec<PublicKey>,
+
+    /// Benchmark-only Byzantine behavior: selected publishers ignore payload
+    /// repair requests after narrowcasting their original lane batches.
+    #[serde(default)]
+    pub withhold_repair: bool,
 
     /// Whether permanent withholding also suppresses original lane headers.
     /// Disable this to drop only the heavy worker batches while retaining the
@@ -542,6 +554,10 @@ fn default_withhold_for_ms() -> u64 {
 
 fn default_withhold_headers() -> bool {
     true
+}
+
+fn default_withhold_stride() -> usize {
+    1
 }
 
 /// Default lane-resume check period, in milliseconds.
@@ -795,7 +811,9 @@ impl Default for Parameters {
             withhold_senders: 0,
             withhold_publishers: Vec::new(),
             withhold_count: None,
+            withhold_stride: default_withhold_stride(),
             withhold_receivers: Vec::new(),
+            withhold_repair: false,
             withhold_headers: default_withhold_headers(),
             late_header_publishers: Vec::new(),
             late_header_receivers: Vec::new(),
@@ -943,8 +961,14 @@ impl Parameters {
             };
             let width = if self.withhold_receivers.is_empty() {
                 match self.withhold_count {
-                    Some(count) => format!("{count} staggered peer(s)"),
-                    None => "a staggered half of the committee".to_string(),
+                    Some(count) => format!(
+                        "{count} staggered peer(s), committee stride {}",
+                        self.withhold_stride
+                    ),
+                    None => format!(
+                        "a staggered half of the committee, committee stride {}",
+                        self.withhold_stride
+                    ),
                 }
             } else {
                 format!("{} fixed peer(s)", self.withhold_receivers.len())
@@ -964,6 +988,9 @@ impl Parameters {
                     publishers, traffic, width
                 ),
             }
+            if self.withhold_repair {
+                info!("Selected Byzantine publishers suppress payload repair responses");
+            }
         }
         if !self.late_header_publishers.is_empty() {
             info!(
@@ -978,6 +1005,32 @@ impl Parameters {
 
     /// Validate the finite-delay Byzantine header-publication experiment.
     pub fn validate_header_faults(&self, committee: &Committee) -> Result<(), String> {
+        let n = committee.size();
+        if self.withhold_senders > n {
+            return Err(format!(
+                "withholding sender count {} exceeds committee size {n}",
+                self.withhold_senders
+            ));
+        }
+        if self.withhold_count.is_some_and(|count| count >= n) {
+            return Err("withholding destination count must be below committee size".to_string());
+        }
+        if self.withhold_stride == 0 {
+            return Err("withholding stride must be greater than zero".to_string());
+        }
+        if self.withhold_receivers.is_empty()
+            && (self.withhold_senders > 0 || !self.withhold_publishers.is_empty())
+            && gcd(self.withhold_stride, n) != 1
+        {
+            return Err(format!(
+                "withholding stride {} must be coprime with committee size {n}",
+                self.withhold_stride
+            ));
+        }
+        if self.withhold_repair && self.withhold_senders == 0 && self.withhold_publishers.is_empty()
+        {
+            return Err("repair suppression requires withholding publishers".to_string());
+        }
         if self.withhold_senders > 0 && !self.withhold_publishers.is_empty() {
             return Err(
                 "staggered withholding senders and fixed withholding publishers are mutually exclusive"
@@ -1392,7 +1445,8 @@ impl Committee {
 
 /// Returns destinations withheld by the local data-plane injector.
 ///
-/// Sender `i` withholds destinations `(i + 1)..=(i + count)` modulo `n`;
+/// Sender `i` withholds destinations `i + stride, ..., i + count*stride`
+/// modulo `n`;
 /// `count = None` keeps the legacy half-committee width `n/2`.
 pub fn withheld_destinations(
     committee: &Committee,
@@ -1400,6 +1454,7 @@ pub fn withheld_destinations(
     withhold_senders: usize,
     fixed_publishers: &[PublicKey],
     count: Option<usize>,
+    stride: usize,
     fixed_receivers: &[PublicKey],
 ) -> Option<HashSet<PublicKey>> {
     let n = committee.size();
@@ -1426,7 +1481,18 @@ pub fn withheld_destinations(
     }
     let order: Vec<PublicKey> = committee.authorities.keys().copied().collect();
     let width = count.unwrap_or(n / 2).min(n.saturating_sub(1));
-    Some((1..=width).map(|offset| order[(i + offset) % n]).collect())
+    Some(
+        (1..=width)
+            .map(|offset| order[(i + offset * stride) % n])
+            .collect(),
+    )
+}
+
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 /// Returns the receivers whose original headers the local Byzantine publisher
@@ -1543,7 +1609,7 @@ mod tests {
     #[test]
     fn withheld_destinations_stagger_wraps_around() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
-        let blocked = withheld_destinations(&committee, &keypairs[15].name, 16, &[], None, &[])
+        let blocked = withheld_destinations(&committee, &keypairs[15].name, 16, &[], None, 1, &[])
             .expect("index 15 is one of the first 16 withholding senders");
         let expected: HashSet<PublicKey> = [16, 17, 18, 19, 0, 1, 2, 3, 4, 5]
             .into_iter()
@@ -1557,7 +1623,9 @@ mod tests {
     fn withheld_destinations_zero_is_none_for_everyone() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         for keypair in &keypairs {
-            assert!(withheld_destinations(&committee, &keypair.name, 0, &[], None, &[]).is_none());
+            assert!(
+                withheld_destinations(&committee, &keypair.name, 0, &[], None, 1, &[]).is_none()
+            );
         }
     }
 
@@ -1566,7 +1634,9 @@ mod tests {
     fn withheld_destinations_k_equals_n_every_sender_withholds() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         for keypair in &keypairs {
-            assert!(withheld_destinations(&committee, &keypair.name, 20, &[], None, &[]).is_some());
+            assert!(
+                withheld_destinations(&committee, &keypair.name, 20, &[], None, 1, &[]).is_some()
+            );
         }
     }
 
@@ -1574,7 +1644,7 @@ mod tests {
     #[test]
     fn withheld_destinations_odd_committee_floors() {
         let (committee, keypairs) = Committee::local_benchmark(7, 1, 9000);
-        let blocked = withheld_destinations(&committee, &keypairs[0].name, 1, &[], None, &[])
+        let blocked = withheld_destinations(&committee, &keypairs[0].name, 1, &[], None, 1, &[])
             .expect("index 0 is the sole withholding sender");
         let expected: HashSet<PublicKey> = [1, 2, 3]
             .into_iter()
@@ -1587,8 +1657,12 @@ mod tests {
     #[test]
     fn withheld_destinations_non_sender_index_is_none() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
-        assert!(withheld_destinations(&committee, &keypairs[2].name, 3, &[], None, &[]).is_some());
-        assert!(withheld_destinations(&committee, &keypairs[3].name, 3, &[], None, &[]).is_none());
+        assert!(
+            withheld_destinations(&committee, &keypairs[2].name, 3, &[], None, 1, &[]).is_some()
+        );
+        assert!(
+            withheld_destinations(&committee, &keypairs[3].name, 3, &[], None, 1, &[]).is_none()
+        );
     }
 
     #[test]
@@ -1599,14 +1673,20 @@ mod tests {
 
         for sender in &keypairs[..3] {
             assert_eq!(
-                withheld_destinations(&committee, &sender.name, 3, &[], Some(3), &receivers),
+                withheld_destinations(&committee, &sender.name, 3, &[], Some(3), 1, &receivers),
                 Some(expected.clone())
             );
         }
-        assert!(
-            withheld_destinations(&committee, &keypairs[3].name, 3, &[], Some(3), &receivers)
-                .is_none()
-        );
+        assert!(withheld_destinations(
+            &committee,
+            &keypairs[3].name,
+            3,
+            &[],
+            Some(3),
+            1,
+            &receivers,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1618,7 +1698,7 @@ mod tests {
 
         for sender in &publishers {
             assert_eq!(
-                withheld_destinations(&committee, sender, 0, &publishers, Some(3), &receivers,),
+                withheld_destinations(&committee, sender, 0, &publishers, Some(3), 1, &receivers,),
                 Some(expected.clone())
             );
         }
@@ -1628,9 +1708,85 @@ mod tests {
             0,
             &publishers,
             Some(3),
+            1,
             &receivers,
         )
         .is_none());
+    }
+
+    #[test]
+    fn coprime_stride_spreads_faulty_lanes_across_every_correct_leader() {
+        let (committee, keypairs) = Committee::local_benchmark(40, 1, 9000);
+        let publishers: Vec<PublicKey> = (0..13)
+            .map(|offset| keypairs[(offset * 13) % 40].name)
+            .collect();
+        let blocked: Vec<HashSet<PublicKey>> = publishers
+            .iter()
+            .map(|sender| {
+                withheld_destinations(&committee, sender, 0, &publishers, Some(13), 3, &[])
+                    .expect("the selected authority is a withholding publisher")
+            })
+            .collect();
+
+        for leader in keypairs
+            .iter()
+            .filter(|leader| !publishers.contains(&leader.name))
+        {
+            let missing = blocked
+                .iter()
+                .filter(|destinations| destinations.contains(&leader.name))
+                .count();
+            let held = 13 - missing;
+            assert!((4..=5).contains(&missing), "missing {missing} faulty lanes");
+            assert!((8..=9).contains(&held), "holds {held} faulty lanes");
+        }
+    }
+
+    #[test]
+    fn n20_leader_burden_mapping_hits_every_correct_leader() {
+        let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
+        let publishers: Vec<PublicKey> = (0..6)
+            .map(|offset| keypairs[(offset * 7) % 20].name)
+            .collect();
+        let blocked: Vec<HashSet<PublicKey>> = publishers
+            .iter()
+            .map(|sender| {
+                withheld_destinations(&committee, sender, 0, &publishers, Some(6), 19, &[])
+                    .expect("the selected authority is a withholding publisher")
+            })
+            .collect();
+
+        for leader in keypairs
+            .iter()
+            .filter(|leader| !publishers.contains(&leader.name))
+        {
+            let missing = blocked
+                .iter()
+                .filter(|destinations| destinations.contains(&leader.name))
+                .count();
+            assert_eq!(
+                missing, 2,
+                "every correct leader must miss two faulty lanes"
+            );
+            assert_eq!(publishers.len() - missing, 4);
+        }
+    }
+
+    #[test]
+    fn repair_suppression_requires_publishers_and_stride_must_be_coprime() {
+        let (committee, _) = Committee::local_benchmark(20, 1, 9000);
+        let mut params = Parameters {
+            withhold_repair: true,
+            ..Parameters::default()
+        };
+        assert!(params.validate_header_faults(&committee).is_err());
+
+        params.withhold_senders = 6;
+        params.withhold_stride = 2;
+        assert!(params.validate_header_faults(&committee).is_err());
+
+        params.withhold_stride = 3;
+        assert!(params.validate_header_faults(&committee).is_ok());
     }
 
     #[test]

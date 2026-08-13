@@ -236,7 +236,7 @@ pub(crate) fn record_typed_received(metrics: &Arc<Metrics>, msg_type: &'static s
 }
 
 /// The messages sent by the primary to its workers.
-// `Committed` must remain last: bincode encodes enum variant indices.
+// New variants must be appended: bincode encodes enum variant indices.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryWorkerMessage {
     /// Requests missing batches from a worker.
@@ -245,6 +245,9 @@ pub enum PrimaryWorkerMessage {
     Cleanup(Height),
     /// Benchmark-only commit notification with a UTC-millisecond timestamp.
     Committed(u64 /* commit UTC-millis */, Vec<Digest>),
+    /// Requests batches specifically from the current optimistic proposal
+    /// leader, which must relay the tips it chose to propose.
+    SynchronizeOptimistic(Vec<Digest>, /* proposal leader */ PublicKey),
 }
 
 impl PrimaryWorkerMessage {
@@ -254,6 +257,7 @@ impl PrimaryWorkerMessage {
             PrimaryWorkerMessage::Synchronize(..) => "Synchronize",
             PrimaryWorkerMessage::Cleanup(..) => "Cleanup",
             PrimaryWorkerMessage::Committed(..) => "Committed",
+            PrimaryWorkerMessage::SynchronizeOptimistic(..) => "SynchronizeOptimistic",
         }
     }
 }
@@ -645,6 +649,7 @@ impl Primary {
                                 parameters.withhold_senders,
                                 &parameters.withhold_publishers,
                                 parameters.withhold_count,
+                                parameters.withhold_stride,
                                 &parameters.withhold_receivers,
                             )
                         })
