@@ -253,7 +253,8 @@ impl Hash for CutVote {
     }
 }
 
-/// Bracha variant's second echo message, counted first-hand by each recipient.
+/// Second echo message, counted first-hand by each recipient; Bracha's ready
+/// round and Opt-RBC's quorum fallback alike.
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub struct CutReady {
     pub round: CutRound,

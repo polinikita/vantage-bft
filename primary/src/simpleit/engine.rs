@@ -28,7 +28,7 @@ pub enum Inbound {
     Decide(Decide),
     Timeout(Timeout),
     TimeoutAccept(TimeoutAccept),
-    /// Bracha-only second echo round.
+    /// Second echo round: Bracha's ready and Opt-RBC's fallback.
     CutReady(CutReady),
     /// A scheduled deadline for this round has elapsed.
     TimerFired(CutRound),
@@ -76,7 +76,7 @@ pub struct CutEngine {
 
     /// Vote aggregators keyed by round and cut. Round-prunable.
     cut_vote_aggregators: BTreeMap<(CutRound, Digest), CutVoteAggregator>,
-    /// Bracha-variant ready aggregators keyed by round and cut. Round-prunable.
+    /// Ready aggregators keyed by round and cut, used by both variants. Round-prunable.
     cut_ready_aggregators: BTreeMap<(CutRound, Digest), CutReadyAggregator>,
     /// Timeout aggregators by round.
     timeouts_aggregators: BTreeMap<CutRound, TimeoutAggregator>,
@@ -98,7 +98,7 @@ pub struct CutEngine {
     committed: BTreeMap<CutRound, Decide>,
     /// Records whether this node sent its cut vote for each round.
     sent_cut_votes: BTreeSet<CutRound>,
-    /// Bracha-only latch for this node's one-shot ready broadcast per round.
+    /// Latch for this node's one-shot ready broadcast per round.
     sent_cut_ready: BTreeSet<CutRound>,
     /// Records whether this node proposed a cut for each round.
     proposed_cut_rounds: BTreeSet<CutRound>,
@@ -297,8 +297,11 @@ impl CutEngine {
             .collect()
     }
 
-    /// Counts each verified vote once.
-    /// Opt marks the cut safe at `mint_threshold`; Bracha broadcasts `CutReady` at quorum.
+    /// Counts each verified vote once. Both variants broadcast `CutReady` at
+    /// quorum — the Opt-RBC fallback round that keeps delivering with `n - f`
+    /// responsive parties. Opt additionally marks the cut safe directly once
+    /// the optimistic `mint_threshold` is met: fewer tolerated faults, two
+    /// fewer message delays.
     pub fn process_cut_vote(
         &mut self,
         vote: CutVote,
@@ -311,18 +314,23 @@ impl CutEngine {
         let round = vote.round;
         let cut_id = vote.cut_id.clone();
         let key = (round, cut_id.clone());
-        let threshold = match self.variant {
-            Variant::Opt => mint_threshold(&self.committee),
-            Variant::Bracha => self.committee.quorum_threshold(),
+        let quorum = self.committee.quorum_threshold();
+        let mint = mint_threshold(&self.committee);
+        let (previous, current, witnesses) = {
+            let aggregator = self.cut_vote_aggregators.entry(key).or_default();
+            let Ok((previous, current)) = aggregator.append(&vote, &self.committee) else {
+                return Vec::new();
+            };
+            (previous, current, aggregator.voters().to_vec())
         };
-        let aggregator = self.cut_vote_aggregators.entry(key).or_default();
-        let Ok(Some(witnesses)) = aggregator.append(&vote, &self.committee, threshold) else {
-            return Vec::new();
-        };
-        match self.variant {
-            Variant::Opt => self.mark_cut_safe(round, cut_id, witnesses, tips, oracle),
-            Variant::Bracha => self.broadcast_cut_ready(round, cut_id, tips, oracle),
+        let mut effects = Vec::new();
+        if previous < quorum && current >= quorum {
+            effects.extend(self.broadcast_cut_ready(round, cut_id.clone(), tips, oracle));
         }
+        if self.variant == Variant::Opt && previous < mint && current >= mint {
+            effects.extend(self.mark_cut_safe(round, cut_id, witnesses, tips, oracle));
+        }
+        effects
     }
 
     fn broadcast_cut_ready(
@@ -351,9 +359,6 @@ impl CutEngine {
         tips: &Cut,
         oracle: &dyn TipOracle,
     ) -> Vec<CutEffect> {
-        if self.variant != Variant::Bracha {
-            return Vec::new();
-        }
         if ready.verify(&self.committee).is_err() {
             return Vec::new();
         }
@@ -1220,26 +1225,90 @@ mod tests {
         );
     }
 
-    /// Ignores `CutReady` messages when the variant is `Opt`.
+    /// The Opt variant must deliver through the ready fallback when the
+    /// optimistic threshold exceeds the number of live authors.
     #[test]
-    fn bracha_cut_ready_is_a_no_op_under_variant_opt() {
-        let (committee, keys) = committee_of(4);
+    fn opt_ready_fallback_reaches_safe_with_only_fourteen_of_twenty_live_authors() {
+        let (committee, keys) = committee_of(20);
         let tips = sample_tips(&keys);
         let oracle = AllAvailable;
-        let mut engine = CutEngine::new(keys[0], committee, 1_000);
+        let round: CutRound = 1;
+        let leader = agb::proposer(&committee, 2);
 
-        let effects = engine.process_cut_ready(
-            CutReady {
-                round: 1,
-                cut_id: Digest([1; 32]),
-                author: keys[1],
-            },
-            &tips,
-            &oracle,
+        assert!(
+            mint_threshold(&committee) > committee.quorum_threshold(),
+            "test setup requires the optimistic threshold to exceed the quorum, \
+             so that safety is reachable only through the ready fallback"
         );
-        assert!(effects.is_empty());
-        assert!(engine.cut_ready_aggregators.is_empty());
-        assert!(!engine.safe.contains_key(&1));
+
+        let live: Vec<PublicKey> = keys.iter().copied().take(14).collect();
+        assert!(live.contains(&leader));
+
+        let mut engine = CutEngine::new(leader, committee, 1_000);
+
+        let mut effects = engine.try_propose_cut_for_current_round(&tips, &oracle);
+        let proposal = find_proposal(&effects).expect("leader broadcasts a cut proposal");
+        let cut_id = proposal.id();
+
+        for author in live.iter().filter(|k| **k != leader) {
+            effects = engine.process_cut_vote(
+                CutVote {
+                    round,
+                    cut_id: cut_id.clone(),
+                    author: *author,
+                },
+                &tips,
+                &oracle,
+            );
+        }
+        assert!(
+            find_ready_for_round(&effects, round).is_some(),
+            "quorum votes without the optimistic threshold must broadcast the \
+             Opt-RBC fallback CutReady"
+        );
+        assert!(
+            !engine.safe.contains_key(&round),
+            "14 votes stay below the optimistic threshold, so the fast path \
+             alone must not mark the cut safe"
+        );
+
+        for author in live.iter().filter(|k| **k != leader) {
+            if engine.safe.contains_key(&round) {
+                break;
+            }
+            effects = engine.process_cut_ready(
+                CutReady {
+                    round,
+                    cut_id: cut_id.clone(),
+                    author: *author,
+                },
+                &tips,
+                &oracle,
+            );
+        }
+        assert_eq!(
+            engine.safe.get(&round),
+            Some(&cut_id),
+            "a quorum of readies must mark the cut safe under Opt"
+        );
+
+        let mut commits = find_commits(&effects, round);
+        for author in live.iter().filter(|k| **k != leader) {
+            if !commits.is_empty() {
+                break;
+            }
+            effects = engine.process_decide(Decide {
+                id: cut_id.clone(),
+                round,
+                author: *author,
+            });
+            commits = find_commits(&effects, round);
+        }
+        assert!(
+            !commits.is_empty(),
+            "a quorum of decides must commit the round with 14 of 20 live"
+        );
+        assert_eq!(commits[0].1, proposal.tips);
     }
 
     #[test]

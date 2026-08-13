@@ -31,22 +31,20 @@ impl CutVoteAggregator {
         }
     }
 
-    /// `threshold` is the weight required to return the counted authors.
-    pub fn append(
-        &mut self,
-        vote: &CutVote,
-        committee: &Committee,
-        threshold: Stake,
-    ) -> DagResult<Option<Vec<PublicKey>>> {
+    /// Records one vote per author and returns the stake before and after it,
+    /// so the caller can detect each threshold crossing exactly once.
+    pub fn append(&mut self, vote: &CutVote, committee: &Committee) -> DagResult<(Stake, Stake)> {
         let author = vote.author;
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
         self.voters.push(author);
+        let previous = self.weight;
         self.weight += committee.stake(&author);
-        if self.weight >= threshold {
-            self.weight = 0;
-            return Ok(Some(std::mem::take(&mut self.voters)));
-        }
-        Ok(None)
+        Ok((previous, self.weight))
+    }
+
+    /// Distinct counted authors in arrival order.
+    pub fn voters(&self) -> &[PublicKey] {
+        &self.voters
     }
 }
 
