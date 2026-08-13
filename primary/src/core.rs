@@ -43,6 +43,10 @@ fn keep_after_slot_period_gc(candidate: Slot, committed: Slot, k: Slot) -> bool 
     candidate > committed || candidate % k != committed % k
 }
 
+fn keep_all_to_all_delivery(candidate: Slot, committed: Slot, gc_depth: Slot) -> bool {
+    candidate >= committed.saturating_sub(gc_depth)
+}
+
 pub struct Core {
     name: PublicKey,
     committee: Committee,
@@ -1836,8 +1840,20 @@ impl Core {
 
         self.consensus_instances
             .retain(|(s, _), _| keep_after_slot_period_gc(*s, slot, k));
-        self.consensus_cancel_handlers
-            .retain(|s, _| keep_after_slot_period_gc(*s, slot, k));
+        if self.all_to_all {
+            // Local instance state for a pipeline lane can be discarded once the
+            // lane advances, but an outbound all-to-all vote is still needed by
+            // an honest replica that has not committed that slot yet. Dropping
+            // its CancelHandler here cancels reliable delivery and can strand
+            // that replica permanently. Keep delivery alive for the same bounded
+            // recovery window used by the rest of the primary state.
+            let gc_depth = self.gc_depth;
+            self.consensus_cancel_handlers
+                .retain(|s, _| keep_all_to_all_delivery(*s, slot, gc_depth));
+        } else {
+            self.consensus_cancel_handlers
+                .retain(|s, _| keep_after_slot_period_gc(*s, slot, k));
+        }
 
         self.qc_makers
             .retain(|(s, _), _| keep_after_slot_period_gc(*s, slot, k));
@@ -2233,5 +2249,18 @@ impl Core {
                 debug!("GC round moved to {}", self.gc_round);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_gc_tests {
+    use super::{keep_after_slot_period_gc, keep_all_to_all_delivery};
+
+    #[test]
+    fn all_to_all_delivery_outlives_the_pipeline_lane() {
+        assert!(!keep_after_slot_period_gc(11, 15, 4));
+        assert!(keep_all_to_all_delivery(11, 15, 50));
+        assert!(keep_all_to_all_delivery(50, 100, 50));
+        assert!(!keep_all_to_all_delivery(49, 100, 50));
     }
 }
