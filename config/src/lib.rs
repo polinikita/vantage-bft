@@ -295,9 +295,16 @@ pub struct Parameters {
     #[serde(default = "default_batch_max_delay_ms")]
     pub batch_max_delay_ms: u64,
 
-    /// Number of staggered payload-withholding senders. Zero disables withholding.
+    /// Number of staggered payload-withholding senders. Zero disables this
+    /// legacy selector unless `withhold_publishers` names explicit senders.
     #[serde(default)]
     pub withhold_senders: usize,
+
+    /// Optional explicit payload-withholding publishers. This is the remote-
+    /// deployment form of `withhold_senders`: it binds the fault to validator
+    /// identities instead of the committee's public-key sort order.
+    #[serde(default)]
+    pub withhold_publishers: Vec<PublicKey>,
 
     /// Destinations each withholding sender excludes. `None` keeps the legacy
     /// half-committee width; values below `n - quorum` keep the withheld blocks
@@ -776,6 +783,7 @@ impl Default for Parameters {
             batch_max_bytes: default_batch_max_bytes(),
             batch_max_delay_ms: default_batch_max_delay_ms(),
             withhold_senders: 0,
+            withhold_publishers: Vec::new(),
             withhold_count: None,
             withhold_receivers: Vec::new(),
             late_header_publishers: Vec::new(),
@@ -911,7 +919,12 @@ impl Parameters {
             self.retry_backoff_max_ms,
             self.volatile_soft_cap
         );
-        if self.withhold_senders > 0 {
+        if self.withhold_senders > 0 || !self.withhold_publishers.is_empty() {
+            let publishers = if self.withhold_publishers.is_empty() {
+                format!("first {} node(s)", self.withhold_senders)
+            } else {
+                format!("{} fixed node(s)", self.withhold_publishers.len())
+            };
             let width = if self.withhold_receivers.is_empty() {
                 match self.withhold_count {
                     Some(count) => format!("{count} staggered peer(s)"),
@@ -922,17 +935,17 @@ impl Parameters {
             };
             match self.withhold_at_ms {
                 Some(at) => info!(
-                    "Data-plane withholding: first {} node(s) withhold payload dissemination \
+                    "Data-plane withholding: {} withhold payload dissemination \
                      from {}, active [{}, {}) ms after start",
-                    self.withhold_senders,
+                    publishers,
                     width,
                     at,
                     at + self.withhold_for_ms
                 ),
                 None => info!(
-                    "Data-plane withholding: first {} node(s) withhold payload dissemination \
+                    "Data-plane withholding: {} withhold payload dissemination \
                      from {}",
-                    self.withhold_senders, width
+                    publishers, width
                 ),
             }
         }
@@ -949,9 +962,29 @@ impl Parameters {
 
     /// Validate the finite-delay Byzantine header-publication experiment.
     pub fn validate_header_faults(&self, committee: &Committee) -> Result<(), String> {
+        if self.withhold_senders > 0 && !self.withhold_publishers.is_empty() {
+            return Err(
+                "staggered withholding senders and fixed withholding publishers are mutually exclusive"
+                    .to_string(),
+            );
+        }
+        let fixed_publishers: HashSet<_> = self.withhold_publishers.iter().copied().collect();
+        if fixed_publishers.len() != self.withhold_publishers.len() {
+            return Err("fixed withholding publisher list contains duplicates".to_string());
+        }
+        if let Some(key) = fixed_publishers
+            .iter()
+            .find(|key| !committee.authorities.contains_key(key))
+        {
+            return Err(format!(
+                "fixed withholding publisher {key} is not in the committee"
+            ));
+        }
         if !self.withhold_receivers.is_empty() {
-            if self.withhold_senders == 0 {
-                return Err("fixed withholding receivers require withholding senders".to_string());
+            if self.withhold_senders == 0 && fixed_publishers.is_empty() {
+                return Err(
+                    "fixed withholding receivers require withholding publishers".to_string()
+                );
             }
             let receivers: HashSet<_> = self.withhold_receivers.iter().copied().collect();
             if receivers.len() != self.withhold_receivers.len() {
@@ -965,12 +998,16 @@ impl Parameters {
                     "fixed withholding receiver {key} is not in the committee"
                 ));
             }
-            let publishers: HashSet<_> = committee
-                .authorities
-                .keys()
-                .take(self.withhold_senders)
-                .copied()
-                .collect();
+            let publishers: HashSet<_> = if fixed_publishers.is_empty() {
+                committee
+                    .authorities
+                    .keys()
+                    .take(self.withhold_senders)
+                    .copied()
+                    .collect()
+            } else {
+                fixed_publishers.clone()
+            };
             if !publishers.is_disjoint(&receivers) {
                 return Err(
                     "fixed withholding publishers and receivers must be disjoint".to_string(),
@@ -991,7 +1028,7 @@ impl Parameters {
         if self.late_header_delay_ms == 0 {
             return Err("late-header delay must be greater than zero".to_string());
         }
-        if self.withhold_senders > 0 {
+        if self.withhold_senders > 0 || !self.withhold_publishers.is_empty() {
             return Err(
                 "finite late-header publication cannot be combined with permanent withholding"
                     .to_string(),
@@ -1345,15 +1382,21 @@ pub fn withheld_destinations(
     committee: &Committee,
     self_pk: &PublicKey,
     withhold_senders: usize,
+    fixed_publishers: &[PublicKey],
     count: Option<usize>,
     fixed_receivers: &[PublicKey],
 ) -> Option<HashSet<PublicKey>> {
     let n = committee.size();
-    if withhold_senders == 0 || n == 0 {
+    if (withhold_senders == 0 && fixed_publishers.is_empty()) || n == 0 {
         return None;
     }
     let i = committee.index_of(self_pk)?;
-    if i >= withhold_senders {
+    let selected = if fixed_publishers.is_empty() {
+        i < withhold_senders
+    } else {
+        fixed_publishers.contains(self_pk)
+    };
+    if !selected {
         return None;
     }
     if !fixed_receivers.is_empty() {
@@ -1483,7 +1526,7 @@ mod tests {
     #[test]
     fn withheld_destinations_stagger_wraps_around() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
-        let blocked = withheld_destinations(&committee, &keypairs[15].name, 16, None, &[])
+        let blocked = withheld_destinations(&committee, &keypairs[15].name, 16, &[], None, &[])
             .expect("index 15 is one of the first 16 withholding senders");
         let expected: HashSet<PublicKey> = [16, 17, 18, 19, 0, 1, 2, 3, 4, 5]
             .into_iter()
@@ -1497,7 +1540,7 @@ mod tests {
     fn withheld_destinations_zero_is_none_for_everyone() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         for keypair in &keypairs {
-            assert!(withheld_destinations(&committee, &keypair.name, 0, None, &[]).is_none());
+            assert!(withheld_destinations(&committee, &keypair.name, 0, &[], None, &[]).is_none());
         }
     }
 
@@ -1506,7 +1549,7 @@ mod tests {
     fn withheld_destinations_k_equals_n_every_sender_withholds() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         for keypair in &keypairs {
-            assert!(withheld_destinations(&committee, &keypair.name, 20, None, &[]).is_some());
+            assert!(withheld_destinations(&committee, &keypair.name, 20, &[], None, &[]).is_some());
         }
     }
 
@@ -1514,7 +1557,7 @@ mod tests {
     #[test]
     fn withheld_destinations_odd_committee_floors() {
         let (committee, keypairs) = Committee::local_benchmark(7, 1, 9000);
-        let blocked = withheld_destinations(&committee, &keypairs[0].name, 1, None, &[])
+        let blocked = withheld_destinations(&committee, &keypairs[0].name, 1, &[], None, &[])
             .expect("index 0 is the sole withholding sender");
         let expected: HashSet<PublicKey> = [1, 2, 3]
             .into_iter()
@@ -1527,8 +1570,8 @@ mod tests {
     #[test]
     fn withheld_destinations_non_sender_index_is_none() {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
-        assert!(withheld_destinations(&committee, &keypairs[2].name, 3, None, &[]).is_some());
-        assert!(withheld_destinations(&committee, &keypairs[3].name, 3, None, &[]).is_none());
+        assert!(withheld_destinations(&committee, &keypairs[2].name, 3, &[], None, &[]).is_some());
+        assert!(withheld_destinations(&committee, &keypairs[3].name, 3, &[], None, &[]).is_none());
     }
 
     #[test]
@@ -1539,13 +1582,38 @@ mod tests {
 
         for sender in &keypairs[..3] {
             assert_eq!(
-                withheld_destinations(&committee, &sender.name, 3, Some(3), &receivers),
+                withheld_destinations(&committee, &sender.name, 3, &[], Some(3), &receivers),
                 Some(expected.clone())
             );
         }
         assert!(
-            withheld_destinations(&committee, &keypairs[3].name, 3, Some(3), &receivers).is_none()
+            withheld_destinations(&committee, &keypairs[3].name, 3, &[], Some(3), &receivers)
+                .is_none()
         );
+    }
+
+    #[test]
+    fn fixed_withholding_publishers_bind_the_fault_to_explicit_identities() {
+        let (committee, keypairs) = Committee::local_benchmark(10, 1, 9000);
+        let publishers: Vec<_> = keypairs[..3].iter().map(|keypair| keypair.name).collect();
+        let receivers: Vec<_> = keypairs[3..6].iter().map(|keypair| keypair.name).collect();
+        let expected: HashSet<_> = receivers.iter().copied().collect();
+
+        for sender in &publishers {
+            assert_eq!(
+                withheld_destinations(&committee, sender, 0, &publishers, Some(3), &receivers,),
+                Some(expected.clone())
+            );
+        }
+        assert!(withheld_destinations(
+            &committee,
+            &keypairs[6].name,
+            0,
+            &publishers,
+            Some(3),
+            &receivers,
+        )
+        .is_none());
     }
 
     #[test]

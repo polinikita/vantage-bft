@@ -495,6 +495,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         digest_statements: !matches.get_flag("no-digest-statements"),
         vantage_compact_ids: !matches.get_flag("no-compact-ids"),
         withhold_senders: withhold,
+        withhold_publishers: Vec::new(),
         withhold_count,
         withhold_receivers,
         late_header_publishers: keypairs

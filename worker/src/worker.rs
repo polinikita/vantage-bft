@@ -147,6 +147,7 @@ impl Worker {
             &committee,
             &name,
             parameters.withhold_senders,
+            &parameters.withhold_publishers,
             parameters.withhold_count,
             &parameters.withhold_receivers,
         );
