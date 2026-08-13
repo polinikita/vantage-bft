@@ -20,9 +20,10 @@ pub struct Helper {
     rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
 
     /// Header requests.
-    rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
+    rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey, bool)>,
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
+    metrics: Arc<Metrics>,
 }
 
 impl Helper {
@@ -30,7 +31,7 @@ impl Helper {
         committee: Committee,
         store: Store,
         rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
-        rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
+        rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey, bool)>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
     ) {
@@ -41,8 +42,9 @@ impl Helper {
                 rx_primaries_certs,
                 rx_primaries_headers,
                 network: SimpleSender::new()
-                    .with_metrics(metrics)
+                    .with_metrics(metrics.clone())
                     .with_batching(batch),
+                metrics,
             }
             .run()
             .await;
@@ -57,7 +59,7 @@ impl Helper {
                     let address = match self.committee.primary(&origin) {
                         Ok(x) => x.primary_to_primary,
                         Err(e) => {
-                            warn!("Unexpected certificate request: {}", e);
+                            warn!("Unexpected header request: {}", e);
                             continue;
                         }
                     };
@@ -76,7 +78,7 @@ impl Helper {
                         }
                     }
                 },
-                Some((digests, origin)) = self.rx_primaries_headers.recv() => {
+                Some((digests, origin, prepare_repair)) = self.rx_primaries_headers.recv() => {
 
                     let address = match self.committee.primary(&origin) {
                         Ok(x) => x.primary_to_primary,
@@ -86,14 +88,24 @@ impl Helper {
                         }
                     };
 
+                    if prepare_repair {
+                        self.metrics.autobahn_prepare_repair_requests_served_total.inc();
+                    }
                     for digest in digests {
                         match self.store.read(digest.to_vec()).await {
-                                Ok(Some(data)) => {
-                                    let header = bincode::deserialize(&data)
-                                        .expect("Failed to deserialize our own certificate");
-                                    let bytes = bincode::serialize(&PrimaryMessage::Header(header, true))
-                                        .expect("Failed to serialize our own certificate");
-                                    self.network.send_typed(address, Bytes::from(bytes), "Header").await;
+                            Ok(Some(data)) => {
+                                let header = bincode::deserialize(&data)
+                                    .expect("Failed to deserialize our own header");
+                                let bytes = bincode::serialize(&PrimaryMessage::Header(header, true))
+                                    .expect("Failed to serialize our own header");
+                                if prepare_repair {
+                                    self.metrics.autobahn_prepare_repair_headers_served_total.inc();
+                                    self.metrics
+                                        .autobahn_prepare_repair_bytes_served_total
+                                        .inc_by(bytes.len() as u64);
+                                }
+                                let msg_type = if prepare_repair { "PrepareHeader" } else { "Header" };
+                                self.network.send_typed(address, Bytes::from(bytes), msg_type).await;
                                 }
                                 Ok(None) => (),
                                 Err(e) => error!("{}", e),

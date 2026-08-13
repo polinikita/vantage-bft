@@ -4,6 +4,7 @@ pub mod error;
 mod aggregators;
 pub mod committer;
 mod core;
+mod delayed_header;
 mod garbage_collector;
 mod header_waiter;
 mod helper;

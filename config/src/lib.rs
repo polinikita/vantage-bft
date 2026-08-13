@@ -305,6 +305,19 @@ pub struct Parameters {
     #[serde(default)]
     pub withhold_count: Option<usize>,
 
+    /// Byzantine authors whose original header publication is delayed to a
+    /// fixed receiver subset. Repair traffic is never delayed.
+    #[serde(default)]
+    pub late_header_publishers: Vec<PublicKey>,
+
+    /// Honest receivers to which selected Byzantine authors publish headers late.
+    #[serde(default)]
+    pub late_header_receivers: Vec<PublicKey>,
+
+    /// Additional one-way delay applied to the selected original publications.
+    #[serde(default)]
+    pub late_header_delay_ms: u64,
+
     /// Withholding start offset, in milliseconds. `None` enables it for the full run.
     #[serde(default)]
     pub withhold_at_ms: Option<u64>,
@@ -758,6 +771,9 @@ impl Default for Parameters {
             batch_max_delay_ms: default_batch_max_delay_ms(),
             withhold_senders: 0,
             withhold_count: None,
+            late_header_publishers: Vec::new(),
+            late_header_receivers: Vec::new(),
+            late_header_delay_ms: 0,
             withhold_at_ms: None,
             withhold_for_ms: default_withhold_for_ms(),
             withhold_window: None,
@@ -909,6 +925,59 @@ impl Parameters {
                 ),
             }
         }
+        if !self.late_header_publishers.is_empty() {
+            info!(
+                "Late original-header publication: {} Byzantine publisher(s), {} receiver(s), \
+                 additional one-way delay {} ms",
+                self.late_header_publishers.len(),
+                self.late_header_receivers.len(),
+                self.late_header_delay_ms
+            );
+        }
+    }
+
+    /// Validate the finite-delay Byzantine header-publication experiment.
+    pub fn validate_header_faults(&self, committee: &Committee) -> Result<(), String> {
+        let publishers_empty = self.late_header_publishers.is_empty();
+        let receivers_empty = self.late_header_receivers.is_empty();
+        if publishers_empty && receivers_empty {
+            return Ok(());
+        }
+        if publishers_empty != receivers_empty {
+            return Err(
+                "late-header publishers and receivers must either both be empty or both be set"
+                    .to_string(),
+            );
+        }
+        if self.late_header_delay_ms == 0 {
+            return Err("late-header delay must be greater than zero".to_string());
+        }
+        if self.withhold_senders > 0 {
+            return Err(
+                "finite late-header publication cannot be combined with permanent withholding"
+                    .to_string(),
+            );
+        }
+
+        let publishers: HashSet<_> = self.late_header_publishers.iter().copied().collect();
+        let receivers: HashSet<_> = self.late_header_receivers.iter().copied().collect();
+        if publishers.len() != self.late_header_publishers.len() {
+            return Err("late-header publisher list contains duplicates".to_string());
+        }
+        if receivers.len() != self.late_header_receivers.len() {
+            return Err("late-header receiver list contains duplicates".to_string());
+        }
+        if !publishers.is_disjoint(&receivers) {
+            return Err("late-header publishers and receivers must be disjoint".to_string());
+        }
+        if let Some(key) = publishers
+            .iter()
+            .chain(receivers.iter())
+            .find(|key| !committee.authorities.contains_key(key))
+        {
+            return Err(format!("late-header node {key} is not in the committee"));
+        }
+        Ok(())
     }
 }
 
@@ -1252,6 +1321,25 @@ pub fn withheld_destinations(
     Some((1..=width).map(|offset| order[(i + offset) % n]).collect())
 }
 
+/// Returns the receivers whose original headers the local Byzantine publisher
+/// delays. An honest/non-selected publisher returns `None`.
+pub fn late_header_destinations(
+    committee: &Committee,
+    self_pk: &PublicKey,
+    publishers: &[PublicKey],
+    receivers: &[PublicKey],
+) -> Option<HashSet<PublicKey>> {
+    if !publishers.contains(self_pk) {
+        return None;
+    }
+    let destinations: HashSet<_> = receivers
+        .iter()
+        .copied()
+        .filter(|key| key != self_pk && committee.authorities.contains_key(key))
+        .collect();
+    (!destinations.is_empty()).then_some(destinations)
+}
+
 /// Returns whether withholding is active at `now`. An unset window is always active;
 /// a set window is active on `[start, end)`.
 pub fn withhold_active(window: Option<&OnceLock<(Instant, Instant)>>, now: Instant) -> bool {
@@ -1392,6 +1480,41 @@ mod tests {
         let (committee, keypairs) = Committee::local_benchmark(20, 1, 9000);
         assert!(withheld_destinations(&committee, &keypairs[2].name, 3, None).is_some());
         assert!(withheld_destinations(&committee, &keypairs[3].name, 3, None).is_none());
+    }
+
+    #[test]
+    fn late_header_destinations_select_only_configured_publishers_and_receivers() {
+        let (committee, keypairs) = Committee::local_benchmark(10, 1, 9000);
+        let publishers: Vec<_> = keypairs[..3].iter().map(|keypair| keypair.name).collect();
+        let receivers: Vec<_> = keypairs[3..6].iter().map(|keypair| keypair.name).collect();
+        let expected: HashSet<_> = receivers.iter().copied().collect();
+
+        assert_eq!(
+            late_header_destinations(&committee, &publishers[0], &publishers, &receivers),
+            Some(expected)
+        );
+        assert!(
+            late_header_destinations(&committee, &keypairs[6].name, &publishers, &receivers)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn late_header_configuration_requires_disjoint_groups_and_excludes_withholding() {
+        let (committee, keypairs) = Committee::local_benchmark(10, 1, 9000);
+        let mut params = Parameters {
+            late_header_publishers: keypairs[..3].iter().map(|keypair| keypair.name).collect(),
+            late_header_receivers: keypairs[3..6].iter().map(|keypair| keypair.name).collect(),
+            late_header_delay_ms: 1_000,
+            ..Parameters::default()
+        };
+        assert!(params.validate_header_faults(&committee).is_ok());
+
+        params.late_header_receivers[0] = params.late_header_publishers[0];
+        assert!(params.validate_header_faults(&committee).is_err());
+        params.late_header_receivers[0] = keypairs[3].name;
+        params.withhold_senders = 1;
+        assert!(params.validate_header_faults(&committee).is_err());
     }
 
     /// No configured window keeps withholding active.

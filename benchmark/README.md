@@ -6,6 +6,29 @@ benchmarks, collect logs, and plot results.
 For local experiments, use `node local-benchmark` or
 [`docker-bench`](../docker-bench/README.md).
 
+## Local Five-Protocol Publication Study
+
+`local_five_protocol_sweep.py` compares Vantage, Autobahn optimistic with
+all-to-all enabled, Autobahn seamless, Simple-IT/Opt-RBC, and
+Simple-IT/Bracha-RBC in one controlled `n=10` experiment:
+
+```bash
+python3 benchmark/local_five_protocol_sweep.py
+```
+
+The primary two-panel figure contrasts a clean offered-load sweep with the
+same sweep when nodes 0–2 delay only original header publication to nodes 3–5
+by one second. Repairs and control traffic remain normal, and the built-in
+ten-region AWS RTT matrix remains active. Defaults use a 10-second warmup and
+a 30-second measured window. A curve stops after the first point below 95% of
+offered load or with a growing latter-half backlog; boundary points are
+repeated three times. The harness also produces a receiver-width sweep for
+`K=0,1,2,3`, raw logs, CSV/JSON measurements, and provenance.
+
+Use `--quick` for a short end-to-end check, optionally with `--protocols
+vantage`. Run databases are discarded after each point unless `--keep-data`
+is supplied.
+
 ## Prerequisites
 
 - An AWS account with EC2 access

@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{QCMaker, TCMaker, VotesAggregator};
+use crate::delayed_header::DelayedHeaderSender;
 use crate::error::{DagError, DagResult};
 use crate::leader::LeaderElector;
 use crate::messages::{
@@ -69,6 +70,8 @@ pub struct Core {
     network: ReliableSender,
     /// Header recipients blocked by fault injection.
     withheld_header_dests: Option<HashSet<PublicKey>>,
+    /// Receiver subset and sender for finite-delay original publication.
+    late_header: Option<(HashSet<PublicKey>, DelayedHeaderSender)>,
     /// Optional active window for withholding.
     withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     metrics: Arc<Metrics>,
@@ -158,12 +161,32 @@ impl Core {
 
         latency_map: HashMap<SocketAddr, Duration>,
         withheld_header_dests: Option<HashSet<PublicKey>>,
+        late_header_dests: Option<HashSet<PublicKey>>,
+        late_header_delay_ms: u64,
         withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
         retry_backoff_max_ms: u64,
     ) {
         tokio::spawn(async move {
+            let late_header = late_header_dests.map(|late| {
+                let addresses = committee
+                    .others_primaries(&name)
+                    .iter()
+                    .filter(|(peer, _)| late.contains(peer))
+                    .map(|(_, value)| value.primary_to_primary)
+                    .collect();
+                let sender = DelayedHeaderSender::new(
+                    addresses,
+                    &latency_map,
+                    late_header_delay_ms,
+                    batch,
+                    retry_backoff_max_ms,
+                    Some(metrics.clone()),
+                )
+                .expect("validated late-header configuration has receivers");
+                (late, sender)
+            });
             Self {
                 name,
                 committee,
@@ -194,6 +217,7 @@ impl Core {
                     .with_batching(batch)
                     .with_retry_backoff_max_ms(retry_backoff_max_ms),
                 withheld_header_dests,
+                late_header,
                 withhold_window,
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
@@ -303,18 +327,28 @@ impl Core {
             .others_primaries(&self.name)
             .iter()
             .filter(|(pk, _)| {
-                self.withheld_header_dests
+                let withheld = self
+                    .withheld_header_dests
                     .as_ref()
-                    .is_none_or(|blocked| !withhold_active || !blocked.contains(pk))
+                    .is_some_and(|blocked| withhold_active && blocked.contains(pk));
+                let late = self
+                    .late_header
+                    .as_ref()
+                    .is_some_and(|(blocked, _)| blocked.contains(pk));
+                !withheld && !late
             })
             .map(|(_, x)| x.primary_to_primary)
             .collect();
         let bytes = bincode::serialize(&PrimaryMessage::Header(header.clone(), false))
             .expect("Failed to serialize our own header");
-        let handlers = self
+        let payload = Bytes::from(bytes);
+        let mut handlers = self
             .network
-            .broadcast_typed(addresses, Bytes::from(bytes), "Header")
+            .broadcast_typed(addresses, payload.clone(), "Header")
             .await;
+        if let Some((_, sender)) = &mut self.late_header {
+            handlers.extend(sender.broadcast(payload).await);
+        }
         self.cancel_handlers
             .entry(header.height)
             .or_default()

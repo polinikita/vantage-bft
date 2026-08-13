@@ -240,6 +240,26 @@ pub struct Metrics {
     /// `latency_misses` is unresolved or pending work.
     pub latency_misses_resolved: IntCounter,
 
+    // --- Finite-delay publication experiment and Autobahn prepare repair.
+    /// Original header deliveries scheduled through the late-publication path.
+    pub late_header_messages_scheduled_total: IntCounter,
+    /// Serialized header bytes scheduled through the late-publication path.
+    pub late_header_bytes_scheduled_total: IntCounter,
+    /// Autobahn proposals that entered prepare-time tip synchronization.
+    pub autobahn_prepare_sync_events_total: IntCounter,
+    /// Missing proposal-tip headers across prepare-time synchronization events.
+    pub autobahn_prepare_missing_headers_total: IntCounter,
+    /// Prepare-time synchronizations that obtained every missing header.
+    pub autobahn_prepare_sync_completed_total: IntCounter,
+    /// Aggregate wall-clock wait in prepare-time synchronization, in microseconds.
+    pub autobahn_prepare_sync_wait_micros_total: IntCounter,
+    /// Prepare-time repair requests served by this node.
+    pub autobahn_prepare_repair_requests_served_total: IntCounter,
+    /// Headers served for prepare-time repair by this node.
+    pub autobahn_prepare_repair_headers_served_total: IntCounter,
+    /// Serialized header bytes served for prepare-time repair by this node.
+    pub autobahn_prepare_repair_bytes_served_total: IntCounter,
+
     // --- Vantage data-plane counters.
     /// Blocks published by this node.
     pub vantage_blocks_published: IntCounter,
@@ -749,6 +769,60 @@ impl Metrics {
             latency_misses_resolved: register_int_counter_with_registry!(
                 "latency_misses_resolved",
                 "Deferred commit-time misses (latency_misses) that later resolved and were counted",
+                registry,
+            )
+            .unwrap(),
+            late_header_messages_scheduled_total: register_int_counter_with_registry!(
+                "late_header_messages_scheduled_total",
+                "Original header deliveries scheduled through the finite-delay path",
+                registry,
+            )
+            .unwrap(),
+            late_header_bytes_scheduled_total: register_int_counter_with_registry!(
+                "late_header_bytes_scheduled_total",
+                "Serialized original-header bytes scheduled through the finite-delay path",
+                registry,
+            )
+            .unwrap(),
+            autobahn_prepare_sync_events_total: register_int_counter_with_registry!(
+                "autobahn_prepare_sync_events_total",
+                "Autobahn proposals that entered prepare-time tip synchronization",
+                registry,
+            )
+            .unwrap(),
+            autobahn_prepare_missing_headers_total: register_int_counter_with_registry!(
+                "autobahn_prepare_missing_headers_total",
+                "Missing proposal-tip headers across Autobahn prepare synchronization events",
+                registry,
+            )
+            .unwrap(),
+            autobahn_prepare_sync_completed_total: register_int_counter_with_registry!(
+                "autobahn_prepare_sync_completed_total",
+                "Autobahn prepare synchronizations that obtained every missing header",
+                registry,
+            )
+            .unwrap(),
+            autobahn_prepare_sync_wait_micros_total: register_int_counter_with_registry!(
+                "autobahn_prepare_sync_wait_micros_total",
+                "Aggregate Autobahn prepare synchronization wait in microseconds",
+                registry,
+            )
+            .unwrap(),
+            autobahn_prepare_repair_requests_served_total: register_int_counter_with_registry!(
+                "autobahn_prepare_repair_requests_served_total",
+                "Autobahn prepare-time repair requests served by this node",
+                registry,
+            )
+            .unwrap(),
+            autobahn_prepare_repair_headers_served_total: register_int_counter_with_registry!(
+                "autobahn_prepare_repair_headers_served_total",
+                "Headers served for Autobahn prepare-time repair by this node",
+                registry,
+            )
+            .unwrap(),
+            autobahn_prepare_repair_bytes_served_total: register_int_counter_with_registry!(
+                "autobahn_prepare_repair_bytes_served_total",
+                "Serialized header bytes served for Autobahn prepare-time repair by this node",
                 registry,
             )
             .unwrap(),

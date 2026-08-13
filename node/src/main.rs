@@ -159,7 +159,15 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .default_value("60")
                         .action(ArgAction::Set)
-                        .help("Benchmark duration in seconds (0 = run until Ctrl-C)"),
+                        .help("Measured benchmark duration in seconds (0 = run until Ctrl-C)"),
+                )
+                .arg(
+                    Arg::new("warmup")
+                        .long("warmup")
+                        .value_name("SEC")
+                        .default_value("0")
+                        .action(ArgAction::Set)
+                        .help("Warmup under load before counters and latency measurements begin"),
                 )
                 .arg(
                     Arg::new("base-port")
@@ -206,6 +214,30 @@ async fn main() -> Result<()> {
                         .value_name("INT")
                         .action(ArgAction::Set)
                         .help("Peers each withholding node excludes (default: half the committee)"),
+                )
+                .arg(
+                    Arg::new("late-header-publishers")
+                        .long("late-header-publishers")
+                        .value_name("INT")
+                        .default_value("0")
+                        .action(ArgAction::Set)
+                        .help("Leading Byzantine nodes that delay original header publication"),
+                )
+                .arg(
+                    Arg::new("late-header-receivers")
+                        .long("late-header-receivers")
+                        .value_name("INT")
+                        .default_value("0")
+                        .action(ArgAction::Set)
+                        .help("Following nodes that receive selected original headers late"),
+                )
+                .arg(
+                    Arg::new("late-header-delay-ms")
+                        .long("late-header-delay-ms")
+                        .value_name("INT")
+                        .default_value("1000")
+                        .action(ArgAction::Set)
+                        .help("Additional one-way delay for selected original headers"),
                 )
                 .arg(
                     Arg::new("withhold-at")

@@ -12,8 +12,10 @@ use metrics::read_duration_snapshot;
 use metrics::{
     aggregate_latency_snapshots, read_counter, read_counter_vec, read_latency_snapshot,
     read_materialised_latency_snapshot, read_vantage_progress, LatencySnapshot, MetricReporter,
+    Metrics,
 };
 use primary::Primary;
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,8 +28,92 @@ use worker::Worker;
 type NodeMetricsHandle = (
     prometheus::Registry,
     Arc<MetricReporter>,
+    Arc<Metrics>,
     (String, SocketAddr),
 );
+
+const BASELINE_COUNTERS: &[&str] = &[
+    "submitted_transactions",
+    "submitted_transactions_bytes",
+    "bytes_sent_total",
+    "bytes_received_total",
+    "late_header_messages_scheduled_total",
+    "late_header_bytes_scheduled_total",
+    "autobahn_prepare_sync_events_total",
+    "autobahn_prepare_missing_headers_total",
+    "autobahn_prepare_sync_completed_total",
+    "autobahn_prepare_sync_wait_micros_total",
+    "autobahn_prepare_repair_requests_served_total",
+    "autobahn_prepare_repair_headers_served_total",
+    "autobahn_prepare_repair_bytes_served_total",
+    "vantage_repairs_requested",
+    "vantage_repairs_served",
+    "vantage_lane_resume_requests_sent",
+    "vantage_lane_resume_blocks_served",
+    "vantage_lane_resume_send_drops",
+];
+
+#[derive(Default)]
+struct RegistryBaseline {
+    counters: BTreeMap<String, u64>,
+    sent_messages: BTreeMap<String, u64>,
+    sent_bytes: BTreeMap<String, u64>,
+    seal_routes: BTreeMap<String, u64>,
+}
+
+impl RegistryBaseline {
+    fn capture(registry: &prometheus::Registry) -> Self {
+        Self {
+            counters: BASELINE_COUNTERS
+                .iter()
+                .map(|name| ((*name).to_string(), read_counter(registry, name)))
+                .collect(),
+            sent_messages: read_counter_vec(registry, "network_messages_sent_total", "type"),
+            sent_bytes: read_counter_vec(registry, "network_bytes_sent_total", "type"),
+            seal_routes: metrics::read_seal_route_counts(registry),
+        }
+    }
+
+    fn counter(&self, registry: &prometheus::Registry, name: &str) -> u64 {
+        read_counter(registry, name).saturating_sub(self.counters.get(name).copied().unwrap_or(0))
+    }
+
+    fn vector(
+        current: BTreeMap<String, u64>,
+        baseline: &BTreeMap<String, u64>,
+    ) -> BTreeMap<String, u64> {
+        current
+            .into_iter()
+            .filter_map(|(label, value)| {
+                let delta = value.saturating_sub(baseline.get(&label).copied().unwrap_or(0));
+                (delta > 0).then_some((label, delta))
+            })
+            .collect()
+    }
+}
+
+struct MeasurementBaseline {
+    workers: Vec<RegistryBaseline>,
+    primaries: Vec<RegistryBaseline>,
+}
+
+impl MeasurementBaseline {
+    fn capture(
+        workers: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
+        primaries: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
+    ) -> Self {
+        Self {
+            workers: workers
+                .iter()
+                .map(|(_, registry, _)| RegistryBaseline::capture(registry))
+                .collect(),
+            primaries: primaries
+                .iter()
+                .map(|(_, registry, _)| RegistryBaseline::capture(registry))
+                .collect(),
+        }
+    }
+}
 
 pub async fn run(matches: &ArgMatches) -> Result<()> {
     let nodes: usize = matches
@@ -57,6 +143,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--duration must be a non-negative integer")?;
+    let warmup: u64 = matches
+        .get_one::<String>("warmup")
+        .unwrap()
+        .parse()
+        .context("--warmup must be a non-negative integer")?;
     let base_port: u16 = matches
         .get_one::<String>("base-port")
         .unwrap()
@@ -113,6 +204,40 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     anyhow::ensure!(
         withhold_count.is_none_or(|count| count < nodes),
         "--withhold-count must be below --nodes"
+    );
+    let late_header_publishers: usize = matches
+        .get_one::<String>("late-header-publishers")
+        .unwrap()
+        .parse()
+        .context("--late-header-publishers must be a non-negative integer")?;
+    let late_header_receivers: usize = matches
+        .get_one::<String>("late-header-receivers")
+        .unwrap()
+        .parse()
+        .context("--late-header-receivers must be a non-negative integer")?;
+    let late_header_delay_ms: u64 = matches
+        .get_one::<String>("late-header-delay-ms")
+        .unwrap()
+        .parse()
+        .context("--late-header-delay-ms must be a non-negative integer")?;
+    anyhow::ensure!(
+        (late_header_publishers == 0) == (late_header_receivers == 0),
+        "--late-header-publishers and --late-header-receivers must both be zero or both be positive"
+    );
+    anyhow::ensure!(
+        late_header_publishers + late_header_receivers <= live_nodes,
+        "late-header publisher ({}) and receiver ({}) groups must fit within {} live nodes",
+        late_header_publishers,
+        late_header_receivers,
+        live_nodes
+    );
+    anyhow::ensure!(
+        late_header_publishers == 0 || late_header_delay_ms > 0,
+        "--late-header-delay-ms must be positive when late-header groups are enabled"
+    );
+    anyhow::ensure!(
+        withhold == 0 || late_header_publishers == 0,
+        "permanent withholding and finite late-header publication cannot be combined"
     );
     let withhold_at_secs: Option<u64> = matches
         .get_one::<String>("withhold-at")
@@ -223,8 +348,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         nodes, workers, rate, tx_size
     );
     println!(
-        "Protocol: {:?}   Mode: {:?}   Duration: {} s   Base port: {}",
-        protocol, mode, duration, base_port
+        "Protocol: {:?}   Mode: {:?}   Warmup: {} s   Measurement: {} s   Base port: {}",
+        protocol, mode, warmup, duration, base_port
     );
     println!(
         "Delta: {} ms   Max batch delay: {} ms   Max header delay: {} ms",
@@ -287,6 +412,16 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             ),
         }
     }
+    if late_header_publishers > 0 {
+        println!(
+            "Late headers: node-0..{} publish original headers to node-{}..{} with {} ms \
+             additional one-way delay; all repair and control traffic is normal",
+            late_header_publishers - 1,
+            late_header_publishers,
+            late_header_publishers + late_header_receivers - 1,
+            late_header_delay_ms,
+        );
+    }
     println!("======================================\n");
 
     let _ = fs::remove_dir_all(&data_dir);
@@ -321,6 +456,24 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         vantage_compact_ids: !matches.get_flag("no-compact-ids"),
         withhold_senders: withhold,
         withhold_count,
+        late_header_publishers: keypairs
+            .iter()
+            .take(late_header_publishers)
+            .map(|keypair| keypair.name)
+            .collect(),
+        late_header_receivers: keypairs
+            .iter()
+            .skip(late_header_publishers)
+            .take(late_header_receivers)
+            .map(|keypair| keypair.name)
+            .collect(),
+        late_header_delay_ms: if late_header_publishers > 0 {
+            late_header_delay_ms
+        } else {
+            0
+        },
+        // Arm the exact epoch after every in-process node and client has booted.
+        metrics_active_at_ms: Some(u64::MAX),
         withhold_at_ms: withhold_at_secs.map(|secs| secs * 1000),
         withhold_for_ms: withhold_for_secs * 1000,
         withhold_window: withhold_window_cell.clone(),
@@ -328,6 +481,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         ..Parameters::default()
     };
     parameters.reconcile_protocol();
+    parameters
+        .validate_header_faults(&committee)
+        .map_err(anyhow::Error::msg)?;
     parameters
         .export(data_dir.join("parameters.json").to_str().unwrap())
         .context("Failed to write parameters.json")?;
@@ -351,6 +507,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
 
     let mut worker_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
     let mut primary_metrics: Vec<(usize, prometheus::Registry, Arc<MetricReporter>)> = Vec::new();
+    let mut metrics_controls: Vec<Arc<Metrics>> = Vec::new();
     let mut metrics_targets: Vec<(String, SocketAddr)> = Vec::new();
     let mut client_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -359,9 +516,10 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         let node_dir = data_dir.join(format!("node-{}", i));
         fs::create_dir_all(&node_dir)?;
 
-        let (primary_registry, primary_reporter, primary_target) =
+        let (primary_registry, primary_reporter, primary_control, primary_target) =
             spawn_node_primary(i, keypair, &node_dir, &committee, &parameters, mode)?;
         primary_metrics.push((i, primary_registry, primary_reporter));
+        metrics_controls.push(primary_control);
         metrics_targets.push(primary_target);
 
         let client_rate_share = (i < load_nodes).then_some(rate_share);
@@ -377,8 +535,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             mode,
             &all_worker_addresses,
         )?;
-        for (worker_registry, worker_reporter, worker_target) in workers_spawned {
+        for (worker_registry, worker_reporter, worker_control, worker_target) in workers_spawned {
             worker_metrics.push((i, worker_registry, worker_reporter));
+            metrics_controls.push(worker_control);
             metrics_targets.push(worker_target);
         }
         client_handles.extend(workers_client_handles);
@@ -394,17 +553,35 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     );
     println!("Grafana (once up): http://localhost:3003\n");
 
-    if duration == 0 {
-        println!("Running benchmark (until Ctrl-C)...");
-    } else {
-        println!("Running benchmark ({} sec)...", duration);
+    let active_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        + warmup.saturating_mul(1_000);
+    for metrics in &metrics_controls {
+        metrics.set_active_from_millis(Some(active_at_ms));
     }
-    let run_start = tokio::time::Instant::now();
+    parameters.metrics_active_at_ms = Some(active_at_ms);
+    parameters
+        .export(data_dir.join("parameters.json").to_str().unwrap())
+        .context("Failed to update parameters.json with the measurement epoch")?;
+
+    if warmup > 0 {
+        println!("Warming up under load for {} sec...", warmup);
+        tokio::time::sleep(tokio::time::Duration::from_secs(warmup)).await;
+    }
+    let baseline = MeasurementBaseline::capture(&worker_metrics, &primary_metrics);
+    if duration == 0 {
+        println!("Measuring (until Ctrl-C)...");
+    } else {
+        println!("Measuring for {} sec...", duration);
+    }
+    let measurement_start = tokio::time::Instant::now();
     if let (Some(cell), Some(at)) = (&withhold_window_cell, withhold_at_secs) {
-        let start = run_start.into_std() + std::time::Duration::from_secs(at);
+        let start = measurement_start.into_std() + std::time::Duration::from_secs(at);
         let end = start + std::time::Duration::from_secs(withhold_for_secs);
         cell.set((start, end))
-            .expect("withhold window is set exactly once, right after run_start");
+            .expect("withhold window is set exactly once at measurement start");
         println!(
             "TIMELINE-WITHHOLD: start={} end={} senders={}",
             at,
@@ -414,9 +591,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     }
     if timeline {
         // Print one diagnostic line per live primary each second.
-        println!(
-            " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume   wish   target   omega_q"
-        );
+        if protocol == Protocol::Vantage {
+            println!(
+                " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume   wish   target   omega_q"
+            );
+        }
         let mut elapsed: u64 = 0;
         // Sum each node's worker counters, then use the highest replicated total.
         let mut prev_committed_total: u64 = 0;
@@ -424,24 +603,26 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
                     elapsed += 1;
-                    for (i, registry, _reporter) in &primary_metrics {
-                        if let Some(p) = read_vantage_progress(registry) {
-                            println!(
-                                " [timeline] T+{:<4} node-{:<3} entered={:<7} a_i={:<5} cursor={:<7} round={:<6} delivered={:<9} consume={:<6} wish={:<6} target={:<6} omega_q={:<6} cache={}",
-                                elapsed, i, p.entered_view, p.frontier_a_i, p.cursor_next_view, p.control_round,
-                                p.control_delivered_len, p.control_consume_pos,
-                                p.own_watermark, p.entry_target, p.omega_q, p.block_cache_len
-                            );
-                            // Keep walk counters on a separate parseable line.
-                            let w = read_counter_vec(registry, "vantage_walk_steps_total", "family");
-                            println!(
-                                "WALK: sec={} node={} chain={} direct={} settle={} blocks={}",
-                                elapsed, i,
-                                w.get("chain").copied().unwrap_or(0),
-                                w.get("direct").copied().unwrap_or(0),
-                                w.get("settle").copied().unwrap_or(0),
-                                read_counter(registry, "vantage_blocks_received"),
-                            );
+                    if protocol == Protocol::Vantage {
+                        for (i, registry, _reporter) in &primary_metrics {
+                            if let Some(p) = read_vantage_progress(registry) {
+                                println!(
+                                    " [timeline] T+{:<4} node-{:<3} entered={:<7} a_i={:<5} cursor={:<7} round={:<6} delivered={:<9} consume={:<6} wish={:<6} target={:<6} omega_q={:<6} cache={}",
+                                    elapsed, i, p.entered_view, p.frontier_a_i, p.cursor_next_view, p.control_round,
+                                    p.control_delivered_len, p.control_consume_pos,
+                                    p.own_watermark, p.entry_target, p.omega_q, p.block_cache_len
+                                );
+                                // Keep walk counters on a separate parseable line.
+                                let w = read_counter_vec(registry, "vantage_walk_steps_total", "family");
+                                println!(
+                                    "WALK: sec={} node={} chain={} direct={} settle={} blocks={}",
+                                    elapsed, i,
+                                    w.get("chain").copied().unwrap_or(0),
+                                    w.get("direct").copied().unwrap_or(0),
+                                    w.get("settle").copied().unwrap_or(0),
+                                    read_counter(registry, "vantage_blocks_received"),
+                                );
+                            }
                         }
                     }
                     let mut committed_by_node: std::collections::BTreeMap<usize, u64> =
@@ -451,6 +632,18 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                             read_counter(registry, "committed_transactions");
                     }
                     let committed_total = committed_by_node.values().copied().max().unwrap_or(0);
+                    let submitted_total: u64 = worker_metrics
+                        .iter()
+                        .zip(&baseline.workers)
+                        .map(|((_, registry, _), before)| {
+                            before.counter(registry, "submitted_transactions")
+                        })
+                        .sum();
+                    let backlog = submitted_total.saturating_sub(committed_total);
+                    println!(
+                        "MEASUREMENT_TICK sec={} submitted={} committed={} backlog={}",
+                        elapsed, submitted_total, committed_total, backlog
+                    );
                     println!(
                         "TIMELINE: sec={} committed_total={} committed_delta={}",
                         elapsed,
@@ -481,14 +674,24 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         }
     }
 
-    let actual_secs = run_start.elapsed().as_secs().max(1);
-    // Read results while clients and commits may still be progressing.
-    print_results(&worker_metrics, &primary_metrics, actual_secs, protocol, "").await;
-
-    // Stop clients, allow in-flight work to settle, and print a final snapshot.
+    let actual_secs = measurement_start.elapsed().as_secs().max(1);
+    // Freeze offered load at the measurement boundary before reading registries.
     for handle in &client_handles {
         handle.abort();
     }
+    print_results(
+        &worker_metrics,
+        &primary_metrics,
+        &baseline,
+        actual_secs,
+        protocol,
+        rate,
+        "",
+        true,
+    )
+    .await;
+
+    // Allow in-flight work to settle and print a diagnostic final snapshot.
     let drain_ms = max_batch_delay_ms
         .saturating_add(max_header_delay_ms)
         .saturating_add(parameters.timeout_delay)
@@ -498,12 +701,15 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     print_results(
         &worker_metrics,
         &primary_metrics,
+        &baseline,
         actual_secs,
         protocol,
+        rate,
         &format!(
             " -- STEADY-STATE (client tasks stopped, {} ms drain before re-read)",
             drain_ms
         ),
+        false,
     )
     .await;
 
@@ -599,6 +805,8 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             }
             "CertificatesRequest"
             | "HeadersRequest"
+            | "PrepareHeadersRequest"
+            | "PrepareHeader"
             | "ProposalHeadersRequest"
             | "Synchronize"
             | "BatchRequest" => "sync",
@@ -739,7 +947,7 @@ fn spawn_node_primary(
         format!("node-{}-primary", i),
         committee.primary(&name).unwrap().metrics,
     );
-    Ok((primary_registry, primary_reporter, target))
+    Ok((primary_registry, primary_reporter, primary_metrics, target))
 }
 
 /// Spawn one node's workers and optional client tasks.
@@ -780,7 +988,7 @@ fn spawn_node_workers(
             format!("node-{}-worker-{}", i, j),
             committee.worker(&name, &worker_id).unwrap().metrics,
         );
-        spawned.push((registry, reporter, target));
+        spawned.push((registry, reporter, metrics, target));
 
         // Unloaded nodes still listen but do not run a client task.
         if let Some(rate_share) = rate_share {
@@ -811,12 +1019,16 @@ fn spawn_node_workers(
 /// parsing. Aggregate counts consistently across worker registries: max for count/misses,
 /// counts the same replicated commit stream), summed sum/sum-of-squares for the exact
 /// avg/stddev ratio, median across nodes for percentiles.
+#[allow(clippy::too_many_arguments)]
 async fn print_results(
     worker_metrics: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
     primary_metrics: &[(usize, prometheus::Registry, Arc<MetricReporter>)],
+    baseline: &MeasurementBaseline,
     duration: u64,
     protocol: Protocol,
+    offered_rate: u64,
     label: &str,
+    machine_output: bool,
 ) {
     let mut snapshots: Vec<LatencySnapshot> = Vec::new();
     // With `--workers > 1`, each worker's registry only ever
@@ -907,7 +1119,8 @@ async fn print_results(
     }
 
     // Report latency after ordered payloads are available locally.
-    match aggregate_latency_snapshots(&materialised) {
+    let materialised_aggregate = aggregate_latency_snapshots(&materialised);
+    match materialised_aggregate {
         Some(agg) => {
             println!(
                 " Materialised transaction latency: avg {:.2} ms (stddev {:.2}), p50/p90/p99 {:.2}/{:.2}/{:.2} ms ({} txs)",
@@ -933,11 +1146,13 @@ async fn print_results(
     // Sum submitted traffic and network usage across nodes.
     let submitted_transactions: u64 = worker_metrics
         .iter()
-        .map(|(_, r, _)| read_counter(r, "submitted_transactions"))
+        .zip(&baseline.workers)
+        .map(|((_, registry, _), before)| before.counter(registry, "submitted_transactions"))
         .sum();
     let submitted_bytes: u64 = worker_metrics
         .iter()
-        .map(|(_, r, _)| read_counter(r, "submitted_transactions_bytes"))
+        .zip(&baseline.workers)
+        .map(|((_, registry, _), before)| before.counter(registry, "submitted_transactions_bytes"))
         .sum();
 
     let mut sent_by_type: std::collections::BTreeMap<String, u64> =
@@ -948,25 +1163,30 @@ async fn print_results(
         std::collections::BTreeMap::new();
     let mut total_bytes_sent: u64 = 0;
     let mut total_bytes_received: u64 = 0;
-    let all_registries = worker_metrics
-        .iter()
-        .map(|(node, registry, _)| (*node, registry))
-        .chain(
-            primary_metrics
-                .iter()
-                .map(|(node, registry, _)| (*node, registry)),
-        );
-    for (node, registry) in all_registries {
-        let bytes_sent = read_counter(registry, "bytes_sent_total");
-        total_bytes_sent += bytes_sent;
-        *sent_bytes_by_node.entry(node).or_default() += bytes_sent;
-        total_bytes_received += read_counter(registry, "bytes_received_total");
-        for (t, c) in read_counter_vec(registry, "network_messages_sent_total", "type") {
-            *sent_by_type.entry(t).or_insert(0) += c;
-        }
-        for (t, b) in read_counter_vec(registry, "network_bytes_sent_total", "type") {
-            *sent_bytes_by_type.entry(t).or_insert(0) += b;
-        }
+    let mut account_registry =
+        |node: usize, registry: &prometheus::Registry, before: &RegistryBaseline| {
+            let bytes_sent = before.counter(registry, "bytes_sent_total");
+            total_bytes_sent += bytes_sent;
+            *sent_bytes_by_node.entry(node).or_default() += bytes_sent;
+            total_bytes_received += before.counter(registry, "bytes_received_total");
+            for (t, c) in RegistryBaseline::vector(
+                read_counter_vec(registry, "network_messages_sent_total", "type"),
+                &before.sent_messages,
+            ) {
+                *sent_by_type.entry(t).or_insert(0) += c;
+            }
+            for (t, b) in RegistryBaseline::vector(
+                read_counter_vec(registry, "network_bytes_sent_total", "type"),
+                &before.sent_bytes,
+            ) {
+                *sent_bytes_by_type.entry(t).or_insert(0) += b;
+            }
+        };
+    for ((node, registry, _), before) in worker_metrics.iter().zip(&baseline.workers) {
+        account_registry(*node, registry, before);
+    }
+    for ((node, registry, _), before) in primary_metrics.iter().zip(&baseline.primaries) {
+        account_registry(*node, registry, before);
     }
     let total_messages_sent: u64 = sent_by_type.values().sum();
 
@@ -1053,15 +1273,24 @@ async fn print_results(
     // Sum lane-resume counters across primaries.
     let resume_requests_sent: u64 = primary_metrics
         .iter()
-        .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_requests_sent"))
+        .zip(&baseline.primaries)
+        .map(|((_, registry, _), before)| {
+            before.counter(registry, "vantage_lane_resume_requests_sent")
+        })
         .sum();
     let resume_blocks_served: u64 = primary_metrics
         .iter()
-        .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_blocks_served"))
+        .zip(&baseline.primaries)
+        .map(|((_, registry, _), before)| {
+            before.counter(registry, "vantage_lane_resume_blocks_served")
+        })
         .sum();
     let resume_send_drops: u64 = primary_metrics
         .iter()
-        .map(|(_, r, _)| read_counter(r, "vantage_lane_resume_send_drops"))
+        .zip(&baseline.primaries)
+        .map(|((_, registry, _), before)| {
+            before.counter(registry, "vantage_lane_resume_send_drops")
+        })
         .sum();
     println!(
         " Lane resume: {} requests sent, {} blocks served, {} sends dropped",
@@ -1073,8 +1302,11 @@ async fn print_results(
     let mut per_route_totals: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
     let mut any_route_observed = false;
-    for (i, registry, _reporter) in primary_metrics {
-        let routes = metrics::read_seal_route_counts(registry);
+    for ((i, registry, _reporter), before) in primary_metrics.iter().zip(&baseline.primaries) {
+        let routes = RegistryBaseline::vector(
+            metrics::read_seal_route_counts(registry),
+            &before.seal_routes,
+        );
         if routes.is_empty() {
             continue;
         }
@@ -1096,6 +1328,107 @@ async fn print_results(
         println!(
             " Total seal routes (summed across nodes): {}",
             total.join(", ")
+        );
+    }
+
+    let sum_primary_counter = |name: &str| -> u64 {
+        primary_metrics
+            .iter()
+            .zip(&baseline.primaries)
+            .map(|((_, registry, _), before)| before.counter(registry, name))
+            .sum()
+    };
+    let max_primary_counter = |name: &str| -> u64 {
+        primary_metrics
+            .iter()
+            .zip(&baseline.primaries)
+            .map(|((_, registry, _), before)| before.counter(registry, name))
+            .max()
+            .unwrap_or(0)
+    };
+    let late_headers = sum_primary_counter("late_header_messages_scheduled_total");
+    let late_header_bytes = sum_primary_counter("late_header_bytes_scheduled_total");
+    let prepare_sync_events = sum_primary_counter("autobahn_prepare_sync_events_total");
+    let prepare_missing = sum_primary_counter("autobahn_prepare_missing_headers_total");
+    let prepare_completed = sum_primary_counter("autobahn_prepare_sync_completed_total");
+    let prepare_wait_micros = sum_primary_counter("autobahn_prepare_sync_wait_micros_total");
+    let prepare_requests_served =
+        sum_primary_counter("autobahn_prepare_repair_requests_served_total");
+    let prepare_headers_served =
+        sum_primary_counter("autobahn_prepare_repair_headers_served_total");
+    let prepare_bytes_served = sum_primary_counter("autobahn_prepare_repair_bytes_served_total");
+    let max_node_prepare_headers =
+        max_primary_counter("autobahn_prepare_repair_headers_served_total");
+    let vantage_repairs_requested = sum_primary_counter("vantage_repairs_requested");
+    let vantage_repairs_served = sum_primary_counter("vantage_repairs_served");
+    let max_node_vantage_repairs_served = max_primary_counter("vantage_repairs_served");
+    if late_headers > 0 || prepare_sync_events > 0 || vantage_repairs_requested > 0 {
+        println!(
+            " Publication/repair burden: late={} ({} B), Autobahn sync={}/{} complete \
+             ({} missing, {:.2} ms aggregate wait, {} requests / {} headers / {} B served), \
+             Vantage request/serve={}/{}",
+            late_headers,
+            late_header_bytes,
+            prepare_completed,
+            prepare_sync_events,
+            prepare_missing,
+            prepare_wait_micros as f64 / 1_000.0,
+            prepare_requests_served,
+            prepare_headers_served,
+            prepare_bytes_served,
+            vantage_repairs_requested,
+            vantage_repairs_served,
+        );
+    }
+    if machine_output {
+        let throughput_pct = if offered_rate > 0 {
+            consensus_tps * 100.0 / offered_rate as f64
+        } else {
+            0.0
+        };
+        let (materialized_p50_ms, materialized_p99_ms) = materialised_aggregate
+            .map(|agg| {
+                (
+                    agg.p50_micros as f64 / 1_000.0,
+                    agg.p99_micros as f64 / 1_000.0,
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        println!(
+            "BENCHMARK_RESULT protocol={} offered_tps={} committed_tps={:.3} \
+             throughput_pct={:.3} duration_s={} submitted={} committed={} backlog={} \
+             materialized_p50_ms={:.3} materialized_p99_ms={:.3} network_bytes={} \
+             late_headers={} late_header_bytes={} autobahn_prepare_sync_events={} \
+             autobahn_prepare_missing_headers={} autobahn_prepare_sync_completed={} \
+             autobahn_prepare_sync_wait_micros={} autobahn_prepare_repair_requests_served={} \
+             autobahn_prepare_repair_headers_served={} autobahn_prepare_repair_bytes_served={} \
+             max_node_prepare_headers={} vantage_repairs_requested={} \
+             vantage_repairs_served={} max_node_vantage_repairs_served={} panics={}",
+            protocol.label(),
+            offered_rate,
+            consensus_tps,
+            throughput_pct,
+            duration,
+            submitted_transactions,
+            max_committed_transactions,
+            submitted_transactions.saturating_sub(max_committed_transactions),
+            materialized_p50_ms,
+            materialized_p99_ms,
+            total_bytes_sent,
+            late_headers,
+            late_header_bytes,
+            prepare_sync_events,
+            prepare_missing,
+            prepare_completed,
+            prepare_wait_micros,
+            prepare_requests_served,
+            prepare_headers_served,
+            prepare_bytes_served,
+            max_node_prepare_headers,
+            vantage_repairs_requested,
+            vantage_repairs_served,
+            max_node_vantage_repairs_served,
+            Metrics::process_panic_count(),
         );
     }
     println!("-----------------------------------------");

@@ -146,6 +146,8 @@ pub enum PrimaryMessage {
     VantageSequenceHeadersRequest(Vec<Digest>, /* requester */ PublicKey),
     VantageSequenceHeaders(Vec<Header>, /* sender */ PublicKey),
     VantageSequenceAnnounceBatch(Vec<SequenceAnnouncement>, /* sender */ PublicKey),
+    // Autobahn prepare-time tip repair; appended for bincode compatibility.
+    PrepareHeadersRequest(Vec<Digest>, /* requestor */ PublicKey),
 }
 
 impl PrimaryMessage {
@@ -216,6 +218,7 @@ impl PrimaryMessage {
             PrimaryMessage::VantageSequenceHeadersRequest(..) => "VantageSequenceHeadersRequest",
             PrimaryMessage::VantageSequenceHeaders(..) => "VantageSequenceHeaders",
             PrimaryMessage::VantageSequenceAnnounceBatch(..) => "VantageSequenceAnnounceBatch",
+            PrimaryMessage::PrepareHeadersRequest(..) => "PrepareHeadersRequest",
         }
     }
 }
@@ -307,6 +310,10 @@ impl Primary {
         let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(CHANNEL_CAPACITY);
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
         let (_tx_mempool, rx_mempool) = channel(CHANNEL_CAPACITY);
+
+        parameters
+            .validate_header_faults(&committee)
+            .unwrap_or_else(|error| panic!("invalid header fault configuration: {error}"));
 
         // Parsed by benchmark tooling.
         parameters.log();
@@ -635,6 +642,14 @@ impl Primary {
                         parameters.withhold_senders,
                         parameters.withhold_count,
                     ),
+                    // Finite-delay original-header destinations.
+                    config::late_header_destinations(
+                        &committee,
+                        &name,
+                        &parameters.late_header_publishers,
+                        &parameters.late_header_receivers,
+                    ),
+                    parameters.late_header_delay_ms,
                     // Time-windowed withholding.
                     parameters.withhold_window.clone(),
                     metrics.clone(),
@@ -733,7 +748,7 @@ impl Primary {
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
-    tx_header_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_header_requests: Sender<(Vec<Digest>, PublicKey, bool)>,
     metrics: Arc<Metrics>,
 }
 
@@ -758,7 +773,12 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .expect("Failed to send primary message"),
             PrimaryMessage::HeadersRequest(missing, requestor) => self
                 .tx_header_requests
-                .send((missing, requestor))
+                .send((missing, requestor, false))
+                .await
+                .expect("Failed to send primary message"),
+            PrimaryMessage::PrepareHeadersRequest(missing, requestor) => self
+                .tx_header_requests
+                .send((missing, requestor, true))
                 .await
                 .expect("Failed to send primary message"),
             request => self

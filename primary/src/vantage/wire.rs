@@ -1,3 +1,4 @@
+use crate::delayed_header::DelayedHeaderSender;
 use crate::messages::Header;
 use crate::primary::PrimaryMessage;
 use crate::vantage::node::Inbound;
@@ -179,6 +180,9 @@ pub struct Wire {
 
     pub(crate) withheld_header_dests: WithheldHeaderDests,
 
+    /// Prompt recipients and the dedicated finite-delay sender, for selected authors.
+    pub(crate) late_header: Option<(Vec<SocketAddr>, DelayedHeaderSender)>,
+
     pub(crate) withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 
     pub(crate) metrics: Option<Arc<Metrics>>,
@@ -223,6 +227,16 @@ impl Wire {
                     self.broadcast_to(bytes, msg_type, addrs).await;
                     return;
                 }
+            }
+            if let Some((prompt, delayed)) = &mut self.late_header {
+                let payload = Bytes::from(bytes);
+                let mut handlers = self
+                    .network
+                    .broadcast_typed_slice(prompt, payload.clone(), msg_type)
+                    .await;
+                handlers.extend(delayed.broadcast(payload).await);
+                self.cancel_handlers.extend(handlers);
+                return;
             }
         }
         self.broadcast(bytes, msg_type).await;

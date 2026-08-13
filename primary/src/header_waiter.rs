@@ -58,6 +58,7 @@ pub struct HeaderWaiter {
 
     /// Network driver allowing to send messages.
     network: SimpleSender,
+    metrics: Arc<Metrics>,
 
     /// Certificate requests and their retry timestamps.
     parent_requests: HashMap<Digest, (Height, u128)>,
@@ -98,8 +99,9 @@ impl HeaderWaiter {
                 tx_core,
                 tx_consensus_loopback,
                 network: SimpleSender::new()
-                    .with_metrics(metrics)
+                    .with_metrics(metrics.clone())
                     .with_batching(batch),
+                metrics,
                 parent_requests: HashMap::new(),
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
@@ -132,14 +134,15 @@ impl HeaderWaiter {
         mut missing: Vec<(Vec<u8>, Store)>,
         deliver: (ConsensusMessage, Header),
         mut handler: Receiver<()>,
-    ) -> DagResult<Option<(ConsensusMessage, Header)>> {
+        started: Instant,
+    ) -> DagResult<Option<((ConsensusMessage, Header), Duration)>> {
         let waiting: Vec<_> = missing
             .iter_mut()
             .map(|(x, y)| y.notify_read(x.to_vec()))
             .collect();
         tokio::select! {
             result = try_join_all(waiting) => {
-                result.map(|_| Some(deliver)).map_err(DagError::from)
+                result.map(|_| Some((deliver, started.elapsed()))).map_err(DagError::from)
             }
             _ = handler.recv() => Ok(None),
         }
@@ -285,6 +288,11 @@ impl HeaderWaiter {
                                 continue;
                             }
 
+                            self.metrics.autobahn_prepare_sync_events_total.inc();
+                            self.metrics
+                                .autobahn_prepare_missing_headers_total
+                                .inc_by(missing.len() as u64);
+
                             // Wait for all referenced headers.
                             let wait_for = missing
                                 .iter()
@@ -292,7 +300,12 @@ impl HeaderWaiter {
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(id, (height, tx_cancel));
-                            let fut = Self::proposal_waiter(wait_for, (consensus_message, header), rx_cancel);
+                            let fut = Self::proposal_waiter(
+                                wait_for,
+                                (consensus_message, header),
+                                rx_cancel,
+                                Instant::now(),
+                            );
                             proposal_waiting.push(fut);
 
                             // Contact the header author first.
@@ -312,9 +325,9 @@ impl HeaderWaiter {
                                     .primary(&author)
                                     .expect("Author of valid header not in the committee")
                                     .primary_to_primary;
-                                let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
+                                let message = PrimaryMessage::PrepareHeadersRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send_typed(address, Bytes::from(bytes), "HeadersRequest").await;
+                                self.network.send_typed(address, Bytes::from(bytes), "PrepareHeadersRequest").await;
                             }
                         }
                     }
@@ -339,7 +352,11 @@ impl HeaderWaiter {
                 },
 
                 Some(result) = proposal_waiting.next() => match result {
-                    Ok(Some(deliver)) => {
+                    Ok(Some((deliver, elapsed))) => {
+                        self.metrics.autobahn_prepare_sync_completed_total.inc();
+                        self.metrics
+                            .autobahn_prepare_sync_wait_micros_total
+                            .inc_by(elapsed.as_micros().min(u64::MAX as u128) as u64);
                         let id = proposal_digest(&deliver.0);
                         let _ = self.pending.remove(&id);
                         for x in deliver.1.payload.keys() {

@@ -319,6 +319,35 @@ impl SimpleItCore {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        let late_header = config::late_header_destinations(
+            &committee,
+            &name,
+            &parameters.late_header_publishers,
+            &parameters.late_header_receivers,
+        )
+        .map(|late| {
+            let prompt = other_primaries
+                .iter()
+                .filter(|(peer, _)| !late.contains(peer))
+                .map(|(_, address)| *address)
+                .collect();
+            let delayed = other_primaries
+                .iter()
+                .filter(|(peer, _)| late.contains(peer))
+                .map(|(_, address)| *address)
+                .collect();
+            let sender = crate::delayed_header::DelayedHeaderSender::new(
+                delayed,
+                &latency_map,
+                parameters.late_header_delay_ms,
+                batch,
+                parameters.retry_backoff_max_ms,
+                core_metrics.clone(),
+            )
+            .expect("validated late-header configuration has receivers");
+            (prompt, sender)
+        });
+
         let in_flight: wire::InFlightMap = Arc::new(Mutex::new(HashMap::new()));
         let wire_codec = wire::VantageWireCodec::new(&committee, false)
             .expect("legacy primary wire supports any committee size");
@@ -372,6 +401,7 @@ impl SimpleItCore {
                 other_primary_addrs,
                 worker_addresses,
                 withheld_header_dests,
+                late_header,
                 withhold_window: parameters.withhold_window.clone(),
                 metrics: core_metrics.clone(),
                 addr_to_peer: other_primaries
