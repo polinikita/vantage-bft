@@ -810,19 +810,21 @@ impl VantageCore {
 
         let (reconnect_tx, reconnect_rx) = channel(committee.size().max(1));
 
-        let withheld_header_dests: wire::WithheldHeaderDests =
-            config::withheld_destinations(&committee, &name, parameters.withhold_senders,
-                                          parameters.withhold_count).map(
-                |blocked| {
-                    let full: Vec<(PublicKey, SocketAddr)> = other_primaries
-                        .iter()
-                        .filter(|(pk, _)| !blocked.contains(pk))
-                        .copied()
-                        .collect();
-                    let addrs: Vec<SocketAddr> = full.iter().map(|(_, a)| *a).collect();
-                    (addrs, full)
-                },
-            );
+        let withheld_header_dests: wire::WithheldHeaderDests = config::withheld_destinations(
+            &committee,
+            &name,
+            parameters.withhold_senders,
+            parameters.withhold_count,
+        )
+        .map(|blocked| {
+            let full: Vec<(PublicKey, SocketAddr)> = other_primaries
+                .iter()
+                .filter(|(pk, _)| !blocked.contains(pk))
+                .copied()
+                .collect();
+            let addrs: Vec<SocketAddr> = full.iter().map(|(_, a)| *a).collect();
+            (addrs, full)
+        });
 
         let worker_addresses: HashMap<WorkerId, SocketAddr> = committee
             .our_workers_by_id(&name)

@@ -143,9 +143,12 @@ impl Worker {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
-        let withheld_destinations =
-            config::withheld_destinations(&committee, &name, parameters.withhold_senders,
-                                          parameters.withhold_count);
+        let withheld_destinations = config::withheld_destinations(
+            &committee,
+            &name,
+            parameters.withhold_senders,
+            parameters.withhold_count,
+        );
 
         let withhold_window = parameters.withhold_window.clone();
 
