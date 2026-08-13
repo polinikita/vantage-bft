@@ -148,6 +148,7 @@ impl Worker {
             &name,
             parameters.withhold_senders,
             parameters.withhold_count,
+            &parameters.withhold_receivers,
         );
 
         let withhold_window = parameters.withhold_window.clone();

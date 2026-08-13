@@ -216,6 +216,14 @@ async fn main() -> Result<()> {
                         .help("Peers each withholding node excludes (default: half the committee)"),
                 )
                 .arg(
+                    Arg::new("withhold-fixed-receivers")
+                        .long("withhold-fixed-receivers")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Make every withholding sender exclude the same following receiver group",
+                        ),
+                )
+                .arg(
                     Arg::new("late-header-publishers")
                         .long("late-header-publishers")
                         .value_name("INT")
@@ -261,6 +269,22 @@ async fn main() -> Result<()> {
                         .default_value("200")
                         .action(ArgAction::Set)
                         .help("Vantage AGB base delay in milliseconds"),
+                )
+                .arg(
+                    Arg::new("timeout-delay-ms")
+                        .long("timeout-delay-ms")
+                        .value_name("INT")
+                        .default_value("1000")
+                        .action(ArgAction::Set)
+                        .help("Autobahn consensus timeout in milliseconds"),
+                )
+                .arg(
+                    Arg::new("fast-path-timeout-ms")
+                        .long("fast-path-timeout-ms")
+                        .value_name("INT")
+                        .default_value("500")
+                        .action(ArgAction::Set)
+                        .help("Autobahn fast-path wait in milliseconds"),
                 )
                 .arg(
                     Arg::new("max-batch-delay-ms")

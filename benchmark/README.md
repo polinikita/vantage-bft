@@ -17,13 +17,25 @@ python3 benchmark/local_five_protocol_sweep.py
 ```
 
 The primary two-panel figure contrasts a clean offered-load sweep with the
-same sweep when nodes 0–2 delay only original header publication to nodes 3–5
-by one second. Repairs and control traffic remain normal, and the built-in
-ten-region AWS RTT matrix remains active. Defaults use a 10-second warmup and
-a 30-second measured window. A curve stops after the first point below 95% of
+same sweep when nodes 0–2 omit original data-lane headers and batches to the
+fixed receiver group nodes 3–5. Repairs and control traffic remain normal.
+Each omitted block therefore still has seven direct holders. The local
+isolation study defaults to a uniform 50 ms honest-link RTT; pass
+`--honest-rtt-ms 0` to use the built-in ten-region AWS RTT matrix instead.
+Defaults use a 10-second warmup and a 30-second measured window. A curve stops
+after the first point below 95% of
 offered load or with a growing latter-half backlog; boundary points are
 repeated three times. The harness also produces a receiver-width sweep for
 `K=0,1,2,3`, raw logs, CSV/JSON measurements, and provenance.
+
+Both Autobahn variants use the deployment configuration's 5-second consensus
+and fast-path timeouts.
+
+After a run, generate the presentation-oriented capacity/latency summary with:
+
+```bash
+python3 benchmark/plot_drop_summary.py benchmark/results/<study-directory>
+```
 
 Use `--quick` for a short end-to-end check, optionally with `--protocols
 vantage`. Run databases are discarded after each point unless `--keep-data`

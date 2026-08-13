@@ -815,6 +815,7 @@ impl VantageCore {
             &name,
             parameters.withhold_senders,
             parameters.withhold_count,
+            &parameters.withhold_receivers,
         )
         .map(|blocked| {
             let full: Vec<(PublicKey, SocketAddr)> = other_primaries

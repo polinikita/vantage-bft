@@ -205,6 +205,18 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         withhold_count.is_none_or(|count| count < nodes),
         "--withhold-count must be below --nodes"
     );
+    let withhold_fixed_receivers = matches.get_flag("withhold-fixed-receivers");
+    anyhow::ensure!(
+        !withhold_fixed_receivers || withhold > 0,
+        "--withhold-fixed-receivers requires --withhold > 0"
+    );
+    let withhold_width = withhold_count
+        .unwrap_or(nodes / 2)
+        .min(nodes.saturating_sub(1));
+    anyhow::ensure!(
+        !withhold_fixed_receivers || withhold + withhold_width <= live_nodes,
+        "fixed withholding publishers and receivers must be disjoint and fit within the live nodes"
+    );
     let late_header_publishers: usize = matches
         .get_one::<String>("late-header-publishers")
         .unwrap()
@@ -260,6 +272,16 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--delta-ms must be a non-negative integer")?;
+    let timeout_delay_ms: u64 = matches
+        .get_one::<String>("timeout-delay-ms")
+        .unwrap()
+        .parse()
+        .context("--timeout-delay-ms must be a non-negative integer")?;
+    let fast_path_timeout_ms: u64 = matches
+        .get_one::<String>("fast-path-timeout-ms")
+        .unwrap()
+        .parse()
+        .context("--fast-path-timeout-ms must be a non-negative integer")?;
     let max_batch_delay_ms: u64 = matches
         .get_one::<String>("max-batch-delay-ms")
         .unwrap()
@@ -352,8 +374,12 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         protocol, mode, warmup, duration, base_port
     );
     println!(
-        "Delta: {} ms   Max batch delay: {} ms   Max header delay: {} ms",
-        delta_ms, max_batch_delay_ms, max_header_delay_ms
+        "Delta: {} ms   Consensus timeout: {} ms   Fast-path timeout: {} ms",
+        delta_ms, timeout_delay_ms, fast_path_timeout_ms
+    );
+    println!(
+        "Max batch delay: {} ms   Max header delay: {} ms",
+        max_batch_delay_ms, max_header_delay_ms
     );
     println!("Data dir: {}", data_dir.display());
     if echo_avail_claims {
@@ -385,12 +411,15 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         );
     }
     if withhold > 0 {
-        let width = withhold_count
-            .unwrap_or(nodes / 2)
-            .min(nodes.saturating_sub(1));
-        let reachable = nodes - width;
-        let shape = if withhold_count.is_some() {
-            format!("staggered width {width}; repair paths unaffected")
+        let reachable = nodes - withhold_width;
+        let shape = if withhold_fixed_receivers {
+            format!(
+                "fixed receiver group node-{}..node-{}; repair paths unaffected",
+                withhold,
+                withhold + withhold_width - 1
+            )
+        } else if withhold_count.is_some() {
+            format!("staggered width {withhold_width}; repair paths unaffected")
         } else {
             "staggered halves; repair paths unaffected".to_string()
         };
@@ -434,6 +463,16 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
 
     let withhold_window_cell: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>> =
         withhold_at_secs.map(|_| Arc::new(OnceLock::new()));
+    let withhold_receivers = if withhold_fixed_receivers {
+        keypairs
+            .iter()
+            .skip(withhold)
+            .take(withhold_width)
+            .map(|keypair| keypair.name)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut parameters = Parameters {
         protocol,
@@ -441,8 +480,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         timeout_delay: match protocol {
             Protocol::SimpleIt => delta_ms.saturating_mul(8),
             Protocol::SimpleItBracha => delta_ms.saturating_mul(5),
-            _ => Parameters::default().timeout_delay,
+            _ => timeout_delay_ms,
         },
+        fast_path_timeout: fast_path_timeout_ms,
         max_batch_delay: max_batch_delay_ms,
         max_header_delay: max_header_delay_ms,
         batch_messages: !matches.get_flag("no-batch-messages"),
@@ -456,6 +496,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         vantage_compact_ids: !matches.get_flag("no-compact-ids"),
         withhold_senders: withhold,
         withhold_count,
+        withhold_receivers,
         late_header_publishers: keypairs
             .iter()
             .take(late_header_publishers)

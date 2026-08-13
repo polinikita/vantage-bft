@@ -641,6 +641,7 @@ impl Primary {
                         &name,
                         parameters.withhold_senders,
                         parameters.withhold_count,
+                        &parameters.withhold_receivers,
                     ),
                     // Finite-delay original-header destinations.
                     config::late_header_destinations(

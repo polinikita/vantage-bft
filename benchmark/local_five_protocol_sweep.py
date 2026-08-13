@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and plot the n=10 clean/late-header five-protocol local study."""
+"""Run and plot the n=10 clean/data-lane-drop five-protocol local study."""
 
 from __future__ import annotations
 
@@ -57,14 +57,29 @@ PROTOCOLS = [
     Protocol(
         "autobahn-optimistic",
         "Autobahn optimistic (all-to-all)",
-        ("--protocol", "autobahn-optimistic", "--all-to-all"),
+        (
+            "--protocol",
+            "autobahn-optimistic",
+            "--all-to-all",
+            "--timeout-delay-ms",
+            "5000",
+            "--fast-path-timeout-ms",
+            "5000",
+        ),
         "#D55E00",
         "s",
     ),
     Protocol(
         "autobahn-seamless",
         "Autobahn seamless",
-        ("--protocol", "autobahn-seamless"),
+        (
+            "--protocol",
+            "autobahn-seamless",
+            "--timeout-delay-ms",
+            "5000",
+            "--fast-path-timeout-ms",
+            "5000",
+        ),
         "#E69F00",
         "^",
     ),
@@ -94,12 +109,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--tx-size", type=int, default=512)
     parser.add_argument("--mode", default="random", choices=("random", "all-zero"))
+    parser.add_argument(
+        "--honest-rtt-ms",
+        type=int,
+        default=50,
+        help="Uniform honest-link RTT; use 0 for the built-in AWS regional matrix",
+    )
     parser.add_argument("--rates", default=",".join(map(str, DEFAULT_RATES)))
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--duration", type=int, default=30)
-    parser.add_argument("--late-publishers", type=int, default=3)
-    parser.add_argument("--late-receivers", type=int, default=3)
-    parser.add_argument("--late-delay-ms", type=int, default=1_000)
+    parser.add_argument("--drop-publishers", type=int, default=3)
+    parser.add_argument("--drop-receivers", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--accept-pct", type=float, default=95.0)
     parser.add_argument("--slope-fraction", type=float, default=0.01)
@@ -142,12 +162,14 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--repeats must be positive, --warmup non-negative, and --duration positive"
         )
-    if args.late_publishers <= 0 or args.late_receivers <= 0 or args.late_delay_ms <= 0:
-        parser.error("late publishers, receivers, and delay must all be positive")
+    if args.drop_publishers <= 0 or args.drop_receivers <= 0:
+        parser.error("drop publishers and receivers must both be positive")
+    if args.honest_rtt_ms < 0:
+        parser.error("--honest-rtt-ms must be non-negative")
     if args.nodes != 10:
         parser.error("this study is defined for --nodes 10")
-    if args.late_publishers + max(args.widths + [args.late_receivers]) > args.nodes:
-        parser.error("late publisher and receiver groups must be disjoint and fit in n")
+    if args.drop_publishers + max(args.widths + [args.drop_receivers]) > args.nodes:
+        parser.error("drop publisher and receiver groups must be disjoint and fit in n")
     if args.output is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         args.output = ROOT / "benchmark/results" / f"local-five-protocol-{stamp}"
@@ -236,14 +258,14 @@ class Study:
     def matching(
         self, protocol: Protocol, rate: int, receivers: int
     ) -> list[dict[str, Any]]:
-        publishers = self.args.late_publishers if receivers else 0
+        publishers = self.args.drop_publishers if receivers else 0
         return [
             record
             for record in self.records
             if record["protocol"] == protocol.key
             and record["offered_tps"] == rate
-            and record["late_publishers"] == publishers
-            and record["late_receivers"] == receivers
+            and record["drop_publishers"] == publishers
+            and record["drop_receivers"] == receivers
         ]
 
     def ensure(
@@ -257,8 +279,8 @@ class Study:
     def run_one(
         self, protocol: Protocol, rate: int, receivers: int, repetition: int, phase: str
     ) -> dict[str, Any]:
-        publishers = self.args.late_publishers if receivers else 0
-        condition = "clean" if receivers == 0 else f"late-k{receivers}"
+        publishers = self.args.drop_publishers if receivers else 0
+        condition = "clean" if receivers == 0 else f"drop-k{receivers}"
         run_id = f"{phase}-{condition}-{protocol.key}-{rate}-r{repetition}"
         data_dir = self.data_root / run_id
         log_path = self.args.output / "raw" / f"{run_id}.log"
@@ -285,15 +307,21 @@ class Study:
             str(data_dir),
             "--delta-ms",
             "200",
-            "--late-header-publishers",
-            str(publishers),
-            "--late-header-receivers",
-            str(receivers),
-            "--late-header-delay-ms",
-            str(self.args.late_delay_ms),
             "--timeline",
             *protocol.cli,
         ]
+        if receivers:
+            command.extend(
+                (
+                    "--withhold",
+                    str(publishers),
+                    "--withhold-count",
+                    str(receivers),
+                    "--withhold-fixed-receivers",
+                )
+            )
+        if self.args.honest_rtt_ms > 0:
+            command.extend(("--mimic-latency-ms", str(self.args.honest_rtt_ms)))
         print(
             f"[{phase}] {condition:8s} {protocol.label:34s} offered={rate:>7,d} TPS r={repetition + 1}",
             flush=True,
@@ -339,9 +367,8 @@ class Study:
             "protocol": protocol.key,
             "protocol_label": protocol.label,
             "condition": condition,
-            "late_publishers": publishers,
-            "late_receivers": receivers,
-            "late_delay_ms": self.args.late_delay_ms if receivers else 0,
+            "drop_publishers": publishers,
+            "drop_receivers": receivers,
             "offered_tps": rate,
             "repetition": repetition,
             "accepted": accepted,
@@ -366,7 +393,7 @@ class Study:
         return record
 
     def pilot_scaling(self) -> None:
-        for receivers, condition in ((0, "clean"), (self.args.late_receivers, "late")):
+        for receivers, condition in ((0, "clean"), (self.args.drop_receivers, "drop")):
             for protocol in self.args.protocol_defs:
                 key = (condition, protocol.key)
                 self.curve_rates[key] = []
@@ -383,7 +410,7 @@ class Study:
             return
         for protocol in self.args.protocol_defs:
             boundary_rates: set[int] = set()
-            for condition in ("clean", "late"):
+            for condition in ("clean", "drop"):
                 rates = self.curve_rates[(condition, protocol.key)]
                 failed = self.first_failed[(condition, protocol.key)]
                 accepted = [
@@ -392,7 +419,7 @@ class Study:
                     if self.matching(
                         protocol,
                         rate,
-                        0 if condition == "clean" else self.args.late_receivers,
+                        0 if condition == "clean" else self.args.drop_receivers,
                     )[0]["accepted"]
                 ]
                 if accepted:
@@ -403,7 +430,7 @@ class Study:
                     boundary_rates.add(rates[-1])
             for condition, receivers in (
                 ("clean", 0),
-                ("late", self.args.late_receivers),
+                ("drop", self.args.drop_receivers),
             ):
                 retained = set(self.curve_rates[(condition, protocol.key)])
                 for rate in sorted(boundary_rates & retained):
@@ -423,13 +450,13 @@ class Study:
                 and self.matching(protocol, rate, 0)[0]["accepted"]
                 for protocol in self.args.protocol_defs
             )
-            delayed_vantage = (
-                self.matching(vantage, rate, self.args.late_receivers)
-                and self.matching(vantage, rate, self.args.late_receivers)[0][
+            dropped_vantage = (
+                self.matching(vantage, rate, self.args.drop_receivers)
+                and self.matching(vantage, rate, self.args.drop_receivers)[0][
                     "accepted"
                 ]
             )
-            if clean and delayed_vantage:
+            if clean and dropped_vantage:
                 candidates.append(rate)
         chosen = max(candidates) if candidates else min(self.args.rates)
         print(f"Receiver-width sweep rate R* = {chosen:,} TPS", flush=True)
@@ -458,7 +485,7 @@ def median_range(
 def scaling_records(
     study: Study, condition: str, protocol: Protocol, rate: int
 ) -> list[dict[str, Any]]:
-    receivers = 0 if condition == "clean" else study.args.late_receivers
+    receivers = 0 if condition == "clean" else study.args.drop_receivers
     return study.matching(protocol, rate, receivers)
 
 
@@ -470,11 +497,11 @@ def plot_scaling(study: Study) -> None:
     y_floor = max(1.0, min(study.args.rates) / 100.0)
     for axis, condition, title in zip(
         axes,
-        ("clean", "late"),
+        ("clean", "drop"),
         (
             "Clean publication",
-            f"{study.args.late_publishers} Byzantine publishers → "
-            f"{study.args.late_receivers} receivers, +{study.args.late_delay_ms} ms",
+            f"{study.args.drop_publishers} Byzantine publishers omit data to "
+            f"{study.args.drop_receivers} receivers",
         ),
     ):
         for protocol in study.args.protocol_defs:
@@ -548,9 +575,12 @@ def plot_scaling(study: Study) -> None:
         ncol=3,
         frameon=False,
     )
-    fig.suptitle(
-        "n=10 local scaling with the built-in 10-region AWS RTT matrix", y=0.995
+    latency = (
+        f"uniform {study.args.honest_rtt_ms} ms honest-link RTT"
+        if study.args.honest_rtt_ms > 0
+        else "the built-in 10-region AWS RTT matrix"
     )
+    fig.suptitle(f"n=10 local scaling with {latency}", y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.84))
     for suffix in ("png", "pdf"):
         fig.savefig(
@@ -587,7 +617,7 @@ def plot_width(study: Study, rate: int) -> None:
     axis.axhline(rate, color="0.55", linestyle="--", linewidth=1, label="offered load")
     axis.set_xticks(study.args.widths)
     axis.set_xlabel(
-        f"Delayed receivers K ({study.args.late_publishers} Byzantine publishers)"
+        f"Dropped receivers K ({study.args.drop_publishers} Byzantine publishers)"
     )
     axis.set_ylabel("Committed throughput (tx/s)")
     axis.set_title(f"Receiver-width sensitivity at R*={rate:,} tx/s")
@@ -627,7 +657,7 @@ def write_csvs(study: Study) -> None:
             record["condition"],
             record["protocol"],
             record["offered_tps"],
-            record["late_receivers"],
+            record["drop_receivers"],
         )
         groups.setdefault(key, []).append(record)
     for (condition, protocol, offered, receivers), records in sorted(groups.items()):
@@ -639,7 +669,7 @@ def write_csvs(study: Study) -> None:
                 "condition": condition,
                 "protocol": protocol,
                 "offered_tps": offered,
-                "late_receivers": receivers,
+                "drop_receivers": receivers,
                 "runs": len(records),
                 "committed_tps_median": throughput[0],
                 "committed_tps_min": throughput[1],
@@ -675,7 +705,11 @@ def write_provenance(args: argparse.Namespace, r_star: int) -> None:
         "python": sys.version,
         "platform": platform.platform(),
         "logical_cpus": os.cpu_count(),
-        "latency_model": "config::LatencyTable::aws_rtt; RTT matrix converted to one-way delay",
+        "latency_model": (
+            f"uniform {args.honest_rtt_ms} ms RTT; converted to one-way delay"
+            if args.honest_rtt_ms > 0
+            else "config::LatencyTable::aws_rtt; RTT matrix converted to one-way delay"
+        ),
         "r_star_tps": r_star,
         "arguments": {
             key: value for key, value in vars(args).items() if key != "protocol_defs"
