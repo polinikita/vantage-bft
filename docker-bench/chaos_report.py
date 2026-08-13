@@ -78,6 +78,8 @@ def main():
         d1 = end if permanent else ev["up_ms"] / 1000
         others = [i for i in committed if i != v]
         window = tl["outage_s"] if tl["outage_s"] > 0 else d1 - d0
+        # Clamp the look-back to the run so counter appearance cannot skew it.
+        window = min(window, d0 - start)
         before = [r for i in others
                   if (r := rate_between(committed[i], d0 - window, d0)) is not None]
         during = [r for i in others if (r := rate_between(committed[i], d0, d1)) is not None]
