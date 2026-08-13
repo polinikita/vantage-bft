@@ -1618,6 +1618,13 @@ impl Core {
             proposals,
         } = prepare_message
         {
+            // A leader skips `is_valid` for its own message, so record the
+            // view here as well: the slot-period timer arming depends on it.
+            let curr_view = self.views.get(slot).copied().unwrap_or(0);
+            if curr_view < *view {
+                self.views.insert(*slot, *view);
+            }
+
             let _ = self.is_prepare_ticket_ready(prepare_message).await;
 
             if self.k > 1
@@ -1680,6 +1687,12 @@ impl Core {
             proposals: _,
         } = confirm_message
         {
+            // Same own-message gap as in `process_prepare_message`.
+            let curr_view = self.views.get(slot).copied().unwrap_or(0);
+            if curr_view < *view {
+                self.views.insert(*slot, *view);
+            }
+
             self.high_qcs.insert(*slot, confirm_message.clone());
 
             let sig = self
