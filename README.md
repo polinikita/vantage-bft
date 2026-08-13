@@ -12,6 +12,8 @@ storage, worker, metrics, and benchmark components for comparable experiments.
 The codebase is derived from the
 [Autobahn SOSP 2024 artifact](https://github.com/neilgiri/autobahn-artifact).
 
+The current Vantage manuscript is available as [vantage.pdf](vantage.pdf).
+
 ## Protocols
 
 | Protocol | CLI name | Description |
