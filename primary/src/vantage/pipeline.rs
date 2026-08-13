@@ -196,10 +196,12 @@ mod tests {
         assert!(trace.note_quorum(&r).is_none());
 
         sleep(Duration::from_millis(1));
-        let mut header = Header::default();
-        header.author = author;
-        header.height = 1;
-        trace.note_committed(&[header.clone()], author, &metrics.pipeline);
+        let header = Header {
+            author,
+            height: 1,
+            ..Header::default()
+        };
+        trace.note_committed(std::slice::from_ref(&header), author, &metrics.pipeline);
         trace.note_committed(&[header], author, &metrics.pipeline);
         reporter.force_report();
 
