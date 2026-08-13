@@ -14,7 +14,8 @@ set -euo pipefail
 : "${NODE_INDEX:?}"; : "${N_NODES:?}"
 : "${OWN_TX_ADDR:?wan-bench must pass OWN_TX_ADDR}"
 : "${PEER_TX_ADDRS:?wan-bench must pass PEER_TX_ADDRS}"
-RATE="${RATE:-100}"; TX_SIZE="${TX_SIZE:-512}"; TX_MODE="${TX_MODE:-random}"
+RATE="${RATE:-100}"; ADVERSARIAL_RATE="${ADVERSARIAL_RATE:-0}"
+TX_SIZE="${TX_SIZE:-512}"; TX_MODE="${TX_MODE:-random}"
 ACTIVATE_AT_MS="${ACTIVATE_AT_MS:-}"
 VERBOSITY="${NODE_VERBOSITY:--vv}"
 
@@ -56,12 +57,28 @@ echo "wanbench: client -> $OWN_TX_ADDR, ${#PEERS[@]} peers, rate ${RATE} tx/s${A
     >"$LOGDIR/client.log" 2>&1 &
 CLIENT_PID=$!
 
-cleanup() { kill "$PRIMARY_PID" "$WORKER_PID" "$CLIENT_PID" >/dev/null 2>&1 || true; }
+ADVERSARIAL_CLIENT_PID=""
+if [ "$ADVERSARIAL_RATE" -gt 0 ]; then
+    echo "wanbench: uncounted adversarial client -> $OWN_TX_ADDR, rate ${ADVERSARIAL_RATE} tx/s"
+    /usr/local/bin/benchmark_client "$OWN_TX_ADDR" \
+        --size "$TX_SIZE" --rate "$ADVERSARIAL_RATE" --mode "$TX_MODE" \
+        --uncounted "${CLIENT_EXTRA[@]}" \
+        --nodes "${PEERS[@]}" \
+        >"$LOGDIR/adversarial-client.log" 2>&1 &
+    ADVERSARIAL_CLIENT_PID=$!
+fi
+
+cleanup() {
+    kill "$PRIMARY_PID" "$WORKER_PID" "$CLIENT_PID" \
+        ${ADVERSARIAL_CLIENT_PID:+"$ADVERSARIAL_CLIENT_PID"} >/dev/null 2>&1 || true
+}
 trap 'echo "wanbench: stop signal"; cleanup; exit 0' INT TERM
 trap cleanup EXIT
 
 while kill -0 "$PRIMARY_PID" 2>/dev/null && kill -0 "$WORKER_PID" 2>/dev/null \
-      && kill -0 "$CLIENT_PID" 2>/dev/null; do
+      && kill -0 "$CLIENT_PID" 2>/dev/null \
+      && { [ -z "$ADVERSARIAL_CLIENT_PID" ] || \
+           kill -0 "$ADVERSARIAL_CLIENT_PID" 2>/dev/null; }; do
     sleep 1
 done
 echo "wanbench: a process exited early -- see $LOGDIR/*.log" >&2
