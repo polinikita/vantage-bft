@@ -22,7 +22,7 @@ async fn agb_gc_makes_old_view_messages_noops() {
     assert!(agb.echo_sent(1));
     assert!(agb.ready_sent(1));
     assert!(agb.on_echo_skip(1, sender).is_empty());
-    assert!(agb.on_ready_timer(1).is_empty());
+    assert!(agb.on_ready_timer(1, &mut rep).is_empty());
 }
 
 #[test]

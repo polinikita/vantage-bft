@@ -27,9 +27,14 @@ fn setup_engine(
     (agb, lm, rep)
 }
 
-fn make_skip_qualified(agb: &mut AgbEngine, name: PublicKey, u: crate::primary::View) {
+fn make_skip_qualified(
+    agb: &mut AgbEngine,
+    rep: &mut crate::vantage::repair::Repairer,
+    name: PublicKey,
+    u: crate::primary::View,
+) {
     agb.on_echo_skip(u, name);
-    agb.on_ready_timer(u);
+    agb.on_ready_timer(u, rep);
 }
 
 #[tokio::test]
@@ -45,7 +50,7 @@ async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
     {
         let (mut agb, mut lm, mut rep) =
             setup_engine(&committee, self_name, ".db_test_batch_echo_conj_a");
-        make_skip_qualified(&mut agb, self_name, 1);
+        make_skip_qualified(&mut agb, &mut rep, self_name, 1);
         let proposal = BatchViewProposal {
             view: 5,
             c: Vec::new(),
@@ -79,8 +84,8 @@ async fn echo_conjunction_one_refusable_coordinate_refuses_the_whole_vector() {
     {
         let (mut agb, mut lm, mut rep) =
             setup_engine(&committee, self_name, ".db_test_batch_echo_conj_b");
-        make_skip_qualified(&mut agb, self_name, 1);
-        make_skip_qualified(&mut agb, self_name, 2);
+        make_skip_qualified(&mut agb, &mut rep, self_name, 1);
+        make_skip_qualified(&mut agb, &mut rep, self_name, 2);
         let proposal = BatchViewProposal {
             view: 5,
             c: Vec::new(),

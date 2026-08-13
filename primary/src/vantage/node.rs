@@ -1634,7 +1634,7 @@ impl VantageCore {
             self.timers.pop();
             let moot = match kind {
                 TimerKind::EchoFallback | TimerKind::EchoAbsolute => self.agb.echo_sent(view),
-                TimerKind::ReadyAbsolute => self.agb.ready_sent(view),
+                TimerKind::ReadyAbsolute => self.agb.ready_finalized(view),
             };
             if moot {
                 continue;
@@ -1648,7 +1648,9 @@ impl VantageCore {
                 TimerKind::EchoAbsolute => {
                     effects.extend(self.agb.on_echo_absolute_timer(view, &mut self.rep))
                 }
-                TimerKind::ReadyAbsolute => effects.extend(self.agb.on_ready_timer(view)),
+                TimerKind::ReadyAbsolute => {
+                    effects.extend(self.agb.on_ready_timer(view, &mut self.rep))
+                }
             }
         }
         effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
@@ -3547,6 +3549,9 @@ impl VantageCore {
                             view, self.name, wish,
                         ))
                         .await;
+                    }
+                    Effect::QuarantineTips(tips) => {
+                        self.frontier.quarantine_tips(&tips, &self.lm);
                     }
                     Effect::BroadcastReady(mut r) => {
                         r.set_wish(self.pacemaker.own_watermark());

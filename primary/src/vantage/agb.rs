@@ -557,7 +557,11 @@ pub(crate) enum Stance {
 struct ViewState {
     fixed: Fixed,
     echo_sent: bool,
+    /// The initial READY-stage response has been emitted.
     ready_sent: bool,
+    /// The local initial response was READY-mix and may still refine to a
+    /// homogeneous grade. Provisional mix cannot authorize resolution metadata.
+    ready_mix_open: bool,
     completed: Option<(Manifest, Manifest)>,
     directed: Option<Outcome>,
     sealed: Option<Outcome>,
@@ -591,6 +595,7 @@ impl Default for ViewState {
             fixed: Fixed::Unset,
             echo_sent: false,
             ready_sent: false,
+            ready_mix_open: false,
             completed: None,
             directed: None,
             sealed: None,
@@ -840,6 +845,22 @@ impl AgbEngine {
 
     pub fn ready_sent(&self, view: View) -> bool {
         self.is_pruned(view) || self.views.get(&view).is_some_and(|s| s.ready_sent)
+    }
+
+    /// Returns true once the initial READY response cannot refine further.
+    pub fn ready_finalized(&self, view: View) -> bool {
+        self.is_pruned(view)
+            || self
+                .views
+                .get(&view)
+                .is_some_and(|s| s.ready_sent && !s.ready_mix_open)
+    }
+
+    #[cfg(test)]
+    pub fn ready_mix_open_for_test(&self, view: View) -> bool {
+        self.views
+            .get(&view)
+            .is_some_and(|state| state.ready_mix_open)
     }
 
     pub fn sid(&self) -> &Digest {
@@ -1227,6 +1248,12 @@ impl AgbEngine {
         let Some(own_ready) = state_u.ready_statements.get(&self.name) else {
             return false;
         };
+        if state_u.ready_mix_open {
+            // A provisional MIX may still refine to the grade incompatible
+            // with this entry. It becomes resolution evidence only after it
+            // refines or is finalized by closure/deadline.
+            return false;
+        }
         if let Some(lock) = &state_u.lock {
             if lock.active {
                 match entry {
@@ -1560,6 +1587,7 @@ impl AgbEngine {
         }
         // Echo-skip affects only the fast-seal nonmatching count.
         self.recheck_lock_release(view);
+        self.finalize_mix_if_closed(view, false);
         effects.extend(self.recheck_fastseal_trigger(view));
         effects.extend(self.recheck_skip_vote_trigger(view));
         effects
@@ -1630,7 +1658,8 @@ impl AgbEngine {
             .map_or(0, |tally| tally.grade_one_parties)
     }
 
-    /// Counts only the first ready-stage statement from each sender.
+    /// Counts one initial ready-stage statement per sender and, after an
+    /// initial READY-mix, at most one same-proposal homogeneous refinement.
     fn count_ready_statement(
         &mut self,
         view: View,
@@ -1642,8 +1671,34 @@ impl AgbEngine {
         }
         let stake = self.committee.stake(&sender);
         let state = self.state_mut(view);
-        if state.ready_statements.contains_key(&sender) {
-            return false;
+        if let Some(existing) = state.ready_statements.get(&sender) {
+            let valid_refinement = matches!(
+                (existing, &statement),
+                (
+                    ReadyStatement::Graded(_, old_digest, ReadyGrade::Mix),
+                    ReadyStatement::Graded(_, new_digest, ReadyGrade::Zero | ReadyGrade::One)
+                ) if old_digest == new_digest
+            );
+            if !valid_refinement {
+                return false;
+            }
+
+            let ReadyStatement::Graded(_, digest, grade) = &statement else {
+                unreachable!("a valid READY refinement is graded")
+            };
+            let Some(tally) = state.ready_tallies.get_mut(digest) else {
+                debug_assert!(false, "READY-mix refinement lost its initial tally");
+                return false;
+            };
+            match grade {
+                ReadyGrade::One => tally.grade_one += stake,
+                ReadyGrade::Zero => tally.grade_zero += stake,
+                ReadyGrade::Mix => unreachable!("READY-mix cannot refine to READY-mix"),
+            }
+            // `any` and the historical non-grade-1 census already counted this
+            // author when its initial READY-mix arrived.
+            state.ready_statements.insert(sender, statement);
+            return true;
         }
         match &statement {
             ReadyStatement::Graded(proposal, digest, grade) => {
@@ -1680,63 +1735,165 @@ impl AgbEngine {
         if self.is_pruned(view) {
             return effects;
         }
-        if self.state_mut(view).ready_sent {
+        if !self.state_mut(view).ready_sent {
+            if let Some((digest, proposal, grade)) = self.ready_candidate(view) {
+                effects.extend(self.emit_initial_ready(view, digest, proposal, grade, rep));
+            }
             return effects;
         }
-        let candidate = self.views.get(&view).and_then(|state| {
-            state.echo_tallies.iter().find_map(|(digest, tally)| {
-                if tally.grade_one + tally.grade_zero < self.quorum {
-                    return None;
-                }
-                let ready =
-                    tally
-                        .proposal
-                        .entries()
-                        .iter()
-                        .enumerate()
-                        .all(|(i, entry)| match entry {
-                            ResolutionEntry::Full(..) | ResolutionEntry::Core(..) => {
-                                tally.origin_ones[i] >= self.f_plus_1_parties
-                            }
-                            ResolutionEntry::Skip(_) => true,
-                        });
-                ready.then(|| {
-                    let grade = if tally.grade_one >= self.quorum {
-                        ReadyGrade::One
-                    } else if tally.grade_zero >= self.quorum {
-                        ReadyGrade::Zero
-                    } else {
-                        ReadyGrade::Mix
-                    };
-                    (digest.clone(), Arc::clone(&tally.proposal), grade)
-                })
-            })
-        });
-        if let Some((digest, proposal, grade)) = candidate {
-            let name = self.name;
-            self.state_mut(view).ready_sent = true;
-            let tally_digest = digest.clone();
-            self.count_ready_statement(
-                view,
-                name,
-                ReadyStatement::Graded(Arc::clone(&proposal), digest, grade),
-            );
-            effects.extend(self.wish_effect(view, ResponseStage::Ready));
-            effects.push(Effect::BroadcastReady(
-                self.build_ready_out(&proposal, grade),
-            ));
-            effects.extend(self.recheck_completion_and_direct(view, &tally_digest, rep));
+        if let Some((digest, proposal, grade)) = self.ready_refinement_candidate(view) {
+            effects.extend(self.emit_ready_refinement(view, digest, proposal, grade, rep));
+        } else {
+            self.finalize_mix_if_closed(view, false);
         }
         effects
     }
 
-    /// Emits no-ready at `e_i + θR` if no ready has been emitted.
-    pub fn on_ready_timer(&mut self, view: View) -> Vec<Effect> {
+    /// Selects the first guarded ECHO quorum immediately, retaining the paper's
+    /// existing READY-mix completion latency.
+    fn ready_candidate(&self, view: View) -> Option<(Digest, Arc<ProposalOut>, ReadyGrade)> {
+        self.views.get(&view).and_then(|state| {
+            state.echo_tallies.iter().find_map(|(digest, tally)| {
+                if tally.grade_one + tally.grade_zero < self.quorum {
+                    return None;
+                }
+                let ready_guard = tally
+                    .proposal
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .all(|(i, entry)| match entry {
+                        ResolutionEntry::Full(..) | ResolutionEntry::Core(..) => {
+                            tally.origin_ones[i] >= self.f_plus_1_parties
+                        }
+                        ResolutionEntry::Skip(_) => true,
+                    });
+                if !ready_guard {
+                    return None;
+                }
+                let grade = if tally.grade_one >= self.quorum {
+                    ReadyGrade::One
+                } else if tally.grade_zero >= self.quorum {
+                    ReadyGrade::Zero
+                } else {
+                    ReadyGrade::Mix
+                };
+                Some((digest.clone(), Arc::clone(&tally.proposal), grade))
+            })
+        })
+    }
+
+    /// Returns a homogeneous refinement only for this party's provisional
+    /// READY-mix proposal.
+    fn ready_refinement_candidate(
+        &self,
+        view: View,
+    ) -> Option<(Digest, Arc<ProposalOut>, ReadyGrade)> {
+        let state = self.views.get(&view)?;
+        if !state.ready_mix_open {
+            return None;
+        }
+        let ReadyStatement::Graded(proposal, digest, ReadyGrade::Mix) =
+            state.ready_statements.get(&self.name)?
+        else {
+            return None;
+        };
+        let tally = state.echo_tallies.get(digest)?;
+        let grade = if tally.grade_one >= self.quorum {
+            ReadyGrade::One
+        } else if tally.grade_zero >= self.quorum {
+            ReadyGrade::Zero
+        } else {
+            return None;
+        };
+        Some((digest.clone(), Arc::clone(proposal), grade))
+    }
+
+    fn finalize_mix_if_closed(&mut self, view: View, deadline: bool) {
+        let close = self.views.get(&view).is_some_and(|state| {
+            state.ready_mix_open && (deadline || state.echo_statements.len() == self.n)
+        });
+        if close {
+            self.state_mut(view).ready_mix_open = false;
+        }
+    }
+
+    fn emit_initial_ready(
+        &mut self,
+        view: View,
+        digest: Digest,
+        proposal: Arc<ProposalOut>,
+        grade: ReadyGrade,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let name = self.name;
+        {
+            let state = self.state_mut(view);
+            state.ready_sent = true;
+            state.ready_mix_open = grade == ReadyGrade::Mix;
+        }
+        let tally_digest = digest.clone();
+        self.count_ready_statement(
+            view,
+            name,
+            ReadyStatement::Graded(Arc::clone(&proposal), digest, grade),
+        );
+        if grade == ReadyGrade::Mix && !proposal.t().is_empty() {
+            effects.push(Effect::QuarantineTips(proposal.t().clone()));
+        }
+        effects.extend(self.wish_effect(view, ResponseStage::Ready));
+        effects.push(Effect::BroadcastReady(
+            self.build_ready_out(&proposal, grade),
+        ));
+        effects.extend(self.recheck_completion_and_direct(view, &tally_digest, rep));
+        self.finalize_mix_if_closed(view, false);
+        effects
+    }
+
+    fn emit_ready_refinement(
+        &mut self,
+        view: View,
+        digest: Digest,
+        proposal: Arc<ProposalOut>,
+        grade: ReadyGrade,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        debug_assert!(matches!(grade, ReadyGrade::Zero | ReadyGrade::One));
+        let accepted = self.count_ready_statement(
+            view,
+            self.name,
+            ReadyStatement::Graded(Arc::clone(&proposal), digest.clone(), grade),
+        );
+        debug_assert!(accepted, "local READY-mix refinement must be admissible");
+        if !accepted {
+            return Vec::new();
+        }
+        self.state_mut(view).ready_mix_open = false;
+        let mut effects = vec![Effect::BroadcastReady(
+            self.build_ready_out(&proposal, grade),
+        )];
+        effects.extend(self.recheck_completion_and_direct(view, &digest, rep));
+        effects
+    }
+
+    /// Closes a provisional READY-mix, or emits NO-READY if no guarded ECHO
+    /// quorum produced an initial response.
+    pub fn on_ready_timer(&mut self, view: View, rep: &mut Repairer) -> Vec<Effect> {
         let mut effects = Vec::new();
         if self.is_pruned(view) {
             return effects;
         }
         if self.state_mut(view).ready_sent {
+            if let Some((digest, proposal, grade)) = self.ready_refinement_candidate(view) {
+                return self.emit_ready_refinement(view, digest, proposal, grade, rep);
+            }
+            self.finalize_mix_if_closed(view, true);
+            return effects;
+        }
+        if let Some((digest, proposal, grade)) = self.ready_candidate(view) {
+            let effects = self.emit_initial_ready(view, digest, proposal, grade, rep);
+            self.finalize_mix_if_closed(view, true);
             return effects;
         }
         self.state_mut(view).ready_sent = true;
@@ -1952,7 +2109,8 @@ pub struct DigestStatements {
     /// Stores the first buffered echo digest statement from each sender for each view.
     /// Statements remain buffered until a matching body is verified.
     buffered_echo: BTreeMap<View, BTreeMap<PublicKey, BufferedEcho>>,
-    /// Stores the first buffered ready digest statement from each sender for each view.
+    /// Stores one effective buffered ready per sender. A same-digest
+    /// homogeneous refinement replaces an earlier READY-mix before body fetch.
     buffered_ready: BTreeMap<View, BTreeMap<PublicKey, BufferedReady>>,
     /// Caches verified proposal bodies by `(view, digest)`.
     known_bodies: BTreeMap<(View, Digest), Arc<ViewProposal>>,
@@ -2125,14 +2283,25 @@ impl DigestStatements {
         grade: ReadyGrade,
         now: Instant,
     ) -> Vec<Effect> {
-        let inserted = match self.buffered_ready.entry(view).or_default().entry(sender) {
+        let accepted = match self.buffered_ready.entry(view).or_default().entry(sender) {
             Entry::Vacant(entry) => {
                 entry.insert((digest.clone(), grade));
                 true
             }
-            Entry::Occupied(_) => false,
+            Entry::Occupied(mut entry) => {
+                let (old_digest, old_grade) = entry.get();
+                if *old_digest == digest
+                    && *old_grade == ReadyGrade::Mix
+                    && matches!(grade, ReadyGrade::Zero | ReadyGrade::One)
+                {
+                    entry.insert((digest.clone(), grade));
+                    true
+                } else {
+                    false
+                }
+            }
         };
-        if inserted {
+        if accepted {
             self.ensure_fetch(view, digest, now)
         } else {
             Vec::new()

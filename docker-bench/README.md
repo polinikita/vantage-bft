@@ -48,6 +48,8 @@ python3 docker-bench/gen.py --help
 
 Common options include `--tx-size`, `--mode`, `--no-latency`,
 `--delta-ms`, `--max-header-delay-ms`, and the state-sync controls.
+Use `--withhold N --withhold-count K` to make the first `N` validators omit
+each payload broadcast to `K` staggered peers.
 
 Vantage carries positional availability claims on AGB echoes by default.
 `--no-echo-avail-claims` selects periodic watermarks; `--no-ack-watermarks`

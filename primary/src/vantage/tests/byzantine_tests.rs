@@ -1000,14 +1000,43 @@ async fn scenario_6_fast_lock_release_unblocks_metaok_no_stale_lock_at_ready_tim
     assert_eq!(
         ready,
         Some(ReadyGrade::Mix),
-        "neither grade alone reaches quorum (g1=1,g0=2 < 3 each) -- the ready must be Mix"
+        "the split quorum must preserve the immediate READY-mix completion path"
     );
 
     let effects3 = agb.recheck_all(&mut lm, &mut rep);
     assert!(
-        effects3.iter().any(
+        !effects3.iter().any(
             |e| matches!(e, Effect::BroadcastEcho(EchoOut::Single(echo)) if echo.proposal.view == 4)
         ),
-        "once the lock releases, the carrying view's Core(1,...) entry must pass MetaOK and echo"
+        "lock release alone is not an R_i(1); the carrier remains pending until READY is homogeneous"
+    );
+
+    let (last_sender, _) = authors()[2];
+    let effects4 = agb.on_echo(
+        Echo {
+            proposal: proposal_u,
+            grade: 0,
+            sender: last_sender,
+            wish: 0,
+            origin: None,
+            avail: None,
+        },
+        &mut rep,
+    );
+    let ready = effects4.iter().find_map(|e| match e {
+        Effect::BroadcastReady(ReadyOut::Single(r)) if r.proposal.view == 1 => Some(r.grade),
+        _ => None,
+    });
+    assert_eq!(
+        ready,
+        Some(ReadyGrade::Zero),
+        "the final echo makes grade zero homogeneous, so READY-0 must win over the earlier split"
+    );
+    let effects5 = agb.recheck_all(&mut lm, &mut rep);
+    assert!(
+        effects5.iter().any(
+            |e| matches!(e, Effect::BroadcastEcho(EchoOut::Single(echo)) if echo.proposal.view == 4)
+        ),
+        "the new READY-0 must unblock the carrying Core entry on the normal recheck pass"
     );
 }

@@ -212,6 +212,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
         "batch_max_bytes": args.batch_max_bytes,
         "batch_max_delay_ms": args.batch_max_delay_ms,
         "withhold_senders": args.withhold,
+        "withhold_count": args.withhold_count,
         "withhold_at_ms": None if args.withhold_at is None else args.withhold_at * 1000,
         "withhold_for_ms": args.withhold_for * 1000,
         "resume_check_period_ms": 1000,
@@ -370,6 +371,8 @@ def write_manifest(n: int, args: argparse.Namespace) -> None:
             not args.no_ack_watermarks and not args.no_echo_avail_claims
         ),
         "vantage_compact_ids": not args.no_compact_ids,
+        "withhold_senders": args.withhold,
+        "withhold_count": args.withhold_count,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -440,6 +443,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--retry-backoff-max-ms", type=int, default=2000,
                    help="maximum reconnect backoff in milliseconds (default 2000)")
     p.add_argument("--withhold", type=int, default=0)
+    p.add_argument("--withhold-count", type=int, default=None,
+                   help="peers each withholding node excludes (default: half the committee)")
     p.add_argument("--withhold-at", type=int, default=None)
     p.add_argument("--withhold-for", type=int, default=30)
     p.add_argument("--rust-log", default=None, metavar="FILTER",
@@ -456,6 +461,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--tx-size must be at least 17 bytes (1 B marker + 8 B id + 8 B timestamp)")
     if not (0 <= args.withhold <= args.nodes):
         p.error("--withhold must be between 0 and --nodes")
+    if args.withhold_count is not None and not (0 <= args.withhold_count < args.nodes):
+        p.error("--withhold-count must be between 0 and --nodes - 1")
+    if args.withhold_count is not None and args.withhold == 0:
+        p.error("--withhold-count requires --withhold > 0")
     if args.withhold_at is not None and args.withhold == 0:
         p.error("--withhold-at requires --withhold > 0")
     if args.sequence_checkpoint_interval < 1:

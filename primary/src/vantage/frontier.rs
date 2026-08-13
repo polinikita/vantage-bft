@@ -4,7 +4,7 @@ use crate::vantage::agb::{formed, BatchViewProposal, Manifest, ResolutionEntry, 
 use crate::vantage::lanes::LaneManager;
 use config::Committee;
 use crypto::PublicKey;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Tracks active views and the contiguous well-formed proposal frontier.
 pub struct Frontier {
@@ -15,6 +15,9 @@ pub struct Frontier {
     active: BTreeSet<View>,
     fixed_well_formed: BTreeMap<View, bool>,
     proposed: BTreeSet<View>,
+    /// A non-quorum tip that contributed to a local READY-mix quarantines its
+    /// author until that prefix (or a containing descendant) becomes core.
+    quarantined_tips: HashMap<PublicKey, crate::vantage::BlockRef>,
     min_live_view: View,
 }
 
@@ -29,6 +32,7 @@ impl Frontier {
             active: BTreeSet::new(),
             fixed_well_formed: BTreeMap::new(),
             proposed: BTreeSet::new(),
+            quarantined_tips: HashMap::new(),
             min_live_view: 1,
         }
     }
@@ -168,8 +172,38 @@ impl Frontier {
         })
     }
 
+    fn refresh_tip_quarantine(&mut self, lm: &LaneManager) {
+        let quorum = self.committee.quorum_threshold();
+        self.quarantined_tips.retain(|author, blocked| {
+            if lm.is_q_available(blocked, quorum) {
+                return false;
+            }
+            let advanced_core = lm
+                .c_candidate(author)
+                .is_some_and(|core| core.1 >= blocked.1 && lm.prefix_contains(&core, blocked));
+            !advanced_core
+        });
+    }
+
+    /// Quarantines each non-quorum tip that contributed to a local READY-mix.
+    /// A later proposal may include that author again once the witnessed prefix
+    /// reaches a quorum or a containing core prefix advances beyond it.
+    pub fn quarantine_tips(&mut self, tips: &Manifest, lm: &LaneManager) {
+        self.refresh_tip_quarantine(lm);
+        let quorum = self.committee.quorum_threshold();
+        for tip in tips {
+            if !lm.is_q_available(tip, quorum) {
+                self.quarantined_tips
+                    .entry(tip.0)
+                    .or_insert_with(|| tip.clone());
+            }
+        }
+    }
+
     /// Builds deduplicated manifests in committee order, with `C` entries before `T` entries.
-    fn build_manifests(&self, view: View, lm: &LaneManager) -> (Manifest, Manifest) {
+    fn build_manifests(&mut self, view: View, lm: &LaneManager) -> (Manifest, Manifest) {
+        self.refresh_tip_quarantine(lm);
+
         let mut seen = HashSet::new();
         let mut c = Manifest::new();
         for author in self.committee.authorities.keys() {
@@ -181,6 +215,9 @@ impl Frontier {
         }
         let mut t = Manifest::new();
         for author in self.committee.authorities.keys() {
+            if self.quarantined_tips.contains_key(author) {
+                continue;
+            }
             if let Some(r) = lm.t_candidate(author) {
                 if seen.insert(r.2.clone()) {
                     t.push(r);

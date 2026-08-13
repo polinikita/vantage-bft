@@ -61,6 +61,8 @@ pub enum Effect {
     BroadcastPropose(ProposalOut),
     BroadcastEcho(EchoOut),
     BroadcastEchoSkip(View),
+    /// Quarantines non-quorum tips carried by a locally emitted READY-mix.
+    QuarantineTips(Manifest),
     BroadcastReady(ReadyOut),
     BroadcastNoReady(View),
     /// Broadcasts a skip vote after the local no-ready and `2f + 1` skip predicates.

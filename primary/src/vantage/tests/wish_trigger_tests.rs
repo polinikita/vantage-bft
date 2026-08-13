@@ -94,7 +94,7 @@ async fn w3_ready_stage_completes_pair_raises_wish_to_u_plus_3() {
         .iter()
         .any(|e| matches!(e, Effect::BroadcastEchoSkip(2))));
 
-    let effects = agb.on_ready_timer(1);
+    let effects = agb.on_ready_timer(1, &mut rep);
     assert!(effects
         .iter()
         .any(|e| matches!(e, Effect::BroadcastNoReady(1))));
@@ -113,8 +113,10 @@ async fn w3_ready_stage_completes_pair_raises_wish_to_u_plus_3() {
 #[tokio::test]
 async fn w3_ready_stage_without_the_pairing_echo_never_raises() {
     let (self_name, _) = authors()[3];
+    let (lm, _store) = new_lane_manager(self_name, ".db_test_w3_ready_no_pair");
+    let mut rep = new_repairer(self_name, &lm);
     let mut agb = new_agb_engine(self_name);
-    let effects = agb.on_ready_timer(1);
+    let effects = agb.on_ready_timer(1, &mut rep);
     assert!(raise_wish_target(&effects).is_none());
 }
 

@@ -721,6 +721,7 @@ impl SimpleItCore {
                 other @ (Effect::BroadcastPropose(_)
                 | Effect::BroadcastEcho(_)
                 | Effect::BroadcastEchoSkip(_)
+                | Effect::QuarantineTips(_)
                 | Effect::BroadcastReady(_)
                 | Effect::BroadcastNoReady(_)
                 | Effect::BroadcastSkipVote(_)

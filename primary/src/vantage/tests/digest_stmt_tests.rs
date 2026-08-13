@@ -323,6 +323,74 @@ async fn buffered_readies_wait_for_body_then_drain_on_serve() {
 }
 
 #[tokio::test]
+async fn buffered_ready_mix_is_replaced_by_its_homogeneous_refinement() {
+    let all = authors();
+    let proposal = sample_proposal(1);
+    let digest = proposal.digest(&test_sid());
+    let sender = all[0].0;
+    let name = all[3].0;
+    for (grade, state_path, lane_path) in [
+        (
+            ReadyGrade::Zero,
+            ".db_test_digest_buffer_mix_refinement_zero",
+            ".db_test_digest_buffer_mix_refinement_zero_lm",
+        ),
+        (
+            ReadyGrade::One,
+            ".db_test_digest_buffer_mix_refinement_one",
+            ".db_test_digest_buffer_mix_refinement_one_lm",
+        ),
+    ] {
+        let mut agb = new_agb_engine(name);
+        let mut rep = dummy_repairer(name, state_path);
+        let (mut lm, _store) = new_lane_manager(name, lane_path);
+        let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
+
+        for observed_grade in [ReadyGrade::Mix, grade] {
+            digest_stmts.on_ready_digest(
+                ReadyDigest {
+                    view: 1,
+                    digest: digest.clone(),
+                    grade: observed_grade,
+                    sender,
+                    wish: 0,
+                },
+                Instant::now(),
+                &mut agb,
+                &mut rep,
+            );
+        }
+        assert_eq!(digest_stmts.buffered_ready_count_for_test(1), 1);
+
+        agb.on_propose(
+            agb.proposer(1),
+            proposal.clone(),
+            Instant::now(),
+            &mut lm,
+            &mut rep,
+        );
+        digest_stmts.on_local_fixed(1, &mut agb, &mut rep);
+        assert_eq!(agb.ready_stage_total(1), 1);
+
+        let mut last = Vec::new();
+        for (other, _) in all.iter().skip(1).take(2) {
+            last = agb.on_ready(ready_msg(proposal.clone(), grade, *other), &mut rep);
+        }
+        match grade {
+            ReadyGrade::Zero => assert!(matches!(
+                sealed_effects(&last).as_slice(),
+                [Outcome::Core(c)] if *c == proposal.c
+            )),
+            ReadyGrade::One => assert!(matches!(
+                sealed_effects(&last).as_slice(),
+                [Outcome::Full(c, t)] if *c == proposal.c && *t == proposal.t
+            )),
+            ReadyGrade::Mix => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
 async fn mismatched_serve_rejected_fetch_retried() {
     let all = authors();
     let true_proposal = sample_proposal(1);

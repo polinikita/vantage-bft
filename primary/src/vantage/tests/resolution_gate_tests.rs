@@ -92,6 +92,59 @@ async fn meta_ok_full_blocks_until_own_target_ready_emitted_then_unblocks() {
 }
 
 #[tokio::test]
+async fn meta_ok_blocks_provisional_mix_until_ready_deadline_closes_it() {
+    let (self_name, _) = authors()[3];
+    let (author_c, _) = authors()[0];
+    let (author_w, _) = authors()[1];
+    let (mut lm, _store) = new_lane_manager(self_name, ".db_test_metaok_provisional_mix");
+    let mut rep = new_repairer(self_name, &lm);
+    let mut agb = new_agb_engine(self_name);
+    let now = std::time::Instant::now();
+
+    let (c_ref, proposal_u) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    let others: Vec<_> = authors()
+        .into_iter()
+        .filter(|(pk, _)| *pk != self_name)
+        .take(2)
+        .collect();
+    for (sender, _) in &others {
+        agb.on_echo(
+            Echo {
+                proposal: proposal_u.clone(),
+                grade: 0,
+                sender: *sender,
+                wish: 0,
+                origin: None,
+                avail: None,
+            },
+            &mut rep,
+        );
+    }
+    assert!(agb.ready_mix_open_for_test(1));
+
+    agb.enter(4, now, &mut lm, &mut rep);
+    let m = Some(ResolutionEntry::Full(1, vec![c_ref], Vec::new()));
+    let proposal_w = carrying_proposal(&mut lm, author_w, 4, m).await;
+    let sender_w = proposer_of(4);
+    let effects = agb.on_propose(sender_w, proposal_w, now, &mut lm, &mut rep);
+    assert!(
+        echo_effect(&effects).is_none(),
+        "a provisional MIX could still refine to grade 0 and must not authorize Full"
+    );
+
+    assert!(agb.on_ready_timer(1, &mut rep).is_empty());
+    assert!(agb.ready_finalized(1));
+    let effects = agb.recheck_all(&mut lm, &mut rep);
+    assert!(
+        effects.iter().any(|effect| {
+            matches!(effect, Effect::BroadcastEcho(EchoOut::Single(echo)) if echo.proposal.view == 4)
+        }),
+        "the same residual MIX is safe evidence after deadline closure"
+    );
+}
+
+#[tokio::test]
 async fn meta_ok_full_passes_once_own_ready_is_grade_one_same_payload() {
     let (self_name, _) = authors()[3];
     let (author_c, _) = authors()[0];
@@ -361,7 +414,7 @@ async fn meta_ok_skip_requires_own_noready_for_target() {
     assert!(echo_effect(&effects).is_none());
 
     agb.on_echo_absolute_timer(1, &mut rep);
-    agb.on_ready_timer(1);
+    agb.on_ready_timer(1, &mut rep);
     let effects = agb.recheck_all(&mut lm, &mut rep);
     let echo = effects
         .iter()
@@ -623,7 +676,7 @@ async fn d6_5_noready_counted_in_ready_stage_census_by_sender() {
     agb.on_noready(1, others[1].0);
     assert_eq!(agb.noready_count(1), 2);
 
-    agb.on_ready_timer(1);
+    agb.on_ready_timer(1, &mut rep);
     assert_eq!(agb.noready_count(1), 3);
     assert_eq!(agb.ready_stage_total(1), 3);
     assert!(

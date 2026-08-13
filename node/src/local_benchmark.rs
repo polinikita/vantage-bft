@@ -260,21 +260,30 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         );
     }
     if withhold > 0 {
-        let reachable = nodes - nodes / 2;
+        let width = withhold_count
+            .unwrap_or(nodes / 2)
+            .min(nodes.saturating_sub(1));
+        let reachable = nodes - width;
+        let shape = if withhold_count.is_some() {
+            format!("staggered width {width}; repair paths unaffected")
+        } else {
+            "staggered halves; repair paths unaffected".to_string()
+        };
         match withhold_at_secs {
             Some(at) => println!(
                 "Withhold: first {} node(s) disseminate payload to only {} of {} nodes \
-                 (staggered halves; repair paths unaffected), active T+{}s..T+{}s",
+                 ({}), active T+{}s..T+{}s",
                 withhold,
                 reachable,
                 nodes,
+                shape,
                 at,
                 at + withhold_for_secs
             ),
             None => println!(
                 "Withhold: first {} node(s) disseminate payload to only {} of {} nodes \
-                 (staggered halves; repair paths unaffected)",
-                withhold, reachable, nodes
+                 ({})",
+                withhold, reachable, nodes, shape
             ),
         }
     }

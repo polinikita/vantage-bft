@@ -25,7 +25,7 @@ async fn exclusivity_vote_then_non_skip_carrier_is_refused() {
         .collect();
     agb.on_echo_skip(1, others[0].0);
     agb.on_echo_skip(1, others[1].0);
-    let effects = agb.on_ready_timer(1);
+    let effects = agb.on_ready_timer(1, &mut rep);
     assert!(
         effects
             .iter()
@@ -66,7 +66,7 @@ async fn exclusivity_endorse_then_vote_gate_refuses() {
 
     agb.enter(1, now, &mut lm, &mut rep);
     agb.on_echo_absolute_timer(1, &mut rep);
-    let effects = agb.on_ready_timer(1);
+    let effects = agb.on_ready_timer(1, &mut rep);
     assert!(!effects
         .iter()
         .any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
@@ -135,13 +135,15 @@ async fn vote_gate_requires_own_noready_first() {
 #[tokio::test]
 async fn vote_gate_requires_echo_skip_quorum() {
     let (self_name, _) = authors()[3];
+    let (lm, _store) = new_lane_manager(self_name, ".db_test_skipvote_requires_echo_skip_q");
+    let mut rep = new_repairer(self_name, &lm);
     let mut agb = new_agb_engine(self_name);
     let others: Vec<_> = authors()
         .into_iter()
         .filter(|(pk, _)| *pk != self_name)
         .collect();
 
-    let effects = agb.on_ready_timer(1);
+    let effects = agb.on_ready_timer(1, &mut rep);
     assert!(!effects
         .iter()
         .any(|e| matches!(e, Effect::BroadcastSkipVote(_))));
@@ -167,11 +169,17 @@ async fn vote_gate_requires_echo_skip_quorum() {
 async fn vote_sent_at_most_once_per_target() {
     let (committee, keys) = Committee::local_benchmark(7, 1, 9500);
     let self_name = keys[0].name;
+    let (lm, _store) = new_lane_manager_with_committee(
+        self_name,
+        ".db_test_skipvote_at_most_once",
+        committee.clone(),
+    );
+    let mut rep = new_repairer_with_committee(self_name, &lm, committee.clone());
     let mut agb = new_agb_engine_with_committee(self_name, committee);
     let others: Vec<_> = keys.iter().skip(1).map(|k| k.name).collect();
     assert_eq!(others.len(), 6);
 
-    agb.on_ready_timer(1);
+    agb.on_ready_timer(1, &mut rep);
     for &sender in &others[..4] {
         let effects = agb.on_echo_skip(1, sender);
         assert!(!effects
@@ -246,7 +254,7 @@ async fn skip_entry_bypasses_nonskip_stance_and_does_not_change_it() {
 
     agb.enter(1, now, &mut lm, &mut rep);
     agb.on_echo_absolute_timer(1, &mut rep);
-    agb.on_ready_timer(1);
+    agb.on_ready_timer(1, &mut rep);
 
     let chain_c = direct_chain(&mut lm, author_c, 1).await;
     let c_ref = block_ref(&chain_c[0]);
@@ -354,7 +362,7 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
         "test setup: the 2f+1=3 echo quorum must fire our own (graded) proposal-ready"
     );
 
-    let effects = agb.on_ready_timer(1);
+    let effects = agb.on_ready_timer(1, &mut rep);
     assert!(effects.is_empty());
 
     for (sender, _) in others.iter().take(3) {

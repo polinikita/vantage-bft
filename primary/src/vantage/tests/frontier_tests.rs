@@ -1,5 +1,7 @@
 use super::common::*;
+use crate::messages::Header;
 use crate::vantage::Frontier;
+use std::collections::BTreeMap;
 
 fn new_frontier() -> Frontier {
     Frontier::new(authors()[3].0, test_committee())
@@ -62,6 +64,59 @@ async fn construction_determinism_from_register_state() {
     let p2 = f2.try_propose(&lm, None).unwrap();
     assert_eq!(p1.c, p2.c);
     assert_eq!(p1.t, p2.t);
+}
+
+#[tokio::test]
+async fn mixed_tip_quarantines_its_author_until_a_quorum_prefix_clears_it() {
+    let proposer1 = crate::vantage::agb::proposer(&test_committee(), 1);
+    let (author, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(proposer1, ".db_test_frontier_mixed_tip_quarantine");
+    let mut frontier = Frontier::new(proposer1, test_committee());
+
+    let first_chain = direct_chain(&mut lm, author, 1).await;
+    let first_ref = block_ref(&first_chain[0]);
+    let first = frontier.propose_view(1, &lm, None).unwrap();
+    assert_eq!(first.t, vec![first_ref.clone()]);
+
+    let second_header = Header::new_vantage(
+        author,
+        2,
+        BTreeMap::new(),
+        first_ref.2.clone(),
+        lm.sid().clone(),
+    );
+    lm.process_publish(author, second_header.clone()).await;
+    let second_ref = block_ref(&second_header);
+    let second = frontier.propose_view(5, &lm, None).unwrap();
+    assert_eq!(
+        second.t,
+        vec![second_ref.clone()],
+        "ordinary inclusion must not suppress a fault-free author's next tip"
+    );
+
+    frontier.quarantine_tips(&second.t, &lm);
+    let third_header = Header::new_vantage(
+        author,
+        3,
+        BTreeMap::new(),
+        second_ref.2.clone(),
+        lm.sid().clone(),
+    );
+    lm.process_publish(author, third_header.clone()).await;
+    let third_ref = block_ref(&third_header);
+    let third = frontier.propose_view(9, &lm, None).unwrap();
+    assert!(
+        third.t.iter().all(|r| r.0 != author),
+        "a mixed non-quorum tip must quarantine fresh tips from the same author"
+    );
+
+    mark_quorum_available(&mut lm, second_ref.clone());
+    let fourth = frontier.propose_view(13, &lm, None).unwrap();
+    assert!(fourth.c.contains(&second_ref));
+    assert!(
+        fourth.t.contains(&third_ref),
+        "a quorum-available quarantine witness must reopen the author's tip slot"
+    );
 }
 
 #[test]

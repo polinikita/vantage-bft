@@ -400,7 +400,9 @@ impl Node {
                 TimerKind::EchoAbsolute => {
                     effects.extend(self.agb.on_echo_absolute_timer(view, &mut self.rep))
                 }
-                TimerKind::ReadyAbsolute => effects.extend(self.agb.on_ready_timer(view)),
+                TimerKind::ReadyAbsolute => {
+                    effects.extend(self.agb.on_ready_timer(view, &mut self.rep))
+                }
             }
         }
         effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
@@ -529,6 +531,10 @@ pub fn drain_local(
                             outbox.push_back((j, Inbound::EchoSkip(view, sender, wish)));
                         }
                     }
+                }
+                Effect::QuarantineTips(tips) => {
+                    let (frontier, lm) = (&mut nodes[idx].frontier, &nodes[idx].lm);
+                    frontier.quarantine_tips(&tips, lm);
                 }
                 Effect::BroadcastReady(mut r) => {
                     r.set_wish(nodes[idx].pacemaker.own_watermark());
