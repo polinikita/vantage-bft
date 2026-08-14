@@ -6,6 +6,13 @@ use config::Committee;
 use crypto::PublicKey;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+#[derive(Clone, Debug)]
+struct TipQuarantine {
+    witness: crate::vantage::BlockRef,
+    probe_attempt: u32,
+    probe_due: View,
+}
+
 /// Tracks active views and the contiguous well-formed proposal frontier.
 pub struct Frontier {
     name: PublicKey,
@@ -15,9 +22,10 @@ pub struct Frontier {
     active: BTreeSet<View>,
     fixed_well_formed: BTreeMap<View, bool>,
     proposed: BTreeSet<View>,
-    /// A non-quorum tip that contributed to a local READY-mix quarantines its
-    /// author until that prefix (or a containing descendant) becomes core.
-    quarantined_tips: HashMap<PublicKey, crate::vantage::BlockRef>,
+    /// A completed-open non-quorum tip suppresses ordinary inclusion for its author.
+    quarantined_tips: HashMap<PublicKey, TipQuarantine>,
+    /// Counts this party's actual proposal broadcasts, independently of view numbers.
+    own_proposal_turn: View,
     min_live_view: View,
 }
 
@@ -33,6 +41,7 @@ impl Frontier {
             fixed_well_formed: BTreeMap::new(),
             proposed: BTreeSet::new(),
             quarantined_tips: HashMap::new(),
+            own_proposal_turn: 0,
             min_live_view: 1,
         }
     }
@@ -143,6 +152,7 @@ impl Frontier {
             return None;
         }
         self.proposed.insert(view);
+        self.own_proposal_turn = self.own_proposal_turn.saturating_add(1);
         let (c, t) = self.build_manifests(view, lm);
         Some(ViewProposal { view, c, t, m })
     }
@@ -163,6 +173,7 @@ impl Frontier {
             return None;
         }
         self.proposed.insert(view);
+        self.own_proposal_turn = self.own_proposal_turn.saturating_add(1);
         let (c, t) = self.build_manifests(view, lm);
         Some(BatchViewProposal {
             view,
@@ -173,29 +184,30 @@ impl Frontier {
     }
 
     fn refresh_tip_quarantine(&mut self, lm: &LaneManager) {
-        let quorum = self.committee.quorum_threshold();
-        self.quarantined_tips.retain(|author, blocked| {
-            if lm.is_q_available(blocked, quorum) {
+        self.quarantined_tips.retain(|author, state| {
+            if lm.is_exact_q_available(&state.witness) {
                 return false;
             }
-            let advanced_core = lm
-                .c_candidate(author)
-                .is_some_and(|core| core.1 >= blocked.1 && lm.prefix_contains(&core, blocked));
+            let advanced_core = lm.c_candidate(author).is_some_and(|core| {
+                core.1 >= state.witness.1 && lm.prefix_contains(&core, &state.witness)
+            });
             !advanced_core
         });
     }
 
-    /// Quarantines each non-quorum tip that contributed to a local READY-mix.
-    /// A later proposal may include that author again once the witnessed prefix
-    /// reaches a quorum or a containing core prefix advances beyond it.
+    /// Quarantines each tip lacking an exact quorum in a completed-open proposal.
+    /// Re-completion preserves the first witness and its retry backoff.
     pub fn quarantine_tips(&mut self, tips: &Manifest, lm: &LaneManager) {
         self.refresh_tip_quarantine(lm);
-        let quorum = self.committee.quorum_threshold();
         for tip in tips {
-            if !lm.is_q_available(tip, quorum) {
+            if !lm.is_exact_q_available(tip) {
                 self.quarantined_tips
                     .entry(tip.0)
-                    .or_insert_with(|| tip.clone());
+                    .or_insert_with(|| TipQuarantine {
+                        witness: tip.clone(),
+                        probe_attempt: 0,
+                        probe_due: self.own_proposal_turn.saturating_add(1),
+                    });
             }
         }
     }
@@ -218,16 +230,68 @@ impl Frontier {
             if self.quarantined_tips.contains_key(author) {
                 continue;
             }
-            if let Some(r) = lm.t_candidate(author) {
+            if let Some(r) = lm
+                .confirmation_candidate(author)
+                .or_else(|| lm.t_candidate(author))
+            {
                 if seen.insert(r.2.clone()) {
                     t.push(r);
                 }
             }
         }
+        let probe = self
+            .committee
+            .authorities
+            .keys()
+            .enumerate()
+            .filter_map(|(committee_index, author)| {
+                let quarantine = self.quarantined_tips.get(author)?;
+                if quarantine.probe_due > self.own_proposal_turn {
+                    return None;
+                }
+                // Once a prefix has a general claim quorum, name that stable
+                // coordinate exactly before chasing a fresher lane head.  Its
+                // exact ECHO census is what makes the reference core-eligible.
+                let candidate = lm
+                    .confirmation_candidate(author)
+                    .or_else(|| lm.t_candidate(author))?;
+                if seen.contains(&candidate.2) {
+                    return None;
+                }
+                Some((quarantine.probe_due, committee_index, *author, candidate))
+            })
+            .min_by_key(|(due, committee_index, _, _)| (*due, *committee_index));
+        if let Some((_, _, author, candidate)) = probe {
+            if seen.insert(candidate.2.clone()) {
+                t.push(candidate);
+                let quarantine = self
+                    .quarantined_tips
+                    .get_mut(&author)
+                    .expect("selected quarantine remains present");
+                let gap = 1u64
+                    .checked_shl(quarantine.probe_attempt.min(63))
+                    .unwrap_or(u64::MAX);
+                quarantine.probe_due = self.own_proposal_turn.saturating_add(gap);
+                quarantine.probe_attempt = quarantine.probe_attempt.saturating_add(1);
+            }
+        }
+        // A probe is selected after ordinary tips, but Formed requires canonical
+        // author order regardless of which path supplied an entry.
+        t.sort_by_key(|r| r.0);
         debug_assert!(
             formed(&self.committee, view, &c, &t, &None),
             "own construction must always be Formed_v"
         );
         (c, t)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quarantine_for_test(
+        &self,
+        author: &PublicKey,
+    ) -> Option<(crate::vantage::BlockRef, u32, View)> {
+        self.quarantined_tips
+            .get(author)
+            .map(|state| (state.witness.clone(), state.probe_attempt, state.probe_due))
     }
 }

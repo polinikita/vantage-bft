@@ -1,6 +1,9 @@
 use super::common::*;
-use crate::vantage::agb::{self, AgbEngine, BatchViewProposal, ProposalOut, ResolutionEntry};
+use crate::vantage::agb::{
+    self, AgbEngine, BatchViewProposal, EchoBatch, ProposalOut, ResolutionEntry,
+};
 use crate::vantage::block;
+use crate::vantage::claim::{AvailClaim, ClaimRef};
 use crate::vantage::control::ControlLog;
 use crate::vantage::resolve::Resolver;
 use crate::vantage::Effect;
@@ -35,6 +38,41 @@ fn make_skip_qualified(
 ) {
     agb.on_echo_skip(u, name);
     agb.on_ready_timer(u, rep);
+}
+
+#[tokio::test]
+async fn batch_echo_carries_claims_over_c_then_t() {
+    let (committee, keys) = batch_committee(9290);
+    let name = keys[0].name;
+    let sender = keys[1].name;
+    let author = keys[2].name;
+    let (mut agb, _lm, mut rep) = setup_engine(&committee, name, ".db_test_batch_echo_avail_claim");
+    let reference = (author, 1, crypto::Digest([91; 32]));
+    let proposal = BatchViewProposal {
+        view: 5,
+        c: vec![reference.clone()],
+        t: Vec::new(),
+        m: vec![ResolutionEntry::Skip(1), ResolutionEntry::Skip(2)],
+    };
+    assert!(ProposalOut::Batch(proposal.clone()).formed(&committee));
+    let mut claim = AvailClaim::with_capacity(1);
+    claim.set_at_tip(0);
+
+    let effects = agb.on_echo_batch(
+        EchoBatch {
+            proposal,
+            grade: 1,
+            sender,
+            wish: 0,
+            avail: Some(claim),
+        },
+        &mut rep,
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::AvailClaimed(s, claims)
+            if *s == sender && claims == &vec![ClaimRef::Exact(reference.clone())]
+    )));
 }
 
 #[tokio::test]

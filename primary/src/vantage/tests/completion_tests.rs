@@ -49,7 +49,9 @@ async fn completion_fires_once_on_mixed_grade_quorum() {
     let (name, _) = authors()[3];
     let mut agb = new_agb_engine(name);
     let mut rep = dummy_repairer(name, ".db_test_completion_mixed_grade");
-    let proposal = sample_proposal(1);
+    let mut proposal = sample_proposal(1);
+    let tip = (authors()[1].0, 2, Digest([2u8; 32]));
+    proposal.t.push(tip.clone());
     let all = authors();
 
     let e1 = agb.on_ready(ready(proposal.clone(), ReadyGrade::One, all[0].0), &mut rep);
@@ -65,6 +67,17 @@ async fn completion_fires_once_on_mixed_grade_quorum() {
     assert!(agb.directed_for_test(1).is_none());
     assert!(sealed_effects(&e3).is_empty());
     assert!(rep.requested_count() > 0);
+    let quarantine_index = e3
+        .iter()
+        .position(
+            |effect| matches!(effect, Effect::QuarantineTips(tips) if tips == &vec![tip.clone()]),
+        )
+        .expect("completed-open transition must quarantine its non-quorum tips");
+    let completed_index = e3
+        .iter()
+        .position(|effect| matches!(effect, Effect::Completed(..)))
+        .expect("the transition completes");
+    assert!(quarantine_index < completed_index);
 
     let e4 = agb.on_ready(ready(proposal, ReadyGrade::Zero, all[3].0), &mut rep);
     assert_eq!(completed_effects(&e4), 0);
@@ -84,6 +97,9 @@ async fn direct_seal_full_on_homogeneous_grade1_quorum() {
     let sealed = sealed_effects(&last);
     assert_eq!(sealed.len(), 1);
     assert!(matches!(&sealed[0], Outcome::Full(c, t) if *c == proposal.c && *t == proposal.t));
+    assert!(last
+        .iter()
+        .all(|effect| !matches!(effect, Effect::QuarantineTips(_))));
 }
 
 #[tokio::test]

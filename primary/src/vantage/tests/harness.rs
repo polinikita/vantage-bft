@@ -40,6 +40,7 @@ pub struct Node {
     pub held_wishes: Vec<(PublicKey, View)>,
     pub metrics: Arc<Metrics>,
     pub ack_watermarks: bool,
+    pub echo_avail_claims: bool,
 }
 
 impl Node {
@@ -94,11 +95,18 @@ impl Node {
             held_wishes: Vec::new(),
             metrics,
             ack_watermarks: false,
+            echo_avail_claims: false,
         }
     }
 
     pub fn with_ack_watermarks(mut self, on: bool) -> Self {
         self.ack_watermarks = on;
+        self
+    }
+
+    pub fn with_echo_avail_claims(mut self, on: bool) -> Self {
+        self.ack_watermarks = on;
+        self.echo_avail_claims = on;
         self
     }
 
@@ -181,6 +189,15 @@ impl Node {
         self.lm.process_ack_availability(availability)
     }
 
+    fn on_claim_availability(
+        &mut self,
+        availability: AckAvailability,
+        _now: Instant,
+    ) -> Vec<Effect> {
+        self.recheck_pending = true;
+        self.lm.process_claim_availability(availability)
+    }
+
     fn record_ack(
         &mut self,
         sender: PublicKey,
@@ -193,6 +210,21 @@ impl Node {
         };
         availability
             .map(|availability| self.on_ack_availability(availability, now))
+            .unwrap_or_default()
+    }
+
+    fn record_claim(
+        &mut self,
+        sender: PublicKey,
+        reference: crate::vantage::block::BlockRef,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let availability = {
+            let mut aggregator = self.ack_aggregator.lock();
+            aggregator.record_ack(sender, reference).availability
+        };
+        availability
+            .map(|availability| self.on_claim_availability(availability, now))
             .unwrap_or_default()
     }
 
@@ -444,7 +476,7 @@ pub fn drain_local(
                 }
                 Effect::BroadcastAck(ack) => {
                     let ack_watermarks = nodes[idx].ack_watermarks;
-                    {
+                    if !nodes[idx].echo_avail_claims {
                         let node = &mut nodes[idx];
                         queue.extend(node.record_ack(node.name, ack.reference(), now));
                     }
@@ -456,13 +488,13 @@ pub fn drain_local(
                         }
                     }
                 }
-                Effect::AvailClaimed(sender, resolved) => {
-                    let refs = nodes[idx].lm.note_claim(sender, &resolved);
+                Effect::AvailClaimed(sender, claims) => {
+                    let refs = nodes[idx].lm.note_claim(sender, &claims);
                     let credited: Vec<_> = refs
                         .into_iter()
                         .flat_map(|r| {
                             let node = &mut nodes[idx];
-                            node.record_ack(sender, r, now)
+                            node.record_claim(sender, r, now)
                         })
                         .collect();
                     queue.extend(credited);
@@ -489,7 +521,7 @@ pub fn drain_local(
                     let node = &mut nodes[idx];
                     let retried = node.lm.retry_pending_avail(&digest);
                     for (sender, r) in retried {
-                        queue.extend(node.record_ack(sender, r, now));
+                        queue.extend(node.record_claim(sender, r, now));
                     }
                     queue.extend(node.rep.on_block_available(digest));
                     node.recheck_pending = true;
@@ -504,6 +536,44 @@ pub fn drain_local(
                 }
                 Effect::BroadcastEcho(mut e) => {
                     e.set_wish(nodes[idx].pacemaker.own_watermark());
+                    if nodes[idx].echo_avail_claims {
+                        match &mut e {
+                            EchoOut::Single(inner) => {
+                                inner.avail =
+                                    Some(nodes[idx].lm.build_avail_claim(&inner.proposal));
+                            }
+                            EchoOut::Batch(inner) => {
+                                inner.avail =
+                                    Some(nodes[idx].lm.build_batch_avail_claim(&inner.proposal));
+                            }
+                        }
+                        let claims = match &e {
+                            EchoOut::Single(inner) => inner
+                                .avail
+                                .as_ref()
+                                .map(|claim| {
+                                    let refs =
+                                        crate::vantage::claim::manifest_refs(&inner.proposal);
+                                    claim.statements(&refs)
+                                })
+                                .unwrap_or_default(),
+                            EchoOut::Batch(inner) => inner
+                                .avail
+                                .as_ref()
+                                .map(|claim| {
+                                    let refs =
+                                        crate::vantage::claim::batch_manifest_refs(&inner.proposal);
+                                    claim.statements(&refs)
+                                })
+                                .unwrap_or_default(),
+                        };
+                        let sender = nodes[idx].name;
+                        let refs = nodes[idx].lm.note_claim(sender, &claims);
+                        for r in refs {
+                            let node = &mut nodes[idx];
+                            queue.extend(node.record_claim(sender, r, now));
+                        }
+                    }
                     let translated = if nodes[idx].digest_statements {
                         match &e {
                             EchoOut::Single(single) => Some(single.to_digest(nodes[idx].agb.sid())),

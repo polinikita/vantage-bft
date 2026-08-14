@@ -92,7 +92,7 @@ async fn ready_grade_mix_fires_at_the_first_split_quorum() {
 }
 
 #[tokio::test]
-async fn initial_ready_mix_quarantines_its_tips_before_broadcast() {
+async fn initial_ready_mix_does_not_quarantine_before_completion() {
     let (name, _) = authors()[3];
     let mut agb = new_agb_engine(name);
     let mut rep = dummy_repairer(name, ".db_test_ready_mix_tip_quarantine");
@@ -104,17 +104,18 @@ async fn initial_ready_mix_quarantines_its_tips_before_broadcast() {
     agb.on_echo(echo(proposal.clone(), 0, all[1].0), &mut rep);
     let effects = agb.on_echo(echo(proposal, 1, all[2].0), &mut rep);
 
-    let quarantine_index = effects
-        .iter()
-        .position(
-            |effect| matches!(effect, Effect::QuarantineTips(tips) if tips == &vec![tip.clone()]),
-        )
-        .expect("an initial READY-mix must quarantine its non-core tips");
-    let ready_index = effects
-        .iter()
-        .position(|effect| matches!(effect, Effect::BroadcastReady(_)))
-        .expect("the initial READY-mix must still broadcast immediately");
-    assert!(quarantine_index < ready_index);
+    assert!(
+        effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::QuarantineTips(_))),
+        "a provisional mixed ECHO census is not yet a completed-open view"
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BroadcastReady(_))),
+        "the initial READY-mix must still broadcast immediately"
+    );
 }
 
 #[tokio::test]
