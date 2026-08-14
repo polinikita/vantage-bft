@@ -36,13 +36,22 @@ and fast-path timeouts.
 
 ### Mandatory crash regression
 
-The protocol CI also runs Vantage with `n=20`, six validators permanently
-absent from genesis, 1,000 offered tx/s, and the built-in AWS RTT matrix. The
-gate requires zero panics, at least 85% committed throughput, and materialized
-p50 latency below five seconds. Run the same check locally with:
+The protocol CI runs a lightweight Vantage crash gate with `n=7`, two
+validators permanently absent from genesis, 200 offered tx/s, and the built-in
+AWS RTT matrix. The gate requires zero panics, at least 85% committed
+throughput, and materialized p50 latency below five seconds. The script keeps
+the larger `n=20`, six-crash, 1,000 tx/s regression as its default for local or
+dedicated benchmark runners:
 
 ```bash
 python3 benchmark/check_protocol_regressions.py --binary target/release/node
+```
+
+To reproduce the smaller CI gate locally:
+
+```bash
+python3 benchmark/check_protocol_regressions.py \
+  --binary target/debug/node --nodes 7 --crash 2 --rate 200
 ```
 
 ## Local Leader-Relay Stress

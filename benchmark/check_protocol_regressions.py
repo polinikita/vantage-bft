@@ -17,6 +17,9 @@ RESULT_PREFIX = "BENCHMARK_RESULT "
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/release/node"))
+    parser.add_argument("--nodes", type=int, default=20)
+    parser.add_argument("--crash", type=int, default=6)
+    parser.add_argument("--rate", type=int, default=1_000)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--duration", type=int, default=10)
     parser.add_argument("--base-port", type=int, default=19_600)
@@ -32,20 +35,30 @@ def parse_result(lines: list[str]) -> dict[str, str]:
 
 def main() -> int:
     args = parse_args()
+    if args.nodes < 4:
+        raise SystemExit("--nodes must be at least 4")
+    if not 0 <= args.crash < args.nodes:
+        raise SystemExit("--crash must be in [0, nodes)")
+    if args.nodes < 3 * args.crash + 1:
+        raise SystemExit("--nodes must satisfy n >= 3f + 1 for --crash=f")
+    if args.rate <= 0:
+        raise SystemExit("--rate must be positive")
+
     binary = args.binary.resolve()
     if not binary.is_file():
         raise SystemExit(f"benchmark binary does not exist: {binary}")
 
-    with tempfile.TemporaryDirectory(prefix="vantage-n20-crash6-") as data_dir:
+    scenario = f"vantage-n{args.nodes}-crash{args.crash}"
+    with tempfile.TemporaryDirectory(prefix=f"{scenario}-") as data_dir:
         command = [
             str(binary),
             "local-benchmark",
             "--nodes",
-            "20",
+            str(args.nodes),
             "--crash",
-            "6",
+            str(args.crash),
             "--rate",
-            "1000",
+            str(args.rate),
             "--protocol",
             "vantage",
             "--warmup",
@@ -72,18 +85,22 @@ def main() -> int:
             lines.append(line.rstrip("\n"))
         returncode = process.wait()
 
+    label = f"n={args.nodes}/f={args.crash}"
     if returncode != 0:
-        raise SystemExit(f"n=20/f=6 crash regression exited with status {returncode}")
-    if not any("Crash fault: 6 of 20 nodes never spawned" in line for line in lines):
-        raise SystemExit("n=20/f=6 crash regression did not activate the permanent fault")
+        raise SystemExit(f"{label} crash regression exited with status {returncode}")
+    fault_message = (
+        f"Crash fault: {args.crash} of {args.nodes} nodes never spawned"
+    )
+    if not any(fault_message in line for line in lines):
+        raise SystemExit(f"{label} crash regression did not activate the permanent fault")
     if not any("real 10-AWS-region RTT matrix" in line for line in lines):
-        raise SystemExit("n=20/f=6 crash regression did not use the AWS RTT matrix")
+        raise SystemExit(f"{label} crash regression did not use the AWS RTT matrix")
 
     result = parse_result(lines)
     failures = []
     if result.get("protocol") != "vantage":
         failures.append(f"protocol={result.get('protocol')!r}")
-    if int(result.get("offered_tps", "0")) != 1_000:
+    if int(result.get("offered_tps", "0")) != args.rate:
         failures.append(f"offered_tps={result.get('offered_tps')!r}")
     if int(result.get("panics", "-1")) != 0:
         failures.append(f"panics={result.get('panics')!r}")
@@ -94,10 +111,12 @@ def main() -> int:
             f"materialized_p50_ms={result.get('materialized_p50_ms')!r} > 5000"
         )
     if failures:
-        raise SystemExit("n=20/f=6 permanent-crash regression failed: " + "; ".join(failures))
+        raise SystemExit(
+            f"{label} permanent-crash regression failed: " + "; ".join(failures)
+        )
 
     print(
-        "REGRESSION_PASS vantage-n20-crash6 "
+        f"REGRESSION_PASS {scenario} "
         f"throughput={float(result['throughput_pct']):.1f}% "
         f"p50={float(result['materialized_p50_ms']):.1f}ms"
     )
