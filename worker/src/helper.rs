@@ -5,10 +5,10 @@ use crypto::{Digest, PublicKey};
 use log::{debug, error, warn};
 use metrics::Metrics;
 use network::{BatchConfig, SimpleSender};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -28,9 +28,11 @@ pub struct Helper {
     rx_request: Receiver<(Vec<Digest>, PublicKey, bool)>,
     /// Sends batches to other workers.
     network: SimpleSender,
-    /// Benchmark-only Byzantine behavior: narrowcast original batches, then
-    /// remain silent when peers ask for repair.
-    suppress_repair: bool,
+    /// Benchmark-only Byzantine behavior: do not serve batches to peers
+    /// excluded from the original narrowcast.
+    suppressed_repair_destinations: Option<HashSet<PublicKey>>,
+    /// Shared time window controlling when repair suppression is active.
+    withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 }
 
 impl Helper {
@@ -44,7 +46,8 @@ impl Helper {
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
-        suppress_repair: bool,
+        suppressed_repair_destinations: Option<HashSet<PublicKey>>,
+        withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -56,7 +59,8 @@ impl Helper {
                     .with_latency(latency_map)
                     .with_metrics(metrics)
                     .with_batching(batch),
-                suppress_repair,
+                suppressed_repair_destinations,
+                withhold_window,
             }
             .run()
             .await;
@@ -65,7 +69,17 @@ impl Helper {
 
     async fn run(&mut self) {
         while let Some((digests, origin, optimistic_leader_repair)) = self.rx_request.recv().await {
-            if self.suppress_repair {
+            let suppress_repair =
+                self.suppressed_repair_destinations
+                    .as_ref()
+                    .is_some_and(|blocked| {
+                        blocked.contains(&origin)
+                            && config::withhold_active(
+                                self.withhold_window.as_deref(),
+                                Instant::now(),
+                            )
+                    });
+            if suppress_repair {
                 debug!(
                     "Suppressing Byzantine repair response for {} requested batch(es)",
                     digests.len()

@@ -392,7 +392,11 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.batch,
-            self.parameters.withhold_repair && self.withheld_destinations.is_some(),
+            self.parameters
+                .withhold_repair
+                .then(|| self.withheld_destinations.clone())
+                .flatten(),
+            self.withhold_window.clone(),
         );
 
         Processor::spawn(

@@ -9,6 +9,7 @@ set -euo pipefail
 : "${N_NODES:?N_NODES must be set}"
 : "${NODE_IP_PREFIX:?NODE_IP_PREFIX must be set}"
 : "${NODE_IP_OFFSET:?NODE_IP_OFFSET must be set}"
+: "${CLIENT_NODE_INDICES:=}"
 : "${TX_RATE_SHARE:?TX_RATE_SHARE must be set}"
 : "${ADVERSARIAL_TX_RATE_SHARE:=0}"
 : "${TX_SIZE:?TX_SIZE must be set}"
@@ -38,7 +39,15 @@ own_addr() {
 
 all_worker_addrs() {
     local i
-    for ((i = 0; i < N_NODES; i++)); do
+    local active_indices=()
+    if [ -n "$CLIENT_NODE_INDICES" ]; then
+        IFS=, read -ra active_indices <<<"$CLIENT_NODE_INDICES"
+    else
+        for ((i = 0; i < N_NODES; i++)); do
+            active_indices+=("$i")
+        done
+    fi
+    for i in "${active_indices[@]}"; do
         echo "${NODE_IP_PREFIX}$((NODE_IP_OFFSET + i)):${TRANSACTIONS_PORT}"
     done
 }

@@ -2,8 +2,7 @@
 
 use crate::error::{ConsensusError, ConsensusResult, DagError, DagResult};
 use crate::primary::{Height, Slot, View};
-use config::{Committee, WorkerId};
-use core::panic;
+use config::{Committee, Stake, WorkerId};
 use crypto::{Blake3Hasher, Digest, Hash, PublicKey, SecretKey, Signature, SignatureService};
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -14,6 +13,18 @@ use std::fmt;
 pub struct Proposal {
     pub header_digest: Digest,
     pub height: Height,
+    /// Exact PoA for a certified tip, or the parent PoA for an optimistic tip.
+    /// Simple-IT reuses this coordinate type and leaves the field empty because
+    /// it carries availability evidence in its own cut protocol.
+    #[serde(default)]
+    pub poa: Option<Certificate>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProposalKind {
+    Genesis,
+    Certified,
+    Optimistic,
 }
 
 impl Proposal {
@@ -21,15 +32,66 @@ impl Proposal {
         Self {
             header_digest,
             height,
+            poa: None,
         }
+    }
+
+    pub fn certified(poa: Certificate) -> Self {
+        Self {
+            header_digest: poa.header_digest.clone(),
+            height: poa.height,
+            poa: Some(poa),
+        }
+    }
+
+    pub fn optimistic(header: &Header) -> Self {
+        Self {
+            header_digest: header.id.clone(),
+            height: header.height,
+            poa: Some(header.parent_cert.clone()),
+        }
+    }
+
+    pub fn genesis(author: PublicKey, committee: &Committee) -> Self {
+        Self::certified(Certificate::genesis_for(author, committee))
+    }
+
+    /// Verifies the proof shape and signatures without requiring the tip body.
+    pub fn verify(&self, lane: &PublicKey, committee: &Committee) -> DagResult<ProposalKind> {
+        let poa = self
+            .poa
+            .as_ref()
+            .ok_or_else(|| DagError::InvalidProposal(self.header_digest.clone()))?;
+        ensure!(
+            poa.author == *lane,
+            DagError::InvalidProposal(self.header_digest.clone())
+        );
+        poa.verify(committee)?;
+
+        if self.height == 0 {
+            ensure!(
+                poa.is_genesis_for(lane, committee) && self.header_digest == poa.header_digest,
+                DagError::InvalidProposal(self.header_digest.clone())
+            );
+            return Ok(ProposalKind::Genesis);
+        }
+        if poa.height == self.height && poa.header_digest == self.header_digest {
+            return Ok(ProposalKind::Certified);
+        }
+        if poa.height.checked_add(1) == Some(self.height) {
+            return Ok(ProposalKind::Optimistic);
+        }
+        Err(DagError::InvalidProposal(self.header_digest.clone()))
     }
 }
 
 impl PartialEq for Proposal {
     fn eq(&self, other: &Self) -> bool {
-        self.height == other.height && self.header_digest == other.header_digest
+        self.digest() == other.digest()
     }
 }
+
+impl Eq for Proposal {}
 
 impl fmt::Debug for Proposal {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
@@ -46,8 +108,23 @@ impl fmt::Display for Proposal {
 impl Hash for Proposal {
     fn digest(&self) -> Digest {
         let mut hasher = Blake3Hasher::new();
+        // Preserve Simple-IT's pre-existing coordinate digest. Autobahn cuts
+        // always carry `Some(PoA)` and use the evidence-bound domain below.
+        if self.poa.is_none() {
+            hasher.update(&self.header_digest.0);
+            hasher.update(&self.height.to_le_bytes());
+            return Digest(hasher.finalize().into());
+        }
+        hasher.update(b"autobahn-tip-v1");
         hasher.update(&self.header_digest.0);
         hasher.update(&self.height.to_le_bytes());
+        match &self.poa {
+            Some(poa) => {
+                hasher.update(&[1]);
+                hasher.update(&poa.evidence_digest().0);
+            }
+            None => unreachable!("proof-free proposals returned above"),
+        };
         Digest(hasher.finalize().into())
     }
 }
@@ -115,42 +192,26 @@ pub fn verify_commit(consensus_message: &ConsensusMessage, committee: &Committee
             slot,
             view,
             qc,
-            proposals: _,
+            proposals,
         } => {
-            let mut hasher = Blake3Hasher::new();
-            hasher.update(&slot.to_le_bytes());
-            hasher.update(&view.to_le_bytes());
-            hasher.update(&0_u8.to_le_bytes());
-            let prepare_id = Digest(hasher.finalize().into());
+            let prepare_id = prepare_digest(*slot, *view, proposals);
 
             debug!(
                 "PrepareIDCheck has slot: {}, view: {}, digest: {}",
                 slot, view, prepare_id
             );
 
-            if qc.votes.len() == committee.size() {
-                if prepare_id != qc.id {
-                    return false;
-                }
-                qc.verify(committee).is_ok()
+            if qc.id == prepare_id {
+                qc.verify_at(committee, committee.fast_threshold()).is_ok()
             } else {
-                // Slow-path Confirm votes include the Prepare identifier.
-                let mut hasher = Blake3Hasher::new();
-                hasher.update(&slot.to_le_bytes());
-                hasher.update(&view.to_le_bytes());
-                hasher.update(&prepare_id.0);
-                hasher.update(&1_u8.to_le_bytes());
-                let confirm_id = Digest(hasher.finalize().into());
+                let confirm_id = confirm_digest(*slot, *view, &prepare_id);
 
                 debug!(
                     "ConfirmIDCheck for slot: {}, view: {}, qc_dig {:?} -> has digest: {}",
                     slot, view, prepare_id, confirm_id
                 );
 
-                if confirm_id != qc.id {
-                    panic!("ids don't match");
-                }
-                qc.verify(committee).is_ok()
+                confirm_id == qc.id && qc.verify(committee).is_ok()
             }
         }
         _ => false,
@@ -163,13 +224,9 @@ pub fn verify_confirm(consensus_message: &ConsensusMessage, committee: &Committe
             slot,
             view,
             qc,
-            proposals: _,
+            proposals,
         } => {
-            let mut hasher = Blake3Hasher::new();
-            hasher.update(&slot.to_le_bytes());
-            hasher.update(&view.to_le_bytes());
-            hasher.update(&0_u8.to_le_bytes());
-            let prepare_id = Digest(hasher.finalize().into());
+            let prepare_id = prepare_digest(*slot, *view, proposals);
 
             if prepare_id != qc.id {
                 return false;
@@ -182,40 +239,59 @@ pub fn verify_confirm(consensus_message: &ConsensusMessage, committee: &Committe
 }
 
 pub fn proposal_digest(consensus_message: &ConsensusMessage) -> Digest {
-    let mut hasher = Blake3Hasher::new();
-    match consensus_message {
+    let proposals = match consensus_message {
         ConsensusMessage::Prepare {
             slot: _,
             view: _,
             tc: _,
             qc_ticket: _,
             proposals,
-        } => {
-            for proposal in proposals.values() {
-                hasher.update(&proposal.header_digest.0);
-            }
-        }
+        } => proposals,
         ConsensusMessage::Confirm {
             slot: _,
             view: _,
             qc: _,
             proposals,
-        } => {
-            for proposal in proposals.values() {
-                hasher.update(&proposal.header_digest.0);
-            }
-        }
+        } => proposals,
         ConsensusMessage::Commit {
             slot: _,
             view: _,
             qc: _,
             proposals,
-        } => {
-            for proposal in proposals.values() {
-                hasher.update(&proposal.header_digest.0);
-            }
-        }
+        } => proposals,
+    };
+    proposals_digest(proposals)
+}
+
+/// Canonical, map-order-independent digest of an Autobahn lane cut.
+pub fn proposals_digest(proposals: &HashMap<PublicKey, Proposal>) -> Digest {
+    let mut entries: Vec<_> = proposals.iter().collect();
+    entries.sort_unstable_by_key(|(author, _)| **author);
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(b"autobahn-cut-v1");
+    hasher.update(&(entries.len() as u64).to_le_bytes());
+    for (author, proposal) in entries {
+        hasher.update(&author.0);
+        hasher.update(&proposal.digest().0);
     }
+    Digest(hasher.finalize().into())
+}
+
+pub fn prepare_digest(slot: Slot, view: View, proposals: &HashMap<PublicKey, Proposal>) -> Digest {
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(b"autobahn-prepare-v1");
+    hasher.update(&slot.to_le_bytes());
+    hasher.update(&view.to_le_bytes());
+    hasher.update(&proposals_digest(proposals).0);
+    Digest(hasher.finalize().into())
+}
+
+pub fn confirm_digest(slot: Slot, view: View, prepare_id: &Digest) -> Digest {
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(b"autobahn-confirm-v1");
+    hasher.update(&slot.to_le_bytes());
+    hasher.update(&view.to_le_bytes());
+    hasher.update(&prepare_id.0);
     Digest(hasher.finalize().into())
 }
 
@@ -228,36 +304,25 @@ impl Hash for ConsensusMessage {
                 view,
                 tc: _,
                 qc_ticket: _,
-                proposals: _,
-            } => {
-                hasher.update(&slot.to_le_bytes());
-                hasher.update(&view.to_le_bytes());
-                // Prepare variant tag.
-                hasher.update(&0_u8.to_le_bytes());
-            }
+                proposals,
+            } => return prepare_digest(*slot, *view, proposals),
             ConsensusMessage::Confirm {
                 slot,
                 view,
-                qc,
-                proposals: _,
-            } => {
-                hasher.update(&slot.to_le_bytes());
-                hasher.update(&view.to_le_bytes());
-                hasher.update(&qc.id.0);
-                // Confirm variant tag.
-                hasher.update(&1_u8.to_le_bytes());
-            }
+                qc: _,
+                proposals,
+            } => return confirm_digest(*slot, *view, &prepare_digest(*slot, *view, proposals)),
             ConsensusMessage::Commit {
                 slot,
                 view,
                 qc,
-                proposals: _,
+                proposals,
             } => {
+                hasher.update(b"autobahn-commit-v1");
                 hasher.update(&slot.to_le_bytes());
                 hasher.update(&view.to_le_bytes());
                 hasher.update(&qc.id.0);
-                // Commit variant tag.
-                hasher.update(&2_u8.to_le_bytes());
+                hasher.update(&proposals_digest(proposals).0);
             }
         }
         Digest(hasher.finalize().into())
@@ -272,67 +337,7 @@ impl std::hash::Hash for ConsensusMessage {
 
 impl PartialEq for ConsensusMessage {
     fn eq(&self, other: &Self) -> bool {
-        match self {
-            ConsensusMessage::Prepare {
-                slot,
-                view,
-                tc,
-                qc_ticket: _,
-                proposals,
-            } => match other {
-                ConsensusMessage::Prepare {
-                    slot: other_slot,
-                    view: other_view,
-                    tc: other_tc,
-                    qc_ticket: _other_ticket,
-                    proposals: other_proposals,
-                } => {
-                    slot == other_slot
-                        && view == other_view
-                        && tc == other_tc
-                        && proposals == other_proposals
-                }
-                _ => false,
-            },
-            ConsensusMessage::Confirm {
-                slot,
-                view,
-                qc,
-                proposals,
-            } => match other {
-                ConsensusMessage::Confirm {
-                    slot: other_slot,
-                    view: other_view,
-                    qc: other_qc,
-                    proposals: other_proposals,
-                } => {
-                    slot == other_slot
-                        && view == other_view
-                        && qc == other_qc
-                        && proposals == other_proposals
-                }
-                _ => false,
-            },
-            ConsensusMessage::Commit {
-                slot,
-                view,
-                qc,
-                proposals,
-            } => match other {
-                ConsensusMessage::Commit {
-                    slot: other_slot,
-                    view: other_view,
-                    qc: other_qc,
-                    proposals: other_proposals,
-                } => {
-                    slot == other_slot
-                        && view == other_view
-                        && qc == other_qc
-                        && proposals == other_proposals
-                }
-                _ => false,
-            },
-        }
+        self.digest() == other.digest()
     }
 }
 
@@ -514,19 +519,7 @@ impl Header {
         committee
             .authorities
             .keys()
-            .map(|pk| {
-                (
-                    *pk,
-                    Proposal {
-                        header_digest: Header {
-                            author: *pk,
-                            ..Self::default()
-                        }
-                        .digest(),
-                        height: 0,
-                    },
-                )
-            })
+            .map(|pk| (*pk, Proposal::genesis(*pk, committee)))
             .collect()
     }
 
@@ -541,6 +534,27 @@ impl Header {
                 .worker(&self.author, worker_id)
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
+
+        let active_instances =
+            self.consensus_messages
+                .iter()
+                .try_fold(0usize, |active, (advertised, message)| {
+                    ensure!(
+                        advertised == &message.digest(),
+                        DagError::MalformedHeader(self.id.clone())
+                    );
+                    Ok::<_, DagError>(
+                        active
+                            + usize::from(matches!(
+                                message,
+                                ConsensusMessage::Prepare { .. } | ConsensusMessage::Confirm { .. }
+                            )),
+                    )
+                })?;
+        ensure!(
+            active_instances == self.num_active_instances,
+            DagError::MalformedHeader(self.id.clone())
+        );
 
         // Vantage validates unsigned headers through `vantage::block::block_ok`.
         self.signature
@@ -602,6 +616,20 @@ impl Hash for Header {
                 hasher.update(&[0u8]);
             }
         };
+
+        // Ride-sharing is an Autobahn-only optimization. When present, bind
+        // the embedded consensus values and their advertised count to the car
+        // signature. Empty maps retain the legacy/Vantage header digest.
+        if !self.consensus_messages.is_empty() {
+            let mut messages: Vec<_> = self.consensus_messages.values().collect();
+            messages.sort_unstable_by_key(|message| message.digest());
+            hasher.update(b"autobahn-rideshare-v1");
+            hasher.update(&(self.num_active_instances as u64).to_le_bytes());
+            hasher.update(&(messages.len() as u64).to_le_bytes());
+            for message in messages {
+                hasher.update(&message.digest().0);
+            }
+        }
 
         Digest(hasher.finalize().into())
     }
@@ -795,11 +823,17 @@ impl Vote {
 
 impl Hash for Vote {
     fn digest(&self) -> Digest {
-        let mut hasher = Blake3Hasher::new();
-        hasher.update(&self.id.0);
-        hasher.update(&self.height.to_le_bytes());
-        Digest(hasher.finalize().into())
+        car_vote_digest(self.origin, self.height, &self.id)
     }
+}
+
+pub fn car_vote_digest(author: PublicKey, height: Height, header_digest: &Digest) -> Digest {
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(b"autobahn-car-vote-v1");
+    hasher.update(&author.0);
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&header_digest.0);
+    Digest(hasher.finalize().into())
 }
 
 impl fmt::Debug for Vote {
@@ -854,49 +888,49 @@ impl Certificate {
         committee
             .authorities
             .keys()
-            .map(|name| Self {
-                header_digest: Header {
-                    author: *name,
-                    ..Header::genesis(committee)
-                }
-                .digest(),
-                author: *name,
-                ..Self::default()
-            })
+            .map(|name| Self::genesis_for(*name, committee))
             .collect()
     }
 
     pub fn genesis_cert(committee: &Committee) -> Self {
+        let author = *committee
+            .authorities
+            .keys()
+            .next()
+            .expect("committee cannot be empty");
+        Self::genesis_for(author, committee)
+    }
+
+    pub fn genesis_for(author: PublicKey, _committee: &Committee) -> Self {
         Self {
-            header_digest: Header::genesis(committee).digest(),
-            ..Self::default()
+            author,
+            header_digest: Header {
+                author,
+                ..Header::default()
+            }
+            .digest(),
+            height: 0,
+            votes: Vec::new(),
         }
+    }
+
+    pub fn is_genesis_for(&self, author: &PublicKey, committee: &Committee) -> bool {
+        committee.stake(author) > 0
+            && self == &Self::genesis_for(*author, committee)
+            && self.votes.is_empty()
     }
 
     pub fn genesis_certs(committee: &Committee) -> HashMap<PublicKey, Self> {
         committee
             .authorities
             .keys()
-            .map(|name| {
-                (
-                    *name,
-                    Self {
-                        header_digest: Header {
-                            author: *name,
-                            ..Header::genesis(committee)
-                        }
-                        .digest(),
-                        author: *name,
-                        ..Self::default()
-                    },
-                )
-            })
+            .map(|name| (*name, Self::genesis_for(*name, committee)))
             .collect()
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
         // Genesis certificates are always valid.
-        if Self::genesis(committee).contains(self) {
+        if self.is_genesis_for(&self.author, committee) {
             return Ok(());
         }
         let mut weight = 0;
@@ -909,18 +943,33 @@ impl Certificate {
             weight += voting_rights;
         }
         ensure!(
-            weight >= committee.quorum_threshold(),
+            weight >= committee.validity_threshold(),
             DagError::CertificateRequiresQuorum
         );
 
-        let mut digests = Vec::with_capacity(self.votes.len());
-        for _ in &self.votes {
-            let mut hasher = Blake3Hasher::new();
-            hasher.update(&self.header_digest.0);
-            hasher.update(&self.height().to_le_bytes());
-            digests.push(Digest(hasher.finalize().into()));
-        }
+        let digest = car_vote_digest(self.author, self.height, &self.header_digest);
+        let digests = vec![digest; self.votes.len()];
         Signature::verify_batch_multi(&digests, &self.votes).map_err(DagError::from)
+    }
+
+    /// Hashes the complete evidence canonically, independent of vote arrival order.
+    pub fn evidence_digest(&self) -> Digest {
+        let mut votes: Vec<_> = self.votes.iter().collect();
+        votes.sort_unstable_by_key(|(author, _)| *author);
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"autobahn-poa-v1");
+        hasher.update(&self.author.0);
+        hasher.update(&self.height.to_le_bytes());
+        hasher.update(&self.header_digest.0);
+        hasher.update(&(votes.len() as u64).to_le_bytes());
+        for (author, signature) in votes {
+            hasher.update(&author.0);
+            let encoded =
+                bincode::serialize(signature).expect("signature serialization cannot fail");
+            hasher.update(&(encoded.len() as u64).to_le_bytes());
+            hasher.update(&encoded);
+        }
+        Digest(hasher.finalize().into())
     }
 
     pub fn height(&self) -> Height {
@@ -934,11 +983,7 @@ impl Certificate {
 
 impl Hash for Certificate {
     fn digest(&self) -> Digest {
-        let mut hasher = Blake3Hasher::new();
-        hasher.update(&self.header_digest.0);
-        hasher.update(&self.height().to_le_bytes());
-
-        Digest(hasher.finalize().into())
+        car_vote_digest(self.author, self.height, &self.header_digest)
     }
 }
 
@@ -956,11 +1001,13 @@ impl fmt::Debug for Certificate {
 
 impl PartialEq for Certificate {
     fn eq(&self, other: &Self) -> bool {
-        let mut ret = self.header_digest == other.header_digest;
-        ret &= self.height() == other.height();
-        ret
+        self.author == other.author
+            && self.header_digest == other.header_digest
+            && self.height == other.height
     }
 }
+
+impl Eq for Certificate {}
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct QC {
@@ -975,6 +1022,11 @@ impl QC {
 
     #[allow(clippy::result_large_err)]
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
+        self.verify_at(committee, committee.quorum_threshold())
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn verify_at(&self, committee: &Committee, threshold: Stake) -> ConsensusResult<()> {
         if Self::genesis(committee) == *self {
             return Ok(());
         }
@@ -988,10 +1040,7 @@ impl QC {
             used.insert(*name);
             weight += voting_rights;
         }
-        ensure!(
-            weight >= committee.quorum_threshold(),
-            ConsensusError::QCRequiresQuorum
-        );
+        ensure!(weight >= threshold, ConsensusError::QCRequiresQuorum);
 
         Signature::verify_batch(&self.id, &self.votes).map_err(ConsensusError::from)
     }
@@ -999,7 +1048,19 @@ impl QC {
 
 impl Hash for QC {
     fn digest(&self) -> Digest {
-        let hasher = Blake3Hasher::new();
+        let mut votes: Vec<_> = self.votes.iter().collect();
+        votes.sort_unstable_by_key(|(author, _)| *author);
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"autobahn-qc-v1");
+        hasher.update(&self.id.0);
+        hasher.update(&(votes.len() as u64).to_le_bytes());
+        for (author, signature) in votes {
+            hasher.update(&author.0);
+            let encoded =
+                bincode::serialize(signature).expect("signature serialization cannot fail");
+            hasher.update(&(encoded.len() as u64).to_le_bytes());
+            hasher.update(&encoded);
+        }
         Digest(hasher.finalize().into())
     }
 }
@@ -1011,10 +1072,12 @@ impl fmt::Debug for QC {
 }
 
 impl PartialEq for QC {
-    fn eq(&self, _other: &Self) -> bool {
-        false
+    fn eq(&self, other: &Self) -> bool {
+        self.digest() == other.digest()
     }
 }
+
+impl Eq for QC {}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Timeout {
@@ -1059,13 +1122,54 @@ impl Timeout {
         );
         self.signature.verify(&self.digest(), &self.author)?;
 
+        if let Some(high_qc) = &self.high_qc {
+            let well_formed = match high_qc {
+                ConsensusMessage::Confirm { slot, view, .. } => {
+                    *slot == self.slot && *view <= self.view && verify_confirm(high_qc, committee)
+                }
+                ConsensusMessage::Prepare { .. } | ConsensusMessage::Commit { .. } => false,
+            };
+            ensure!(well_formed, DagError::MalformedTimeout(self.digest()));
+        }
+
+        if let Some(high_prop) = &self.high_prop {
+            let well_formed = matches!(
+                high_prop,
+                ConsensusMessage::Prepare { slot, view, .. }
+                    if *slot == self.slot && *view <= self.view
+            );
+            ensure!(well_formed, DagError::MalformedTimeout(self.digest()));
+        }
+
         Ok(())
     }
 }
 
 impl Hash for Timeout {
     fn digest(&self) -> Digest {
-        let hasher = Blake3Hasher::new();
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"autobahn-timeout-v1");
+        hasher.update(&self.slot.to_le_bytes());
+        hasher.update(&self.view.to_le_bytes());
+        hasher.update(&self.author.0);
+        match &self.high_qc {
+            Some(qc) => {
+                hasher.update(&[1]);
+                hasher.update(&qc.digest().0);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        };
+        match &self.high_prop {
+            Some(proposal) => {
+                hasher.update(&[1]);
+                hasher.update(&proposal.digest().0);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        };
         Digest(hasher.finalize().into())
     }
 }
@@ -1115,10 +1219,15 @@ pub struct TC {
 }
 
 impl PartialEq for TC {
-    fn eq(&self, _other: &Self) -> bool {
-        true
+    fn eq(&self, other: &Self) -> bool {
+        self.slot == other.slot && self.view == other.view && self.timeouts == other.timeouts
     }
 }
+
+impl Eq for TC {}
+
+type ViewChangeCandidate = (View, Digest, HashMap<PublicKey, Proposal>, Vec<PublicKey>);
+type PrepareReports = (Stake, HashMap<PublicKey, Proposal>, Vec<PublicKey>);
 
 impl TC {
     pub fn new(_committee: &Committee, slot: Slot, view: View, timeouts: Vec<Timeout>) -> Self {
@@ -1133,71 +1242,110 @@ impl TC {
         Self::default()
     }
 
-    pub fn get_winning_proposals(&self, committee: &Committee) -> HashMap<PublicKey, Proposal> {
-        let mut winning_proposals = HashMap::new();
-        let mut winning_view = 0;
-        let mut prepared_feq: HashMap<Digest, u32> = HashMap::new();
+    /// Returns the paper's deterministic view-change winner together with the
+    /// replicas whose evidence proves possession of that Prepare's optimistic
+    /// tips. The candidate with the highest view wins; a PrepareQC wins a tie
+    /// against f+1 matching high-Prepare reports, exactly as in Section 5.3.
+    pub fn get_winning_proposal(
+        &self,
+        committee: &Committee,
+    ) -> Option<(HashMap<PublicKey, Proposal>, Vec<PublicKey>)> {
+        let mut highest_qc: Option<ViewChangeCandidate> = None;
 
-        // Prefer the highest justified proposal set.
         for timeout in &self.timeouts {
-            if let Some(qc) = &timeout.high_qc {
-                match qc {
-                    ConsensusMessage::Confirm {
-                        slot: _,
-                        view: other_view,
-                        qc: _,
-                        proposals,
-                    } if other_view > &winning_view => {
-                        winning_view = timeout.view;
-                        winning_proposals = proposals.clone();
-                    }
-
-                    ConsensusMessage::Commit {
-                        slot: _,
-                        view: _,
-                        qc: _,
-                        proposals,
-                    } => {
-                        winning_proposals = proposals.clone();
-                        break;
-                    }
-
-                    _ => {}
-                }
+            let Some(message) = &timeout.high_qc else {
+                continue;
             };
-            if let Some(prepare) = &timeout.high_prop {
-                if let ConsensusMessage::Prepare {
-                    slot: _,
+            let (slot, view, qc, proposals) = match message {
+                ConsensusMessage::Confirm {
+                    slot,
                     view,
-                    tc: _,
-                    qc_ticket: _,
+                    qc,
                     proposals,
-                } = prepare
-                {
-                    if view > &winning_view {
-                        let weight = prepared_feq.entry(prepare.digest()).or_default();
-                        *weight += committee.stake(&timeout.author);
-
-                        if *weight >= committee.validity_threshold() {
-                            winning_view = *view;
-                            winning_proposals = proposals.clone();
-                        }
-                    }
-                }
+                } => (*slot, *view, qc, proposals),
+                ConsensusMessage::Prepare { .. } | ConsensusMessage::Commit { .. } => continue,
+            };
+            if slot != self.slot {
+                continue;
+            }
+            let digest = message.digest();
+            let replace = highest_qc
+                .as_ref()
+                .is_none_or(|(best_view, best_digest, ..)| {
+                    (view, &digest) > (*best_view, best_digest)
+                });
+            if replace {
+                let mut sources: Vec<_> = qc.votes.iter().map(|(author, _)| *author).collect();
+                sources.sort_unstable();
+                sources.dedup();
+                highest_qc = Some((view, digest, proposals.clone(), sources));
             }
         }
-        winning_proposals
+
+        let mut prepares: HashMap<(View, Digest), PrepareReports> = HashMap::new();
+        for timeout in &self.timeouts {
+            let Some(prepare) = &timeout.high_prop else {
+                continue;
+            };
+            let ConsensusMessage::Prepare {
+                slot,
+                view,
+                proposals,
+                ..
+            } = prepare
+            else {
+                continue;
+            };
+            if *slot != self.slot || *view > self.view {
+                continue;
+            }
+            let entry = prepares
+                .entry((*view, prepare.digest()))
+                .or_insert_with(|| (0, proposals.clone(), Vec::new()));
+            entry.0 += committee.stake(&timeout.author);
+            entry.2.push(timeout.author);
+        }
+
+        let highest_prepare = prepares
+            .into_iter()
+            .filter(|(_, (stake, _, _))| *stake >= committee.validity_threshold())
+            .max_by(|((view_a, digest_a), _), ((view_b, digest_b), _)| {
+                (view_a, digest_a).cmp(&(view_b, digest_b))
+            })
+            .map(|((view, digest), (_, proposals, mut sources))| {
+                sources.sort_unstable();
+                sources.dedup();
+                (view, digest, proposals, sources)
+            });
+
+        let winner = match (highest_qc, highest_prepare) {
+            (Some(qc), Some(prepare)) if prepare.0 > qc.0 => prepare,
+            (Some(qc), _) => qc,
+            (None, Some(prepare)) => prepare,
+            (None, None) => return None,
+        };
+        Some((winner.2, winner.3))
+    }
+
+    pub fn get_winning_proposals(&self, committee: &Committee) -> HashMap<PublicKey, Proposal> {
+        self.get_winning_proposal(committee)
+            .map(|(proposals, _)| proposals)
+            .unwrap_or_default()
     }
 
     #[allow(clippy::result_large_err)]
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
-        if Self::genesis(committee) == *self {
+        if self.slot == 0 && self.view == 0 && self.timeouts.is_empty() {
             return Ok(());
         }
 
         let mut weight = 0;
         let mut used = HashSet::new();
         for timeout in self.timeouts.iter() {
+            ensure!(
+                timeout.slot == self.slot && timeout.view == self.view,
+                ConsensusError::InvalidTimeout(timeout.clone())
+            );
             let name = &timeout.author;
             ensure!(!used.contains(name), ConsensusError::AuthorityReuse(*name));
             let voting_rights = committee.stake(name);
@@ -1220,5 +1368,298 @@ impl TC {
 impl fmt::Debug for TC {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "TC({}, {:?})", self.slot, self.view)
+    }
+}
+
+#[cfg(test)]
+mod autobahn_alignment_tests {
+    use super::*;
+
+    fn poa_with_votes(count: usize) -> (Committee, Certificate) {
+        let committee = crate::common::committee();
+        let header = crate::common::header();
+        let mut certificate = crate::common::certificate(&header);
+        certificate.votes.truncate(count);
+        (committee, certificate)
+    }
+
+    #[test]
+    fn poa_uses_f_plus_one_not_consensus_quorum() {
+        let (committee, enough) = poa_with_votes(2);
+        assert_eq!(committee.validity_threshold(), 2);
+        assert_eq!(committee.quorum_threshold(), 3);
+        assert!(enough.verify(&committee).is_ok());
+
+        let (_, too_small) = poa_with_votes(1);
+        assert!(too_small.verify(&committee).is_err());
+    }
+
+    #[test]
+    fn lane_proof_cannot_be_transplanted_to_another_author() {
+        let (committee, certificate) = poa_with_votes(2);
+        let proposal = Proposal::certified(certificate.clone());
+        assert_eq!(
+            proposal.verify(&certificate.author, &committee).unwrap(),
+            ProposalKind::Certified
+        );
+        let other = committee
+            .authorities
+            .keys()
+            .copied()
+            .find(|author| *author != certificate.author)
+            .unwrap();
+        assert!(proposal.verify(&other, &committee).is_err());
+    }
+
+    #[test]
+    fn genesis_proof_requires_a_committee_lane() {
+        let committee = crate::common::committee();
+        let outsider = PublicKey([91; 32]);
+        assert!(Certificate::genesis_for(outsider, &committee)
+            .verify(&committee)
+            .is_err());
+    }
+
+    #[test]
+    fn cut_digest_is_canonical_across_hashmap_order() {
+        let committee = crate::common::committee();
+        let first = Header::genesis_proposals(&committee);
+        let mut entries: Vec<_> = first.clone().into_iter().collect();
+        entries.reverse();
+        let second: HashMap<_, _> = entries.into_iter().collect();
+        assert_eq!(proposals_digest(&first), proposals_digest(&second));
+        assert_eq!(prepare_digest(7, 3, &first), prepare_digest(7, 3, &second));
+    }
+
+    #[test]
+    fn proof_free_simpleit_coordinate_keeps_its_legacy_digest() {
+        let proposal = Proposal {
+            header_digest: Digest([17; 32]),
+            height: 9,
+            poa: None,
+        };
+        let mut expected = Blake3Hasher::new();
+        expected.update(&proposal.header_digest.0);
+        expected.update(&proposal.height.to_le_bytes());
+        assert_eq!(proposal.digest(), Digest(expected.finalize().into()));
+    }
+
+    #[test]
+    fn direct_consensus_vote_rejects_non_members() {
+        let committee = crate::common::committee();
+        let vote = ConsensusVote {
+            author: PublicKey([91; 32]),
+            slot: 3,
+            digest: Digest([27; 32]),
+            sig: Signature::default(),
+        };
+        assert!(vote.verify(&committee).is_err());
+    }
+
+    #[test]
+    fn prepare_qc_is_bound_to_the_complete_cut() {
+        let committee = crate::common::committee();
+        let keys = crate::common::keys();
+        let cut = Header::genesis_proposals(&committee);
+        let prepare_id = prepare_digest(7, 2, &cut);
+        let votes = keys
+            .iter()
+            .take(committee.quorum_threshold() as usize)
+            .map(|(author, secret)| (*author, Signature::new(&prepare_id, secret)))
+            .collect();
+        let qc = QC {
+            id: prepare_id,
+            votes,
+        };
+        let confirm = ConsensusMessage::Confirm {
+            slot: 7,
+            view: 2,
+            qc: qc.clone(),
+            proposals: cut.clone(),
+        };
+        assert!(verify_confirm(&confirm, &committee));
+
+        let mut changed = cut;
+        let lane = *changed.keys().next().unwrap();
+        changed.get_mut(&lane).unwrap().height += 1;
+        let forged = ConsensusMessage::Confirm {
+            slot: 7,
+            view: 2,
+            qc,
+            proposals: changed,
+        };
+        assert!(!verify_confirm(&forged, &committee));
+    }
+
+    #[test]
+    fn ride_shared_consensus_is_bound_by_the_car_signature_digest() {
+        let committee = crate::common::committee();
+        let mut header = crate::common::header();
+        let prepare = ConsensusMessage::Prepare {
+            slot: 1,
+            view: 1,
+            tc: None,
+            qc_ticket: None,
+            proposals: Header::genesis_proposals(&committee),
+        };
+        header
+            .consensus_messages
+            .insert(prepare.digest(), prepare.clone());
+        header.num_active_instances = 1;
+        let with_prepare = header.digest();
+        header.consensus_messages.clear();
+        assert_ne!(with_prepare, header.digest());
+    }
+
+    #[test]
+    fn ride_shared_map_keys_and_active_count_are_canonical() {
+        let committee = crate::common::committee();
+        let keys = crate::common::keys();
+        let (author, secret) = keys.into_iter().next().unwrap();
+        let prepare = ConsensusMessage::Prepare {
+            slot: 1,
+            view: 1,
+            tc: None,
+            qc_ticket: None,
+            proposals: Header::genesis_proposals(&committee),
+        };
+        let mut header = Header {
+            author,
+            height: 1,
+            consensus_messages: HashMap::from([(prepare.digest(), prepare.clone())]),
+            num_active_instances: 1,
+            signature: Some(Signature::default()),
+            ..Header::default()
+        };
+        header.id = header.digest();
+        header.signature = Some(Signature::new(&header.id, &secret));
+        assert!(header.verify(&committee).is_ok());
+
+        header.consensus_messages = HashMap::from([(Digest([88; 32]), prepare)]);
+        assert_eq!(header.digest(), header.id, "map keys are not wire values");
+        assert!(header.verify(&committee).is_err());
+
+        header.consensus_messages.clear();
+        header.num_active_instances = 1;
+        header.id = header.digest();
+        header.signature = Some(Signature::new(&header.id, &secret));
+        assert!(header.verify(&committee).is_err());
+    }
+
+    #[test]
+    fn timeout_high_qc_must_be_a_prepare_qc_not_a_commit_qc() {
+        let committee = crate::common::committee();
+        let (author, secret) = crate::common::keys().into_iter().next().unwrap();
+        let commit = ConsensusMessage::Commit {
+            slot: 4,
+            view: 2,
+            qc: QC::default(),
+            proposals: Header::genesis_proposals(&committee),
+        };
+        let timeout = Timeout::new_from_key(None, Some(commit), 4, 2, author, &secret);
+        assert!(timeout.verify(&committee).is_err());
+    }
+
+    #[test]
+    fn tc_selects_f_plus_one_matching_prepare_reports() {
+        let committee = crate::common::committee();
+        let keys = crate::common::keys();
+        let proposals = Header::genesis_proposals(&committee);
+        let prepare = ConsensusMessage::Prepare {
+            slot: 9,
+            view: 3,
+            tc: None,
+            qc_ticket: None,
+            proposals: proposals.clone(),
+        };
+        let timeouts = keys
+            .iter()
+            .take(committee.validity_threshold() as usize)
+            .map(|(author, _)| Timeout {
+                slot: 9,
+                view: 4,
+                high_qc: None,
+                high_prop: Some(prepare.clone()),
+                author: *author,
+                signature: Signature::default(),
+            })
+            .collect();
+        let tc = TC::new(&committee, 9, 4, timeouts);
+        let (winner, sources) = tc.get_winning_proposal(&committee).unwrap();
+        assert_eq!(winner, proposals);
+        assert_eq!(sources.len() as u32, committee.validity_threshold());
+    }
+
+    #[test]
+    fn tc_compares_qc_and_prepare_views_and_gives_qc_the_tie() {
+        let committee = crate::common::committee();
+        let keys = crate::common::keys();
+        let qc_cut = Header::genesis_proposals(&committee);
+        let mut prepare_cut = qc_cut.clone();
+        let lane = *prepare_cut.keys().next().unwrap();
+        prepare_cut.get_mut(&lane).unwrap().header_digest = Digest([33; 32]);
+
+        let high_prepare = ConsensusMessage::Prepare {
+            slot: 11,
+            view: 3,
+            tc: None,
+            qc_ticket: None,
+            proposals: prepare_cut.clone(),
+        };
+        let high_qc = |view| ConsensusMessage::Confirm {
+            slot: 11,
+            view,
+            qc: QC::default(),
+            proposals: qc_cut.clone(),
+        };
+        let make_tc = |qc_view| {
+            TC::new(
+                &committee,
+                11,
+                4,
+                keys.iter()
+                    .take(committee.validity_threshold() as usize)
+                    .enumerate()
+                    .map(|(index, (author, _))| Timeout {
+                        slot: 11,
+                        view: 4,
+                        high_qc: (index == 0).then(|| high_qc(qc_view)),
+                        high_prop: Some(high_prepare.clone()),
+                        author: *author,
+                        signature: Signature::default(),
+                    })
+                    .collect(),
+            )
+        };
+
+        assert_eq!(make_tc(2).get_winning_proposals(&committee), prepare_cut);
+        assert_eq!(make_tc(3).get_winning_proposals(&committee), qc_cut);
+    }
+
+    #[test]
+    fn timeout_digest_binds_reported_evidence() {
+        let committee = crate::common::committee();
+        let author = *committee.authorities.keys().next().unwrap();
+        let mut first = Timeout {
+            slot: 4,
+            view: 2,
+            high_qc: None,
+            high_prop: None,
+            author,
+            signature: Signature::default(),
+        };
+        let baseline = first.digest();
+        first.high_prop = Some(ConsensusMessage::Prepare {
+            slot: 4,
+            view: 2,
+            tc: None,
+            qc_ticket: None,
+            proposals: Header::genesis_proposals(&committee),
+        });
+        assert_ne!(baseline, first.digest());
+        assert_ne!(
+            TC::genesis(&committee),
+            TC::new(&committee, 4, 2, vec![first])
+        );
     }
 }

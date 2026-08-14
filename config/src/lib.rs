@@ -95,6 +95,22 @@ impl Protocol {
         }
     }
 
+    /// Autobahn's optimistic variant uses all-to-all vote dissemination.
+    pub fn implies_all_to_all(&self) -> bool {
+        matches!(self, Protocol::AutobahnOptimistic)
+    }
+
+    /// Minimum proof-calibrated round timeout, expressed in multiples of Delta.
+    /// Vantage uses its own AGB/control timers directly from `delta_ms`.
+    pub fn minimum_round_timeout_deltas(&self) -> Option<u64> {
+        match self {
+            Protocol::AutobahnOptimistic | Protocol::AutobahnSeamless => Some(10),
+            Protocol::SimpleIt => Some(8),
+            Protocol::SimpleItBracha => Some(5),
+            Protocol::Vantage => None,
+        }
+    }
+
     /// Canonical label for `protocol_info` and the `--protocol` CLI value.
     pub fn label(&self) -> &'static str {
         match self {
@@ -325,8 +341,9 @@ pub struct Parameters {
     #[serde(default)]
     pub withhold_receivers: Vec<PublicKey>,
 
-    /// Benchmark-only Byzantine behavior: selected publishers ignore payload
-    /// repair requests after narrowcasting their original lane batches.
+    /// Benchmark-only Byzantine behavior: selected publishers ignore lane
+    /// header, certificate, and batch repair requests after narrowcasting the
+    /// original publication.
     #[serde(default)]
     pub withhold_repair: bool,
 
@@ -746,7 +763,8 @@ impl LatencyTable {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
-            timeout_delay: 1_000,
+            // The default protocol is Autobahn optimistic and its proof uses 10 * Delta.
+            timeout_delay: 2_000,
             header_size: 1_000,
             max_header_delay: 100,
             gc_depth: 50,
@@ -789,7 +807,7 @@ impl Default for Parameters {
             fast_path_timeout: 500,
             use_ride_share: false,
             car_timeout: 2000,
-            all_to_all: false,
+            all_to_all: true,
 
             // Asynchrony defaults.
             simulate_asynchrony: false,
@@ -842,7 +860,7 @@ impl Import for Parameters {}
 impl Export for Parameters {}
 
 impl Parameters {
-    /// Reconcile `use_optimistic_tips` with the selected protocol.
+    /// Reconcile protocol-derived mode flags with the selected protocol.
     pub fn reconcile_protocol(&mut self) {
         if let Some(implied) = self.protocol.implied_optimistic_tips() {
             if self.use_optimistic_tips != implied {
@@ -852,6 +870,28 @@ impl Parameters {
                     self.use_optimistic_tips, self.protocol, implied
                 );
                 self.use_optimistic_tips = implied;
+            }
+        }
+        if self.protocol.implies_all_to_all() && !self.all_to_all {
+            warn!(
+                "all_to_all=false is inconsistent with protocol {:?}; \
+                 protocol wins, using all_to_all=true",
+                self.protocol
+            );
+            self.all_to_all = true;
+        }
+        if let Some(multiplier) = self.protocol.minimum_round_timeout_deltas() {
+            let minimum = self.delta_ms.saturating_mul(multiplier);
+            if self.timeout_delay < minimum {
+                warn!(
+                    "timeout_delay={} ms is below the proof-calibrated {}*Delta={} ms for {:?}; using {} ms",
+                    self.timeout_delay,
+                    multiplier,
+                    minimum,
+                    self.protocol,
+                    minimum
+                );
+                self.timeout_delay = minimum;
             }
         }
     }
@@ -989,7 +1029,7 @@ impl Parameters {
                 ),
             }
             if self.withhold_repair {
-                info!("Selected Byzantine publishers suppress payload repair responses");
+                info!("Selected Byzantine publishers suppress all lane repair responses");
             }
         }
         if !self.late_header_publishers.is_empty() {
@@ -1552,6 +1592,53 @@ impl Default for KeyPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimistic_autobahn_implies_all_to_all() {
+        let mut optimistic = Parameters {
+            protocol: Protocol::AutobahnOptimistic,
+            all_to_all: false,
+            ..Parameters::default()
+        };
+        optimistic.reconcile_protocol();
+        assert!(optimistic.all_to_all);
+
+        let mut seamless = Parameters {
+            protocol: Protocol::AutobahnSeamless,
+            all_to_all: false,
+            ..Parameters::default()
+        };
+        seamless.reconcile_protocol();
+        assert!(!seamless.all_to_all);
+    }
+
+    #[test]
+    fn protocol_round_timeouts_are_proof_calibrated() {
+        for (protocol, multiplier) in [
+            (Protocol::AutobahnOptimistic, 10),
+            (Protocol::AutobahnSeamless, 10),
+            (Protocol::SimpleIt, 8),
+            (Protocol::SimpleItBracha, 5),
+        ] {
+            let mut parameters = Parameters {
+                protocol,
+                delta_ms: 200,
+                timeout_delay: 1,
+                ..Parameters::default()
+            };
+            parameters.reconcile_protocol();
+            assert_eq!(parameters.timeout_delay, multiplier * 200);
+        }
+
+        let mut vantage = Parameters {
+            protocol: Protocol::Vantage,
+            delta_ms: 200,
+            timeout_delay: 123,
+            ..Parameters::default()
+        };
+        vantage.reconcile_protocol();
+        assert_eq!(vantage.timeout_delay, 123);
+    }
 
     /// Generated Vantage parameters retain protocol and latency settings.
     #[test]

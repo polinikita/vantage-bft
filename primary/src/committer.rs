@@ -19,7 +19,7 @@ use network::BatchConfig;
 #[cfg(feature = "benchmark")]
 use network::SimpleSender;
 use std::borrow::BorrowMut;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "benchmark")]
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,6 +36,27 @@ struct State {
     log: HashMap<Slot, ConsensusMessage>,
     // Last executed slot.
     last_executed_slot: Slot,
+}
+
+/// Deterministically interleaves per-lane suffixes while preserving the order
+/// within every lane. The cut's `HashMap` iteration order must never influence
+/// the replicated output log.
+fn zip_lane_suffixes(mut suffixes: Vec<(PublicKey, Vec<Header>)>) -> Vec<Header> {
+    suffixes.sort_unstable_by_key(|(author, _)| *author);
+    let mut suffixes: Vec<_> = suffixes
+        .into_iter()
+        .map(|(author, headers)| (author, VecDeque::from(headers)))
+        .collect();
+    let total = suffixes.iter().map(|(_, headers)| headers.len()).sum();
+    let mut output = Vec::with_capacity(total);
+    while output.len() < total {
+        for (_, headers) in &mut suffixes {
+            if let Some(header) = headers.pop_front() {
+                output.push(header);
+            }
+        }
+    }
+    output
 }
 
 impl State {
@@ -135,9 +156,9 @@ impl Committer {
             // Queue commits until slots are contiguous.
             state.log.insert(slot, commit_message);
 
-            while state.log.contains_key(&(state.last_executed_slot + 1)) {
-                let current_commit_message =
-                    state.log.get(&(state.last_executed_slot + 1)).unwrap();
+            while let Some(current_commit_message) =
+                state.log.remove(&(state.last_executed_slot + 1))
+            {
                 debug!(
                     "Currently executing slot {:?}",
                     state.last_executed_slot + 1
@@ -149,8 +170,11 @@ impl Committer {
                     proposals,
                 } = current_commit_message
                 {
-                    for (pk, proposal) in proposals {
-                        let stop_height = *state.last_executed_heights.get(pk).unwrap();
+                    let mut ordered_proposals: Vec<_> = proposals.into_iter().collect();
+                    ordered_proposals.sort_unstable_by_key(|(author, _)| *author);
+                    let mut suffixes = Vec::with_capacity(ordered_proposals.len());
+                    for (pk, proposal) in ordered_proposals {
+                        let stop_height = *state.last_executed_heights.get(&pk).unwrap();
                         // Skip already executed proposals.
                         if proposal.height <= stop_height {
                             debug!("skipping this proposal because it's too old");
@@ -164,53 +188,53 @@ impl Committer {
                             .expect("should have ancestors by now");
 
                         if proposal.height > stop_height {
-                            state.last_executed_heights.insert(*pk, proposal.height);
+                            state.last_executed_heights.insert(pk, proposal.height);
+                            self.synchronizer.mark_executed(pk, proposal.height);
                         }
 
-                        for header in headers {
-                            debug!("Committed {}", header);
-                            #[cfg(feature = "benchmark")]
-                            {
-                                for digest in header.payload.keys() {
-                                    // Parsed by benchmark tooling.
-                                    debug!("Committed {} -> {:?}", header, digest);
-                                }
+                        suffixes.push((pk, headers));
+                    }
 
-                                // Use this commit instant for worker latency measurement.
-                                let commit_millis = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .expect("Failed to measure time")
-                                    .as_millis()
-                                    as u64;
+                    for header in zip_lane_suffixes(suffixes) {
+                        debug!("Committed {}", header);
+                        #[cfg(feature = "benchmark")]
+                        {
+                            for digest in header.payload.keys() {
+                                // Parsed by benchmark tooling.
+                                debug!("Committed {} -> {:?}", header, digest);
+                            }
 
-                                // Notify local workers of committed batches.
-                                let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
-                                for (digest, worker_id) in header.payload.iter() {
-                                    by_worker
-                                        .entry(*worker_id)
-                                        .or_default()
-                                        .push(digest.clone());
-                                }
-                                for (worker_id, digests) in by_worker {
-                                    if let Some(address) = self.worker_addresses.get(&worker_id) {
-                                        let bytes =
-                                            bincode::serialize(&PrimaryWorkerMessage::Committed(
-                                                commit_millis,
-                                                digests,
-                                            ))
-                                            .expect("Failed to serialize committed message");
-                                        self.network
-                                            .send_typed(*address, Bytes::from(bytes), "Committed")
-                                            .await;
-                                    }
+                            // Use this commit instant for worker latency measurement.
+                            let commit_millis = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Failed to measure time")
+                                .as_millis() as u64;
+
+                            // Notify local workers of committed batches.
+                            let mut by_worker: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
+                            for (digest, worker_id) in header.payload.iter() {
+                                by_worker
+                                    .entry(*worker_id)
+                                    .or_default()
+                                    .push(digest.clone());
+                            }
+                            for (worker_id, digests) in by_worker {
+                                if let Some(address) = self.worker_addresses.get(&worker_id) {
+                                    let bytes = bincode::serialize(
+                                        &PrimaryWorkerMessage::Committed(commit_millis, digests),
+                                    )
+                                    .expect("Failed to serialize committed message");
+                                    self.network
+                                        .send_typed(*address, Bytes::from(bytes), "Committed")
+                                        .await;
                                 }
                             }
-                            debug!("Finished Commit");
-                            if let Err(e) = self.tx_output.send(header.clone()).await {
-                                debug!("Failed to send block through the output channel: {}", e);
-                            }
-                            debug!("Finish upcall");
                         }
+                        debug!("Finished Commit");
+                        if let Err(e) = self.tx_output.send(header.clone()).await {
+                            debug!("Failed to send block through the output channel: {}", e);
+                        }
+                        debug!("Finish upcall");
                     }
                     state.last_executed_slot += 1;
                 }
@@ -228,9 +252,68 @@ impl Committer {
                 Some(commit_message) = self.rx_commit_message.recv() => {
                     self.process_commit_message(state.borrow_mut(), commit_message).await;
                 },
-                Some(_) = self.rx_deliver.recv() => {}
-
+                Some(_) = self.rx_deliver.recv() => {},
+                // Every producer is owned by another in-process actor. During an
+                // orderly runtime shutdown they may all disappear before this task;
+                // an exhausted select is actor termination, not a protocol failure.
+                else => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zip_lane_suffixes;
+    use crate::messages::Header;
+    use crypto::Digest;
+
+    #[test]
+    fn lane_zip_is_deterministic_and_preserves_each_lane() {
+        let mut authors: Vec<_> = crate::common::keys()
+            .into_iter()
+            .take(3)
+            .map(|(author, _)| author)
+            .collect();
+        authors.sort_unstable();
+        let lane = |author, heights: &[u64]| {
+            heights
+                .iter()
+                .map(|height| Header {
+                    author,
+                    height: *height,
+                    id: Digest([*height as u8; 32]),
+                    ..Header::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let forward = vec![
+            (authors[0], lane(authors[0], &[1, 2, 3])),
+            (authors[1], lane(authors[1], &[4])),
+            (authors[2], lane(authors[2], &[5, 6])),
+        ];
+        let mut reverse = forward.clone();
+        reverse.reverse();
+
+        let first = zip_lane_suffixes(forward);
+        let second = zip_lane_suffixes(reverse);
+        let coordinates = |headers: Vec<Header>| {
+            headers
+                .into_iter()
+                .map(|header| (header.author, header.height))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(coordinates(first.clone()), coordinates(second));
+        assert_eq!(
+            coordinates(first),
+            vec![
+                (authors[0], 1),
+                (authors[1], 4),
+                (authors[2], 5),
+                (authors[0], 2),
+                (authors[2], 6),
+                (authors[0], 3),
+            ]
+        );
     }
 }

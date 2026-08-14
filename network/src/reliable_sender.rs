@@ -13,6 +13,7 @@ use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
@@ -41,6 +42,26 @@ type BufferedEntry = (Bytes, ReplyTargets, VolatileKey);
 
 /// Default maximum delay between reconnect attempts, in milliseconds.
 const DEFAULT_RETRY_BACKOFF_MAX_MS: u64 = 2_000;
+
+/// Set immediately before an embedding process tears down its Tokio runtime.
+///
+/// Runtime shutdown cancels connection actors and their callers in an arbitrary
+/// order. A caller that happens to run after its connection actor was cancelled
+/// must park until it is cancelled too, rather than reporting a false network
+/// failure during otherwise successful benchmark teardown.
+static PROCESS_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Marks the current process as intentionally tearing down its Tokio runtime.
+///
+/// Normal node processes never call this: an unexpectedly closed internal
+/// connection channel therefore remains a fatal invariant violation.
+pub fn begin_process_shutdown() {
+    PROCESS_SHUTTING_DOWN.store(true, Ordering::Release);
+}
+
+fn process_is_shutting_down() -> bool {
+    PROCESS_SHUTTING_DOWN.load(Ordering::Acquire)
+}
 
 /// Maintains one TCP connection per peer and retries messages until acknowledgement or
 /// cancellation.
@@ -145,22 +166,38 @@ impl ReliableSender {
         tx
     }
 
-    /// Reliably send a message to a specific address.
-    pub async fn send(&mut self, address: SocketAddr, data: Bytes) -> CancelHandler {
-        let (sender, receiver) = oneshot::channel();
+    /// Queue a message for one connection actor.
+    async fn enqueue(&mut self, address: SocketAddr, message: InnerMessage) {
         if !self.connections.contains_key(&address) {
             let tx = self.spawn_connection(address);
             self.connections.insert(address, tx);
         }
-        self.connections
+        if self
+            .connections
             .get(&address)
             .unwrap()
-            .send(InnerMessage {
+            .send(message)
+            .await
+            .is_err()
+        {
+            if process_is_shutting_down() {
+                std::future::pending::<()>().await;
+            }
+            panic!("Failed to send internal message");
+        }
+    }
+
+    /// Reliably send a message to a specific address.
+    pub async fn send(&mut self, address: SocketAddr, data: Bytes) -> CancelHandler {
+        let (sender, receiver) = oneshot::channel();
+        self.enqueue(
+            address,
+            InnerMessage {
                 data,
                 class: SendClass::Durable(sender),
-            })
-            .await
-            .expect("Failed to send internal message");
+            },
+        )
+        .await;
         receiver
     }
 
@@ -255,12 +292,14 @@ impl ReliableSender {
         }
         let tx = self.connections.get(&address).unwrap();
         if self.volatile_soft_cap == 0 {
-            tx.send(InnerMessage {
-                data,
-                class: SendClass::Volatile(key),
-            })
-            .await
-            .expect("Failed to send internal message");
+            self.enqueue(
+                address,
+                InnerMessage {
+                    data,
+                    class: SendClass::Volatile(key),
+                },
+            )
+            .await;
             return;
         }
         let depth = tx.max_capacity().saturating_sub(tx.capacity());
@@ -276,6 +315,7 @@ impl ReliableSender {
             // The depth check normally handles this case first.
             Err(TrySendError::Full(_)) => self.record_volatile_shed(address, key),
             // A closed connection channel is a sender error, not a dropped message.
+            Err(TrySendError::Closed(_)) if process_is_shutting_down() => {}
             Err(TrySendError::Closed(_)) => panic!("Failed to send internal message"),
         }
     }
@@ -331,19 +371,14 @@ impl ReliableSender {
 
     /// Send a durable message without returning a cancellation handler.
     pub async fn send_detached(&mut self, address: SocketAddr, data: Bytes) {
-        if !self.connections.contains_key(&address) {
-            let tx = self.spawn_connection(address);
-            self.connections.insert(address, tx);
-        }
-        self.connections
-            .get(&address)
-            .unwrap()
-            .send(InnerMessage {
+        self.enqueue(
+            address,
+            InnerMessage {
                 data,
                 class: SendClass::DurableDetached,
-            })
-            .await
-            .expect("Failed to send internal message");
+            },
+        )
+        .await;
     }
 
     /// Typed variant of `send_detached` (see `send_typed`).

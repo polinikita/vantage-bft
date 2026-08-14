@@ -112,7 +112,12 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         'partition_nodes': 1,
     }
     node_params = {
-        'timeout_delay': 5_000,  # ms
+        'timeout_delay': {
+            'autobahn-optimistic': 2_000,
+            'autobahn-seamless': 2_000,
+            'simple-it': 1_600,
+            'simple-it-bracha': 1_000,
+        }.get(protocol, 1_000),  # proof-calibrated for Delta = 200 ms
         'header_size': 32,  # bytes
         'max_header_delay': 5_000,  # ms
         'gc_depth': 50,  # rounds
@@ -124,14 +129,15 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         'use_parallel_proposals': True,
         'k': 4,
         'use_fast_path': True,
-        'fast_path_timeout': 5_000,
+        'fast_path_timeout': 500,
         'use_ride_share': False,
-        'car_timeout': 5_000,
-        'delta_ms': 150,  # ms, Vantage AGB/control-log delay
+        'car_timeout': 2_000,
+        'delta_ms': 200,  # 160 ms one-way netem bound + 40 ms processing margin
         # `node run` interprets positive RTT as one-way link latency.
         'mimic_latency_ms': int(mimic_latency_ms),
-        # `--all-to-all` enables direct communication between every pair.
-        'all_to_all': all_to_all,
+        # Optimistic Autobahn is all-to-all by definition. The task flag also
+        # permits explicit all-to-all experiments with another protocol mode.
+        'all_to_all': all_to_all or protocol == 'autobahn-optimistic',
         # Enable per-peer transport batching by default.
         'batch_messages': batch_messages,
         'batch_max_bytes': batch_max_bytes,
@@ -178,7 +184,12 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
             'partition_nodes': 0,
         }
         node_params = {
-            'timeout_delay': 5_000,  # ms, Autobahn core only
+            'timeout_delay': {
+                'autobahn-optimistic': 2_000,
+                'autobahn-seamless': 2_000,
+                'simple-it': 1_600,
+                'simple-it-bracha': 1_000,
+            }.get(protocol, 1_000),  # proof-calibrated for Delta = 200 ms
             'header_size': 32,  # bytes
             'max_header_delay': int(max_header_delay),  # ms
             'gc_depth': 50,  # rounds, Autobahn core only
@@ -191,10 +202,10 @@ def campaign(ctx, debug=False, protocol='vantage', latency='aws', mimic_latency_
             'use_parallel_proposals': True,
             'k': 4,
             'use_fast_path': True,
-            'fast_path_timeout': 5_000,
+            'fast_path_timeout': 500,
             'use_ride_share': False,
-            'car_timeout': 5_000,
-            'delta_ms': 150,  # ms, Vantage AGB/control-log delay
+            'car_timeout': 2_000,
+            'delta_ms': 200,  # 160 ms one-way netem bound + 40 ms processing margin
             'simulate_asynchrony': False,
             'asynchrony_start': 15_000,  # ms
             'asynchrony_duration': 3_000,  # ms

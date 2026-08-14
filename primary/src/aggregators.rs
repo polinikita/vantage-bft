@@ -40,6 +40,10 @@ impl VotesAggregator {
             return Ok((true, false));
         }
         let author = vote.author;
+        ensure!(
+            committee.stake(&author) > 0,
+            DagError::UnknownAuthority(author)
+        );
         // Count each authority once.
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 
@@ -64,7 +68,11 @@ impl VotesAggregator {
     }
 
     pub fn get(&mut self) -> DagResult<Option<Certificate>> {
-        if self.get_once {
+        // A passenger QC can complete before its ambassador car reaches the
+        // f+1 availability threshold. Looking for the PoA at that point must
+        // not consume the one-shot delivery; consume it only once a
+        // certificate actually exists.
+        if self.get_once && self.diss_cert.is_some() {
             self.get_once = false;
             Ok(self.diss_cert.clone())
         } else {
@@ -106,10 +114,12 @@ impl QCMaker {
         vote: (Digest, Signature),
         committee: &Committee,
     ) -> DagResult<(bool, Option<QC>)> {
+        let voting_rights = committee.stake(&author);
+        ensure!(voting_rights > 0, DagError::UnknownAuthority(author));
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 
         self.votes.push((author, vote.1));
-        self.weight += committee.stake(&author);
+        self.weight += voting_rights;
 
         if self.try_fast {
             return self.check_fast_qc(vote.0, committee);
@@ -211,5 +221,84 @@ impl TCMaker {
             }));
         }
         Ok(None)
+    }
+
+    pub fn weight(&self) -> Stake {
+        self.weight
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TCMaker, VotesAggregator};
+    use crate::messages::{Timeout, Vote};
+
+    #[test]
+    fn early_car_certificate_lookup_does_not_consume_later_poa() {
+        let committee = crate::common::committee();
+        let keys = crate::common::keys();
+        let header = crate::common::header();
+        let mut maker = VotesAggregator::new();
+
+        assert!(maker.get().unwrap().is_none());
+        for (author, _) in keys.iter().take(committee.validity_threshold() as usize) {
+            let vote = Vote {
+                id: header.id.clone(),
+                height: header.height,
+                origin: header.author,
+                author: *author,
+                signature: Default::default(),
+                consensus_votes: Vec::new(),
+            };
+            maker.append(vote, &committee, &header).unwrap();
+        }
+
+        assert!(maker.get().unwrap().is_some());
+        assert!(maker.get().unwrap().is_none());
+    }
+
+    #[test]
+    fn timeout_weight_exposes_the_f_plus_one_mutiny_boundary() {
+        let committee = crate::common::committee();
+        let keys = crate::common::keys();
+        let mut maker = TCMaker::new();
+        let validity = committee.validity_threshold() as usize;
+        let quorum = committee.quorum_threshold() as usize;
+
+        for (author, _) in keys.iter().take(validity) {
+            assert!(maker
+                .append(
+                    Timeout {
+                        slot: 7,
+                        view: 3,
+                        high_qc: None,
+                        high_prop: None,
+                        author: *author,
+                        signature: Default::default(),
+                    },
+                    &committee,
+                )
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(maker.weight(), committee.validity_threshold());
+
+        let mut tc = None;
+        for (author, _) in keys.iter().skip(validity).take(quorum - validity) {
+            tc = maker
+                .append(
+                    Timeout {
+                        slot: 7,
+                        view: 3,
+                        high_qc: None,
+                        high_prop: None,
+                        author: *author,
+                        signature: Default::default(),
+                    },
+                    &committee,
+                )
+                .unwrap();
+        }
+        assert_eq!(tc.unwrap().timeouts.len(), quorum);
     }
 }

@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
                     Arg::new("withhold-repair")
                         .long("withhold-repair")
                         .action(ArgAction::SetTrue)
-                        .help("Make selected Byzantine publishers ignore payload repair requests"),
+                        .help("Make selected Byzantine publishers ignore all lane repair requests"),
                 )
                 .arg(
                     Arg::new("late-header-publishers")
@@ -294,9 +294,11 @@ async fn main() -> Result<()> {
                     Arg::new("timeout-delay-ms")
                         .long("timeout-delay-ms")
                         .value_name("INT")
-                        .default_value("1000")
                         .action(ArgAction::Set)
-                        .help("Autobahn consensus timeout in milliseconds"),
+                        .help(
+                            "Override the proof-calibrated round timeout in milliseconds \
+                             (defaults: Autobahn 10*Delta, Simple-IT Opt 8*Delta, Bracha 5*Delta)",
+                        ),
                 )
                 .arg(
                     Arg::new("fast-path-timeout-ms")
@@ -369,7 +371,10 @@ async fn main() -> Result<()> {
                     Arg::new("all-to-all")
                         .long("all-to-all")
                         .action(ArgAction::SetTrue)
-                        .help("Use all-to-all Autobahn vote and acknowledgement exchange"),
+                        .help(
+                            "Use all-to-all Autobahn vote and acknowledgement exchange \
+                             (implied by autobahn-optimistic)",
+                        ),
                 )
                 .arg(
                     Arg::new("echo-avail-claims")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and plot the n=10 clean/data-lane-drop five-protocol local study."""
+"""Run and plot the n=10 clean/Byzantine-lane five-protocol local study."""
 
 from __future__ import annotations
 
@@ -61,10 +61,6 @@ PROTOCOLS = [
             "--protocol",
             "autobahn-optimistic",
             "--all-to-all",
-            "--timeout-delay-ms",
-            "5000",
-            "--fast-path-timeout-ms",
-            "5000",
         ),
         "#D55E00",
         "s",
@@ -75,10 +71,6 @@ PROTOCOLS = [
         (
             "--protocol",
             "autobahn-seamless",
-            "--timeout-delay-ms",
-            "5000",
-            "--fast-path-timeout-ms",
-            "5000",
         ),
         "#E69F00",
         "^",
@@ -119,14 +111,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--duration", type=int, default=30)
     parser.add_argument("--drop-publishers", type=int, default=3)
-    parser.add_argument("--drop-receivers", type=int, default=3)
+    parser.add_argument("--drop-receivers", type=int, default=7)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--accept-pct", type=float, default=95.0)
     parser.add_argument("--slope-fraction", type=float, default=0.01)
     parser.add_argument("--slope-floor", type=float, default=100.0)
     parser.add_argument("--base-port", type=int, default=14_000)
     parser.add_argument("--protocols", default=",".join(p.key for p in PROTOCOLS))
-    parser.add_argument("--widths", default="0,1,2,3")
+    parser.add_argument("--widths", default="0,3,6,7")
     parser.add_argument("--no-width", action="store_true")
     parser.add_argument("--keep-data", action="store_true")
     parser.add_argument(
@@ -140,7 +132,7 @@ def parse_args() -> argparse.Namespace:
         args.warmup = 1
         args.duration = 2
         args.repeats = 1
-        args.widths = "0,3"
+        args.widths = "0,7"
     args.rates = sorted(
         {int(value.replace("_", "")) for value in args.rates.split(",")}
     )
@@ -268,6 +260,15 @@ class Study:
             and record["drop_receivers"] == receivers
         ]
 
+    def reachable_fraction(self, receivers: int) -> float:
+        unavailable_publishers = (
+            self.args.drop_publishers
+            if receivers > 0
+            and self.args.drop_publishers + receivers == self.args.nodes
+            else 0
+        )
+        return (self.args.nodes - unavailable_publishers) / self.args.nodes
+
     def ensure(
         self, protocol: Protocol, rate: int, receivers: int, count: int, phase: str
     ) -> list[dict[str, Any]]:
@@ -318,6 +319,7 @@ class Study:
                     "--withhold-count",
                     str(receivers),
                     "--withhold-fixed-receivers",
+                    "--withhold-repair",
                 )
             )
         if self.args.honest_rtt_ms > 0:
@@ -355,10 +357,19 @@ class Study:
             raise RuntimeError(f"{error}; see {log_path}") from error
         ticks = parse_ticks(completed.stdout)
         slope = latter_half_slope(ticks)
-        slope_limit = max(self.args.slope_floor, rate * self.args.slope_fraction)
+        reachable_fraction = self.reachable_fraction(receivers)
+        reachable_tps = rate * reachable_fraction
+        reachable_throughput_pct = (
+            100.0 * float(result["committed_tps"]) / reachable_tps
+        )
+        unavoidable_backlog_tps = rate - reachable_tps
+        excess_backlog_slope = max(0.0, slope - unavoidable_backlog_tps)
+        slope_limit = max(
+            self.args.slope_floor, reachable_tps * self.args.slope_fraction
+        )
         accepted = (
-            float(result["throughput_pct"]) >= self.args.accept_pct
-            and slope <= slope_limit
+            reachable_throughput_pct >= self.args.accept_pct
+            and excess_backlog_slope <= slope_limit
             and int(result.get("panics", 0)) == 0
         )
         record = {
@@ -369,10 +380,15 @@ class Study:
             "condition": condition,
             "drop_publishers": publishers,
             "drop_receivers": receivers,
+            "repair_suppressed": receivers > 0,
             "offered_tps": rate,
+            "reachable_offered_tps": reachable_tps,
+            "reachable_throughput_pct": reachable_throughput_pct,
+            "unavoidable_backlog_tps": unavoidable_backlog_tps,
             "repetition": repetition,
             "accepted": accepted,
             "backlog_slope_tps": slope,
+            "excess_backlog_slope_tps": excess_backlog_slope,
             "backlog_slope_limit_tps": slope_limit,
             "wall_seconds": wall_seconds,
             "cpu_seconds": cpu_seconds,
@@ -387,7 +403,8 @@ class Study:
         verdict = "PASS" if accepted else "FAIL"
         print(
             f"  {verdict}: {float(result['committed_tps']):,.0f} TPS "
-            f"({float(result['throughput_pct']):.1f}%), backlog slope {slope:,.1f} tx/s",
+            f"({reachable_throughput_pct:.1f}% of reachable), "
+            f"excess backlog slope {excess_backlog_slope:,.1f} tx/s",
             flush=True,
         )
         return record
@@ -500,8 +517,8 @@ def plot_scaling(study: Study) -> None:
         ("clean", "drop"),
         (
             "Clean publication",
-            f"{study.args.drop_publishers} Byzantine publishers omit data to "
-            f"{study.args.drop_receivers} receivers",
+            f"{study.args.drop_publishers} Byzantine publishers omit lane data to "
+            f"{study.args.drop_receivers} receivers and refuse repair",
         ),
     ):
         for protocol in study.args.protocol_defs:
@@ -539,13 +556,24 @@ def plot_scaling(study: Study) -> None:
                     zorder=10,
                 )
         bound = max(study.args.rates)
+        reachable_fraction = study.reachable_fraction(
+            0 if condition == "clean" else study.args.drop_receivers
+        )
+        target_label = (
+            "ideal y=x"
+            if reachable_fraction == 1.0
+            else f"reachable y={reachable_fraction:.1f}x"
+        )
         axis.plot(
             [min(study.args.rates), bound],
-            [min(study.args.rates), bound],
-            "--",
+            [
+                min(study.args.rates) * reachable_fraction,
+                bound * reachable_fraction,
+            ],
+            "--" if condition == "clean" else ":",
             color="0.55",
             linewidth=1,
-            label="ideal y=x",
+            label=target_label,
         )
         axis.set_xscale("log")
         axis.set_yscale("log")
@@ -565,8 +593,28 @@ def plot_scaling(study: Study) -> None:
         )
         for protocol in study.args.protocol_defs
     ]
-    handles.append(
-        Line2D([0], [0], color="0.55", linestyle="--", linewidth=1, label="ideal y=x")
+    handles.extend(
+        [
+            Line2D(
+                [0],
+                [0],
+                color="0.55",
+                linestyle="--",
+                linewidth=1,
+                label="clean target y=x",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="0.55",
+                linestyle=":",
+                linewidth=1,
+                label=(
+                    "Byzantine target "
+                    f"y={study.reachable_fraction(study.args.drop_receivers):.1f}x"
+                ),
+            ),
+        ]
     )
     fig.legend(
         handles=handles,
@@ -670,6 +718,7 @@ def write_csvs(study: Study) -> None:
                 "protocol": protocol,
                 "offered_tps": offered,
                 "drop_receivers": receivers,
+                "reachable_offered_tps": records[0]["reachable_offered_tps"],
                 "runs": len(records),
                 "committed_tps_median": throughput[0],
                 "committed_tps_min": throughput[1],
@@ -678,6 +727,9 @@ def write_csvs(study: Study) -> None:
                 "materialized_p99_ms_median": p99[0],
                 "backlog_slope_tps_median": statistics.median(
                     r["backlog_slope_tps"] for r in records
+                ),
+                "excess_backlog_slope_tps_median": statistics.median(
+                    r["excess_backlog_slope_tps"] for r in records
                 ),
                 "cpu_cores_median": statistics.median(
                     r["average_cpu_cores"] for r in records
@@ -711,6 +763,10 @@ def write_provenance(args: argparse.Namespace, r_star: int) -> None:
             else "config::LatencyTable::aws_rtt; RTT matrix converted to one-way delay"
         ),
         "r_star_tps": r_star,
+        "fault_model": (
+            "selected Byzantine publishers narrowcast original lane data and refuse "
+            "certificate, header, and batch repair; consensus traffic remains enabled"
+        ),
         "arguments": {
             key: value for key, value in vars(args).items() if key != "protocol_defs"
         },
@@ -725,7 +781,8 @@ def write_provenance(args: argparse.Namespace, r_star: int) -> None:
     (args.output / "README.md").write_text(
         "# Local five-protocol study\n\n"
         "`scaling.pdf`/`.png` is the primary two-panel figure. Open markers are the first "
-        "failed rate (throughput below the acceptance threshold or a growing latter-half backlog). "
+        "failed rate (throughput below the reachable-load acceptance threshold or excess "
+        "latter-half backlog growth). "
         "Whiskers show min–max over boundary repetitions. `receiver_width.*` is the supporting K "
         f"sweep at R*={r_star:,} tx/s. Raw process output, individual measurements, aggregate CSV, "
         "and exact provenance are retained alongside the figures. Databases are discarded unless "

@@ -3,10 +3,12 @@
 #
 # Usage:
 #   ./run.sh --nodes 4 --rate 200 --duration 60 --protocol vantage
+#   ./run.sh --nodes 7 --crash 2 --rate 200 --duration 60 --protocol vantage
 #   ./run.sh --nodes 4 --rate 200 --duration 90 --withhold 1 --withhold-at 30 \
 #       --withhold-for 20
 #
-# Core flags are handled here; other flags are passed to gen.py.
+# --crash leaves the first N validators absent from genesis. --no-build reuses
+# vantage-docker-bench:latest. Other flags are passed to gen.py.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -25,6 +27,8 @@ NODES=4
 RATE=200
 DURATION=60
 PROTOCOL=vantage
+CRASH=0
+BUILD_IMAGE=1
 EXTRA=()
 
 while [ $# -gt 0 ]; do
@@ -33,12 +37,32 @@ while [ $# -gt 0 ]; do
         --rate) RATE="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
         --protocol) PROTOCOL="$2"; shift 2 ;;
+        --crash) CRASH="$2"; shift 2 ;;
+        --no-build) BUILD_IMAGE=0; shift ;;
         -h|--help)
-            sed -n '2,12p' "$SCRIPT_DIR/run.sh"
+            sed -n '2,15p' "$SCRIPT_DIR/run.sh"
             exit 0
             ;;
         *) EXTRA+=("$1"); shift ;;
     esac
+done
+
+case "$NODES" in
+    ''|*[!0-9]*) echo "run.sh: --nodes must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$NODES" -gt 0 ] || { echo "run.sh: --nodes must be positive" >&2; exit 2; }
+case "$CRASH" in
+    ''|*[!0-9]*) echo "run.sh: --crash must be a non-negative integer" >&2; exit 2 ;;
+esac
+FAULT_BUDGET=$(( (NODES - 1) / 3 ))
+[ "$CRASH" -le "$FAULT_BUDGET" ] || {
+    echo "run.sh: --crash $CRASH exceeds fault budget f=$FAULT_BUDGET for n=$NODES" >&2
+    exit 2
+}
+ACTIVE_COUNT=$((NODES - CRASH))
+ACTIVE_SERVICES=()
+for ((i = CRASH; i < NODES; i++)); do
+    ACTIVE_SERVICES+=("node-$i")
 done
 
 # Refuse overlapping runs; all runs share one Compose project.
@@ -85,19 +109,30 @@ cleanup_on_exit() {
 trap cleanup_on_interrupt INT TERM
 trap cleanup_on_exit EXIT
 
-echo "==> [1/7] gen (nodes=$NODES rate=$RATE duration=$DURATION protocol=$PROTOCOL)"
+echo "==> [1/7] gen (nodes=$NODES crash=$CRASH rate=$RATE duration=$DURATION protocol=$PROTOCOL)"
 # Preserve empty-array behavior across Bash versions.
-python3 gen.py --nodes "$NODES" --rate "$RATE" --duration "$DURATION" --protocol "$PROTOCOL" \
+python3 gen.py --nodes "$NODES" --crash "$CRASH" --rate "$RATE" --duration "$DURATION" --protocol "$PROTOCOL" \
     "${EXTRA[@]+"${EXTRA[@]}"}"
 
-echo "==> [2/7] build (DOCKER_BUILDKIT=1)"
-BUILD_START=$SECONDS
-DOCKER_BUILDKIT=1 docker build -f Dockerfile -t vantage-docker-bench:latest ..
-echo "    build took $((SECONDS - BUILD_START))s"
+if [ "$BUILD_IMAGE" -eq 1 ]; then
+    echo "==> [2/7] build (DOCKER_BUILDKIT=1)"
+    BUILD_START=$SECONDS
+    DOCKER_BUILDKIT=1 docker build -f Dockerfile -t vantage-docker-bench:latest ..
+    echo "    build took $((SECONDS - BUILD_START))s"
+else
+    echo "==> [2/7] build skipped (--no-build)"
+    docker image inspect vantage-docker-bench:latest >/dev/null 2>&1 || {
+        echo "run.sh: vantage-docker-bench:latest is missing; omit --no-build" >&2
+        exit 1
+    }
+fi
 
-echo "==> [3/7] starting validators"
+echo "==> [3/7] starting $ACTIVE_COUNT/$NODES validators"
 BENCHMARK_RUNNING=1
-docker compose -f docker-compose.yml up -d
+docker compose -f docker-compose.yml up -d "${ACTIVE_SERVICES[@]}"
+if [ "$CRASH" -gt 0 ]; then
+    echo "    permanent from-genesis crash set: node-0..node-$((CRASH - 1))"
+fi
 
 echo "==> [4/7] starting Prometheus and Grafana"
 # Recreate Prometheus with current targets; its volume preserves samples.
@@ -105,22 +140,23 @@ monitoring_compose up -d --force-recreate prometheus
 monitoring_compose up -d grafana
 PROMETHEUS_CONTAINER_ID="$(monitoring_compose ps -q prometheus)"
 
-echo "==> [5/7] waiting for validators and all $((NODES * 2)) Prometheus target(s) (timeout ${READY_TIMEOUT}s)"
+echo "==> [5/7] waiting for active validators and all $((ACTIVE_COUNT * 2)) active Prometheus target(s) (timeout ${READY_TIMEOUT}s)"
 WAIT_START=$SECONDS
-until python3 - "$NODES" <<'PYEOF'
+until python3 - "$NODES" "$CRASH" <<'PYEOF'
 import json, sys, urllib.request
 from pathlib import Path
 n = int(sys.argv[1])
+crash = int(sys.argv[2])
 manifest = json.loads(Path("data/manifest.json").read_text())
 base = manifest["host_primary_metrics_base"]
 ok = 0
-for i in range(n):
+for i in range(crash, n):
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{base + i}/metrics", timeout=1)
         ok += 1
     except Exception:
         pass
-sys.exit(0 if ok == n else 1)
+sys.exit(0 if ok == n - crash else 1)
 PYEOF
 do
     if [ $((SECONDS - WAIT_START)) -ge "$READY_TIMEOUT" ]; then
@@ -130,13 +166,14 @@ do
     fi
     sleep 1
 done
-until python3 - "$NODES" <<'PYEOF'
+until python3 - "$NODES" "$CRASH" <<'PYEOF'
 import json, sys, urllib.request
 
 n = int(sys.argv[1])
+crash = int(sys.argv[2])
 expected = {
     label
-    for i in range(n)
+    for i in range(crash, n)
     for label in (f"node-{i}-primary", f"node-{i}-worker-0")
 }
 try:

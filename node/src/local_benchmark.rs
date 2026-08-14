@@ -288,11 +288,14 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--delta-ms must be a non-negative integer")?;
-    let timeout_delay_ms: u64 = matches
+    let timeout_delay_override_ms: Option<u64> = matches
         .get_one::<String>("timeout-delay-ms")
-        .unwrap()
-        .parse()
-        .context("--timeout-delay-ms must be a non-negative integer")?;
+        .map(|value| {
+            value
+                .parse()
+                .context("--timeout-delay-ms must be a non-negative integer")
+        })
+        .transpose()?;
     let fast_path_timeout_ms: u64 = matches
         .get_one::<String>("fast-path-timeout-ms")
         .unwrap()
@@ -378,6 +381,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             other
         ),
     };
+    let timeout_delay_ms = timeout_delay_override_ms.unwrap_or_else(|| {
+        protocol
+            .minimum_round_timeout_deltas()
+            .map_or(1_000, |multiplier| delta_ms.saturating_mul(multiplier))
+    });
     let mode = TransactionMode::parse(&mode_str).context("Invalid --mode")?;
 
     println!("\n=== local-benchmark configuration ===");
@@ -440,7 +448,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             format!("staggered halves, stride {withhold_stride}")
         };
         let repair = if withhold_repair {
-            "Byzantine authors remain silent on repair"
+            "Byzantine authors remain silent on all lane repair"
         } else {
             "authors serve repair"
         };
@@ -502,11 +510,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     let mut parameters = Parameters {
         protocol,
         delta_ms,
-        timeout_delay: match protocol {
-            Protocol::SimpleIt => delta_ms.saturating_mul(8),
-            Protocol::SimpleItBracha => delta_ms.saturating_mul(5),
-            _ => timeout_delay_ms,
-        },
+        timeout_delay: timeout_delay_ms,
         fast_path_timeout: fast_path_timeout_ms,
         max_batch_delay: max_batch_delay_ms,
         max_header_delay: max_header_delay_ms,
@@ -580,6 +584,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     let mut metrics_controls: Vec<Arc<Metrics>> = Vec::new();
     let mut metrics_targets: Vec<(String, SocketAddr)> = Vec::new();
     let mut client_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut shutdown_stores: Vec<Store> = Vec::with_capacity(2 * live_nodes * workers.max(1));
 
     for (i, keypair) in keypairs.into_iter().take(live_nodes).enumerate() {
         let name = keypair.name;
@@ -587,7 +592,15 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         fs::create_dir_all(&node_dir)?;
 
         let (primary_registry, primary_reporter, primary_control, primary_target) =
-            spawn_node_primary(i, keypair, &node_dir, &committee, &parameters, mode)?;
+            spawn_node_primary(
+                i,
+                keypair,
+                &node_dir,
+                &committee,
+                &parameters,
+                mode,
+                &mut shutdown_stores,
+            )?;
         primary_metrics.push((i, primary_registry, primary_reporter));
         metrics_controls.push(primary_control);
         metrics_targets.push(primary_target);
@@ -604,6 +617,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             client_rate_share,
             mode,
             &all_worker_addresses,
+            &mut shutdown_stores,
         )?;
         for (worker_registry, worker_reporter, worker_control, worker_target) in workers_spawned {
             worker_metrics.push((i, worker_registry, worker_reporter));
@@ -782,6 +796,14 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         false,
     )
     .await;
+
+    // The Tokio runtime cancels all in-process node actors when this command
+    // returns. Mark shared infrastructure first so an arbitrary cancellation
+    // order is not misreported as a storage or network failure after results.
+    network::begin_process_shutdown();
+    for store in &shutdown_stores {
+        store.begin_shutdown();
+    }
 
     Ok(())
 }
@@ -976,6 +998,7 @@ fn spawn_node_primary(
     committee: &Committee,
     parameters: &Parameters,
     mode: TransactionMode,
+    shutdown_stores: &mut Vec<Store>,
 ) -> Result<NodeMetricsHandle> {
     let name = keypair.name;
     let signature_service = SignatureService::new(keypair.secret);
@@ -985,6 +1008,7 @@ fn spawn_node_primary(
         StoreProfile::Metadata,
     )
     .context("Failed to create primary store")?;
+    shutdown_stores.push(primary_store.clone());
 
     let (tx_output, mut rx_output) = channel(CHANNEL_CAPACITY);
     let (tx_new_certificates, _rx_new_certificates) = channel(CHANNEL_CAPACITY);
@@ -1034,6 +1058,7 @@ fn spawn_node_workers(
     rate_share: Option<u64>,
     mode: TransactionMode,
     all_worker_addresses: &[SocketAddr],
+    shutdown_stores: &mut Vec<Store>,
 ) -> Result<(Vec<NodeMetricsHandle>, Vec<tokio::task::JoinHandle<()>>)> {
     let mut spawned = Vec::with_capacity(workers);
     let mut client_handles = Vec::with_capacity(workers);
@@ -1044,6 +1069,7 @@ fn spawn_node_workers(
             StoreProfile::Data,
         )
         .context("Failed to create worker store")?;
+        shutdown_stores.push(worker_store.clone());
 
         let (metrics, reporter, registry) = Worker::spawn(
             name,

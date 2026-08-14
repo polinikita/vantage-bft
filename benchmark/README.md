@@ -17,19 +17,65 @@ python3 benchmark/local_five_protocol_sweep.py
 ```
 
 The primary two-panel figure contrasts a clean offered-load sweep with the
-same sweep when nodes 0–2 omit original data-lane headers and batches to the
-fixed receiver group nodes 3–5. Repairs and control traffic remain normal.
-Each omitted block therefore still has seven direct holders. The local
-isolation study defaults to a uniform 50 ms honest-link RTT; pass
+same sweep when Byzantine nodes 0–2 send original data-lane headers and
+batches only within their own three-node group and refuse subsequent
+certificate, header, and batch repair to the rest of the committee. Consensus
+traffic remains enabled. Each unavailable lane therefore contributes roughly
+one tenth of offered load but cannot materialize at the seven honest nodes.
+The local isolation study defaults to a uniform 50 ms honest-link RTT; pass
 `--honest-rtt-ms 0` to use the built-in ten-region AWS RTT matrix instead.
 Defaults use a 10-second warmup and a 30-second measured window. A curve stops
-after the first point below 95% of
-offered load or with a growing latter-half backlog; boundary points are
-repeated three times. The harness also produces a receiver-width sweep for
-`K=0,1,2,3`, raw logs, CSV/JSON measurements, and provenance.
+after the first point below 95% of reachable offered load or with backlog
+growth beyond the unavoidable rate of transactions submitted to unavailable
+Byzantine lanes; boundary points are repeated three times. The harness also
+produces a receiver-width sweep for
+`K=0,3,6,7`, raw logs, CSV/JSON measurements, and provenance.
 
-Both Autobahn variants use the deployment configuration's 5-second consensus
-and fast-path timeouts.
+With the default `Delta = 200 ms`, both Autobahn variants use the paper's
+proof-calibrated `10 * Delta = 2 s` consensus timeout. Their separate 500 ms
+fast-path wait is a performance tuning, not a view-change timeout.
+
+### Mandatory crash regression
+
+The protocol CI runs all five implementations in release mode with `n=7`, two
+validators permanently absent from genesis, 200 offered tx/s, and the built-in
+AWS RTT matrix over a 30-second measured window. Each implementation must
+report zero panics, at least 85% committed throughput, and materialized p50
+latency below five seconds. Autobahn uses its proof-calibrated 10 × Δ round
+timer (2 seconds for the harness's Δ = 200 ms). The script keeps the larger
+`n=20`, six-crash, 1,000 tx/s all-protocol liveness matrix as its default for
+local or dedicated benchmark runners. That larger stress gate rejects panics,
+throughput below 50%, and materialized p50 above 15 seconds; these bounds
+detect stalls without turning a maximal-fault smoke test into a capacity claim:
+
+```bash
+python3 benchmark/check_protocol_regressions.py --binary target/release/node
+```
+
+To reproduce the smaller CI gate locally:
+
+```bash
+python3 benchmark/check_protocol_regressions.py \
+  --binary target/release/node --protocols all \
+  --nodes 7 --crash 2 --rate 200 --duration 30 \
+  --min-throughput-pct 85 --max-p50-ms 5000
+```
+
+Use `--protocols vantage` (or a comma-separated subset) for a focused run.
+
+The heavier post-feature control uses one Docker container per validator and
+real `tc netem` WAN delays. It compares clean, six-from-genesis-crash, and six
+Byzantine lane-withholding cases for all five protocol modes at `n=20` and
+1,000 tx/s, recording p50/p90/p99 latency and throughput:
+
+```bash
+python3 docker-bench/check_protocol_controls.py
+```
+
+See [`docker-bench/README.md`](../docker-bench/README.md) for the exact fault
+model and gates. This matrix is deliberately local/dedicated rather than part
+of the normal hosted CI job; CI retains the smaller release-mode `n=7`, `f=2`
+permanent-crash matrix above.
 
 ## Local Leader-Relay Stress
 
@@ -52,8 +98,8 @@ docker-bench/run.sh \
   --correct-load-only --adversarial-rate 20000
 ```
 
-Use `--protocol vantage` or `--protocol simple-it --timeout-delay-ms 1600`
-for the matched controls. Plot a CSV containing `protocol`,
+Use `--protocol vantage` or `--protocol simple-it` for the matched controls;
+the latter derives its `8 * Delta` timeout automatically. Plot a CSV containing `protocol`,
 `adversarial_tps`, `useful_tps`, `p50_ms`, and `p99_ms` with:
 
 ```bash

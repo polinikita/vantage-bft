@@ -33,6 +33,18 @@ def main() -> int:
     args = parse_args()
     records = json.loads((args.study / "measurements.json").read_text())
     output = args.output or args.study / "drop_impact.png"
+    dropped_records = [
+        record for record in records if record["condition"].startswith("drop-")
+    ]
+    drop_publishers = max(
+        (int(record["drop_publishers"]) for record in dropped_records), default=0
+    )
+    drop_receivers = max(
+        (int(record["drop_receivers"]) for record in dropped_records), default=0
+    )
+    repair_suppressed = any(
+        bool(record.get("repair_suppressed", False)) for record in dropped_records
+    )
 
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -169,7 +181,13 @@ def main() -> int:
     latency_axis.legend(
         handles=[
             Line2D([0], [0], color="0.55", marker="s", label="clean"),
-            Line2D([0], [0], color="0.2", marker="o", label="3×3 data omission"),
+            Line2D(
+                [0],
+                [0],
+                color="0.2",
+                marker="o",
+                label=f"{drop_publishers}×{drop_receivers} Byzantine omission",
+            ),
         ],
         loc="lower right",
         frameon=False,
@@ -183,8 +201,12 @@ def main() -> int:
     fig.text(
         0.5,
         0.925,
-        "uniform 50 ms honest RTT · publishers 0–2 omit original headers and batches "
-        "to receivers 3–5 · repair/control traffic remains normal · 5 s warmup + 20 s sample",
+        "publishers omit original headers and batches to the fixed receiver group · "
+        + (
+            "lane repair suppressed · consensus traffic remains normal"
+            if repair_suppressed
+            else "repair/control traffic remains normal"
+        ),
         ha="center",
         fontsize=10,
         color="0.3",

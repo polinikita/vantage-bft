@@ -125,6 +125,25 @@ def committed_total(snapshots: list[NodeSnapshot]) -> int:
     return max((s.committed_transactions for s in snapshots), default=0)
 
 
+def submitted_total(snapshots: list[NodeSnapshot]) -> int:
+    # Submission is partitioned across workers, so aggregate it.
+    return sum(s.submitted_transactions for s in snapshots if s.reachable)
+
+
+def latency_quantiles_ms(
+    snapshots: list[NodeSnapshot], *, materialised: bool
+) -> dict[str, float | None]:
+    attrs = ("m50", "m90", "m99") if materialised else ("p50", "p90", "p99")
+    values = [
+        [getattr(s, attr) for s in snapshots if s.reachable and getattr(s, attr) is not None]
+        for attr in attrs
+    ]
+    return {
+        quantile: (median(samples) / 1000 if samples else None)
+        for quantile, samples in zip(("p50", "p90", "p99"), values)
+    }
+
+
 def latency_line(snapshots: list[NodeSnapshot]) -> str:
     with_latency = [s for s in snapshots if s.reachable and s.p50 is not None]
     if not with_latency:
@@ -182,6 +201,7 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     sys.stdout.flush()
     prev_total = 0
     first_total: int | None = None
+    first_submitted: int | None = None
     first_elapsed = 0
     last_snapshots: list[NodeSnapshot] = []
     elapsed = 0
@@ -194,6 +214,7 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             total = committed_total(snapshots)
             if first_total is None:
                 first_total = total
+                first_submitted = submitted_total(snapshots)
                 first_elapsed = elapsed
             delta = max(0, total - prev_total)
             print(
@@ -207,17 +228,34 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     except KeyboardInterrupt:
         print()
 
-    if not last_snapshots or first_total is None or elapsed <= first_elapsed:
+    if (not last_snapshots or first_total is None or first_submitted is None
+            or elapsed <= first_elapsed):
         return  # Too short a window to derive a rate.
     window = elapsed - first_elapsed
-    rate = (prev_total - first_total) / window
+    committed_delta = prev_total - first_total
+    submitted_delta = submitted_total(last_snapshots) - first_submitted
+    rate = committed_delta / window
     print("-----------------------------------------")
     print(f" docker-bench SUMMARY (measured over this {window}s watch window):")
     print("-----------------------------------------")
-    print(f" Consensus TPS: {rate:.0f} tx/s  (delta {prev_total - first_total} tx / {window}s)")
+    print(f" Consensus TPS: {rate:.0f} tx/s  (delta {committed_delta} tx / {window}s)")
     print(latency_line(last_snapshots))
     print(materialised_line(last_snapshots))
     print("-----------------------------------------")
+    result = {
+        "measurement_seconds": window,
+        "committed_transactions": committed_delta,
+        "committed_tps": rate,
+        "submitted_transactions": submitted_delta,
+        "submitted_tps": submitted_delta / window,
+        "reachable_workers": sum(s.reachable for s in last_snapshots),
+        "expected_workers": manifest["nodes"],
+        "real_latency_ms": latency_quantiles_ms(last_snapshots, materialised=False),
+        "materialised_latency_ms": latency_quantiles_ms(
+            last_snapshots, materialised=True
+        ),
+    }
+    print("DOCKER_BENCH_RESULT " + json.dumps(result, sort_keys=True))
 
 
 def main(argv=None) -> None:

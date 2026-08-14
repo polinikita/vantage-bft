@@ -42,6 +42,12 @@ pub enum DagError {
     #[error("Malformed header {0}")]
     MalformedHeader(Digest),
 
+    #[error("Invalid Autobahn lane-tip proposal {0}")]
+    InvalidProposal(Digest),
+
+    #[error("Malformed Autobahn timeout {0}")]
+    MalformedTimeout(Digest),
+
     #[error("Malformed special header {0}")]
     MalformedSpecialHeader(Digest),
 

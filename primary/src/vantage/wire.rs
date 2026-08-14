@@ -179,6 +179,8 @@ pub struct Wire {
     pub(crate) worker_addresses: HashMap<WorkerId, SocketAddr>,
 
     pub(crate) withheld_header_dests: WithheldHeaderDests,
+    /// Peers to which this selected publisher refuses lane repair.
+    pub(crate) suppressed_repair_destinations: Option<HashSet<PublicKey>>,
 
     /// Prompt recipients and the dedicated finite-delay sender, for selected authors.
     pub(crate) late_header: Option<(Vec<SocketAddr>, DelayedHeaderSender)>,
@@ -246,6 +248,13 @@ impl Wire {
         let msg_type = message.type_name();
         let bytes = self.serialize_message(&message);
         self.send_to(peer, bytes, msg_type).await;
+    }
+
+    pub(crate) async fn send_repair_message(&mut self, peer: PublicKey, message: PrimaryMessage) {
+        if self.repair_suppressed_for(&peer) {
+            return;
+        }
+        self.send_message(peer, message).await;
     }
 
     pub(crate) async fn broadcast_volatile(
@@ -406,15 +415,17 @@ impl Wire {
     }
 
     pub(crate) fn enqueue_resume_header(&self, peer: PublicKey, header: Header) {
-        if let Some((_, allowed)) = &self.withheld_header_dests {
-            let peer_allowed = allowed.iter().any(|(pk, _)| *pk == peer);
-            if !peer_allowed
-                && config::withhold_active(self.withhold_window.as_deref(), Instant::now())
-            {
-                return;
-            }
+        if self.repair_suppressed_for(&peer) {
+            return;
         }
         self.enqueue_resume(peer, PrimaryMessage::Header(header, false));
+    }
+
+    pub(crate) fn repair_suppressed_for(&self, peer: &PublicKey) -> bool {
+        self.suppressed_repair_destinations
+            .as_ref()
+            .is_some_and(|blocked| blocked.contains(peer))
+            && config::withhold_active(self.withhold_window.as_deref(), Instant::now())
     }
 
     pub(crate) fn worker_addr(&self, worker_id: WorkerId) -> Option<SocketAddr> {
