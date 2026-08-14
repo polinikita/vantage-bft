@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     common::{committee, keys},
-    messages::Vote,
+    messages::{ConsensusMessage, Header, Vote},
 };
 use serial_test::serial;
 use tokio::sync::mpsc::channel;
@@ -266,5 +266,52 @@ async fn propose_confirm_message() {
 
     assert_eq!(header.height, 1);
     assert_eq!(header.payload.get(&digest), Some(&worker_id));
+    assert!(header.verify(&committee()).is_ok());
+}
+
+#[tokio::test]
+#[serial]
+async fn duplicate_consensus_info_is_counted_once() {
+    let (name, secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(secret);
+
+    let (tx_parents, rx_parents) = channel(1);
+    let (tx_our_digests, rx_our_digests) = channel(1);
+    let (tx_headers, mut rx_headers) = channel(1);
+    let (tx_ticket, rx_ticket) = channel(2);
+
+    Proposer::spawn(
+        name,
+        committee(),
+        signature_service,
+        /* header_size */ 32,
+        /* max_header_delay */ 1_000_000,
+        /* rx_core */ rx_parents,
+        /* rx_workers */ rx_our_digests,
+        rx_ticket,
+        /* tx_core */ tx_headers,
+    );
+
+    tx_parents
+        .send(Certificate::genesis_for(name, &committee()))
+        .await
+        .unwrap();
+    let prepare = ConsensusMessage::Prepare {
+        slot: 1,
+        view: 1,
+        tc: None,
+        qc_ticket: None,
+        proposals: Header::genesis_proposals(&committee()),
+    };
+    tx_ticket.send(prepare.clone()).await.unwrap();
+    tx_ticket.send(prepare).await.unwrap();
+    sleep(Duration::from_millis(20)).await;
+
+    let payload = Digest(name.0);
+    tx_our_digests.send((payload, 0)).await.unwrap();
+    let header = rx_headers.recv().await.unwrap();
+
+    assert_eq!(header.consensus_messages.len(), 1);
+    assert_eq!(header.num_active_instances, 1);
     assert!(header.verify(&committee()).is_ok());
 }

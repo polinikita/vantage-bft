@@ -887,6 +887,7 @@ mod tests {
                     Proposal {
                         header_digest: Digest([i as u8 + 1; 32]),
                         height: 1,
+                        poa: None,
                     },
                 )
             })

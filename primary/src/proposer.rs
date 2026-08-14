@@ -62,7 +62,7 @@ impl Proposer {
         rx_instance: Receiver<ConsensusMessage>,
         tx_core: Sender<Header>,
     ) {
-        let genesis = Certificate::genesis_cert(&committee);
+        let genesis = Certificate::genesis_for(name, &committee);
 
         tokio::spawn(async move {
             Self {
@@ -167,6 +167,12 @@ impl Proposer {
                 Some(info) = self.rx_instance.recv() => {
                     debug!("received consensus info");
 
+                    let digest = info.digest();
+                    if self.consensus_instances.contains_key(&digest) {
+                        debug!("ignoring duplicate consensus info {}", digest);
+                        continue;
+                    }
+
                     match &info {
                         ConsensusMessage::Prepare { slot: _, view: _, tc: _, qc_ticket: _, proposals: _} => {
                             if self.use_special_rule {
@@ -184,7 +190,7 @@ impl Proposer {
                         _ => {},
                     }
 
-                    self.consensus_instances.insert(info.digest(), info);
+                    self.consensus_instances.insert(digest, info);
                 }
 
                 // Receive the local parent certificate.

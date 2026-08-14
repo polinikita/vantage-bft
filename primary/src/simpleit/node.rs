@@ -572,6 +572,7 @@ impl SimpleItCore {
                         Proposal {
                             header_digest: digest,
                             height,
+                            poa: None,
                         },
                     )
                 })
@@ -1234,6 +1235,7 @@ mod tests {
                     Proposal {
                         header_digest: header.id.clone(),
                         height: header.height,
+                        poa: None,
                     },
                 )
             })

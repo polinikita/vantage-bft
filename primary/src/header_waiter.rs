@@ -1,6 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::leader::LeaderElector;
 use crate::messages::{proposal_digest, ConsensusMessage, Header, Proposal};
 use crate::primary::{Height, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
@@ -25,7 +24,54 @@ const TIMER_RESOLUTION: u64 = 1_000;
 
 type BatchRequestGroups = HashMap<WorkerId, Vec<Digest>>;
 type OptimisticTipSources = HashMap<Digest, (PublicKey, Height)>;
-type OptimisticLaneSources = HashMap<PublicKey, (PublicKey, Height)>;
+type CertifiedLaneSources = HashMap<PublicKey, (Vec<PublicKey>, Height)>;
+
+fn record_certified_lane_sources(
+    known: &mut CertifiedLaneSources,
+    lane: PublicKey,
+    mut sources: Vec<PublicKey>,
+    tip_height: Height,
+) {
+    sources.sort_unstable();
+    sources.dedup();
+    known
+        .entry(lane)
+        .and_modify(|(existing, known_height)| {
+            existing.append(&mut sources);
+            existing.sort_unstable();
+            existing.dedup();
+            *known_height = (*known_height).max(tip_height);
+        })
+        .or_insert((sources, tip_height));
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BatchSyncSource {
+    Author(PublicKey),
+    OptimisticLeader(PublicKey),
+    ProofSources(Vec<PublicKey>),
+}
+
+#[derive(Clone, Debug)]
+struct PendingProposalRequest {
+    proposal: Proposal,
+    stop_height: Height,
+    sources: Vec<PublicKey>,
+    requested_at: u128,
+}
+
+fn proposal_request_needs_update(
+    pending: Option<&PendingProposalRequest>,
+    proposal: &Proposal,
+    stop_height: Height,
+    sources: &[PublicKey],
+) -> bool {
+    pending.is_none_or(|pending| {
+        pending.proposal != *proposal
+            || pending.stop_height > stop_height
+            || pending.sources != sources
+    })
+}
 
 #[derive(Clone, Debug)]
 struct PendingPayload {
@@ -37,20 +83,20 @@ struct PendingPayload {
 type PendingPayloads = HashMap<Digest, PendingPayload>;
 
 fn register_batch_requests(
-    tracked: &mut HashMap<Digest, (Height, PublicKey)>,
+    tracked: &mut HashMap<Digest, (Height, BatchSyncSource)>,
     missing: &HashMap<Digest, WorkerId>,
     height: Height,
-    target: PublicKey,
+    source: BatchSyncSource,
 ) -> BatchRequestGroups {
     let mut groups = HashMap::new();
     for (digest, worker_id) in missing {
         if tracked
             .get(digest)
-            .is_some_and(|(_, previous_target)| *previous_target == target)
+            .is_some_and(|(_, previous_source)| *previous_source == source)
         {
             continue;
         }
-        tracked.insert(digest.clone(), (height, target));
+        tracked.insert(digest.clone(), (height, source.clone()));
         groups
             .entry(*worker_id)
             .or_insert_with(Vec::new)
@@ -82,45 +128,10 @@ fn register_optimistic_tip_sources(
     }
 }
 
-fn inherit_optimistic_tip_source(
-    sources: &mut OptimisticTipSources,
-    child: &Digest,
-    parent: Digest,
-    parent_height: Height,
-) -> Option<PublicKey> {
-    let proposal_leader = sources.get(child).map(|(leader, _)| *leader);
-    if let Some(proposal_leader) = proposal_leader {
-        sources.insert(parent, (proposal_leader, parent_height));
-    }
-    proposal_leader
-}
-
 fn merge_batch_request_groups(destination: &mut BatchRequestGroups, source: BatchRequestGroups) {
     for (worker, mut digests) in source {
         destination.entry(worker).or_default().append(&mut digests);
     }
-}
-
-fn collect_optimistic_prefix_requests(
-    pending_payloads: &PendingPayloads,
-    tracked: &mut HashMap<Digest, (Height, PublicKey)>,
-    sources: &mut OptimisticTipSources,
-    author: PublicKey,
-    tip_height: Height,
-    proposal_leader: PublicKey,
-) -> BatchRequestGroups {
-    let mut requests = HashMap::new();
-    for (header_id, pending) in pending_payloads {
-        if pending.author != author || pending.height > tip_height {
-            continue;
-        }
-        sources.insert(header_id.clone(), (proposal_leader, pending.height));
-        merge_batch_request_groups(
-            &mut requests,
-            register_batch_requests(tracked, &pending.missing, pending.height, proposal_leader),
-        );
-    }
-    requests
 }
 
 /// Commands sent to the waiter.
@@ -128,8 +139,21 @@ fn collect_optimistic_prefix_requests(
 #[derive(Debug)]
 pub enum WaiterMessage {
     SyncBatches(HashMap<Digest, WorkerId>, Header, bool),
-    SyncProposals(Vec<(PublicKey, Proposal)>, ConsensusMessage, Header),
-    SyncParent(Digest, Header),
+    /// Certified suffixes and their exclusive executed-height bound.
+    SyncCertified(Vec<(PublicKey, Proposal, Height)>),
+    /// Missing optimistic tips, the elected leader, and an optional Prepare
+    /// that must resume once the tips themselves are present.
+    SyncOptimistic(
+        Vec<(PublicKey, Proposal)>,
+        PublicKey,
+        Option<(ConsensusMessage, Header)>,
+    ),
+    /// Repairs an implicitly certified winning tip asynchronously from the
+    /// replicas named by its TC or PrepareQC evidence.
+    SyncImplicit(Vec<(PublicKey, Proposal)>, Vec<PublicKey>),
+    /// A Commit resumes only after all currently missing suffix roots arrive.
+    WaitForCommit(Vec<Digest>, ConsensusMessage, Header),
+    SyncParent(Digest, Header, Height),
     SyncHeader(Digest),
 }
 
@@ -139,9 +163,6 @@ pub struct HeaderWaiter {
     name: PublicKey,
     /// The committee information.
     committee: Committee,
-    /// Deterministic Autobahn leader schedule. Prepare repair must target the
-    /// elected leader, not whichever header happened to carry the message.
-    leader_elector: LeaderElector,
     /// The persistent storage.
     store: Store,
     /// The current consensus round (used for cleanup).
@@ -164,21 +185,23 @@ pub struct HeaderWaiter {
     network: SimpleSender,
     metrics: Arc<Metrics>,
 
-    /// Certificate requests and their retry timestamps.
-    parent_requests: HashMap<Digest, (Height, u128)>,
     /// Requests for special parents.
     header_requests: HashMap<Digest, (Height, u128)>,
     /// Batch requests, their heights, and their current target. A Prepare
     /// leader may supersede an earlier request to the Byzantine lane author.
-    batch_requests: HashMap<Digest, (Height, PublicKey)>,
+    batch_requests: HashMap<Digest, (Height, BatchSyncSource)>,
     /// Missing payloads retained by lane so a Prepare can request the whole
     /// unavailable prefix concurrently rather than walking one block per RTT.
     pending_payloads: PendingPayloads,
     /// Prepare leader that can relay each missing optimistic tip. The lane
     /// author itself is not a valid liveness dependency when it is Byzantine.
     optimistic_tip_sources: OptimisticTipSources,
-    /// Latest elected Prepare leader and covered height for each lane.
-    optimistic_lane_sources: OptimisticLaneSources,
+    /// Exact TC/PrepareQC witnesses for implicitly certified optimistic tips.
+    implicit_tip_sources: HashMap<Digest, (Vec<PublicKey>, Height)>,
+    /// PoA voters and covered tip height for each certified lane suffix.
+    certified_lane_sources: CertifiedLaneSources,
+    /// Whole-suffix requests and their proof-derived retry sources.
+    proposal_requests: HashMap<Digest, PendingProposalRequest>,
     /// Pending items and cancellation handles.
     pending: HashMap<Digest, (Height, Sender<()>)>,
 }
@@ -200,11 +223,9 @@ impl HeaderWaiter {
         batch: BatchConfig,
     ) {
         tokio::spawn(async move {
-            let leader_elector = LeaderElector::new(committee.clone());
             Self {
                 name,
                 committee,
-                leader_elector,
                 store,
                 consensus_round,
                 gc_depth,
@@ -217,12 +238,13 @@ impl HeaderWaiter {
                     .with_metrics(metrics.clone())
                     .with_batching(batch),
                 metrics,
-                parent_requests: HashMap::new(),
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
                 pending_payloads: HashMap::new(),
                 optimistic_tip_sources: HashMap::new(),
-                optimistic_lane_sources: HashMap::new(),
+                implicit_tip_sources: HashMap::new(),
+                certified_lane_sources: HashMap::new(),
+                proposal_requests: HashMap::new(),
                 pending: HashMap::new(),
             }
             .run()
@@ -291,12 +313,116 @@ impl HeaderWaiter {
             let message = if optimistic_leader_repair {
                 PrimaryWorkerMessage::SynchronizeOptimistic(digests, target)
             } else {
-                PrimaryWorkerMessage::Synchronize(digests, target)
+                PrimaryWorkerMessage::SynchronizeAuthor(digests, target)
             };
             let bytes =
                 bincode::serialize(&message).expect("Failed to serialize batch sync request");
             self.network
                 .send_typed(address, Bytes::from(bytes), message.type_name())
+                .await;
+        }
+    }
+
+    async fn send_proof_batch_requests(
+        &mut self,
+        mut sources: Vec<PublicKey>,
+        requests: BatchRequestGroups,
+    ) {
+        sources.sort_unstable();
+        sources.dedup();
+        if sources.is_empty() {
+            return;
+        }
+        for (worker_id, digests) in requests {
+            let address = self
+                .committee
+                .worker(&self.name, &worker_id)
+                .expect("Local worker is not in the committee")
+                .primary_to_worker;
+            let message = PrimaryWorkerMessage::SynchronizeProofSources(digests, sources.clone());
+            let bytes =
+                bincode::serialize(&message).expect("Failed to serialize proof-source batch sync");
+            self.network
+                .send_typed(address, Bytes::from(bytes), message.type_name())
+                .await;
+        }
+    }
+
+    fn proposal_sources(proposal: &Proposal) -> Vec<PublicKey> {
+        let mut sources: Vec<_> = proposal
+            .poa
+            .as_ref()
+            .map(|poa| poa.votes.iter().map(|(author, _)| *author).collect())
+            .unwrap_or_default();
+        sources.sort_unstable();
+        sources.dedup();
+        sources
+    }
+
+    async fn send_proposal_suffix_request(
+        &mut self,
+        proposal: Proposal,
+        stop_height: Height,
+        mut sources: Vec<PublicKey>,
+    ) {
+        sources.sort_unstable();
+        sources.dedup();
+        let message =
+            PrimaryMessage::ProposalHeadersRequest(proposal.clone(), stop_height, self.name);
+        let bytes =
+            bincode::serialize(&message).expect("Failed to serialize proposal suffix request");
+        for source in &sources {
+            if *source == self.name {
+                continue;
+            }
+            let address = self
+                .committee
+                .primary(source)
+                .expect("Proof source is not in the committee")
+                .primary_to_primary;
+            self.network
+                .send_typed(
+                    address,
+                    Bytes::from(bytes.clone()),
+                    "ProposalHeadersRequest",
+                )
+                .await;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Failed to measure time")
+            .as_millis();
+        self.proposal_requests.insert(
+            proposal.header_digest.clone(),
+            PendingProposalRequest {
+                proposal,
+                stop_height,
+                sources,
+                requested_at: now,
+            },
+        );
+    }
+
+    /// Starts a request, or retargets an existing request when stronger
+    /// protocol evidence names a different source set. An already pending
+    /// request that covers a longer suffix is sufficient.
+    async fn ensure_proposal_suffix_request(
+        &mut self,
+        proposal: Proposal,
+        stop_height: Height,
+        mut sources: Vec<PublicKey>,
+    ) {
+        sources.sort_unstable();
+        sources.dedup();
+        let needs_request = proposal_request_needs_update(
+            self.proposal_requests.get(&proposal.header_digest),
+            &proposal,
+            stop_height,
+            &sources,
+        );
+        if needs_request {
+            self.send_proposal_suffix_request(proposal, stop_height, sources)
                 .await;
         }
     }
@@ -330,44 +456,75 @@ impl HeaderWaiter {
                                     missing: missing.clone(),
                                 });
 
-                            let lane_source = self
-                                .optimistic_lane_sources
+                            let optimistic_source = self
+                                .optimistic_tip_sources
+                                .get(&header_id)
+                                .copied();
+                            let implicit_sources = self
+                                .implicit_tip_sources
+                                .get(&header_id)
+                                .cloned()
+                                .map(|(sources, _)| sources);
+                            let certified_sources = self
+                                .certified_lane_sources
                                 .get(&author)
-                                .copied()
-                                .filter(|(_, tip_height)| round <= *tip_height);
-                            let proposal_source = lane_source
-                                .or_else(|| {
-                                    self.optimistic_tip_sources
-                                        .get(&header_id)
-                                        .copied()
-                                });
+                                .cloned()
+                                .filter(|(_, tip_height)| round <= *tip_height)
+                                .map(|(sources, _)| sources);
 
                             // A served copy must be allowed to upgrade an
                             // existing direct-header wait into a fetch before
                             // the waiter itself is deduplicated below.
-                            if force_sync || proposal_source.is_some() {
-                                let (target, requests, optimistic) =
-                                    if let Some((proposal_leader, tip_height)) = proposal_source {
-                                        let requests = collect_optimistic_prefix_requests(
-                                            &self.pending_payloads,
-                                            &mut self.batch_requests,
-                                            &mut self.optimistic_tip_sources,
-                                            author,
-                                            tip_height.max(round),
-                                            proposal_leader,
-                                        );
-                                        (proposal_leader, requests, true)
-                                    } else {
-                                        let requests = register_batch_requests(
-                                            &mut self.batch_requests,
-                                            &missing,
-                                            round,
-                                            author,
-                                        );
-                                        (author, requests, false)
-                                    };
-                                if !requests.is_empty() {
-                                    self.send_batch_requests(target, requests, optimistic).await;
+                            if force_sync
+                                || optimistic_source.is_some()
+                                || implicit_sources.is_some()
+                                || certified_sources.is_some()
+                            {
+                                // A new-view possession proof supersedes the
+                                // original leader-only obligation. This avoids
+                                // pinning the new leader to a stale source.
+                                if let Some(sources) = implicit_sources {
+                                    let source = BatchSyncSource::ProofSources(sources.clone());
+                                    let requests = register_batch_requests(
+                                        &mut self.batch_requests,
+                                        &missing,
+                                        round,
+                                        source,
+                                    );
+                                    if !requests.is_empty() {
+                                        self.send_proof_batch_requests(sources, requests).await;
+                                    }
+                                } else if let Some((proposal_leader, _)) = optimistic_source {
+                                    let requests = register_batch_requests(
+                                        &mut self.batch_requests,
+                                        &missing,
+                                        round,
+                                        BatchSyncSource::OptimisticLeader(proposal_leader),
+                                    );
+                                    if !requests.is_empty() {
+                                        self.send_batch_requests(proposal_leader, requests, true).await;
+                                    }
+                                } else if let Some(sources) = certified_sources {
+                                    let source = BatchSyncSource::ProofSources(sources.clone());
+                                    let requests = register_batch_requests(
+                                        &mut self.batch_requests,
+                                        &missing,
+                                        round,
+                                        source,
+                                    );
+                                    if !requests.is_empty() {
+                                        self.send_proof_batch_requests(sources, requests).await;
+                                    }
+                                } else {
+                                    let requests = register_batch_requests(
+                                        &mut self.batch_requests,
+                                        &missing,
+                                        round,
+                                        BatchSyncSource::Author(author),
+                                    );
+                                    if !requests.is_empty() {
+                                        self.send_batch_requests(author, requests, false).await;
+                                    }
                                 }
                             }
 
@@ -388,7 +545,7 @@ impl HeaderWaiter {
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (round, tx_cancel));
-                            let fut = Self::waiter(wait_for, header, rx_cancel);
+                            let fut = Self::waiter(wait_for, header.clone(), rx_cancel);
                             waiting.push(fut);
                         }
 
@@ -424,21 +581,11 @@ impl HeaderWaiter {
                             }
                         }
 
-                        WaiterMessage::SyncParent(missing, header) => {
+                        WaiterMessage::SyncParent(missing, header, stop_height) => {
                             debug!("Synching the parents of {}", header);
                             let header_id = header.id.clone();
                             let height = header.height();
                             let author = header.author;
-                            // The elected leader's relay obligation covers the
-                            // whole missing prefix behind an optimistic tip,
-                            // not only the tip header itself. Carry the source
-                            // backward before the child is retried.
-                            let proposal_leader = inherit_optimistic_tip_source(
-                                &mut self.optimistic_tip_sources,
-                                &header_id,
-                                missing.clone(),
-                                height.saturating_sub(1),
-                            );
 
                             // Deduplicate requests for the same header.
                             if self.pending.contains_key(&header_id) {
@@ -449,137 +596,195 @@ impl HeaderWaiter {
                             let wait_for = vec![(missing.to_vec(), self.store.clone())];
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (height, tx_cancel));
-                            let fut = Self::waiter(wait_for, header, rx_cancel);
+                            let fut = Self::waiter(wait_for, header.clone(), rx_cancel);
                             waiting.push(fut);
 
-                            // Contact the optimistic proposal leader first
-                            // while walking its missing lane prefix. Generic
-                            // recovery still contacts the lane author.
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Failed to measure time")
-                                .as_millis();
-                            let mut requires_sync = Vec::new();
-                            self.parent_requests.entry(missing.clone()).or_insert_with(|| {
-                                requires_sync.push(missing);
-                                (height, now)
-                            });
-                            if !requires_sync.is_empty() {
-                                let address = self.committee
-                                    .primary(&proposal_leader.unwrap_or(author))
-                                    .expect("Author of valid header not in the committee")
-                                    .primary_to_primary;
-                                let message = if proposal_leader.is_some() {
-                                    PrimaryMessage::PrepareHeadersRequest(requires_sync, self.name)
-                                } else {
-                                    PrimaryMessage::HeadersRequest(requires_sync, self.name)
-                                };
-                                let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send_typed(address, Bytes::from(bytes), message.type_name()).await;
+                            // A car vote implies possession of the parent chain.
+                            // Recover it only from the voters named by the parent
+                            // PoA, never from timer-selected random peers.
+                            let parent = Proposal::certified(header.parent_cert.clone());
+                            let sources = Self::proposal_sources(&parent);
+                            record_certified_lane_sources(
+                                &mut self.certified_lane_sources,
+                                author,
+                                sources.clone(),
+                                parent.height,
+                            );
+                            self.ensure_proposal_suffix_request(parent, stop_height, sources)
+                                .await;
+                        }
+                        WaiterMessage::SyncCertified(repairs) => {
+                            for (lane, proposal, stop_height) in repairs {
+                                let sources = Self::proposal_sources(&proposal);
+                                record_certified_lane_sources(
+                                    &mut self.certified_lane_sources,
+                                    lane,
+                                    sources.clone(),
+                                    proposal.height,
+                                );
+
+                                // A header may have arrived before its cut proof.
+                                // Upgrade any such payload waits to the exact PoA
+                                // voter set immediately.
+                                let mut requests = HashMap::new();
+                                let source = BatchSyncSource::ProofSources(sources.clone());
+                                for pending in self.pending_payloads.values() {
+                                    if pending.author == lane
+                                        && pending.height > stop_height
+                                        && pending.height <= proposal.height
+                                    {
+                                        merge_batch_request_groups(
+                                            &mut requests,
+                                            register_batch_requests(
+                                                &mut self.batch_requests,
+                                                &pending.missing,
+                                                pending.height,
+                                                source.clone(),
+                                            ),
+                                        );
+                                    }
+                                }
+                                if !requests.is_empty() {
+                                    self.send_proof_batch_requests(sources.clone(), requests)
+                                        .await;
+                                }
+
+                                self.ensure_proposal_suffix_request(
+                                    proposal,
+                                    stop_height,
+                                    sources,
+                                )
+                                .await;
                             }
                         }
 
-
-                        WaiterMessage::SyncProposals(missing, consensus_message, header) => {
-                            let height = header.height();
-                            // Every phase carries the slot and view of the
-                            // elected Autobahn leader that chose this cut. A
-                            // replica may receive Confirm or Commit before its
-                            // Prepare, so those phases must recover from the
-                            // same leader as well.
-                            let (slot, view) = match &consensus_message {
-                                ConsensusMessage::Prepare { slot, view, .. }
-                                | ConsensusMessage::Confirm { slot, view, .. }
-                                | ConsensusMessage::Commit { slot, view, .. } => (*slot, *view),
-                            };
-                            let proposal_leader = self.leader_elector.get_leader(slot, view);
-                            // Prepare, Confirm, and Commit can reference the
-                            // same proposal vector while it is unavailable.
-                            // Keep one waiter per consensus message so a later
-                            // phase is not discarded behind an earlier one.
-                            let id = proposal_waiter_id(&consensus_message);
-
-                            // Deduplicate requests for the same proposal.
-                            if self.pending.contains_key(&id) {
-                                continue;
-                            }
-
-                            // The elected Autobahn leader must relay any
-                            // optimistic tip in its cut; a Byzantine lane
-                            // author may remain silent after narrowcasting.
-                            // `Core` admits a peer tip to `current_proposal_tips`
-                            // only after `missing_payload` succeeds, so a
-                            // correct leader necessarily possesses these bytes.
+                        WaiterMessage::SyncOptimistic(missing, proposal_leader, resume) => {
                             register_optimistic_tip_sources(
                                 &mut self.optimistic_tip_sources,
                                 &missing,
                                 proposal_leader,
                             );
 
-                            let mut prefix_requests = HashMap::new();
-                            for (author, proposal) in &missing {
-                                self.optimistic_lane_sources
-                                    .insert(*author, (proposal_leader, proposal.height));
-                                merge_batch_request_groups(
-                                    &mut prefix_requests,
-                                    collect_optimistic_prefix_requests(
-                                        &self.pending_payloads,
-                                        &mut self.batch_requests,
-                                        &mut self.optimistic_tip_sources,
-                                        *author,
-                                        proposal.height,
-                                        proposal_leader,
-                                    ),
+                            let mut requests = HashMap::new();
+                            for (_, proposal) in &missing {
+                                if let Some(pending) = self.pending_payloads.get(&proposal.header_digest) {
+                                    merge_batch_request_groups(
+                                        &mut requests,
+                                        register_batch_requests(
+                                            &mut self.batch_requests,
+                                            &pending.missing,
+                                            pending.height,
+                                            BatchSyncSource::OptimisticLeader(proposal_leader),
+                                        ),
+                                    );
+                                }
+                            }
+                            if !requests.is_empty() {
+                                self.send_batch_requests(proposal_leader, requests, true).await;
+                            }
+
+                            for (_, proposal) in &missing {
+                                self.ensure_proposal_suffix_request(
+                                    proposal.clone(),
+                                    proposal.height.saturating_sub(1),
+                                    vec![proposal_leader],
+                                )
+                                .await;
+                            }
+
+                            if let Some((consensus_message, header)) = resume {
+                                let id = proposal_waiter_id(&consensus_message);
+                                if !self.pending.contains_key(&id) {
+                                    self.metrics.autobahn_prepare_sync_events_total.inc();
+                                    self.metrics
+                                        .autobahn_prepare_missing_headers_total
+                                        .inc_by(missing.len() as u64);
+                                    let wait_for = missing
+                                        .iter()
+                                        .map(|(_, proposal)| {
+                                            (proposal.header_digest.to_vec(), self.store.clone())
+                                        })
+                                        .collect();
+                                    let height = missing
+                                        .iter()
+                                        .map(|(_, proposal)| proposal.height)
+                                        .max()
+                                        .unwrap_or_default();
+                                    let (tx_cancel, rx_cancel) = channel(1);
+                                    self.pending.insert(id, (height, tx_cancel));
+                                    proposal_waiting.push(Self::proposal_waiter(
+                                        wait_for,
+                                        (consensus_message, header),
+                                        rx_cancel,
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+
+                        WaiterMessage::SyncImplicit(missing, mut sources) => {
+                            sources.sort_unstable();
+                            sources.dedup();
+                            let mut requests = HashMap::new();
+                            for (_, proposal) in &missing {
+                                // TC/PrepareQC evidence supersedes a fresh
+                                // leader-only fetch and keeps repair asynchronous.
+                                self.optimistic_tip_sources
+                                    .remove(&proposal.header_digest);
+                                self.implicit_tip_sources.insert(
+                                    proposal.header_digest.clone(),
+                                    (sources.clone(), proposal.height),
                                 );
+                                if let Some(pending) = self.pending_payloads.get(&proposal.header_digest) {
+                                    merge_batch_request_groups(
+                                        &mut requests,
+                                        register_batch_requests(
+                                            &mut self.batch_requests,
+                                            &pending.missing,
+                                            pending.height,
+                                            BatchSyncSource::ProofSources(sources.clone()),
+                                        ),
+                                    );
+                                }
+                                self.ensure_proposal_suffix_request(
+                                    proposal.clone(),
+                                    proposal.height.saturating_sub(1),
+                                    sources.clone(),
+                                )
+                                .await;
                             }
-                            if !prefix_requests.is_empty() {
-                                self.send_batch_requests(proposal_leader, prefix_requests, true)
-                                    .await;
+                            if !requests.is_empty() {
+                                self.send_proof_batch_requests(sources, requests).await;
                             }
+                        }
 
-                            self.metrics.autobahn_prepare_sync_events_total.inc();
-                            self.metrics
-                                .autobahn_prepare_missing_headers_total
-                                .inc_by(missing.len() as u64);
-
-                            // Wait for all referenced headers.
-                            let wait_for = missing
-                                .iter()
-                                .map(|(_, proposal)| {
-                                    (proposal.header_digest.to_vec(), self.store.clone())
-                                })
-                                .collect();
-                            let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(id, (height, tx_cancel));
-                            let fut = Self::proposal_waiter(
-                                wait_for,
-                                (consensus_message, header),
-                                rx_cancel,
-                                Instant::now(),
-                            );
-                            proposal_waiting.push(fut);
-
-                            // Contact the elected proposal leader. A lane
-                            // author that narrowcast the tip may remain silent.
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Failed to measure time")
-                                .as_millis();
-                            let mut requires_sync = Vec::new();
-                            for (_, missing) in missing {
-                                self.parent_requests.entry(missing.header_digest.clone()).or_insert_with(|| {
-                                    requires_sync.push(missing.header_digest);
-                                    (missing.height, now)
-                                });
-                            }
-                            if !requires_sync.is_empty() {
-                                let address = self.committee
-                                    .primary(&proposal_leader)
-                                    .expect("Author of valid header not in the committee")
-                                    .primary_to_primary;
-                                let message = PrimaryMessage::PrepareHeadersRequest(requires_sync, self.name);
-                                let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send_typed(address, Bytes::from(bytes), "PrepareHeadersRequest").await;
+                        WaiterMessage::WaitForCommit(missing, consensus_message, header) => {
+                            let id = proposal_waiter_id(&consensus_message);
+                            if !self.pending.contains_key(&id) {
+                                let wait_for = missing
+                                    .into_iter()
+                                    .map(|digest| (digest.to_vec(), self.store.clone()))
+                                    .collect();
+                                // Direct consensus requests use a synthetic
+                                // carrier header at height zero. Retain the wait
+                                // according to the committed cut itself instead.
+                                let height = match &consensus_message {
+                                    ConsensusMessage::Prepare { proposals, .. }
+                                    | ConsensusMessage::Confirm { proposals, .. }
+                                    | ConsensusMessage::Commit { proposals, .. } => proposals
+                                        .values()
+                                        .map(|proposal| proposal.height)
+                                        .max()
+                                        .unwrap_or_else(|| header.height()),
+                                };
+                                let (tx_cancel, rx_cancel) = channel(1);
+                                self.pending.insert(id, (height, tx_cancel));
+                                proposal_waiting.push(Self::proposal_waiter(
+                                    wait_for,
+                                    (consensus_message, header),
+                                    rx_cancel,
+                                    Instant::now(),
+                                ));
                             }
                         }
                     }
@@ -593,7 +798,7 @@ impl HeaderWaiter {
                         for x in header.payload.keys() {
                             let _ = self.batch_requests.remove(x);
                         }
-                        let _ = self.parent_requests.remove(&header.parent_cert.header_digest);
+                        let _ = self.proposal_requests.remove(&header.id);
 
                         self.tx_core.send(header).await.expect("Failed to send header");
                     },
@@ -606,10 +811,12 @@ impl HeaderWaiter {
 
                 Some(result) = proposal_waiting.next() => match result {
                     Ok(Some((deliver, elapsed))) => {
-                        self.metrics.autobahn_prepare_sync_completed_total.inc();
-                        self.metrics
-                            .autobahn_prepare_sync_wait_micros_total
-                            .inc_by(elapsed.as_micros().min(u64::MAX as u128) as u64);
+                        if matches!(&deliver.0, ConsensusMessage::Prepare { .. }) {
+                            self.metrics.autobahn_prepare_sync_completed_total.inc();
+                            self.metrics
+                                .autobahn_prepare_sync_wait_micros_total
+                                .inc_by(elapsed.as_micros().min(u64::MAX as u128) as u64);
+                        }
                         let id = proposal_waiter_id(&deliver.0);
                         let _ = self.pending.remove(&id);
                         for x in deliver.1.payload.keys() {
@@ -622,8 +829,9 @@ impl HeaderWaiter {
                             ConsensusMessage::Commit {view: _, slot: _, qc: _, proposals} => proposals,
                         };
                         for (_, prop) in possibly_missing.iter() {
-                            let _ = self.parent_requests.remove(&prop.header_digest);
+                            let _ = self.proposal_requests.remove(&prop.header_digest);
                             let _ = self.optimistic_tip_sources.remove(&prop.header_digest);
+                            let _ = self.implicit_tip_sources.remove(&prop.header_digest);
                         }
 
                         self.tx_consensus_loopback.send(deliver).await.expect("Failed to send header");
@@ -642,18 +850,26 @@ impl HeaderWaiter {
                         .expect("Failed to measure time")
                         .as_millis();
 
-                    // Header requests use a separate retry path.
-                    let mut retry = Vec::new();
-                    for (digest, (_, timestamp)) in &self.parent_requests {
-                        if timestamp + (self.sync_retry_delay as u128) < now {
-                            debug!("Requesting retry sync for parent header {} (retry)", digest);
-                            retry.push(digest.clone());
+                    // Retry only the leader or proof voters selected by the
+                    // protocol evidence. No arbitrary peer is introduced.
+                    let retry: Vec<_> = self.proposal_requests
+                        .iter()
+                        .filter(|(_, request)| {
+                            request.requested_at + (self.sync_retry_delay as u128) < now
+                        })
+                        .map(|(digest, request)| (digest.clone(), request.clone()))
+                        .collect();
+                    for (digest, request) in retry {
+                        if self.store.read(digest.to_vec()).await.ok().flatten().is_some() {
+                            self.proposal_requests.remove(&digest);
+                            continue;
                         }
+                        self.send_proposal_suffix_request(
+                            request.proposal,
+                            request.stop_height,
+                            request.sources,
+                        ).await;
                     }
-                    let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
-                    let message = PrimaryMessage::HeadersRequest(retry, self.name);
-                    let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                    self.network.lucky_broadcast_typed(addresses, Bytes::from(bytes), self.sync_retry_nodes, "HeadersRequest").await;
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
@@ -676,9 +892,12 @@ impl HeaderWaiter {
                     .retain(|_, pending| pending.height > gc_round);
                 self.optimistic_tip_sources
                     .retain(|_, (_, r)| r > &mut gc_round);
-                self.optimistic_lane_sources
+                self.implicit_tip_sources
                     .retain(|_, (_, r)| r > &mut gc_round);
-                self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
+                self.certified_lane_sources
+                    .retain(|_, (_, r)| r > &mut gc_round);
+                self.proposal_requests
+                    .retain(|_, request| request.proposal.height > gc_round);
                 self.header_requests.retain(|_, (r, _)| r > &mut gc_round);
             }
         }
@@ -690,6 +909,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn certified_forks_retain_all_proof_derived_sources() {
+        let keys = crate::common::keys();
+        let lane = keys[0].0;
+        let mut known = CertifiedLaneSources::new();
+
+        record_certified_lane_sources(&mut known, lane, vec![keys[1].0, keys[2].0], 7);
+        record_certified_lane_sources(&mut known, lane, vec![keys[2].0, keys[3].0], 7);
+
+        let (sources, height) = known.get(&lane).unwrap();
+        assert_eq!(*height, 7);
+        assert_eq!(sources.len(), 3);
+        assert!(sources.contains(&keys[1].0));
+        assert!(sources.contains(&keys[2].0));
+        assert!(sources.contains(&keys[3].0));
+    }
+
+    #[test]
     fn batch_requests_group_by_worker_and_deduplicate() {
         let first_target = crate::common::keys()[0].0;
         let replacement_target = crate::common::keys()[1].0;
@@ -697,19 +933,66 @@ mod tests {
         let b = Digest([2; 32]);
         let c = Digest([3; 32]);
         let missing = HashMap::from([(a.clone(), 0), (b.clone(), 0), (c.clone(), 1)]);
-        let mut tracked = HashMap::from([(a.clone(), (4, first_target))]);
+        let first_source = BatchSyncSource::Author(first_target);
+        let replacement_source = BatchSyncSource::OptimisticLeader(replacement_target);
+        let mut tracked = HashMap::from([(a.clone(), (4, first_source.clone()))]);
 
-        let mut groups = register_batch_requests(&mut tracked, &missing, 7, first_target);
+        let mut groups = register_batch_requests(&mut tracked, &missing, 7, first_source.clone());
         let mut worker_zero = groups.remove(&0).unwrap();
         worker_zero.sort();
         assert_eq!(worker_zero, vec![b]);
         assert_eq!(groups.remove(&1), Some(vec![c]));
         assert!(groups.is_empty());
-        assert!(register_batch_requests(&mut tracked, &missing, 8, first_target).is_empty());
+        assert!(register_batch_requests(&mut tracked, &missing, 8, first_source).is_empty());
 
-        let replacement = register_batch_requests(&mut tracked, &missing, 8, replacement_target);
+        let replacement =
+            register_batch_requests(&mut tracked, &missing, 8, replacement_source.clone());
         assert_eq!(replacement.values().map(Vec::len).sum::<usize>(), 3);
-        assert_eq!(tracked.get(&a), Some(&(8, replacement_target)));
+        assert_eq!(tracked.get(&a), Some(&(8, replacement_source)));
+
+        let third_target = crate::common::keys()[2].0;
+        let first_proof = BatchSyncSource::ProofSources(vec![first_target, replacement_target]);
+        let second_proof = BatchSyncSource::ProofSources(vec![first_target, third_target]);
+        let mut proof_tracked = HashMap::new();
+        assert_eq!(
+            register_batch_requests(&mut proof_tracked, &missing, 8, first_proof)
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(
+            register_batch_requests(&mut proof_tracked, &missing, 8, second_proof)
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn implicit_evidence_retargets_a_pending_leader_only_header_request() {
+        let keys = crate::common::keys();
+        let old_leader = keys[0].0;
+        let proof_sources = vec![keys[1].0, keys[2].0];
+        let proposal = Proposal {
+            header_digest: Digest([17; 32]),
+            height: 9,
+            poa: None,
+        };
+        let pending = PendingProposalRequest {
+            proposal: proposal.clone(),
+            stop_height: 8,
+            sources: vec![old_leader],
+            requested_at: 0,
+        };
+
+        assert!(proposal_request_needs_update(
+            Some(&pending),
+            &proposal,
+            8,
+            &proof_sources,
+        ));
     }
 
     #[test]
@@ -738,10 +1021,12 @@ mod tests {
         let first = Proposal {
             header_digest: Digest([7; 32]),
             height: 11,
+            poa: None,
         };
         let second = Proposal {
             header_digest: Digest([8; 32]),
             height: 13,
+            poa: None,
         };
         let mut sources = HashMap::new();
 
@@ -756,85 +1041,32 @@ mod tests {
     }
 
     #[test]
-    fn optimistic_repair_source_is_inherited_by_the_missing_parent() {
+    fn optimistic_leader_obligation_is_tip_only() {
         let leader = crate::common::keys()[0].0;
         let child = Digest([7; 32]);
         let parent = Digest([8; 32]);
-        let mut sources = HashMap::from([(child.clone(), (leader, 11))]);
+        let sources = HashMap::from([(child.clone(), (leader, 11))]);
 
-        let inherited = inherit_optimistic_tip_source(&mut sources, &child, parent.clone(), 10);
-
-        assert_eq!(inherited, Some(leader));
-        assert_eq!(sources.get(&parent), Some(&(leader, 10)));
+        assert_eq!(sources.get(&child), Some(&(leader, 11)));
+        assert!(!sources.contains_key(&parent));
     }
 
     #[test]
-    fn prepare_collects_the_whole_known_missing_lane_prefix_for_its_leader() {
-        let keys = crate::common::keys();
-        let lane = keys[0].0;
-        let other_lane = keys[1].0;
-        let leader = keys[2].0;
-        let old_target = keys[3].0;
-        let low_header = Digest([1; 32]);
-        let tip_header = Digest([2; 32]);
-        let future_header = Digest([3; 32]);
-        let other_header = Digest([4; 32]);
-        let low_batch = Digest([11; 32]);
-        let tip_batch = Digest([12; 32]);
-        let future_batch = Digest([13; 32]);
-        let other_batch = Digest([14; 32]);
-        let pending = HashMap::from([
-            (
-                low_header.clone(),
-                PendingPayload {
-                    author: lane,
-                    height: 4,
-                    missing: HashMap::from([(low_batch.clone(), 0)]),
-                },
-            ),
-            (
-                tip_header.clone(),
-                PendingPayload {
-                    author: lane,
-                    height: 5,
-                    missing: HashMap::from([(tip_batch.clone(), 1)]),
-                },
-            ),
-            (
-                future_header,
-                PendingPayload {
-                    author: lane,
-                    height: 6,
-                    missing: HashMap::from([(future_batch, 0)]),
-                },
-            ),
-            (
-                other_header,
-                PendingPayload {
-                    author: other_lane,
-                    height: 5,
-                    missing: HashMap::from([(other_batch, 0)]),
-                },
-            ),
-        ]);
-        let mut tracked = HashMap::from([(low_batch.clone(), (4, old_target))]);
-        let mut sources = HashMap::new();
+    fn certified_repair_sources_are_exactly_the_poa_voters() {
+        let header = crate::common::header();
+        let mut certificate = crate::common::certificate(&header);
+        certificate.votes.truncate(2);
+        let expected: Vec<_> = certificate
+            .votes
+            .iter()
+            .map(|(author, _)| *author)
+            .collect();
 
-        let groups = collect_optimistic_prefix_requests(
-            &pending,
-            &mut tracked,
-            &mut sources,
-            lane,
-            5,
-            leader,
-        );
-        let requested: usize = groups.values().map(Vec::len).sum();
-
-        assert_eq!(requested, 2);
-        assert_eq!(tracked.get(&low_batch), Some(&(4, leader)));
-        assert_eq!(tracked.get(&tip_batch), Some(&(5, leader)));
-        assert_eq!(sources.get(&low_header), Some(&(leader, 4)));
-        assert_eq!(sources.get(&tip_header), Some(&(leader, 5)));
-        assert_eq!(sources.len(), 2);
+        let proposal = Proposal::certified(certificate);
+        let mut sources = HeaderWaiter::proposal_sources(&proposal);
+        let mut expected = expected;
+        sources.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(sources, expected);
     }
 }

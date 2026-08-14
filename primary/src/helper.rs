@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::primary::PrimaryMessage;
+use crate::messages::{Header, Proposal};
+use crate::primary::{Height, PrimaryMessage};
 use bytes::Bytes;
 use config::Committee;
 use crypto::{Digest, PublicKey};
@@ -21,6 +22,8 @@ pub struct Helper {
 
     /// Header requests.
     rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey, bool)>,
+    /// Whole Autobahn suffix requests selected by a PoA or elected leader.
+    rx_proposal_headers: Receiver<(Proposal, Height, PublicKey)>,
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
     metrics: Arc<Metrics>,
@@ -32,6 +35,7 @@ impl Helper {
         store: Store,
         rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
         rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey, bool)>,
+        rx_proposal_headers: Receiver<(Proposal, Height, PublicKey)>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
     ) {
@@ -41,6 +45,7 @@ impl Helper {
                 store,
                 rx_primaries_certs,
                 rx_primaries_headers,
+                rx_proposal_headers,
                 network: SimpleSender::new()
                     .with_metrics(metrics.clone())
                     .with_batching(batch),
@@ -112,6 +117,66 @@ impl Helper {
                         }
                     }
 
+                },
+                Some((proposal, stop_height, origin)) = self.rx_proposal_headers.recv() => {
+                    let address = match self.committee.primary(&origin) {
+                        Ok(x) => x.primary_to_primary,
+                        Err(e) => {
+                            warn!("Unexpected proposal suffix request: {}", e);
+                            continue;
+                        }
+                    };
+                    let Some(poa) = proposal.poa.as_ref() else {
+                        warn!("Ignoring proof-free Autobahn suffix request");
+                        continue;
+                    };
+                    let lane = poa.author;
+                    if stop_height >= proposal.height
+                        || proposal.verify(&lane, &self.committee).is_err()
+                    {
+                        warn!("Ignoring malformed Autobahn suffix request");
+                        continue;
+                    }
+                    let mut digest = proposal.header_digest.clone();
+                    let mut height = proposal.height;
+                    let mut headers = Vec::new();
+                    while height > stop_height {
+                        let data = match self.store.read(digest.to_vec()).await {
+                            Ok(Some(data)) => data,
+                            Ok(None) => break,
+                            Err(e) => {
+                                error!("{}", e);
+                                break;
+                            }
+                        };
+                        let header: Header = match bincode::deserialize(&data) {
+                            Ok(header) => header,
+                            Err(error) => {
+                                error!("Failed to deserialize stored proposal header: {}", error);
+                                break;
+                            }
+                        };
+                        if header.author != lane || header.height != height || header.id != digest {
+                            warn!("Stored header does not match requested Autobahn suffix");
+                            break;
+                        }
+                        digest = header.parent_cert.header_digest.clone();
+                        height = header.parent_cert.height;
+                        headers.push(header);
+                    }
+                    if headers.is_empty() {
+                        continue;
+                    }
+                    // The requester processes one signed header at a time; oldest
+                    // first ensures that observing the tip implies its prefix has
+                    // already entered the validation pipeline.
+                    headers.reverse();
+                    let response = PrimaryMessage::ProposalHeaders(headers);
+                    let bytes = bincode::serialize(&response)
+                        .expect("Failed to serialize proposal suffix response");
+                    self.network
+                        .send_typed(address, Bytes::from(bytes), "ProposalHeaders")
+                        .await;
                 },
             };
         }

@@ -154,6 +154,56 @@ async fn optimistic_synchronize_retargets_a_pending_batch_to_the_new_leader() {
     assert!(second.await.is_ok());
 }
 
+#[tokio::test]
+async fn proof_source_synchronize_targets_every_and_only_named_holder() {
+    let (tx_message, rx_message) = channel(1);
+    let mut keys = keys();
+    let (name, _) = keys.pop().unwrap();
+    let (first, _) = keys.pop().unwrap();
+    let (second, _) = keys.pop().unwrap();
+    let id = 0;
+    let committee = committee_with_base_port(9_300);
+    let path = ".db_test_proof_source_synchronize";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    Synchronizer::spawn(
+        name,
+        id,
+        committee.clone(),
+        store,
+        50,
+        1_000_000,
+        3,
+        rx_message,
+        std::collections::HashMap::new(),
+        Metrics::new(&prometheus::Registry::new()).0,
+        BatchConfig::default(),
+    );
+
+    let missing = vec![batch_digest()];
+    let expected = WorkerMessage::BatchRequest(missing.clone(), name);
+    let serialized = Bytes::from(bincode::serialize(&expected).unwrap());
+    let first_listener = listener(
+        committee.worker(&first, &id).unwrap().worker_to_worker,
+        Some(serialized.clone()),
+    );
+    let second_listener = listener(
+        committee.worker(&second, &id).unwrap().worker_to_worker,
+        Some(serialized),
+    );
+
+    tx_message
+        .send(PrimaryWorkerMessage::SynchronizeProofSources(
+            missing,
+            vec![second, first],
+        ))
+        .await
+        .unwrap();
+
+    assert!(first_listener.await.is_ok());
+    assert!(second_listener.await.is_ok());
+}
+
 /// Deferred misses are retried and stale entries are evicted.
 #[cfg(feature = "benchmark")]
 mod benchmark_metrics_tests {

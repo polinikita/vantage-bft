@@ -148,6 +148,8 @@ pub enum PrimaryMessage {
     VantageSequenceAnnounceBatch(Vec<SequenceAnnouncement>, /* sender */ PublicKey),
     // Autobahn prepare-time tip repair; appended for bincode compatibility.
     PrepareHeadersRequest(Vec<Digest>, /* requestor */ PublicKey),
+    // Autobahn whole-suffix response; appended for bincode compatibility.
+    ProposalHeaders(Vec<Header>),
 }
 
 impl PrimaryMessage {
@@ -219,6 +221,7 @@ impl PrimaryMessage {
             PrimaryMessage::VantageSequenceHeaders(..) => "VantageSequenceHeaders",
             PrimaryMessage::VantageSequenceAnnounceBatch(..) => "VantageSequenceAnnounceBatch",
             PrimaryMessage::PrepareHeadersRequest(..) => "PrepareHeadersRequest",
+            PrimaryMessage::ProposalHeaders(..) => "ProposalHeaders",
         }
     }
 }
@@ -248,6 +251,10 @@ pub enum PrimaryWorkerMessage {
     /// Requests batches specifically from the current optimistic proposal
     /// leader, which must relay the tips it chose to propose.
     SynchronizeOptimistic(Vec<Digest>, /* proposal leader */ PublicKey),
+    /// Requests batches only from holders named by a PoA, QC, or TC.
+    SynchronizeProofSources(Vec<Digest>, Vec<PublicKey>),
+    /// Autobahn direct-car repair: retry only against the lane author.
+    SynchronizeAuthor(Vec<Digest>, /* lane author */ PublicKey),
 }
 
 impl PrimaryWorkerMessage {
@@ -258,6 +265,8 @@ impl PrimaryWorkerMessage {
             PrimaryWorkerMessage::Cleanup(..) => "Cleanup",
             PrimaryWorkerMessage::Committed(..) => "Committed",
             PrimaryWorkerMessage::SynchronizeOptimistic(..) => "SynchronizeOptimistic",
+            PrimaryWorkerMessage::SynchronizeProofSources(..) => "SynchronizeProofSources",
+            PrimaryWorkerMessage::SynchronizeAuthor(..) => "SynchronizeAuthor",
         }
     }
 }
@@ -310,6 +319,7 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_header_requests, rx_header_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_proposal_header_requests, rx_proposal_header_requests) = channel(CHANNEL_CAPACITY);
         let (tx_instance, rx_instance) = channel(CHANNEL_CAPACITY);
         let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(CHANNEL_CAPACITY);
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
@@ -556,6 +566,7 @@ impl Primary {
                         tx_primary_messages,
                         tx_cert_requests,
                         tx_header_requests,
+                        tx_proposal_header_requests,
                         metrics: metrics.clone(),
                     },
                     Some(metrics.clone()),
@@ -629,6 +640,7 @@ impl Primary {
                     parameters.use_fast_path,
                     parameters.fast_path_timeout,
                     parameters.use_ride_share,
+                    parameters.car_timeout,
                     parameters.all_to_all,
                     parameters.simulate_asynchrony,
                     parameters.asynchrony_start,
@@ -734,6 +746,7 @@ impl Primary {
                     store,
                     rx_cert_requests,
                     rx_header_requests,
+                    rx_proposal_header_requests,
                     metrics.clone(),
                     batch,
                 );
@@ -761,6 +774,7 @@ struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
     tx_header_requests: Sender<(Vec<Digest>, PublicKey, bool)>,
+    tx_proposal_header_requests: Sender<(Proposal, Height, PublicKey)>,
     metrics: Arc<Metrics>,
 }
 
@@ -793,6 +807,19 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .send((missing, requestor, true))
                 .await
                 .expect("Failed to send primary message"),
+            PrimaryMessage::ProposalHeadersRequest(proposal, stop_height, requestor) => self
+                .tx_proposal_header_requests
+                .send((proposal, stop_height, requestor))
+                .await
+                .expect("Failed to send proposal suffix request"),
+            PrimaryMessage::ProposalHeaders(headers) => {
+                for header in headers {
+                    self.tx_primary_messages
+                        .send(PrimaryMessage::Header(header, true))
+                        .await
+                        .expect("Failed to deliver proposal suffix header");
+                }
+            }
             request => self
                 .tx_primary_messages
                 .send(request)

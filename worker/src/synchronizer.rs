@@ -114,7 +114,7 @@ pub struct Synchronizer {
     gc_depth: Round,
     /// Delay between sync retries, in milliseconds.
     sync_retry_delay: u64,
-    /// Number of random peers used for sync retries.
+    /// Number of random peers used by Vantage's widening retry policy.
     sync_retry_nodes: usize,
     /// Commands from the primary.
     rx_message: Receiver<PrimaryWorkerMessage>,
@@ -123,9 +123,18 @@ pub struct Synchronizer {
     /// Primary round used for cleanup.
     round: Round,
     /// Digests awaiting their batches, with cleanup round, request time, and
-    /// current target. A new Prepare leader must be able to supersede a
-    /// silent leader without waiting for the generic broadcast retry.
-    pending: HashMap<Digest, (Round, Sender<()>, u128, PublicKey)>,
+    /// exact protocol-derived repair policy.
+    pending: HashMap<Digest, (Round, Sender<()>, u128, SyncPolicy)>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SyncPolicy {
+    /// Existing Vantage behavior: try the author, then widen on retry.
+    Widening(PublicKey),
+    /// Autobahn behavior: the lane author is the only justified source.
+    Author(PublicKey),
+    OptimisticLeader(PublicKey),
+    ProofSources(Vec<PublicKey>),
 }
 
 /// Processes benchmark commit metrics without blocking batch synchronization.
@@ -198,10 +207,13 @@ impl Synchronizer {
     async fn synchronize(
         &mut self,
         digests: Vec<Digest>,
-        target: PublicKey,
-        optimistic_leader_repair: bool,
+        mut policy: SyncPolicy,
         tx_waiter: &Sender<Result<Option<Digest>, StoreError>>,
     ) {
+        if let SyncPolicy::ProofSources(sources) = &mut policy {
+            sources.sort_unstable();
+            sources.dedup();
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Failed to measure time")
@@ -223,10 +235,10 @@ impl Synchronizer {
                 continue;
             }
 
-            if let Some((_, _, timestamp, previous_target)) = self.pending.get_mut(&digest) {
-                if optimistic_leader_repair && *previous_target != target {
+            if let Some((_, _, timestamp, previous_policy)) = self.pending.get_mut(&digest) {
+                if *previous_policy != policy {
                     *timestamp = now;
-                    *previous_target = target;
+                    *previous_policy = policy.clone();
                     missing.push(digest);
                 }
                 continue;
@@ -245,34 +257,54 @@ impl Synchronizer {
                 let _ = tx_result.send(result).await;
             });
             self.pending
-                .insert(digest, (self.round, tx_cancel, now, target));
+                .insert(digest, (self.round, tx_cancel, now, policy.clone()));
         }
 
         if missing.is_empty() {
             return;
         }
-        let address = match self.committee.worker(&target, &self.id) {
-            Ok(address) => address.worker_to_worker,
-            Err(e) => {
-                error!("The primary asked us to sync with an unknown node: {}", e);
-                return;
-            }
-        };
-        let (message, kind) = if optimistic_leader_repair {
-            (
-                WorkerMessage::OptimisticBatchRequest(missing, self.name),
-                "OptimisticBatchRequest",
-            )
-        } else {
-            (
+        self.send_requests(missing, &policy).await;
+    }
+
+    async fn send_requests(&mut self, missing: Vec<Digest>, policy: &SyncPolicy) {
+        let (targets, message, kind) = match policy {
+            SyncPolicy::Widening(author) => (
+                vec![*author],
                 WorkerMessage::BatchRequest(missing, self.name),
                 "BatchRequest",
-            )
+            ),
+            SyncPolicy::Author(author) => (
+                vec![*author],
+                WorkerMessage::BatchRequest(missing, self.name),
+                "BatchRequest",
+            ),
+            SyncPolicy::OptimisticLeader(leader) => (
+                vec![*leader],
+                WorkerMessage::OptimisticBatchRequest(missing, self.name),
+                "OptimisticBatchRequest",
+            ),
+            SyncPolicy::ProofSources(sources) => (
+                sources.clone(),
+                WorkerMessage::BatchRequest(missing, self.name),
+                "ProofSourceBatchRequest",
+            ),
         };
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-        self.network
-            .send_typed(address, Bytes::from(serialized), kind)
-            .await;
+        for target in targets {
+            if target == self.name {
+                continue;
+            }
+            let address = match self.committee.worker(&target, &self.id) {
+                Ok(address) => address.worker_to_worker,
+                Err(e) => {
+                    error!("The primary asked us to sync with an unknown node: {}", e);
+                    continue;
+                }
+            };
+            self.network
+                .send_typed(address, Bytes::from(serialized.clone()), kind)
+                .await;
+        }
     }
 
     /// Main loop for primary synchronization requests.
@@ -290,10 +322,28 @@ impl Synchronizer {
             tokio::select! {
                 Some(message) = self.rx_message.recv() => match message {
                     PrimaryWorkerMessage::Synchronize(digests, target) => {
-                        self.synchronize(digests, target, false, &tx_waiter).await;
+                        self.synchronize(digests, SyncPolicy::Widening(target), &tx_waiter).await;
                     },
                     PrimaryWorkerMessage::SynchronizeOptimistic(digests, target) => {
-                        self.synchronize(digests, target, true, &tx_waiter).await;
+                        self.synchronize(
+                            digests,
+                            SyncPolicy::OptimisticLeader(target),
+                            &tx_waiter,
+                        ).await;
+                    },
+                    PrimaryWorkerMessage::SynchronizeProofSources(digests, sources) => {
+                        self.synchronize(
+                            digests,
+                            SyncPolicy::ProofSources(sources),
+                            &tx_waiter,
+                        ).await;
+                    },
+                    PrimaryWorkerMessage::SynchronizeAuthor(digests, author) => {
+                        self.synchronize(
+                            digests,
+                            SyncPolicy::Author(author),
+                            &tx_waiter,
+                        ).await;
                     },
                     PrimaryWorkerMessage::Cleanup(round) => {
                         self.round = round;
@@ -340,15 +390,34 @@ impl Synchronizer {
                         }
                     }
                     if !retry.is_empty() {
-                        let message = WorkerMessage::BatchRequest(retry, self.name);
-                        let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-                        let addresses = self.committee
-                            .others_workers(&self.name, &self.id)
-                            .iter().map(|(_, address)| address.worker_to_worker)
-                            .collect();
-                        self.network
-                            .lucky_broadcast_typed(addresses, Bytes::from(serialized), self.sync_retry_nodes, "BatchRequest")
-                            .await;
+                        let mut by_policy: HashMap<SyncPolicy, Vec<Digest>> = HashMap::new();
+                        for digest in retry {
+                            if let Some((_, _, _, policy)) = self.pending.get(&digest) {
+                                by_policy.entry(policy.clone()).or_default().push(digest);
+                            }
+                        }
+                        for (policy, digests) in by_policy {
+                            if matches!(policy, SyncPolicy::Widening(_)) {
+                                let message = WorkerMessage::BatchRequest(digests, self.name);
+                                let serialized = bincode::serialize(&message)
+                                    .expect("Failed to serialize our own message");
+                                let addresses = self.committee
+                                    .others_workers(&self.name, &self.id)
+                                    .iter()
+                                    .map(|(_, address)| address.worker_to_worker)
+                                    .collect();
+                                self.network
+                                    .lucky_broadcast_typed(
+                                        addresses,
+                                        Bytes::from(serialized),
+                                        self.sync_retry_nodes,
+                                        "BatchRequest",
+                                    )
+                                    .await;
+                            } else {
+                                self.send_requests(digests, &policy).await;
+                            }
+                        }
                     }
 
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
