@@ -49,12 +49,12 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
-      - name: Build benchmark-enabled node
-        run: cargo build -p node --features benchmark
+      - name: Build optimized benchmark-enabled node
+        run: cargo build --release -p node --features benchmark
       - name: Check n=7, f=2 permanent-crash regression
         run: >-
           python3 benchmark/check_protocol_regressions.py
-          --binary target/debug/node
+          --binary target/release/node
           --nodes 7
           --crash 2
           --rate 200

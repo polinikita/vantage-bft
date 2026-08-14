@@ -51,7 +51,7 @@ To reproduce the smaller CI gate locally:
 
 ```bash
 python3 benchmark/check_protocol_regressions.py \
-  --binary target/debug/node --nodes 7 --crash 2 --rate 200
+  --binary target/release/node --nodes 7 --crash 2 --rate 200
 ```
 
 ## Local Leader-Relay Stress
