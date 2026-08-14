@@ -20,10 +20,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("measurements", type=Path, help="CSV produced by the experiment")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--offered-tps", type=int, default=5_000)
+    parser.add_argument(
+        "--title",
+        default="Leader-relay burden under narrowcast data lanes",
+    )
+    parser.add_argument(
+        "--subtitle",
+        default=(
+            "n=20 · AWS RTT matrix via tc netem · 5,000 useful TPS on 14 correct "
+            "lanes · 6 silent Byzantine authors · each correct leader misses 2 of "
+            "6 faulty lanes"
+        ),
+    )
+    parser.add_argument(
+        "--annotate-low-throughput",
+        action="store_true",
+        help="label non-aligned points below 5%% of offered useful load",
+    )
     return parser.parse_args()
 
 
-def load_measurements(path: Path) -> list[dict[str, float | str]]:
+def load_measurements(path: Path) -> list[dict[str, float | str | bool]]:
     with path.open(newline="") as source:
         records = list(csv.DictReader(source))
     required = {"protocol", "adversarial_tps", "useful_tps", "p50_ms", "p99_ms"}
@@ -37,6 +54,9 @@ def load_measurements(path: Path) -> list[dict[str, float | str]]:
             "useful_tps": float(record["useful_tps"]),
             "p50_ms": float(record["p50_ms"]),
             "p99_ms": float(record["p99_ms"]),
+            "aligned": record.get("aligned", "true").lower() in {
+                "1", "true", "yes", "aligned"
+            },
         }
         for record in records
     ]
@@ -66,20 +86,62 @@ def main() -> int:
             background,
             useful,
             color=color,
-            marker=marker,
-            markersize=7,
             linewidth=2.3,
             label=label,
         )
+        for point, x, y in zip(points, background, useful):
+            throughput_axis.plot(
+                x,
+                y,
+                marker=marker,
+                markersize=7,
+                markerfacecolor=color if point["aligned"] else "white",
+                markeredgecolor=color,
+                markeredgewidth=1.7,
+            )
+            if (
+                args.annotate_low_throughput
+                and not point["aligned"]
+                and y < args.offered_tps * 0.05
+            ):
+                throughput_axis.annotate(
+                    f"{y:,.0f} TPS",
+                    xy=(x, y),
+                    xytext=(-12, 36),
+                    textcoords="offset points",
+                    ha="right",
+                    va="bottom",
+                    fontsize=9,
+                    color=color,
+                    arrowprops={"arrowstyle": "->", "color": color, "lw": 1.2},
+                )
         latency_axis.plot(
             background,
             p50,
             color=color,
-            marker=marker,
-            markersize=6,
             linewidth=2.3,
         )
         latency_axis.plot(background, p99, color=color, linestyle=":", linewidth=1.7)
+        for point, x, y50, y99 in zip(points, background, p50, p99):
+            face = color if point["aligned"] else "white"
+            latency_axis.plot(
+                x,
+                y50,
+                marker=marker,
+                markersize=6,
+                markerfacecolor=face,
+                markeredgecolor=color,
+                markeredgewidth=1.5,
+            )
+            latency_axis.plot(
+                x,
+                y99,
+                marker=marker,
+                markersize=5,
+                markerfacecolor=face,
+                markeredgecolor=color,
+                markeredgewidth=1.3,
+            )
 
     throughput_axis.axhline(
         args.offered_tps,
@@ -111,32 +173,34 @@ def main() -> int:
         handles=[
             Line2D([0], [0], color="0.25", linewidth=2.3, label="p50"),
             Line2D([0], [0], color="0.25", linewidth=1.7, linestyle=":", label="p99"),
+            Line2D(
+                [0], [0], color="0.35", marker="o", markerfacecolor="white",
+                linewidth=0, label="replica-divergent point",
+            ),
         ],
         frameon=False,
         loc="upper left",
     )
-    latency_axis.text(
-        0.99,
-        0.02,
+    figure.text(
+        0.75,
+        0.018,
         "Latency becomes survivor-biased once useful throughput collapses.",
-        transform=latency_axis.transAxes,
-        ha="right",
+        ha="center",
         va="bottom",
         fontsize=8.5,
         color="0.38",
     )
 
-    figure.suptitle("Leader-relay burden under narrowcast data lanes", fontsize=15, y=0.995)
+    figure.suptitle(args.title, fontsize=15, y=0.995)
     figure.text(
         0.5,
         0.925,
-        "n=20 · AWS RTT matrix via tc netem · 5,000 useful TPS on 14 correct lanes · "
-        "6 silent Byzantine authors · each correct leader misses 2 of 6 faulty lanes",
+        args.subtitle,
         ha="center",
         fontsize=9.5,
         color="0.3",
     )
-    figure.tight_layout(rect=(0, 0.02, 1, 0.89), w_pad=3.0)
+    figure.tight_layout(rect=(0, 0.055, 1, 0.89), w_pad=3.0)
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=220, bbox_inches="tight")
     figure.savefig(output.with_suffix(".pdf"), bbox_inches="tight")
