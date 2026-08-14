@@ -37,22 +37,22 @@ PROTOCOLS = (
     Protocol(
         "autobahn-optimistic",
         "Autobahn optimistic (all-to-all)",
-        ("--all-to-all", "--timeout-delay-ms", "2000"),
+        ("--all-to-all",),
     ),
     Protocol(
         "autobahn-seamless",
         "Autobahn seamless",
-        ("--timeout-delay-ms", "2000"),
+        (),
     ),
     Protocol(
         "simple-it",
         "Simple-IT (Opt-RBC)",
-        ("--timeout-delay-ms", "1600"),
+        (),
     ),
     Protocol(
         "simple-it-bracha",
         "Simple-IT (Bracha-RBC)",
-        ("--timeout-delay-ms", "1000"),
+        (),
     ),
 )
 

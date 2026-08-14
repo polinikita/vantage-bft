@@ -40,7 +40,9 @@ python3 docker-bench/check_protocol_controls.py
 It runs Vantage, Autobahn optimistic, Autobahn seamless, Simple-IT/Opt-RBC,
 and Simple-IT/Bracha-RBC under the AWS RTT matrix implemented with
 per-destination `tc netem`. Autobahn optimistic always enables its defining
-all-to-all communication mode. The three scenarios are:
+all-to-all communication mode. Round timeouts are derived from `--delta-ms`:
+Autobahn uses 10x, Simple-IT/Opt-RBC 8x, and Simple-IT/Bracha-RBC 5x. The
+three scenarios are:
 
 1. `clean`: all 20 validators run and the reachable target is 1,000 tx/s.
 2. `crash`: validators 0--5 are never started; 1,000 tx/s is redistributed over

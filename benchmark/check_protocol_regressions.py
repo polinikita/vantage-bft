@@ -21,10 +21,9 @@ PROTOCOLS = (
 )
 PROTOCOL_ARGS = {
     "vantage": (),
-    # Autobahn's liveness proof uses a conservative 10*Delta round timer.
-    # local-benchmark's default Delta is 200 ms.
-    "autobahn-optimistic": ("--all-to-all", "--timeout-delay-ms", "2000"),
-    "autobahn-seamless": ("--timeout-delay-ms", "2000"),
+    # Optimistic Autobahn implies all-to-all; round timers are derived from Delta.
+    "autobahn-optimistic": ("--all-to-all",),
+    "autobahn-seamless": (),
     "simple-it": (),
     "simple-it-bracha": (),
 }

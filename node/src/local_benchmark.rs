@@ -288,11 +288,14 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .unwrap()
         .parse()
         .context("--delta-ms must be a non-negative integer")?;
-    let timeout_delay_ms: u64 = matches
+    let timeout_delay_override_ms: Option<u64> = matches
         .get_one::<String>("timeout-delay-ms")
-        .unwrap()
-        .parse()
-        .context("--timeout-delay-ms must be a non-negative integer")?;
+        .map(|value| {
+            value
+                .parse()
+                .context("--timeout-delay-ms must be a non-negative integer")
+        })
+        .transpose()?;
     let fast_path_timeout_ms: u64 = matches
         .get_one::<String>("fast-path-timeout-ms")
         .unwrap()
@@ -378,6 +381,11 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             other
         ),
     };
+    let timeout_delay_ms = timeout_delay_override_ms.unwrap_or_else(|| {
+        protocol
+            .minimum_round_timeout_deltas()
+            .map_or(1_000, |multiplier| delta_ms.saturating_mul(multiplier))
+    });
     let mode = TransactionMode::parse(&mode_str).context("Invalid --mode")?;
 
     println!("\n=== local-benchmark configuration ===");
@@ -502,11 +510,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     let mut parameters = Parameters {
         protocol,
         delta_ms,
-        timeout_delay: match protocol {
-            Protocol::SimpleIt => delta_ms.saturating_mul(8),
-            Protocol::SimpleItBracha => delta_ms.saturating_mul(5),
-            _ => timeout_delay_ms,
-        },
+        timeout_delay: timeout_delay_ms,
         fast_path_timeout: fast_path_timeout_ms,
         max_batch_delay: max_batch_delay_ms,
         max_header_delay: max_header_delay_ms,

@@ -31,8 +31,9 @@ Byzantine lanes; boundary points are repeated three times. The harness also
 produces a receiver-width sweep for
 `K=0,3,6,7`, raw logs, CSV/JSON measurements, and provenance.
 
-Both Autobahn variants use the deployment configuration's 5-second consensus
-and fast-path timeouts.
+With the default `Delta = 200 ms`, both Autobahn variants use the paper's
+proof-calibrated `10 * Delta = 2 s` consensus timeout. Their separate 500 ms
+fast-path wait is a performance tuning, not a view-change timeout.
 
 ### Mandatory crash regression
 
@@ -97,8 +98,8 @@ docker-bench/run.sh \
   --correct-load-only --adversarial-rate 20000
 ```
 
-Use `--protocol vantage` or `--protocol simple-it --timeout-delay-ms 1600`
-for the matched controls. Plot a CSV containing `protocol`,
+Use `--protocol vantage` or `--protocol simple-it` for the matched controls;
+the latter derives its `8 * Delta` timeout automatically. Plot a CSV containing `protocol`,
 `adversarial_tps`, `useful_tps`, `p50_ms`, and `p99_ms` with:
 
 ```bash

@@ -294,9 +294,11 @@ async fn main() -> Result<()> {
                     Arg::new("timeout-delay-ms")
                         .long("timeout-delay-ms")
                         .value_name("INT")
-                        .default_value("1000")
                         .action(ArgAction::Set)
-                        .help("Autobahn consensus timeout in milliseconds"),
+                        .help(
+                            "Override the proof-calibrated round timeout in milliseconds \
+                             (defaults: Autobahn 10*Delta, Simple-IT Opt 8*Delta, Bracha 5*Delta)",
+                        ),
                 )
                 .arg(
                     Arg::new("fast-path-timeout-ms")

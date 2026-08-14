@@ -183,8 +183,17 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
             for offset in range(args.withhold)
         ]
         withhold_senders = 0
+    timeout_multipliers = {
+        "autobahn-optimistic": 10,
+        "autobahn-seamless": 10,
+        "simple-it": 8,
+        "simple-it-bracha": 5,
+    }
+    timeout_delay_ms = args.timeout_delay_ms
+    if timeout_delay_ms is None:
+        timeout_delay_ms = timeout_multipliers.get(args.protocol, 5) * args.delta_ms
     return {
-        "timeout_delay": args.timeout_delay_ms,
+        "timeout_delay": timeout_delay_ms,
         "header_size": 1000,
         "max_header_delay": args.max_header_delay_ms,
         "gc_depth": 50,
@@ -483,9 +492,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     "with another docker-compose project already on this host")
     # Match local-benchmark parameter names.
     p.add_argument("--delta-ms", type=int, default=200)
-    p.add_argument("--timeout-delay-ms", type=int, default=1000,
-                   help="protocol round timeout in milliseconds (default 1000; "
-                        "Simple-IT with Opt-RBC requires 8 * --delta-ms)")
+    p.add_argument("--timeout-delay-ms", type=int, default=None,
+                   help="override the proof-calibrated round timeout: Autobahn "
+                        "10*Delta, Simple-IT Opt 8*Delta, Bracha 5*Delta")
     p.add_argument("--max-batch-delay-ms", type=int, default=20)
     p.add_argument("--max-header-delay-ms", type=int, default=100)
     p.add_argument("--no-batch-messages", action="store_true")
