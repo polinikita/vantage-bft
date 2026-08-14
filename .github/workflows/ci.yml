@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - 'benchmark/**'
       - '**/*.md'
       - '.gitignore'
   pull_request:
@@ -50,7 +49,9 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
-      - name: Build benchmark-enabled node
-        run: cargo build -p node --features benchmark
+      # This is a throughput/liveness regression, so an unoptimized binary can
+      # measure runner CPU starvation instead of protocol behavior.
+      - name: Build optimized benchmark-enabled node
+        run: cargo build --release -p node --features benchmark
       - name: Check n=20, f=6 permanent-crash regression
-        run: python3 benchmark/check_protocol_regressions.py --binary target/debug/node
+        run: python3 benchmark/check_protocol_regressions.py --binary target/release/node
