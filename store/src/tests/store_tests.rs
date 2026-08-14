@@ -227,3 +227,15 @@ async fn drain_counter_advances_with_dequeued_commands() {
         "drain counter must be monotonic across further commands"
     );
 }
+
+#[tokio::test]
+async fn shutdown_marker_is_shared_by_store_clones() {
+    let path = ".db_test_shutdown_marker";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    let clone = store.clone();
+
+    assert!(!store.is_shutting_down());
+    clone.begin_shutdown();
+    assert!(store.is_shutting_down());
+}

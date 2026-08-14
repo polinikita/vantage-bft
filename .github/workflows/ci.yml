@@ -51,10 +51,14 @@ jobs:
       - run: cargo test --all-features
       - name: Build optimized benchmark-enabled node
         run: cargo build --release -p node --features benchmark
-      - name: Check n=7, f=2 permanent-crash regression
+      - name: Check all protocols with n=7, f=2 permanent crashes
         run: >-
           python3 benchmark/check_protocol_regressions.py
           --binary target/release/node
+          --protocols all
           --nodes 7
           --crash 2
           --rate 200
+          --duration 30
+          --min-throughput-pct 85
+          --max-p50-ms 5000

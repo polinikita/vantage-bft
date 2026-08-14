@@ -14,5 +14,5 @@ pub mod common;
 
 pub use crate::batch::BatchConfig;
 pub use crate::receiver::{MessageHandler, Receiver, Writer};
-pub use crate::reliable_sender::{CancelHandler, DirtyMap, ReliableSender};
+pub use crate::reliable_sender::{begin_process_shutdown, CancelHandler, DirtyMap, ReliableSender};
 pub use crate::simple_sender::SimpleSender;

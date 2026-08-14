@@ -4,7 +4,7 @@ use rocksdb::{
     WriteOptions,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
@@ -51,6 +51,10 @@ pub enum StoreCommand {
 #[derive(Clone)]
 pub struct Store {
     channel: Sender<StoreCommand>,
+    /// Set by an embedding process before it tears down its Tokio runtime.
+    /// Store users then park instead of reporting actor-channel races as
+    /// storage failures while all runtime tasks are being cancelled.
+    shutting_down: Arc<AtomicBool>,
     /// Epoch-millisecond stamp written after each completed actor-loop iteration.
     /// It measures actor liveness, including when the store is idle.
     heartbeat_millis: Arc<AtomicU64>,
@@ -90,6 +94,7 @@ impl Store {
         let heartbeat = heartbeat_millis.clone();
         let commands_drained = Arc::new(AtomicU64::new(0));
         let drained = commands_drained.clone();
+        let shutting_down = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
             // `pending` is a read-your-writes overlay. Reads consult it before RocksDB;
             // notify readers are resolved as soon as a value is accepted. Writes remain
@@ -208,9 +213,23 @@ impl Store {
         });
         Ok(Self {
             channel: tx,
+            shutting_down,
             heartbeat_millis,
             commands_drained,
         })
+    }
+
+    /// Marks an enclosing runtime as intentionally shutting down.
+    ///
+    /// This does not stop or flush the store actor; dropping all store handles
+    /// retains that behavior. It only distinguishes coordinated runtime
+    /// teardown from an unexpected store actor failure.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
     }
 
     /// Occupancy of the actor's bounded command channel (capacity `queue_capacity()`).
@@ -237,6 +256,9 @@ impl Store {
 
     pub async fn write(&mut self, key: Key, value: Value) {
         if let Err(e) = self.channel.send(StoreCommand::Write(key, value)).await {
+            if self.is_shutting_down() {
+                return;
+            }
             panic!("Failed to send Write command to store: {}", e);
         }
     }
@@ -246,6 +268,9 @@ impl Store {
             return;
         }
         if let Err(e) = self.channel.send(StoreCommand::WriteMany(entries)).await {
+            if self.is_shutting_down() {
+                return;
+            }
             panic!("Failed to send WriteMany command to store: {}", e);
         }
     }
@@ -253,11 +278,16 @@ impl Store {
     pub async fn read(&mut self, key: Key) -> StoreResult<Option<Value>> {
         let (sender, receiver) = oneshot::channel();
         if let Err(e) = self.channel.send(StoreCommand::Read(key, sender)).await {
+            if self.is_shutting_down() {
+                return std::future::pending().await;
+            }
             panic!("Failed to send Read command to store: {}", e);
         }
-        receiver
-            .await
-            .expect("Failed to receive reply to Read command from store")
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) if self.is_shutting_down() => std::future::pending().await,
+            Err(error) => panic!("Failed to receive reply to Read command from store: {error}"),
+        }
     }
 
     /// Read many keys in input order. An empty request returns immediately. The whole
@@ -272,11 +302,18 @@ impl Store {
             .send(StoreCommand::ReadMany(keys, sender))
             .await
         {
+            if self.is_shutting_down() {
+                return std::future::pending().await;
+            }
             panic!("Failed to send ReadMany command to store: {}", e);
         }
-        receiver
-            .await
-            .expect("Failed to receive reply to ReadMany command from store")
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) if self.is_shutting_down() => std::future::pending().await,
+            Err(error) => {
+                panic!("Failed to receive reply to ReadMany command from store: {error}")
+            }
+        }
     }
 
     pub async fn notify_read(&mut self, key: Key) -> StoreResult<Value> {
@@ -286,11 +323,18 @@ impl Store {
             .send(StoreCommand::NotifyRead(key, sender))
             .await
         {
+            if self.is_shutting_down() {
+                return std::future::pending().await;
+            }
             panic!("Failed to send NotifyRead command to store: {}", e);
         }
-        receiver
-            .await
-            .expect("Failed to receive reply to NotifyRead command from store")
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) if self.is_shutting_down() => std::future::pending().await,
+            Err(error) => {
+                panic!("Failed to receive reply to NotifyRead command from store: {error}")
+            }
+        }
     }
 }
 

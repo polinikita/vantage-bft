@@ -252,8 +252,11 @@ impl Committer {
                 Some(commit_message) = self.rx_commit_message.recv() => {
                     self.process_commit_message(state.borrow_mut(), commit_message).await;
                 },
-                Some(_) = self.rx_deliver.recv() => {}
-
+                Some(_) = self.rx_deliver.recv() => {},
+                // Every producer is owned by another in-process actor. During an
+                // orderly runtime shutdown they may all disappear before this task;
+                // an exhausted select is actor termination, not a protocol failure.
+                else => return,
             }
         }
     }

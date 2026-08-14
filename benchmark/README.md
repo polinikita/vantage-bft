@@ -36,12 +36,16 @@ and fast-path timeouts.
 
 ### Mandatory crash regression
 
-The protocol CI runs a lightweight Vantage crash gate with `n=7`, two
+The protocol CI runs all five implementations in release mode with `n=7`, two
 validators permanently absent from genesis, 200 offered tx/s, and the built-in
-AWS RTT matrix. The gate requires zero panics, at least 85% committed
-throughput, and materialized p50 latency below five seconds. The script keeps
-the larger `n=20`, six-crash, 1,000 tx/s regression as its default for local or
-dedicated benchmark runners:
+AWS RTT matrix over a 30-second measured window. Each implementation must
+report zero panics, at least 85% committed throughput, and materialized p50
+latency below five seconds. Autobahn uses its proof-calibrated 10 × Δ round
+timer (2 seconds for the harness's Δ = 200 ms). The script keeps the larger
+`n=20`, six-crash, 1,000 tx/s all-protocol liveness matrix as its default for
+local or dedicated benchmark runners. That larger stress gate rejects panics,
+throughput below 50%, and materialized p50 above 15 seconds; these bounds
+detect stalls without turning a maximal-fault smoke test into a capacity claim:
 
 ```bash
 python3 benchmark/check_protocol_regressions.py --binary target/release/node
@@ -51,8 +55,12 @@ To reproduce the smaller CI gate locally:
 
 ```bash
 python3 benchmark/check_protocol_regressions.py \
-  --binary target/release/node --nodes 7 --crash 2 --rate 200
+  --binary target/release/node --protocols all \
+  --nodes 7 --crash 2 --rate 200 --duration 30 \
+  --min-throughput-pct 85 --max-p50-ms 5000
 ```
+
+Use `--protocols vantage` (or a comma-separated subset) for a focused run.
 
 ## Local Leader-Relay Stress
 

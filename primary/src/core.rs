@@ -62,6 +62,11 @@ where
     latest.into_values().collect()
 }
 
+/// A valid Prepare(s, _) is the timer ticket for s+1 in parallel mode.
+fn parallel_timer_slot(prepare_slot: Slot, k: Slot) -> Option<Slot> {
+    (k > 1).then(|| prepare_slot.checked_add(1)).flatten()
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ParentVoteState {
     Exact,
@@ -1516,6 +1521,18 @@ impl Core {
                     return false;
                 }
                 self.enter_consensus_view(*slot, *view);
+                // Section 5.4 starts the next parallel slot's timer upon the
+                // first valid Prepare(s, _), independently of payload sync and
+                // CommitQC(s+1-k). The latter remains the view-1 leader's
+                // bounded-concurrency proposal ticket.
+                if let Some(next_slot) = parallel_timer_slot(*slot, self.k) {
+                    if !self.views.contains_key(&next_slot)
+                        && !self.committed_slots.contains_key(&next_slot)
+                    {
+                        debug!("start timer for slot {}", next_slot);
+                        self.enter_consensus_view(next_slot, 1);
+                    }
+                }
                 true
             }
             ConsensusMessage::Confirm {
@@ -1868,18 +1885,6 @@ impl Core {
 
             let _ = self.is_prepare_ticket_ready(prepare_message).await;
 
-            if let Some(next_slot) = slot.checked_add(1) {
-                let ticket_available = next_slot <= self.k
-                    || next_slot
-                        .checked_sub(self.k)
-                        .is_some_and(|ticket_slot| self.committed_slots.contains_key(&ticket_slot));
-                if self.k > 1 && ticket_available && !self.committed_slots.contains_key(&next_slot)
-                {
-                    debug!("start timer for slot {}", next_slot);
-                    self.enter_consensus_view(next_slot, 1);
-                }
-            }
-
             for proposal in proposals.values() {
                 debug!(
                     "prepare slot {:?}, proposal height {:?}",
@@ -2003,14 +2008,12 @@ impl Core {
                 CommitQC::new(*slot, *view, qc.clone(), proposals.clone()).await,
             );
 
-            if let Some(ticketed_slot) = slot.checked_add(self.k) {
-                let predecessor_observed = self.k == 1
-                    || ticketed_slot
-                        .checked_sub(1)
-                        .is_some_and(|previous| self.views.contains_key(&previous));
-                if predecessor_observed {
-                    debug!("start timer for slot {}", ticketed_slot);
-                    self.enter_consensus_view(ticketed_slot, 1);
+            // Sequential mode retains the ordinary CommitQC(s-1) slot ticket.
+            // Parallel mode starts slot timers from Prepare(s-1, _) instead.
+            if self.k == 1 {
+                if let Some(next_slot) = slot.checked_add(1) {
+                    debug!("start timer for slot {}", next_slot);
+                    self.enter_consensus_view(next_slot, 1);
                 }
             }
 
@@ -2578,7 +2581,8 @@ impl Core {
 mod slot_gc_tests {
     use super::{
         autobahn_cut_is_valid, keep_after_slot_period_gc, keep_all_to_all_delivery,
-        latest_pipeline_tickets, parent_vote_state, record_car_vote, ParentVoteState,
+        latest_pipeline_tickets, parallel_timer_slot, parent_vote_state, record_car_vote,
+        ParentVoteState,
     };
     use crate::messages::{Header, Proposal};
     use crypto::Digest;
@@ -2590,6 +2594,13 @@ mod slot_gc_tests {
         assert!(keep_all_to_all_delivery(11, 15, 50));
         assert!(keep_all_to_all_delivery(50, 100, 50));
         assert!(!keep_all_to_all_delivery(49, 100, 50));
+    }
+
+    #[test]
+    fn parallel_prepare_is_the_next_slot_timer_ticket() {
+        assert_eq!(parallel_timer_slot(15, 4), Some(16));
+        assert_eq!(parallel_timer_slot(15, 1), None);
+        assert_eq!(parallel_timer_slot(u64::MAX, 4), None);
     }
 
     #[test]
