@@ -492,14 +492,18 @@ async fn echo_with_out_of_range_grade_is_dropped_not_counted() {
         sender,
         wish: 0,
         origin: None,
-        avail: None,
+        avail: Some({
+            let mut claim = crate::vantage::claim::AvailClaim::with_capacity(1);
+            claim.set_at_tip(0);
+            claim
+        }),
     };
     let (bad_sender, _) = authors()[1];
 
     let effects = agb.on_echo(make_echo(2, bad_sender), &mut rep);
     assert!(
         effects.is_empty(),
-        "a malformed grade must produce no effects"
+        "a malformed grade must produce neither a consensus effect nor an ACK claim"
     );
 
     let effects = agb.on_echo(make_echo(1, bad_sender), &mut rep);

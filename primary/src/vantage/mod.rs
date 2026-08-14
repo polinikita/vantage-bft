@@ -61,7 +61,7 @@ pub enum Effect {
     BroadcastPropose(ProposalOut),
     BroadcastEcho(EchoOut),
     BroadcastEchoSkip(View),
-    /// Quarantines non-quorum tips carried by a locally emitted READY-mix.
+    /// Quarantines non-quorum tips after a READY quorum completes without either grade quorum.
     QuarantineTips(Manifest),
     BroadcastReady(ReadyOut),
     BroadcastNoReady(View),
@@ -122,8 +122,8 @@ pub enum Effect {
 
     /// Serves a replayed block to the requesting peer.
     ResumeServeTo(PublicKey, Header),
-    /// Carries resolved claims; `true` means the digest came from the proposal tip.
-    AvailClaimed(PublicKey, Vec<(BlockRef, bool)>),
+    /// Carries authenticated positional claims for local ancestry resolution.
+    AvailClaimed(PublicKey, Vec<claim::ClaimRef>),
 }
 
 pub mod control;

@@ -69,7 +69,7 @@ async fn four_party_happy_path_three_consecutive_views_identical_output() {
 }
 
 #[tokio::test]
-async fn four_party_happy_path_identical_output_with_ack_watermarks() {
+async fn four_party_happy_path_identical_output_with_echo_availability_claims() {
     let all = authors();
     let mut nodes: Vec<Node> = all
         .iter()
@@ -80,7 +80,7 @@ async fn four_party_happy_path_identical_output_with_ack_watermarks() {
                 &format!(".db_test_integration_node_avail_{}", i),
                 MAX_VIEWS,
             )
-            .with_ack_watermarks(true)
+            .with_echo_avail_claims(true)
         })
         .collect();
     let now = Instant::now();
@@ -91,8 +91,6 @@ async fn four_party_happy_path_identical_output_with_ack_watermarks() {
         drain_local(&mut nodes, i, effects, now, &mut outbox);
     }
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
-    avail_tick(&mut nodes, now, &mut outbox).await;
-
     boot(&mut nodes, now, &mut outbox).await;
 
     for (i, node) in nodes.iter().enumerate() {
@@ -121,9 +119,48 @@ async fn four_party_happy_path_identical_output_with_ack_watermarks() {
         assert_eq!(refs.len(), 1, "exactly one seeded block per author");
         assert!(
             nodes[0].lm.is_q_available(&refs[0], quorum),
-            "author {:?}'s seeded block must be quorum-available via the watermark front-end",
+            "author {:?}'s seeded block must be quorum-available via proposal ECHO claims",
             author
         );
+    }
+}
+
+#[tokio::test]
+async fn four_party_happy_path_identical_output_with_periodic_availability_watermarks() {
+    let all = authors();
+    let mut nodes: Vec<Node> = all
+        .iter()
+        .enumerate()
+        .map(|(i, (pk, _))| {
+            Node::new(
+                *pk,
+                &format!(".db_test_integration_node_watermark_{}", i),
+                MAX_VIEWS,
+            )
+            .with_ack_watermarks(true)
+        })
+        .collect();
+    let now = Instant::now();
+    let mut outbox: VecDeque<(usize, Inbound)> = VecDeque::new();
+
+    for i in 0..nodes.len() {
+        let (_, effects) = nodes[i].lm.publish_own(BTreeMap::new()).await;
+        drain_local(&mut nodes, i, effects, now, &mut outbox);
+    }
+    run_to_quiescence(&mut nodes, &mut outbox, now).await;
+    avail_tick(&mut nodes, now, &mut outbox).await;
+    boot(&mut nodes, now, &mut outbox).await;
+
+    let reference = nodes[0].cursor.output_log().to_vec();
+    assert!(!reference.is_empty());
+    for (i, node) in nodes.iter().enumerate() {
+        assert!(
+            node.cursor.next_view() >= 4,
+            "node {} only reached view {}",
+            i,
+            node.cursor.next_view()
+        );
+        assert_eq!(node.cursor.output_log(), reference.as_slice());
     }
 }
 

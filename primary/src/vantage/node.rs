@@ -2918,6 +2918,22 @@ impl VantageCore {
 
     /// Schedules an AGB recheck even when availability processing emits no effects.
     fn on_ack_availability(&mut self, availability: AckAvailability, _now: Instant) -> Vec<Effect> {
+        self.on_availability(availability, true)
+    }
+
+    fn on_claim_availability(
+        &mut self,
+        availability: AckAvailability,
+        _now: Instant,
+    ) -> Vec<Effect> {
+        self.on_availability(availability, false)
+    }
+
+    fn on_availability(
+        &mut self,
+        availability: AckAvailability,
+        promote_core: bool,
+    ) -> Vec<Effect> {
         #[cfg(feature = "pipeline-tracing")]
         if availability.threshold == crate::vantage::lanes::AckThreshold::Quorum
             && availability.reference.0 == self.name
@@ -2931,7 +2947,11 @@ impl VantageCore {
             }
         }
         self.recheck_pending = true;
-        self.lm.process_ack_availability(availability)
+        if promote_core {
+            self.lm.process_ack_availability(availability)
+        } else {
+            self.lm.process_claim_availability(availability)
+        }
     }
 
     #[cfg(feature = "pipeline-tracing")]
@@ -2962,7 +2982,13 @@ impl VantageCore {
     }
 
     /// Credits watermark references through the same aggregator as individual acknowledgments.
-    fn credit_refs(&mut self, sender: PublicKey, refs: Vec<BlockRef>, now: Instant) -> Vec<Effect> {
+    fn credit_refs(
+        &mut self,
+        sender: PublicKey,
+        refs: Vec<BlockRef>,
+        now: Instant,
+        promote_core: bool,
+    ) -> Vec<Effect> {
         let results = {
             let mut aggregator = self.ack_aggregator.lock();
             refs.iter()
@@ -2983,7 +3009,11 @@ impl VantageCore {
                 metrics.vantage_avail_credited_refs.inc();
             }
             if let Some(availability) = result.availability {
-                effects.extend(self.on_ack_availability(availability, now));
+                if promote_core {
+                    effects.extend(self.on_ack_availability(availability, now));
+                } else {
+                    effects.extend(self.on_claim_availability(availability, now));
+                }
             }
         }
         effects
@@ -3050,7 +3080,7 @@ impl VantageCore {
                     metrics.vantage_avail_received.inc();
                 }
                 let refs = self.lm.resolve_watermark(sender, &entries);
-                self.credit_refs(sender, refs, now)
+                self.credit_refs(sender, refs, now, true)
             }
             Inbound::Propose(proposal) => {
                 // Sender-less proposals are attributed to the designated proposer for the view.
@@ -3507,13 +3537,17 @@ impl VantageCore {
                             .await
                     }
 
-                    Effect::AvailClaimed(sender, resolved) => {
-                        let refs = self.lm.note_claim(sender, &resolved);
-                        queue.extend(self.credit_refs(sender, refs, now));
+                    Effect::AvailClaimed(sender, claims) => {
+                        let refs = self.lm.note_claim(sender, &claims);
+                        queue.extend(self.credit_refs(sender, refs, now, false));
                     }
                     Effect::BroadcastAck(ack) => {
-                        // Local self-acknowledgment is required even when wire acks are suppressed.
-                        queue.extend(self.record_local_ack(&ack, now));
+                        // ECHO-claim mode creates no acknowledgment until an
+                        // actual claim-bearing ECHO is emitted.  The legacy
+                        // standalone/watermark A/B paths retain local credit.
+                        if !self.echo_avail_claims {
+                            queue.extend(self.record_local_ack(&ack, now));
+                        }
                         if !self.ack_watermarks {
                             self.broadcast_recorded(PrimaryMessage::VantageAck(ack))
                                 .await
@@ -3539,7 +3573,7 @@ impl VantageCore {
                     }
                     Effect::BlockCached(digest) => {
                         for (sender, r) in self.lm.retry_pending_avail(&digest) {
-                            queue.extend(self.credit_refs(sender, vec![r], now));
+                            queue.extend(self.credit_refs(sender, vec![r], now, false));
                         }
                         queue.extend(self.rep.on_block_available(digest));
 
@@ -3563,9 +3597,38 @@ impl VantageCore {
                         e.set_wish(self.pacemaker.own_watermark());
 
                         if self.echo_avail_claims {
-                            if let EchoOut::Single(inner) = &mut e {
-                                inner.avail = Some(self.lm.build_avail_claim(&inner.proposal));
+                            match &mut e {
+                                EchoOut::Single(inner) => {
+                                    inner.avail = Some(self.lm.build_avail_claim(&inner.proposal));
+                                }
+                                EchoOut::Batch(inner) => {
+                                    inner.avail =
+                                        Some(self.lm.build_batch_avail_claim(&inner.proposal));
+                                }
                             }
+                            let claims = match &e {
+                                EchoOut::Single(inner) => inner
+                                    .avail
+                                    .as_ref()
+                                    .map(|claim| {
+                                        let refs =
+                                            crate::vantage::claim::manifest_refs(&inner.proposal);
+                                        claim.statements(&refs)
+                                    })
+                                    .unwrap_or_default(),
+                                EchoOut::Batch(inner) => inner
+                                    .avail
+                                    .as_ref()
+                                    .map(|claim| {
+                                        let refs = crate::vantage::claim::batch_manifest_refs(
+                                            &inner.proposal,
+                                        );
+                                        claim.statements(&refs)
+                                    })
+                                    .unwrap_or_default(),
+                            };
+                            let refs = self.lm.note_claim(self.name, &claims);
+                            queue.extend(self.credit_refs(self.name, refs, now, false));
                         }
                         match e {
                             EchoOut::Single(e) if self.digest_statements => {

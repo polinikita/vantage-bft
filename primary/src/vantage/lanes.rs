@@ -1,7 +1,7 @@
 use crate::messages::{Ack, Header};
 use crate::primary::Height;
 use crate::vantage::block::{self, block_ok, BlockRef};
-use crate::vantage::claim::{manifest_refs, AvailClaim};
+use crate::vantage::claim::{batch_manifest_refs, manifest_refs, AvailClaim, ClaimRef};
 use crate::vantage::Effect;
 use config::{Committee, Stake, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -507,6 +507,37 @@ impl BlockCache {
             expected_height -= 1;
         }
     }
+
+    /// Derives an exact verified ancestor of a proposal anchor.
+    pub(crate) fn resolve_verified_ancestor(
+        &self,
+        anchor: &BlockRef,
+        delta: Height,
+    ) -> AncestorWalk {
+        if delta == 0 || delta >= anchor.1 {
+            return AncestorWalk::Forked;
+        }
+        let target_height = anchor.1 - delta;
+        let author = anchor.0;
+        let mut expected_height = anchor.1;
+        let mut cur = anchor.2.clone();
+        loop {
+            let Some(entry) = self.by_digest.get(&cur) else {
+                return AncestorWalk::Pending;
+            };
+            if !entry.pinned_at(author, expected_height) {
+                return AncestorWalk::Forked;
+            }
+            if !entry.block_ok_verified {
+                return AncestorWalk::Pending;
+            }
+            if expected_height == target_height {
+                return AncestorWalk::Ready((author, target_height, cur));
+            }
+            cur = entry.block.parent_cert.header_digest.clone();
+            expected_height -= 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +548,13 @@ pub enum SuffixWalk {
     /// A required block or validation result is unavailable.
     Pending,
     /// The target ancestry does not contain the watermark coordinate.
+    Forked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AncestorWalk {
+    Ready(BlockRef),
+    Pending,
     Forked,
 }
 
@@ -690,12 +728,31 @@ impl AckAggregator {
         }
     }
 
+    pub(crate) fn will_count(&self, sender: PublicKey, reference: &BlockRef) -> bool {
+        self.members.contains(&sender)
+            && self.emitted.get(reference) != Some(&AckThreshold::Quorum)
+            && !self
+                .senders
+                .get(reference)
+                .is_some_and(|senders| senders.contains(&sender))
+    }
+
     pub fn senders_tracked(&self) -> usize {
         self.senders.len()
     }
 
     pub fn refs_retired(&self) -> usize {
         self.emitted.len()
+    }
+
+    pub(crate) fn is_at_quorum(&self, reference: &BlockRef) -> bool {
+        self.emitted.get(reference) == Some(&AckThreshold::Quorum)
+    }
+
+    pub(crate) fn reset_author(&mut self, author: PublicKey) {
+        self.senders.retain(|r, _| r.0 != author);
+        self.weights.retain(|r, _| r.0 != author);
+        self.emitted.retain(|r, _| r.0 != author);
     }
 }
 
@@ -741,9 +798,13 @@ pub struct LaneManager {
     /// Last pending reference checked for each author.
     refresh_scan_after: HashMap<PublicKey, BlockRef>,
     direct_pub_refs: BTreeSet<BlockRef>,
+    /// Locally direct references with a general quorum of prefix claims.
+    quorum_claim_refs: BTreeSet<BlockRef>,
+    /// Locally direct references with a quorum of exact-position claims.
     quorum_direct_refs: BTreeSet<BlockRef>,
 
     c_candidate: HashMap<PublicKey, BlockRef>,
+    confirmation_candidate: HashMap<PublicKey, BlockRef>,
     t_candidate: HashMap<PublicKey, BlockRef>,
 
     /// This node's lane tip, or `(0, genesis)` before its first block.
@@ -833,8 +894,10 @@ impl LaneManager {
             direct_prefix_blocker_by_digest: HashMap::new(),
             refresh_scan_after: HashMap::new(),
             direct_pub_refs: BTreeSet::new(),
+            quorum_claim_refs: BTreeSet::new(),
             quorum_direct_refs: BTreeSet::new(),
             c_candidate: HashMap::new(),
+            confirmation_candidate: HashMap::new(),
             t_candidate: HashMap::new(),
             own_frontier: (0, genesis),
             own_avail_watermark: HashMap::new(),
@@ -967,6 +1030,7 @@ impl LaneManager {
             .iter()
             .chain(self.pending_direct_blocked_by.keys())
             .chain(self.direct_pub_refs.iter())
+            .chain(self.quorum_claim_refs.iter())
             .chain(self.quorum_direct_refs.iter())
             .chain(self.ack_availability.keys())
             .chain(self.acked.iter())
@@ -986,11 +1050,13 @@ impl LaneManager {
         self.direct_prefix_blocker_by_digest
             .retain(|digest, _| !stale_digests.contains(digest));
         self.direct_pub_refs.retain(|r| r.0 != self.name);
+        self.quorum_claim_refs.retain(|r| r.0 != self.name);
         self.quorum_direct_refs.retain(|r| r.0 != self.name);
         self.ack_availability.retain(|r, _| r.0 != self.name);
         self.acked.retain(|r| r.0 != self.name);
         self.refresh_scan_after.remove(&self.name);
         self.c_candidate.remove(&self.name);
+        self.confirmation_candidate.remove(&self.name);
         self.t_candidate.remove(&self.name);
 
         let anchor = (self.name, header.height, header.id.clone());
@@ -1001,6 +1067,7 @@ impl LaneManager {
         self.avail.note_threshold(&anchor, AckThreshold::Quorum);
         self.acked.insert(anchor.clone());
         self.direct_pub_refs.insert(anchor.clone());
+        self.quorum_claim_refs.insert(anchor.clone());
         self.quorum_direct_refs.insert(anchor.clone());
         self.c_candidate.insert(self.name, anchor.clone());
         self.own_avail_watermark
@@ -1409,6 +1476,21 @@ impl LaneManager {
 
     /// Records only monotonic availability thresholds for an exact reference.
     pub fn process_ack_availability(&mut self, availability: AckAvailability) -> Vec<Effect> {
+        self.process_availability(availability, true)
+    }
+
+    /// Records an ECHO-derived threshold without promoting a core candidate.
+    /// Exact-position quorum promotion is tracked independently by `note_claim`;
+    /// a quorum containing digest-free ancestor claims is only eventually common.
+    pub fn process_claim_availability(&mut self, availability: AckAvailability) -> Vec<Effect> {
+        self.process_availability(availability, false)
+    }
+
+    fn process_availability(
+        &mut self,
+        availability: AckAvailability,
+        promote_core: bool,
+    ) -> Vec<Effect> {
         let r = availability.reference;
         let threshold = availability.threshold;
         if self
@@ -1424,11 +1506,12 @@ impl LaneManager {
         if r.1 > *high {
             *high = r.1;
         }
-        if threshold >= AckThreshold::Quorum
-            && self.direct_pub_refs.contains(&r)
-            && self.quorum_direct_refs.insert(r.clone())
-        {
-            self.refresh_registers(r.0);
+        if threshold >= AckThreshold::Quorum && self.direct_pub_refs.contains(&r) {
+            let learned_claim_quorum = self.quorum_claim_refs.insert(r.clone());
+            let learned_core_quorum = promote_core && self.quorum_direct_refs.insert(r.clone());
+            if learned_claim_quorum || learned_core_quorum {
+                self.refresh_registers(r.0);
+            }
         }
         Vec::new()
     }
@@ -1440,6 +1523,11 @@ impl LaneManager {
             Some(AckThreshold::Validity) => q <= self.committee.validity_threshold(),
             None => false,
         }
+    }
+
+    /// Exact-position quorum evidence is bounded-common and core-eligible.
+    pub fn is_exact_q_available(&self, r: &BlockRef) -> bool {
+        self.avail.is_exact_quorum(r)
     }
 
     /// Requires an exact coordinate and a direct, payload-ready prefix through genesis.
@@ -1523,9 +1611,16 @@ impl LaneManager {
         self.t_candidate.get(author).cloned()
     }
 
+    pub fn confirmation_candidate(&self, author: &PublicKey) -> Option<BlockRef> {
+        self.confirmation_candidate.get(author).cloned()
+    }
+
     fn record_direct_pub(&mut self, r: &BlockRef) {
         self.direct_pub_refs.insert(r.clone());
         if self.is_q_available(r, self.committee.quorum_threshold()) {
+            self.quorum_claim_refs.insert(r.clone());
+        }
+        if self.avail.is_exact_quorum(r) {
             self.quorum_direct_refs.insert(r.clone());
         }
         let advances = match self.own_avail_watermark.get(&r.0) {
@@ -1567,28 +1662,40 @@ impl LaneManager {
     /// Claims a proposal tip only when its exact coordinate is held and validated.
     pub fn build_avail_claim(&self, proposal: &crate::vantage::agb::ViewProposal) -> AvailClaim {
         let refs = manifest_refs(proposal);
+        self.build_avail_claim_for_refs(&refs)
+    }
+
+    /// Builds claims for a skip-only batch proposal's `C || T` reference vector.
+    pub fn build_batch_avail_claim(
+        &self,
+        proposal: &crate::vantage::agb::BatchViewProposal,
+    ) -> AvailClaim {
+        let refs = batch_manifest_refs(proposal);
+        self.build_avail_claim_for_refs(&refs)
+    }
+
+    fn build_avail_claim_for_refs(&self, refs: &[&BlockRef]) -> AvailClaim {
         let mut claim = AvailClaim::with_capacity(refs.len());
-        let blocks = self.blocks.lock();
         for (j, r) in refs.iter().enumerate() {
-            let (author, height, digest) = (r.0, r.1, &r.2);
-            let Some((own_h, own_head)) = self.own_avail_watermark.get(&author) else {
+            if self.direct_pub_refs.contains(*r) {
+                claim.set_at_tip(j);
                 continue;
-            };
-            if *own_h >= height {
-                let holds_named = blocks.get(digest).is_some_and(|e| {
-                    e.block.author == author
-                        && e.block.height == height
-                        && e.block.id == *digest
-                        && e.block_ok_verified
-                });
-                if holds_named {
-                    claim.set_at_tip(j);
-                }
-            } else if *own_h > 0 {
-                claim.push_short(j, height - *own_h, own_head.clone());
+            }
+            if let Some(ancestor) = self.greatest_direct_ancestor(r) {
+                claim.push_short(j, r.1 - ancestor.1);
             }
         }
         claim
+    }
+
+    /// Returns the greatest directly published strict ancestor on `anchor`'s exact branch.
+    fn greatest_direct_ancestor(&self, anchor: &BlockRef) -> Option<BlockRef> {
+        self.direct_pub_refs
+            .range(author_lower_bound(anchor.0)..=author_upper_bound(anchor.0))
+            .rev()
+            .filter(|candidate| candidate.1 < anchor.1)
+            .find(|candidate| self.prefix_contains(anchor, candidate))
+            .cloned()
     }
 
     pub fn avail_high(&self, author: &PublicKey) -> Height {
@@ -1621,12 +1728,18 @@ impl LaneManager {
         self.avail.resolve_watermark(sender, entries)
     }
 
-    pub fn note_claim(
-        &mut self,
-        sender: PublicKey,
-        resolved: &[(BlockRef, bool)],
-    ) -> Vec<BlockRef> {
-        self.avail.note_claim(sender, resolved)
+    pub fn note_claim(&mut self, sender: PublicKey, claims: &[ClaimRef]) -> Vec<BlockRef> {
+        let credits = self.avail.note_claim(sender, claims);
+        let mut changed = HashSet::new();
+        for r in credits.newly_exact_quorum {
+            if self.direct_pub_refs.contains(&r) && self.quorum_direct_refs.insert(r.clone()) {
+                changed.insert(r.0);
+            }
+        }
+        for author in changed {
+            self.refresh_registers(author);
+        }
+        credits.references
     }
 
     pub fn claim_avail_height(&self, author: &PublicKey) -> Height {
@@ -1642,8 +1755,38 @@ impl LaneManager {
         let c = newest_indexed(&self.quorum_direct_refs, author);
         set_candidate(&mut self.c_candidate, author, c.clone());
 
+        let confirmation = self.least_confirmation_candidate(author, c.as_ref());
+        set_candidate(&mut self.confirmation_candidate, author, confirmation);
         let t = self.newest_t_candidate(author, c.as_ref());
         set_candidate(&mut self.t_candidate, author, t);
+    }
+
+    /// Selects the least-height generally quorum-known prefix above `C` that
+    /// still needs an exact-position ECHO census.  Holding this coordinate
+    /// stable prevents continuous publication from making confirmation chase
+    /// a fresh head forever.
+    fn least_confirmation_candidate(
+        &self,
+        author: PublicKey,
+        c: Option<&BlockRef>,
+    ) -> Option<BlockRef> {
+        let min_height = c.map_or(0, |c_ref| c_ref.1.saturating_add(1));
+        for r in self
+            .quorum_claim_refs
+            .range(author_lower_bound_from(author, min_height)..=author_upper_bound(author))
+        {
+            if self.quorum_direct_refs.contains(r) {
+                continue;
+            }
+            let qualifies = match c {
+                Some(c_ref) => r.1 > c_ref.1 && self.prefix_contains(r, c_ref),
+                None => true,
+            };
+            if qualifies {
+                return Some(r.clone());
+            }
+        }
+        None
     }
 
     fn newest_t_candidate(&self, author: PublicKey, c: Option<&BlockRef>) -> Option<BlockRef> {
@@ -1679,6 +1822,9 @@ impl LaneManager {
     ///
     /// The walk pins the author and decreases expected height on every step.
     pub fn prefix_contains(&self, r: &BlockRef, target: &BlockRef) -> bool {
+        if r.0 != target.0 || target.1 > r.1 {
+            return false;
+        }
         let blocks = self.blocks.lock();
         let author = r.0;
         let mut cur = r.2.clone();
@@ -1694,6 +1840,9 @@ impl LaneManager {
                 return false;
             }
             if entry.block.height != expected_height {
+                return false;
+            }
+            if !entry.block_ok_verified {
                 return false;
             }
             if expected_height == target.1 {

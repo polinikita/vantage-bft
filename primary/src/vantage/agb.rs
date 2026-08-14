@@ -175,6 +175,9 @@ pub struct EchoBatch {
     pub grade: u8,
     pub sender: PublicKey,
     pub wish: View,
+    /// Claims are positional over the batch proposal's `C || T` vector.
+    #[serde(default)]
+    pub avail: Option<crate::vantage::claim::AvailClaim>,
 }
 
 /// This internal echo representation is not serialized.
@@ -1170,6 +1173,7 @@ impl AgbEngine {
                 grade,
                 sender: self.name,
                 wish: 0,
+                avail: None,
             }),
         }
     }
@@ -1520,26 +1524,37 @@ impl AgbEngine {
     }
 
     pub fn on_echo(&mut self, echo: Echo, rep: &mut Repairer) -> Vec<Effect> {
-        // Apply availability claims before counting the echo.
+        // Apply only the first accepted echo-stage envelope from this sender.
         let mut effects = Vec::new();
-        if let Some(claim) = &echo.avail {
-            let refs = crate::vantage::claim::manifest_refs(&echo.proposal);
-            let at_tip: std::collections::HashSet<Digest> = refs
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| claim.is_at_tip(*j))
-                .map(|(_, r)| r.2.clone())
-                .collect();
-            let resolved: Vec<(BlockRef, bool)> = claim
-                .resolve(&refs)
-                .into_iter()
-                .map(|r| {
-                    let tip = at_tip.contains(&r.2);
-                    (r, tip)
-                })
-                .collect();
-            if !resolved.is_empty() {
-                effects.push(Effect::AvailClaimed(echo.sender, resolved));
+        let first_echo = !self
+            .views
+            .get(&echo.proposal.view)
+            .is_some_and(|state| state.echo_statements.contains_key(&echo.sender));
+        let claim_carrier_is_formed = echo.grade <= 1
+            && !self.is_pruned(echo.proposal.view)
+            && first_echo
+            && self.committee.authorities.contains_key(&echo.sender)
+            && formed(
+                &self.committee,
+                echo.proposal.view,
+                &echo.proposal.c,
+                &echo.proposal.t,
+                &echo.proposal.m,
+            );
+        if claim_carrier_is_formed {
+            if let Some(claim) = &echo.avail {
+                let refs = crate::vantage::claim::manifest_refs(&echo.proposal);
+                let statements = claim.statements(&refs);
+                if !statements.is_empty() {
+                    effects.push(Effect::AvailClaimed(echo.sender, statements.clone()));
+                    for statement in statements {
+                        let anchor = match statement {
+                            crate::vantage::claim::ClaimRef::Exact(reference) => reference,
+                            crate::vantage::claim::ClaimRef::Ancestor { anchor, .. } => anchor,
+                        };
+                        effects.extend(rep.authorize(anchor));
+                    }
+                }
             }
         }
         effects.extend(self.on_echo_any(EchoOut::Single(echo), rep));
@@ -1547,7 +1562,40 @@ impl AgbEngine {
     }
 
     pub fn on_echo_batch(&mut self, echo: EchoBatch, rep: &mut Repairer) -> Vec<Effect> {
-        self.on_echo_any(EchoOut::Batch(echo), rep)
+        let mut effects = Vec::new();
+        let first_echo = !self
+            .views
+            .get(&echo.proposal.view)
+            .is_some_and(|state| state.echo_statements.contains_key(&echo.sender));
+        let claim_carrier_is_formed = echo.grade <= 1
+            && !self.is_pruned(echo.proposal.view)
+            && first_echo
+            && self.committee.authorities.contains_key(&echo.sender)
+            && formed_batch(
+                &self.committee,
+                echo.proposal.view,
+                &echo.proposal.c,
+                &echo.proposal.t,
+                &echo.proposal.m,
+            );
+        if claim_carrier_is_formed {
+            if let Some(claim) = &echo.avail {
+                let refs = crate::vantage::claim::batch_manifest_refs(&echo.proposal);
+                let statements = claim.statements(&refs);
+                if !statements.is_empty() {
+                    effects.push(Effect::AvailClaimed(echo.sender, statements.clone()));
+                    for statement in statements {
+                        let anchor = match statement {
+                            crate::vantage::claim::ClaimRef::Exact(reference) => reference,
+                            crate::vantage::claim::ClaimRef::Ancestor { anchor, .. } => anchor,
+                        };
+                        effects.extend(rep.authorize(anchor));
+                    }
+                }
+            }
+        }
+        effects.extend(self.on_echo_any(EchoOut::Batch(echo), rep));
+        effects
     }
 
     fn on_echo_any(&mut self, echo: EchoOut, rep: &mut Repairer) -> Vec<Effect> {
@@ -1839,9 +1887,6 @@ impl AgbEngine {
             name,
             ReadyStatement::Graded(Arc::clone(&proposal), digest, grade),
         );
-        if grade == ReadyGrade::Mix && !proposal.t().is_empty() {
-            effects.push(Effect::QuarantineTips(proposal.t().clone()));
-        }
         effects.extend(self.wish_effect(view, ResponseStage::Ready));
         effects.push(Effect::BroadcastReady(
             self.build_ready_out(&proposal, grade),
@@ -1974,6 +2019,9 @@ impl AgbEngine {
             }
             if !proposal.entries().is_empty() {
                 effects.push(Effect::CompletionReportable(view, (*proposal).clone()));
+            }
+            if g1_stake < self.quorum && g0_stake < self.quorum && !t.is_empty() {
+                effects.push(Effect::QuarantineTips(t.clone()));
             }
             effects.push(Effect::Completed(view, c, t));
         }
