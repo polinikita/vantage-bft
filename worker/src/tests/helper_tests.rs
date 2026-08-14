@@ -27,7 +27,8 @@ async fn batch_reply() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
-        false,
+        None,
+        None,
     );
 
     let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;
@@ -53,6 +54,7 @@ async fn byzantine_author_does_not_reply_to_repair_requests() {
     store
         .write(batch_digest().to_vec(), serialized_batch())
         .await;
+    let suppressed = Some(std::iter::once(requestor).collect());
 
     Helper::spawn(
         id,
@@ -62,7 +64,8 @@ async fn byzantine_author_does_not_reply_to_repair_requests() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
-        true,
+        suppressed,
+        None,
     );
 
     let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;

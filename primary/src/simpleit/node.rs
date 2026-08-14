@@ -284,19 +284,18 @@ impl SimpleItCore {
         let other_primary_addrs: Vec<SocketAddr> =
             other_primaries.iter().map(|(_, a)| *a).collect();
 
+        let withholding_dests = config::withheld_destinations(
+            &committee,
+            &name,
+            parameters.withhold_senders,
+            &parameters.withhold_publishers,
+            parameters.withhold_count,
+            parameters.withhold_stride,
+            &parameters.withhold_receivers,
+        );
         let withheld_header_dests: wire::WithheldHeaderDests = parameters
             .withhold_headers
-            .then(|| {
-                config::withheld_destinations(
-                    &committee,
-                    &name,
-                    parameters.withhold_senders,
-                    &parameters.withhold_publishers,
-                    parameters.withhold_count,
-                    parameters.withhold_stride,
-                    &parameters.withhold_receivers,
-                )
-            })
+            .then(|| withholding_dests.clone())
             .flatten()
             .map(|blocked| {
                 let full: Vec<(PublicKey, SocketAddr)> = other_primaries
@@ -409,6 +408,10 @@ impl SimpleItCore {
                 other_primary_addrs,
                 worker_addresses,
                 withheld_header_dests,
+                suppressed_repair_destinations: parameters
+                    .withhold_repair
+                    .then_some(withholding_dests)
+                    .flatten(),
                 late_header,
                 withhold_window: parameters.withhold_window.clone(),
                 metrics: core_metrics.clone(),
@@ -743,7 +746,7 @@ impl SimpleItCore {
                 }
                 Effect::ServeTo(peer, header) => {
                     self.wire
-                        .send_message(peer, PrimaryMessage::Header(header, true))
+                        .send_repair_message(peer, PrimaryMessage::Header(header, true))
                         .await
                 }
                 Effect::BlockCached(digest) => {

@@ -55,8 +55,8 @@ committee order instead of selecting a consecutive prefix.
 Add `--withhold-fixed-receivers` to use one disjoint receiver group and
 `--withhold-batches-only` to keep lane headers flowing while permanently
 dropping only the heavy transaction batches on those links.
-Add `--withhold-repair` to make the selected Byzantine publishers ignore
-payload repair requests after narrowcasting.
+Add `--withhold-repair` to make the selected Byzantine publishers ignore all
+lane-header, certificate, and batch repair requests after narrowcasting.
 Use `--correct-load-only --adversarial-rate R` for a leader-relay experiment:
 the counted offered load is distributed over correct authors, while the
 selected Byzantine authors generate `R` tx/s of uncounted background payload.

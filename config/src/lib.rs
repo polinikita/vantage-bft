@@ -325,8 +325,9 @@ pub struct Parameters {
     #[serde(default)]
     pub withhold_receivers: Vec<PublicKey>,
 
-    /// Benchmark-only Byzantine behavior: selected publishers ignore payload
-    /// repair requests after narrowcasting their original lane batches.
+    /// Benchmark-only Byzantine behavior: selected publishers ignore lane
+    /// header, certificate, and batch repair requests after narrowcasting the
+    /// original publication.
     #[serde(default)]
     pub withhold_repair: bool,
 
@@ -989,7 +990,7 @@ impl Parameters {
                 ),
             }
             if self.withhold_repair {
-                info!("Selected Byzantine publishers suppress payload repair responses");
+                info!("Selected Byzantine publishers suppress all lane repair responses");
             }
         }
         if !self.late_header_publishers.is_empty() {

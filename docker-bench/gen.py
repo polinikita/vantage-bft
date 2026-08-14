@@ -526,7 +526,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--withhold-batches-only", action="store_true",
                    help="drop heavy worker batches but continue original lane headers")
     p.add_argument("--withhold-repair", action="store_true",
-                   help="make selected Byzantine publishers ignore payload repair requests")
+                   help="make selected Byzantine publishers ignore all lane repair requests")
     p.add_argument("--correct-load-only", action="store_true",
                    help="distribute counted client load only across non-withholding authors")
     p.add_argument("--adversarial-rate", type=int, default=0,

@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
                     Arg::new("withhold-repair")
                         .long("withhold-repair")
                         .action(ArgAction::SetTrue)
-                        .help("Make selected Byzantine publishers ignore payload repair requests"),
+                        .help("Make selected Byzantine publishers ignore all lane repair requests"),
                 )
                 .arg(
                     Arg::new("late-header-publishers")

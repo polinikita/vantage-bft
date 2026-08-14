@@ -17,19 +17,33 @@ python3 benchmark/local_five_protocol_sweep.py
 ```
 
 The primary two-panel figure contrasts a clean offered-load sweep with the
-same sweep when nodes 0–2 omit original data-lane headers and batches to the
-fixed receiver group nodes 3–5. Repairs and control traffic remain normal.
-Each omitted block therefore still has seven direct holders. The local
-isolation study defaults to a uniform 50 ms honest-link RTT; pass
+same sweep when Byzantine nodes 0–2 send original data-lane headers and
+batches only within their own three-node group and refuse subsequent
+certificate, header, and batch repair to the rest of the committee. Consensus
+traffic remains enabled. Each unavailable lane therefore contributes roughly
+one tenth of offered load but cannot materialize at the seven honest nodes.
+The local isolation study defaults to a uniform 50 ms honest-link RTT; pass
 `--honest-rtt-ms 0` to use the built-in ten-region AWS RTT matrix instead.
 Defaults use a 10-second warmup and a 30-second measured window. A curve stops
-after the first point below 95% of
-offered load or with a growing latter-half backlog; boundary points are
-repeated three times. The harness also produces a receiver-width sweep for
-`K=0,1,2,3`, raw logs, CSV/JSON measurements, and provenance.
+after the first point below 95% of reachable offered load or with backlog
+growth beyond the unavoidable rate of transactions submitted to unavailable
+Byzantine lanes; boundary points are repeated three times. The harness also
+produces a receiver-width sweep for
+`K=0,3,6,7`, raw logs, CSV/JSON measurements, and provenance.
 
 Both Autobahn variants use the deployment configuration's 5-second consensus
 and fast-path timeouts.
+
+### Mandatory crash regression
+
+The protocol CI also runs Vantage with `n=20`, six validators permanently
+absent from genesis, 1,000 offered tx/s, and the built-in AWS RTT matrix. The
+gate requires zero panics, at least 85% committed throughput, and materialized
+p50 latency below five seconds. Run the same check locally with:
+
+```bash
+python3 benchmark/check_protocol_regressions.py --binary target/release/node
+```
 
 ## Local Leader-Relay Stress
 

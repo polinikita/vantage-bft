@@ -7,9 +7,15 @@ use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use metrics::Metrics;
 use network::{BatchConfig, SimpleSender};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
+
+#[cfg(test)]
+#[path = "tests/helper_tests.rs"]
+pub mod helper_tests;
 
 /// Serves certificate and header requests from other authorities.
 pub struct Helper {
@@ -27,9 +33,16 @@ pub struct Helper {
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
     metrics: Arc<Metrics>,
+    /// Benchmark-only Byzantine behavior: do not serve lane metadata to peers
+    /// excluded from the original narrowcast.
+    suppressed_repair_destinations: Option<HashSet<PublicKey>>,
+    /// Shared time window controlling when repair suppression is active.
+    withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 }
 
 impl Helper {
+    // The independent request channels keep receiver dispatch typed.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         committee: Committee,
         store: Store,
@@ -38,6 +51,8 @@ impl Helper {
         rx_proposal_headers: Receiver<(Proposal, Height, PublicKey)>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        suppressed_repair_destinations: Option<HashSet<PublicKey>>,
+        withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -50,6 +65,8 @@ impl Helper {
                     .with_metrics(metrics.clone())
                     .with_batching(batch),
                 metrics,
+                suppressed_repair_destinations,
+                withhold_window,
             }
             .run()
             .await;
@@ -60,6 +77,10 @@ impl Helper {
         loop {
             tokio::select! {
                 Some((digests, origin)) = self.rx_primaries_certs.recv() => {
+
+                    if self.suppress_repair_to(&origin) {
+                        continue;
+                    }
 
                     let address = match self.committee.primary(&origin) {
                         Ok(x) => x.primary_to_primary,
@@ -84,6 +105,10 @@ impl Helper {
                     }
                 },
                 Some((digests, origin, prepare_repair)) = self.rx_primaries_headers.recv() => {
+
+                    if self.suppress_repair_to(&origin) {
+                        continue;
+                    }
 
                     let address = match self.committee.primary(&origin) {
                         Ok(x) => x.primary_to_primary,
@@ -119,6 +144,9 @@ impl Helper {
 
                 },
                 Some((proposal, stop_height, origin)) = self.rx_proposal_headers.recv() => {
+                    if self.suppress_repair_to(&origin) {
+                        continue;
+                    }
                     let address = match self.committee.primary(&origin) {
                         Ok(x) => x.primary_to_primary,
                         Err(e) => {
@@ -180,5 +208,14 @@ impl Helper {
                 },
             };
         }
+    }
+
+    fn suppress_repair_to(&self, origin: &PublicKey) -> bool {
+        self.suppressed_repair_destinations
+            .as_ref()
+            .is_some_and(|blocked| {
+                blocked.contains(origin)
+                    && config::withhold_active(self.withhold_window.as_deref(), Instant::now())
+            })
     }
 }

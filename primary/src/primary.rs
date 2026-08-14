@@ -553,6 +553,24 @@ impl Primary {
                 );
             }
             Protocol::AutobahnOptimistic | Protocol::AutobahnSeamless => {
+                let withholding_dests = config::withheld_destinations(
+                    &committee,
+                    &name,
+                    parameters.withhold_senders,
+                    &parameters.withhold_publishers,
+                    parameters.withhold_count,
+                    parameters.withhold_stride,
+                    &parameters.withhold_receivers,
+                );
+                let withheld_header_dests = parameters
+                    .withhold_headers
+                    .then(|| withholding_dests.clone())
+                    .flatten();
+                let suppressed_repair_destinations = parameters
+                    .withhold_repair
+                    .then_some(withholding_dests)
+                    .flatten();
+
                 // Receive messages from other primaries.
                 let mut address = committee
                     .primary(&name)
@@ -652,20 +670,7 @@ impl Primary {
                         .map(|table| committee.latency_map(&name, table))
                         .unwrap_or_default(),
                     // Data-plane withholding destinations.
-                    parameters
-                        .withhold_headers
-                        .then(|| {
-                            config::withheld_destinations(
-                                &committee,
-                                &name,
-                                parameters.withhold_senders,
-                                &parameters.withhold_publishers,
-                                parameters.withhold_count,
-                                parameters.withhold_stride,
-                                &parameters.withhold_receivers,
-                            )
-                        })
-                        .flatten(),
+                    withheld_header_dests,
                     // Finite-delay original-header destinations.
                     config::late_header_destinations(
                         &committee,
@@ -749,6 +754,8 @@ impl Primary {
                     rx_proposal_header_requests,
                     metrics.clone(),
                     batch,
+                    suppressed_repair_destinations,
+                    parameters.withhold_window.clone(),
                 );
 
                 // Parsed by benchmark tooling.

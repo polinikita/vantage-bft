@@ -440,7 +440,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
             format!("staggered halves, stride {withhold_stride}")
         };
         let repair = if withhold_repair {
-            "Byzantine authors remain silent on repair"
+            "Byzantine authors remain silent on all lane repair"
         } else {
             "authors serve repair"
         };
