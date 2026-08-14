@@ -369,7 +369,10 @@ async fn main() -> Result<()> {
                     Arg::new("all-to-all")
                         .long("all-to-all")
                         .action(ArgAction::SetTrue)
-                        .help("Use all-to-all Autobahn vote and acknowledgement exchange"),
+                        .help(
+                            "Use all-to-all Autobahn vote and acknowledgement exchange \
+                             (implied by autobahn-optimistic)",
+                        ),
                 )
                 .arg(
                     Arg::new("echo-avail-claims")

@@ -62,6 +62,20 @@ python3 benchmark/check_protocol_regressions.py \
 
 Use `--protocols vantage` (or a comma-separated subset) for a focused run.
 
+The heavier post-feature control uses one Docker container per validator and
+real `tc netem` WAN delays. It compares clean, six-from-genesis-crash, and six
+Byzantine lane-withholding cases for all five protocol modes at `n=20` and
+1,000 tx/s, recording p50/p90/p99 latency and throughput:
+
+```bash
+python3 docker-bench/check_protocol_controls.py
+```
+
+See [`docker-bench/README.md`](../docker-bench/README.md) for the exact fault
+model and gates. This matrix is deliberately local/dedicated rather than part
+of the normal hosted CI job; CI retains the smaller release-mode `n=7`, `f=2`
+permanent-crash matrix above.
+
 ## Local Leader-Relay Stress
 
 The leader-relay experiment keeps useful demand fixed on correct lanes while

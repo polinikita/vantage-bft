@@ -130,8 +130,9 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         'delta_ms': 150,  # ms, Vantage AGB/control-log delay
         # `node run` interprets positive RTT as one-way link latency.
         'mimic_latency_ms': int(mimic_latency_ms),
-        # `--all-to-all` enables direct communication between every pair.
-        'all_to_all': all_to_all,
+        # Optimistic Autobahn is all-to-all by definition. The task flag also
+        # permits explicit all-to-all experiments with another protocol mode.
+        'all_to_all': all_to_all or protocol == 'autobahn-optimistic',
         # Enable per-peer transport batching by default.
         'batch_messages': batch_messages,
         'batch_max_bytes': batch_max_bytes,

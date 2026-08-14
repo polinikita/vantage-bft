@@ -95,6 +95,11 @@ impl Protocol {
         }
     }
 
+    /// Autobahn's optimistic variant uses all-to-all vote dissemination.
+    pub fn implies_all_to_all(&self) -> bool {
+        matches!(self, Protocol::AutobahnOptimistic)
+    }
+
     /// Canonical label for `protocol_info` and the `--protocol` CLI value.
     pub fn label(&self) -> &'static str {
         match self {
@@ -790,7 +795,7 @@ impl Default for Parameters {
             fast_path_timeout: 500,
             use_ride_share: false,
             car_timeout: 2000,
-            all_to_all: false,
+            all_to_all: true,
 
             // Asynchrony defaults.
             simulate_asynchrony: false,
@@ -843,7 +848,7 @@ impl Import for Parameters {}
 impl Export for Parameters {}
 
 impl Parameters {
-    /// Reconcile `use_optimistic_tips` with the selected protocol.
+    /// Reconcile protocol-derived mode flags with the selected protocol.
     pub fn reconcile_protocol(&mut self) {
         if let Some(implied) = self.protocol.implied_optimistic_tips() {
             if self.use_optimistic_tips != implied {
@@ -854,6 +859,14 @@ impl Parameters {
                 );
                 self.use_optimistic_tips = implied;
             }
+        }
+        if self.protocol.implies_all_to_all() && !self.all_to_all {
+            warn!(
+                "all_to_all=false is inconsistent with protocol {:?}; \
+                 protocol wins, using all_to_all=true",
+                self.protocol
+            );
+            self.all_to_all = true;
         }
     }
 
@@ -1553,6 +1566,25 @@ impl Default for KeyPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimistic_autobahn_implies_all_to_all() {
+        let mut optimistic = Parameters {
+            protocol: Protocol::AutobahnOptimistic,
+            all_to_all: false,
+            ..Parameters::default()
+        };
+        optimistic.reconcile_protocol();
+        assert!(optimistic.all_to_all);
+
+        let mut seamless = Parameters {
+            protocol: Protocol::AutobahnSeamless,
+            all_to_all: false,
+            ..Parameters::default()
+        };
+        seamless.reconcile_protocol();
+        assert!(!seamless.all_to_all);
+    }
 
     /// Generated Vantage parameters retain protocol and latency settings.
     #[test]
