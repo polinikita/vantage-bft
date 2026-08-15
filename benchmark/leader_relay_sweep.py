@@ -37,6 +37,7 @@ PROTOCOLS = (
     Protocol("autobahn-optimistic", "Autobahn optimistic (all-to-all)", ("--all-to-all",)),
     Protocol("vantage", "Vantage"),
     Protocol("simple-it", "Simple-IT (Opt-RBC)"),
+    Protocol("simple-it-bracha", "Simple-IT (Bracha RBC)"),
     Protocol("autobahn-seamless", "Autobahn seamless (control)"),
 )
 
@@ -52,9 +53,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--accept-pct", type=float, default=95.0)
     parser.add_argument(
+        "--optimistic-commit-through",
+        type=int,
+        default=10_000,
+        help="require Optimistic to commit Byzantine payload through this total offered rate",
+    )
+    parser.add_argument("--min-byzantine-commit-pct", type=float, default=80.0)
+    parser.add_argument(
         "--protocols",
         default="autobahn-optimistic,vantage,simple-it",
-        help="comma-separated protocol keys; add autobahn-seamless for the diagnostic control",
+        help="comma-separated protocol keys; seamless and Bracha are diagnostic controls",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--no-build", action="store_true")
@@ -91,6 +99,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--repeats must be positive")
     if args.egress_mbps <= 0:
         parser.error("--egress-mbps must be positive and explicitly disclosed")
+    if args.optimistic_commit_through < 0:
+        parser.error("--optimistic-commit-through must be non-negative")
+    if not 0 < args.min_byzantine_commit_pct <= 100:
+        parser.error("--min-byzantine-commit-pct must be in (0, 100]")
     if args.output is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         args.output = ROOT / "benchmark/results" / f"leader-relay-n{args.nodes}-{stamp}"
@@ -228,8 +240,23 @@ class Study:
             raise RuntimeError(f"{error}; see {log_path}") from error
 
         honest_offered = float(result["honest_offered_tps"])
+        byzantine_offered = float(rate) - honest_offered
         committed = float(result["committed_tps"])
+        committed_uncounted = float(result["committed_uncounted_tps"])
         delivery_pct = 100.0 * committed / honest_offered if honest_offered else 0.0
+        byzantine_delivery_pct = (
+            100.0 * committed_uncounted / byzantine_offered
+            if byzantine_offered
+            else 0.0
+        )
+        byzantine_commit_required = (
+            protocol.key == "autobahn-optimistic"
+            and rate <= self.args.optimistic_commit_through
+        )
+        semantics_ok = (
+            not byzantine_commit_required
+            or byzantine_delivery_pct >= self.args.min_byzantine_commit_pct
+        )
         commit_latency = result["real_latency_ms"]
         materialised_latency = result["materialised_latency_ms"]
         record = {
@@ -238,13 +265,17 @@ class Study:
             "protocol_label": protocol.label,
             "offered_tps": rate,
             "honest_offered_tps": honest_offered,
+            "byzantine_offered_tps": byzantine_offered,
             "committed_tps": committed,
-            "committed_uncounted_tps": result["committed_uncounted_tps"],
+            "committed_uncounted_tps": committed_uncounted,
             "committed_uncounted_transactions": result[
                 "committed_uncounted_transactions"
             ],
             "honest_delivery_pct": delivery_pct,
-            "accepted": delivery_pct >= self.args.accept_pct,
+            "byzantine_delivery_pct": byzantine_delivery_pct,
+            "byzantine_commit_required": byzantine_commit_required,
+            "semantics_ok": semantics_ok,
+            "accepted": delivery_pct >= self.args.accept_pct and semantics_ok,
             "repetition": repetition,
             "measurement_seconds": result["measurement_seconds"],
             "p50_ms": materialised_latency["p50"] or commit_latency["p50"] or 0.0,
@@ -269,8 +300,9 @@ class Study:
         print(
             f"  {verdict}: honest {committed:,.0f}/{honest_offered:,.0f} TPS "
             f"({delivery_pct:.1f}%), p50/p99={record['p50_ms']:.0f}/"
-            f"{record['p99_ms']:.0f} ms, adversarial committed "
-            f"{record['committed_uncounted_tps']:,.0f} TPS, peak egress "
+            f"{record['p99_ms']:.0f} ms, Byzantine "
+            f"{record['committed_uncounted_tps']:,.0f}/{byzantine_offered:,.0f} TPS "
+            f"({byzantine_delivery_pct:.1f}%), peak egress "
             f"{record['max_node_wire_mbps']:.1f} Mbit/s",
             flush=True,
         )
@@ -317,10 +349,12 @@ def write_provenance(args: argparse.Namespace) -> None:
         "fault_model": (
             "uniform total load; f Byzantine lane authors mark their normal load uncounted, "
             "broadcast headers, keep each batch at its author and narrowcast it only to an "
-            "(f-1)-wide correct group (f direct holders, one below PoA), aggregate one batch "
-            "per Delta, advance the receiver group by f-1 after five batches (a 5-Delta epoch), and refuse "
-            "repair; Byzantine consensus leaders propose certified cuts while honest leaders "
-            "serve optimistic repair normally"
+            "(f-1)-wide correct group fixed per lane (f direct holders, one below PoA), "
+            "stagger those groups across lanes so every correct leader holds complete prefixes, "
+            "aggregate one batch per Delta, and refuse "
+            "pre-commit repair; committed data may subsequently materialize from random peers; "
+            "Byzantine consensus leaders propose certified cuts while honest leaders serve "
+            "optimistic repair normally"
         ),
         "latency_model": "ten-region AWS RTT matrix applied as one-way tc netem delays",
         "arguments": {

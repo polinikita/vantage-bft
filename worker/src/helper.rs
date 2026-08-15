@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
+use crate::worker::WorkerMessage;
+
 #[cfg(test)]
 #[path = "tests/helper_tests.rs"]
 pub mod helper_tests;
@@ -25,7 +27,7 @@ pub struct Helper {
     /// The persistent storage.
     store: Store,
     /// Batch requests from other workers.
-    rx_request: Receiver<(Vec<Digest>, PublicKey, bool)>,
+    rx_request: Receiver<(Vec<Digest>, PublicKey, bool, bool)>,
     /// Sends batches to other workers.
     network: SimpleSender,
     /// Benchmark-only Byzantine behavior: do not serve batches to peers
@@ -42,7 +44,7 @@ impl Helper {
         id: WorkerId,
         committee: Committee,
         store: Store,
-        rx_request: Receiver<(Vec<Digest>, PublicKey, bool)>,
+        rx_request: Receiver<(Vec<Digest>, PublicKey, bool, bool)>,
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
@@ -68,7 +70,9 @@ impl Helper {
     }
 
     async fn run(&mut self) {
-        while let Some((digests, origin, optimistic_leader_repair)) = self.rx_request.recv().await {
+        while let Some((digests, origin, optimistic_leader_repair, committed_materialization)) =
+            self.rx_request.recv().await
+        {
             let suppress_repair =
                 self.suppressed_repair_destinations
                     .as_ref()
@@ -91,6 +95,8 @@ impl Helper {
                 digests.len(),
                 if optimistic_leader_repair {
                     "optimistic-leader"
+                } else if committed_materialization {
+                    "committed-materialization"
                 } else {
                     "proof/author"
                 },
@@ -107,10 +113,17 @@ impl Helper {
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
                     Ok(Some(data)) => {
-                        let kind = if optimistic_leader_repair {
-                            "OptimisticBatch"
+                        let (data, kind) = if committed_materialization {
+                            let message = WorkerMessage::CommittedBatch(data);
+                            (
+                                bincode::serialize(&message)
+                                    .expect("Failed to serialize committed batch response"),
+                                "CommittedBatch",
+                            )
+                        } else if optimistic_leader_repair {
+                            (data, "OptimisticBatch")
                         } else {
-                            "Batch"
+                            (data, "Batch")
                         };
                         self.network
                             .send_typed(address, Bytes::from(data), kind)

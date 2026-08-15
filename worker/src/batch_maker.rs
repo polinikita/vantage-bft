@@ -28,12 +28,10 @@ pub type Transaction = Bytes;
 /// Serialized batch forwarded to the processor.
 pub type Batch = Vec<Transaction>;
 
-/// Deterministic recipients for the rotating optimistic-leader burden profile.
+/// Deterministic recipients for one Byzantine lane in the optimistic-leader
+/// burden profile.
 pub(crate) struct LeaderRelayRecipients {
     pub(crate) targets: Vec<(PublicKey, SocketAddr)>,
-    pub(crate) batches_per_target: u64,
-    pub(crate) target_width: usize,
-    pub(crate) target_stride: usize,
 }
 
 /// Assembles client transactions into batches.
@@ -52,13 +50,11 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Worker addresses allowed by withholding configuration.
     withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
-    /// Rotating correct receivers for the leader-relay attack, plus the number
-    /// of consecutive batches per holder group.
+    /// Fixed correct receivers for this Byzantine lane in the leader-relay
+    /// attack.
     leader_relay_workers_addresses: Option<LeaderRelayRecipients>,
     /// Optional withholding time window.
     withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
-    /// Number of attack batches already assigned to a receiver epoch.
-    leader_relay_sequence: u64,
     /// Current batch.
     current_batch: Batch,
     /// Current batch size in bytes.
@@ -74,18 +70,8 @@ pub struct BatchMaker {
 /// Explicit yield interval.
 const YIELD_EVERY: u64 = 32;
 
-fn leader_relay_batch_addresses(
-    targets: &[(PublicKey, SocketAddr)],
-    sequence: u64,
-    batches_per_target: u64,
-    target_width: usize,
-    target_stride: usize,
-) -> Vec<SocketAddr> {
-    let epoch = sequence / batches_per_target.max(1);
-    let target_start = (epoch as usize).wrapping_mul(target_stride) % targets.len();
-    (0..target_width.min(targets.len()))
-        .map(|offset| targets[(target_start + offset) % targets.len()].1)
-        .collect()
+fn leader_relay_batch_addresses(targets: &[(PublicKey, SocketAddr)]) -> Vec<SocketAddr> {
+    targets.iter().map(|(_, address)| *address).collect()
 }
 
 impl BatchMaker {
@@ -114,7 +100,6 @@ impl BatchMaker {
                 withheld_workers_addresses,
                 leader_relay_workers_addresses,
                 withhold_window,
-                leader_relay_sequence: 0,
                 current_batch: Batch::new(),
                 current_batch_size: 0,
                 network: SimpleSender::new()
@@ -225,19 +210,11 @@ impl BatchMaker {
         let addresses: Vec<SocketAddr> = if withhold_active {
             match &self.leader_relay_workers_addresses {
                 Some(profile) if !profile.targets.is_empty() => {
-                    // Every selected publisher deterministically sends five
-                    // consecutive Delta-sized batches to its current honest
-                    // holder group. The next epoch advances that group by f-1,
-                    // so every correct leader is eventually burdened.
-                    let addresses = leader_relay_batch_addresses(
-                        &profile.targets,
-                        self.leader_relay_sequence,
-                        profile.batches_per_target,
-                        profile.target_width,
-                        profile.target_stride,
-                    );
-                    self.leader_relay_sequence = self.leader_relay_sequence.wrapping_add(1);
-                    addresses
+                    // A fixed group receives every batch in this lane and
+                    // therefore holds its complete payload prefix. Groups are
+                    // staggered across Byzantine publishers so every correct
+                    // leader is burdened by at least one lane.
+                    leader_relay_batch_addresses(&profile.targets)
                 }
                 _ => self
                     .withheld_workers_addresses

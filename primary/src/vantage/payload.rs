@@ -220,9 +220,9 @@ impl PayloadIo {
 
         for (worker_id, digests) in by_worker {
             if let Some(addr) = wire.worker_addr(worker_id) {
-                let bytes = bincode::serialize(&PrimaryWorkerMessage::Synchronize(digests, author))
-                    .expect("serializes");
-                wire.send_to_worker(addr, bytes, "Synchronize").await;
+                let message = PrimaryWorkerMessage::SynchronizeAuthor(digests, author);
+                let bytes = bincode::serialize(&message).expect("serializes");
+                wire.send_to_worker(addr, bytes, message.type_name()).await;
             }
         }
 

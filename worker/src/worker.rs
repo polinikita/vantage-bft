@@ -2,7 +2,7 @@
 use crate::batch_maker::{Batch, BatchMaker, LeaderRelayRecipients, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
-use crate::processor::{Processor, SerializedBatchMessage};
+use crate::processor::{DigestNotification, Processor, SerializedBatchMessage};
 #[cfg(feature = "benchmark")]
 use crate::synchronizer::CommitObserver;
 use crate::synchronizer::Synchronizer;
@@ -67,6 +67,12 @@ pub enum WorkerMessage {
     /// Batch request on the optimistic proposal's critical path. The current
     /// consensus leader, rather than the lane author, serves this request.
     OptimisticBatchRequest(Vec<Digest>, PublicKey),
+    /// Post-decision request whose response materializes execution data without
+    /// creating direct-publication provenance at the primary.
+    CommittedBatchRequest(Vec<Digest>, PublicKey),
+    /// Original serialized `Batch` bytes returned for post-decision
+    /// materialization. This variant is an envelope and is never itself hashed.
+    CommittedBatch(Vec<u8>),
 }
 
 #[derive(Deserialize)]
@@ -74,11 +80,14 @@ enum BorrowedWorkerMessage<'a> {
     Batch(#[serde(borrow)] Vec<&'a [u8]>),
     BatchRequest(Vec<Digest>, PublicKey),
     OptimisticBatchRequest(Vec<Digest>, PublicKey),
+    CommittedBatchRequest(Vec<Digest>, PublicKey),
+    CommittedBatch(#[serde(borrow)] &'a [u8]),
 }
 
 enum WorkerMessageRoute {
     Batch,
-    BatchRequest(Vec<Digest>, PublicKey, bool),
+    CommittedBatch(Vec<u8>),
+    BatchRequest(Vec<Digest>, PublicKey, bool, bool),
 }
 
 fn route_worker_message(serialized: &[u8]) -> bincode::Result<WorkerMessageRoute> {
@@ -87,11 +96,17 @@ fn route_worker_message(serialized: &[u8]) -> bincode::Result<WorkerMessageRoute
             let _ = transactions.len();
             Ok(WorkerMessageRoute::Batch)
         }
-        BorrowedWorkerMessage::BatchRequest(missing, requestor) => {
-            Ok(WorkerMessageRoute::BatchRequest(missing, requestor, false))
-        }
-        BorrowedWorkerMessage::OptimisticBatchRequest(missing, requestor) => {
-            Ok(WorkerMessageRoute::BatchRequest(missing, requestor, true))
+        BorrowedWorkerMessage::BatchRequest(missing, requestor) => Ok(
+            WorkerMessageRoute::BatchRequest(missing, requestor, false, false),
+        ),
+        BorrowedWorkerMessage::OptimisticBatchRequest(missing, requestor) => Ok(
+            WorkerMessageRoute::BatchRequest(missing, requestor, true, false),
+        ),
+        BorrowedWorkerMessage::CommittedBatchRequest(missing, requestor) => Ok(
+            WorkerMessageRoute::BatchRequest(missing, requestor, false, true),
+        ),
+        BorrowedWorkerMessage::CommittedBatch(serialized) => {
+            Ok(WorkerMessageRoute::CommittedBatch(serialized.to_vec()))
         }
     }
 }
@@ -323,32 +338,27 @@ impl Worker {
         let leader_relay_workers_addresses = (self.parameters.leader_relay_attack
             && self.withheld_destinations.is_some())
         .then(|| {
-            let publishers = config::withholding_publishers(
+            let targets = config::leader_relay_destinations(
                 &self.committee,
+                &self.name,
                 self.parameters.withhold_senders,
                 &self.parameters.withhold_publishers,
             );
-            let correct = full_workers_addresses
+            let targets = targets.into_iter().collect::<HashSet<_>>();
+            let targets = full_workers_addresses
                 .iter()
-                .filter(|(name, _)| !publishers.contains(name))
+                .filter(|(name, _)| targets.contains(name))
                 .copied()
                 .collect::<Vec<_>>();
-            LeaderRelayRecipients {
-                targets: correct,
-                batches_per_target: 5,
-                target_width: publishers.len().saturating_sub(1),
-                target_stride: publishers.len().saturating_sub(1),
-            }
+            LeaderRelayRecipients { targets }
         });
 
         // In the attack profile a Byzantine publisher is free to choose its
-        // batching. Emit one heavy batch per Delta and keep five consecutive
-        // batches on the same (f-1)-wide correct-holder group, yielding a
-        // disclosed 5-Delta receiver epoch. Each epoch advances the group by
-        // f-1 positions.
+        // batching. Emit one heavy batch per Delta to its fixed (f-1)-wide
+        // correct-holder group, preserving a complete prefix at those holders.
         let (batch_size, max_batch_delay) = if leader_relay_workers_addresses.is_some() {
             info!(
-                "Leader-relay Byzantine batching: one batch per Delta={} ms, five batches per (f-1)-wide correct-holder epoch; receiver-group stride=f-1",
+                "Leader-relay Byzantine batching: one batch per Delta={} ms to this lane's fixed (f-1)-wide correct-holder group; groups are staggered across Byzantine lanes",
                 self.parameters.delta_ms.max(1)
             );
             (usize::MAX, self.parameters.delta_ms.max(1))
@@ -375,7 +385,7 @@ impl Worker {
             self.store.clone(),
             rx_processor,
             tx_primary,
-            true,
+            DigestNotification::Our,
             #[cfg(feature = "pipeline-tracing")]
             self.metrics.clone(),
         );
@@ -395,9 +405,11 @@ impl Worker {
     ) -> Vec<QueueProbe> {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
+        let (tx_materializer, rx_materializer) = channel(CHANNEL_CAPACITY);
         let probes = vec![
             probe("helper", tx_helper.clone()),
             probe("processor_peer", tx_processor.clone()),
+            probe("processor_committed", tx_materializer.clone()),
         ];
 
         let mut address = self
@@ -411,6 +423,7 @@ impl Worker {
             WorkerReceiverHandler {
                 tx_helper,
                 tx_processor,
+                tx_materializer,
                 metrics: self.metrics.clone(),
             },
             Some(self.metrics.clone()),
@@ -439,8 +452,21 @@ impl Worker {
             self.id,
             self.store.clone(),
             rx_processor,
+            tx_primary.clone(),
+            DigestNotification::Others,
+            #[cfg(feature = "pipeline-tracing")]
+            self.metrics.clone(),
+        );
+
+        // Committed repair is intentionally storage-only. Sending an
+        // `OthersBatch` notification here would let repaired possession wake
+        // Vantage's first-hand ACK path.
+        Processor::spawn(
+            self.id,
+            self.store.clone(),
+            rx_materializer,
             tx_primary,
-            false,
+            DigestNotification::None,
             #[cfg(feature = "pipeline-tracing")]
             self.metrics.clone(),
         );
@@ -488,8 +514,9 @@ impl MessageHandler for TxReceiverHandler {
 /// Handles batches and batch requests from workers.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_helper: Sender<(Vec<Digest>, PublicKey, bool)>,
+    tx_helper: Sender<(Vec<Digest>, PublicKey, bool, bool)>,
     tx_processor: Sender<SerializedBatchMessage>,
+    tx_materializer: Sender<SerializedBatchMessage>,
     metrics: Arc<Metrics>,
 }
 
@@ -516,8 +543,29 @@ impl MessageHandler for WorkerReceiverHandler {
                     .await
                     .expect("Failed to send batch")
             }
-            Ok(WorkerMessageRoute::BatchRequest(missing, requestor, optimistic_leader_repair)) => {
-                let kind = if optimistic_leader_repair {
+            Ok(WorkerMessageRoute::CommittedBatch(batch)) => {
+                self.metrics
+                    .network_messages_received_total
+                    .with_label_values(&["CommittedBatch"])
+                    .inc();
+                self.metrics
+                    .network_bytes_received_total
+                    .with_label_values(&["CommittedBatch"])
+                    .inc_by(serialized.len() as u64);
+                self.tx_materializer
+                    .send(Bytes::from(batch))
+                    .await
+                    .expect("Failed to materialize committed batch")
+            }
+            Ok(WorkerMessageRoute::BatchRequest(
+                missing,
+                requestor,
+                optimistic_leader_repair,
+                committed_materialization,
+            )) => {
+                let kind = if committed_materialization {
+                    "CommittedBatchRequest"
+                } else if optimistic_leader_repair {
                     "OptimisticBatchRequest"
                 } else {
                     "BatchRequest"
@@ -531,7 +579,12 @@ impl MessageHandler for WorkerReceiverHandler {
                     .with_label_values(&[kind])
                     .inc_by(serialized.len() as u64);
                 self.tx_helper
-                    .send((missing, requestor, optimistic_leader_repair))
+                    .send((
+                        missing,
+                        requestor,
+                        optimistic_leader_repair,
+                        committed_materialization,
+                    ))
                     .await
                     .expect("Failed to send batch request")
             }
@@ -573,11 +626,13 @@ impl MessageHandler for PrimaryReceiverHandler {
                     PrimaryWorkerMessage::Committed(commit_millis, digests) => {
                         #[cfg(feature = "benchmark")]
                         self.tx_committed
-                            .send((commit_millis, digests))
+                            .send((commit_millis, digests.clone()))
                             .await
                             .expect("Failed to send committed batches");
-                        #[cfg(not(feature = "benchmark"))]
-                        let _ = (commit_millis, digests);
+                        self.tx_synchronizer
+                            .send(PrimaryWorkerMessage::Committed(commit_millis, digests))
+                            .await
+                            .expect("Failed to schedule committed batch materialization");
                     }
                     message => self
                         .tx_synchronizer

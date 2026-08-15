@@ -18,7 +18,7 @@ fn worker_message_routing_matches_wire_format() {
     let bytes = bincode::serialize(&request).unwrap();
     assert!(matches!(
         route_worker_message(&bytes).unwrap(),
-        WorkerMessageRoute::BatchRequest(missing, requestor, false)
+        WorkerMessageRoute::BatchRequest(missing, requestor, false, false)
             if missing == vec![batch_digest()] && requestor == keys()[0].0
     ));
 
@@ -26,8 +26,24 @@ fn worker_message_routing_matches_wire_format() {
     let bytes = bincode::serialize(&request).unwrap();
     assert!(matches!(
         route_worker_message(&bytes).unwrap(),
-        WorkerMessageRoute::BatchRequest(missing, requestor, true)
+        WorkerMessageRoute::BatchRequest(missing, requestor, true, false)
             if missing == vec![batch_digest()] && requestor == keys()[0].0
+    ));
+
+    let request = WorkerMessage::CommittedBatchRequest(vec![batch_digest()], keys()[0].0);
+    let bytes = bincode::serialize(&request).unwrap();
+    assert!(matches!(
+        route_worker_message(&bytes).unwrap(),
+        WorkerMessageRoute::BatchRequest(missing, requestor, false, true)
+            if missing == vec![batch_digest()] && requestor == keys()[0].0
+    ));
+
+    let original = bincode::serialize(&WorkerMessage::Batch(vec![transaction()])).unwrap();
+    let response = WorkerMessage::CommittedBatch(original.clone());
+    let bytes = bincode::serialize(&response).unwrap();
+    assert!(matches!(
+        route_worker_message(&bytes).unwrap(),
+        WorkerMessageRoute::CommittedBatch(batch) if batch == original
     ));
 }
 

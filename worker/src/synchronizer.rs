@@ -116,7 +116,7 @@ pub struct Synchronizer {
     gc_depth: Round,
     /// Delay between sync retries, in milliseconds.
     sync_retry_delay: u64,
-    /// Number of random peers used by Vantage's widening retry policy.
+    /// Number of random peers used to materialize committed data.
     sync_retry_nodes: usize,
     /// Commands from the primary.
     rx_message: Receiver<PrimaryWorkerMessage>,
@@ -131,12 +131,14 @@ pub struct Synchronizer {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum SyncPolicy {
-    /// Existing Vantage behavior: try the author, then widen on retry.
-    Widening(PublicKey),
-    /// Autobahn behavior: the lane author is the only justified source.
+    /// Before commit, the lane author is the only source justified by a
+    /// directly received header.
     Author(PublicKey),
     OptimisticLeader(PublicKey),
     ProofSources(Vec<PublicKey>),
+    /// Once consensus commits a digest, materialization may use arbitrary
+    /// peers without affecting the availability decision.
+    Committed,
 }
 
 /// Processes benchmark commit metrics without blocking batch synchronization.
@@ -238,7 +240,10 @@ impl Synchronizer {
             }
 
             if let Some((_, _, timestamp, previous_policy)) = self.pending.get_mut(&digest) {
-                if *previous_policy != policy {
+                // Commit is a one-way boundary: it may widen an existing
+                // pre-commit request, but a late header must never narrow a
+                // committed materialization request again.
+                if *previous_policy != policy && !matches!(previous_policy, SyncPolicy::Committed) {
                     *timestamp = now;
                     *previous_policy = policy.clone();
                     missing.push(digest);
@@ -270,12 +275,32 @@ impl Synchronizer {
 
     async fn send_requests(&mut self, missing: Vec<Digest>, policy: &SyncPolicy) {
         let missing_count = missing.len();
+        if matches!(policy, SyncPolicy::Committed) {
+            let addresses = self
+                .committee
+                .others_workers(&self.name, &self.id)
+                .iter()
+                .map(|(_, address)| address.worker_to_worker)
+                .collect();
+            let message = WorkerMessage::CommittedBatchRequest(missing, self.name);
+            let serialized =
+                bincode::serialize(&message).expect("Failed to serialize committed batch request");
+            debug!(
+                "Requesting {} committed batch(es) from {} random peer(s)",
+                missing_count, self.sync_retry_nodes
+            );
+            self.network
+                .lucky_broadcast_typed(
+                    addresses,
+                    Bytes::from(serialized),
+                    self.sync_retry_nodes,
+                    "CommittedBatchRequest",
+                )
+                .await;
+            return;
+        }
+
         let (targets, message, kind) = match policy {
-            SyncPolicy::Widening(author) => (
-                vec![*author],
-                WorkerMessage::BatchRequest(missing, self.name),
-                "BatchRequest",
-            ),
             SyncPolicy::Author(author) => (
                 vec![*author],
                 WorkerMessage::BatchRequest(missing, self.name),
@@ -291,6 +316,7 @@ impl Synchronizer {
                 WorkerMessage::BatchRequest(missing, self.name),
                 "ProofSourceBatchRequest",
             ),
+            SyncPolicy::Committed => unreachable!("handled above"),
         };
         debug!(
             "Sending {} {} message(s) to {} protocol-derived target(s)",
@@ -331,7 +357,7 @@ impl Synchronizer {
             tokio::select! {
                 Some(message) = self.rx_message.recv() => match message {
                     PrimaryWorkerMessage::Synchronize(digests, target) => {
-                        self.synchronize(digests, SyncPolicy::Widening(target), &tx_waiter).await;
+                        self.synchronize(digests, SyncPolicy::Author(target), &tx_waiter).await;
                     },
                     PrimaryWorkerMessage::SynchronizeOptimistic(digests, target) => {
                         self.synchronize(
@@ -369,7 +395,9 @@ impl Synchronizer {
                         }
                         self.pending.retain(|_, (r, _, _, _)| r > &mut gc_round);
                     }
-                    PrimaryWorkerMessage::Committed(..) => {}
+                    PrimaryWorkerMessage::Committed(_, digests) => {
+                        self.synchronize(digests, SyncPolicy::Committed, &tx_waiter).await;
+                    }
                 },
 
                 Some(result) = rx_waiter.recv() => match result {
@@ -406,26 +434,7 @@ impl Synchronizer {
                             }
                         }
                         for (policy, digests) in by_policy {
-                            if matches!(policy, SyncPolicy::Widening(_)) {
-                                let message = WorkerMessage::BatchRequest(digests, self.name);
-                                let serialized = bincode::serialize(&message)
-                                    .expect("Failed to serialize our own message");
-                                let addresses = self.committee
-                                    .others_workers(&self.name, &self.id)
-                                    .iter()
-                                    .map(|(_, address)| address.worker_to_worker)
-                                    .collect();
-                                self.network
-                                    .lucky_broadcast_typed(
-                                        addresses,
-                                        Bytes::from(serialized),
-                                        self.sync_retry_nodes,
-                                        "BatchRequest",
-                                    )
-                                    .await;
-                            } else {
-                                self.send_requests(digests, &policy).await;
-                            }
+                            self.send_requests(digests, &policy).await;
                         }
                     }
 

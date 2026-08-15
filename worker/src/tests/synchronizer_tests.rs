@@ -1,8 +1,31 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{batch_digest, committee_with_base_port, keys, listener};
+use futures::sink::SinkExt as _;
+use futures::stream::StreamExt as _;
 use std::fs;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::channel;
+use tokio::time::{timeout, Duration};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+fn listener_n(address: SocketAddr, expected: Bytes, count: usize) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(address).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let transport = Framed::new(socket, LengthDelimitedCodec::new());
+        let (mut writer, mut reader) = transport.split();
+        for _ in 0..count {
+            let received = reader
+                .next()
+                .await
+                .expect("connection closed before every retry arrived")
+                .expect("failed to read retry frame");
+            assert_eq!(received.freeze(), expected);
+            writer.send(Bytes::from_static(b"Ack")).await.unwrap();
+        }
+    })
+}
 
 #[tokio::test]
 async fn synchronize() {
@@ -44,6 +67,108 @@ async fn synchronize() {
     tx_message.send(message).await.unwrap();
 
     assert!(handle.await.is_ok());
+}
+
+#[tokio::test]
+async fn precommit_retries_remain_author_targeted() {
+    let (tx_message, rx_message) = channel(1);
+    let mut keys = keys();
+    let (name, _) = keys.pop().unwrap();
+    let (author, _) = keys.pop().unwrap();
+    let (unrelated, _) = keys.pop().unwrap();
+    let id = 0;
+    let committee = committee_with_base_port(9_400);
+    let path = ".db_test_precommit_author_only_retry";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    Synchronizer::spawn(
+        name,
+        id,
+        committee.clone(),
+        store,
+        50,
+        1,
+        3,
+        rx_message,
+        std::collections::HashMap::new(),
+        Metrics::new(&prometheus::Registry::new()).0,
+        BatchConfig::default(),
+    );
+
+    let missing = vec![batch_digest()];
+    let expected = Bytes::from(
+        bincode::serialize(&WorkerMessage::BatchRequest(missing.clone(), name)).unwrap(),
+    );
+    let author_address = committee.worker(&author, &id).unwrap().worker_to_worker;
+    let unrelated_address = committee.worker(&unrelated, &id).unwrap().worker_to_worker;
+    let author_listener = listener_n(author_address, expected.clone(), 2);
+    let mut unrelated_listener = listener_n(unrelated_address, expected, 1);
+
+    tx_message
+        .send(PrimaryWorkerMessage::SynchronizeAuthor(missing, author))
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(3), author_listener)
+        .await
+        .expect("author did not receive the initial request and its retry")
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), &mut unrelated_listener)
+            .await
+            .is_err(),
+        "a pre-commit retry reached an arbitrary peer"
+    );
+    unrelated_listener.abort();
+    let _ = fs::remove_dir_all(path);
+}
+
+#[tokio::test]
+async fn committed_data_materialization_uses_random_peers() {
+    let (tx_message, rx_message) = channel(1);
+    let mut keys = keys();
+    let (name, _) = keys.pop().unwrap();
+    let id = 0;
+    let committee = committee_with_base_port(9_500);
+    let path = ".db_test_committed_random_materialization";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    Synchronizer::spawn(
+        name,
+        id,
+        committee.clone(),
+        store,
+        50,
+        1_000_000,
+        3,
+        rx_message,
+        std::collections::HashMap::new(),
+        Metrics::new(&prometheus::Registry::new()).0,
+        BatchConfig::default(),
+    );
+
+    let missing = vec![batch_digest()];
+    let expected = Bytes::from(
+        bincode::serialize(&WorkerMessage::CommittedBatchRequest(missing.clone(), name)).unwrap(),
+    );
+    let listeners: Vec<_> = committee
+        .others_workers(&name, &id)
+        .iter()
+        .map(|(_, addresses)| listener_n(addresses.worker_to_worker, expected.clone(), 1))
+        .collect();
+
+    tx_message
+        .send(PrimaryWorkerMessage::Committed(0, missing))
+        .await
+        .unwrap();
+
+    for listener in listeners {
+        timeout(Duration::from_secs(3), listener)
+            .await
+            .expect("a committed-data peer was not contacted")
+            .unwrap();
+    }
+    let _ = fs::remove_dir_all(path);
 }
 
 #[tokio::test]

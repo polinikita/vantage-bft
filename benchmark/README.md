@@ -68,8 +68,10 @@ Use `--protocols vantage` (or a comma-separated subset) for a focused run.
 
 The heavier post-feature control uses one Docker container per validator and
 real `tc netem` WAN delays. It compares clean, six-from-genesis-crash, and six
-Byzantine lane-withholding cases for all five protocol modes at `n=20` and
-1,000 tx/s, recording p50/p90/p99 latency and throughput:
+Byzantine-cohort-isolation cases for all five protocol modes at `n=20` and
+1,000 tx/s, recording p50/p90/p99 latency and throughput. The isolation case
+keeps the faulty bytes inside the Byzantine cohort; it is distinct from the
+outside-holder leader-relay experiment below:
 
 ```bash
 python3 docker-bench/check_protocol_controls.py
@@ -86,20 +88,19 @@ The leader-relay experiment increases one uniform total workload. For `n=20`,
 six Byzantine authors each receive the same `1/20` load share as every correct
 author. Their transactions exercise the full data path but are excluded from
 useful-throughput and latency metrics, making the honest target exactly 70% of
-total offered load. Each successive Byzantine batch remains at its author and
-is narrowcast only to a rotating group of five correct validators: exactly
-`f=6` direct holders, one below the `f+1=7` PoA threshold. It is not sent to the
-other Byzantine validators. All six Byzantine authors use the same correct
-group during each `5 Delta = 1 s` epoch. Selected
-Byzantine publishers aggregate their uniform input share into one batch per
-`Delta`; after five consecutive batches, the group advances by `f-1` positions.
-Thus every correct leader is eventually selected and locally holds all six
-faulty lanes. Headers remain visible and Byzantine authors refuse repair. To
-isolate the honest-leader relay cost,
+total offered load. Every Byzantine batch remains at its author and is
+narrowcast only to a correct group of five validators fixed for that lane:
+exactly `f=6` direct holders, one below the `f+1=7` PoA threshold. It is not
+sent to the other Byzantine validators. The six fixed lane groups are
+staggered by `f-1`, so together they cover every correct leader while each
+holder retains a complete prefix of its lanes. Selected Byzantine publishers
+aggregate their uniform input share into one batch per `Delta`. Headers remain
+visible and Byzantine authors refuse repair. To isolate the honest-leader
+relay cost,
 a selected Byzantine publisher uses its certified cut whenever it is itself a
 consensus leader; it does not deliberately stall that view with an optimistic
 tip it will refuse to serve. Autobahn's selected Byzantine cars carry
-one digest, so one sub-PoA tip at a time moves across every correct leader;
+ordinary payload capacity, so queued batches share the next sub-PoA car;
 relay dissemination may subsequently let that car obtain a PoA and advance the
 lane. Vantage and Simple-IT keep their ordinary block-construction rules.
 
@@ -136,6 +137,9 @@ Simple-IT/Opt-RBC. Add the strict seamless diagnostic with
 The runner uses the Docker AWS-RTT netem matrix, a disclosed 1 Gbit/s
 per-validator egress cap, 70-second runs (the first 10 seconds are excluded
 from rate calculation), and three repetitions around each observed knee. It
+enforces a strict Optimistic regression through 10,000 total TPS: at least 80%
+of the offered Byzantine share must appear in
+`committed_uncounted_tps`, in addition to the honest-goodput gate. It
 writes raw logs, configurations, JSON/CSV measurements, provenance, and
 `leader-relay.{png,pdf}` below `benchmark/results/`.
 

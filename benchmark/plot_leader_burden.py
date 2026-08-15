@@ -14,6 +14,7 @@ PROTOCOLS = (
     ("autobahn-optimistic", "Autobahn optimistic (all-to-all)", "#D55E00", "s"),
     ("vantage", "Vantage", "#0072B2", "o"),
     ("simple-it", "Simple-IT (Opt-RBC)", "#009E73", "D"),
+    ("simple-it-bracha", "Simple-IT (Bracha RBC)", "#CC79A7", "v"),
     ("autobahn-seamless", "Autobahn seamless (control)", "#E69F00", "^"),
 )
 
@@ -45,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         "--subtitle",
         default=(
             "n=20, f=6 · uniform offered load · AWS RTT netem · Byzantine batches "
-            "have f direct holders (one below PoA) in rotating correct groups"
+            "have f direct holders (one below PoA) in fixed per-lane groups"
         ),
     )
     parser.add_argument("--accept-pct", type=float, default=95.0)

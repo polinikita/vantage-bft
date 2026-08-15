@@ -50,6 +50,11 @@ three scenarios are:
 3. `withhold`: validators 0--5 send lane data only among themselves and refuse
    repair to validators 6--19; the materializable target is 700 tx/s.
 
+The third case is Byzantine-cohort isolation, not the optimistic leader-relay
+profile. Use `--leader-relay` (or `benchmark/leader_relay_sweep.py`) when the
+bytes must reach `f-1` honest holders and Optimistic is expected to commit the
+Byzantine share by relaying it through honest leaders.
+
 Each point records submitted and committed throughput, real and materialized
 p50/p90/p99 latency, panic matches, the exact command, and its full log.
 `records.json`, `records.csv`, and `summary.md` are written below
@@ -97,15 +102,16 @@ offered rate remains uniformly distributed across all validators; the normal
 share submitted to each selected Byzantine author is marked uncounted so the
 reported throughput and latency cover honest transactions only. Each
 Byzantine batch remains at its author and is sent only to an `(f-1)`-wide
-rotating correct group. These `f` direct holders are exactly one below the
-`f+1` PoA threshold; the other Byzantine validators do not receive the bytes.
+correct group fixed for that Byzantine lane. These `f` direct holders are
+exactly one below the `f+1` PoA threshold; the other Byzantine validators do
+not receive the bytes.
 Lane headers stay visible, Byzantine authors refuse repair, and all Byzantine
-authors use the same correct group
-during each `5 Delta` epoch. Selected Byzantine publishers aggregate one batch
-per `Delta`, so five consecutive batches remain there; the next epoch advances
-the group by `f-1` positions. This concentrates all faulty lanes on each selected
-leader while eventually exercising every correct leader. The mode implies batch-only withholding from all other
-peers. Selected Byzantine Autobahn publishers use one payload digest per car,
+lane groups are staggered by `f-1` positions across the correct validators.
+Selected Byzantine publishers aggregate one batch per `Delta`; the fixed group
+therefore retains the lane's complete payload prefix. Across the Byzantine
+lanes, the staggered groups exercise every correct leader. The mode implies
+batch-only withholding from all other peers. Selected Byzantine Autobahn
+publishers retain ordinary car capacity,
 keeping a single sub-PoA tip active until dissemination later supplies another
 holder; honest lanes and the other protocols retain their normal payload
 capacity and block-construction rules. A selected

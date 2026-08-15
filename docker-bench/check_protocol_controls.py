@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the n=20 Docker/netem clean, crash, and Byzantine-lane controls."""
+"""Run clean, crash, and Byzantine-cohort-isolation Docker/netem controls."""
 
 from __future__ import annotations
 

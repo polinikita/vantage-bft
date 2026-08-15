@@ -140,7 +140,7 @@ pub struct Parameters {
     pub gc_depth: u64,
     /// Sync retry delay, in milliseconds.
     pub sync_retry_delay: u64,
-    /// Number of random peers used for sync retries.
+    /// Number of random peers used for committed-data and header sync retries.
     pub sync_retry_nodes: usize,
     /// Preferred worker batch size, in bytes.
     pub batch_size: usize,
@@ -354,12 +354,12 @@ pub struct Parameters {
     pub withhold_headers: bool,
 
     /// Benchmark-only leader-relay attack. Each selected Byzantine publisher
-    /// sends every worker batch only to an (f-1)-wide rotating correct group.
-    /// Including the author's local copy, this is exactly f direct batch
-    /// holders, one below the f+1 PoA threshold. Lane headers remain visible
-    /// and the Byzantine authors refuse repair. The Autobahn path
-    /// separately limits selected publishers to one batch per car, making the
-    /// correct holder the only live relay source for that tip.
+    /// sends every worker batch only to an (f-1)-wide correct group fixed for
+    /// that lane; the groups are staggered across publishers. Including the
+    /// author's local copy, this is exactly f direct batch holders, one below
+    /// the f+1 PoA threshold. Lane headers remain visible and the Byzantine
+    /// authors refuse repair. A correct direct holder is therefore the only
+    /// live relay source for an optimistic tip.
     #[serde(default)]
     pub leader_relay_attack: bool,
 
@@ -1044,8 +1044,7 @@ impl Parameters {
             }
             if self.leader_relay_attack {
                 info!(
-                    "Leader-relay attack: each Byzantine batch has f direct holders (its author plus an (f-1)-wide correct group), one below PoA; rotating every {} ms (5-Delta)",
-                    self.delta_ms.saturating_mul(5)
+                    "Leader-relay attack: each Byzantine lane has a fixed (f-1)-wide correct-holder group, staggered across lanes; every batch has f direct holders including its author, one below PoA"
                 );
             }
         }
@@ -1593,23 +1592,33 @@ pub fn withholding_publishers(
     }
 }
 
-/// Returns the rotating non-publisher receiver group for a Byzantine batch.
+/// Returns the fixed non-publisher receiver group for a Byzantine lane.
 ///
-/// All selected publishers use the same (f-1)-wide group and advance by f-1
-/// each epoch. Together with the local author's copy, this yields exactly f
-/// direct holders, one below the f+1 PoA threshold; successive groups cover
-/// every correct validator and expose optimistic leaders to the missing data.
+/// Each selected publisher uses an `(f-1)`-wide group offset by `f-1` from the
+/// previous publisher's group. Together with the local author's copy, this
+/// yields exactly `f` direct holders, one below the `f+1` PoA threshold. A
+/// fixed group holds the lane's complete payload prefix, while staggering the
+/// groups across publishers exposes every correct consensus leader to at least
+/// one Byzantine lane.
 pub fn leader_relay_destinations(
     committee: &Committee,
     self_pk: &PublicKey,
     withhold_senders: usize,
     fixed_publishers: &[PublicKey],
-    epoch: u64,
 ) -> Vec<PublicKey> {
     let publishers = withholding_publishers(committee, withhold_senders, fixed_publishers);
     if !publishers.contains(self_pk) {
         return Vec::new();
     }
+    let publisher_order: Vec<_> = committee
+        .authorities
+        .keys()
+        .filter(|key| publishers.contains(key))
+        .copied()
+        .collect();
+    let Some(publisher_index) = publisher_order.iter().position(|key| key == self_pk) else {
+        return Vec::new();
+    };
     let targets: Vec<_> = committee
         .authorities
         .keys()
@@ -1620,7 +1629,7 @@ pub fn leader_relay_destinations(
         return Vec::new();
     }
     let width = publishers.len().saturating_sub(1).min(targets.len());
-    let start = (epoch as usize).wrapping_mul(width) % targets.len();
+    let start = publisher_index.wrapping_mul(width) % targets.len();
     (0..width)
         .map(|offset| targets[(start + offset) % targets.len()])
         .collect()
@@ -1958,9 +1967,15 @@ mod tests {
     }
 
     #[test]
-    fn n20_leader_relay_rotates_sub_poa_holders_across_every_correct_leader() {
+    fn n20_leader_relay_fixed_lane_groups_cover_every_correct_leader() {
         let (committee, _) = Committee::local_benchmark(20, 1, 9000);
         let publishers = withholding_publishers(&committee, 6, &[]);
+        let publisher_order: Vec<_> = committee
+            .authorities
+            .keys()
+            .filter(|key| publishers.contains(key))
+            .copied()
+            .collect();
         let correct: Vec<_> = committee
             .authorities
             .keys()
@@ -1976,23 +1991,60 @@ mod tests {
         );
 
         let mut covered = HashSet::new();
-        for epoch in 0..3 {
-            let publisher = *publishers.iter().next().unwrap();
-            let epoch_targets: HashSet<_> =
-                leader_relay_destinations(&committee, &publisher, 6, &[], epoch)
+        for publisher in publisher_order {
+            let lane_targets: HashSet<_> =
+                leader_relay_destinations(&committee, &publisher, 6, &[])
                     .into_iter()
                     .collect();
-            assert_eq!(epoch_targets.len(), publishers.len() - 1);
-            assert_eq!(epoch_targets.len() + 1, publishers.len());
-            assert!(publishers.iter().all(|other| {
-                leader_relay_destinations(&committee, other, 6, &[], epoch)
+            assert_eq!(lane_targets.len(), publishers.len() - 1);
+            assert_eq!(lane_targets.len() + 1, publishers.len());
+            assert_eq!(
+                leader_relay_destinations(&committee, &publisher, 6, &[])
                     .into_iter()
-                    .collect::<HashSet<_>>()
-                    == epoch_targets
-            }));
-            covered.extend(epoch_targets);
+                    .collect::<HashSet<_>>(),
+                lane_targets,
+                "a lane's holder group must remain fixed"
+            );
+            covered.extend(lane_targets);
         }
-        assert_eq!(covered, correct.into_iter().collect());
+        assert_eq!(covered, correct.iter().copied().collect());
+        assert!(
+            correct
+                .iter()
+                .all(|other| { leader_relay_destinations(&committee, other, 6, &[]).is_empty() }),
+            "correct publishers do not use the Byzantine narrowcast profile"
+        );
+    }
+
+    #[test]
+    fn n40_leader_relay_has_thirteen_sub_poa_holders_and_covers_every_leader() {
+        let (committee, _) = Committee::local_benchmark(40, 1, 9000);
+        let publishers = withholding_publishers(&committee, 13, &[]);
+        let correct: HashSet<_> = committee
+            .authorities
+            .keys()
+            .filter(|key| !publishers.contains(key))
+            .copied()
+            .collect();
+        let mut covered = HashSet::new();
+
+        for publisher in &publishers {
+            let lane_targets: HashSet<_> =
+                leader_relay_destinations(&committee, publisher, 13, &[])
+                    .into_iter()
+                    .collect();
+            assert_eq!(lane_targets.len(), 12);
+            assert!(lane_targets.is_subset(&correct));
+            covered.extend(lane_targets);
+        }
+
+        assert_eq!(publishers.len(), 13);
+        assert_eq!(correct.len(), 27);
+        assert_eq!(
+            publishers.len() + 1,
+            committee.validity_threshold() as usize
+        );
+        assert_eq!(covered, correct);
     }
 
     #[test]

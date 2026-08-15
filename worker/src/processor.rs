@@ -20,6 +20,16 @@ pub mod processor_tests;
 /// Serialized `WorkerMessage::Batch` bytes.
 pub type SerializedBatchMessage = Bytes;
 
+/// Selects whether storing a batch also advertises its digest to the primary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DigestNotification {
+    Our,
+    Others,
+    /// Post-commit materialization is deliberately invisible to availability
+    /// logic: repaired possession must not create first-hand provenance.
+    None,
+}
+
 /// Hashes and stores batches, then sends their digests to the primary.
 pub struct Processor;
 
@@ -32,8 +42,7 @@ impl Processor {
         mut store: Store,
         mut rx_batch: Receiver<SerializedBatchMessage>,
         tx_digest: Sender<SerializedBatchDigestMessage>,
-        // Selects the local or peer digest message.
-        own_digest: bool,
+        digest_notification: DigestNotification,
         #[cfg(feature = "pipeline-tracing")] metrics: Arc<Metrics>,
     ) {
         tokio::spawn(async move {
@@ -73,15 +82,16 @@ impl Processor {
                     #[cfg(feature = "pipeline-tracing")]
                     let (digest, started) = digest;
                     #[cfg(feature = "pipeline-tracing")]
-                    if own_digest {
+                    if digest_notification == DigestNotification::Our {
                         metrics
                             .pipeline
                             .batch_processing_latency
                             .observe(started.elapsed());
                     }
-                    let message = match own_digest {
-                        true => WorkerPrimaryMessage::OurBatch(digest, id),
-                        false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                    let message = match digest_notification {
+                        DigestNotification::Our => WorkerPrimaryMessage::OurBatch(digest, id),
+                        DigestNotification::Others => WorkerPrimaryMessage::OthersBatch(digest, id),
+                        DigestNotification::None => continue,
                     };
                     let message = bincode::serialize(&message)
                         .expect("Failed to serialize our own worker-primary message");

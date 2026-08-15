@@ -4,49 +4,33 @@ use crate::common::transaction;
 use tokio::sync::mpsc::channel;
 
 #[test]
-fn leader_relay_rotates_one_correct_holder_without_sending_to_byzantine_peers() {
+fn leader_relay_uses_every_configured_fixed_holder() {
     let address = |port| {
         (
             PublicKey::default(),
             format!("127.0.0.1:{port}").parse().unwrap(),
         )
     };
-    let correct: Vec<_> = (1..=14).map(|port| address(20_000 + port)).collect();
+    let holders: Vec<_> = (1..=5).map(|port| address(20_000 + port)).collect();
+    let expected: Vec<_> = holders.iter().map(|(_, address)| *address).collect();
 
-    for epoch in 0..correct.len() as u64 {
-        for within_epoch in 0..5 {
-            let sequence = epoch * 5 + within_epoch;
-            let recipients = leader_relay_batch_addresses(&correct, sequence, 5, 1, 1);
-            assert_eq!(recipients.len() + 1, 2, "include the local author");
-            assert_eq!(recipients.last(), Some(&correct[epoch as usize].1));
-        }
-    }
-    assert_eq!(
-        leader_relay_batch_addresses(&correct, correct.len() as u64 * 5, 5, 1, 1).last(),
-        Some(&correct[0].1),
-    );
+    assert_eq!(leader_relay_batch_addresses(&holders), expected);
+    assert_eq!(leader_relay_batch_addresses(&holders), expected);
 }
 
 #[test]
-fn leader_relay_f_holders_stay_below_poa_and_cover_every_correct_leader() {
+fn leader_relay_f_holders_stay_below_poa() {
     let address = |port| {
         (
             PublicKey::default(),
             format!("127.0.0.1:{port}").parse().unwrap(),
         )
     };
-    let correct: Vec<_> = (1..=14).map(|port| address(20_000 + port)).collect();
-    let mut covered = std::collections::HashSet::new();
+    let holders: Vec<_> = (1..=5).map(|port| address(20_000 + port)).collect();
 
     // At n=20, the local Byzantine author plus five correct recipients give
-    // exactly f=6 direct holders, one below the f+1=7 PoA threshold. Three
-    // (f-1)-wide epochs cover all 14 correct consensus leaders.
-    for epoch in 0..3 {
-        let recipients = leader_relay_batch_addresses(&correct, epoch * 5, 5, 5, 5);
-        assert_eq!(recipients.len() + 1, 6);
-        covered.extend(recipients);
-    }
-    assert_eq!(covered.len(), correct.len());
+    // exactly f=6 direct holders, one below the f+1=7 PoA threshold.
+    assert_eq!(leader_relay_batch_addresses(&holders).len() + 1, 6);
 }
 
 #[tokio::test]

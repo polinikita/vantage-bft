@@ -122,7 +122,7 @@ def remote(ctx, debug=True, protocol='autobahn-optimistic', all_to_all=False,
         'max_header_delay': 5_000,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 5_000,  # ms
-        'sync_retry_nodes': 3,  # number of nodes
+        'sync_retry_nodes': 3,  # committed-data/header materialization peers
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 20,  # ms
         'protocol': protocol,

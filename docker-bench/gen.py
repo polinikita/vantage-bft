@@ -215,10 +215,9 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         "asynchrony_duration": 10_000,
         "protocol": args.protocol,
         "tx_mode": args.mode,
-        # Keep the ordinary validation and honest-lane capacity unchanged.
-        # Autobahn caps only selected Byzantine publishers to one digest per
-        # car; Vantage/Simple-IT may simply leave unavailable Byzantine lanes
-        # out of their certified/available cuts.
+        # Keep the ordinary validation and lane capacity unchanged. Vantage
+        # and Simple-IT may simply leave unavailable Byzantine lanes out of
+        # their certified/available cuts.
         "max_block_payload": 16,
         "delta_ms": args.delta_ms,
         "vantage_gc_window_views": 200,
@@ -485,8 +484,13 @@ def write_manifest(
         "withhold_repair": args.withhold_repair or args.leader_relay,
         "leader_relay_attack": args.leader_relay,
         "leader_relay_batch_interval_ms": args.delta_ms if args.leader_relay else 0,
-        "leader_relay_rotation_ms": args.delta_ms * 5 if args.leader_relay else 0,
-        "leader_relay_receiver_group_stride": (
+        "leader_relay_holder_group_mode": (
+            "fixed-per-lane" if args.leader_relay else "disabled"
+        ),
+        "leader_relay_receiver_group_width": (
+            args.withhold - 1 if args.leader_relay else 0
+        ),
+        "leader_relay_receiver_group_offset_stride": (
             args.withhold - 1 if args.leader_relay else 0
         ),
         "leader_relay_direct_holders": args.withhold if args.leader_relay else 0,
@@ -592,9 +596,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--leader-relay",
         action="store_true",
         help="keep each Byzantine batch at its author and narrowcast it only to an (f-1)-wide "
-             "rotating correct group (f direct holders, one below PoA) in 5-Delta epochs; implies batch-only "
-             "withholding from every other peer, repair refusal, and one payload digest "
-             "per selected Byzantine Autobahn car",
+             "fixed correct group, staggered across Byzantine lanes (f direct holders, one below PoA); implies batch-only "
+             "withholding from every other peer and repair refusal",
     )
     p.add_argument("--correct-load-only", action="store_true",
                    help="distribute counted client load only across non-withholding authors")
@@ -654,7 +657,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.leader_relay and (
         args.withhold_count is not None or args.withhold_fixed_receivers
     ):
-        p.error("--leader-relay selects its own rotating receiver; omit receiver flags")
+        p.error("--leader-relay selects its own fixed per-lane receivers; omit receiver flags")
     if args.leader_relay and (args.correct_load_only or args.adversarial_rate):
         p.error(
             "--leader-relay uses one uniform total load and marks the Byzantine share "
@@ -695,9 +698,24 @@ def main(argv=None) -> None:
     SUBNET = f"{args.subnet_base}.0.0/16"
     NODE_IP_PREFIX = f"{args.subnet_base}.1."
 
-    if DATA_DIR.exists():
-        shutil.rmtree(DATA_DIR)
-    DATA_DIR.mkdir(parents=True)
+    # Keep the bind-mount root stable across back-to-back Docker Desktop runs.
+    # Removing and recreating the root can race the host file-sharing layer,
+    # which then reports a generated file such as committee.json as missing
+    # while Compose starts containers in parallel.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for path in DATA_DIR.iterdir():
+        if path.is_dir() and path.name.startswith("node-"):
+            # Node directories are bind-mounted as `/data`; preserve their
+            # paths for the same reason as the shared root.
+            for child in path.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
     node_bin = ensure_node_binary(args.node_bin)
     print(f"-- using node binary: {node_bin}")
@@ -785,8 +803,8 @@ def main(argv=None) -> None:
         print(
             "   leader-relay attack: uniform load; uncounted Byzantine shares on "
             f"node(s) {uncounted_load_indices}; author plus an (f-1)-wide correct "
-            f"group per batch (f direct holders, one below PoA); groups advance by f-1 every "
-            f"{args.delta_ms * 5} ms (5-Delta)"
+            f"group fixed per lane (f direct holders, one below PoA); lane groups are "
+            f"staggered across every correct leader"
         )
     print(f"   data dir: {DATA_DIR}")
     print(f"   compose file: {COMPOSE_PATH}")
