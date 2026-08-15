@@ -328,32 +328,27 @@ impl Worker {
                 self.parameters.withhold_senders,
                 &self.parameters.withhold_publishers,
             );
-            let cohort = full_workers_addresses
-                .iter()
-                .filter(|(name, _)| publishers.contains(name))
-                .copied()
-                .collect::<Vec<_>>();
             let correct = full_workers_addresses
                 .iter()
                 .filter(|(name, _)| !publishers.contains(name))
                 .copied()
                 .collect::<Vec<_>>();
             LeaderRelayRecipients {
-                cohort,
                 targets: correct,
                 batches_per_target: 5,
-                target_width: publishers.len(),
-                target_stride: publishers.len(),
+                target_width: publishers.len().saturating_sub(1),
+                target_stride: publishers.len().saturating_sub(1),
             }
         });
 
         // In the attack profile a Byzantine publisher is free to choose its
         // batching. Emit one heavy batch per Delta and keep five consecutive
-        // batches on the same f-wide correct-holder group, yielding a disclosed
-        // 5-Delta receiver epoch. Each epoch advances the group by f positions.
+        // batches on the same (f-1)-wide correct-holder group, yielding a
+        // disclosed 5-Delta receiver epoch. Each epoch advances the group by
+        // f-1 positions.
         let (batch_size, max_batch_delay) = if leader_relay_workers_addresses.is_some() {
             info!(
-                "Leader-relay Byzantine batching: one batch per Delta={} ms, five batches per f-wide correct-holder epoch; receiver-group stride=f",
+                "Leader-relay Byzantine batching: one batch per Delta={} ms, five batches per (f-1)-wide correct-holder epoch; receiver-group stride=f-1",
                 self.parameters.delta_ms.max(1)
             );
             (usize::MAX, self.parameters.delta_ms.max(1))

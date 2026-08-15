@@ -94,7 +94,8 @@ def median(values: list[int]) -> int:
 
 
 class NodeSnapshot:
-    __slots__ = ("reachable", "committed_transactions", "submitted_transactions",
+    __slots__ = ("reachable", "committed_transactions",
+                 "committed_uncounted_transactions", "submitted_transactions",
                  "count", "p50", "p90", "p99", "m50", "m90", "m99",
                  "wire_bytes_sent", "optimistic_batch_bytes_sent",
                  "prepare_sync_events", "prepare_missing_headers",
@@ -103,6 +104,7 @@ class NodeSnapshot:
     def __init__(self):
         self.reachable = False
         self.committed_transactions = 0
+        self.committed_uncounted_transactions = 0
         self.submitted_transactions = 0
         self.count = 0
         self.p50 = self.p90 = self.p99 = None
@@ -122,6 +124,9 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         return s
     s.reachable = True
     s.committed_transactions = counter(worker_samples, "committed_transactions")
+    s.committed_uncounted_transactions = counter(
+        worker_samples, "committed_uncounted_transactions"
+    )
     s.submitted_transactions = counter(worker_samples, "submitted_transactions")
     s.wire_bytes_sent = counter(worker_samples, "bytes_sent_total")
     s.optimistic_batch_bytes_sent = counter_by_label(
@@ -287,6 +292,11 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         return  # Too short a window to derive a rate.
     window = elapsed - first_elapsed
     committed_delta = prev_total - first_total
+    uncounted_deltas = counter_deltas(
+        first_snapshots, last_snapshots, "committed_uncounted_transactions"
+    )
+    # Every validator observes the replicated committed stream; do not sum it.
+    uncounted_delta = max(uncounted_deltas, default=0)
     submitted_delta = submitted_total(last_snapshots) - first_submitted
     rate = committed_delta / window
     relay_bytes = counter_deltas(
@@ -310,6 +320,12 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     print(f" docker-bench SUMMARY (measured over this {window}s watch window):")
     print("-----------------------------------------")
     print(f" Consensus TPS: {rate:.0f} tx/s  (delta {committed_delta} tx / {window}s)")
+    if uncounted_delta:
+        print(
+            " Committed adversarial payload: "
+            f"{uncounted_delta / window:.0f} tx/s "
+            f"(delta {uncounted_delta} tx; excluded from Consensus TPS)"
+        )
     print(latency_line(last_snapshots))
     print(materialised_line(last_snapshots))
     if sum(relay_bytes):
@@ -323,6 +339,8 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         "measurement_seconds": window,
         "committed_transactions": committed_delta,
         "committed_tps": rate,
+        "committed_uncounted_transactions": uncounted_delta,
+        "committed_uncounted_tps": uncounted_delta / window,
         "submitted_transactions": submitted_delta,
         "submitted_tps": submitted_delta / window,
         "total_offered_tps": manifest.get("rate"),

@@ -86,21 +86,22 @@ The leader-relay experiment increases one uniform total workload. For `n=20`,
 six Byzantine authors each receive the same `1/20` load share as every correct
 author. Their transactions exercise the full data path but are excluded from
 useful-throughput and latency metrics, making the honest target exactly 70% of
-total offered load. Each successive Byzantine batch is narrowcast to the six
-Byzantine validators plus a rotating group of six correct validators: exactly
-`2f=12` direct holders, one below the quorum of 13. All six Byzantine authors
-use the same correct group during each `5 Delta = 1 s` epoch. Selected
+total offered load. Each successive Byzantine batch remains at its author and
+is narrowcast only to a rotating group of five correct validators: exactly
+`f=6` direct holders, one below the `f+1=7` PoA threshold. It is not sent to the
+other Byzantine validators. All six Byzantine authors use the same correct
+group during each `5 Delta = 1 s` epoch. Selected
 Byzantine publishers aggregate their uniform input share into one batch per
-`Delta`; after five consecutive batches, the group advances by `f` positions.
+`Delta`; after five consecutive batches, the group advances by `f-1` positions.
 Thus every correct leader is eventually selected and locally holds all six
-faulty lanes. Headers remain visible and
-the Byzantine cohort refuses repair. To isolate the honest-leader relay cost,
+faulty lanes. Headers remain visible and Byzantine authors refuse repair. To
+isolate the honest-leader relay cost,
 a selected Byzantine publisher uses its certified cut whenever it is itself a
 consensus leader; it does not deliberately stall that view with an optimistic
 tip it will refuse to serve. Autobahn's selected Byzantine cars carry
-one digest, so each car can obtain a PoA and locally available tips move across
-every correct leader. Vantage and Simple-IT keep their ordinary block
-construction rules.
+one digest, so one sub-PoA tip at a time moves across every correct leader;
+relay dissemination may subsequently let that car obtain a PoA and advance the
+lane. Vantage and Simple-IT keep their ordinary block-construction rules.
 
 An optimistic Autobahn leader includes those locally held uncertified tips,
 making itself the repair source for the remaining validators before they can
@@ -110,6 +111,9 @@ does not make optional tip materialization vote-critical, while Simple-IT
 admits only availability-qualified data. Strict Autobahn seamless is an
 optional diagnostic control: every Prepare entry, including the leader's own,
 is Genesis or PoA-certified, so Prepare voting never waits for data.
+The worker exports `committed_uncounted_transactions`: it proves how much
+Byzantine marker-2 payload was committed and materialized while keeping that
+payload out of the useful-throughput and latency statistics.
 
 One point can be reproduced with:
 

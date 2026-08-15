@@ -239,6 +239,10 @@ class Study:
             "offered_tps": rate,
             "honest_offered_tps": honest_offered,
             "committed_tps": committed,
+            "committed_uncounted_tps": result["committed_uncounted_tps"],
+            "committed_uncounted_transactions": result[
+                "committed_uncounted_transactions"
+            ],
             "honest_delivery_pct": delivery_pct,
             "accepted": delivery_pct >= self.args.accept_pct,
             "repetition": repetition,
@@ -265,7 +269,8 @@ class Study:
         print(
             f"  {verdict}: honest {committed:,.0f}/{honest_offered:,.0f} TPS "
             f"({delivery_pct:.1f}%), p50/p99={record['p50_ms']:.0f}/"
-            f"{record['p99_ms']:.0f} ms, peak egress "
+            f"{record['p99_ms']:.0f} ms, adversarial committed "
+            f"{record['committed_uncounted_tps']:,.0f} TPS, peak egress "
             f"{record['max_node_wire_mbps']:.1f} Mbit/s",
             flush=True,
         )
@@ -311,9 +316,9 @@ def write_provenance(args: argparse.Namespace) -> None:
         "platform": platform.platform(),
         "fault_model": (
             "uniform total load; f Byzantine lane authors mark their normal load uncounted, "
-            "broadcast headers, narrowcast each batch to the Byzantine cohort plus an f-wide "
-            "correct group (2f direct holders, one below quorum), aggregate one batch per Delta, "
-            "advance the receiver group by f after five batches (a 5-Delta epoch), and refuse "
+            "broadcast headers, keep each batch at its author and narrowcast it only to an "
+            "(f-1)-wide correct group (f direct holders, one below PoA), aggregate one batch "
+            "per Delta, advance the receiver group by f-1 after five batches (a 5-Delta epoch), and refuse "
             "repair; Byzantine consensus leaders propose certified cuts while honest leaders "
             "serve optimistic repair normally"
         ),
@@ -352,7 +357,7 @@ def main() -> int:
             "--subtitle",
             (
                 f"n={args.nodes}, f={args.faults} · uniform total load · AWS RTT netem · "
-                "faulty batches reach 2f direct holders (<2f+1 quorum) · "
+                "faulty batches reach f direct holders (<f+1 PoA) · "
                 f"{args.egress_mbps:,} Mbit/s/validator cap"
             ),
         ],

@@ -486,8 +486,10 @@ def write_manifest(
         "leader_relay_attack": args.leader_relay,
         "leader_relay_batch_interval_ms": args.delta_ms if args.leader_relay else 0,
         "leader_relay_rotation_ms": args.delta_ms * 5 if args.leader_relay else 0,
-        "leader_relay_receiver_group_stride": args.withhold if args.leader_relay else 0,
-        "leader_relay_direct_holders": args.withhold * 2 if args.leader_relay else 0,
+        "leader_relay_receiver_group_stride": (
+            args.withhold - 1 if args.leader_relay else 0
+        ),
+        "leader_relay_direct_holders": args.withhold if args.leader_relay else 0,
         "correct_load_only": args.correct_load_only,
         "load_node_indices": load_node_indices,
         "uncounted_load_node_indices": uncounted_load_indices,
@@ -589,8 +591,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--leader-relay",
         action="store_true",
-        help="narrowcast each Byzantine batch to the Byzantine cohort plus an f-wide rotating "
-             "correct group (2f direct holders) in 5-Delta epochs; implies batch-only "
+        help="keep each Byzantine batch at its author and narrowcast it only to an (f-1)-wide "
+             "rotating correct group (f direct holders, one below PoA) in 5-Delta epochs; implies batch-only "
              "withholding from every other peer, repair refusal, and one payload digest "
              "per selected Byzantine Autobahn car",
     )
@@ -782,8 +784,8 @@ def main(argv=None) -> None:
     if args.leader_relay:
         print(
             "   leader-relay attack: uniform load; uncounted Byzantine shares on "
-            f"node(s) {uncounted_load_indices}; Byzantine cohort plus an f-wide correct "
-            f"group per batch (2f direct holders); receiver groups advance by f every "
+            f"node(s) {uncounted_load_indices}; author plus an (f-1)-wide correct "
+            f"group per batch (f direct holders, one below PoA); groups advance by f-1 every "
             f"{args.delta_ms * 5} ms (5-Delta)"
         )
     print(f"   data dir: {DATA_DIR}")

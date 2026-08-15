@@ -96,22 +96,27 @@ Use `--leader-relay` for the optimistic leader-capacity experiment. The total
 offered rate remains uniformly distributed across all validators; the normal
 share submitted to each selected Byzantine author is marked uncounted so the
 reported throughput and latency cover honest transactions only. Each
-Byzantine batch is sent to all `f` Byzantine validators (including the
-author's local copy) plus an `f`-wide rotating correct group. These `2f` direct
-holders are exactly one below quorum. Lane headers stay visible, the Byzantine
-cohort refuses repair, and all Byzantine authors use the same correct group
+Byzantine batch remains at its author and is sent only to an `(f-1)`-wide
+rotating correct group. These `f` direct holders are exactly one below the
+`f+1` PoA threshold; the other Byzantine validators do not receive the bytes.
+Lane headers stay visible, Byzantine authors refuse repair, and all Byzantine
+authors use the same correct group
 during each `5 Delta` epoch. Selected Byzantine publishers aggregate one batch
 per `Delta`, so five consecutive batches remain there; the next epoch advances
-the group by `f` positions. This concentrates all faulty lanes on each selected
+the group by `f-1` positions. This concentrates all faulty lanes on each selected
 leader while eventually exercising every correct leader. The mode implies batch-only withholding from all other
 peers. Selected Byzantine Autobahn publishers use one payload digest per car,
-allowing those cars to obtain PoAs; honest lanes and the other protocols retain
-their normal payload capacity and block-construction rules. A selected
+keeping a single sub-PoA tip active until dissemination later supplies another
+holder; honest lanes and the other protocols retain their normal payload
+capacity and block-construction rules. A selected
 Byzantine publisher proposes its certified cut when it is the consensus leader,
 so its refusal to serve does not add a separate, intentional Byzantine-leader
 timeout to the honest-leader capacity experiment.
 `--egress-mbps R` adds the same aggregate egress cap to every container while
 retaining the AWS RTT `tc netem` matrix.
+The final JSON reports `committed_uncounted_tps` separately. For this experiment
+it is the committed Byzantine payload rate; it is deliberately excluded from
+`committed_tps`, which remains honest useful goodput.
 
 Vantage carries positional availability claims on AGB echoes by default.
 `--no-echo-avail-claims` selects periodic watermarks; `--no-ack-watermarks`

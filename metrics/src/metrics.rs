@@ -231,6 +231,8 @@ pub struct Metrics {
     pub transaction_materialised_latency_squared_micros: IntCounter,
     /// Total transactions whose latency was successfully observed.
     pub committed_transactions: IntCounter,
+    /// Total committed benchmark transactions deliberately excluded from useful goodput.
+    pub committed_uncounted_transactions: IntCounter,
     /// Total bytes of transactions whose latency was successfully observed.
     pub committed_bytes: IntCounter,
     /// Commit-time batch lookups deferred for retry because the payload is absent.
@@ -751,6 +753,12 @@ impl Metrics {
             committed_transactions: register_int_counter_with_registry!(
                 "committed_transactions",
                 "Total committed transactions whose latency was observed",
+                registry,
+            )
+            .unwrap(),
+            committed_uncounted_transactions: register_int_counter_with_registry!(
+                "committed_uncounted_transactions",
+                "Total committed benchmark transactions deliberately excluded from useful goodput",
                 registry,
             )
             .unwrap(),

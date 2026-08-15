@@ -45,6 +45,7 @@ struct DeferredMiss {
 #[derive(Default)]
 struct BatchLatencyTotals {
     tx_count: u64,
+    uncounted_tx_count: u64,
     tx_bytes: u64,
     committed_squared_micros: u64,
     materialised_squared_micros: u64,
@@ -58,6 +59,7 @@ struct BatchLatencyTotals {
 impl BatchLatencyTotals {
     fn accumulate(&mut self, other: &Self) {
         self.tx_count += other.tx_count;
+        self.uncounted_tx_count += other.uncounted_tx_count;
         self.tx_bytes += other.tx_bytes;
         self.committed_squared_micros = self
             .committed_squared_micros
@@ -646,11 +648,15 @@ impl CommitObserver {
         let mut totals = BatchLatencyTotals::default();
         for tx in transactions {
             // Format: marker, big-endian ID, little-endian submission timestamp.
-            if tx.len() < 17 || !transaction_counts_toward_goodput(&tx) {
+            if tx.len() < 17 {
                 continue;
             }
             let submitted_millis = u64::from_le_bytes(tx[9..17].try_into().unwrap());
             if !self.metrics.counts_toward_metrics(submitted_millis) {
+                continue;
+            }
+            if !transaction_counts_toward_goodput(&tx) {
+                totals.uncounted_tx_count += 1;
                 continue;
             }
             let committed_latency =
@@ -694,7 +700,7 @@ impl CommitObserver {
     /// Flush accumulated transaction totals into shared counters.
     #[cfg(feature = "benchmark")]
     fn flush_totals(&self, totals: &BatchLatencyTotals) {
-        if totals.tx_count == 0 {
+        if totals.tx_count == 0 && totals.uncounted_tx_count == 0 {
             return;
         }
         for (latency, count) in &totals.committed_latency_counts {
@@ -721,6 +727,9 @@ impl CommitObserver {
             .transaction_materialised_latency_squared_micros
             .inc_by(totals.materialised_squared_micros);
         self.metrics.committed_transactions.inc_by(totals.tx_count);
+        self.metrics
+            .committed_uncounted_transactions
+            .inc_by(totals.uncounted_tx_count);
         self.metrics.committed_bytes.inc_by(totals.tx_bytes);
     }
 

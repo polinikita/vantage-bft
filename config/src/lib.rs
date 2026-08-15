@@ -354,10 +354,10 @@ pub struct Parameters {
     pub withhold_headers: bool,
 
     /// Benchmark-only leader-relay attack. Each selected Byzantine publisher
-    /// sends every worker batch to the Byzantine publisher cohort and an
-    /// f-wide rotating non-publisher group. Including the author's local copy,
-    /// this is exactly 2f direct batch holders, one below quorum. Lane headers remain
-    /// visible and the Byzantine cohort refuses repair. The Autobahn path
+    /// sends every worker batch only to an (f-1)-wide rotating correct group.
+    /// Including the author's local copy, this is exactly f direct batch
+    /// holders, one below the f+1 PoA threshold. Lane headers remain visible
+    /// and the Byzantine authors refuse repair. The Autobahn path
     /// separately limits selected publishers to one batch per car, making the
     /// correct holder the only live relay source for that tip.
     #[serde(default)]
@@ -1044,7 +1044,7 @@ impl Parameters {
             }
             if self.leader_relay_attack {
                 info!(
-                    "Leader-relay attack: each Byzantine batch has 2f direct holders (the Byzantine cohort plus an f-wide correct group), rotating every {} ms (5-Delta)",
+                    "Leader-relay attack: each Byzantine batch has f direct holders (its author plus an (f-1)-wide correct group), one below PoA; rotating every {} ms (5-Delta)",
                     self.delta_ms.saturating_mul(5)
                 );
             }
@@ -1595,10 +1595,10 @@ pub fn withholding_publishers(
 
 /// Returns the rotating non-publisher receiver group for a Byzantine batch.
 ///
-/// All selected publishers use the same f-wide group and advance by f each
-/// epoch. Together with the full Byzantine publisher cohort, this yields 2f
-/// direct holders, one below quorum; successive groups cover every correct
-/// validator while lanes keep obtaining PoAs.
+/// All selected publishers use the same (f-1)-wide group and advance by f-1
+/// each epoch. Together with the local author's copy, this yields exactly f
+/// direct holders, one below the f+1 PoA threshold; successive groups cover
+/// every correct validator and expose optimistic leaders to the missing data.
 pub fn leader_relay_destinations(
     committee: &Committee,
     self_pk: &PublicKey,
@@ -1619,8 +1619,9 @@ pub fn leader_relay_destinations(
     if targets.is_empty() {
         return Vec::new();
     }
-    let start = (epoch as usize).wrapping_mul(publishers.len()) % targets.len();
-    (0..publishers.len().min(targets.len()))
+    let width = publishers.len().saturating_sub(1).min(targets.len());
+    let start = (epoch as usize).wrapping_mul(width) % targets.len();
+    (0..width)
         .map(|offset| targets[(start + offset) % targets.len()])
         .collect()
 }
@@ -1957,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn n20_leader_relay_rotates_two_f_holders_across_every_correct_leader() {
+    fn n20_leader_relay_rotates_sub_poa_holders_across_every_correct_leader() {
         let (committee, _) = Committee::local_benchmark(20, 1, 9000);
         let publishers = withholding_publishers(&committee, 6, &[]);
         let correct: Vec<_> = committee
@@ -1981,7 +1982,8 @@ mod tests {
                 leader_relay_destinations(&committee, &publisher, 6, &[], epoch)
                     .into_iter()
                     .collect();
-            assert_eq!(epoch_targets.len(), publishers.len());
+            assert_eq!(epoch_targets.len(), publishers.len() - 1);
+            assert_eq!(epoch_targets.len() + 1, publishers.len());
             assert!(publishers.iter().all(|other| {
                 leader_relay_destinations(&committee, other, 6, &[], epoch)
                     .into_iter()

@@ -238,13 +238,13 @@ mod benchmark_metrics_tests {
     }
 
     #[tokio::test]
-    async fn adversarial_background_batch_contributes_no_committed_goodput() {
+    async fn adversarial_background_batch_is_sequenced_but_contributes_no_goodput() {
         let path = ".db_test_uncounted_background";
         let _ = fs::remove_dir_all(path);
         let store = Store::new(path).unwrap();
         let registry = prometheus::Registry::new();
         let (metrics, _) = Metrics::new(&registry);
-        let observer = new_test_observer(store, metrics);
+        let observer = new_test_observer(store, metrics.clone());
         let submitted = now_millis().saturating_sub(5);
         let batch = WorkerMessage::Batch(vec![make_tx_with_marker(
             2,
@@ -261,7 +261,11 @@ mod benchmark_metrics_tests {
             panic!("valid adversarial batch should deserialize");
         };
         assert_eq!(totals.tx_count, 0);
+        assert_eq!(totals.uncounted_tx_count, 1);
         assert_eq!(totals.tx_bytes, 0);
+        observer.flush_totals(&totals);
+        assert_eq!(metrics.committed_transactions.get(), 0);
+        assert_eq!(metrics.committed_uncounted_transactions.get(), 1);
         drop(observer);
         let _ = fs::remove_dir_all(path);
     }

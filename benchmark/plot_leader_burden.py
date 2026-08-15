@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         "--subtitle",
         default=(
             "n=20, f=6 · uniform offered load · AWS RTT netem · Byzantine batches "
-            "have 2f direct holders (one below quorum) in rotating correct groups"
+            "have f direct holders (one below PoA) in rotating correct groups"
         ),
     )
     parser.add_argument("--accept-pct", type=float, default=95.0)

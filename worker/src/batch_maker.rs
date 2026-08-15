@@ -30,7 +30,6 @@ pub type Batch = Vec<Transaction>;
 
 /// Deterministic recipients for the rotating optimistic-leader burden profile.
 pub(crate) struct LeaderRelayRecipients {
-    pub(crate) cohort: Vec<(PublicKey, SocketAddr)>,
     pub(crate) targets: Vec<(PublicKey, SocketAddr)>,
     pub(crate) batches_per_target: u64,
     pub(crate) target_width: usize,
@@ -53,8 +52,8 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Worker addresses allowed by withholding configuration.
     withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
-    /// Fixed Byzantine cohort and rotating correct receivers for the
-    /// leader-relay attack, plus the number of consecutive batches per holder.
+    /// Rotating correct receivers for the leader-relay attack, plus the number
+    /// of consecutive batches per holder group.
     leader_relay_workers_addresses: Option<LeaderRelayRecipients>,
     /// Optional withholding time window.
     withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
@@ -76,7 +75,6 @@ pub struct BatchMaker {
 const YIELD_EVERY: u64 = 32;
 
 fn leader_relay_batch_addresses(
-    cohort: &[(PublicKey, SocketAddr)],
     targets: &[(PublicKey, SocketAddr)],
     sequence: u64,
     batches_per_target: u64,
@@ -85,13 +83,8 @@ fn leader_relay_batch_addresses(
 ) -> Vec<SocketAddr> {
     let epoch = sequence / batches_per_target.max(1);
     let target_start = (epoch as usize).wrapping_mul(target_stride) % targets.len();
-    cohort
-        .iter()
-        .map(|(_, address)| *address)
-        .chain(
-            (0..target_width.min(targets.len()))
-                .map(|offset| targets[(target_start + offset) % targets.len()].1),
-        )
+    (0..target_width.min(targets.len()))
+        .map(|offset| targets[(target_start + offset) % targets.len()].1)
         .collect()
 }
 
@@ -234,10 +227,9 @@ impl BatchMaker {
                 Some(profile) if !profile.targets.is_empty() => {
                     // Every selected publisher deterministically sends five
                     // consecutive Delta-sized batches to its current honest
-                    // holder group. The next epoch advances that group by f,
+                    // holder group. The next epoch advances that group by f-1,
                     // so every correct leader is eventually burdened.
                     let addresses = leader_relay_batch_addresses(
-                        &profile.cohort,
                         &profile.targets,
                         self.leader_relay_sequence,
                         profile.batches_per_target,
