@@ -28,6 +28,15 @@ pub type Transaction = Bytes;
 /// Serialized batch forwarded to the processor.
 pub type Batch = Vec<Transaction>;
 
+/// Deterministic recipients for the rotating optimistic-leader burden profile.
+pub(crate) struct LeaderRelayRecipients {
+    pub(crate) cohort: Vec<(PublicKey, SocketAddr)>,
+    pub(crate) targets: Vec<(PublicKey, SocketAddr)>,
+    pub(crate) batches_per_target: u64,
+    pub(crate) target_width: usize,
+    pub(crate) target_stride: usize,
+}
+
 /// Assembles client transactions into batches.
 pub struct BatchMaker {
     /// The preferred batch size (in bytes).
@@ -44,8 +53,13 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Worker addresses allowed by withholding configuration.
     withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
+    /// Fixed Byzantine cohort and rotating correct receivers for the
+    /// leader-relay attack, plus the number of consecutive batches per holder.
+    leader_relay_workers_addresses: Option<LeaderRelayRecipients>,
     /// Optional withholding time window.
     withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
+    /// Number of attack batches already assigned to a receiver epoch.
+    leader_relay_sequence: u64,
     /// Current batch.
     current_batch: Batch,
     /// Current batch size in bytes.
@@ -61,6 +75,26 @@ pub struct BatchMaker {
 /// Explicit yield interval.
 const YIELD_EVERY: u64 = 32;
 
+fn leader_relay_batch_addresses(
+    cohort: &[(PublicKey, SocketAddr)],
+    targets: &[(PublicKey, SocketAddr)],
+    sequence: u64,
+    batches_per_target: u64,
+    target_width: usize,
+    target_stride: usize,
+) -> Vec<SocketAddr> {
+    let epoch = sequence / batches_per_target.max(1);
+    let target_start = (epoch as usize).wrapping_mul(target_stride) % targets.len();
+    cohort
+        .iter()
+        .map(|(_, address)| *address)
+        .chain(
+            (0..target_width.min(targets.len()))
+                .map(|offset| targets[(target_start + offset) % targets.len()].1),
+        )
+        .collect()
+}
+
 impl BatchMaker {
     // The constructor has more arguments than Clippy's default limit.
     #[allow(clippy::too_many_arguments)]
@@ -71,6 +105,7 @@ impl BatchMaker {
         tx_batch: Sender<SerializedBatchMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         withheld_workers_addresses: Option<Vec<(PublicKey, SocketAddr)>>,
+        leader_relay_workers_addresses: Option<LeaderRelayRecipients>,
         withhold_window: Option<Arc<OnceLock<(std::time::Instant, std::time::Instant)>>>,
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
@@ -84,7 +119,9 @@ impl BatchMaker {
                 tx_batch,
                 workers_addresses,
                 withheld_workers_addresses,
+                leader_relay_workers_addresses,
                 withhold_window,
+                leader_relay_sequence: 0,
                 current_batch: Batch::new(),
                 current_batch_size: 0,
                 network: SimpleSender::new()
@@ -190,20 +227,39 @@ impl BatchMaker {
         }
 
         // Apply withholding when its configured window is active.
-        let addresses: Vec<SocketAddr> = match &self.withheld_workers_addresses {
-            Some(filtered)
-                if config::withhold_active(
-                    self.withhold_window.as_deref(),
-                    std::time::Instant::now(),
-                ) =>
-            {
-                filtered.iter().map(|(_, addr)| *addr).collect()
+        let withhold_active =
+            config::withhold_active(self.withhold_window.as_deref(), std::time::Instant::now());
+        let addresses: Vec<SocketAddr> = if withhold_active {
+            match &self.leader_relay_workers_addresses {
+                Some(profile) if !profile.targets.is_empty() => {
+                    // Every selected publisher deterministically sends five
+                    // consecutive Delta-sized batches to its current honest
+                    // holder group. The next epoch advances that group by f,
+                    // so every correct leader is eventually burdened.
+                    let addresses = leader_relay_batch_addresses(
+                        &profile.cohort,
+                        &profile.targets,
+                        self.leader_relay_sequence,
+                        profile.batches_per_target,
+                        profile.target_width,
+                        profile.target_stride,
+                    );
+                    self.leader_relay_sequence = self.leader_relay_sequence.wrapping_add(1);
+                    addresses
+                }
+                _ => self
+                    .withheld_workers_addresses
+                    .as_ref()
+                    .unwrap_or(&self.workers_addresses)
+                    .iter()
+                    .map(|(_, addr)| *addr)
+                    .collect(),
             }
-            _ => self
-                .workers_addresses
+        } else {
+            self.workers_addresses
                 .iter()
                 .map(|(_, addr)| *addr)
-                .collect(),
+                .collect()
         };
         self.network
             .broadcast_typed(addresses, bytes.clone(), "Batch")

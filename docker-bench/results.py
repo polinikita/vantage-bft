@@ -68,8 +68,20 @@ def gauge_by_label(samples: dict, name: str, label: str, value: str) -> int | No
     return None
 
 
+def counter_by_label(samples: dict, name: str, label: str, value: str) -> int:
+    for labels, sample in samples.get(name, []):
+        if labels.get(label) == value:
+            return int(sample)
+    return 0
+
+
 def worker_url(manifest: dict, i: int) -> str:
     port = manifest["host_worker_metrics_base"] + i
+    return f"http://127.0.0.1:{port}/metrics"
+
+
+def primary_url(manifest: dict, i: int) -> str:
+    port = manifest["host_primary_metrics_base"] + i
     return f"http://127.0.0.1:{port}/metrics"
 
 
@@ -83,7 +95,10 @@ def median(values: list[int]) -> int:
 
 class NodeSnapshot:
     __slots__ = ("reachable", "committed_transactions", "submitted_transactions",
-                 "count", "p50", "p90", "p99", "m50", "m90", "m99")
+                 "count", "p50", "p90", "p99", "m50", "m90", "m99",
+                 "wire_bytes_sent", "optimistic_batch_bytes_sent",
+                 "prepare_sync_events", "prepare_missing_headers",
+                 "prepare_sync_completed", "prepare_sync_wait_micros")
 
     def __init__(self):
         self.reachable = False
@@ -92,28 +107,64 @@ class NodeSnapshot:
         self.count = 0
         self.p50 = self.p90 = self.p99 = None
         self.m50 = self.m90 = self.m99 = None
+        self.wire_bytes_sent = 0
+        self.optimistic_batch_bytes_sent = 0
+        self.prepare_sync_events = 0
+        self.prepare_missing_headers = 0
+        self.prepare_sync_completed = 0
+        self.prepare_sync_wait_micros = 0
 
 
 def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
     s = NodeSnapshot()
-    samples = scrape(worker_url(manifest, i))
-    if samples is None:
+    worker_samples = scrape(worker_url(manifest, i))
+    if worker_samples is None:
         return s
     s.reachable = True
-    s.committed_transactions = counter(samples, "committed_transactions")
-    s.submitted_transactions = counter(samples, "submitted_transactions")
-    count = gauge_by_label(samples, "transaction_committed_latency", "v", "count")
+    s.committed_transactions = counter(worker_samples, "committed_transactions")
+    s.submitted_transactions = counter(worker_samples, "submitted_transactions")
+    s.wire_bytes_sent = counter(worker_samples, "bytes_sent_total")
+    s.optimistic_batch_bytes_sent = counter_by_label(
+        worker_samples, "network_bytes_sent_total", "type", "OptimisticBatch"
+    )
+    count = gauge_by_label(worker_samples, "transaction_committed_latency", "v", "count")
     if count:
         s.count = count
-        s.p50 = gauge_by_label(samples, "transaction_committed_latency", "v", "p50")
-        s.p90 = gauge_by_label(samples, "transaction_committed_latency", "v", "p90")
-        s.p99 = gauge_by_label(samples, "transaction_committed_latency", "v", "p99")
+        s.p50 = gauge_by_label(worker_samples, "transaction_committed_latency", "v", "p50")
+        s.p90 = gauge_by_label(worker_samples, "transaction_committed_latency", "v", "p90")
+        s.p99 = gauge_by_label(worker_samples, "transaction_committed_latency", "v", "p99")
     # Materialised latency ends when the payload is local.
-    if gauge_by_label(samples, "transaction_materialised_latency", "v", "count"):
-        s.m50 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p50")
-        s.m90 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p90")
-        s.m99 = gauge_by_label(samples, "transaction_materialised_latency", "v", "p99")
+    if gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "count"):
+        s.m50 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p50")
+        s.m90 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p90")
+        s.m99 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p99")
+
+    primary_samples = scrape(primary_url(manifest, i))
+    if primary_samples is not None:
+        s.wire_bytes_sent += counter(primary_samples, "bytes_sent_total")
+        s.prepare_sync_events = counter(
+            primary_samples, "autobahn_prepare_sync_events_total"
+        )
+        s.prepare_missing_headers = counter(
+            primary_samples, "autobahn_prepare_missing_headers_total"
+        )
+        s.prepare_sync_completed = counter(
+            primary_samples, "autobahn_prepare_sync_completed_total"
+        )
+        s.prepare_sync_wait_micros = counter(
+            primary_samples, "autobahn_prepare_sync_wait_micros_total"
+        )
     return s
+
+
+def counter_deltas(
+    first: list[NodeSnapshot], last: list[NodeSnapshot], field: str
+) -> list[int]:
+    return [
+        max(0, int(getattr(after, field)) - int(getattr(before, field)))
+        for before, after in zip(first, last)
+        if after.reachable
+    ]
 
 
 def snapshot_all(manifest: dict) -> list[NodeSnapshot]:
@@ -202,6 +253,7 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     prev_total = 0
     first_total: int | None = None
     first_submitted: int | None = None
+    first_snapshots: list[NodeSnapshot] | None = None
     first_elapsed = 0
     last_snapshots: list[NodeSnapshot] = []
     elapsed = 0
@@ -215,6 +267,7 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             if first_total is None:
                 first_total = total
                 first_submitted = submitted_total(snapshots)
+                first_snapshots = snapshots
                 first_elapsed = elapsed
             delta = max(0, total - prev_total)
             print(
@@ -229,18 +282,42 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         print()
 
     if (not last_snapshots or first_total is None or first_submitted is None
+            or first_snapshots is None
             or elapsed <= first_elapsed):
         return  # Too short a window to derive a rate.
     window = elapsed - first_elapsed
     committed_delta = prev_total - first_total
     submitted_delta = submitted_total(last_snapshots) - first_submitted
     rate = committed_delta / window
+    relay_bytes = counter_deltas(
+        first_snapshots, last_snapshots, "optimistic_batch_bytes_sent"
+    )
+    wire_bytes = counter_deltas(first_snapshots, last_snapshots, "wire_bytes_sent")
+    sync_events = counter_deltas(first_snapshots, last_snapshots, "prepare_sync_events")
+    sync_missing = counter_deltas(
+        first_snapshots, last_snapshots, "prepare_missing_headers"
+    )
+    sync_completed = counter_deltas(
+        first_snapshots, last_snapshots, "prepare_sync_completed"
+    )
+    sync_wait_micros = counter_deltas(
+        first_snapshots, last_snapshots, "prepare_sync_wait_micros"
+    )
+    total_sync_events = sum(sync_events)
+    total_sync_completed = sum(sync_completed)
+    total_sync_wait_micros = sum(sync_wait_micros)
     print("-----------------------------------------")
     print(f" docker-bench SUMMARY (measured over this {window}s watch window):")
     print("-----------------------------------------")
     print(f" Consensus TPS: {rate:.0f} tx/s  (delta {committed_delta} tx / {window}s)")
     print(latency_line(last_snapshots))
     print(materialised_line(last_snapshots))
+    if sum(relay_bytes):
+        print(
+            " Optimistic leader batch relay: "
+            f"{sum(relay_bytes) / window / 1_000_000:.2f} MB/s aggregate, "
+            f"peak node {max(relay_bytes) * 8 / window / 1_000_000:.2f} Mbit/s"
+        )
     print("-----------------------------------------")
     result = {
         "measurement_seconds": window,
@@ -248,8 +325,24 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         "committed_tps": rate,
         "submitted_transactions": submitted_delta,
         "submitted_tps": submitted_delta / window,
+        "total_offered_tps": manifest.get("rate"),
+        "honest_offered_tps": manifest.get("honest_offered_tps", manifest.get("rate")),
         "reachable_workers": sum(s.reachable for s in last_snapshots),
-        "expected_workers": manifest["nodes"],
+        "expected_workers": manifest["nodes"] - manifest.get("crash", 0),
+        "prepare_sync_events": total_sync_events,
+        "prepare_missing_headers": sum(sync_missing),
+        "prepare_sync_completed": total_sync_completed,
+        "prepare_sync_mean_wait_ms": (
+            total_sync_wait_micros / total_sync_completed / 1_000
+            if total_sync_completed
+            else 0.0
+        ),
+        "optimistic_batch_relay_bytes": sum(relay_bytes),
+        "optimistic_batch_relay_mbps": sum(relay_bytes) * 8 / window / 1_000_000,
+        "max_node_optimistic_batch_relay_mbps": (
+            max(relay_bytes, default=0) * 8 / window / 1_000_000
+        ),
+        "max_node_wire_mbps": max(wire_bytes, default=0) * 8 / window / 1_000_000,
         "real_latency_ms": latency_quantiles_ms(last_snapshots, materialised=False),
         "materialised_latency_ms": latency_quantiles_ms(
             last_snapshots, materialised=True

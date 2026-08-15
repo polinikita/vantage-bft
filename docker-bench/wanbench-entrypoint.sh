@@ -16,6 +16,7 @@ set -euo pipefail
 : "${PEER_TX_ADDRS:?wan-bench must pass PEER_TX_ADDRS}"
 RATE="${RATE:-100}"; ADVERSARIAL_RATE="${ADVERSARIAL_RATE:-0}"
 TX_SIZE="${TX_SIZE:-512}"; TX_MODE="${TX_MODE:-random}"
+TX_COUNTED="${TX_COUNTED:-true}"
 ACTIVATE_AT_MS="${ACTIVATE_AT_MS:-}"
 VERBOSITY="${NODE_VERBOSITY:--vv}"
 
@@ -47,6 +48,9 @@ PEERS=($PEER_TX_ADDRS)
 CLIENT_EXTRA=()
 if [ -n "$ACTIVATE_AT_MS" ]; then
   CLIENT_EXTRA+=(--activate-at-ms "$ACTIVATE_AT_MS")
+fi
+if [ "$TX_COUNTED" != "true" ]; then
+  CLIENT_EXTRA+=(--uncounted)
 fi
 echo "wanbench: client -> $OWN_TX_ADDR, ${#PEERS[@]} peers, rate ${RATE} tx/s${ACTIVATE_AT_MS:+, submitting from ${ACTIVATE_AT_MS} (epoch ms)}"
 # `--nodes` must be last; following arguments are addresses.

@@ -267,6 +267,7 @@ impl Synchronizer {
     }
 
     async fn send_requests(&mut self, missing: Vec<Digest>, policy: &SyncPolicy) {
+        let missing_count = missing.len();
         let (targets, message, kind) = match policy {
             SyncPolicy::Widening(author) => (
                 vec![*author],
@@ -289,6 +290,12 @@ impl Synchronizer {
                 "ProofSourceBatchRequest",
             ),
         };
+        debug!(
+            "Sending {} {} message(s) to {} protocol-derived target(s)",
+            missing_count,
+            kind,
+            targets.len()
+        );
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
         for target in targets {
             if target == self.name {

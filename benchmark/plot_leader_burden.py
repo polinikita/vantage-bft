@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Plot useful throughput and latency for the leader-relay stress experiment."""
+"""Plot honest goodput, latency, and leader egress for a relay-load sweep."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import statistics
+from collections import defaultdict
 from pathlib import Path
 
 
@@ -12,195 +14,206 @@ PROTOCOLS = (
     ("autobahn-optimistic", "Autobahn optimistic (all-to-all)", "#D55E00", "s"),
     ("vantage", "Vantage", "#0072B2", "o"),
     ("simple-it", "Simple-IT (Opt-RBC)", "#009E73", "D"),
+    ("autobahn-seamless", "Autobahn seamless (control)", "#E69F00", "^"),
 )
+
+REQUIRED = {
+    "protocol",
+    "offered_tps",
+    "honest_offered_tps",
+    "committed_tps",
+    "p50_ms",
+    "p99_ms",
+    "max_node_wire_mbps",
+    "max_node_optimistic_batch_relay_mbps",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("measurements", type=Path, help="CSV produced by the experiment")
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--offered-tps", type=int, default=5_000)
     parser.add_argument(
-        "--title",
-        default="Leader-relay burden under narrowcast data lanes",
+        "measurements",
+        type=Path,
+        nargs="+",
+        help="one or more sweep CSV files; repeated points are combined by median",
+    )
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--title", default="Optimistic availability concentrates recovery on the leader"
     )
     parser.add_argument(
         "--subtitle",
         default=(
-            "n=20 · AWS RTT matrix via tc netem · 5,000 useful TPS on 14 correct "
-            "lanes · 6 silent Byzantine authors · each correct leader misses 2 of "
-            "6 faulty lanes"
+            "n=20, f=6 · uniform offered load · AWS RTT netem · Byzantine batches "
+            "have 2f direct holders (one below quorum) in rotating correct groups"
         ),
     )
-    parser.add_argument(
-        "--annotate-low-throughput",
-        action="store_true",
-        help="label non-aligned points below 5%% of offered useful load",
-    )
+    parser.add_argument("--accept-pct", type=float, default=95.0)
     return parser.parse_args()
 
 
-def load_measurements(path: Path) -> list[dict[str, float | str | bool]]:
+def load(path: Path) -> list[dict[str, float | str]]:
     with path.open(newline="") as source:
-        records = list(csv.DictReader(source))
-    required = {"protocol", "adversarial_tps", "useful_tps", "p50_ms", "p99_ms"}
-    if not records or not required <= records[0].keys():
-        missing = sorted(required - (records[0].keys() if records else set()))
-        raise SystemExit(f"{path}: missing columns: {', '.join(missing)}")
+        rows = list(csv.DictReader(source))
+    fields = set(rows[0]) if rows else set()
+    missing = REQUIRED - fields
+    if missing:
+        raise SystemExit(f"{path}: missing columns: {', '.join(sorted(missing))}")
+    numeric = REQUIRED - {"protocol"}
     return [
         {
-            "protocol": record["protocol"],
-            "adversarial_tps": float(record["adversarial_tps"]),
-            "useful_tps": float(record["useful_tps"]),
-            "p50_ms": float(record["p50_ms"]),
-            "p99_ms": float(record["p99_ms"]),
-            "aligned": record.get("aligned", "true").lower() in {
-                "1", "true", "yes", "aligned"
-            },
+            key: float(value) if key in numeric else value
+            for key, value in row.items()
         }
-        for record in records
+        for row in rows
     ]
+
+
+def grouped_medians(
+    rows: list[dict[str, float | str]], protocol: str
+) -> list[dict[str, float]]:
+    groups: dict[float, list[dict[str, float | str]]] = defaultdict(list)
+    for row in rows:
+        if row["protocol"] == protocol:
+            groups[float(row["offered_tps"])].append(row)
+    points = []
+    for offered, records in sorted(groups.items()):
+        point = {"offered_tps": offered}
+        for field in REQUIRED - {"protocol", "offered_tps"}:
+            values = [float(record[field]) for record in records]
+            point[field] = statistics.median(values)
+            point[f"{field}_min"] = min(values)
+            point[f"{field}_max"] = max(values)
+        points.append(point)
+    return points
 
 
 def main() -> int:
     args = parse_args()
-    records = load_measurements(args.measurements)
-    output = args.output or args.measurements.with_suffix(".png")
+    rows = [row for path in args.measurements for row in load(path)]
+    output = args.output or args.measurements[0].with_suffix(".png")
 
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    figure, (throughput_axis, latency_axis) = plt.subplots(1, 2, figsize=(13.6, 5.8))
+    figure, (throughput_axis, latency_axis, egress_axis) = plt.subplots(
+        1, 3, figsize=(16.2, 5.6)
+    )
+    ideal: dict[float, float] = {}
     for key, label, color, marker in PROTOCOLS:
-        points = sorted(
-            (record for record in records if record["protocol"] == key),
-            key=lambda record: record["adversarial_tps"],
-        )
+        points = grouped_medians(rows, key)
         if not points:
             continue
-        background = [point["adversarial_tps"] / 1_000 for point in points]
-        useful = [point["useful_tps"] for point in points]
+        offered = [point["offered_tps"] for point in points]
+        committed = [point["committed_tps"] for point in points]
         p50 = [point["p50_ms"] for point in points]
         p99 = [point["p99_ms"] for point in points]
-        throughput_axis.plot(
-            background,
-            useful,
-            color=color,
-            linewidth=2.3,
-            label=label,
-        )
-        for point, x, y in zip(points, background, useful):
-            throughput_axis.plot(
-                x,
-                y,
-                marker=marker,
-                markersize=7,
-                markerfacecolor=color if point["aligned"] else "white",
-                markeredgecolor=color,
-                markeredgewidth=1.7,
+        egress = [point["max_node_wire_mbps"] for point in points]
+        relay = [point["max_node_optimistic_batch_relay_mbps"] for point in points]
+        for point in points:
+            ideal[point["offered_tps"]] = point["honest_offered_tps"]
+
+        throughput_axis.plot(offered, committed, color=color, linewidth=2.2, label=label)
+        latency_axis.plot(offered, p50, color=color, linewidth=2.2)
+        latency_axis.plot(offered, p99, color=color, linestyle=":", linewidth=1.7)
+        egress_axis.plot(offered, egress, color=color, linewidth=2.2)
+        if key == "autobahn-optimistic" and any(relay):
+            egress_axis.plot(
+                offered,
+                relay,
+                color=color,
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.9,
             )
-            if (
-                args.annotate_low_throughput
-                and not point["aligned"]
-                and y < args.offered_tps * 0.05
+
+        for point, x, y, y50, y99, wire in zip(
+            points, offered, committed, p50, p99, egress
+        ):
+            healthy = y >= point["honest_offered_tps"] * args.accept_pct / 100.0
+            face = color if healthy else "white"
+            for axis, value, size in (
+                (throughput_axis, y, 6.5),
+                (latency_axis, y50, 6.0),
+                (latency_axis, y99, 5.0),
+                (egress_axis, wire, 6.0),
             ):
-                throughput_axis.annotate(
-                    f"{y:,.0f} TPS",
-                    xy=(x, y),
-                    xytext=(-12, 36),
-                    textcoords="offset points",
-                    ha="right",
-                    va="bottom",
-                    fontsize=9,
-                    color=color,
-                    arrowprops={"arrowstyle": "->", "color": color, "lw": 1.2},
+                axis.plot(
+                    [x],
+                    [value],
+                    marker=marker,
+                    markersize=size,
+                    markerfacecolor=face,
+                    markeredgecolor=color,
+                    markeredgewidth=1.4,
+                    linestyle="none",
+                    zorder=5,
                 )
-        latency_axis.plot(
-            background,
-            p50,
-            color=color,
-            linewidth=2.3,
+
+    ideal_points = sorted(ideal.items())
+    if ideal_points:
+        throughput_axis.plot(
+            [point[0] for point in ideal_points],
+            [point[1] for point in ideal_points],
+            color="0.45",
+            linestyle="--",
+            linewidth=1.2,
+            label="honest offered load",
         )
-        latency_axis.plot(background, p99, color=color, linestyle=":", linewidth=1.7)
-        for point, x, y50, y99 in zip(points, background, p50, p99):
-            face = color if point["aligned"] else "white"
-            latency_axis.plot(
-                x,
-                y50,
-                marker=marker,
-                markersize=6,
-                markerfacecolor=face,
-                markeredgecolor=color,
-                markeredgewidth=1.5,
-            )
-            latency_axis.plot(
-                x,
-                y99,
-                marker=marker,
-                markersize=5,
-                markerfacecolor=face,
-                markeredgecolor=color,
-                markeredgewidth=1.3,
-            )
 
-    throughput_axis.axhline(
-        args.offered_tps,
-        color="0.25",
-        linestyle="--",
-        linewidth=1.3,
-        label=f"useful load offered ({args.offered_tps:,} TPS)",
-    )
-    throughput_axis.axhline(
-        args.offered_tps * 0.95,
-        color="0.65",
-        linestyle=":",
-        linewidth=1.2,
-        label="95% stability threshold",
-    )
-    throughput_axis.set_ylim(0, args.offered_tps * 1.12)
-    throughput_axis.set_xlabel("Adversarial lane payload (thousand tx/s)")
-    throughput_axis.set_ylabel("Committed useful throughput (tx/s)")
+    for axis in (throughput_axis, latency_axis, egress_axis):
+        axis.set_xscale("log")
+        axis.set_xlabel("Total offered load (tx/s)")
+        axis.grid(True, which="both", alpha=0.22)
+    throughput_axis.set_yscale("log")
+    throughput_axis.set_ylabel("Committed honest throughput (tx/s)")
     throughput_axis.set_title("Useful throughput")
-    throughput_axis.grid(True, alpha=0.22)
-    throughput_axis.legend(frameon=False, fontsize=9, loc="lower left")
-
     latency_axis.set_yscale("log")
-    latency_axis.set_xlabel("Adversarial lane payload (thousand tx/s)")
-    latency_axis.set_ylabel("Committed useful-transaction latency (ms)")
-    latency_axis.set_title("Latency of transactions that commit")
-    latency_axis.grid(True, which="both", alpha=0.22)
-    latency_axis.legend(
-        handles=[
-            Line2D([0], [0], color="0.25", linewidth=2.3, label="p50"),
-            Line2D([0], [0], color="0.25", linewidth=1.7, linestyle=":", label="p99"),
+    latency_axis.set_ylabel("Honest transaction latency (ms)")
+    latency_axis.set_title("Commit latency")
+    egress_axis.set_ylabel("Peak validator wire egress (Mbit/s)")
+    egress_axis.set_title("Peak per-validator egress")
+
+    handles, labels = throughput_axis.get_legend_handles_labels()
+    figure.legend(
+        handles
+        + [
+            Line2D([0], [0], color="0.25", linewidth=2.2, label="p50"),
+            Line2D([0], [0], color="0.25", linestyle=":", linewidth=1.7, label="p99"),
             Line2D(
-                [0], [0], color="0.35", marker="o", markerfacecolor="white",
-                linewidth=0, label="replica-divergent point",
+                [0],
+                [0],
+                color="#D55E00",
+                linestyle="--",
+                linewidth=1.5,
+                label="Autobahn relayed payload",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="0.35",
+                marker="o",
+                markerfacecolor="white",
+                linewidth=0,
+                label=f"< {args.accept_pct:g}% honest delivery",
             ),
         ],
+        labels
+        + [
+            "p50",
+            "p99",
+            "Autobahn relayed payload",
+            f"< {args.accept_pct:g}% honest delivery",
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.9),
+        ncol=4,
         frameon=False,
-        loc="upper left",
-    )
-    figure.text(
-        0.75,
-        0.018,
-        "Latency becomes survivor-biased once useful throughput collapses.",
-        ha="center",
-        va="bottom",
         fontsize=8.5,
-        color="0.38",
     )
-
-    figure.suptitle(args.title, fontsize=15, y=0.995)
-    figure.text(
-        0.5,
-        0.925,
-        args.subtitle,
-        ha="center",
-        fontsize=9.5,
-        color="0.3",
-    )
-    figure.tight_layout(rect=(0, 0.055, 1, 0.89), w_pad=3.0)
+    figure.suptitle(args.title, fontsize=15, y=0.985)
+    figure.text(0.5, 0.94, args.subtitle, ha="center", fontsize=9.5, color="0.3")
+    figure.tight_layout(rect=(0, 0, 1, 0.79), w_pad=2.4)
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=220, bbox_inches="tight")
     figure.savefig(output.with_suffix(".pdf"), bbox_inches="tight")

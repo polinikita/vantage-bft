@@ -44,6 +44,23 @@ pub type View = u64;
 /// Consensus slot number.
 pub type Slot = u64;
 
+/// The rotating-holder experiment needs one digest per Byzantine Autobahn
+/// car, but must not reduce the capacity of honest lanes.
+fn autobahn_payload_digest_cap(
+    name: &PublicKey,
+    committee: &Committee,
+    parameters: &Parameters,
+) -> Option<usize> {
+    (parameters.leader_relay_attack
+        && config::withholding_publishers(
+            committee,
+            parameters.withhold_senders,
+            &parameters.withhold_publishers,
+        )
+        .contains(name))
+    .then_some(1)
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
@@ -553,6 +570,8 @@ impl Primary {
                 );
             }
             Protocol::AutobahnOptimistic | Protocol::AutobahnSeamless => {
+                let max_payload_digests =
+                    autobahn_payload_digest_cap(&name, &committee, &parameters);
                 let withholding_dests = config::withheld_destinations(
                     &committee,
                     &name,
@@ -660,6 +679,7 @@ impl Primary {
                     parameters.use_ride_share,
                     parameters.car_timeout,
                     parameters.all_to_all,
+                    max_payload_digests.is_some(),
                     parameters.simulate_asynchrony,
                     parameters.asynchrony_start,
                     parameters.asynchrony_duration,
@@ -739,6 +759,7 @@ impl Primary {
                     signature_service,
                     parameters.header_size,
                     parameters.max_header_delay,
+                    max_payload_digests,
                     /* rx_core */ rx_parents,
                     /* rx_workers */ rx_our_digests,
                     /* rx_ticket */ rx_instance,
@@ -873,5 +894,40 @@ impl MessageHandler for WorkerReceiverHandler {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leader_relay_caps_only_byzantine_autobahn_publishers() {
+        let (committee, _) = Committee::local_benchmark(7, 1, 18_000);
+        let mut parameters = Parameters {
+            leader_relay_attack: true,
+            withhold_senders: 2,
+            ..Parameters::default()
+        };
+        let authors: Vec<_> = committee.authorities.keys().copied().collect();
+
+        assert_eq!(
+            autobahn_payload_digest_cap(&authors[0], &committee, &parameters),
+            Some(1)
+        );
+        assert_eq!(
+            autobahn_payload_digest_cap(&authors[1], &committee, &parameters),
+            Some(1)
+        );
+        assert_eq!(
+            autobahn_payload_digest_cap(&authors[2], &committee, &parameters),
+            None
+        );
+
+        parameters.leader_relay_attack = false;
+        assert_eq!(
+            autobahn_payload_digest_cap(&authors[0], &committee, &parameters),
+            None
+        );
     }
 }

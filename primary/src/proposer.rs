@@ -23,6 +23,8 @@ pub struct Proposer {
     header_size: usize,
     /// The maximum delay to wait for batches' digests.
     max_header_delay: u64,
+    /// Optional hard payload-entry cap used by deterministic fault experiments.
+    max_payload_digests: Option<usize>,
 
     /// Receives parent certificates for the next header.
     rx_core: Receiver<Certificate>,
@@ -57,6 +59,7 @@ impl Proposer {
         signature_service: SignatureService,
         header_size: usize,
         max_header_delay: u64,
+        max_payload_digests: Option<usize>,
         rx_core: Receiver<Certificate>,
         rx_workers: Receiver<(Digest, WorkerId)>,
         rx_instance: Receiver<ConsensusMessage>,
@@ -70,6 +73,7 @@ impl Proposer {
                 signature_service,
                 header_size,
                 max_header_delay,
+                max_payload_digests,
                 rx_core,
                 rx_workers,
                 rx_instance,
@@ -92,10 +96,16 @@ impl Proposer {
         // Build a new header.
         debug!("digests size before is {:?}", self.digests.len());
 
+        let take = self
+            .max_payload_digests
+            .unwrap_or(self.digests.len())
+            .min(self.digests.len());
+        let payload = self.digests.drain(..take).collect();
+        self.payload_size = self.digests.iter().map(|(digest, _)| digest.size()).sum();
         let mut header = Header::new(
             self.name,
             self.height,
-            self.digests.drain(..).collect(),
+            payload,
             self.last_parent.clone().unwrap(),
             &mut self.signature_service,
             self.consensus_instances.clone(),
@@ -156,7 +166,6 @@ impl Proposer {
                 current_time = Instant::now();
 
                 self.make_header().await;
-                self.payload_size = 0;
 
                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                 timer.as_mut().reset(deadline);

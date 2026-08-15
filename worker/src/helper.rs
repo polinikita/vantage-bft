@@ -86,6 +86,16 @@ impl Helper {
                 );
                 continue;
             }
+            debug!(
+                "Serving {} {} request(s) to {}",
+                digests.len(),
+                if optimistic_leader_repair {
+                    "optimistic-leader"
+                } else {
+                    "proof/author"
+                },
+                origin
+            );
             let address = match self.committee.worker(&origin, &self.id) {
                 Ok(x) => x.worker_to_worker,
                 Err(e) => {

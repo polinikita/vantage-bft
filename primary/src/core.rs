@@ -103,8 +103,7 @@ fn record_car_vote(
 
 fn autobahn_cut_is_valid(
     committee: &Committee,
-    use_optimistic_tips: bool,
-    proposal_leader: PublicKey,
+    allow_optimistic_tips: bool,
     proposals: &HashMap<PublicKey, Proposal>,
 ) -> bool {
     if proposals.len() != committee.size() {
@@ -116,13 +115,34 @@ fn autobahn_cut_is_valid(
         };
         match proposal.verify(lane, committee) {
             Ok(ProposalKind::Genesis | ProposalKind::Certified) => true,
-            Ok(ProposalKind::Optimistic) => use_optimistic_tips || *lane == proposal_leader,
+            Ok(ProposalKind::Optimistic) => allow_optimistic_tips,
             Err(error) => {
                 debug!("invalid Autobahn cut entry for lane {}: {}", lane, error);
                 false
             }
         }
     })
+}
+
+fn autobahn_own_tip_is_admissible(
+    committee: &Committee,
+    lane: &PublicKey,
+    allow_optimistic_tip: bool,
+    proposal: &Proposal,
+) -> bool {
+    match proposal.verify(lane, committee) {
+        Ok(ProposalKind::Genesis | ProposalKind::Certified) => true,
+        Ok(ProposalKind::Optimistic) => allow_optimistic_tip,
+        Err(_) => false,
+    }
+}
+
+fn allow_optimistic_leader_cut(
+    use_optimistic_tips: bool,
+    certified_only_leader: bool,
+    has_tc: bool,
+) -> bool {
+    use_optimistic_tips && !certified_only_leader && !has_tc
 }
 
 pub struct Core {
@@ -202,6 +222,9 @@ pub struct Core {
 
     /// Whether replicas broadcast votes and assemble certificates locally.
     all_to_all: bool,
+    /// Benchmark adversary: a Byzantine lane publisher avoids self-stalling
+    /// its own consensus-leader views by proposing only its certified cut.
+    certified_only_leader: bool,
     /// Early all-to-all votes, bounded by slot, digest, and committee author.
     /// Entries are drained when the matching consensus instance is registered.
     pending_consensus_votes: HashMap<Slot, HashMap<Digest, HashMap<PublicKey, ConsensusVote>>>,
@@ -244,6 +267,7 @@ impl Core {
         use_ride_share: bool,
         car_timeout: u64,
         all_to_all: bool,
+        certified_only_leader: bool,
 
         simulate_asynchrony: bool,
         asynchrony_start: u64,
@@ -342,6 +366,7 @@ impl Core {
                 car_timer_futures: FuturesUnordered::new(),
                 fast_timer_futures: FuturesUnordered::new(),
                 all_to_all,
+                certified_only_leader,
                 pending_consensus_votes: HashMap::with_capacity(2 * gc_depth as usize),
 
                 simulate_asynchrony,
@@ -517,6 +542,12 @@ impl Core {
                             && parent.id == header.parent_cert.header_digest,
                         DagError::MalformedHeader(header.id.clone())
                     );
+                    // The child's verified PoA identifies f+1 holders of the
+                    // parent. Use those proof sources for parent/suffix repair;
+                    // a Byzantine lane author is not a liveness dependency.
+                    self.synchronizer
+                        .register_parent_poa_sources(&header.parent_cert)
+                        .await;
                     self.process_header(parent.clone(), true).await?;
                     if parent_vote_state(&self.last_voted, &parent) != ParentVoteState::Exact {
                         debug!("The parent is present but not yet vote-eligible");
@@ -1135,25 +1166,46 @@ impl Core {
             let set_proposal = tc.is_none() || proposals.is_empty();
             if set_proposal {
                 debug!("UPDATING HEADER for slot {}", slot);
-                *proposals = match (tc.is_some(), self.use_optimistic_tips) {
-                    // A later-view proposal with no TC winner starts from the
-                    // leader's local certified cut. The leader-tip optimization
-                    // is applied below, but optimistic peer tips are not.
-                    (true, _) | (false, false) => self.current_certified_tips.clone(),
-                    (false, true) => self.current_proposal_tips.clone(),
+                let allow_optimistic_cut = allow_optimistic_leader_cut(
+                    self.use_optimistic_tips,
+                    self.certified_only_leader,
+                    tc.is_some(),
+                );
+                *proposals = if allow_optimistic_cut {
+                    self.current_proposal_tips.clone()
+                } else {
+                    // A later-view proposal with no TC winner, every seamless
+                    // proposal, and the benchmark's Byzantine leader strategy
+                    // start from the local certified cut.
+                    self.current_certified_tips.clone()
                 };
 
-                proposals.insert(self.name, own_tip);
+                // View 1 of the optimistic protocol may use the leader's own
+                // current car. A no-winner TC, like every seamless Prepare,
+                // must keep a fully PoA-certified cut; replacing its own-lane
+                // entry with an optimistic car would make the fallback
+                // structurally invalid at every replica.
+                let allow_optimistic_own = allow_optimistic_cut;
+                if autobahn_own_tip_is_admissible(
+                    &self.committee,
+                    &self.name,
+                    allow_optimistic_own,
+                    &own_tip,
+                ) {
+                    proposals.insert(self.name, own_tip);
+                }
 
-                // Seamless cuts contain only certified peer tips.
+                // A seamless Prepare is data-independent: every lane entry,
+                // including the leader's, is Genesis or PoA-certified.
                 if !self.use_optimistic_tips {
                     debug_assert!(
-                        proposals.iter().all(|(pk, proposal)| {
-                            *pk == self.name
-                                || self.current_certified_tips.get(pk)
-                                    .is_some_and(|certified| proposal.height <= certified.height)
+                        proposals.iter().all(|(lane, proposal)| {
+                            matches!(
+                                proposal.verify(lane, &self.committee),
+                                Ok(ProposalKind::Genesis | ProposalKind::Certified)
+                            )
                         }),
-                        "seamless invariant violated: a cut proposal exceeds its author's last certified height"
+                        "seamless invariant violated: a Prepare contains an optimistic tip"
                     );
                 }
 
@@ -1346,31 +1398,25 @@ impl Core {
     fn validate_cut(
         &self,
         proposals: &HashMap<PublicKey, Proposal>,
-        proposal_leader: PublicKey,
+        _proposal_leader: PublicKey,
     ) -> bool {
-        autobahn_cut_is_valid(
-            &self.committee,
-            self.use_optimistic_tips,
-            proposal_leader,
-            proposals,
-        )
+        autobahn_cut_is_valid(&self.committee, self.use_optimistic_tips, proposals)
     }
 
     /// Validates the self-contained shape and proofs of a cut, independently
     /// of which view originally admitted its optimistic tips. A QC or TC
     /// supplies that missing admission evidence.
     fn validate_proven_cut(&self, proposals: &HashMap<PublicKey, Proposal>) -> bool {
-        autobahn_cut_is_valid(&self.committee, true, PublicKey::default(), proposals)
+        autobahn_cut_is_valid(&self.committee, true, proposals)
     }
 
-    /// A TC without a winner starts from certified peer tips; only the current
-    /// leader's own tip may use the leader-tip optimization.
+    /// A TC without a winner starts from a fully certified cut.
     fn validate_no_winner_cut(
         &self,
         proposals: &HashMap<PublicKey, Proposal>,
-        proposal_leader: PublicKey,
+        _proposal_leader: PublicKey,
     ) -> bool {
-        autobahn_cut_is_valid(&self.committee, false, proposal_leader, proposals)
+        autobahn_cut_is_valid(&self.committee, false, proposals)
     }
 
     fn validate_timeout_evidence(&self, timeout: &Timeout) -> bool {
@@ -2580,9 +2626,9 @@ impl Core {
 #[cfg(test)]
 mod slot_gc_tests {
     use super::{
-        autobahn_cut_is_valid, keep_after_slot_period_gc, keep_all_to_all_delivery,
-        latest_pipeline_tickets, parallel_timer_slot, parent_vote_state, record_car_vote,
-        ParentVoteState,
+        allow_optimistic_leader_cut, autobahn_cut_is_valid, autobahn_own_tip_is_admissible,
+        keep_after_slot_period_gc, keep_all_to_all_delivery, latest_pipeline_tickets,
+        parallel_timer_slot, parent_vote_state, record_car_vote, ParentVoteState,
     };
     use crate::messages::{Header, Proposal};
     use crypto::Digest;
@@ -2638,7 +2684,7 @@ mod slot_gc_tests {
     }
 
     #[test]
-    fn seamless_allows_only_the_leaders_optimistic_tip() {
+    fn seamless_rejects_every_optimistic_tip_including_the_leaders() {
         let committee = crate::common::committee();
         let mut certificate = crate::common::certificate(&crate::common::header());
         certificate
@@ -2658,8 +2704,8 @@ mod slot_gc_tests {
         let mut cut = Header::genesis_proposals(&committee);
         cut.insert(lane, optimistic.clone());
 
-        assert!(!autobahn_cut_is_valid(&committee, false, leader, &cut));
-        assert!(autobahn_cut_is_valid(&committee, true, leader, &cut));
+        assert!(!autobahn_cut_is_valid(&committee, false, &cut));
+        assert!(autobahn_cut_is_valid(&committee, true, &cut));
 
         let mut leader_cut = Header::genesis_proposals(&committee);
         leader_cut.insert(
@@ -2672,11 +2718,45 @@ mod slot_gc_tests {
                 height: 1,
             },
         );
-        assert!(autobahn_cut_is_valid(
+        assert!(!autobahn_cut_is_valid(&committee, false, &leader_cut));
+        assert!(autobahn_cut_is_valid(&committee, true, &leader_cut));
+    }
+
+    #[test]
+    fn no_winner_fallback_never_replaces_its_own_certified_lane_with_an_optimistic_tip() {
+        let committee = crate::common::committee();
+        let lane = *committee.authorities.keys().next().unwrap();
+        let optimistic = Proposal {
+            poa: Some(crate::messages::Certificate::genesis_for(lane, &committee)),
+            header_digest: Digest([101; 32]),
+            height: 1,
+        };
+
+        assert!(autobahn_own_tip_is_admissible(
             &committee,
-            false,
-            leader,
-            &leader_cut,
+            &lane,
+            true,
+            &optimistic,
         ));
+        assert!(!autobahn_own_tip_is_admissible(
+            &committee,
+            &lane,
+            false,
+            &optimistic,
+        ));
+        assert!(autobahn_own_tip_is_admissible(
+            &committee,
+            &lane,
+            false,
+            &Proposal::genesis(lane, &committee),
+        ));
+    }
+
+    #[test]
+    fn benchmark_byzantine_leader_uses_a_certified_cut_without_changing_honest_leaders() {
+        assert!(allow_optimistic_leader_cut(true, false, false));
+        assert!(!allow_optimistic_leader_cut(true, true, false));
+        assert!(!allow_optimistic_leader_cut(true, false, true));
+        assert!(!allow_optimistic_leader_cut(false, false, false));
     }
 }

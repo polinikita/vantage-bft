@@ -57,9 +57,12 @@ To reproduce the smaller CI gate locally:
 ```bash
 python3 benchmark/check_protocol_regressions.py \
   --binary target/release/node --protocols all \
-  --nodes 7 --crash 2 --rate 200 --duration 30 \
+  --nodes 7 --crash 2 --rate 200 --duration 45 \
   --min-throughput-pct 85 --max-p50-ms 5000
 ```
+
+The 45-second window amortizes the bounded tail left by crashed-leader
+timeouts without weakening the 85% in-window throughput gate.
 
 Use `--protocols vantage` (or a comma-separated subset) for a focused run.
 
@@ -79,42 +82,65 @@ permanent-crash matrix above.
 
 ## Local Leader-Relay Stress
 
-The leader-relay experiment keeps useful demand fixed on correct lanes while
-silent Byzantine authors add uncounted, narrowcast payload. The background
-transactions traverse the complete data path but are excluded from offered and
-committed goodput. For the `n=20` mapping used in the study, six publishers are
-spread with publisher stride 7; each omits six receivers with stride 19. Every
-correct leader therefore holds four faulty lanes and must recover two.
+The leader-relay experiment increases one uniform total workload. For `n=20`,
+six Byzantine authors each receive the same `1/20` load share as every correct
+author. Their transactions exercise the full data path but are excluded from
+useful-throughput and latency metrics, making the honest target exactly 70% of
+total offered load. Each successive Byzantine batch is narrowcast to the six
+Byzantine validators plus a rotating group of six correct validators: exactly
+`2f=12` direct holders, one below the quorum of 13. All six Byzantine authors
+use the same correct group during each `5 Delta = 1 s` epoch. Selected
+Byzantine publishers aggregate their uniform input share into one batch per
+`Delta`; after five consecutive batches, the group advances by `f` positions.
+Thus every correct leader is eventually selected and locally holds all six
+faulty lanes. Headers remain visible and
+the Byzantine cohort refuses repair. To isolate the honest-leader relay cost,
+a selected Byzantine publisher uses its certified cut whenever it is itself a
+consensus leader; it does not deliberately stall that view with an optimistic
+tip it will refuse to serve. Autobahn's selected Byzantine cars carry
+one digest, so each car can obtain a PoA and locally available tips move across
+every correct leader. Vantage and Simple-IT keep their ordinary block
+construction rules.
+
+An optimistic Autobahn leader includes those locally held uncertified tips,
+making itself the repair source for the remaining validators before they can
+vote. At low load that relay finishes on the fast path. Increasing load first
+loses the 500 ms fast path and eventually the `10 Delta = 2 s` round. Vantage
+does not make optional tip materialization vote-critical, while Simple-IT
+admits only availability-qualified data. Strict Autobahn seamless is an
+optional diagnostic control: every Prepare entry, including the leader's own,
+is Genesis or PoA-certified, so Prepare voting never waits for data.
 
 One point can be reproduced with:
 
 ```bash
 docker-bench/run.sh \
-  --nodes 20 --rate 5000 --duration 40 \
+  --nodes 20 --rate 10000 --duration 70 \
   --protocol autobahn-optimistic --all-to-all \
-  --withhold 6 --withhold-publisher-stride 7 \
-  --withhold-count 6 --withhold-stride 19 \
-  --withhold-batches-only --withhold-repair \
-  --correct-load-only --adversarial-rate 20000
+  --withhold 6 --leader-relay --egress-mbps 1000
 ```
 
-Use `--protocol vantage` or `--protocol simple-it` for the matched controls;
-the latter derives its `8 * Delta` timeout automatically. Plot a CSV containing `protocol`,
-`adversarial_tps`, `useful_tps`, `p50_ms`, and `p99_ms` with:
+Run the complete geometric load sweep and generate the publication figure with:
 
 ```bash
-python3 benchmark/plot_leader_burden.py measurements.csv
+python3 benchmark/leader_relay_sweep.py
 ```
 
-After a run, generate the presentation-oriented capacity/latency summary with:
+The default primary series are Autobahn optimistic all-to-all, Vantage, and
+Simple-IT/Opt-RBC. Add the strict seamless diagnostic with
+`--protocols autobahn-optimistic,vantage,simple-it,autobahn-seamless`.
+The runner uses the Docker AWS-RTT netem matrix, a disclosed 1 Gbit/s
+per-validator egress cap, 70-second runs (the first 10 seconds are excluded
+from rate calculation), and three repetitions around each observed knee. It
+writes raw logs, configurations, JSON/CSV measurements, provenance, and
+`leader-relay.{png,pdf}` below `benchmark/results/`.
+
+To replot retained measurements:
 
 ```bash
-python3 benchmark/plot_drop_summary.py benchmark/results/<study-directory>
+python3 benchmark/plot_leader_burden.py \
+  benchmark/results/<study-directory>/measurements.csv
 ```
-
-Use `--quick` for a short end-to-end check, optionally with `--protocols
-vantage`. Run databases are discarded after each point unless `--keep-data`
-is supplied.
 
 ## Prerequisites
 

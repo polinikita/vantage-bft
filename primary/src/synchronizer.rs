@@ -1,7 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
-use crate::messages::{proposals_digest, ConsensusMessage, Header, Proposal, ProposalKind};
+use crate::messages::{
+    proposals_digest, Certificate, ConsensusMessage, Header, Proposal, ProposalKind,
+};
 use crate::primary::Slot;
 use crate::Height;
 use config::Committee;
@@ -120,6 +122,24 @@ impl Synchronizer {
             .expect("executed-height lock poisoned");
         let current = heights.entry(lane).or_default();
         *current = (*current).max(height);
+    }
+
+    /// Register a verified parent PoA before retrying a locally known parent.
+    ///
+    /// The PoA voters, rather than the possibly Byzantine lane author, are the
+    /// protocol-justified repair sources for the certified parent and its
+    /// unexecuted suffix. Sending this command before `process_header` retries
+    /// the parent also upgrades its pending payload request in FIFO order.
+    pub async fn register_parent_poa_sources(&mut self, parent: &Certificate) {
+        let stop_height = self.executed_height(&parent.author);
+        self.tx_header_waiter
+            .send(WaiterMessage::SyncCertified(vec![(
+                parent.author,
+                Proposal::certified(parent.clone()),
+                stop_height,
+            )]))
+            .await
+            .expect("Failed to register certified-parent repair sources");
     }
 
     async fn read_proposal_header(
@@ -482,6 +502,28 @@ mod alignment_tests {
         let mut cut = Header::genesis_proposals(committee);
         cut.insert(lane, proposal);
         cut
+    }
+
+    #[tokio::test]
+    async fn verified_parent_poa_registers_its_voters_as_repair_sources() {
+        let (committee, lane, proposal) = missing_certified_tip();
+        let parent = proposal.poa.expect("certified proposal");
+        let expected = Proposal::certified(parent.clone());
+        let (tx, mut rx) = channel(1);
+        let path = ".db_test_parent_poa_sources";
+        let _ = fs::remove_dir_all(path);
+        let store = Store::new(path).unwrap();
+        let mut synchronizer = Synchronizer::new(lane, &committee, store, tx);
+
+        synchronizer.register_parent_poa_sources(&parent).await;
+
+        match rx.recv().await {
+            Some(WaiterMessage::SyncCertified(repairs)) => {
+                assert_eq!(repairs, vec![(lane, expected, 0)]);
+            }
+            other => panic!("unexpected waiter command: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(path);
     }
 
     #[tokio::test]

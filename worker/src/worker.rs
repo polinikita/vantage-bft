@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::batch_maker::{Batch, BatchMaker, LeaderRelayRecipients, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
@@ -320,14 +320,55 @@ impl Worker {
                     .copied()
                     .collect()
             });
+        let leader_relay_workers_addresses = (self.parameters.leader_relay_attack
+            && self.withheld_destinations.is_some())
+        .then(|| {
+            let publishers = config::withholding_publishers(
+                &self.committee,
+                self.parameters.withhold_senders,
+                &self.parameters.withhold_publishers,
+            );
+            let cohort = full_workers_addresses
+                .iter()
+                .filter(|(name, _)| publishers.contains(name))
+                .copied()
+                .collect::<Vec<_>>();
+            let correct = full_workers_addresses
+                .iter()
+                .filter(|(name, _)| !publishers.contains(name))
+                .copied()
+                .collect::<Vec<_>>();
+            LeaderRelayRecipients {
+                cohort,
+                targets: correct,
+                batches_per_target: 5,
+                target_width: publishers.len(),
+                target_stride: publishers.len(),
+            }
+        });
+
+        // In the attack profile a Byzantine publisher is free to choose its
+        // batching. Emit one heavy batch per Delta and keep five consecutive
+        // batches on the same f-wide correct-holder group, yielding a disclosed
+        // 5-Delta receiver epoch. Each epoch advances the group by f positions.
+        let (batch_size, max_batch_delay) = if leader_relay_workers_addresses.is_some() {
+            info!(
+                "Leader-relay Byzantine batching: one batch per Delta={} ms, five batches per f-wide correct-holder epoch; receiver-group stride=f",
+                self.parameters.delta_ms.max(1)
+            );
+            (usize::MAX, self.parameters.delta_ms.max(1))
+        } else {
+            (self.parameters.batch_size, self.parameters.max_batch_delay)
+        };
 
         BatchMaker::spawn(
-            self.parameters.batch_size,
-            self.parameters.max_batch_delay,
+            batch_size,
+            max_batch_delay,
             rx_batch_maker,
             tx_processor,
             full_workers_addresses,
             withheld_workers_addresses,
+            leader_relay_workers_addresses,
             self.withhold_window.clone(),
             self.latency_map.clone(),
             self.metrics.clone(),

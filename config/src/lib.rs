@@ -353,6 +353,16 @@ pub struct Parameters {
     #[serde(default = "default_withhold_headers")]
     pub withhold_headers: bool,
 
+    /// Benchmark-only leader-relay attack. Each selected Byzantine publisher
+    /// sends every worker batch to the Byzantine publisher cohort and an
+    /// f-wide rotating non-publisher group. Including the author's local copy,
+    /// this is exactly 2f direct batch holders, one below quorum. Lane headers remain
+    /// visible and the Byzantine cohort refuses repair. The Autobahn path
+    /// separately limits selected publishers to one batch per car, making the
+    /// correct holder the only live relay source for that tip.
+    #[serde(default)]
+    pub leader_relay_attack: bool,
+
     /// Byzantine authors whose original header publication is delayed to a
     /// fixed receiver subset. Repair traffic is never delayed.
     #[serde(default)]
@@ -833,6 +843,7 @@ impl Default for Parameters {
             withhold_receivers: Vec::new(),
             withhold_repair: false,
             withhold_headers: default_withhold_headers(),
+            leader_relay_attack: false,
             late_header_publishers: Vec::new(),
             late_header_receivers: Vec::new(),
             late_header_delay_ms: 0,
@@ -1031,6 +1042,12 @@ impl Parameters {
             if self.withhold_repair {
                 info!("Selected Byzantine publishers suppress all lane repair responses");
             }
+            if self.leader_relay_attack {
+                info!(
+                    "Leader-relay attack: each Byzantine batch has 2f direct holders (the Byzantine cohort plus an f-wide correct group), rotating every {} ms (5-Delta)",
+                    self.delta_ms.saturating_mul(5)
+                );
+            }
         }
         if !self.late_header_publishers.is_empty() {
             info!(
@@ -1070,6 +1087,41 @@ impl Parameters {
         if self.withhold_repair && self.withhold_senders == 0 && self.withhold_publishers.is_empty()
         {
             return Err("repair suppression requires withholding publishers".to_string());
+        }
+        if self.leader_relay_attack {
+            if self.withhold_senders == 0 && self.withhold_publishers.is_empty() {
+                return Err("leader-relay attack requires withholding publishers".to_string());
+            }
+            let publishers =
+                withholding_publishers(committee, self.withhold_senders, &self.withhold_publishers);
+            let fault_budget = n.saturating_sub(1) / 3;
+            if publishers.len() != fault_budget {
+                return Err(format!(
+                    "leader-relay attack requires exactly f={fault_budget} Byzantine publishers"
+                ));
+            }
+            if self.withhold_headers {
+                return Err(
+                    "leader-relay attack must keep lane headers visible (withhold_headers=false)"
+                        .to_string(),
+                );
+            }
+            if !self.withhold_repair {
+                return Err("leader-relay attack requires Byzantine repair suppression".to_string());
+            }
+            if !self.withhold_receivers.is_empty()
+                || self.withhold_count != Some(n.saturating_sub(1))
+            {
+                return Err(
+                    "leader-relay attack requires withholding from every non-author destination"
+                        .to_string(),
+                );
+            }
+            if publishers.len() >= n {
+                return Err(
+                    "leader-relay attack requires at least one non-publisher target".to_string(),
+                );
+            }
         }
         if self.withhold_senders > 0 && !self.withhold_publishers.is_empty() {
             return Err(
@@ -1502,12 +1554,7 @@ pub fn withheld_destinations(
         return None;
     }
     let i = committee.index_of(self_pk)?;
-    let selected = if fixed_publishers.is_empty() {
-        i < withhold_senders
-    } else {
-        fixed_publishers.contains(self_pk)
-    };
-    if !selected {
+    if !withholding_publishers(committee, withhold_senders, fixed_publishers).contains(self_pk) {
         return None;
     }
     if !fixed_receivers.is_empty() {
@@ -1526,6 +1573,56 @@ pub fn withheld_destinations(
             .map(|offset| order[(i + offset * stride) % n])
             .collect(),
     )
+}
+
+/// Resolves the identities controlled by the data-plane fault injector.
+pub fn withholding_publishers(
+    committee: &Committee,
+    withhold_senders: usize,
+    fixed_publishers: &[PublicKey],
+) -> HashSet<PublicKey> {
+    if fixed_publishers.is_empty() {
+        committee
+            .authorities
+            .keys()
+            .take(withhold_senders)
+            .copied()
+            .collect()
+    } else {
+        fixed_publishers.iter().copied().collect()
+    }
+}
+
+/// Returns the rotating non-publisher receiver group for a Byzantine batch.
+///
+/// All selected publishers use the same f-wide group and advance by f each
+/// epoch. Together with the full Byzantine publisher cohort, this yields 2f
+/// direct holders, one below quorum; successive groups cover every correct
+/// validator while lanes keep obtaining PoAs.
+pub fn leader_relay_destinations(
+    committee: &Committee,
+    self_pk: &PublicKey,
+    withhold_senders: usize,
+    fixed_publishers: &[PublicKey],
+    epoch: u64,
+) -> Vec<PublicKey> {
+    let publishers = withholding_publishers(committee, withhold_senders, fixed_publishers);
+    if !publishers.contains(self_pk) {
+        return Vec::new();
+    }
+    let targets: Vec<_> = committee
+        .authorities
+        .keys()
+        .filter(|key| !publishers.contains(key))
+        .copied()
+        .collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let start = (epoch as usize).wrapping_mul(publishers.len()) % targets.len();
+    (0..publishers.len().min(targets.len()))
+        .map(|offset| targets[(start + offset) % targets.len()])
+        .collect()
 }
 
 fn gcd(mut a: usize, mut b: usize) -> usize {
@@ -1860,6 +1957,69 @@ mod tests {
     }
 
     #[test]
+    fn n20_leader_relay_rotates_two_f_holders_across_every_correct_leader() {
+        let (committee, _) = Committee::local_benchmark(20, 1, 9000);
+        let publishers = withholding_publishers(&committee, 6, &[]);
+        let correct: Vec<_> = committee
+            .authorities
+            .keys()
+            .filter(|key| !publishers.contains(key))
+            .copied()
+            .collect();
+
+        assert_eq!(publishers.len(), 6);
+        assert_eq!(correct.len(), 14);
+        assert_eq!(
+            publishers.len() + 1,
+            committee.validity_threshold() as usize
+        );
+
+        let mut covered = HashSet::new();
+        for epoch in 0..3 {
+            let publisher = *publishers.iter().next().unwrap();
+            let epoch_targets: HashSet<_> =
+                leader_relay_destinations(&committee, &publisher, 6, &[], epoch)
+                    .into_iter()
+                    .collect();
+            assert_eq!(epoch_targets.len(), publishers.len());
+            assert!(publishers.iter().all(|other| {
+                leader_relay_destinations(&committee, other, 6, &[], epoch)
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+                    == epoch_targets
+            }));
+            covered.extend(epoch_targets);
+        }
+        assert_eq!(covered, correct.into_iter().collect());
+    }
+
+    #[test]
+    fn leader_relay_configuration_requires_visible_headers_and_suppressed_author_repair() {
+        let (committee, _) = Committee::local_benchmark(20, 1, 9000);
+        let mut params = Parameters {
+            withhold_senders: 6,
+            withhold_count: Some(19),
+            withhold_headers: false,
+            withhold_repair: true,
+            leader_relay_attack: true,
+            ..Parameters::default()
+        };
+        assert!(params.validate_header_faults(&committee).is_ok());
+
+        params.withhold_headers = true;
+        assert!(params.validate_header_faults(&committee).is_err());
+        params.withhold_headers = false;
+        params.withhold_repair = false;
+        assert!(params.validate_header_faults(&committee).is_err());
+        params.withhold_repair = true;
+        params.withhold_count = Some(18);
+        assert!(params.validate_header_faults(&committee).is_err());
+        params.withhold_count = Some(19);
+        params.withhold_senders = 5;
+        assert!(params.validate_header_faults(&committee).is_err());
+    }
+
+    #[test]
     fn repair_suppression_requires_publishers_and_stride_must_be_coprime() {
         let (committee, _) = Committee::local_benchmark(20, 1, 9000);
         let mut params = Parameters {
@@ -2010,5 +2170,6 @@ mod tests {
         let decoded: Parameters =
             serde_json::from_value(object.into()).expect("legacy parameters deserialize");
         assert!(decoded.withhold_headers);
+        assert!(!decoded.leader_relay_attack);
     }
 }

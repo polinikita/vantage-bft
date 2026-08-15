@@ -11,6 +11,7 @@ set -euo pipefail
 : "${NODE_IP_OFFSET:?NODE_IP_OFFSET must be set}"
 : "${CLIENT_NODE_INDICES:=}"
 : "${TX_RATE_SHARE:?TX_RATE_SHARE must be set}"
+: "${TX_COUNTED:=true}"
 : "${ADVERSARIAL_TX_RATE_SHARE:=0}"
 : "${TX_SIZE:?TX_SIZE must be set}"
 : "${TX_MODE:?TX_MODE must be set}"
@@ -68,8 +69,13 @@ WORKER_PID=$!
 
 mapfile -t PEER_ADDRS < <(all_worker_addrs)
 echo "entrypoint: node $NODE_INDEX/$N_NODES starting client -> $(own_addr), rate ${TX_RATE_SHARE} tx/s"
+CLIENT_COUNT_ARGS=()
+if [ "$TX_COUNTED" != "true" ]; then
+    CLIENT_COUNT_ARGS+=(--uncounted)
+fi
 /usr/local/bin/benchmark_client "$(own_addr)" \
     --size "$TX_SIZE" --rate "$TX_RATE_SHARE" --mode "$TX_MODE" \
+    "${CLIENT_COUNT_ARGS[@]}" \
     --nodes "${PEER_ADDRS[@]}" \
     >"$LOGDIR/client.log" 2>&1 &
 CLIENT_PID=$!

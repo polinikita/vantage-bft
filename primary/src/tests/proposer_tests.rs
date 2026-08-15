@@ -24,6 +24,7 @@ async fn propose_empty() {
         signature_service,
         /* header_size */ 1_000,
         /* max_header_delay */ 20,
+        /* max_payload_digests */ None,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_ticket,
@@ -62,6 +63,7 @@ async fn propose_payload() {
         signature_service,
         /* header_size */ 32,
         /* max_header_delay */ 1_000_000, // Ensure it is not triggered.
+        /* max_payload_digests */ None,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_ticket,
@@ -109,6 +111,7 @@ async fn propose_normal() {
         signature_service,
         /* header_size */ 32,
         /* max_header_delay */ 1_000_000, // Ensure it is not triggered.
+        /* max_payload_digests */ None,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_ticket,
@@ -171,6 +174,68 @@ async fn propose_normal() {
 
 #[tokio::test]
 #[serial]
+async fn payload_cap_keeps_extra_digests_for_successive_lane_blocks() {
+    let (name, secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(secret);
+    let (tx_parents, rx_parents) = channel(3);
+    let (tx_our_digests, rx_our_digests) = channel(3);
+    let (tx_headers, mut rx_headers) = channel(3);
+    let (_tx_ticket, rx_ticket) = channel(1);
+
+    Proposer::spawn(
+        name,
+        committee(),
+        signature_service,
+        /* header_size */ 1,
+        /* max_header_delay */ 1_000_000,
+        /* max_payload_digests */ Some(1),
+        rx_parents,
+        rx_our_digests,
+        rx_ticket,
+        tx_headers,
+    );
+
+    tx_parents
+        .send(Certificate::genesis_for(name, &committee()))
+        .await
+        .unwrap();
+    let digests = [Digest([41; 32]), Digest([42; 32]), Digest([43; 32])];
+    tx_our_digests.send((digests[0].clone(), 0)).await.unwrap();
+    let first = rx_headers.recv().await.unwrap();
+    assert_eq!(first.payload.len(), 1);
+    assert!(first.payload.contains_key(&digests[0]));
+
+    tx_our_digests.send((digests[1].clone(), 0)).await.unwrap();
+    tx_our_digests.send((digests[2].clone(), 0)).await.unwrap();
+    tx_parents
+        .send(Certificate {
+            author: name,
+            header_digest: first.digest(),
+            height: first.height,
+            votes: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let second = rx_headers.recv().await.unwrap();
+    assert_eq!(second.payload.len(), 1);
+    assert!(second.payload.contains_key(&digests[1]));
+
+    tx_parents
+        .send(Certificate {
+            author: name,
+            header_digest: second.digest(),
+            height: second.height,
+            votes: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let third = rx_headers.recv().await.unwrap();
+    assert_eq!(third.payload.len(), 1);
+    assert!(third.payload.contains_key(&digests[2]));
+}
+
+#[tokio::test]
+#[serial]
 async fn propose_special_ticket_first() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
@@ -186,6 +251,7 @@ async fn propose_special_ticket_first() {
         signature_service,
         /* header_size */ 32,
         /* max_header_delay */ 1_000_000, // Ensure it is not triggered.
+        /* max_payload_digests */ None,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_ticket,
@@ -236,6 +302,7 @@ async fn propose_confirm_message() {
         signature_service,
         /* header_size */ 32,
         /* max_header_delay */ 1_000_000, // Ensure it is not triggered.
+        /* max_payload_digests */ None,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_ticket,
@@ -286,6 +353,7 @@ async fn duplicate_consensus_info_is_counted_once() {
         signature_service,
         /* header_size */ 32,
         /* max_header_delay */ 1_000_000,
+        /* max_payload_digests */ None,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_ticket,
