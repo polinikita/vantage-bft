@@ -2267,8 +2267,6 @@ impl Core {
     }
 
     async fn local_timeout_round(&mut self, slot: Slot, view: View) -> DagResult<()> {
-        warn!("Timeout reached for slot {}, view {}", slot, view);
-
         if !self.timers.contains(&(slot, view)) {
             debug!(
                 "Timer for slot {}, view {} is obsolete. Has been cancelled",
@@ -2290,6 +2288,9 @@ impl Core {
         if self.committed_slots.contains_key(&slot) {
             return Ok(());
         }
+
+        // Only a timer that outlives every moot check is a real view timeout.
+        warn!("Timeout reached for slot {}, view {}", slot, view);
 
         debug!("Sending Timeout for slot {}, view {}", slot, view);
         let Some(timeout) = self.broadcast_own_timeout(slot, view).await else {
@@ -2608,6 +2609,12 @@ impl Core {
                 Err(e @ DagError::HeaderTooOld(..)) => debug!("{}", e),
                 Err(e @ DagError::VoteTooOld(..)) => debug!("{}", e),
                 Err(e @ DagError::CertificateTooOld(..)) => debug!("{}", e),
+                // A car vote that arrives after its lane advanced, and a vote for
+                // a car whose PoA is already complete, are the ordinary outcome of
+                // a WAN round trip longer than the header delay: at n=20 they were
+                // 93% of the primary log.
+                Err(e @ DagError::UnexpectedVote(..)) => debug!("{}", e),
+                Err(e @ DagError::CarAlreadySatisfied) => debug!("{}", e),
                 Err(e) => warn!("{}", e),
             }
 
