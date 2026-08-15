@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::Framed;
+
+use crate::codec::frame_codec;
 
 #[cfg(test)]
 #[path = "tests/simple_sender_tests.rs"]
@@ -252,7 +254,7 @@ impl Connection {
         let Some(stream) = self.connect().await else {
             return;
         };
-        let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
+        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
 
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
@@ -266,7 +268,7 @@ impl Connection {
                     coalesce_deadline = None;
                     let len = bundle.len();
                     if let Err(e) = writer.send(bundle).await {
-                        warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                        warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                         return;
                     }
                     if let Some(metrics) = &self.metrics {
@@ -284,7 +286,7 @@ impl Connection {
                             coalesce_deadline = None;
                             let len = bundle.len();
                             if let Err(e) = writer.send(bundle).await {
-                                warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                                warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                                 return;
                             }
                             if let Some(metrics) = &self.metrics {
@@ -295,7 +297,7 @@ impl Connection {
                     } else {
                         let len = data.len();
                         if let Err(e) = writer.send(data).await {
-                            warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                            warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                             return;
                         }
                         if let Some(metrics) = &self.metrics {
@@ -323,7 +325,7 @@ impl Connection {
         let Some(stream) = self.connect().await else {
             return;
         };
-        let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
+        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
 
         // Preserve per-connection ordering.
         let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> =
@@ -345,7 +347,7 @@ impl Connection {
                     let (_, data) = delay_queue.pop_front().unwrap();
                     let len = data.len();
                     if let Err(e) = writer.send(data).await {
-                        warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                        warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                         return;
                     }
                     if let Some(metrics) = &self.metrics {

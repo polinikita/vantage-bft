@@ -19,7 +19,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, sleep_until, Duration, Instant};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::Framed;
+
+use crate::codec::frame_codec;
 
 #[cfg(test)]
 #[path = "tests/reliable_sender_tests.rs"]
@@ -676,7 +678,7 @@ impl Connection {
         let mut volatile_coalescer: Coalescer<u64> = Coalescer::new();
         let mut volatile_deadline: Option<Instant> = None;
 
-        let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
+        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
         let error = 'connection: loop {
             while let Some((data, handlers, key)) = self.buffer.pop_front() {
                 if all_closed(&handlers) {
@@ -690,8 +692,9 @@ impl Connection {
                         pending_replies.push_back((data, handlers, key));
                     }
                     Err(e) => {
+                        let len = data.len();
                         self.buffer.push_front((data, handlers, key));
-                        break 'connection NetworkError::FailedToSendMessage(self.address, e);
+                        break 'connection NetworkError::FailedToSendMessage(self.address, len, e);
                     }
                 }
             }
@@ -771,7 +774,7 @@ impl Connection {
         let mut volatile_coalescer: Coalescer<u64> = Coalescer::new();
         let mut volatile_deadline: Option<Instant> = None;
 
-        let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
+        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
         let error = 'connection: loop {
             while let Some((data, handlers, key)) = self.buffer.pop_front() {
                 if all_closed(&handlers) {
@@ -802,8 +805,9 @@ impl Connection {
                             pending_replies.push_back((data, handlers, key));
                         }
                         Err(e) => {
+                            let len = data.len();
                             self.buffer.push_front((data, handlers, key));
-                            break 'connection NetworkError::FailedToSendMessage(self.address, e);
+                            break 'connection NetworkError::FailedToSendMessage(self.address, len, e);
                         }
                     }
                 },

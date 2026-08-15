@@ -16,6 +16,8 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use crate::codec::frame_codec;
+
 #[cfg(test)]
 #[path = "tests/receiver_tests.rs"]
 pub mod receiver_tests;
@@ -136,7 +138,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 config.peers,
                 rtt_micros,
             );
-            let transport = Framed::new(socket, LengthDelimitedCodec::new());
+            let transport = Framed::new(socket, frame_codec());
             let (mut writer, mut reader) = transport.split();
             while let Some(frame) = reader.next().await {
                 match frame.map_err(|e| NetworkError::FailedToReceiveMessage(peer, e)) {

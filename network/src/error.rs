@@ -11,8 +11,8 @@ pub enum NetworkError {
     #[error("Failed to accept connection: {0}")]
     FailedToListen(std::io::Error),
 
-    #[error("Failed to send message to {0}: {1}")]
-    FailedToSendMessage(SocketAddr, std::io::Error),
+    #[error("Failed to send message of {1} bytes to {0}: {2}")]
+    FailedToSendMessage(SocketAddr, usize, std::io::Error),
 
     #[error("Failed to receive message from {0}: {1}")]
     FailedToReceiveMessage(SocketAddr, std::io::Error),
