@@ -331,11 +331,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     // Every node in this process shares one parameter document, so one fresh seed per run
     // stands in for out-of-band provisioning across the committee.
     let channel_auth = matches.get_flag("channel-auth");
-    let channel_auth_seed = channel_auth.then(|| {
-        let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
-        crypto::encode_base64_key(&seed)
-    });
+    let channel_auth_seed =
+        channel_auth.then(|| crypto::encode_base64_key(&rand::random::<[u8; 32]>()));
     let timeline: bool = matches.get_flag("timeline") || withhold_at_secs.is_some();
     let mimic_latency_ms: u64 = matches
         .get_one::<String>("mimic-latency-ms")
