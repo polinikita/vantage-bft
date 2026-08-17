@@ -89,6 +89,7 @@ async fn process_header_missing_parent() {
         None,
         test_metrics(),
         BatchConfig::default(),
+        None,
         parameters.retry_backoff_max_ms,
     );
 
@@ -186,6 +187,7 @@ async fn process_header_invalid_height() {
         None,
         test_metrics(),
         BatchConfig::default(),
+        None,
         parameters.retry_backoff_max_ms,
     );
 
@@ -275,6 +277,7 @@ async fn process_header_missing_payload() {
         None,
         test_metrics(),
         BatchConfig::default(),
+        None,
         parameters.retry_backoff_max_ms,
     );
 
@@ -363,6 +366,7 @@ async fn process_votes() {
         None,
         test_metrics(),
         BatchConfig::default(),
+        None,
         parameters.retry_backoff_max_ms,
     );
 
@@ -457,6 +461,7 @@ async fn process_certificates() {
         None,
         test_metrics(),
         BatchConfig::default(),
+        None,
         parameters.retry_backoff_max_ms,
     );
 
@@ -565,6 +570,7 @@ async fn local_timeout_view() {
         None,
         test_metrics(),
         BatchConfig::default(),
+        None,
         parameters.retry_backoff_max_ms,
     );
 }

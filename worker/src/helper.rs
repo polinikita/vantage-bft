@@ -4,7 +4,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{debug, error, warn};
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, ChannelAuth, SimpleSender};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -48,6 +48,7 @@ impl Helper {
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
         suppressed_repair_destinations: Option<HashSet<PublicKey>>,
         withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     ) {
@@ -60,7 +61,8 @@ impl Helper {
                 network: SimpleSender::new()
                     .with_latency(latency_map)
                     .with_metrics(metrics)
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    .with_channel_auth(auth),
                 suppressed_repair_destinations,
                 withhold_window,
             }

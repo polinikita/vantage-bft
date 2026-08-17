@@ -328,6 +328,14 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         .context("--ack-watermark-period-ms must be a non-negative integer")?;
     let ack_watermarks = !matches.get_flag("no-ack-watermarks");
     let echo_avail_claims = ack_watermarks && !matches.get_flag("no-echo-avail-claims");
+    // Every node in this process shares one parameter document, so one fresh seed per run
+    // stands in for out-of-band provisioning across the committee.
+    let channel_auth = matches.get_flag("channel-auth");
+    let channel_auth_seed = channel_auth.then(|| {
+        let mut seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut seed);
+        crypto::encode_base64_key(&seed)
+    });
     let timeline: bool = matches.get_flag("timeline") || withhold_at_secs.is_some();
     let mimic_latency_ms: u64 = matches
         .get_one::<String>("mimic-latency-ms")
@@ -523,6 +531,8 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         ack_watermark_period_ms,
         digest_statements: !matches.get_flag("no-digest-statements"),
         vantage_compact_ids: !matches.get_flag("no-compact-ids"),
+        channel_auth,
+        channel_auth_seed,
         withhold_senders: withhold,
         withhold_publishers: Vec::new(),
         withhold_count,

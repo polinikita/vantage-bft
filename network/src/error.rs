@@ -22,4 +22,7 @@ pub enum NetworkError {
 
     #[error("Receive unexpected ACK from {0}")]
     UnexpectedAck(SocketAddr),
+
+    #[error("Failed to authenticate the channel to {0}: {1}")]
+    ChannelAuthFailed(SocketAddr, std::io::Error),
 }

@@ -430,6 +430,15 @@ pub struct Metrics {
     pub network_peer_rtt_microseconds_total: IntCounterVec,
     /// Number of TCP RTT samples.
     pub network_peer_rtt_samples_total: IntCounterVec,
+    /// Frames carrying a channel-authentication tag, by `direction`.
+    ///
+    /// Positive control for the authenticated configuration: a run that reports no cost
+    /// and a run that authenticated nothing are otherwise indistinguishable.
+    pub channel_auth_frames_total: IntCounterVec,
+    /// Payload bytes covered by a channel-authentication tag, by `direction`.
+    pub channel_auth_bytes_total: IntCounterVec,
+    /// Connections rejected for failing channel authentication, by `listener`.
+    pub channel_auth_failures_total: IntCounterVec,
     // --- Sequence-chain metrics.
     /// Highest view covered by the local sequence chain.
     pub vantage_sequence_head_view: IntGauge,
@@ -1305,6 +1314,27 @@ impl Metrics {
             network_connect_wait_discarded_total: register_int_counter_with_registry!(
                 "network_connect_wait_discarded_total",
                 "SimpleSender frames discarded while waiting out a connect backoff",
+                registry,
+            )
+            .unwrap(),
+            channel_auth_frames_total: register_int_counter_vec_with_registry!(
+                "channel_auth_frames_total",
+                "Frames carrying a channel-authentication tag, by direction",
+                &["direction"],
+                registry,
+            )
+            .unwrap(),
+            channel_auth_bytes_total: register_int_counter_vec_with_registry!(
+                "channel_auth_bytes_total",
+                "Payload bytes covered by a channel-authentication tag, by direction",
+                &["direction"],
+                registry,
+            )
+            .unwrap(),
+            channel_auth_failures_total: register_int_counter_vec_with_registry!(
+                "channel_auth_failures_total",
+                "Connections rejected for failing channel authentication, by listener",
+                &["listener"],
                 registry,
             )
             .unwrap(),

@@ -98,6 +98,40 @@ fn public_key_index_encoding_supports_exactly_256_keys() {
 }
 
 #[test]
+fn channel_root_key_is_unordered_and_pair_specific() {
+    let seed = [7u8; 32];
+    assert_eq!(
+        channel_root_key(&seed, 3, 11),
+        channel_root_key(&seed, 11, 3)
+    );
+    assert_ne!(
+        channel_root_key(&seed, 3, 11),
+        channel_root_key(&seed, 3, 12)
+    );
+    assert_ne!(
+        channel_root_key(&seed, 3, 11),
+        channel_root_key(&[8u8; 32], 3, 11)
+    );
+}
+
+#[test]
+fn channel_session_key_depends_on_both_salts_and_their_roles() {
+    let root = channel_root_key(&[7u8; 32], 0, 1);
+    let dialer = [1u8; 16];
+    let listener = [2u8; 16];
+    let key = channel_session_key(&root, &dialer, &listener);
+
+    // Swapping the roles of two salts must not yield the same session key.
+    assert_ne!(key, channel_session_key(&root, &listener, &dialer));
+    // A fresh salt on either side re-keys the session.
+    assert_ne!(key, channel_session_key(&root, &[3u8; 16], &listener));
+    assert_ne!(key, channel_session_key(&root, &dialer, &[3u8; 16]));
+    // A different pair cannot reach the same session key from the same salts.
+    let other = channel_root_key(&[7u8; 32], 0, 2);
+    assert_ne!(key, channel_session_key(&other, &dialer, &listener));
+}
+
+#[test]
 fn verify_valid_signature() {
     // Get a keypair.
     let (public_key, secret_key) = keys().pop().unwrap();

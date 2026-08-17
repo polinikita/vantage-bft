@@ -29,6 +29,7 @@ async fn batch_reply() {
         BatchConfig::default(),
         None,
         None,
+        None,
     );
 
     let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;
@@ -67,6 +68,7 @@ async fn byzantine_author_does_not_reply_to_repair_requests() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
         suppressed,
         None,
     );
@@ -106,6 +108,7 @@ async fn committed_batch_reply_wraps_original_batch_bytes() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
         None,
         None,
     );

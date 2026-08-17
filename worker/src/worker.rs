@@ -14,7 +14,7 @@ use log::{error, info, warn};
 use metrics::{
     spawn_queue_sampler, start_prometheus_server, MetricReporter, Metrics, QueueProbe, StoreProbe,
 };
-use network::{BatchConfig, MessageHandler, Receiver, Writer};
+use network::{BatchConfig, ChannelAuth, MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,8 @@ pub struct Worker {
     withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     /// Transport-level batching for worker-to-worker and worker-to-primary traffic.
     batch: BatchConfig,
+    /// Pairwise channel keys covering the worker-to-worker links.
+    channel_auth: Option<Arc<ChannelAuth>>,
 }
 
 impl Worker {
@@ -183,6 +185,10 @@ impl Worker {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        // Batch dissemination between workers of different validators is a protocol link
+        // and is authenticated. Traffic to our own primary and from clients is not.
+        let channel_auth = primary::channel_auth(&name, &committee, &parameters);
+
         let worker = Self {
             name,
             id,
@@ -194,6 +200,7 @@ impl Worker {
             withheld_destinations,
             withhold_window,
             batch,
+            channel_auth,
         };
 
         Metrics::install_panic_hook(metrics.clone());
@@ -214,6 +221,7 @@ impl Worker {
             rx_primary,
             worker.metrics.clone(),
             worker.batch,
+            worker.channel_auth.clone(),
         );
 
         info!(
@@ -262,6 +270,8 @@ impl Worker {
             false,
             self.parameters.batch_messages,
             "primary_to_worker",
+            // Our own primary reaches us over a same-host link.
+            None,
         );
 
         #[cfg(feature = "benchmark")]
@@ -279,6 +289,7 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.batch,
+            self.channel_auth.clone(),
         );
 
         info!(
@@ -319,6 +330,8 @@ impl Worker {
             // Client frames are unbundled.
             false,
             "transactions",
+            // Clients hold no committee identity, so this link is never authenticated.
+            None,
         );
 
         let full_workers_addresses: Vec<(PublicKey, SocketAddr)> = self
@@ -378,6 +391,7 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.batch,
+            self.channel_auth.clone(),
         );
 
         Processor::spawn(
@@ -431,6 +445,7 @@ impl Worker {
             true,
             self.parameters.batch_messages,
             "worker_to_worker",
+            self.channel_auth.clone(),
         );
 
         Helper::spawn(
@@ -441,6 +456,7 @@ impl Worker {
             self.latency_map.clone(),
             self.metrics.clone(),
             self.batch,
+            self.channel_auth.clone(),
             self.parameters
                 .withhold_repair
                 .then(|| self.withheld_destinations.clone())

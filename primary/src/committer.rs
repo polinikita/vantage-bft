@@ -15,9 +15,9 @@ use crypto::Hash as _;
 use crypto::PublicKey;
 use log::debug;
 use metrics::Metrics;
-use network::BatchConfig;
 #[cfg(feature = "benchmark")]
 use network::SimpleSender;
+use network::{BatchConfig, ChannelAuth};
 use std::borrow::BorrowMut;
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "benchmark")]
@@ -103,6 +103,7 @@ impl Committer {
         synchronizer: Synchronizer,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         let (_tx_deliver, rx_deliver) = channel(CHANNEL_CAPACITY);
 
@@ -129,7 +130,8 @@ impl Committer {
                 #[cfg(feature = "benchmark")]
                 network: SimpleSender::new()
                     .with_metrics(metrics)
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    .with_channel_auth(auth),
             }
             .run()
             .await;

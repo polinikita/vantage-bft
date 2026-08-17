@@ -80,7 +80,9 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
-use network::{BatchConfig, DirtyMap, MessageHandler, ReliableSender, SimpleSender, Writer};
+use network::{
+    BatchConfig, ChannelAuth, DirtyMap, MessageHandler, ReliableSender, SimpleSender, Writer,
+};
 use parking_lot::Mutex;
 use prometheus::IntCounter;
 use std::cmp::Reverse;
@@ -683,6 +685,7 @@ impl VantageCore {
         metrics: Option<Arc<Metrics>>,
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
+        auth: Option<Arc<ChannelAuth>>,
     ) -> VantageSpawnOutput {
         let (
             core,
@@ -697,7 +700,7 @@ impl VantageCore {
             sequence_large_gap_drop,
             sequence_install_drop_through,
             reconnect_rx,
-        ) = Self::build(name, committee, parameters, store, metrics, tx_output);
+        ) = Self::build(name, committee, parameters, store, metrics, tx_output, auth);
         tokio::spawn(core.run(
             rx_vantage,
             rx_bulk,
@@ -724,6 +727,7 @@ impl VantageCore {
         store: Store,
         metrics: Option<Arc<Metrics>>,
         tx_output: Sender<Header>,
+        auth: Option<Arc<ChannelAuth>>,
     ) -> BuildOutput {
         let (tx_vantage, rx_vantage) = channel(CHANNEL_CAPACITY);
 
@@ -874,6 +878,7 @@ impl VantageCore {
                 &latency_map,
                 parameters.late_header_delay_ms,
                 batch,
+                auth.clone(),
                 parameters.retry_backoff_max_ms,
                 core_metrics.clone(),
             )
@@ -894,6 +899,7 @@ impl VantageCore {
             parameters.replay_chunk_interval_ms,
             parameters.replay_serve_max_bytes,
             parameters.retry_backoff_max_ms,
+            auth.clone(),
         );
 
         let core = Self {
@@ -951,6 +957,7 @@ impl VantageCore {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
                         .with_batching(batch)
+                        .with_channel_auth(auth.clone())
                         .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms);
 
                     if parameters.reconnect_replay {
@@ -967,7 +974,8 @@ impl VantageCore {
                 worker_network: {
                     let mut s = SimpleSender::new()
                         .with_latency(latency_map)
-                        .with_batching(batch);
+                        .with_batching(batch)
+                        .with_channel_auth(auth.clone());
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
                     }
@@ -4006,6 +4014,7 @@ mod tests {
             store,
             Some(metrics),
             tx_output,
+            None,
         );
         core
     }

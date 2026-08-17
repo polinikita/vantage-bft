@@ -19,7 +19,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::codec::Framed;
 
-use crate::codec::frame_codec;
+use crate::channel_auth::{ChannelAuth, Role};
+use crate::codec::{authenticated_frame_codec, frame_codec, AuthCodec};
+use crate::receiver::record_auth_frame;
 
 #[cfg(test)]
 #[path = "tests/simple_sender_tests.rs"]
@@ -40,6 +42,8 @@ pub struct SimpleSender {
     metrics: Option<Arc<Metrics>>,
     /// Outbound batching configuration.
     batch: BatchConfig,
+    /// Pairwise channel keys, when channel authentication is enabled.
+    auth: Option<Arc<ChannelAuth>>,
 }
 
 impl std::default::Default for SimpleSender {
@@ -56,6 +60,7 @@ impl SimpleSender {
             latency: HashMap::new(),
             metrics: None,
             batch: BatchConfig::default(),
+            auth: None,
         }
     }
 
@@ -77,11 +82,27 @@ impl SimpleSender {
         self
     }
 
+    /// Attach pairwise channel keys before spawning connections.
+    ///
+    /// Only destinations this map covers are authenticated, which leaves client and
+    /// same-host connections untouched without a decision at each call site.
+    pub fn with_channel_auth(mut self, auth: Option<Arc<ChannelAuth>>) -> Self {
+        self.auth = auth;
+        self
+    }
+
     /// Spawns a connection task.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<Bytes> {
         let (tx, rx) = channel(100_000);
         let extra_latency = self.latency.get(&address).copied().unwrap_or_default();
-        Connection::spawn(address, rx, extra_latency, self.metrics.clone(), self.batch);
+        Connection::spawn(
+            address,
+            rx,
+            extra_latency,
+            self.metrics.clone(),
+            self.batch,
+            self.auth.clone(),
+        );
         tx
     }
 
@@ -162,6 +183,8 @@ struct Connection {
     metrics: Option<Arc<Metrics>>,
     /// Outbound batching configuration.
     batch: BatchConfig,
+    /// Pairwise channel keys, when channel authentication is enabled.
+    auth: Option<Arc<ChannelAuth>>,
 }
 
 impl Connection {
@@ -171,6 +194,7 @@ impl Connection {
         extra_latency: Duration,
         metrics: Option<Arc<Metrics>>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -179,15 +203,20 @@ impl Connection {
                 extra_latency,
                 metrics,
                 batch,
+                auth,
             }
             .run()
             .await;
         });
     }
 
-    fn record_frame_sent(&self) {
-        if let Some(metrics) = &self.metrics {
-            metrics.network_frames_sent_total.inc();
+    /// Records one transmitted frame.
+    fn record_sent(&self, len: usize, authenticated: bool) {
+        let Some(metrics) = &self.metrics else { return };
+        metrics.bytes_sent_total.inc_by(len as u64 + 4);
+        metrics.network_frames_sent_total.inc();
+        if authenticated {
+            record_auth_frame(metrics, "sent", len);
         }
     }
 
@@ -226,35 +255,67 @@ impl Connection {
         }
     }
 
-    async fn connect(&mut self) -> Option<TcpStream> {
+    /// Connects and, on an authenticated destination, binds the connection to the peer's
+    /// committee identity. A failed handshake is retried like a failed connect.
+    async fn connect(&mut self) -> Option<(TcpStream, AuthCodec)> {
         let mut delay = STARTUP_RETRY_DELAY_MS;
         let mut retry = 0;
         loop {
-            match TcpStream::connect(self.address).await {
-                Ok(stream) => {
+            let failure = match TcpStream::connect(self.address).await {
+                Ok(mut stream) => {
                     // Disable Nagle buffering for small protocol frames.
                     let _ = stream.set_nodelay(true);
-                    debug!("Outgoing connection established with {}", self.address);
-                    return Some(stream);
-                }
-                Err(e) => {
-                    warn!("{}", NetworkError::FailedToConnect(self.address, retry, e));
-                    if !self.drain_until(Duration::from_millis(delay)).await {
-                        return None;
+                    match self.handshake(&mut stream).await {
+                        Ok(codec) => {
+                            debug!("Outgoing connection established with {}", self.address);
+                            return Some((stream, codec));
+                        }
+                        Err(e) => e,
                     }
-                    delay = min(2 * delay, STARTUP_RETRY_BACKOFF_MAX_MS);
-                    retry += 1;
                 }
+                Err(e) => NetworkError::FailedToConnect(self.address, retry, e),
+            };
+
+            warn!("{}", failure);
+            if !self.drain_until(Duration::from_millis(delay)).await {
+                return None;
+            }
+            delay = min(2 * delay, STARTUP_RETRY_BACKOFF_MAX_MS);
+            retry += 1;
+        }
+    }
+
+    /// Builds the codec for a new connection, authenticating first when required.
+    async fn handshake(&self, stream: &mut TcpStream) -> Result<AuthCodec, NetworkError> {
+        let Some(peer) = self
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.peer_index(&self.address).map(|index| (auth, index)))
+        else {
+            return Ok(frame_codec());
+        };
+        let (auth, index) = peer;
+        match auth.handshake_dialer(stream, index).await {
+            Ok(key) => Ok(authenticated_frame_codec(key, Role::Dialer)),
+            Err(e) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .channel_auth_failures_total
+                        .with_label_values(&["dialer"])
+                        .inc();
+                }
+                Err(NetworkError::ChannelAuthFailed(self.address, e))
             }
         }
     }
 
     /// Send loop without an artificial delay. Batching is applied before writing.
     async fn run_immediate(&mut self) {
-        let Some(stream) = self.connect().await else {
+        let Some((stream, codec)) = self.connect().await else {
             return;
         };
-        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
+        let authenticated = codec.is_authenticated();
+        let (mut writer, mut reader) = Framed::new(stream, codec).split();
 
         let mut coalescer: Coalescer<()> = Coalescer::new();
         let mut coalesce_deadline: Option<tokio::time::Instant> = None;
@@ -271,10 +332,7 @@ impl Connection {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                         return;
                     }
-                    if let Some(metrics) = &self.metrics {
-                        metrics.bytes_sent_total.inc_by(len as u64 + 4);
-                    }
-                    self.record_frame_sent();
+                    self.record_sent(len, authenticated);
                 },
                 Some(data) = self.receiver.recv() => {
                     if self.batch.enabled {
@@ -289,10 +347,7 @@ impl Connection {
                                 warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                                 return;
                             }
-                            if let Some(metrics) = &self.metrics {
-                                metrics.bytes_sent_total.inc_by(len as u64 + 4);
-                            }
-                            self.record_frame_sent();
+                            self.record_sent(len, authenticated);
                         }
                     } else {
                         let len = data.len();
@@ -300,10 +355,7 @@ impl Connection {
                             warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                             return;
                         }
-                        if let Some(metrics) = &self.metrics {
-                            metrics.bytes_sent_total.inc_by(len as u64 + 4);
-                        }
-                        self.record_frame_sent();
+                        self.record_sent(len, authenticated);
                     }
                 },
                 response = reader.next() => {
@@ -322,10 +374,11 @@ impl Connection {
 
     /// Sends with a fixed per-destination delay.
     async fn run_delayed(&mut self) {
-        let Some(stream) = self.connect().await else {
+        let Some((stream, codec)) = self.connect().await else {
             return;
         };
-        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
+        let authenticated = codec.is_authenticated();
+        let (mut writer, mut reader) = Framed::new(stream, codec).split();
 
         // Preserve per-connection ordering.
         let mut delay_queue: std::collections::VecDeque<(tokio::time::Instant, Bytes)> =
@@ -350,10 +403,7 @@ impl Connection {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, len, e));
                         return;
                     }
-                    if let Some(metrics) = &self.metrics {
-                        metrics.bytes_sent_total.inc_by(len as u64 + 4);
-                    }
-                    self.record_frame_sent();
+                    self.record_sent(len, authenticated);
                 },
                 () = coalesce_due, if self.batch.enabled && !coalescer.is_empty() => {
                     let (bundle, _) = coalescer.flush();

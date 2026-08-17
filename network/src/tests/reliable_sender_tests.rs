@@ -1,11 +1,67 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use crate::common::listener;
+use crate::common::{authenticating_listener, listener};
 use futures::future::try_join_all;
 use std::collections::HashMap;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+/// A sender that authenticates to committee member 1 at `address`, and that member's own
+/// view of the same pairwise key.
+fn authenticating_pair(address: SocketAddr) -> (ReliableSender, Arc<ChannelAuth>) {
+    let seed = [17u8; 32];
+    let dialer = ChannelAuth::new(&seed, 0, 2, HashMap::from([(address, 1)]));
+    let peer = Arc::new(ChannelAuth::new(&seed, 1, 2, HashMap::new()));
+    let sender = ReliableSender::new().with_channel_auth(Some(Arc::new(dialer)));
+    (sender, peer)
+}
+
+#[tokio::test]
+async fn authenticated_send_is_delivered_and_acknowledged() {
+    let address = "127.0.0.1:5900".parse::<SocketAddr>().unwrap();
+    let message = "Hello, world!";
+    let (mut sender, peer) = authenticating_pair(address);
+    let handle = authenticating_listener(address, peer, message.to_string(), 1);
+
+    let cancel_handler = sender.send(address, Bytes::from(message)).await;
+
+    assert!(cancel_handler.await.is_ok());
+    assert!(handle.await.is_ok());
+}
+
+/// The tag lives in the codec, so a payload requeued from a dead session is re-tagged under
+/// the next session's key and counter. Tagging where the message is built would replay a
+/// counter the peer has moved past, and no retry would ever verify.
+#[tokio::test]
+async fn a_requeued_payload_is_retagged_on_the_next_session() {
+    let address = "127.0.0.1:5901".parse::<SocketAddr>().unwrap();
+    let message = "Hello, world!";
+    let (mut sender, peer) = authenticating_pair(address);
+    // The first of the two sessions reads the frame and closes without acknowledging it.
+    let handle = authenticating_listener(address, peer, message.to_string(), 2);
+
+    let cancel_handler = sender.send(address, Bytes::from(message)).await;
+
+    assert!(cancel_handler.await.is_ok());
+    assert!(handle.await.is_ok());
+}
+
+/// A destination outside the peer map stays on the plain path. This is what keeps client
+/// and same-host connections unauthenticated without a decision at every call site.
+#[tokio::test]
+async fn an_unmapped_destination_is_not_authenticated() {
+    let address = "127.0.0.1:5902".parse::<SocketAddr>().unwrap();
+    let message = "Hello, world!";
+    let auth = ChannelAuth::new(&[17u8; 32], 0, 2, HashMap::new());
+    let mut sender = ReliableSender::new().with_channel_auth(Some(Arc::new(auth)));
+    let handle = listener(address, message.to_string());
+
+    let cancel_handler = sender.send(address, Bytes::from(message)).await;
+
+    assert!(cancel_handler.await.is_ok());
+    assert!(handle.await.is_ok());
+}
 
 #[tokio::test]
 async fn send() {

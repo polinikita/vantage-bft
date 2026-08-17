@@ -31,7 +31,7 @@ async fn receive() {
     let sent = "Hello, world!";
     let bytes = Bytes::from(bincode::serialize(sent).unwrap());
     let stream = TcpStream::connect(address).await.unwrap();
-    let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+    let mut transport = Framed::new(stream, frame_codec());
     transport.send(bytes.clone()).await.unwrap();
 
     let message = rx.recv().await;

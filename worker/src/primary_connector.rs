@@ -2,7 +2,7 @@
 use crate::worker::SerializedBatchDigestMessage;
 use bytes::Bytes;
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, ChannelAuth, SimpleSender};
 use primary::WorkerPrimaryMessage;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ impl PrimaryConnector {
         rx_digest: Receiver<SerializedBatchDigestMessage>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -31,7 +32,8 @@ impl PrimaryConnector {
                 rx_digest,
                 network: SimpleSender::new()
                     .with_metrics(metrics)
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    .with_channel_auth(auth),
             }
             .run()
             .await;

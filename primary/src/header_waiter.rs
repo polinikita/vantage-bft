@@ -10,7 +10,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, ChannelAuth, SimpleSender};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -221,6 +221,7 @@ impl HeaderWaiter {
         tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -236,7 +237,8 @@ impl HeaderWaiter {
                 tx_consensus_loopback,
                 network: SimpleSender::new()
                     .with_metrics(metrics.clone())
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    .with_channel_auth(auth),
                 metrics,
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),

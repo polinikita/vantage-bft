@@ -419,6 +419,12 @@ async fn main() -> Result<()> {
                         .long("no-compact-ids")
                         .action(ArgAction::SetTrue)
                         .help("Send full committee identifiers on the Vantage primary wire"),
+                )
+                .arg(
+                    Arg::new("channel-auth")
+                        .long("channel-auth")
+                        .action(ArgAction::SetTrue)
+                        .help("Authenticate cross-validator links with a per-frame pairwise MAC"),
                 ),
         )
         .subcommand_required(true)

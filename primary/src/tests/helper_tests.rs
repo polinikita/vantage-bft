@@ -39,6 +39,7 @@ async fn honest_author_replies_to_header_repair_requests() {
         BatchConfig::default(),
         None,
         None,
+        None,
     );
     drop(tx_certificates);
     drop(tx_proposals);
@@ -81,6 +82,7 @@ async fn byzantine_author_does_not_reply_to_header_repair_requests() {
         rx_proposals,
         test_metrics(),
         BatchConfig::default(),
+        None,
         suppressed,
         None,
     );

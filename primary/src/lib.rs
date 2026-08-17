@@ -25,5 +25,5 @@ mod common;
 pub use crate::error::DagError;
 pub use crate::messages::{Ack, Certificate, Header};
 pub use crate::primary::{
-    Height, Primary, PrimaryMessage, PrimaryWorkerMessage, WorkerPrimaryMessage,
+    channel_auth, Height, Primary, PrimaryMessage, PrimaryWorkerMessage, WorkerPrimaryMessage,
 };

@@ -21,7 +21,9 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, sleep_until, Duration, Instant};
 use tokio_util::codec::Framed;
 
-use crate::codec::frame_codec;
+use crate::channel_auth::{ChannelAuth, Role};
+use crate::codec::{authenticated_frame_codec, frame_codec, AuthCodec};
+use crate::receiver::record_auth_frame;
 
 #[cfg(test)]
 #[path = "tests/reliable_sender_tests.rs"]
@@ -86,6 +88,8 @@ pub struct ReliableSender {
     retry_backoff_max_ms: u64,
     /// Queue depth at which volatile sends are shed. Zero disables shedding.
     volatile_soft_cap: usize,
+    /// Pairwise channel keys, when channel authentication is enabled.
+    auth: Option<Arc<ChannelAuth>>,
 }
 
 impl std::default::Default for ReliableSender {
@@ -106,6 +110,7 @@ impl ReliableSender {
             drop_map: None,
             retry_backoff_max_ms: DEFAULT_RETRY_BACKOFF_MAX_MS,
             volatile_soft_cap: 0,
+            auth: None,
         }
     }
 
@@ -151,6 +156,15 @@ impl ReliableSender {
         self
     }
 
+    /// Attach pairwise channel keys before spawning connections.
+    ///
+    /// Only destinations this map covers are authenticated, which leaves client and
+    /// same-host connections untouched without a decision at each call site.
+    pub fn with_channel_auth(mut self, auth: Option<Arc<ChannelAuth>>) -> Self {
+        self.auth = auth;
+        self
+    }
+
     /// Spawn a connection task.
     fn spawn_connection(&self, address: SocketAddr) -> Sender<InnerMessage> {
         let (tx, rx) = channel(100_000);
@@ -164,6 +178,7 @@ impl ReliableSender {
             self.reconnect_events.clone(),
             self.drop_map.clone(),
             self.retry_backoff_max_ms,
+            self.auth.clone(),
         );
         tx
     }
@@ -484,6 +499,8 @@ struct Connection {
     retry_backoff_max_ms: u64,
     /// Whether this connection has failed before.
     had_failure: bool,
+    /// Pairwise channel keys, when channel authentication is enabled.
+    auth: Option<Arc<ChannelAuth>>,
 }
 
 impl Connection {
@@ -497,6 +514,7 @@ impl Connection {
         reconnect_events: Option<Sender<SocketAddr>>,
         drop_map: Option<DirtyMap>,
         retry_backoff_max_ms: u64,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -511,6 +529,7 @@ impl Connection {
                 drop_map,
                 retry_backoff_max_ms,
                 had_failure: false,
+                auth,
             }
             .run()
             .await;
@@ -520,18 +539,48 @@ impl Connection {
     /// Length-delimited frame prefix size.
     const FRAME_PREFIX_LEN: u64 = 4;
 
-    fn record_bytes_sent(&self, len: usize) {
-        if let Some(metrics) = &self.metrics {
-            metrics
-                .bytes_sent_total
-                .inc_by(len as u64 + Self::FRAME_PREFIX_LEN);
+    /// Record one physical wire frame.
+    fn record_sent(&self, len: usize, authenticated: bool) {
+        let Some(metrics) = &self.metrics else { return };
+        metrics
+            .bytes_sent_total
+            .inc_by(len as u64 + Self::FRAME_PREFIX_LEN);
+        metrics.network_frames_sent_total.inc();
+        if authenticated {
+            record_auth_frame(metrics, "sent", len);
         }
     }
 
-    /// Record one physical wire frame.
-    fn record_frame_sent(&self) {
-        if let Some(metrics) = &self.metrics {
-            metrics.network_frames_sent_total.inc();
+    /// Connects and, on an authenticated destination, binds the connection to the peer's
+    /// committee identity.
+    ///
+    /// The tag is applied by the codec, so a payload requeued from a session that failed
+    /// is re-tagged under the new session's key and counter when it goes out again.
+    async fn connect(&self, retry: u16) -> Result<(TcpStream, AuthCodec), NetworkError> {
+        let mut stream = TcpStream::connect(self.address)
+            .await
+            .map_err(|e| NetworkError::FailedToConnect(self.address, retry, e))?;
+        // Disable Nagle buffering for small protocol frames.
+        let _ = stream.set_nodelay(true);
+
+        let Some((auth, index)) = self
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.peer_index(&self.address).map(|index| (auth, index)))
+        else {
+            return Ok((stream, frame_codec()));
+        };
+        match auth.handshake_dialer(&mut stream, index).await {
+            Ok(key) => Ok((stream, authenticated_frame_codec(key, Role::Dialer))),
+            Err(e) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .channel_auth_failures_total
+                        .with_label_values(&["dialer"])
+                        .inc();
+                }
+                Err(NetworkError::ChannelAuthFailed(self.address, e))
+            }
         }
     }
 
@@ -551,10 +600,8 @@ impl Connection {
         let mut delay = self.retry_delay;
         let mut retry = 0;
         loop {
-            match TcpStream::connect(self.address).await {
-                Ok(stream) => {
-                    // Disable Nagle buffering for small protocol frames.
-                    let _ = stream.set_nodelay(true);
+            match self.connect(retry).await {
+                Ok((stream, codec)) => {
                     debug!("Outgoing connection established with {}", self.address);
 
                     if self.had_failure {
@@ -566,13 +613,13 @@ impl Connection {
                     delay = self.retry_delay;
                     retry = 0;
 
-                    let error = self.keep_alive(stream).await;
+                    let error = self.keep_alive(stream, codec).await;
                     self.had_failure = true;
                     warn!("{}", error);
                 }
                 Err(e) => {
                     self.had_failure = true;
-                    warn!("{}", NetworkError::FailedToConnect(self.address, retry, e));
+                    warn!("{}", e);
                     let timer = sleep(Duration::from_millis(delay));
                     tokio::pin!(timer);
 
@@ -607,11 +654,11 @@ impl Connection {
     }
 
     /// Transmit messages using the immediate or delayed path.
-    async fn keep_alive(&mut self, stream: TcpStream) -> NetworkError {
+    async fn keep_alive(&mut self, stream: TcpStream, codec: AuthCodec) -> NetworkError {
         if self.extra_latency.is_zero() {
-            self.keep_alive_immediate(stream).await
+            self.keep_alive_immediate(stream, codec).await
         } else {
-            self.keep_alive_delayed(stream).await
+            self.keep_alive_delayed(stream, codec).await
         }
     }
 
@@ -671,14 +718,15 @@ impl Connection {
     }
 
     /// Transmit without an artificial delay. Batching occurs before this loop.
-    async fn keep_alive_immediate(&mut self, stream: TcpStream) -> NetworkError {
+    async fn keep_alive_immediate(&mut self, stream: TcpStream, codec: AuthCodec) -> NetworkError {
         let mut pending_replies: VecDeque<BufferedEntry> = VecDeque::new();
         let mut durable_coalescer: Coalescer<oneshot::Sender<Bytes>> = Coalescer::new();
         let mut durable_deadline: Option<Instant> = None;
         let mut volatile_coalescer: Coalescer<u64> = Coalescer::new();
         let mut volatile_deadline: Option<Instant> = None;
 
-        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
+        let authenticated = codec.is_authenticated();
+        let (mut writer, mut reader) = Framed::new(stream, codec).split();
         let error = 'connection: loop {
             while let Some((data, handlers, key)) = self.buffer.pop_front() {
                 if all_closed(&handlers) {
@@ -687,8 +735,7 @@ impl Connection {
 
                 match writer.send(data.clone()).await {
                     Ok(()) => {
-                        self.record_bytes_sent(data.len());
-                        self.record_frame_sent();
+                        self.record_sent(data.len(), authenticated);
                         pending_replies.push_back((data, handlers, key));
                     }
                     Err(e) => {
@@ -765,7 +812,7 @@ impl Connection {
     }
 
     /// Transmit with a fixed per-connection delay.
-    async fn keep_alive_delayed(&mut self, stream: TcpStream) -> NetworkError {
+    async fn keep_alive_delayed(&mut self, stream: TcpStream, codec: AuthCodec) -> NetworkError {
         let mut pending_replies: VecDeque<BufferedEntry> = VecDeque::new();
         let mut delay_queue: VecDeque<(Instant, Bytes, ReplyTargets, VolatileKey)> =
             VecDeque::new();
@@ -774,7 +821,8 @@ impl Connection {
         let mut volatile_coalescer: Coalescer<u64> = Coalescer::new();
         let mut volatile_deadline: Option<Instant> = None;
 
-        let (mut writer, mut reader) = Framed::new(stream, frame_codec()).split();
+        let authenticated = codec.is_authenticated();
+        let (mut writer, mut reader) = Framed::new(stream, codec).split();
         let error = 'connection: loop {
             while let Some((data, handlers, key)) = self.buffer.pop_front() {
                 if all_closed(&handlers) {
@@ -800,8 +848,7 @@ impl Connection {
                     }
                     match writer.send(data.clone()).await {
                         Ok(()) => {
-                            self.record_bytes_sent(data.len());
-                            self.record_frame_sent();
+                            self.record_sent(data.len(), authenticated);
                             pending_replies.push_back((data, handlers, key));
                         }
                         Err(e) => {

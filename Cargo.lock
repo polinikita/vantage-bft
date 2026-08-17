@@ -971,7 +971,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bincode",
+ "blake3",
  "bytes",
+ "crypto",
  "futures",
  "libc",
  "log",

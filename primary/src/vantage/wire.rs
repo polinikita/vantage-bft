@@ -7,7 +7,7 @@ use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{with_public_key_index_codec, PublicKey, PublicKeyIndexCodec, PublicKeyIndexError};
 use metrics::Metrics;
-use network::{BatchConfig, CancelHandler, DirtyMap, ReliableSender, SimpleSender};
+use network::{BatchConfig, CancelHandler, ChannelAuth, DirtyMap, ReliableSender, SimpleSender};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -558,18 +558,22 @@ pub(crate) fn spawn_resume_sender(
     chunk_interval_ms: u64,
     replay_serve_max_bytes: usize,
     retry_backoff_max_ms: u64,
+    auth: Option<Arc<ChannelAuth>>,
 ) -> ResumeSenders {
     let (lane_tx, lane_rx) = mpsc::channel(RESUME_LANE_CHANNEL_CAPACITY);
     let max_reserved_bytes = replay_serve_max_bytes.saturating_mul(2).max(1);
     let (replay_tx, replay_rx) = ReplaySender::channel(max_reserved_bytes, codec.clone());
     let sequence_latency = latency_map.clone();
     let sequence_metrics = metrics.clone();
+    let sequence_auth = auth.clone();
     let mut messages = SimpleSender::new()
         .with_latency(latency_map.clone())
-        .with_batching(batch);
+        .with_batching(batch)
+        .with_channel_auth(auth.clone());
     let mut replay = ReliableSender::new()
         .with_latency(latency_map)
         .with_batching(batch)
+        .with_channel_auth(auth)
         .with_retry_backoff_max_ms(retry_backoff_max_ms);
     if let Some(m) = metrics {
         messages = messages.with_metrics(m.clone());
@@ -589,7 +593,8 @@ pub(crate) fn spawn_resume_sender(
     let (sequence_tx, sequence_rx) = mpsc::channel(SEQUENCE_SEND_CHANNEL_CAPACITY);
     let mut sequence_messages = SimpleSender::new()
         .with_latency(sequence_latency)
-        .with_batching(batch);
+        .with_batching(batch)
+        .with_channel_auth(sequence_auth);
     if let Some(m) = sequence_metrics {
         sequence_messages = sequence_messages.with_metrics(m);
     }

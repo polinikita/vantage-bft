@@ -8,7 +8,7 @@ use crypto::PublicKey;
 use crypto::{Blake3Hasher, Digest};
 use log::debug;
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, ChannelAuth, SimpleSender};
 use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
@@ -89,6 +89,7 @@ impl BatchMaker {
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -105,7 +106,8 @@ impl BatchMaker {
                 network: SimpleSender::new()
                     .with_latency(latency_map)
                     .with_metrics(metrics.clone())
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    .with_channel_auth(auth),
                 metrics,
                 loop_ticks: 0,
             }

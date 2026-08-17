@@ -25,7 +25,7 @@ use config::{Committee, Parameters, Protocol, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use log::info;
 use metrics::{spawn_queue_sampler, start_prometheus_server, MetricReporter, Metrics, StoreProbe};
-use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
+use network::{ChannelAuth, MessageHandler, Receiver as NetworkReceiver, Writer};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -310,6 +310,34 @@ impl WorkerPrimaryMessage {
     }
 }
 
+/// Builds the process-wide channel-authentication context, or `None` when disabled.
+///
+/// Shared by the primary and the worker: both hold a committee, their own identity, and
+/// the parameter document that carries the seed.
+pub fn channel_auth(
+    name: &PublicKey,
+    committee: &Committee,
+    parameters: &Parameters,
+) -> Option<Arc<ChannelAuth>> {
+    let seed = parameters
+        .channel_auth_seed_bytes()
+        .unwrap_or_else(|error| panic!("invalid channel-authentication configuration: {error}"))?;
+    let index = committee
+        .index_of(name)
+        .expect("Our public key is not in the committee") as u8;
+    let peers = committee.peer_channel_indices(name);
+    info!(
+        "Channel authentication enabled: {} peer address(es) authenticated",
+        peers.len()
+    );
+    Some(Arc::new(ChannelAuth::new(
+        &seed,
+        index,
+        committee.size(),
+        peers,
+    )))
+}
+
 pub struct Primary;
 
 impl Primary {
@@ -399,6 +427,11 @@ impl Primary {
             max_delay_ms: parameters.batch_max_delay_ms,
         };
 
+        // Derive the pairwise channel keys once. Senders authenticate the peer addresses
+        // this covers and leave every other destination alone; peer listeners are handed
+        // the same value and refuse a connection that cannot produce a valid tag.
+        let channel_auth = channel_auth(&name, &committee, &parameters);
+
         match parameters.protocol {
             Protocol::Vantage => {
                 // Start the Vantage core and worker-facing receiver.
@@ -417,6 +450,7 @@ impl Primary {
                     Some(metrics.clone()),
                     rx_our_digests,
                     tx_output,
+                    channel_auth.clone(),
                 );
 
                 // Route primary messages to Vantage.
@@ -450,6 +484,7 @@ impl Primary {
                     true,
                     parameters.batch_messages,
                     "primary_to_primary",
+                    channel_auth.clone(),
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -476,6 +511,8 @@ impl Primary {
                     false,
                     parameters.batch_messages,
                     "worker_to_primary",
+                    // Our own workers reach us over a same-host link, which the model does not cover.
+                    None,
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -505,6 +542,7 @@ impl Primary {
                     Some(metrics.clone()),
                     rx_our_digests,
                     tx_output,
+                    channel_auth.clone(),
                 );
 
                 // Route primary messages to Simple-IT.
@@ -527,6 +565,7 @@ impl Primary {
                     true,
                     parameters.batch_messages,
                     "primary_to_primary",
+                    channel_auth.clone(),
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -553,6 +592,8 @@ impl Primary {
                     false,
                     parameters.batch_messages,
                     "worker_to_primary",
+                    // Our own workers reach us over a same-host link, which the model does not cover.
+                    None,
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -615,6 +656,7 @@ impl Primary {
                     true,
                     parameters.batch_messages,
                     "primary_to_primary",
+                    channel_auth.clone(),
                 );
                 info!(
                     "Primary {} listening to primary messages on {}",
@@ -641,6 +683,8 @@ impl Primary {
                     false,
                     parameters.batch_messages,
                     "worker_to_primary",
+                    // Our own workers reach us over a same-host link, which the model does not cover.
+                    None,
                 );
                 info!(
                     "Primary {} listening to workers messages on {}",
@@ -706,6 +750,7 @@ impl Primary {
                     parameters.withhold_window.clone(),
                     metrics.clone(),
                     batch,
+                    channel_auth.clone(),
                     // Reconnect backoff for the primary network.
                     parameters.retry_backoff_max_ms,
                 );
@@ -722,6 +767,7 @@ impl Primary {
                     synchronizer,
                     metrics.clone(),
                     batch,
+                    channel_auth.clone(),
                 );
 
                 // Track the latest round for garbage collection.
@@ -734,6 +780,7 @@ impl Primary {
                     tx_certificates_loopback.clone(),
                     metrics.clone(),
                     batch,
+                    channel_auth.clone(),
                 );
 
                 // Store batch digests used to validate headers.
@@ -753,6 +800,7 @@ impl Primary {
                     tx_header_waiter_instances,
                     metrics.clone(),
                     batch,
+                    channel_auth.clone(),
                 );
 
                 // Build headers from parent certificates and worker batches.
@@ -777,6 +825,7 @@ impl Primary {
                     rx_proposal_header_requests,
                     metrics.clone(),
                     batch,
+                    channel_auth.clone(),
                     suppressed_repair_destinations,
                     parameters.withhold_window.clone(),
                 );

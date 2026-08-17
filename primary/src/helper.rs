@@ -6,7 +6,7 @@ use config::Committee;
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, ChannelAuth, SimpleSender};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -51,6 +51,7 @@ impl Helper {
         rx_proposal_headers: Receiver<(Proposal, Height, PublicKey)>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
         suppressed_repair_destinations: Option<HashSet<PublicKey>>,
         withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
     ) {
@@ -63,7 +64,8 @@ impl Helper {
                 rx_proposal_headers,
                 network: SimpleSender::new()
                     .with_metrics(metrics.clone())
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    .with_channel_auth(auth),
                 metrics,
                 suppressed_repair_destinations,
                 withhold_window,

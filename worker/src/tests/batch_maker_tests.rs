@@ -51,6 +51,7 @@ async fn make_batch() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
     );
 
     tx_transaction.send(transaction()).await.unwrap();
@@ -82,6 +83,7 @@ async fn batch_timeout() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
     );
 
     tx_transaction.send(transaction()).await.unwrap();
@@ -115,6 +117,7 @@ async fn pipeline_metric_observes_every_transaction() {
         std::collections::HashMap::new(),
         metrics,
         BatchConfig::default(),
+        None,
     );
 
     let submitted_millis = SystemTime::now()

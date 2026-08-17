@@ -7,7 +7,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{debug, error};
 use metrics::Metrics;
-use network::{BatchConfig, SimpleSender};
+use network::{BatchConfig, ChannelAuth, SimpleSender};
 use primary::PrimaryWorkerMessage;
 use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
@@ -170,6 +170,7 @@ impl Synchronizer {
         latency_map: HashMap<SocketAddr, Duration>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -184,7 +185,8 @@ impl Synchronizer {
                 network: SimpleSender::new()
                     .with_latency(latency_map)
                     .with_metrics(metrics.clone())
-                    .with_batching(batch),
+                    .with_batching(batch)
+                    .with_channel_auth(auth),
                 round: Round::default(),
                 pending: HashMap::new(),
             }

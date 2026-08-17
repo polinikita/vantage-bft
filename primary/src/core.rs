@@ -20,7 +20,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn};
 use metrics::Metrics;
-use network::{BatchConfig, CancelHandler, ReliableSender};
+use network::{BatchConfig, CancelHandler, ChannelAuth, ReliableSender};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -280,6 +280,7 @@ impl Core {
         withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
         metrics: Arc<Metrics>,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
         retry_backoff_max_ms: u64,
     ) {
         assert!(k > 0, "Autobahn parallel window k must be positive");
@@ -296,6 +297,7 @@ impl Core {
                     &latency_map,
                     late_header_delay_ms,
                     batch,
+                    auth.clone(),
                     retry_backoff_max_ms,
                     Some(metrics.clone()),
                 )
@@ -330,6 +332,7 @@ impl Core {
                     .with_latency(latency_map)
                     .with_metrics(metrics)
                     .with_batching(batch)
+                    .with_channel_auth(auth)
                     .with_retry_backoff_max_ms(retry_backoff_max_ms),
                 withheld_header_dests,
                 late_header,

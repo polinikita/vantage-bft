@@ -54,6 +54,7 @@ async fn synchronize() {
         std::collections::HashMap::new(),
         metrics,
         BatchConfig::default(),
+        None,
     );
 
     let (target, _) = keys.pop().unwrap();
@@ -93,6 +94,7 @@ async fn precommit_retries_remain_author_targeted() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
     );
 
     let missing = vec![batch_digest()];
@@ -145,6 +147,7 @@ async fn committed_data_materialization_uses_random_peers() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
     );
 
     let missing = vec![batch_digest()];
@@ -195,6 +198,7 @@ async fn optimistic_synchronize_targets_the_proposal_leader() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
     );
 
     let (leader, _) = keys.pop().unwrap();
@@ -240,6 +244,7 @@ async fn optimistic_synchronize_retargets_a_pending_batch_to_the_new_leader() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
     );
 
     let missing = vec![batch_digest()];
@@ -303,6 +308,7 @@ async fn proof_source_synchronize_targets_every_and_only_named_holder() {
         std::collections::HashMap::new(),
         Metrics::new(&prometheus::Registry::new()).0,
         BatchConfig::default(),
+        None,
     );
 
     let missing = vec![batch_digest()];

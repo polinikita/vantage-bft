@@ -21,7 +21,7 @@ use config::{Committee, Parameters, Protocol, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::Metrics;
-use network::{BatchConfig, MessageHandler, ReliableSender, SimpleSender, Writer};
+use network::{BatchConfig, ChannelAuth, MessageHandler, ReliableSender, SimpleSender, Writer};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -218,9 +218,10 @@ impl SimpleItCore {
         metrics: Option<Arc<Metrics>>,
         rx_our_digests: Receiver<(Digest, WorkerId)>,
         tx_output: Sender<Header>,
+        auth: Option<Arc<ChannelAuth>>,
     ) -> (Sender<Inbound>, SharedAckAggregator) {
         let (core, rx_simpleit, rx_payload_ready, tx_simpleit, ack_aggregator) =
-            Self::build(name, committee, parameters, store, metrics, tx_output);
+            Self::build(name, committee, parameters, store, metrics, tx_output, auth);
         tokio::spawn(core.run(rx_simpleit, rx_our_digests, rx_payload_ready));
         (tx_simpleit, ack_aggregator)
     }
@@ -233,6 +234,7 @@ impl SimpleItCore {
         store: Store,
         metrics: Option<Arc<Metrics>>,
         tx_output: Sender<Header>,
+        auth: Option<Arc<ChannelAuth>>,
     ) -> BuildOutput {
         let (tx_simpleit, rx_simpleit) = channel(CHANNEL_CAPACITY);
         let (tx_payload_ready, rx_payload_ready) = channel(CHANNEL_CAPACITY);
@@ -348,6 +350,7 @@ impl SimpleItCore {
                 &latency_map,
                 parameters.late_header_delay_ms,
                 batch,
+                auth.clone(),
                 parameters.retry_backoff_max_ms,
                 core_metrics.clone(),
             )
@@ -368,6 +371,7 @@ impl SimpleItCore {
             parameters.replay_chunk_interval_ms,
             parameters.replay_serve_max_bytes,
             parameters.retry_backoff_max_ms,
+            auth.clone(),
         );
 
         let core = Self {
@@ -383,6 +387,7 @@ impl SimpleItCore {
                     let mut s = ReliableSender::new()
                         .with_latency(latency_map.clone())
                         .with_batching(batch)
+                        .with_channel_auth(auth.clone())
                         .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms);
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
@@ -392,7 +397,8 @@ impl SimpleItCore {
                 worker_network: {
                     let mut s = SimpleSender::new()
                         .with_latency(latency_map)
-                        .with_batching(batch);
+                        .with_batching(batch)
+                        .with_channel_auth(auth.clone());
                     if let Some(m) = &core_metrics {
                         s = s.with_metrics(m.clone());
                     }
@@ -1052,6 +1058,7 @@ mod tests {
                 store,
                 Some(metrics),
                 tx_output,
+                None,
             );
         (core, rx_output)
     }

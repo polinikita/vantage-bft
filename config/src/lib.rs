@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crypto::{generate_production_keypair, PublicKey, SecretKey};
+use crypto::{decode_base64_key, generate_production_keypair, PublicKey, SecretKey};
 use log::{info, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -429,6 +429,19 @@ pub struct Parameters {
     /// Replay episode and in-flight stream lifetime, in milliseconds.
     #[serde(default = "default_replay_episode_max_ms")]
     pub replay_episode_max_ms: u64,
+    /// Whether cross-validator links carry a per-frame authentication tag.
+    ///
+    /// The model assumes authenticated point-to-point channels. Off by default so that
+    /// runs stay comparable with those collected before this existed.
+    #[serde(default)]
+    pub channel_auth: bool,
+    /// Base64 seed, 32 bytes, that pairwise channel keys are derived from.
+    ///
+    /// A stand-in for out-of-band key provisioning: a deployment would install pairwise
+    /// keys directly rather than expand them from shared material. Required whenever
+    /// `channel_auth` is set.
+    #[serde(default)]
+    pub channel_auth_seed: Option<String>,
 }
 
 fn default_batch_messages() -> bool {
@@ -863,6 +876,8 @@ impl Default for Parameters {
             replay_serve_max_bytes: default_replay_serve_max_bytes(),
             outbox_max_bytes: default_outbox_max_bytes(),
             replay_episode_max_ms: default_replay_episode_max_ms(),
+            channel_auth: false,
+            channel_auth_seed: None,
         }
     }
 }
@@ -1057,6 +1072,25 @@ impl Parameters {
                 self.late_header_delay_ms
             );
         }
+    }
+
+    /// Seed that pairwise channel keys are derived from, or `None` when channel
+    /// authentication is disabled.
+    ///
+    /// A missing or malformed seed with authentication enabled is a configuration error
+    /// rather than a reason to fall back to a constant: every party must expand the same
+    /// material or no pair can agree on a key.
+    pub fn channel_auth_seed_bytes(&self) -> Result<Option<[u8; 32]>, String> {
+        if !self.channel_auth {
+            return Ok(None);
+        }
+        let encoded = self
+            .channel_auth_seed
+            .as_deref()
+            .ok_or_else(|| "channel_auth is set but channel_auth_seed is missing".to_string())?;
+        decode_base64_key(encoded)
+            .map(Some)
+            .map_err(|e| format!("channel_auth_seed is not 32 base64-encoded bytes: {e}"))
     }
 
     /// Validate the finite-delay Byzantine header-publication experiment.
@@ -1439,6 +1473,30 @@ impl Committee {
         out
     }
 
+    /// Committee index of every peer address that channel authentication covers.
+    ///
+    /// Only links between validators are listed: the consensus and primary planes, and
+    /// worker-to-worker data dissemination. Client transaction submission and the
+    /// same-host primary-to-worker links are deliberately absent — they are one trust
+    /// domain, and the model's pairwise channels are between parties. A destination
+    /// missing from this map is therefore never authenticated, which keeps the decision
+    /// here rather than at every sender.
+    pub fn peer_channel_indices(&self, myself: &PublicKey) -> HashMap<SocketAddr, u8> {
+        let mut out = HashMap::new();
+        for (index, (name, authority)) in self.authorities.iter().enumerate() {
+            if name == myself {
+                continue;
+            }
+            let index = index as u8;
+            out.insert(authority.consensus.consensus_to_consensus, index);
+            out.insert(authority.primary.primary_to_primary, index);
+            for worker in authority.workers.values() {
+                out.insert(worker.worker_to_worker, index);
+            }
+        }
+        out
+    }
+
     /// Builds one-way latency entries for every other authority.
     pub fn latency_map(
         &self,
@@ -1717,6 +1775,83 @@ mod tests {
         };
         seamless.reconcile_protocol();
         assert!(!seamless.all_to_all);
+    }
+
+    #[test]
+    fn channel_auth_seed_is_required_and_must_be_thirty_two_bytes() {
+        let disabled = Parameters::default();
+        assert_eq!(disabled.channel_auth_seed_bytes(), Ok(None));
+
+        // Enabled without a seed: no pair could agree on a key, so this is an error
+        // rather than a silent fallback to a constant.
+        let missing = Parameters {
+            channel_auth: true,
+            ..Parameters::default()
+        };
+        assert!(missing.channel_auth_seed_bytes().is_err());
+
+        let short = Parameters {
+            channel_auth: true,
+            channel_auth_seed: Some(crypto::encode_base64_key(&[3; 32])[..8].to_string()),
+            ..Parameters::default()
+        };
+        assert!(short.channel_auth_seed_bytes().is_err());
+
+        let valid = Parameters {
+            channel_auth: true,
+            channel_auth_seed: Some(crypto::encode_base64_key(&[3; 32])),
+            ..Parameters::default()
+        };
+        assert_eq!(valid.channel_auth_seed_bytes(), Ok(Some([3; 32])));
+    }
+
+    /// Parameter documents written before channel authentication existed must still load,
+    /// so runs recorded earlier stay reproducible.
+    #[test]
+    fn channel_auth_defaults_to_off_when_absent() {
+        let mut document: serde_json::Value = serde_json::to_value(Parameters::default()).unwrap();
+        let fields = document.as_object_mut().unwrap();
+        assert!(fields.remove("channel_auth").is_some());
+        assert!(fields.remove("channel_auth_seed").is_some());
+
+        let parameters: Parameters = serde_json::from_value(document).unwrap();
+        assert!(!parameters.channel_auth);
+        assert_eq!(parameters.channel_auth_seed_bytes(), Ok(None));
+    }
+
+    /// Authentication covers links between validators. Client submission and the same-host
+    /// primary-to-worker links are excluded, and a destination missing from the map is
+    /// never authenticated.
+    #[test]
+    fn peer_channel_indices_cover_only_cross_validator_links() {
+        let (committee, keys) = Committee::local_benchmark(4, 1, 20_000);
+        let myself = keys[1].name;
+        let peers = committee.peer_channel_indices(&myself);
+
+        // Three listeners for each of the three other authorities.
+        assert_eq!(peers.len(), 9);
+
+        for (index, (name, authority)) in committee.authorities.iter().enumerate() {
+            let worker = &authority.workers[&0];
+            if name == &myself {
+                assert!(!peers.contains_key(&authority.primary.primary_to_primary));
+                assert!(!peers.contains_key(&worker.worker_to_worker));
+                continue;
+            }
+            let index = index as u8;
+            assert_eq!(
+                peers.get(&authority.primary.primary_to_primary),
+                Some(&index)
+            );
+            assert_eq!(
+                peers.get(&authority.consensus.consensus_to_consensus),
+                Some(&index)
+            );
+            assert_eq!(peers.get(&worker.worker_to_worker), Some(&index));
+            assert!(!peers.contains_key(&worker.transactions));
+            assert!(!peers.contains_key(&worker.primary_to_worker));
+            assert!(!peers.contains_key(&authority.primary.worker_to_primary));
+        }
     }
 
     #[test]

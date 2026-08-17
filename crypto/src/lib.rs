@@ -25,6 +25,53 @@ pub type CryptoError = ed25519::Error;
 /// 32-byte output directly, matching `Digest`'s width with no truncation.
 pub type Blake3Hasher = blake3::Hasher;
 
+/// Domain separator for pairwise channel-authentication keys.
+///
+/// `blake3::derive_key` requires a hardcoded context, so the committee seed and the
+/// party indices travel in the key material instead.
+const CHANNEL_KEY_CONTEXT: &str = "vantage-channel-v1";
+
+/// Encodes 32 bytes of out-of-band key material for a configuration file.
+pub fn encode_base64_key(key: &[u8; 32]) -> String {
+    BASE64_STANDARD.encode(&key[..])
+}
+
+/// Decodes 32 bytes of out-of-band key material from a configuration file.
+pub fn decode_base64_key(encoded: &str) -> Result<[u8; 32], base64::DecodeError> {
+    let bytes = BASE64_STANDARD.decode(encoded)?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| base64::DecodeError::InvalidLength(bytes.len()))
+}
+
+/// Derives the static key shared by committee members `i` and `j`.
+///
+/// The pair is unordered: both parties compute the same key without agreeing on who
+/// dialed. `seed` stands in for out-of-band key provisioning.
+pub fn channel_root_key(seed: &[u8; 32], i: u8, j: u8) -> [u8; 32] {
+    let mut material = [0u8; 34];
+    material[..32].copy_from_slice(seed);
+    material[32] = i.min(j);
+    material[33] = i.max(j);
+    blake3::derive_key(CHANNEL_KEY_CONTEXT, &material)
+}
+
+/// Binds a static pairwise key to one connection through both parties' salts.
+///
+/// Salts are ordered by role rather than by index, which both ends know without
+/// negotiation. Fresh salts per connection make the per-frame counters safe to reset.
+pub fn channel_session_key(
+    root: &[u8; 32],
+    dialer_salt: &[u8; 16],
+    listener_salt: &[u8; 16],
+) -> [u8; 32] {
+    let mut material = [0u8; 32];
+    material[..16].copy_from_slice(dialer_salt);
+    material[16..].copy_from_slice(listener_salt);
+    *blake3::keyed_hash(root, &material).as_bytes()
+}
+
 /// Represents a hash digest (32 bytes).
 #[derive(Hash, PartialEq, Default, Eq, Clone, Deserialize, Serialize, Ord, PartialOrd)]
 pub struct Digest(pub [u8; 32]);

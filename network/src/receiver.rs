@@ -14,16 +14,17 @@ use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::Framed;
 
-use crate::codec::frame_codec;
+use crate::channel_auth::{ChannelAuth, Role};
+use crate::codec::{authenticated_frame_codec, frame_codec, AuthCodec};
 
 #[cfg(test)]
 #[path = "tests/receiver_tests.rs"]
 pub mod receiver_tests;
 
 /// Writer half of a framed TCP connection.
-pub type Writer = SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>;
+pub type Writer = SplitSink<Framed<TcpStream, AuthCodec>, Bytes>;
 
 #[async_trait]
 pub trait MessageHandler: Clone + Send + Sync + 'static {
@@ -47,12 +48,14 @@ pub struct Receiver<Handler: MessageHandler> {
     batch: bool,
     /// Stable listener-role label for current inbound connection gauges.
     listener: &'static str,
+    /// Pairwise channel keys. When set, every connection must authenticate.
+    auth: Option<Arc<ChannelAuth>>,
 }
 
 impl<Handler: MessageHandler> Receiver<Handler> {
     /// Spawns a receiver for incoming peer connections.
     pub fn spawn(address: SocketAddr, handler: Handler) {
-        Self::spawn_full(address, handler, None, false, false, "unlabeled");
+        Self::spawn_full(address, handler, None, false, false, "unlabeled", None);
     }
 
     /// Spawns a receiver with optional per-frame byte metrics.
@@ -61,10 +64,14 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         handler: Handler,
         metrics: Option<Arc<Metrics>>,
     ) {
-        Self::spawn_full(address, handler, metrics, false, false, "unlabeled");
+        Self::spawn_full(address, handler, metrics, false, false, "unlabeled", None);
     }
 
     /// Full receiver configuration. Sender and receiver batching must match.
+    ///
+    /// `auth` is set only on listeners that serve other committee members. Client and
+    /// same-host listeners pass `None` and stay unauthenticated.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_full(
         address: SocketAddr,
         handler: Handler,
@@ -72,6 +79,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         acks: bool,
         batch: bool,
         listener: &'static str,
+        auth: Option<Arc<ChannelAuth>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -81,6 +89,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 acks,
                 batch,
                 listener,
+                auth,
             }
             .run()
             .await;
@@ -116,6 +125,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                     batch: self.batch,
                     listener: self.listener,
                     peers: peers.clone(),
+                    auth: self.auth.clone(),
                 },
             )
             .await;
@@ -130,6 +140,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         config: RunnerConfig,
     ) {
         tokio::spawn(async move {
+            let mut socket = socket;
             let rtt_micros = tcp_rtt_micros(&socket);
             let _connection = ConnectionMetricGuard::new(
                 config.metrics.clone(),
@@ -138,8 +149,25 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 config.peers,
                 rtt_micros,
             );
-            let transport = Framed::new(socket, frame_codec());
-            let (mut writer, mut reader) = transport.split();
+
+            // Bind the connection to a committee identity before dispatching anything from
+            // it. A peer that cannot produce a valid tag never reaches the handler.
+            let codec = match &config.auth {
+                Some(auth) => match auth.handshake_listener(&mut socket).await {
+                    Ok((index, key)) => {
+                        debug!("Authenticated connection from committee member {}", index);
+                        authenticated_frame_codec(key, Role::Listener)
+                    }
+                    Err(e) => {
+                        warn!("{}", NetworkError::ChannelAuthFailed(peer, e));
+                        record_auth_failure(&config.metrics, config.listener);
+                        return;
+                    }
+                },
+                None => frame_codec(),
+            };
+            let authenticated = codec.is_authenticated();
+            let (mut writer, mut reader) = Framed::new(socket, codec).split();
             while let Some(frame) = reader.next().await {
                 match frame.map_err(|e| NetworkError::FailedToReceiveMessage(peer, e)) {
                     Ok(message) => {
@@ -147,6 +175,9 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                             metrics
                                 .bytes_received_total
                                 .inc_by(message.len() as u64 + 4);
+                            if authenticated {
+                                record_auth_frame(metrics, "received", message.len());
+                            }
                         }
                         let payload = message.freeze();
 
@@ -194,6 +225,32 @@ struct RunnerConfig {
     batch: bool,
     listener: &'static str,
     peers: Arc<PeerSessions>,
+    auth: Option<Arc<ChannelAuth>>,
+}
+
+/// Records a rejected connection: a bad hello, a timeout, or a tag that did not verify.
+fn record_auth_failure(metrics: &Option<Arc<Metrics>>, listener: &'static str) {
+    if let Some(metrics) = metrics {
+        metrics
+            .channel_auth_failures_total
+            .with_label_values(&[listener])
+            .inc();
+    }
+}
+
+/// Records one frame that carried a tag.
+///
+/// These counters exist to distinguish an authenticated run that costs little from a run
+/// in which nothing was authenticated at all.
+pub(crate) fn record_auth_frame(metrics: &Metrics, direction: &'static str, payload_len: usize) {
+    metrics
+        .channel_auth_frames_total
+        .with_label_values(&[direction])
+        .inc();
+    metrics
+        .channel_auth_bytes_total
+        .with_label_values(&[direction])
+        .inc_by(payload_len as u64);
 }
 
 #[derive(Default)]

@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use metrics::Metrics;
-use network::{BatchConfig, CancelHandler, ReliableSender};
+use network::{BatchConfig, CancelHandler, ChannelAuth, ReliableSender};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ impl DelayedHeaderSender {
         base_latency: &HashMap<SocketAddr, Duration>,
         additional_delay_ms: u64,
         batch: BatchConfig,
+        auth: Option<Arc<ChannelAuth>>,
         retry_backoff_max_ms: u64,
         metrics: Option<Arc<Metrics>>,
     ) -> Option<Self> {
@@ -42,6 +43,7 @@ impl DelayedHeaderSender {
         let mut network = ReliableSender::new()
             .with_latency(latency)
             .with_batching(batch)
+            .with_channel_auth(auth)
             .with_retry_backoff_max_ms(retry_backoff_max_ms);
         if let Some(value) = &metrics {
             network = network.with_metrics(value.clone());
