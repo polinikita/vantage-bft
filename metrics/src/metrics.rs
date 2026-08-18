@@ -332,6 +332,8 @@ pub struct Metrics {
     pub vantage_lane_resume_blocks_served: IntCounter,
     /// Resume messages rejected by the dedicated resume-sender queue.
     pub vantage_lane_resume_send_drops: IntCounter,
+    /// Responses to peer requests rejected by the dedicated serve-sender queue.
+    pub vantage_serve_send_drops_total: IntCounter,
 
     // --- Reconnect replay.
     /// Replay streams rejected by a full or closed sender queue.
@@ -1024,6 +1026,12 @@ impl Metrics {
             vantage_lane_resume_send_drops: register_int_counter_with_registry!(
                 "vantage_lane_resume_send_drops",
                 "Lane-resume messages dropped by a full or closed sender queue",
+                registry,
+            )
+            .unwrap(),
+            vantage_serve_send_drops_total: register_int_counter_with_registry!(
+                "vantage_serve_send_drops_total",
+                "Served responses dropped by a full or closed serve-sender queue",
                 registry,
             )
             .unwrap(),

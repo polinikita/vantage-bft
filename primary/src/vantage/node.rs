@@ -180,7 +180,63 @@ pub enum Inbound {
     SequenceHeaders(Vec<Header>, PublicKey),
 }
 
+/// Utilization labels indexed by `Inbound::family`; nested inside `inbound_dispatch`.
+const INBOUND_FAMILY_LABELS: [&str; 8] = [
+    "in_publish",
+    "in_echo",
+    "in_ready",
+    "in_avail",
+    "in_propose",
+    "in_control",
+    "in_serve",
+    "in_sync",
+];
+
 impl Inbound {
+    /// Returns the `INBOUND_FAMILY_LABELS` index for this input, grouped by purpose.
+    ///
+    /// The match is exhaustive so that a new variant must be classified here.
+    fn family(&self) -> usize {
+        match self {
+            Inbound::Publish(_, _) => 0,
+            Inbound::Echo(_) | Inbound::EchoSkip(_, _, _) | Inbound::EchoDigest(_) => 1,
+            Inbound::Ready(_) | Inbound::NoReady(_, _, _) | Inbound::ReadyDigest(_) => 2,
+            Inbound::Ack(_) | Inbound::AckAvailability(_) | Inbound::Avail(_, _) => 3,
+            Inbound::Propose(_) => 4,
+            Inbound::ControlInit(_, _)
+            | Inbound::ControlEcho(_, _)
+            | Inbound::ControlReady(_, _)
+            | Inbound::ControlCommit(_, _)
+            | Inbound::ControlTimeoutVote(_, _)
+            | Inbound::ControlTimeoutAccept(_, _)
+            | Inbound::Wish(_, _)
+            | Inbound::CompReport(_, _, _)
+            | Inbound::SkipVote(_, _) => 5,
+            Inbound::HeadersRequest(_, _)
+            | Inbound::LaneResume(_, _, _)
+            | Inbound::ControlFetch(_, _, _)
+            | Inbound::BodyFetch(_, _, _)
+            | Inbound::SequenceRequest(_, _)
+            | Inbound::SequenceDeltaRequest(_, _)
+            | Inbound::SequenceDeltaRangeRequest(_, _)
+            | Inbound::SequenceOutcomeRequest(_, _)
+            | Inbound::SequenceHeadersRequest(_, _) => 6,
+            Inbound::Serve(_)
+            | Inbound::ControlServe(_, _)
+            | Inbound::BodyServe(_, _)
+            | Inbound::ResumeHello(_, _)
+            | Inbound::ReplayDone(_, _, _, _)
+            | Inbound::SequenceAnnounce(_, _)
+            | Inbound::SequenceAnnounceBatch(_, _)
+            | Inbound::SequenceRecords(_, _)
+            | Inbound::SequenceDelta(_, _)
+            | Inbound::SequenceDeltaRange(_, _)
+            | Inbound::SequenceOutcome(_, _)
+            | Inbound::SequenceUnavailable(_, _)
+            | Inbound::SequenceHeaders(_, _) => 7,
+        }
+    }
+
     /// Returns whether this is a droppable request for local service.
     fn is_bulk(&self) -> bool {
         matches!(
@@ -635,6 +691,7 @@ pub struct VantageCore {
     metrics: Option<Arc<Metrics>>,
 
     ut_inbound_dispatch: Option<IntCounter>,
+    ut_inbound_family: [Option<IntCounter>; INBOUND_FAMILY_LABELS.len()],
     ut_payload_sync: Option<IntCounter>,
     ut_timer_firing: Option<IntCounter>,
     ut_effect_execution: Option<IntCounter>,
@@ -1009,6 +1066,7 @@ impl VantageCore {
                 resume_lane_tx: resume_senders.lane,
                 replay_tx: resume_senders.replay,
                 sequence_tx: resume_senders.sequence,
+                serve_tx: resume_senders.serve,
                 replay_generation: resume_senders.generation,
                 cancel_handlers: Vec::new(),
                 last_prune_len: 0,
@@ -1062,6 +1120,7 @@ impl VantageCore {
             last_gc_floor: 1,
             metrics: core_metrics,
             ut_inbound_dispatch: None,
+            ut_inbound_family: std::array::from_fn(|_| None),
             ut_payload_sync: None,
             ut_timer_firing: None,
             ut_effect_execution: None,
@@ -1395,7 +1454,14 @@ impl VantageCore {
             &mut self.ut_inbound_dispatch,
             "inbound_dispatch",
         );
+        let family = inbound.family();
+        let family_timer = Self::cached_utilization_timer(
+            &self.metrics,
+            &mut self.ut_inbound_family[family],
+            INBOUND_FAMILY_LABELS[family],
+        );
         let effects = self.dispatch_inbound(inbound, now).await;
+        drop(family_timer);
         drop(dispatch_timer);
         self.execute(effects, now).await;
     }
@@ -3676,9 +3742,10 @@ impl VantageCore {
                             .await;
                     }
                     Effect::ServeTo(peer, header) => {
-                        self.wire
-                            .send_repair_message(peer, PrimaryMessage::Header(header, true))
-                            .await
+                        let digest = header.id.clone();
+                        if !self.wire.enqueue_repair_serve(peer, header) {
+                            self.rep.unanswer(&peer, &digest);
+                        }
                     }
                     Effect::BlockCached(digest) => {
                         for (sender, r) in self.lm.retry_pending_avail(&digest) {
@@ -3956,18 +4023,17 @@ impl VantageCore {
                             .await;
                     }
 
-                    Effect::ControlServeTo(peer, view, proposal) => match proposal {
-                        ProposalOut::Single(p) => {
-                            self.wire
-                                .send_message(peer, PrimaryMessage::ControlServe(view, p))
-                                .await
+                    Effect::ControlServeTo(peer, view, proposal) => {
+                        // A dropped enqueue must release the at-most-once mark, or the
+                        // requester's repeat fetch is refused and the hole is permanent.
+                        let message = match proposal {
+                            ProposalOut::Single(p) => PrimaryMessage::ControlServe(view, p),
+                            ProposalOut::Batch(p) => PrimaryMessage::ControlServeBatch(view, p),
+                        };
+                        if !self.wire.try_enqueue_serve(peer, message) {
+                            self.control.unanswer_fetch(&peer, view);
                         }
-                        ProposalOut::Batch(p) => {
-                            self.wire
-                                .send_message(peer, PrimaryMessage::ControlServeBatch(view, p))
-                                .await
-                        }
-                    },
+                    }
                     Effect::ArmControlTimer(round, deadline) => {
                         self.control_timers.push(Reverse((deadline, round)));
                     }
@@ -3988,9 +4054,12 @@ impl VantageCore {
                             .await;
                     }
                     Effect::BodyServeTo(peer, view, proposal) => {
-                        self.wire
-                            .send_message(peer, PrimaryMessage::VantageBodyServe(view, proposal))
-                            .await;
+                        if !self.wire.try_enqueue_serve(
+                            peer,
+                            PrimaryMessage::VantageBodyServe(view, proposal),
+                        ) {
+                            self.digest_stmts.unanswer_fetch(&peer, view);
+                        }
                     }
 
                     Effect::ResumeServeTo(requester, header) => {
@@ -4069,6 +4138,39 @@ mod tests {
         ] {
             assert!(!inbound.is_bulk(), "must stay consensus-class: {inbound:?}");
         }
+    }
+
+    #[test]
+    fn each_inbound_family_owns_one_label_and_one_counter_slot() {
+        use crypto::PublicKey;
+        let k = PublicKey::default();
+        let d = Digest::default();
+
+        // One representative per family, listed in `INBOUND_FAMILY_LABELS` order.
+        let families: Vec<usize> = [
+            Inbound::Publish(k, Header::default()),
+            Inbound::EchoSkip(1, k, 1),
+            Inbound::NoReady(1, k, 1),
+            Inbound::Avail(Vec::new(), k),
+            Inbound::Propose(ProposalOut::Single(dummy_proposal())),
+            Inbound::Wish(1, k),
+            Inbound::HeadersRequest(vec![d], k),
+            Inbound::Serve(Header::default()),
+        ]
+        .iter()
+        .map(Inbound::family)
+        .collect();
+
+        assert_eq!(
+            families,
+            (0..INBOUND_FAMILY_LABELS.len()).collect::<Vec<_>>(),
+            "each family must index its own label slot"
+        );
+        assert_eq!(
+            INBOUND_FAMILY_LABELS.iter().collect::<HashSet<_>>().len(),
+            INBOUND_FAMILY_LABELS.len(),
+            "duplicate labels would merge two families in one counter"
+        );
     }
 
     use super::*;

@@ -206,6 +206,43 @@ async fn pending_request_answered_once_on_retention() {
 }
 
 #[tokio::test]
+async fn unanswer_reopens_a_serve_that_never_reached_the_transport() {
+    let all = authors();
+    let (watcher, _) = all[0];
+    let (author, _) = all[1];
+    let (requester, _) = all[2];
+    let mut repairer = new_standalone_repairer(watcher);
+    let sid = session_id(&test_committee());
+    let genesis = genesis_digest(&sid);
+
+    let block = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
+    let h = block.id.clone();
+
+    repairer.authorize((author, 1, h.clone()));
+    repairer.on_serve(block);
+    let effects = repairer.on_request(requester, h.clone());
+    assert_eq!(served_to(&effects, requester), 1);
+
+    let effects = repairer.on_request(requester, h.clone());
+    assert_eq!(served_to(&effects, requester), 0);
+
+    repairer.unanswer(&requester, &h);
+    let effects = repairer.on_request(requester, h);
+    assert_eq!(
+        served_to(&effects, requester),
+        1,
+        "a dropped serve must be servable again after its mark is cleared"
+    );
+}
+
+fn served_to(effects: &[Effect], requester: PublicKey) -> usize {
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::ServeTo(p, _) if *p == requester))
+        .count()
+}
+
+#[tokio::test]
 async fn settled_ref_is_retained_and_servable_and_leaves_pending() {
     let all = authors();
     let (watcher, _) = all[0];

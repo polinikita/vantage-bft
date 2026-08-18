@@ -170,6 +170,7 @@ pub struct Wire {
     pub(crate) resume_lane_tx: mpsc::Sender<LaneSend>,
     pub(crate) replay_tx: ReplaySender,
     pub(crate) sequence_tx: mpsc::Sender<SequenceSend>,
+    pub(crate) serve_tx: mpsc::Sender<ServeSend>,
     pub(crate) replay_generation: AtomicU64,
     pub(crate) cancel_handlers: Vec<CancelHandler>,
     pub(crate) last_prune_len: usize,
@@ -421,6 +422,37 @@ impl Wire {
         self.enqueue_resume(peer, PrimaryMessage::Header(header, false));
     }
 
+    /// Enqueues a response to a peer request off the core; returns whether it was handled.
+    ///
+    /// An unknown peer counts as handled because the direct send path also has no
+    /// destination for one.
+    pub(crate) fn try_enqueue_serve(&self, peer: PublicKey, message: PrimaryMessage) -> bool {
+        let Some(addr) = self
+            .other_primaries
+            .iter()
+            .find(|(pk, _)| *pk == peer)
+            .map(|(_, a)| *a)
+        else {
+            return true;
+        };
+        if self.serve_tx.try_send(ServeSend(addr, message)).is_err() {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_serve_send_drops_total.inc();
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Reports a suppressed destination as handled: the withhold experiment refuses the
+    /// header on purpose, so the caller must keep its at-most-once mark.
+    pub(crate) fn enqueue_repair_serve(&self, peer: PublicKey, header: Header) -> bool {
+        if self.repair_suppressed_for(&peer) {
+            return true;
+        }
+        self.try_enqueue_serve(peer, PrimaryMessage::Header(header, true))
+    }
+
     pub(crate) fn repair_suppressed_for(&self, peer: &PublicKey) -> bool {
         self.suppressed_repair_destinations
             .as_ref()
@@ -437,6 +469,8 @@ impl Wire {
 pub(crate) struct LaneSend(SocketAddr, PrimaryMessage);
 
 pub(crate) struct SequenceSend(pub(crate) SocketAddr, pub(crate) PrimaryMessage);
+
+pub(crate) struct ServeSend(SocketAddr, PrimaryMessage);
 
 #[derive(Debug)]
 pub(crate) struct ReplaySend {
@@ -536,15 +570,17 @@ impl From<ReplaySend> for ReplayStream {
 const SEQUENCE_SEND_CHANNEL_CAPACITY: usize = 256;
 const RESUME_LANE_CHANNEL_CAPACITY: usize = 4096;
 const REPLAY_SEND_CHANNEL_CAPACITY: usize = 64;
+const SERVE_SEND_CHANNEL_CAPACITY: usize = 4096;
 
 pub(crate) struct ResumeSenders {
     pub(crate) lane: mpsc::Sender<LaneSend>,
     pub(crate) replay: ReplaySender,
     pub(crate) sequence: mpsc::Sender<SequenceSend>,
+    pub(crate) serve: mpsc::Sender<ServeSend>,
     pub(crate) generation: AtomicU64,
 }
 
-/// Starts isolated lane, replay, and sequence senders with bounded ingress queues.
+/// Starts isolated lane, replay, sequence, and serve senders with bounded ingress queues.
 ///
 /// `chunk_interval_ms` and `retry_backoff_max_ms` are milliseconds.
 #[allow(clippy::too_many_arguments)]
@@ -571,13 +607,19 @@ pub(crate) fn spawn_resume_sender(
         .with_batching(batch)
         .with_channel_auth(auth.clone());
     let mut replay = ReliableSender::new()
+        .with_latency(latency_map.clone())
+        .with_batching(batch)
+        .with_channel_auth(auth.clone())
+        .with_retry_backoff_max_ms(retry_backoff_max_ms);
+    let mut serve = ReliableSender::new()
         .with_latency(latency_map)
         .with_batching(batch)
         .with_channel_auth(auth)
         .with_retry_backoff_max_ms(retry_backoff_max_ms);
     if let Some(m) = metrics {
         messages = messages.with_metrics(m.clone());
-        replay = replay.with_metrics(m);
+        replay = replay.with_metrics(m.clone());
+        serve = serve.with_metrics(m);
     }
     let chunk_interval = Duration::from_millis(chunk_interval_ms.max(1));
     tokio::spawn(run_lane_sender(lane_rx, messages, codec.clone()));
@@ -590,6 +632,8 @@ pub(crate) fn spawn_resume_sender(
         chunk_interval,
         codec.clone(),
     ));
+    let (serve_tx, serve_rx) = mpsc::channel(SERVE_SEND_CHANNEL_CAPACITY);
+    tokio::spawn(run_serve_sender(serve_rx, serve, codec.clone()));
     let (sequence_tx, sequence_rx) = mpsc::channel(SEQUENCE_SEND_CHANNEL_CAPACITY);
     let mut sequence_messages = SimpleSender::new()
         .with_latency(sequence_latency)
@@ -603,7 +647,23 @@ pub(crate) fn spawn_resume_sender(
         lane: lane_tx,
         replay: replay_tx,
         sequence: sequence_tx,
+        serve: serve_tx,
         generation: AtomicU64::new(1),
+    }
+}
+
+/// Retries are detached because the core keeps no cancel handler for a served response.
+async fn run_serve_sender(
+    mut rx: mpsc::Receiver<ServeSend>,
+    mut serve: ReliableSender,
+    codec: VantageWireCodec,
+) {
+    while let Some(ServeSend(to, message)) = rx.recv().await {
+        let msg_type = message.type_name();
+        let bytes = codec.serialize(&message).expect("serializes");
+        serve
+            .send_detached_typed(to, Bytes::from(bytes), msg_type)
+            .await;
     }
 }
 

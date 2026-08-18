@@ -523,6 +523,14 @@ impl Repairer {
         effects
     }
 
+    /// Clears the at-most-once mark for a response that never reached the transport.
+    ///
+    /// Serving is loss-free only while the mark and the send agree: a dropped serve must
+    /// release the pair, otherwise a repeat request from the same peer is never answered.
+    pub(crate) fn unanswer(&mut self, peer: &PublicKey, digest: &Digest) {
+        self.answered.remove(&(*peer, digest.clone()));
+    }
+
     pub(crate) fn walk_steps_settle(&self) -> u64 {
         self.walk_steps_settle
     }

@@ -15,6 +15,7 @@ while [ $# -gt 0 ]; do
         --settle) SETTLE="$2"; shift 2;;
         --interval) INTERVAL="$2"; shift 2;;
         --no-state-sync) EXTRA+=(--no-state-sync); shift;;
+        --no-build) EXTRA+=(--no-build); shift;;
         --sequence-sync-shed-gap-views) EXTRA+=(--sequence-sync-shed-gap-views "$2"); shift 2;;
         --sequence-sync-min-gap-views) EXTRA+=(--sequence-sync-min-gap-views "$2"); shift 2;;
         --sequence-sync-rearm-gap-views) EXTRA+=(--sequence-sync-rearm-gap-views "$2"); shift 2;;

@@ -499,6 +499,48 @@ async fn malformed_serve_rejected_even_with_matching_digest() {
 }
 
 #[tokio::test]
+async fn unanswer_fetch_reopens_a_body_serve_that_never_reached_the_transport() {
+    let all = authors();
+    let (name, _) = all[3];
+    let (requester, _) = all[1];
+    let (other, _) = all[2];
+    let mut agb = new_agb_engine(name);
+    let mut rep = dummy_repairer(name, ".db_test_digest_unanswer");
+    let (mut lm, _store) = new_lane_manager(name, ".db_test_digest_unanswer_lm");
+    let mut digest_stmts = DigestStatements::new(TEST_DELTA_MS);
+
+    let proposal = sample_proposal(1);
+    let digest = proposal.digest(&test_sid());
+    let proposer = agb.proposer(1);
+    agb.on_propose(proposer, proposal, Instant::now(), &mut lm, &mut rep);
+
+    assert!(!digest_stmts
+        .on_body_fetch(requester, 1, digest.clone(), &agb)
+        .is_empty());
+    assert!(!digest_stmts
+        .on_body_fetch(other, 1, digest.clone(), &agb)
+        .is_empty());
+    assert!(digest_stmts
+        .on_body_fetch(requester, 1, digest.clone(), &agb)
+        .is_empty());
+
+    digest_stmts.unanswer_fetch(&requester, 1);
+    assert!(
+        digest_stmts
+            .on_body_fetch(requester, 1, digest.clone(), &agb)
+            .iter()
+            .any(|e| matches!(e, Effect::BodyServeTo(peer, v, _) if *peer == requester && *v == 1)),
+        "a dropped body serve must be servable again after its mark is cleared"
+    );
+    assert!(
+        digest_stmts
+            .on_body_fetch(other, 1, digest, &agb)
+            .is_empty(),
+        "releasing one requester must not reopen another"
+    );
+}
+
+#[tokio::test]
 async fn gc_prunes_buffered_statements_and_fetch_state() {
     let all = authors();
     let proposal = sample_proposal(1);

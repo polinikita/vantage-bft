@@ -293,6 +293,42 @@ async fn fetch_serves_once_per_requester_and_pair() {
 }
 
 #[tokio::test]
+async fn unanswer_fetch_reopens_a_serve_that_never_reached_the_transport() {
+    let (name, _) = authors()[3];
+    let mut control = new_control(name);
+    let requester = authors()[0].0;
+    let other = authors()[1].0;
+    let proposal = skip_proposal(4, 1);
+    control.on_completion_reportable(4, proposal.clone());
+    let digest = proposal.digest(&test_sid());
+
+    assert!(!control
+        .on_control_fetch(requester, 4, digest.clone())
+        .is_empty());
+    assert!(!control
+        .on_control_fetch(other, 4, digest.clone())
+        .is_empty());
+    assert!(control
+        .on_control_fetch(requester, 4, digest.clone())
+        .is_empty());
+
+    control.unanswer_fetch(&requester, 4);
+    assert!(
+        control
+            .on_control_fetch(requester, 4, digest.clone())
+            .iter()
+            .any(
+                |e| matches!(e, Effect::ControlServeTo(peer, v, _) if *peer == requester && *v == 4)
+            ),
+        "a dropped serve must be servable again after its mark is cleared"
+    );
+    assert!(
+        control.on_control_fetch(other, 4, digest).is_empty(),
+        "releasing one requester must not reopen another"
+    );
+}
+
+#[tokio::test]
 async fn fetch_serves_below_state_floor_down_to_the_serve_floor() {
     let (name, _) = authors()[3];
     let mut control = new_control(name);

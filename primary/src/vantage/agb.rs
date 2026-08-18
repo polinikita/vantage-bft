@@ -2559,6 +2559,25 @@ impl DigestStatements {
         vec![Effect::BodyServeTo(requester, view, vp.clone())]
     }
 
+    /// Clears the at-most-once marks for a body response that never reached the transport.
+    ///
+    /// Serving is loss-free only while the marks and the send agree: a dropped serve must
+    /// release the requester, otherwise its repeat fetch is refused forever. The drop site
+    /// carries no digest, so every digest marked for this `(view, requester)` pair is
+    /// released; a repeat fetch revalidates the pair against the fixed proposal.
+    pub fn unanswer_fetch(&mut self, requester: &PublicKey, view: View) {
+        let released: Vec<(View, Digest, PublicKey)> = self
+            .fetch_answered
+            .range((view, Digest::default(), PublicKey::default())..)
+            .take_while(|(v, _, _)| *v == view)
+            .filter(|(_, _, peer)| peer == requester)
+            .cloned()
+            .collect();
+        for key in released {
+            self.fetch_answered.remove(&key);
+        }
+    }
+
     /// Accepts only well-formed bodies requested or named by a buffered statement.
     /// Accepted bodies do not create proposal provenance.
     pub fn on_body_serve(

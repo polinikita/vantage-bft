@@ -756,6 +756,25 @@ impl ControlLog {
         vec![Effect::ControlServeTo(requester, w, proposal.clone())]
     }
 
+    /// Clears the at-most-once marks for a response that never reached the transport.
+    ///
+    /// Serving is loss-free only while the marks and the send agree: a dropped serve must
+    /// release the requester, otherwise its repeat fetch is refused forever and the view
+    /// keeps a permanent hole. The drop site carries no digest, so every digest marked for
+    /// this `(view, requester)` pair is released; a repeat fetch revalidates the pair.
+    pub fn unanswer_fetch(&mut self, requester: &PublicKey, w: View) {
+        let released: Vec<(View, Digest, PublicKey)> = self
+            .fetch_answered
+            .range((w, Digest::default(), PublicKey::default())..)
+            .take_while(|(view, _, _)| *view == w)
+            .filter(|(_, _, peer)| peer == requester)
+            .cloned()
+            .collect();
+        for key in released {
+            self.fetch_answered.remove(&key);
+        }
+    }
+
     /// Accepts only a well-formed body matching an outstanding `(view, digest)` request.
     pub fn on_control_serve(&mut self, view: View, proposal: ProposalOut) -> Vec<Effect> {
         if self.is_pruned_view(view) {
