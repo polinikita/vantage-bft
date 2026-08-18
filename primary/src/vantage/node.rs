@@ -644,6 +644,8 @@ pub struct VantageCore {
     ut_metrics_tick: Option<IntCounter>,
 
     walk_steps_published: (u64, u64, u64),
+    /// Chain-walk nanoseconds already published as a utilization section.
+    chain_walk_nanos_published: u64,
 
     walk_fails_published: ([u64; 3], [u64; 3]),
     ut_header_seal: Option<IntCounter>,
@@ -1047,6 +1049,7 @@ impl VantageCore {
             ut_resume_tick: None,
             ut_metrics_tick: None,
             walk_steps_published: (0, 0, 0),
+            chain_walk_nanos_published: 0,
             walk_fails_published: ([0; 3], [0; 3]),
             ut_header_seal: None,
             queue_len_peak: 0,
@@ -1729,10 +1732,14 @@ impl VantageCore {
 
     fn sample_metrics(&mut self) {
         if self.metrics.is_some() {
-            let (chain_direct, fails) = {
+            let (chain_direct, fails, chain_nanos) = {
                 let blocks = self.lm.blocks_handle();
                 let blocks = blocks.lock();
-                (blocks.walk_steps(), blocks.walk_failures())
+                (
+                    blocks.walk_steps(),
+                    blocks.walk_failures(),
+                    blocks.walk_nanos_chain(),
+                )
             };
             let now = (chain_direct.0, chain_direct.1, self.rep.walk_steps_settle());
             let prev = self.walk_steps_published;
@@ -1748,6 +1755,11 @@ impl VantageCore {
                         .with_label_values(&[family])
                         .inc_by(cur.saturating_sub(was));
                 }
+                metrics
+                    .utilization_timer
+                    .with_label_values(&["chain_walk"])
+                    .inc_by(chain_nanos.saturating_sub(self.chain_walk_nanos_published) / 1_000);
+                self.chain_walk_nanos_published = chain_nanos;
                 for (family, cur, was) in [
                     ("chain", fails.0, prev_fails.0),
                     ("direct", fails.1, prev_fails.1),

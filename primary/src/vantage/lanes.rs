@@ -46,6 +46,8 @@ pub struct BlockCache {
     by_digest: HashMap<Digest, BlockEntry>,
     by_author: HashMap<PublicKey, BTreeMap<Height, HashSet<Digest>>>,
     walk_steps_chain: u64,
+    /// Nanoseconds spent in the chain walk, published as a utilization section.
+    walk_nanos_chain: u64,
     walk_steps_direct: u64,
     /// Failure counts indexed as missing block, coordinate mismatch, and validity gate.
     walk_fail_chain: [u64; 3],
@@ -81,6 +83,14 @@ impl BlockCache {
     /// Returns monotonic `(chain, direct)` walk-step counts.
     pub fn walk_steps(&self) -> (u64, u64) {
         (self.walk_steps_chain, self.walk_steps_direct)
+    }
+
+    /// Returns monotonic nanoseconds spent walking chains.
+    ///
+    /// The step counts alone cannot say whether the walk is cheap per step or dominates
+    /// effect execution, which is the question the aggregate section could not answer.
+    pub fn walk_nanos_chain(&self) -> u64 {
+        self.walk_nanos_chain
     }
 
     /// Returns monotonic `(chain, direct)` failure counts in missing, coordinate, gate order.
@@ -337,7 +347,31 @@ impl BlockCache {
     /// Verifies one author, consecutive heights, validated blocks, and the genesis link.
     ///
     /// Expected height decreases on every step, and only successful prefixes are memoized.
+    ///
+    /// Wraps the walk in a clock so its cost is attributable: the step counters say how
+    /// far it walks but not what that costs, and the enclosing effect-execution section is
+    /// too coarse to tell whether this path or something else dominates.
     pub fn verified_prefix_through_genesis(
+        &mut self,
+        committee: &Committee,
+        sid: &Digest,
+        max_block_payload: usize,
+        genesis: &Digest,
+        h: &Digest,
+    ) -> bool {
+        let clock = std::time::Instant::now();
+        let verified = self.verified_prefix_through_genesis_inner(
+            committee,
+            sid,
+            max_block_payload,
+            genesis,
+            h,
+        );
+        self.walk_nanos_chain += clock.elapsed().as_nanos() as u64;
+        verified
+    }
+
+    fn verified_prefix_through_genesis_inner(
         &mut self,
         _committee: &Committee,
         _sid: &Digest,
