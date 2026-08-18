@@ -96,6 +96,9 @@ pub struct Repairer {
     answered: HashSet<(PublicKey, Digest)>,
 
     metrics: Option<Arc<Metrics>>,
+    /// Cached `utilization_timer{proc="repair_settle"}`. Settle runs hundreds of thousands
+    /// of times a second, so a label lookup per call would itself distort the measurement.
+    ut_settle: Option<prometheus::IntCounter>,
     walk_steps_settle: u64,
 }
 
@@ -125,6 +128,7 @@ impl Repairer {
             blocked_on: HashMap::new(),
             blocked_at: HashMap::new(),
             settle_calls: 0,
+            ut_settle: None,
             requested: HashSet::new(),
             requested_hashes: HashSet::new(),
             refetch_at: HashMap::new(),
@@ -525,9 +529,18 @@ impl Repairer {
 
     fn settle(&mut self, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
         self.settle_calls += 1;
-        if let Some(metrics) = &self.metrics {
+        let _timer = self.metrics.as_ref().map(|metrics| {
+            let counter = self
+                .ut_settle
+                .get_or_insert_with(|| {
+                    metrics
+                        .utilization_timer
+                        .with_label_values(&["repair_settle"])
+                })
+                .clone();
             metrics.vantage_repair_settle_calls_total.inc();
-        }
+            metrics::UtilizationTimer::from_counter(counter)
+        });
         let mut cur = r;
         let mut frames: Vec<BlockRef> = Vec::new();
         let mut steps: u64 = 0;
