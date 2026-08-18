@@ -987,6 +987,68 @@ impl SequenceTransfer {
         )
     }
 
+    /// Returns up to `max` disjoint outstanding wants, nearest first.
+    ///
+    /// Fetch cost is one chunk per round trip, so a gap spanning many chunks is
+    /// round-trip bound. Outcomes and deltas are per-view maps and `first_missing` skips
+    /// forward over what has already arrived, so distinct ranges can be in flight at once
+    /// and merged in any order. Records stay single: they verify as a chain, and a later
+    /// record cannot be checked before its predecessor.
+    ///
+    /// `outcome_span` and `delta_span` are the per-response view caps the caller will put
+    /// on the wire; spacing wants by them keeps the ranges from overlapping.
+    pub fn wants(&self, max: usize, outcome_span: View, delta_span: View) -> Vec<SequenceWant> {
+        match self.state {
+            TransferState::FetchingRecords | TransferState::Verified | TransferState::Exhausted => {
+                self.want().into_iter().collect()
+            }
+            TransferState::FetchingOutcomes => self
+                .missing_spaced(&self.outcome_scan_from, &self.outcomes, outcome_span, max)
+                .into_iter()
+                .map(|from_view| SequenceWant::Outcomes { from_view })
+                .collect(),
+            TransferState::FetchingDeltas => self
+                .missing_spaced(&self.delta_scan_from, &self.deltas, delta_span, max)
+                .into_iter()
+                .map(|view| SequenceWant::Deltas {
+                    from_view: view,
+                    start_index: self
+                        .delta_in_flight
+                        .get(&view)
+                        .map(|verifier| verifier.next_index())
+                        .unwrap_or(0),
+                })
+                .collect(),
+        }
+    }
+
+    /// Missing views spaced at least `span` apart, so their responses cannot overlap.
+    fn missing_spaced<T>(
+        &self,
+        cursor: &Cell<View>,
+        have: &BTreeMap<View, T>,
+        span: View,
+        max: usize,
+    ) -> Vec<View> {
+        let mut out = Vec::new();
+        let Some(first) = self.first_missing(cursor, have) else {
+            return out;
+        };
+        out.push(first);
+        let span = span.max(1);
+        let mut from = first.saturating_add(span);
+        while out.len() < max.max(1) && from <= self.target_view {
+            let Some(view) = (from..=self.target_view).find(|view| {
+                self.chain.verified_record(*view).is_some() && !have.contains_key(view)
+            }) else {
+                break;
+            };
+            out.push(view);
+            from = view.saturating_add(span);
+        }
+        out
+    }
+
     /// Returns up to `max` sources beginning at the current failover cursor.
     pub fn next_sources(&self, max: usize) -> Vec<PublicKey> {
         if self.sources.is_empty() {

@@ -824,6 +824,134 @@ fn a_transfer_downloads_and_verifies_a_whole_target() {
     }
 }
 
+/// Records verify as a chain, so only the next one may be outstanding however many
+/// sources are available.
+#[test]
+fn wants_stay_single_while_fetching_records() {
+    let (store, sid) = populated_store(6);
+    let keys = authors();
+    let (a, _) = keys[0];
+    let (b, _) = keys[1];
+    let transfer = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        6,
+        store.head().clone(),
+        vec![a, b],
+    );
+    assert_eq!(transfer.wants(3, 3, 3).len(), 1);
+    assert_eq!(
+        transfer.wants(3, 3, 3),
+        transfer.want().into_iter().collect::<Vec<_>>()
+    );
+}
+
+/// Outcome ranges are per-view, so several may be in flight at once. They must be spaced
+/// by the response cap or two sources would return the same views.
+#[test]
+fn wants_spread_disjoint_outcome_ranges_over_sources() {
+    let (store, sid) = populated_store(6);
+    let keys = authors();
+    let (a, _) = keys[0];
+    let (b, _) = keys[1];
+    let mut transfer = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        6,
+        store.head().clone(),
+        vec![a, b],
+    );
+    transfer
+        .on_records(
+            &SequenceRecordChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                records: store.records_from(1, 6),
+                serve_floor: 1,
+                sender: a,
+            },
+            &a,
+        )
+        .unwrap();
+
+    // A single source asks for exactly what want() would.
+    assert_eq!(
+        transfer.wants(1, 2, 2),
+        vec![SequenceWant::Outcomes { from_view: 1 }]
+    );
+
+    // Three sources cover three ranges two views apart, none overlapping.
+    assert_eq!(
+        transfer.wants(3, 2, 2),
+        vec![
+            SequenceWant::Outcomes { from_view: 1 },
+            SequenceWant::Outcomes { from_view: 3 },
+            SequenceWant::Outcomes { from_view: 5 },
+        ]
+    );
+
+    // More sources than remaining work yields only the work that exists; the caller
+    // repeats the nearest want on the spares.
+    assert!(transfer.wants(8, 2, 2).len() <= 3);
+}
+
+/// An out-of-order arrival must not leave a hole: the nearest want stays the lowest
+/// missing view, and no want repeats a range that already landed.
+#[test]
+fn wants_skip_ranges_that_already_arrived() {
+    let (store, sid) = populated_store(6);
+    let keys = authors();
+    let (a, _) = keys[0];
+    let (b, _) = keys[1];
+    let mut transfer = SequenceTransfer::new(
+        sid.clone(),
+        7,
+        0,
+        genesis_head(&sid),
+        6,
+        store.head().clone(),
+        vec![a, b],
+    );
+    transfer
+        .on_records(
+            &SequenceRecordChunk {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                records: store.records_from(1, 6),
+                serve_floor: 1,
+                sender: a,
+            },
+            &a,
+        )
+        .unwrap();
+    // The far range answers first.
+    transfer
+        .on_outcomes(
+            &SequenceOutcomeServe {
+                version: SEQUENCE_VERSION,
+                transfer_id: 7,
+                target_head: store.head().clone(),
+                outcomes: store.outcomes_from(3, 4, 2, usize::MAX),
+                sender: b,
+            },
+            &b,
+        )
+        .unwrap();
+
+    let wants = transfer.wants(3, 2, 2);
+    assert_eq!(wants[0], SequenceWant::Outcomes { from_view: 1 });
+    assert!(
+        !wants.contains(&SequenceWant::Outcomes { from_view: 3 }),
+        "views 3-4 already arrived and must not be requested again: {wants:?}"
+    );
+}
+
 #[test]
 fn outcome_batches_accept_useful_overlap() {
     let (store, sid) = populated_store(6);

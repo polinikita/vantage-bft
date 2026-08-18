@@ -544,8 +544,11 @@ pub struct VantageCore {
 
     sequence_request_at: Option<Instant>,
 
-    /// Suppresses duplicate requests until the transfer's requested item changes.
-    sequence_last_want: Option<SequenceWant>,
+    /// Suppresses duplicate requests until the transfer's outstanding set changes.
+    ///
+    /// Holds every want last put on the wire, so a response that advances any one of the
+    /// concurrent ranges releases the next round without waiting out the request timeout.
+    sequence_last_want: Option<Vec<SequenceWant>>,
     sequence_request_timeout_ms: u64,
     sequence_max_sources: usize,
 
@@ -2559,7 +2562,16 @@ impl VantageCore {
         let Some(transfer) = self.sequence_transfer.as_ref() else {
             return;
         };
-        let Some(want) = transfer.want() else {
+        // Spread disjoint ranges over the selected sources. Fetch is one chunk per round
+        // trip, so a gap spanning many chunks only closes at the rate concurrent requests
+        // allow. When there is less work than there are sources the spares repeat the
+        // nearest want, which keeps the small-gap case as redundant as it has always been.
+        let wants = transfer.wants(
+            self.sequence_max_sources,
+            self.sequence_chunk_outcomes as View,
+            SEQUENCE_DELTA_RANGE_VIEWS as View,
+        );
+        let Some(nearest) = wants.first().cloned() else {
             return;
         };
         let (target_view, target_head) = transfer.target();
@@ -2570,8 +2582,9 @@ impl VantageCore {
         let outcome_items_cap = self.sequence_chunk_outcome_items as u32;
         let digests_cap = self.sequence_chunk_digests as u32;
         let me = self.name;
-        for peer in sources {
-            let message = match &want {
+        for (slot, peer) in sources.into_iter().enumerate() {
+            let want = wants.get(slot).unwrap_or(&nearest);
+            let message = match want {
                 SequenceWant::Records { from_view } => {
                     PrimaryMessage::VantageSequenceRequest(SequenceRequest {
                         version: SEQUENCE_VERSION,
@@ -2613,7 +2626,7 @@ impl VantageCore {
             self.send_sequence(&peer, message);
         }
         self.sequence_request_at = Some(Instant::now());
-        self.sequence_last_want = Some(want);
+        self.sequence_last_want = Some(wants);
     }
 
     /// Accepts selected-source responses for the active request.
@@ -2644,8 +2657,16 @@ impl VantageCore {
             log::debug!("vantage sequence sync: invalid chunk from a source: {e:?}");
         }
 
-        let want = self.sequence_transfer.as_ref().and_then(|t| t.want());
-        if want != self.sequence_last_want {
+        // Any advance in any concurrent range releases the next round immediately; only a
+        // round that moved nothing waits out the request timeout.
+        let wants = self.sequence_transfer.as_ref().map(|t| {
+            t.wants(
+                self.sequence_max_sources,
+                self.sequence_chunk_outcomes as View,
+                SEQUENCE_DELTA_RANGE_VIEWS as View,
+            )
+        });
+        if wants != self.sequence_last_want {
             self.sequence_request_at = None;
             self.drive_sequence_sync();
         }
