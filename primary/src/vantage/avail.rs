@@ -5,17 +5,108 @@ use crate::vantage::BlockRef;
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use metrics::Metrics;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound::{Excluded, Included};
 use std::sync::Arc;
 
 /// Maximum remembered quorum references per author.
 pub(crate) const AT_QUORUM_HEIGHTS: usize = 1_024;
+
+/// Maximum remembered verified heights per author in the shared chain segment.
+const CHAIN_SEGMENT_HEIGHTS: Height = 256;
+
+/// Maximum remembered anchor-height span per author for derived relative targets.
+///
+/// Anchors are proposal manifest entries, so only the newest heights are claimed against;
+/// a narrow span keeps the count bound below out of reach of honest traffic.
+const RELATIVE_ANCHOR_HEIGHTS: Height = 32;
+
+/// Maximum remembered relative targets per author, whatever their anchor span.
+const RELATIVE_TARGETS: usize = 1_024;
+
+/// Derived ancestors keyed by anchor height, anchor digest, and claimed distance.
+type RelativeTargets = BTreeMap<(Height, Digest, Height), BlockRef>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PendingRelativeClaim {
     sender: PublicKey,
     anchor: BlockRef,
     delta: Height,
+}
+
+/// One contiguous run of verified coordinates on a single fork of one author's chain.
+///
+/// Every coordinate is appended from a walk that verified its parent link, so two runs
+/// that agree at one height agree at every lower height they both cover: one shared
+/// coordinate decides whether a walk extends this run or replaces it.
+#[derive(Default)]
+struct ChainSegment {
+    heights: BTreeMap<Height, Digest>,
+}
+
+impl ChainSegment {
+    fn digest_at(&self, height: Height) -> Option<&Digest> {
+        self.heights.get(&height)
+    }
+
+    /// Returns the digests over `(floor_height, height]` when this run is the exact fork
+    /// named by both endpoints.
+    ///
+    /// Both endpoints are compared: a sender whose floor sits on another fork, or whose
+    /// head is another fork's block, must fall back to its own walk.
+    fn suffix(
+        &self,
+        floor_height: Height,
+        floor_digest: &Digest,
+        height: Height,
+        head: &Digest,
+    ) -> Option<Vec<Digest>> {
+        if self.digest_at(floor_height) != Some(floor_digest)
+            || self.digest_at(height) != Some(head)
+        {
+            return None;
+        }
+        let suffix: Vec<Digest> = self
+            .heights
+            .range((Excluded(floor_height), Included(height)))
+            .map(|(_, digest)| digest.clone())
+            .collect();
+        // A gap inside the run would skip a link the walk validates.
+        (suffix.len() as Height == height - floor_height).then_some(suffix)
+    }
+
+    /// Returns the digest `target_height` below the exact coordinate `(height, digest)`.
+    fn ancestor(&self, height: Height, digest: &Digest, target_height: Height) -> Option<&Digest> {
+        if self.digest_at(height) != Some(digest) {
+            return None;
+        }
+        let target = self.digest_at(target_height)?;
+        // Every intermediate link must be present for the same reason.
+        let span = self.heights.range(target_height..=height).count() as Height;
+        (span == height - target_height + 1).then_some(target)
+    }
+
+    /// Returns the highest height held both by this run and by `[lo, hi]`.
+    fn shared_height(&self, lo: Height, hi: Height) -> Option<Height> {
+        let base = *self.heights.keys().next()?;
+        let top = *self.heights.keys().next_back()?;
+        let shared = top.min(hi);
+        (base.max(lo) <= shared).then_some(shared)
+    }
+
+    /// Drops every coordinate further than `CHAIN_SEGMENT_HEIGHTS` below the run's top.
+    fn prune_below_window(&mut self) {
+        let Some(cut) = self
+            .heights
+            .keys()
+            .next_back()
+            .and_then(|top| top.checked_sub(CHAIN_SEGMENT_HEIGHTS))
+        else {
+            return;
+        };
+        let keep = self.heights.split_off(&cut);
+        self.heights = keep;
+    }
 }
 
 #[derive(Default)]
@@ -49,7 +140,18 @@ pub struct AvailResolver {
     /// Exact-position claims have bounded commonality and alone may promote `C`.
     exact_claims: AckAggregator,
 
+    /// One verified run per author, shared by every sender claiming that lane.
+    ///
+    /// Positional claims name the same targets for all senders, so the segment between a
+    /// sender's floor and its claim is walked once per author and sliced afterwards.
+    chain_segments: HashMap<PublicKey, ChainSegment>,
+    /// Derived ancestors per author for anchors the shared run does not cover.
+    relative_targets: HashMap<PublicKey, RelativeTargets>,
+
     metrics: Option<Arc<Metrics>>,
+
+    #[cfg(test)]
+    segment_walks: u64,
 }
 
 impl AvailResolver {
@@ -75,7 +177,11 @@ impl AvailResolver {
             at_quorum: HashMap::new(),
             claimed: HashMap::new(),
             exact_claims,
+            chain_segments: HashMap::new(),
+            relative_targets: HashMap::new(),
             metrics: None,
+            #[cfg(test)]
+            segment_walks: 0,
         }
     }
 
@@ -101,6 +207,10 @@ impl AvailResolver {
             .insert(author, [(anchor.1, anchor.2.clone())].into());
         self.claimed.remove(&author);
         self.exact_claims.reset_author(author);
+        // The anchor replaces this lane's history, so nothing remembered below it may still
+        // answer a claim.
+        self.chain_segments.remove(&author);
+        self.relative_targets.remove(&author);
     }
 
     /// Records monotonic positional claims and returns newly credited exact references.
@@ -158,8 +268,56 @@ impl AvailResolver {
         self.exact_claims.is_at_quorum(r)
     }
 
-    fn resolve_relative(&self, anchor: &BlockRef, delta: Height) -> AncestorWalk {
-        self.blocks.lock().resolve_verified_ancestor(anchor, delta)
+    /// Derives an ancestor from the shared run or the per-anchor memo, walking only when
+    /// neither covers the tuple.
+    fn resolve_relative(&mut self, anchor: &BlockRef, delta: Height) -> AncestorWalk {
+        // The walk answers both of these as forked, so no remembered coordinate -- least of
+        // all height zero, which every fork shares -- may answer in its place.
+        if delta > 0 && delta < anchor.1 {
+            if let Some(r) = self.cached_relative(anchor, delta) {
+                return AncestorWalk::Ready(r);
+            }
+        }
+        let walked = self.blocks.lock().resolve_verified_ancestor(anchor, delta);
+        if let AncestorWalk::Ready(r) = &walked {
+            self.memoize_relative(anchor, delta, r.clone());
+        }
+        walked
+    }
+
+    fn cached_relative(&self, anchor: &BlockRef, delta: Height) -> Option<BlockRef> {
+        let target_height = anchor.1 - delta;
+        let from_segment = self
+            .chain_segments
+            .get(&anchor.0)
+            .and_then(|segment| segment.ancestor(anchor.1, &anchor.2, target_height))
+            .map(|digest| (anchor.0, target_height, digest.clone()));
+        from_segment.or_else(|| {
+            self.relative_targets
+                .get(&anchor.0)?
+                .get(&(anchor.1, anchor.2.clone(), delta))
+                .cloned()
+        })
+    }
+
+    /// Remembers one derived ancestor for the exact `(anchor, delta)` tuple.
+    fn memoize_relative(&mut self, anchor: &BlockRef, delta: Height, target: BlockRef) {
+        let memo = self.relative_targets.entry(anchor.0).or_default();
+        memo.insert((anchor.1, anchor.2.clone(), delta), target);
+        // Anchor height orders the memo, so one split bounds how far back anchors are kept.
+        if let Some(cut) = memo
+            .last_key_value()
+            .map(|((height, _, _), _)| *height)
+            .and_then(|top| top.checked_sub(RELATIVE_ANCHOR_HEIGHTS))
+        {
+            let keep = memo.split_off(&(cut, Digest([0u8; 32]), 0));
+            *memo = keep;
+        }
+        // That window cannot bound how many distinct distances one anchor attracts, so the
+        // count is the hard bound; dropping the memo only costs later walks.
+        if memo.len() > RELATIVE_TARGETS {
+            memo.clear();
+        }
     }
 
     fn credit_claim_prefix(&mut self, sender: PublicKey, r: BlockRef) -> Vec<BlockRef> {
@@ -335,17 +493,7 @@ impl AvailResolver {
             Some((_, digest)) => digest.clone(),
             None => self.genesis.clone(),
         };
-        let segment = {
-            let blocks = self.blocks.lock();
-            blocks.collect_verified_suffix(
-                &self.committee,
-                &self.sid,
-                self.max_block_payload,
-                floor_height,
-                &floor_digest,
-                &entry.head,
-            )
-        };
+        let segment = self.verified_segment(entry, floor_height, &floor_digest);
         match segment {
             Some(suffix) => {
                 let mut refs = Vec::with_capacity(suffix.len());
@@ -389,6 +537,86 @@ impl AvailResolver {
                 }
             }
         }
+    }
+
+    /// Returns the verified suffix above the floor, sliced from the author's shared run when
+    /// it covers the same fork and walked under the blocks lock otherwise.
+    fn verified_segment(
+        &mut self,
+        entry: &AvailEntry,
+        floor_height: Height,
+        floor_digest: &Digest,
+    ) -> Option<Vec<Digest>> {
+        if let Some(suffix) = self.chain_segments.get(&entry.author).and_then(|segment| {
+            segment.suffix(floor_height, floor_digest, entry.height, &entry.head)
+        }) {
+            return Some(suffix);
+        }
+        #[cfg(test)]
+        {
+            self.segment_walks += 1;
+        }
+        let walked = {
+            let blocks = self.blocks.lock();
+            blocks.collect_verified_suffix(
+                &self.committee,
+                &self.sid,
+                self.max_block_payload,
+                floor_height,
+                floor_digest,
+                &entry.head,
+            )
+        };
+        if let Some(suffix) = &walked {
+            self.memoize_segment(entry.author, floor_height, floor_digest, suffix);
+        }
+        walked
+    }
+
+    /// Records a walked run so later senders on the same fork are served by slicing.
+    ///
+    /// One shared coordinate decides the merge: agreement there means the two runs agree
+    /// wherever they overlap, and anything else -- another fork, or a gap between the two
+    /// spans -- replaces the run rather than merging into it.
+    fn memoize_segment(
+        &mut self,
+        author: PublicKey,
+        floor_height: Height,
+        floor_digest: &Digest,
+        suffix: &[Digest],
+    ) {
+        if suffix.is_empty() {
+            return;
+        }
+        let walked_at = |height: Height| -> &Digest {
+            if height == floor_height {
+                floor_digest
+            } else {
+                &suffix[(height - floor_height - 1) as usize]
+            }
+        };
+        let walked_top = floor_height + suffix.len() as Height;
+        let segment = self.chain_segments.entry(author).or_default();
+        let agrees = segment
+            .shared_height(floor_height, walked_top)
+            .is_some_and(|height| segment.digest_at(height) == Some(walked_at(height)));
+        if !agrees {
+            segment.heights.clear();
+        }
+        segment.heights.insert(floor_height, floor_digest.clone());
+        for (i, digest) in suffix.iter().enumerate() {
+            segment
+                .heights
+                .insert(floor_height + 1 + i as Height, digest.clone());
+        }
+        // The run grows only here, so one ordered split after every extension is the whole
+        // memory bound: no scan over senders or their floors.
+        segment.prune_below_window();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn segment_walks_for_test(&self) -> u64 {
+        self.segment_walks
     }
 
     #[cfg(test)]

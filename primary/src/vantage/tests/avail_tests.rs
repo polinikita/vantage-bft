@@ -1,8 +1,26 @@
 use super::common::*;
 use crate::messages::Header;
-use crate::vantage::lanes::{AckAggregator, AckAvailability, AckThreshold, AvailEntry};
-use crypto::Digest;
+use crate::vantage::avail::AvailResolver;
+use crate::vantage::lanes::{
+    AckAggregator, AckAvailability, AckThreshold, AvailEntry, LaneManager,
+};
+use crypto::{Digest, PublicKey};
 use std::collections::BTreeMap;
+
+fn avail_resolver(lm: &LaneManager) -> AvailResolver {
+    AvailResolver::new(
+        test_committee(),
+        lm.sid().clone(),
+        lm.genesis().clone(),
+        MAX_BLOCK_PAYLOAD,
+        lm.blocks_handle(),
+    )
+}
+
+/// Senders are only crediting identities here, so watermarks may name any distinct key.
+fn sender_key(b: u8) -> PublicKey {
+    PublicKey([b; 32])
+}
 
 #[tokio::test]
 async fn take_avail_flush_tracks_own_direct_pub_watermark() {
@@ -293,6 +311,91 @@ async fn a_watermark_does_not_recredit_a_ref_already_at_quorum() {
     assert!(
         !later.iter().any(|x| x == &r),
         "a ref already at quorum was re-credited: {later:?}"
+    );
+}
+
+#[tokio::test]
+async fn one_walk_credits_every_sender_claiming_the_same_targets() {
+    let (watcher, _) = authors()[0];
+    let (author, _) = authors()[1];
+    let (mut lm, _store) = new_lane_manager(watcher, ".db_test_avail_shared_segment");
+    let chain = direct_chain(&mut lm, author, 3).await;
+    let mut res = avail_resolver(&lm);
+    let senders: Vec<PublicKey> = (1..=8u8).map(sender_key).collect();
+
+    for (i, header) in chain.iter().enumerate() {
+        let height = i as u64 + 1;
+        let entry = AvailEntry {
+            author,
+            height,
+            head: header.id.clone(),
+        };
+        let expected = vec![(author, height, header.id.clone())];
+        for (s, sender) in senders.iter().enumerate() {
+            assert_eq!(
+                res.resolve_watermark(*sender, std::slice::from_ref(&entry)),
+                expected,
+                "sender {s} must be credited exactly what its own walk would credit at \
+                 height {height}"
+            );
+        }
+    }
+
+    assert_eq!(
+        res.segment_walks_for_test(),
+        3,
+        "one walk per newly claimed height; the other seven senders per height must be \
+         served from the author's verified run"
+    );
+}
+
+#[tokio::test]
+async fn a_warm_segment_never_serves_a_floor_on_another_fork() {
+    let (watcher, _) = authors()[0];
+    let (author, _) = authors()[1];
+    let (mut lm, _store) = new_lane_manager(watcher, ".db_test_avail_segment_fork_guard");
+    let sid = lm.sid().clone();
+    let genesis = lm.genesis().clone();
+
+    let a1 = tagged_header(author, 1, genesis.clone(), sid.clone(), 1);
+    let a2 = tagged_header(author, 2, a1.id.clone(), sid.clone(), 1);
+    let a3 = tagged_header(author, 3, a2.id.clone(), sid.clone(), 1);
+    let b1 = tagged_header(author, 1, genesis, sid, 2);
+    for header in [&a1, &a2, &a3, &b1] {
+        lm.process_publish(author, header.clone()).await;
+    }
+    let mut res = avail_resolver(&lm);
+    let (forked, canonical) = (sender_key(1), sender_key(2));
+    let at = |height: u64, head: &Digest| AvailEntry {
+        author,
+        height,
+        head: head.clone(),
+    };
+
+    assert_eq!(
+        res.resolve_watermark(forked, &[at(1, &b1.id)]),
+        vec![(author, 1, b1.id.clone())],
+        "the forked sender's credited floor lands on branch B"
+    );
+    assert_eq!(
+        res.resolve_watermark(canonical, &[at(3, &a3.id)]),
+        vec![
+            (author, 1, a1.id.clone()),
+            (author, 2, a2.id.clone()),
+            (author, 3, a3.id.clone()),
+        ],
+        "branch A warms the author's verified run"
+    );
+    assert_eq!(
+        res.resolve_watermark(forked, &[at(3, &a3.id)]),
+        vec![(author, 3, a3.id.clone())],
+        "branch A's run must not backfill a sender whose floor is on branch B: that \
+         segment is unresolvable, so only the head is credited by attestation"
+    );
+    assert!(
+        res.pending_avail_keys_for_test()
+            .contains(&(forked, author)),
+        "the contradicted watermark must still be stashed for retry"
     );
 }
 
