@@ -323,14 +323,13 @@ impl AvailResolver {
 
     fn resolve_one(&mut self, sender: PublicKey, entry: &AvailEntry) -> Vec<BlockRef> {
         let key = (sender, entry.author);
-        let (floor_height, floor_digest) = self
-            .credited_floor
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| (0, self.genesis.clone()));
-        if entry.height <= floor_height {
-            return Vec::new();
-        }
+        // Compare heights before cloning anything: this runs once per claim and the
+        // covered case is the common one.
+        let (floor_height, floor_digest) = match self.credited_floor.get(&key) {
+            Some((floor, _)) if entry.height <= *floor => return Vec::new(),
+            Some((floor, digest)) => (*floor, digest.clone()),
+            None => (0, self.genesis.clone()),
+        };
         let segment = {
             let blocks = self.blocks.lock();
             blocks.collect_verified_suffix(

@@ -638,6 +638,9 @@ pub struct VantageCore {
     ut_payload_sync: Option<IntCounter>,
     ut_timer_firing: Option<IntCounter>,
     ut_effect_execution: Option<IntCounter>,
+    /// Cached `utilization_timer{proc="avail_claims"}`: the claim-crediting share of
+    /// effect execution, which is the candidate for moving off the core thread.
+    ut_avail_claims: Option<IntCounter>,
 
     ut_avail_flush: Option<IntCounter>,
     ut_resume_tick: Option<IntCounter>,
@@ -1045,6 +1048,7 @@ impl VantageCore {
             ut_payload_sync: None,
             ut_timer_firing: None,
             ut_effect_execution: None,
+            ut_avail_claims: None,
             ut_avail_flush: None,
             ut_resume_tick: None,
             ut_metrics_tick: None,
@@ -3587,6 +3591,11 @@ impl VantageCore {
                     }
 
                     Effect::AvailClaimed(sender, claims) => {
+                        let _timer = Self::cached_utilization_timer(
+                            &self.metrics,
+                            &mut self.ut_avail_claims,
+                            "avail_claims",
+                        );
                         let refs = self.lm.note_claim(sender, &claims);
                         queue.extend(self.credit_refs(sender, refs, now, false));
                     }
