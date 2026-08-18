@@ -17,6 +17,13 @@ while [ $# -gt 0 ]; do
         --no-state-sync) EXTRA+=(--no-state-sync); shift;;
         --sequence-sync-shed-gap-views) EXTRA+=(--sequence-sync-shed-gap-views "$2"); shift 2;;
         --sequence-sync-min-gap-views) EXTRA+=(--sequence-sync-min-gap-views "$2"); shift 2;;
+        --sequence-sync-rearm-gap-views) EXTRA+=(--sequence-sync-rearm-gap-views "$2"); shift 2;;
+        # Header delay sets lane block density, which is what catch-up cost scales with.
+        --max-header-delay-ms) EXTRA+=(--max-header-delay-ms "$2"); shift 2;;
+        --sequence-sync-chunk-records) EXTRA+=(--sequence-sync-chunk-records "$2"); shift 2;;
+        --sequence-sync-chunk-digests) EXTRA+=(--sequence-sync-chunk-digests "$2"); shift 2;;
+        --sequence-sync-chunk-outcomes) EXTRA+=(--sequence-sync-chunk-outcomes "$2"); shift 2;;
+        --sequence-sync-chunk-outcome-items) EXTRA+=(--sequence-sync-chunk-outcome-items "$2"); shift 2;;
         *) echo "unknown flag: $1" >&2; exit 2;;
     esac
 done

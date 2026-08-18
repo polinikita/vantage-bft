@@ -234,6 +234,9 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_shed_gap_views": args.sequence_sync_shed_gap_views,
+        "sequence_sync_rearm_gap_views": args.sequence_sync_rearm_gap_views,
+        "sequence_sync_chunk_records": args.sequence_sync_chunk_records,
+        "sequence_sync_chunk_digests": args.sequence_sync_chunk_digests,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
         "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
@@ -468,6 +471,9 @@ def write_manifest(
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
         "sequence_sync_shed_gap_views": args.sequence_sync_shed_gap_views,
+        "sequence_sync_rearm_gap_views": args.sequence_sync_rearm_gap_views,
+        "sequence_sync_chunk_records": args.sequence_sync_chunk_records,
+        "sequence_sync_chunk_digests": args.sequence_sync_chunk_digests,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
         "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
@@ -567,6 +573,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                         ">= --sequence-sync-min-gap-views (default 300)")
     p.add_argument("--sequence-sync-min-gap-views", type=int, default=100,
                    help="minimum certified cursor gap that starts state sync (default 100)")
+    p.add_argument("--sequence-sync-rearm-gap-views", type=int, default=300,
+                   help="gap that re-arms a completed state sync; keep well below "
+                        "--sequence-sync-shed-gap-views so a finished pass stops "
+                        "shedding (default 300)")
+    p.add_argument("--sequence-sync-chunk-records", type=int, default=256,
+                   help="maximum chain records per state-sync response (default 256)")
+    p.add_argument("--sequence-sync-chunk-digests", type=int, default=1024,
+                   help="maximum block digests per delta-range response (default 1024); "
+                        "lower values raise the round trips per pass, which is how lane "
+                        "count drives catch-up cost at larger n")
     p.add_argument("--sequence-sync-chunk-outcomes", type=int, default=256,
                    help="maximum outcome views per state-sync response (default 256)")
     p.add_argument("--sequence-sync-chunk-outcome-items", type=int, default=1600,
@@ -679,9 +695,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--sequence-checkpoint-interval must be at least 1")
     if args.sequence_sync_min_gap_views < 0:
         p.error("--sequence-sync-min-gap-views must be non-negative")
+    if args.sequence_sync_rearm_gap_views < 0:
+        fail("--sequence-sync-rearm-gap-views must be non-negative")
     if args.sequence_sync_shed_gap_views < args.sequence_sync_min_gap_views:
         # The shed gap must not be below the sync threshold.
         p.error("--sequence-sync-shed-gap-views must be >= --sequence-sync-min-gap-views")
+    if args.sequence_sync_chunk_records < 1:
+        fail("--sequence-sync-chunk-records must be positive")
+    if args.sequence_sync_chunk_digests < 1:
+        fail("--sequence-sync-chunk-digests must be positive")
     if args.sequence_sync_chunk_outcomes < 1:
         p.error("--sequence-sync-chunk-outcomes must be at least 1")
     if args.sequence_sync_chunk_outcome_items < 1:
