@@ -329,6 +329,7 @@ impl Core {
                 votes_aggregator: VotesAggregator::new(),
                 metrics: metrics.clone(),
                 network: ReliableSender::new()
+                    .with_queue_role("core")
                     .with_latency(latency_map)
                     .with_metrics(metrics)
                     .with_batching(batch)

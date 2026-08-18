@@ -603,15 +603,18 @@ pub(crate) fn spawn_resume_sender(
     let sequence_metrics = metrics.clone();
     let sequence_auth = auth.clone();
     let mut messages = SimpleSender::new()
+        .with_queue_role("lane")
         .with_latency(latency_map.clone())
         .with_batching(batch)
         .with_channel_auth(auth.clone());
     let mut replay = ReliableSender::new()
+        .with_queue_role("replay")
         .with_latency(latency_map.clone())
         .with_batching(batch)
         .with_channel_auth(auth.clone())
         .with_retry_backoff_max_ms(retry_backoff_max_ms);
     let mut serve = ReliableSender::new()
+        .with_queue_role("serve")
         .with_latency(latency_map)
         .with_batching(batch)
         .with_channel_auth(auth)
@@ -636,6 +639,7 @@ pub(crate) fn spawn_resume_sender(
     tokio::spawn(run_serve_sender(serve_rx, serve, codec.clone()));
     let (sequence_tx, sequence_rx) = mpsc::channel(SEQUENCE_SEND_CHANNEL_CAPACITY);
     let mut sequence_messages = SimpleSender::new()
+        .with_queue_role("sequence")
         .with_latency(sequence_latency)
         .with_batching(batch)
         .with_channel_auth(sequence_auth);

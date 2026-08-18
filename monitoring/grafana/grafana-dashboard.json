@@ -755,7 +755,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "quantile(0.5, (sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) and on(node) protocol_info{protocol=\"vantage\"})) / 10000",
+          "expr": "quantile(0.5, (sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\",proc=~\"inbound_dispatch|effect_execution|payload_sync|timer_firing|header_seal|resume_tick|metrics_tick|avail_flush\"}[1m])) and on(node) protocol_info{protocol=\"vantage\"})) / 10000",
           "legendFormat": "busy",
           "refId": "A"
         },
@@ -852,7 +852,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(quantile by (proc) (0.5, rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m]))) / 10000",
+          "expr": "sum(quantile by (proc) (0.5, rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\",proc=~\"inbound_dispatch|effect_execution|payload_sync|timer_firing|header_seal|resume_tick|metrics_tick|avail_flush\"}[1m]))) / 10000",
           "legendFormat": "total",
           "refId": "B"
         }
@@ -984,7 +984,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "max((sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) and on(node) protocol_info{protocol=\"vantage\"})) / 10000 or vector(0)",
+          "expr": "max((sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\",proc=~\"inbound_dispatch|effect_execution|payload_sync|timer_firing|header_seal|resume_tick|metrics_tick|avail_flush\"}[1m])) and on(node) protocol_info{protocol=\"vantage\"})) / 10000 or vector(0)",
           "legendFormat": "percent",
           "refId": "A"
         }
@@ -2034,7 +2034,7 @@
           },
           "refId": "A",
           "legendFormat": "{{node}} cpu",
-          "expr": "(100 * (sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\"}[1m])) - sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m]))) / 1e6) and on(node) protocol_info{protocol=\"vantage\"}"
+          "expr": "(100 * (sum by (node) (rate(utilization_timer{node=~\"$node\",node=~\".*-primary$\",proc=~\"inbound_dispatch|effect_execution|payload_sync|timer_firing|header_seal|resume_tick|metrics_tick|avail_flush\"}[1m])) - sum by (node) (rate(core_wait_timer{node=~\"$node\",node=~\".*-primary$\"}[1m]))) / 1e6) and on(node) protocol_info{protocol=\"vantage\"}"
         },
         {
           "datasource": {

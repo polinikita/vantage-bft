@@ -174,7 +174,10 @@ impl PrimaryMessage {
     /// Returns the wire variant name used for metrics.
     pub fn type_name(&self) -> &'static str {
         match self {
-            PrimaryMessage::Header(..) => "Header",
+            // The serve flag gets its own label so repair serves are separable from
+            // broadcast publishes in the typed wire counters.
+            PrimaryMessage::Header(_, true) => "HeaderServe",
+            PrimaryMessage::Header(_, false) => "Header",
             PrimaryMessage::Vote(..) => "Vote",
             PrimaryMessage::Certificate(..) => "Certificate",
             PrimaryMessage::Timeout(..) => "Timeout",

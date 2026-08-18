@@ -41,6 +41,7 @@ impl DelayedHeaderSender {
             })
             .collect();
         let mut network = ReliableSender::new()
+            .with_queue_role("delayed_header")
             .with_latency(latency)
             .with_batching(batch)
             .with_channel_auth(auth)

@@ -420,6 +420,15 @@ pub struct Metrics {
     pub network_frames_sent_total: IntCounter,
     /// Volatile sends shed after the destination queue reaches its soft cap.
     pub network_volatile_shed_total: IntCounter,
+    /// Deepest per-destination sender queue observed in this process, by sender `role`.
+    /// High-watermark: it never decays within the process lifetime, so it reports the
+    /// worst backlog since start, not the current one, and it cannot be windowed by a
+    /// baseline/final delta the way counters can. Each role has one owning sender
+    /// instance, which keeps the gauge single-writer.
+    pub network_sender_queue_peak: IntGaugeVec,
+    /// Acknowledged detached sends, by `type`. Detached sends have no reply target, so
+    /// without this counter they are only visible as enqueued, never as delivered.
+    pub network_detached_acked_total: IntCounterVec,
     /// Open inbound TCP connections by listener role.
     pub network_connections: IntGaugeVec,
     /// Distinct remote IPs with an open inbound connection.
@@ -580,6 +589,15 @@ pub struct Metrics {
     pub vantage_walk_steps_total: IntCounterVec,
     /// Failed prefix walks by family and failure branch.
     pub vantage_walk_failures_total: IntCounterVec,
+    /// Microseconds spent in chain walks. This time is cross-cutting: it accrues on both
+    /// the inbound and the effect path, so it must stay out of `utilization_timer` — only
+    /// that metric's top-level sections partition the core loop, its nested labels are
+    /// subsections of a single parent each, and a two-parent term would corrupt both views.
+    pub vantage_chain_walk_busy_us: IntCounter,
+    /// Microseconds spent settling repair references. Cross-cutting like the chain walk:
+    /// settling is reached from at least four top-level sections, so it lives outside
+    /// `utilization_timer` and must never be summed with its sections.
+    pub vantage_repair_settle_busy_us: IntCounter,
     /// Fresh repair campaigns after a full-coverage campaign went unanswered.
     pub vantage_repair_refetch_campaigns_total: IntCounter,
     /// Body-fetch pairs abandoned after `MAX_FETCH_ATTEMPTS`.
@@ -1277,6 +1295,20 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
+            network_sender_queue_peak: register_int_gauge_vec_with_registry!(
+                "network_sender_queue_peak",
+                "High-watermark depth of a sender's per-destination queues, by sender role",
+                &["role"],
+                registry,
+            )
+            .unwrap(),
+            network_detached_acked_total: register_int_counter_vec_with_registry!(
+                "network_detached_acked_total",
+                "Detached sends whose acknowledgement arrived, by type",
+                &["type"],
+                registry,
+            )
+            .unwrap(),
             network_connections: register_int_gauge_vec_with_registry!(
                 "network_connections",
                 "Currently-open inbound TCP connections by listener role",
@@ -1718,6 +1750,18 @@ impl Metrics {
                 "vantage_walk_failures_total",
                 "Failed prefix walks by family and failure branch",
                 &["family", "branch"],
+                registry,
+            )
+            .unwrap(),
+            vantage_chain_walk_busy_us: register_int_counter_with_registry!(
+                "vantage_chain_walk_busy_us",
+                "Microseconds spent in chain walks, spanning the inbound and effect paths",
+                registry,
+            )
+            .unwrap(),
+            vantage_repair_settle_busy_us: register_int_counter_with_registry!(
+                "vantage_repair_settle_busy_us",
+                "Microseconds spent settling repair references, reached from several sections",
                 registry,
             )
             .unwrap(),

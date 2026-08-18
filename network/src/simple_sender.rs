@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch::{sleep_until_or_pending, BatchConfig, Coalescer};
 use crate::error::NetworkError;
-use crate::reliable_sender::record_typed_sent;
+use crate::reliable_sender::{note_queue_depth, record_typed_sent};
 use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
@@ -44,6 +44,12 @@ pub struct SimpleSender {
     batch: BatchConfig,
     /// Pairwise channel keys, when channel authentication is enabled.
     auth: Option<Arc<ChannelAuth>>,
+    /// Role label for the sender-queue watermark gauge.
+    queue_role: &'static str,
+    /// Deepest queue this instance has reported. Owned state, so updates are single-writer.
+    queue_peak_seen: i64,
+    /// Cached gauge child for `queue_role`.
+    queue_gauge: Option<metrics::IntGauge>,
 }
 
 impl std::default::Default for SimpleSender {
@@ -61,7 +67,18 @@ impl SimpleSender {
             metrics: None,
             batch: BatchConfig::default(),
             auth: None,
+            queue_role: "unlabeled",
+            queue_peak_seen: 0,
+            queue_gauge: None,
         }
+    }
+
+    /// Names this sender in the queue-watermark gauge.
+    ///
+    /// One instance per role per process keeps the gauge single-writer.
+    pub fn with_queue_role(mut self, role: &'static str) -> Self {
+        self.queue_role = role;
+        self
     }
 
     /// Set fixed per-destination send latency before spawning connections.
@@ -108,7 +125,19 @@ impl SimpleSender {
 
     /// Best-effort send to one address.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
-        if let Some(tx) = self.connections.get(&address) {
+        if self.connections.contains_key(&address) {
+            let depth = {
+                let tx = self.connections.get(&address).unwrap();
+                tx.max_capacity().saturating_sub(tx.capacity())
+            };
+            note_queue_depth(
+                &self.metrics,
+                self.queue_role,
+                &mut self.queue_peak_seen,
+                &mut self.queue_gauge,
+                depth,
+            );
+            let tx = self.connections.get(&address).unwrap();
             if tx.send(data.clone()).await.is_ok() {
                 return;
             }

@@ -22,3 +22,5 @@ pub use crate::snapshot::{
     AggregatedLatency, LatencySnapshot, VantageProgress,
 };
 pub use crate::stat::{histogram, DivUsize, HistogramSender, MulUsize, PreciseHistogram};
+/// Re-exported for crates that hold cached gauge children without a prometheus dependency.
+pub use ::prometheus::IntGauge;

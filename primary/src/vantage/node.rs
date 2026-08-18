@@ -704,7 +704,7 @@ pub struct VantageCore {
     ut_metrics_tick: Option<IntCounter>,
 
     walk_steps_published: (u64, u64, u64),
-    /// Chain-walk nanoseconds already published as a utilization section.
+    /// Chain-walk nanoseconds already published to `vantage_chain_walk_busy_us`.
     chain_walk_nanos_published: u64,
 
     walk_fails_published: ([u64; 3], [u64; 3]),
@@ -1020,6 +1020,7 @@ impl VantageCore {
                 codec: wire_codec,
                 network: {
                     let mut s = ReliableSender::new()
+                        .with_queue_role("core")
                         .with_latency(latency_map.clone())
                         .with_batching(batch)
                         .with_channel_auth(auth.clone())
@@ -1038,6 +1039,7 @@ impl VantageCore {
                 },
                 worker_network: {
                     let mut s = SimpleSender::new()
+                        .with_queue_role("primary_worker")
                         .with_latency(latency_map)
                         .with_batching(batch)
                         .with_channel_auth(auth.clone());
@@ -1826,8 +1828,7 @@ impl VantageCore {
                         .inc_by(cur.saturating_sub(was));
                 }
                 metrics
-                    .utilization_timer
-                    .with_label_values(&["chain_walk"])
+                    .vantage_chain_walk_busy_us
                     .inc_by(chain_nanos.saturating_sub(self.chain_walk_nanos_published) / 1_000);
                 self.chain_walk_nanos_published = chain_nanos;
                 for (family, cur, was) in [

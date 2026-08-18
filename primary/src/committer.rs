@@ -129,6 +129,7 @@ impl Committer {
                 worker_addresses,
                 #[cfg(feature = "benchmark")]
                 network: SimpleSender::new()
+                    .with_queue_role("committer")
                     .with_metrics(metrics)
                     .with_batching(batch)
                     .with_channel_auth(auth),

@@ -63,6 +63,7 @@ impl Helper {
                 rx_primaries_headers,
                 rx_proposal_headers,
                 network: SimpleSender::new()
+                    .with_queue_role("primary_helper")
                     .with_metrics(metrics.clone())
                     .with_batching(batch)
                     .with_channel_auth(auth),

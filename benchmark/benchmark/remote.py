@@ -41,7 +41,14 @@ COLLECTOR_QUERIES = {
     'bytes_sent_total': 'sum(bytes_sent_total)',
     'bytes_received_total': 'sum(bytes_received_total)',
     'submitted_transactions': 'sum(submitted_transactions)',
-    'utilization_timer_by_proc': 'sum by (proc) (utilization_timer)',
+    # Only the top-level sections partition the core loop; nested labels
+    # (avail_claims, in_*) are subsections and must not be summed with them.
+    'utilization_timer_by_proc': 'sum by (proc) (utilization_timer{proc=~"inbound_dispatch|effect_execution|payload_sync|timer_firing|header_seal|resume_tick|metrics_tick|avail_flush"})',
+    'utilization_timer_nested_by_proc': 'sum by (proc) (utilization_timer{proc!~"inbound_dispatch|effect_execution|payload_sync|timer_firing|header_seal|resume_tick|metrics_tick|avail_flush"})',
+    'vantage_chain_walk_busy_us': 'sum(vantage_chain_walk_busy_us)',
+    'vantage_repair_settle_busy_us': 'sum(vantage_repair_settle_busy_us)',
+    'network_detached_acked_by_type': 'sum by (type) (network_detached_acked_total)',
+    'network_sender_queue_peak_by_role': 'max by (role) (network_sender_queue_peak)',
     'core_wait_timer_by_proc': 'sum by (proc) (core_wait_timer)',
     'core_queue_length': 'core_queue_length',
     'core_queue_peak': 'core_queue_peak',

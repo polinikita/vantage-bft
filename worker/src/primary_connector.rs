@@ -31,6 +31,7 @@ impl PrimaryConnector {
                 primary_address,
                 rx_digest,
                 network: SimpleSender::new()
+                    .with_queue_role("worker_primary")
                     .with_metrics(metrics)
                     .with_batching(batch)
                     .with_channel_auth(auth),

@@ -59,6 +59,7 @@ impl Helper {
                 store,
                 rx_request,
                 network: SimpleSender::new()
+                    .with_queue_role("worker_helper")
                     .with_latency(latency_map)
                     .with_metrics(metrics)
                     .with_batching(batch)

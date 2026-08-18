@@ -57,6 +57,7 @@ impl GarbageCollector {
                 tx_loopback,
                 addresses,
                 network: SimpleSender::new()
+                    .with_queue_role("gc")
                     .with_metrics(metrics)
                     .with_batching(batch)
                     .with_channel_auth(auth),

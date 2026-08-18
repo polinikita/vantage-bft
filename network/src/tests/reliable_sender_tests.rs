@@ -465,6 +465,52 @@ async fn send_detached_typed_done_frame_survives_past_the_send_call_scope() {
     );
 }
 
+/// A detached send has no reply target, so its delivery is observable only through the
+/// counter. The durable frame behind it is the barrier: acknowledgements are consumed in
+/// transmission order, so its handler cannot resolve before the detached ack is counted.
+#[tokio::test]
+async fn detached_delivery_is_counted_by_message_type_when_its_ack_arrives() {
+    let address = "127.0.0.1:5316".parse::<SocketAddr>().unwrap();
+    let registry = prometheus::Registry::new();
+    let (metrics, _reporter) = Metrics::new(&registry);
+    let mut sender = ReliableSender::new().with_metrics(metrics.clone());
+
+    let handle = tokio::spawn(async move {
+        let listener = TcpListener::bind(&address).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (mut writer, mut reader) = Framed::new(socket, LengthDelimitedCodec::new()).split();
+        for _ in 0..2 {
+            match reader.next().await {
+                Some(Ok(_)) => writer.send(Bytes::from("Ack")).await.unwrap(),
+                _ => panic!("a frame never reached the wire"),
+            }
+        }
+    });
+
+    sender
+        .send_detached_typed(address, Bytes::from("detached"), "VantageReplayDone")
+        .await;
+    let barrier = sender.send(address, Bytes::from("durable")).await;
+    assert!(barrier.await.is_ok());
+    assert!(handle.await.is_ok());
+
+    assert_eq!(
+        metrics
+            .network_detached_acked_total
+            .with_label_values(&["VantageReplayDone"])
+            .get(),
+        1
+    );
+    assert_eq!(
+        metrics
+            .network_detached_acked_total
+            .with_label_values(&["Header"])
+            .get(),
+        0,
+        "the ack must be attributed to the type that was sent"
+    );
+}
+
 /// A detached durable entry survives the pre-send cancellation check.
 #[tokio::test]
 async fn detached_entry_survives_pre_send_skip_on_a_live_session() {
@@ -542,7 +588,10 @@ async fn detached_entry_is_requeued_across_a_session_death_like_any_durable_entr
 async fn volatile_soft_cap_sheds_into_the_drop_map_instead_of_blocking() {
     let address = "127.0.0.1:5320".parse::<SocketAddr>().unwrap();
     let drop_map: DirtyMap = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let registry = prometheus::Registry::new();
+    let (metrics, _reporter) = Metrics::new(&registry);
     let mut sender = ReliableSender::new()
+        .with_metrics(metrics.clone())
         .with_drop_map(drop_map.clone())
         .with_volatile_soft_cap(2);
     let (tx, _rx) = mpsc::channel(100);
@@ -559,6 +608,16 @@ async fn volatile_soft_cap_sheds_into_the_drop_map_instead_of_blocking() {
     assert_eq!(drop_map.lock().get(&address), Some(&3));
     sender.send_volatile(address, Bytes::from("e"), 5).await;
     assert_eq!(drop_map.lock().get(&address), Some(&3));
+
+    assert_eq!(
+        metrics
+            .network_sender_queue_peak
+            .with_label_values(&["unlabeled"])
+            .get(),
+        2,
+        "the watermark must report the two frames this undrained queue held under the \
+         default role, not the depth of the last send"
+    );
 }
 
 /// A shed without a drop map is not queued or recorded.

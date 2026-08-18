@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use log::{debug, warn};
-use metrics::Metrics;
+use metrics::{IntGauge, Metrics};
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -41,8 +41,11 @@ type ReplyTargets = Vec<oneshot::Sender<Bytes>>;
 /// Minimum key used to account for a discarded volatile entry.
 type VolatileKey = Option<u64>;
 
-/// Wire bytes, reply targets, and the optional volatile key for one entry.
-type BufferedEntry = (Bytes, ReplyTargets, VolatileKey);
+/// Message type of a detached entry, which has no reply target to notify on delivery.
+type DetachedType = Option<&'static str>;
+
+/// Wire bytes, reply targets, the optional volatile key, and the detached type.
+type BufferedEntry = (Bytes, ReplyTargets, VolatileKey, DetachedType);
 
 /// Default maximum delay between reconnect attempts, in milliseconds.
 const DEFAULT_RETRY_BACKOFF_MAX_MS: u64 = 2_000;
@@ -90,6 +93,12 @@ pub struct ReliableSender {
     volatile_soft_cap: usize,
     /// Pairwise channel keys, when channel authentication is enabled.
     auth: Option<Arc<ChannelAuth>>,
+    /// Role label for the sender-queue watermark gauge.
+    queue_role: &'static str,
+    /// Deepest queue this instance has reported. Owned state, so updates are single-writer.
+    queue_peak_seen: i64,
+    /// Cached gauge child for `queue_role`.
+    queue_gauge: Option<IntGauge>,
 }
 
 impl std::default::Default for ReliableSender {
@@ -111,7 +120,18 @@ impl ReliableSender {
             retry_backoff_max_ms: DEFAULT_RETRY_BACKOFF_MAX_MS,
             volatile_soft_cap: 0,
             auth: None,
+            queue_role: "unlabeled",
+            queue_peak_seen: 0,
+            queue_gauge: None,
         }
+    }
+
+    /// Names this sender in the queue-watermark gauge.
+    ///
+    /// One instance per role per process keeps the gauge single-writer.
+    pub fn with_queue_role(mut self, role: &'static str) -> Self {
+        self.queue_role = role;
+        self
     }
 
     /// Set fixed per-destination latency before spawning connections.
@@ -189,14 +209,19 @@ impl ReliableSender {
             let tx = self.spawn_connection(address);
             self.connections.insert(address, tx);
         }
-        if self
-            .connections
-            .get(&address)
-            .unwrap()
-            .send(message)
-            .await
-            .is_err()
-        {
+        let depth = {
+            let tx = self.connections.get(&address).unwrap();
+            tx.max_capacity().saturating_sub(tx.capacity())
+        };
+        note_queue_depth(
+            &self.metrics,
+            self.queue_role,
+            &mut self.queue_peak_seen,
+            &mut self.queue_gauge,
+            depth,
+        );
+        let tx = self.connections.get(&address).unwrap();
+        if tx.send(message).await.is_err() {
             if process_is_shutting_down() {
                 std::future::pending::<()>().await;
             }
@@ -307,7 +332,6 @@ impl ReliableSender {
             let tx = self.spawn_connection(address);
             self.connections.insert(address, tx);
         }
-        let tx = self.connections.get(&address).unwrap();
         if self.volatile_soft_cap == 0 {
             self.enqueue(
                 address,
@@ -319,11 +343,22 @@ impl ReliableSender {
             .await;
             return;
         }
-        let depth = tx.max_capacity().saturating_sub(tx.capacity());
+        let depth = {
+            let tx = self.connections.get(&address).unwrap();
+            tx.max_capacity().saturating_sub(tx.capacity())
+        };
+        note_queue_depth(
+            &self.metrics,
+            self.queue_role,
+            &mut self.queue_peak_seen,
+            &mut self.queue_gauge,
+            depth,
+        );
         if depth >= self.volatile_soft_cap {
             self.record_volatile_shed(address, key);
             return;
         }
+        let tx = self.connections.get(&address).unwrap();
         match tx.try_send(InnerMessage {
             data,
             class: SendClass::Volatile(key),
@@ -392,13 +427,16 @@ impl ReliableSender {
             address,
             InnerMessage {
                 data,
-                class: SendClass::DurableDetached,
+                class: SendClass::DurableDetached(None),
             },
         )
         .await;
     }
 
     /// Typed variant of `send_detached` (see `send_typed`).
+    ///
+    /// The type travels with the entry so delivery can be counted: a detached send has no
+    /// reply target, so the acknowledgement is otherwise unobservable.
     pub async fn send_detached_typed(
         &mut self,
         address: SocketAddr,
@@ -406,7 +444,14 @@ impl ReliableSender {
         msg_type: &'static str,
     ) {
         record_typed_sent(&self.metrics, msg_type, data.len());
-        self.send_detached(address, data).await;
+        self.enqueue(
+            address,
+            InnerMessage {
+                data,
+                class: SendClass::DurableDetached(Some(msg_type)),
+            },
+        )
+        .await;
     }
 }
 
@@ -445,7 +490,7 @@ pub(crate) fn record_typed_sent_n(
 #[derive(Debug)]
 enum SendClass {
     Durable(oneshot::Sender<Bytes>),
-    DurableDetached,
+    DurableDetached(DetachedType),
     Volatile(u64),
 }
 
@@ -456,6 +501,41 @@ struct InnerMessage {
     data: Bytes,
     /// Delivery class.
     class: SendClass,
+}
+
+/// Raises one sender's queue high-watermark.
+///
+/// The comparison state lives in the owning sender and each role has one owning
+/// instance per process, so updates are single-writer and monotone — there is no
+/// cross-thread race to lose an observation to. The published gauge never decays
+/// within the process lifetime: it reports the worst backlog since start, not the
+/// current one, and it cannot be windowed by baseline/final deltas like a counter.
+pub(crate) fn note_queue_depth(
+    metrics: &Option<Arc<Metrics>>,
+    role: &'static str,
+    peak_seen: &mut i64,
+    gauge: &mut Option<IntGauge>,
+    depth: usize,
+) {
+    let Some(metrics) = metrics else { return };
+    let depth = depth as i64;
+    if depth > *peak_seen {
+        *peak_seen = depth;
+        gauge
+            .get_or_insert_with(|| metrics.network_sender_queue_peak.with_label_values(&[role]))
+            .set(depth);
+    }
+}
+
+/// Counts one acknowledged detached send.
+fn record_detached_ack(metrics: &Option<Arc<Metrics>>, msg_type: DetachedType) {
+    let (Some(metrics), Some(msg_type)) = (metrics, msg_type) else {
+        return;
+    };
+    metrics
+        .network_detached_acked_total
+        .with_label_values(&[msg_type])
+        .inc();
 }
 
 /// Returns true when all non-empty reply targets are closed.
@@ -638,13 +718,13 @@ impl Connection {
                                 match class {
                                     SendClass::Durable(h) => {
                                         let data = if self.batch.enabled { encode_bundle(&[data]) } else { data };
-                                        self.buffer.push_back((data, vec![h], None));
-                                        self.buffer.retain(|(_, handlers, _)| !all_closed(handlers));
+                                        self.buffer.push_back((data, vec![h], None, None));
+                                        self.buffer.retain(|(_, handlers, _, _)| !all_closed(handlers));
                                     }
-                                    SendClass::DurableDetached => {
+                                    SendClass::DurableDetached(msg_type) => {
                                         let data = if self.batch.enabled { encode_bundle(&[data]) } else { data };
-                                        self.buffer.push_back((data, Vec::new(), None));
-                                        self.buffer.retain(|(_, handlers, _)| !all_closed(handlers));
+                                        self.buffer.push_back((data, Vec::new(), None, msg_type));
+                                        self.buffer.retain(|(_, handlers, _, _)| !all_closed(handlers));
                                     }
                                     SendClass::Volatile(k) => self.report_dropped(Some(k)),
                                 }
@@ -682,19 +762,19 @@ impl Connection {
         volatile_deadline: &mut Option<Instant>,
     ) {
         match class {
-            SendClass::DurableDetached => {
+            SendClass::DurableDetached(msg_type) => {
                 let data = if self.batch.enabled {
                     encode_bundle(&[data])
                 } else {
                     data
                 };
-                self.buffer.push_back((data, Vec::new(), None));
+                self.buffer.push_back((data, Vec::new(), None, msg_type));
             }
             SendClass::Durable(h) if !self.batch.enabled => {
-                self.buffer.push_back((data, vec![h], None));
+                self.buffer.push_back((data, vec![h], None, None));
             }
             SendClass::Volatile(k) if !self.batch.enabled => {
-                self.buffer.push_back((data, Vec::new(), Some(k)));
+                self.buffer.push_back((data, Vec::new(), Some(k), None));
             }
             SendClass::Durable(h) => {
                 if durable_coalescer.push(data, h) {
@@ -703,7 +783,7 @@ impl Connection {
                 if durable_coalescer.over_cap(self.batch.max_bytes) {
                     let (bundle, handlers) = durable_coalescer.flush();
                     *durable_deadline = None;
-                    self.buffer.push_back((bundle, handlers, None));
+                    self.buffer.push_back((bundle, handlers, None, None));
                 }
             }
             SendClass::Volatile(k) => {
@@ -714,7 +794,7 @@ impl Connection {
                     let (bundle, keys) = volatile_coalescer.flush();
                     *volatile_deadline = None;
                     self.buffer
-                        .push_back((bundle, Vec::new(), keys.into_iter().min()));
+                        .push_back((bundle, Vec::new(), keys.into_iter().min(), None));
                 }
             }
         }
@@ -731,7 +811,7 @@ impl Connection {
         let authenticated = codec.is_authenticated();
         let (mut writer, mut reader) = Framed::new(stream, codec).split();
         let error = 'connection: loop {
-            while let Some((data, handlers, key)) = self.buffer.pop_front() {
+            while let Some((data, handlers, key, msg_type)) = self.buffer.pop_front() {
                 if all_closed(&handlers) {
                     continue;
                 }
@@ -739,11 +819,11 @@ impl Connection {
                 match writer.send(data.clone()).await {
                     Ok(()) => {
                         self.record_sent(data.len(), authenticated);
-                        pending_replies.push_back((data, handlers, key));
+                        pending_replies.push_back((data, handlers, key, msg_type));
                     }
                     Err(e) => {
                         let len = data.len();
-                        self.buffer.push_front((data, handlers, key));
+                        self.buffer.push_front((data, handlers, key, msg_type));
                         break 'connection NetworkError::FailedToSendMessage(self.address, len, e);
                     }
                 }
@@ -756,27 +836,28 @@ impl Connection {
                 () = durable_due, if self.batch.enabled && !durable_coalescer.is_empty() => {
                     let (bundle, handlers) = durable_coalescer.flush();
                     durable_deadline = None;
-                    self.buffer.push_back((bundle, handlers, None));
+                    self.buffer.push_back((bundle, handlers, None, None));
                 },
                 () = volatile_due, if self.batch.enabled && !volatile_coalescer.is_empty() => {
                     let (bundle, keys) = volatile_coalescer.flush();
                     volatile_deadline = None;
-                    self.buffer.push_back((bundle, Vec::new(), keys.into_iter().min()));
+                    self.buffer.push_back((bundle, Vec::new(), keys.into_iter().min(), None));
                 },
                 Some(InnerMessage{data, class}) = self.receiver.recv() => {
                     self.on_arrival(data, class, &mut durable_coalescer, &mut durable_deadline, &mut volatile_coalescer, &mut volatile_deadline);
                 },
                 response = reader.next() => {
-                    let (data, handlers, key) = match pending_replies.pop_front() {
+                    let (data, handlers, key, msg_type) = match pending_replies.pop_front() {
                         Some(message) => message,
                         None => break 'connection NetworkError::UnexpectedAck(self.address)
                     };
                     match response {
                         Some(Ok(bytes)) => {
+                            record_detached_ack(&self.metrics, msg_type);
                             notify_all(handlers, bytes.freeze());
                         },
                         _ => {
-                            pending_replies.push_front((data, handlers, key));
+                            pending_replies.push_front((data, handlers, key, msg_type));
                             break 'connection NetworkError::FailedToReceiveAck(self.address);
                         }
                     }
@@ -786,10 +867,10 @@ impl Connection {
 
         // Requeue durable entries and account for dropped volatile entries.
         let mut min_dropped_key: Option<u64> = None;
-        while let Some((data, handlers, key)) = pending_replies.pop_back() {
+        while let Some((data, handlers, key, msg_type)) = pending_replies.pop_back() {
             match key {
                 Some(k) => merge_min_key(&mut min_dropped_key, k),
-                None => self.buffer.push_front((data, handlers, None)),
+                None => self.buffer.push_front((data, handlers, None, msg_type)),
             }
         }
         // Preserve bundle framing for unflushed durable messages.
@@ -797,13 +878,13 @@ impl Connection {
         if !durable_drained.is_empty() {
             let (msgs, handlers): (Vec<Bytes>, ReplyTargets) = durable_drained.into_iter().unzip();
             self.buffer
-                .push_front((encode_bundle(&msgs), handlers, None));
+                .push_front((encode_bundle(&msgs), handlers, None, None));
         }
         let volatile_drained = volatile_coalescer.drain();
         for (_, k) in volatile_drained {
             merge_min_key(&mut min_dropped_key, k);
         }
-        self.buffer.retain(|(_, _, key)| match key {
+        self.buffer.retain(|(_, _, key, _)| match key {
             Some(k) => {
                 merge_min_key(&mut min_dropped_key, *k);
                 false
@@ -817,7 +898,7 @@ impl Connection {
     /// Transmit with a fixed per-connection delay.
     async fn keep_alive_delayed(&mut self, stream: TcpStream, codec: AuthCodec) -> NetworkError {
         let mut pending_replies: VecDeque<BufferedEntry> = VecDeque::new();
-        let mut delay_queue: VecDeque<(Instant, Bytes, ReplyTargets, VolatileKey)> =
+        let mut delay_queue: VecDeque<(Instant, Bytes, ReplyTargets, VolatileKey, DetachedType)> =
             VecDeque::new();
         let mut durable_coalescer: Coalescer<oneshot::Sender<Bytes>> = Coalescer::new();
         let mut durable_deadline: Option<Instant> = None;
@@ -827,16 +908,16 @@ impl Connection {
         let authenticated = codec.is_authenticated();
         let (mut writer, mut reader) = Framed::new(stream, codec).split();
         let error = 'connection: loop {
-            while let Some((data, handlers, key)) = self.buffer.pop_front() {
+            while let Some((data, handlers, key, msg_type)) = self.buffer.pop_front() {
                 if all_closed(&handlers) {
                     continue;
                 }
-                delay_queue.push_back((self.scheduled_release(), data, handlers, key));
+                delay_queue.push_back((self.scheduled_release(), data, handlers, key, msg_type));
             }
 
             let due = async {
                 match delay_queue.front() {
-                    Some((release_at, _, _, _)) => sleep_until(*release_at).await,
+                    Some((release_at, _, _, _, _)) => sleep_until(*release_at).await,
                     None => std::future::pending::<()>().await,
                 }
             };
@@ -845,18 +926,18 @@ impl Connection {
 
             tokio::select! {
                 () = due, if !delay_queue.is_empty() => {
-                    let (_, data, handlers, key) = delay_queue.pop_front().unwrap();
+                    let (_, data, handlers, key, msg_type) = delay_queue.pop_front().unwrap();
                     if all_closed(&handlers) {
                         continue;
                     }
                     match writer.send(data.clone()).await {
                         Ok(()) => {
                             self.record_sent(data.len(), authenticated);
-                            pending_replies.push_back((data, handlers, key));
+                            pending_replies.push_back((data, handlers, key, msg_type));
                         }
                         Err(e) => {
                             let len = data.len();
-                            self.buffer.push_front((data, handlers, key));
+                            self.buffer.push_front((data, handlers, key, msg_type));
                             break 'connection NetworkError::FailedToSendMessage(self.address, len, e);
                         }
                     }
@@ -864,27 +945,28 @@ impl Connection {
                 () = durable_due, if self.batch.enabled && !durable_coalescer.is_empty() => {
                     let (bundle, handlers) = durable_coalescer.flush();
                     durable_deadline = None;
-                    self.buffer.push_back((bundle, handlers, None));
+                    self.buffer.push_back((bundle, handlers, None, None));
                 },
                 () = volatile_due, if self.batch.enabled && !volatile_coalescer.is_empty() => {
                     let (bundle, keys) = volatile_coalescer.flush();
                     volatile_deadline = None;
-                    self.buffer.push_back((bundle, Vec::new(), keys.into_iter().min()));
+                    self.buffer.push_back((bundle, Vec::new(), keys.into_iter().min(), None));
                 },
                 Some(InnerMessage{data, class}) = self.receiver.recv() => {
                     self.on_arrival(data, class, &mut durable_coalescer, &mut durable_deadline, &mut volatile_coalescer, &mut volatile_deadline);
                 },
                 response = reader.next() => {
-                    let (data, handlers, key) = match pending_replies.pop_front() {
+                    let (data, handlers, key, msg_type) = match pending_replies.pop_front() {
                         Some(message) => message,
                         None => break 'connection NetworkError::UnexpectedAck(self.address)
                     };
                     match response {
                         Some(Ok(bytes)) => {
+                            record_detached_ack(&self.metrics, msg_type);
                             notify_all(handlers, bytes.freeze());
                         },
                         _ => {
-                            pending_replies.push_front((data, handlers, key));
+                            pending_replies.push_front((data, handlers, key, msg_type));
                             break 'connection NetworkError::FailedToReceiveAck(self.address);
                         }
                     }
@@ -894,29 +976,29 @@ impl Connection {
 
         // Requeue durable entries and account for dropped volatile entries.
         let mut min_dropped_key: Option<u64> = None;
-        while let Some((data, handlers, key)) = pending_replies.pop_back() {
+        while let Some((data, handlers, key, msg_type)) = pending_replies.pop_back() {
             match key {
                 Some(k) => merge_min_key(&mut min_dropped_key, k),
-                None => self.buffer.push_front((data, handlers, None)),
+                None => self.buffer.push_front((data, handlers, None, msg_type)),
             }
         }
-        while let Some((_, data, handlers, key)) = delay_queue.pop_back() {
+        while let Some((_, data, handlers, key, msg_type)) = delay_queue.pop_back() {
             match key {
                 Some(k) => merge_min_key(&mut min_dropped_key, k),
-                None => self.buffer.push_front((data, handlers, None)),
+                None => self.buffer.push_front((data, handlers, None, msg_type)),
             }
         }
         let durable_drained = durable_coalescer.drain();
         if !durable_drained.is_empty() {
             let (msgs, handlers): (Vec<Bytes>, ReplyTargets) = durable_drained.into_iter().unzip();
             self.buffer
-                .push_front((encode_bundle(&msgs), handlers, None));
+                .push_front((encode_bundle(&msgs), handlers, None, None));
         }
         let volatile_drained = volatile_coalescer.drain();
         for (_, k) in volatile_drained {
             merge_min_key(&mut min_dropped_key, k);
         }
-        self.buffer.retain(|(_, _, key)| match key {
+        self.buffer.retain(|(_, _, key, _)| match key {
             Some(k) => {
                 merge_min_key(&mut min_dropped_key, *k);
                 false

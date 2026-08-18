@@ -385,6 +385,7 @@ impl SimpleItCore {
                 codec: wire_codec,
                 network: {
                     let mut s = ReliableSender::new()
+                        .with_queue_role("core")
                         .with_latency(latency_map.clone())
                         .with_batching(batch)
                         .with_channel_auth(auth.clone())
@@ -396,6 +397,7 @@ impl SimpleItCore {
                 },
                 worker_network: {
                     let mut s = SimpleSender::new()
+                        .with_queue_role("primary_worker")
                         .with_latency(latency_map)
                         .with_batching(batch)
                         .with_channel_auth(auth.clone());

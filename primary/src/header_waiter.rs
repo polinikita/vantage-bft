@@ -236,6 +236,7 @@ impl HeaderWaiter {
                 tx_core,
                 tx_consensus_loopback,
                 network: SimpleSender::new()
+                    .with_queue_role("header_waiter")
                     .with_metrics(metrics.clone())
                     .with_batching(batch)
                     .with_channel_auth(auth),

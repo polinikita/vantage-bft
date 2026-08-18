@@ -183,6 +183,7 @@ impl Synchronizer {
                 sync_retry_nodes,
                 rx_message,
                 network: SimpleSender::new()
+                    .with_queue_role("worker_sync")
                     .with_latency(latency_map)
                     .with_metrics(metrics.clone())
                     .with_batching(batch)

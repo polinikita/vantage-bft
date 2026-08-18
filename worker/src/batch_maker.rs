@@ -104,6 +104,7 @@ impl BatchMaker {
                 current_batch: Batch::new(),
                 current_batch_size: 0,
                 network: SimpleSender::new()
+                    .with_queue_role("worker_batch")
                     .with_latency(latency_map)
                     .with_metrics(metrics.clone())
                     .with_batching(batch)
