@@ -323,12 +323,17 @@ impl AvailResolver {
 
     fn resolve_one(&mut self, sender: PublicKey, entry: &AvailEntry) -> Vec<BlockRef> {
         let key = (sender, entry.author);
-        // Compare heights before cloning anything: this runs once per claim and the
-        // covered case is the common one.
-        let (floor_height, floor_digest) = match self.credited_floor.get(&key) {
-            Some((floor, _)) if entry.height <= *floor => return Vec::new(),
-            Some((floor, digest)) => (*floor, digest.clone()),
-            None => (0, self.genesis.clone()),
+        let floor = self.credited_floor.get(&key);
+        // The floor probe compares heights before cloning anything, and it also covers the
+        // never-credited key: that floor is genesis, where an entry at height zero claims
+        // nothing to walk.
+        let floor_height = floor.map_or(0, |(height, _)| *height);
+        if entry.height <= floor_height {
+            return Vec::new();
+        }
+        let floor_digest = match floor {
+            Some((_, digest)) => digest.clone(),
+            None => self.genesis.clone(),
         };
         let segment = {
             let blocks = self.blocks.lock();

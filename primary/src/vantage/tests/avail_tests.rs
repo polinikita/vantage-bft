@@ -191,6 +191,32 @@ async fn resolve_watermark_credits_reach_the_same_availability_marks_as_direct_a
 }
 
 #[tokio::test]
+async fn height_zero_entry_credits_nothing_and_stashes_nothing() {
+    let (watcher, _) = authors()[0];
+    let (author, _) = authors()[1];
+    let (sender, _) = authors()[2];
+    let (mut lm, _store) = new_lane_manager(watcher, ".db_test_vantage_avail_height_zero");
+    let sid = lm.sid().clone();
+    let genesis = lm.genesis().clone();
+
+    let h1 = Header::new_vantage(author, 1, BTreeMap::new(), genesis, sid);
+    let entry = AvailEntry {
+        author,
+        height: 0,
+        head: h1.id.clone(),
+    };
+
+    assert!(
+        lm.resolve_watermark(sender, &[entry]).is_empty(),
+        "the genesis floor already covers height zero, so there is nothing to credit"
+    );
+    assert!(
+        lm.pending_avail_keys_for_test().is_empty(),
+        "a covered entry must not be stashed for retry"
+    );
+}
+
+#[tokio::test]
 async fn pending_avail_index_mirrors_the_map_through_stash_and_resolve() {
     let (watcher, _) = authors()[0];
     let (author, _) = authors()[1];

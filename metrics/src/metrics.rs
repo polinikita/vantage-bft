@@ -439,8 +439,6 @@ pub struct Metrics {
     pub channel_auth_frames_total: IntCounterVec,
     /// Payload bytes covered by a channel-authentication tag, by `direction`.
     pub channel_auth_bytes_total: IntCounterVec,
-    /// Claim batches dropped at the full aggregator channel; credits recoverable later.
-    pub vantage_claim_batches_dropped_total: IntCounter,
     /// Connections rejected for failing channel authentication, by `listener`.
     pub channel_auth_failures_total: IntCounterVec,
     // --- Sequence-chain metrics.
@@ -1338,12 +1336,6 @@ impl Metrics {
                 "channel_auth_bytes_total",
                 "Payload bytes covered by a channel-authentication tag, by direction",
                 &["direction"],
-                registry,
-            )
-            .unwrap(),
-            vantage_claim_batches_dropped_total: register_int_counter_with_registry!(
-                "vantage_claim_batches_dropped_total",
-                "Claim batches dropped at the full aggregator channel",
                 registry,
             )
             .unwrap(),

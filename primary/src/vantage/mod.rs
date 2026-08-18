@@ -2,7 +2,6 @@ pub mod agb;
 pub mod avail;
 pub mod block;
 pub mod claim;
-pub(crate) mod claim_agg;
 pub mod cursor;
 pub mod frontier;
 pub mod install;

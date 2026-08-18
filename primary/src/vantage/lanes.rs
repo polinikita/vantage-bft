@@ -847,7 +847,7 @@ pub struct LaneManager {
     /// This node's highest contiguous direct prefix for each author.
     own_avail_watermark: HashMap<PublicKey, (Height, Digest)>,
     avail_dirty: bool,
-    avail: Arc<Mutex<crate::vantage::avail::AvailResolver>>,
+    avail: crate::vantage::avail::AvailResolver,
 
     /// Greatest height with at least a validity-threshold availability mark.
     avail_watermark_high: HashMap<PublicKey, Height>,
@@ -905,13 +905,13 @@ impl LaneManager {
     ) -> Self {
         let sid = block::session_id(&committee);
         let genesis = block::genesis_digest(&sid);
-        let avail = Arc::new(Mutex::new(crate::vantage::avail::AvailResolver::new(
+        let avail = crate::vantage::avail::AvailResolver::new(
             committee.clone(),
             sid.clone(),
             genesis.clone(),
             max_block_payload,
             blocks.clone(),
-        )));
+        );
         Self {
             name,
             committee,
@@ -969,14 +969,14 @@ impl LaneManager {
     pub(crate) fn pending_avail_index_for_test(
         &self,
     ) -> std::collections::HashSet<(PublicKey, PublicKey)> {
-        self.avail.lock().pending_avail_index_for_test()
+        self.avail.pending_avail_index_for_test()
     }
 
     #[cfg(test)]
     pub(crate) fn pending_avail_keys_for_test(
         &self,
     ) -> std::collections::HashSet<(PublicKey, PublicKey)> {
-        self.avail.lock().pending_avail_keys_for_test()
+        self.avail.pending_avail_keys_for_test()
     }
 
     #[cfg(test)]
@@ -1095,12 +1095,10 @@ impl LaneManager {
 
         let anchor = (self.name, header.height, header.id.clone());
         self.blocks.lock().seed_recovered_own_anchor(header.clone());
-        self.avail.lock().reset_author(self.name, &anchor);
+        self.avail.reset_author(self.name, &anchor);
         self.ack_availability
             .insert(anchor.clone(), AckThreshold::Quorum);
-        self.avail
-            .lock()
-            .note_threshold(&anchor, AckThreshold::Quorum);
+        self.avail.note_threshold(&anchor, AckThreshold::Quorum);
         self.acked.insert(anchor.clone());
         self.direct_pub_refs.insert(anchor.clone());
         self.quorum_claim_refs.insert(anchor.clone());
@@ -1537,7 +1535,7 @@ impl LaneManager {
             return Vec::new();
         }
         self.ack_availability.insert(r.clone(), threshold);
-        self.avail.lock().note_threshold(&r, threshold);
+        self.avail.note_threshold(&r, threshold);
         let high = self.avail_watermark_high.entry(r.0).or_insert(0);
         if r.1 > *high {
             *high = r.1;
@@ -1563,7 +1561,7 @@ impl LaneManager {
 
     /// Exact-position quorum evidence is bounded-common and core-eligible.
     pub fn is_exact_q_available(&self, r: &BlockRef) -> bool {
-        self.avail.lock().is_exact_quorum(r)
+        self.avail.is_exact_quorum(r)
     }
 
     /// Requires an exact coordinate and a direct, payload-ready prefix through genesis.
@@ -1656,7 +1654,7 @@ impl LaneManager {
         if self.is_q_available(r, self.committee.quorum_threshold()) {
             self.quorum_claim_refs.insert(r.clone());
         }
-        if self.avail.lock().is_exact_quorum(r) {
+        if self.avail.is_exact_quorum(r) {
             self.quorum_direct_refs.insert(r.clone());
         }
         let advances = match self.own_avail_watermark.get(&r.0) {
@@ -1761,41 +1759,29 @@ impl LaneManager {
         sender: PublicKey,
         entries: &[AvailEntry],
     ) -> Vec<BlockRef> {
-        self.avail.lock().resolve_watermark(sender, entries)
+        self.avail.resolve_watermark(sender, entries)
     }
 
     pub fn note_claim(&mut self, sender: PublicKey, claims: &[ClaimRef]) -> Vec<BlockRef> {
-        let credits = self.avail.lock().note_claim(sender, claims);
-        self.apply_claim_quorums(&credits.newly_exact_quorum);
-        credits.references
-    }
-
-    /// Applies the register side of claim crediting: quorum-crossing references refresh
-    /// the candidate registers. Split from `note_claim` so the claim aggregator can run
-    /// the counting off-core and hand only this part back to the core's state.
-    pub(crate) fn apply_claim_quorums(&mut self, newly_exact_quorum: &[BlockRef]) {
+        let credits = self.avail.note_claim(sender, claims);
         let mut changed = HashSet::new();
-        for r in newly_exact_quorum {
-            if self.direct_pub_refs.contains(r) && self.quorum_direct_refs.insert(r.clone()) {
+        for r in credits.newly_exact_quorum {
+            if self.direct_pub_refs.contains(&r) && self.quorum_direct_refs.insert(r.clone()) {
                 changed.insert(r.0);
             }
         }
         for author in changed {
             self.refresh_registers(author);
         }
-    }
-
-    /// Shared handle to the claim-crediting state for the off-core aggregator.
-    pub(crate) fn avail_handle(&self) -> Arc<Mutex<crate::vantage::avail::AvailResolver>> {
-        self.avail.clone()
+        credits.references
     }
 
     pub fn claim_avail_height(&self, author: &PublicKey) -> Height {
-        self.avail.lock().avail_height(author)
+        self.avail.avail_height(author)
     }
 
     pub fn retry_pending_avail(&mut self, digest: &Digest) -> Vec<(PublicKey, BlockRef)> {
-        self.avail.lock().retry_pending_avail(digest)
+        self.avail.retry_pending_avail(digest)
     }
 
     /// Refreshes candidates using greatest height and smallest-digest tie-breaking.
