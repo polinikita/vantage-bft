@@ -24,7 +24,7 @@ pub const MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024;
 pub const TAG_LEN: usize = 16;
 
 /// Width of the length prefix `LengthDelimitedCodec` writes by default.
-const LENGTH_PREFIX_LEN: usize = 4;
+pub const LENGTH_PREFIX_LEN: usize = 4;
 
 /// Keys and counters bound to one authenticated connection.
 struct Session {

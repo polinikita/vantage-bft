@@ -17,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 use crate::channel_auth::{ChannelAuth, Role};
-use crate::codec::{authenticated_frame_codec, frame_codec, AuthCodec};
+use crate::codec::{authenticated_frame_codec, frame_codec, AuthCodec, LENGTH_PREFIX_LEN, TAG_LEN};
 
 #[cfg(test)]
 #[path = "tests/receiver_tests.rs"]
@@ -172,9 +172,12 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 match frame.map_err(|e| NetworkError::FailedToReceiveMessage(peer, e)) {
                     Ok(message) => {
                         if let Some(metrics) = &config.metrics {
+                            // The decoder strips the tag before returning, so add it back:
+                            // this counter measures what crossed the wire.
+                            let tag = if authenticated { TAG_LEN as u64 } else { 0 };
                             metrics
                                 .bytes_received_total
-                                .inc_by(message.len() as u64 + 4);
+                                .inc_by(message.len() as u64 + LENGTH_PREFIX_LEN as u64 + tag);
                             if authenticated {
                                 record_auth_frame(metrics, "received", message.len());
                             }

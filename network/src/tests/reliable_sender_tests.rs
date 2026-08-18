@@ -47,6 +47,45 @@ async fn a_requeued_payload_is_retagged_on_the_next_session() {
     assert!(handle.await.is_ok());
 }
 
+/// `bytes_sent_total` must measure what crossed the wire. The codec appends the tag after
+/// the sender records the payload length, so an authenticated frame costs its payload, the
+/// length prefix, and the tag. Without this the bytes-per-sequenced-byte figure understates
+/// an authenticated run by one tag per frame, which is ten percent of a small frame.
+#[tokio::test]
+async fn authenticated_frames_are_counted_with_their_tag() {
+    let address = "127.0.0.1:5903".parse::<SocketAddr>().unwrap();
+    let message = "Hello, world!";
+    let registry = prometheus::Registry::new();
+    let (metrics, _reporter) = Metrics::new(&registry);
+
+    let seed = [17u8; 32];
+    let dialer = ChannelAuth::new(&seed, 0, 2, HashMap::from([(address, 1)]));
+    let peer = Arc::new(ChannelAuth::new(&seed, 1, 2, HashMap::new()));
+    let mut sender = ReliableSender::new()
+        .with_metrics(metrics.clone())
+        .with_channel_auth(Some(Arc::new(dialer)));
+    let handle = authenticating_listener(address, peer, message.to_string(), 1);
+
+    let cancel_handler = sender.send(address, Bytes::from(message)).await;
+    assert!(cancel_handler.await.is_ok());
+    assert!(handle.await.is_ok());
+
+    let expected = message.len() as u64 + 4 + crate::codec::TAG_LEN as u64;
+    assert_eq!(
+        metrics.bytes_sent_total.get(),
+        expected,
+        "an authenticated frame must be counted as payload + prefix + tag"
+    );
+    assert_eq!(
+        metrics
+            .channel_auth_bytes_total
+            .with_label_values(&["sent"])
+            .get(),
+        message.len() as u64,
+        "the auth counter tracks covered payload, not the tag itself"
+    );
+}
+
 /// A destination outside the peer map stays on the plain path. This is what keeps client
 /// and same-host connections unauthenticated without a decision at every call site.
 #[tokio::test]

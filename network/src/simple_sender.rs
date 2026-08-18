@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::codec::Framed;
 
 use crate::channel_auth::{ChannelAuth, Role};
-use crate::codec::{authenticated_frame_codec, frame_codec, AuthCodec};
+use crate::codec::{authenticated_frame_codec, frame_codec, AuthCodec, LENGTH_PREFIX_LEN, TAG_LEN};
 use crate::receiver::record_auth_frame;
 
 #[cfg(test)]
@@ -213,7 +213,12 @@ impl Connection {
     /// Records one transmitted frame.
     fn record_sent(&self, len: usize, authenticated: bool) {
         let Some(metrics) = &self.metrics else { return };
-        metrics.bytes_sent_total.inc_by(len as u64 + 4);
+        // The codec appends the tag after this point, so count it here: the counter
+        // measures what crossed the wire, not what the protocol handed to the transport.
+        let tag = if authenticated { TAG_LEN as u64 } else { 0 };
+        metrics
+            .bytes_sent_total
+            .inc_by(len as u64 + LENGTH_PREFIX_LEN as u64 + tag);
         metrics.network_frames_sent_total.inc();
         if authenticated {
             record_auth_frame(metrics, "sent", len);
