@@ -220,6 +220,13 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         # their certified/available cuts.
         "max_block_payload": 16,
         "delta_ms": args.delta_ms,
+        "channel_auth": not args.no_channel_auth,
+        # One seed per generated run: every node reads the same document, so all pairs
+        # expand the same key material. Stands in for out-of-band provisioning.
+        "channel_auth_seed": (
+            None if args.no_channel_auth
+            else base64.b64encode(os.urandom(32)).decode()
+        ),
         "vantage_gc_window_views": 200,
         "simpleit_gc_window_rounds": 50,
         "ack_watermarks": not args.no_ack_watermarks,
@@ -474,6 +481,7 @@ def write_manifest(
         "sequence_sync_rearm_gap_views": args.sequence_sync_rearm_gap_views,
         "sequence_sync_chunk_records": args.sequence_sync_chunk_records,
         "sequence_sync_chunk_digests": args.sequence_sync_chunk_digests,
+        "channel_auth": not args.no_channel_auth,
         "sequence_sync_chunk_outcomes": args.sequence_sync_chunk_outcomes,
         "sequence_sync_chunk_outcome_items": args.sequence_sync_chunk_outcome_items,
         "sequence_install_enabled": not args.no_state_sync,
@@ -573,6 +581,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         ">= --sequence-sync-min-gap-views (default 300)")
     p.add_argument("--sequence-sync-min-gap-views", type=int, default=100,
                    help="minimum certified cursor gap that starts state sync (default 100)")
+    p.add_argument("--no-channel-auth", action="store_true",
+                   help="leave cross-validator links unauthenticated; the per-frame "
+                        "pairwise MAC the model assumes is on by default")
     p.add_argument("--sequence-sync-rearm-gap-views", type=int, default=300,
                    help="gap that re-arms a completed state sync; keep well below "
                         "--sequence-sync-shed-gap-views so a finished pass stops "

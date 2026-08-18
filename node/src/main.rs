@@ -421,10 +421,13 @@ async fn main() -> Result<()> {
                         .help("Send full committee identifiers on the Vantage primary wire"),
                 )
                 .arg(
-                    Arg::new("channel-auth")
-                        .long("channel-auth")
+                    Arg::new("no-channel-auth")
+                        .long("no-channel-auth")
                         .action(ArgAction::SetTrue)
-                        .help("Authenticate cross-validator links with a per-frame pairwise MAC"),
+                        .help(
+                            "Leave cross-validator links unauthenticated; the per-frame \
+                             pairwise MAC the model assumes is on by default",
+                        ),
                 ),
         )
         .subcommand_required(true)

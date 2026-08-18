@@ -330,7 +330,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     let echo_avail_claims = ack_watermarks && !matches.get_flag("no-echo-avail-claims");
     // Every node in this process shares one parameter document, so one fresh seed per run
     // stands in for out-of-band provisioning across the committee.
-    let channel_auth = matches.get_flag("channel-auth");
+    let channel_auth = !matches.get_flag("no-channel-auth");
     let channel_auth_seed =
         channel_auth.then(|| crypto::encode_base64_key(&rand::random::<[u8; 32]>()));
     let timeline: bool = matches.get_flag("timeline") || withhold_at_secs.is_some();
