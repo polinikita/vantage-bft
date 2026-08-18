@@ -638,9 +638,13 @@ pub struct VantageCore {
     ut_payload_sync: Option<IntCounter>,
     ut_timer_firing: Option<IntCounter>,
     ut_effect_execution: Option<IntCounter>,
-    /// Cached `utilization_timer{proc="avail_claims"}`: the claim-crediting share of
-    /// effect execution, which is the candidate for moving off the core thread.
-    ut_avail_claims: Option<IntCounter>,
+    /// Commands for the off-core claim aggregator. Bounded, and sends never block the
+    /// core: an overflowing batch is dropped and counted, because claims are an
+    /// availability optimization the protocol can lose without losing safety.
+    tx_claim_cmds: tokio::sync::mpsc::Sender<crate::vantage::claim_agg::ClaimCmd>,
+    /// Bumped on every own-lane checkpoint reset; claim events carrying an older value
+    /// were computed against pre-reset state and are dropped on receipt.
+    claim_generation: u64,
 
     ut_avail_flush: Option<IntCounter>,
     ut_resume_tick: Option<IntCounter>,
@@ -672,6 +676,7 @@ type BuildOutput = (
     Arc<AtomicBool>,
     Arc<AtomicU64>,
     Receiver<SocketAddr>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::vantage::claim_agg::ClaimEvent>,
 );
 
 pub type VantageSpawnOutput = (
@@ -708,6 +713,7 @@ impl VantageCore {
             sequence_large_gap_drop,
             sequence_install_drop_through,
             reconnect_rx,
+            rx_claim_events,
         ) = Self::build(name, committee, parameters, store, metrics, tx_output, auth);
         tokio::spawn(core.run(
             rx_vantage,
@@ -716,6 +722,7 @@ impl VantageCore {
             rx_our_digests,
             rx_payload_ready,
             reconnect_rx,
+            rx_claim_events,
         ));
         (
             tx_vantage,
@@ -910,6 +917,16 @@ impl VantageCore {
             auth.clone(),
         );
 
+        let (tx_claim_cmds, rx_claim_cmds) =
+            tokio::sync::mpsc::channel::<crate::vantage::claim_agg::ClaimCmd>(CHANNEL_CAPACITY);
+        let (tx_claim_events, rx_claim_events) =
+            tokio::sync::mpsc::unbounded_channel::<crate::vantage::claim_agg::ClaimEvent>();
+        crate::vantage::claim_agg::spawn(
+            lm.avail_handle(),
+            rx_claim_cmds,
+            tx_claim_events,
+            core_metrics.clone(),
+        );
         let core = Self {
             name,
             members,
@@ -1048,7 +1065,8 @@ impl VantageCore {
             ut_payload_sync: None,
             ut_timer_firing: None,
             ut_effect_execution: None,
-            ut_avail_claims: None,
+            tx_claim_cmds,
+            claim_generation: 0,
             ut_avail_flush: None,
             ut_resume_tick: None,
             ut_metrics_tick: None,
@@ -1072,9 +1090,11 @@ impl VantageCore {
             sequence_large_gap_drop,
             sequence_install_drop_through,
             reconnect_rx,
+            rx_claim_events,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         mut self,
         mut rx_vantage: Receiver<Inbound>,
@@ -1083,6 +1103,9 @@ impl VantageCore {
         mut rx_our_digests: Receiver<(Digest, WorkerId)>,
         mut rx_payload_ready: Receiver<(Digest, Digest, WorkerId)>,
         mut reconnect_rx: Receiver<SocketAddr>,
+        mut rx_claim_events: tokio::sync::mpsc::UnboundedReceiver<
+            crate::vantage::claim_agg::ClaimEvent,
+        >,
     ) {
         let boot = Instant::now();
 
@@ -1164,6 +1187,9 @@ impl VantageCore {
                     self.dispatch_and_execute(inbound).await;
                 }
 
+                Some(event) = rx_claim_events.recv() => {
+                    self.on_claim_event(event, Instant::now()).await;
+                }
                 Some(inbound) = rx_bulk.recv() => {
                     self.dispatch_and_execute(inbound).await;
                 }
@@ -3035,6 +3061,37 @@ impl VantageCore {
     }
 
     /// Credits watermark references through the same aggregator as individual acknowledgments.
+    /// Hands one validated claim carrier to the off-core aggregator.
+    ///
+    /// try_send keeps the core's send side non-blocking: the return path is unbounded,
+    /// so a blocking send here would be the one edge that could complete a cycle. A
+    /// dropped batch costs availability credits the protocol can recover through later
+    /// claims and repair, never safety.
+    fn ship_claims(&mut self, sender: PublicKey, statements: Vec<crate::vantage::claim::ClaimRef>) {
+        let cmd = crate::vantage::claim_agg::ClaimCmd::Claims {
+            generation: self.claim_generation,
+            sender,
+            statements,
+        };
+        if self.tx_claim_cmds.try_send(cmd).is_err() {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_claim_batches_dropped_total.inc();
+            }
+        }
+    }
+
+    /// Applies one aggregator result: register refreshes, then availability crediting.
+    async fn on_claim_event(&mut self, event: crate::vantage::claim_agg::ClaimEvent, now: Instant) {
+        if event.generation != self.claim_generation {
+            // Computed against pre-reset state; the reset already superseded it.
+            return;
+        }
+        self.lm
+            .apply_claim_quorums(&event.credits.newly_exact_quorum);
+        let effects = self.credit_refs(event.sender, event.credits.references, now, false);
+        self.execute(effects, now).await;
+    }
+
     fn credit_refs(
         &mut self,
         sender: PublicKey,
@@ -3591,13 +3648,7 @@ impl VantageCore {
                     }
 
                     Effect::AvailClaimed(sender, claims) => {
-                        let _timer = Self::cached_utilization_timer(
-                            &self.metrics,
-                            &mut self.ut_avail_claims,
-                            "avail_claims",
-                        );
-                        let refs = self.lm.note_claim(sender, &claims);
-                        queue.extend(self.credit_refs(sender, refs, now, false));
+                        self.ship_claims(sender, claims);
                     }
                     Effect::BroadcastAck(ack) => {
                         // ECHO-claim mode creates no acknowledgment until an
@@ -3685,8 +3736,7 @@ impl VantageCore {
                                     })
                                     .unwrap_or_default(),
                             };
-                            let refs = self.lm.note_claim(self.name, &claims);
-                            queue.extend(self.credit_refs(self.name, refs, now, false));
+                            self.ship_claims(self.name, claims);
                         }
                         match e {
                             EchoOut::Single(e) if self.digest_statements => {
@@ -3837,6 +3887,9 @@ impl VantageCore {
                     }
                     Effect::RecoverOwnLane(header) => {
                         self.lm.recover_own_frontier(header).await;
+                        // The reset replaced the claim state this lane's in-flight
+                        // aggregator events were computed against; expire them.
+                        self.claim_generation = self.claim_generation.wrapping_add(1);
                     }
 
                     Effect::CompletionReportable(view, proposal) => {
@@ -4049,6 +4102,7 @@ mod tests {
             _sequence_large_gap_drop,
             _sequence_install_drop_through,
             _reconnect_rx,
+            _rx_claim_events,
         ) = VantageCore::build(
             name,
             committee,
