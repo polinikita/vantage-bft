@@ -2,6 +2,7 @@ use crate::messages::{Ack, Header};
 use crate::primary::Height;
 use crate::vantage::block::{self, block_ok, BlockRef};
 use crate::vantage::claim::{batch_manifest_refs, manifest_refs, AvailClaim, ClaimRef};
+use crate::vantage::index::{ByAuthor, ByRef, CommitteeIndex, MemberSet, Slot};
 use crate::vantage::Effect;
 use config::{Committee, Stake, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -640,18 +641,11 @@ fn newest_indexed(index: &BTreeSet<BlockRef>, author: PublicKey) -> Option<Block
 }
 
 fn set_candidate(
-    candidates: &mut HashMap<PublicKey, BlockRef>,
-    author: PublicKey,
+    candidates: &mut ByAuthor<Option<BlockRef>>,
+    author: &Slot,
     value: Option<BlockRef>,
 ) {
-    match value {
-        Some(r) => {
-            candidates.insert(author, r);
-        }
-        None => {
-            candidates.remove(&author);
-        }
-    }
+    *candidates.entry(author) = value;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -672,90 +666,101 @@ pub struct AckAggregationResult {
     pub availability: Option<AckAvailability>,
 }
 
+#[derive(Default)]
+/// Distinct committee senders counted for one exact reference, and their stake.
+struct AckCensus {
+    senders: MemberSet,
+    weight: Stake,
+}
+
+#[derive(Default)]
+struct AckPosition {
+    /// Live census; the quorum crossing is terminal and retires it.
+    census: Option<AckCensus>,
+    /// Highest emitted threshold.
+    emitted: Option<AckThreshold>,
+}
+
 pub struct AckAggregator {
-    committee: Committee,
-    members: HashSet<PublicKey>,
-    /// Distinct committee senders counted for each exact reference.
-    senders: HashMap<BlockRef, HashSet<PublicKey>>,
-    weights: HashMap<BlockRef, Stake>,
-    /// Highest emitted threshold; quorum entries permanently retire working state.
-    emitted: HashMap<BlockRef, AckThreshold>,
+    index: Arc<CommitteeIndex>,
+    positions: ByRef<AckPosition>,
+    /// References holding a live census, and references holding an emitted threshold.
+    tracked: usize,
+    retired: usize,
 }
 
 impl AckAggregator {
     pub fn new(committee: Committee) -> Self {
-        let members = committee.authorities.keys().cloned().collect();
+        let index = CommitteeIndex::new(&committee);
         Self {
-            committee,
-            members,
-            senders: HashMap::new(),
-            weights: HashMap::new(),
-            emitted: HashMap::new(),
+            positions: ByRef::new(&index),
+            index,
+            tracked: 0,
+            retired: 0,
         }
     }
 
     /// Counts each committee sender once and emits each crossed threshold once.
     pub fn record_ack(&mut self, sender: PublicKey, reference: BlockRef) -> AckAggregationResult {
-        if !self.members.contains(&sender) {
+        let Some(sender_index) = self.index.slot(&sender).index() else {
             return AckAggregationResult {
                 accepted: false,
                 availability: None,
             };
-        }
-        if self.emitted.get(&reference) == Some(&AckThreshold::Quorum) {
-            return AckAggregationResult {
-                accepted: true,
-                availability: None,
-            };
-        }
-        if !self
-            .senders
-            .entry(reference.clone())
-            .or_default()
-            .insert(sender)
-        {
+        };
+        let stake = self.index.stake_at(sender_index);
+        let quorum = self.index.quorum_threshold();
+        let validity = self.index.validity_threshold();
+        let author = self.index.slot(&reference.0);
+        let (position, _) = self.positions.entry(&author, reference.1, &reference.2);
+        if position.emitted == Some(AckThreshold::Quorum) {
             return AckAggregationResult {
                 accepted: true,
                 availability: None,
             };
         }
 
-        let stake = self.committee.stake(&sender);
-        let weight = self.weights.entry(reference.clone()).or_insert(0);
-        *weight += stake;
-        let crossed = if *weight >= self.committee.quorum_threshold() {
+        let opened = position.census.is_none();
+        let census = position.census.get_or_insert_with(AckCensus::default);
+        if !census.senders.insert(sender_index) {
+            return AckAggregationResult {
+                accepted: true,
+                availability: None,
+            };
+        }
+        census.weight += stake;
+        let crossed = if census.weight >= quorum {
             Some(AckThreshold::Quorum)
-        } else if *weight >= self.committee.validity_threshold() {
+        } else if census.weight >= validity {
             Some(AckThreshold::Validity)
         } else {
             None
         };
 
-        let Some(threshold) = crossed else {
-            return AckAggregationResult {
-                accepted: true,
-                availability: None,
-            };
-        };
-        if self
-            .emitted
-            .get(&reference)
-            .is_some_and(|old| *old >= threshold)
-        {
-            return AckAggregationResult {
-                accepted: true,
-                availability: None,
-            };
+        let emit = crossed.filter(|threshold| position.emitted.is_none_or(|old| old < *threshold));
+        let first_threshold = emit.is_some() && position.emitted.is_none();
+        if let Some(threshold) = emit {
+            position.emitted = Some(threshold);
+            if threshold == AckThreshold::Quorum {
+                // Quorum is terminal; `emitted` prevents later acknowledgments from recreating
+                // the census.
+                position.census = None;
+            }
         }
-        self.emitted.insert(reference.clone(), threshold);
-        if threshold == AckThreshold::Quorum {
-            // Quorum is terminal; `emitted` prevents later acknowledgments from recreating state.
-            self.senders.remove(&reference);
-            self.weights.remove(&reference);
+        let retired_census = emit == Some(AckThreshold::Quorum);
+
+        if opened {
+            self.tracked += 1;
+        }
+        if retired_census {
+            self.tracked -= 1;
+        }
+        if first_threshold {
+            self.retired += 1;
         }
         AckAggregationResult {
             accepted: true,
-            availability: Some(AckAvailability {
+            availability: emit.map(|threshold| AckAvailability {
                 reference,
                 threshold,
             }),
@@ -763,30 +768,47 @@ impl AckAggregator {
     }
 
     pub(crate) fn will_count(&self, sender: PublicKey, reference: &BlockRef) -> bool {
-        self.members.contains(&sender)
-            && self.emitted.get(reference) != Some(&AckThreshold::Quorum)
-            && !self
-                .senders
-                .get(reference)
-                .is_some_and(|senders| senders.contains(&sender))
+        let Some(sender_index) = self.index.slot(&sender).index() else {
+            return false;
+        };
+        let author = self.index.slot(&reference.0);
+        match self.positions.get(&author, reference.1, &reference.2) {
+            None => true,
+            Some(position) => {
+                position.emitted != Some(AckThreshold::Quorum)
+                    && !position
+                        .census
+                        .as_ref()
+                        .is_some_and(|census| census.senders.contains(sender_index))
+            }
+        }
     }
 
     pub fn senders_tracked(&self) -> usize {
-        self.senders.len()
+        self.tracked
     }
 
     pub fn refs_retired(&self) -> usize {
-        self.emitted.len()
+        self.retired
     }
 
     pub(crate) fn is_at_quorum(&self, reference: &BlockRef) -> bool {
-        self.emitted.get(reference) == Some(&AckThreshold::Quorum)
+        let author = self.index.slot(&reference.0);
+        self.positions
+            .get(&author, reference.1, &reference.2)
+            .is_some_and(|position| position.emitted == Some(AckThreshold::Quorum))
     }
 
     pub(crate) fn reset_author(&mut self, author: PublicKey) {
-        self.senders.retain(|r, _| r.0 != author);
-        self.weights.retain(|r, _| r.0 != author);
-        self.emitted.retain(|r, _| r.0 != author);
+        let author = self.index.slot(&author);
+        for position in self.positions.drain_author(&author) {
+            if position.census.is_some() {
+                self.tracked -= 1;
+            }
+            if position.emitted.is_some() {
+                self.retired -= 1;
+            }
+        }
     }
 }
 
@@ -813,6 +835,7 @@ pub(crate) fn aggregate_received_ack(
 pub struct LaneManager {
     name: PublicKey,
     committee: Committee,
+    index: Arc<CommitteeIndex>,
     sid: Digest,
     genesis: Digest,
     max_block_payload: usize,
@@ -830,27 +853,27 @@ pub struct LaneManager {
     pending_direct_waiters_by_blocker: HashMap<Digest, BTreeSet<BlockRef>>,
     direct_prefix_blocker_by_digest: HashMap<Digest, Digest>,
     /// Last pending reference checked for each author.
-    refresh_scan_after: HashMap<PublicKey, BlockRef>,
+    refresh_scan_after: ByAuthor<Option<BlockRef>>,
     direct_pub_refs: BTreeSet<BlockRef>,
     /// Locally direct references with a general quorum of prefix claims.
     quorum_claim_refs: BTreeSet<BlockRef>,
     /// Locally direct references with a quorum of exact-position claims.
     quorum_direct_refs: BTreeSet<BlockRef>,
 
-    c_candidate: HashMap<PublicKey, BlockRef>,
-    confirmation_candidate: HashMap<PublicKey, BlockRef>,
-    t_candidate: HashMap<PublicKey, BlockRef>,
+    c_candidate: ByAuthor<Option<BlockRef>>,
+    confirmation_candidate: ByAuthor<Option<BlockRef>>,
+    t_candidate: ByAuthor<Option<BlockRef>>,
 
     /// This node's lane tip, or `(0, genesis)` before its first block.
     own_frontier: (Height, Digest),
 
     /// This node's highest contiguous direct prefix for each author.
-    own_avail_watermark: HashMap<PublicKey, (Height, Digest)>,
+    own_avail_watermark: ByAuthor<Option<(Height, Digest)>>,
     avail_dirty: bool,
     avail: crate::vantage::avail::AvailResolver,
 
     /// Greatest height with at least a validity-threshold availability mark.
-    avail_watermark_high: HashMap<PublicKey, Height>,
+    avail_watermark_high: ByAuthor<Height>,
 
     metrics: Option<Arc<Metrics>>,
 
@@ -912,6 +935,7 @@ impl LaneManager {
             max_block_payload,
             blocks.clone(),
         );
+        let index = CommitteeIndex::new(&committee);
         Self {
             name,
             committee,
@@ -926,18 +950,19 @@ impl LaneManager {
             pending_direct_blocked_by: BTreeMap::new(),
             pending_direct_waiters_by_blocker: HashMap::new(),
             direct_prefix_blocker_by_digest: HashMap::new(),
-            refresh_scan_after: HashMap::new(),
+            refresh_scan_after: ByAuthor::new(index.clone()),
             direct_pub_refs: BTreeSet::new(),
             quorum_claim_refs: BTreeSet::new(),
             quorum_direct_refs: BTreeSet::new(),
-            c_candidate: HashMap::new(),
-            confirmation_candidate: HashMap::new(),
-            t_candidate: HashMap::new(),
+            c_candidate: ByAuthor::new(index.clone()),
+            confirmation_candidate: ByAuthor::new(index.clone()),
+            t_candidate: ByAuthor::new(index.clone()),
             own_frontier: (0, genesis),
-            own_avail_watermark: HashMap::new(),
+            own_avail_watermark: ByAuthor::new(index.clone()),
             avail_dirty: false,
             avail,
-            avail_watermark_high: HashMap::new(),
+            avail_watermark_high: ByAuthor::new(index.clone()),
+            index,
             metrics: None,
             wt_store_probe: None,
             seeded_anchor: None,
@@ -1088,10 +1113,11 @@ impl LaneManager {
         self.quorum_direct_refs.retain(|r| r.0 != self.name);
         self.ack_availability.retain(|r, _| r.0 != self.name);
         self.acked.retain(|r| r.0 != self.name);
-        self.refresh_scan_after.remove(&self.name);
-        self.c_candidate.remove(&self.name);
-        self.confirmation_candidate.remove(&self.name);
-        self.t_candidate.remove(&self.name);
+        let own = self.index.slot(&self.name);
+        self.refresh_scan_after.clear(&own);
+        self.c_candidate.clear(&own);
+        self.confirmation_candidate.clear(&own);
+        self.t_candidate.clear(&own);
 
         let anchor = (self.name, header.height, header.id.clone());
         self.blocks.lock().seed_recovered_own_anchor(header.clone());
@@ -1103,10 +1129,9 @@ impl LaneManager {
         self.direct_pub_refs.insert(anchor.clone());
         self.quorum_claim_refs.insert(anchor.clone());
         self.quorum_direct_refs.insert(anchor.clone());
-        self.c_candidate.insert(self.name, anchor.clone());
-        self.own_avail_watermark
-            .insert(self.name, (anchor.1, anchor.2.clone()));
-        self.avail_watermark_high.insert(self.name, anchor.1);
+        *self.c_candidate.entry(&own) = Some(anchor.clone());
+        *self.own_avail_watermark.entry(&own) = Some((anchor.1, anchor.2.clone()));
+        *self.avail_watermark_high.entry(&own) = anchor.1;
         self.avail_dirty = true;
         self.own_frontier = recovered;
         self.seeded_anchor = None;
@@ -1399,10 +1424,11 @@ impl LaneManager {
     /// Checks a rotating bounded subset of pending direct references for `author`.
     fn refresh_author(&mut self, author: PublicKey) -> Vec<Effect> {
         let mut effects = Vec::new();
+        let slot = self.index.slot(&author);
         let lower = author_lower_bound(author);
         let upper = author_upper_bound(author);
         let mut refs = Vec::with_capacity(REFRESH_WALK_BUDGET);
-        if let Some(after) = self.refresh_scan_after.get(&author) {
+        if let Some(after) = self.refresh_scan_after.get(&slot).and_then(Option::as_ref) {
             refs.extend(
                 self.pending_direct
                     .range((Excluded(after.clone()), Included(upper.clone())))
@@ -1425,11 +1451,7 @@ impl LaneManager {
                     .cloned(),
             );
         }
-        if let Some(last) = refs.last() {
-            self.refresh_scan_after.insert(author, last.clone());
-        } else {
-            self.refresh_scan_after.remove(&author);
-        }
+        *self.refresh_scan_after.entry(&slot) = refs.last().cloned();
         let mut registers_changed = false;
         for r in &refs {
             if self.acked.contains(r) {
@@ -1451,7 +1473,7 @@ impl LaneManager {
             registers_changed = true;
         }
         if registers_changed {
-            self.refresh_registers(author);
+            self.refresh_registers(&slot);
         }
         effects
     }
@@ -1536,7 +1558,8 @@ impl LaneManager {
         }
         self.ack_availability.insert(r.clone(), threshold);
         self.avail.note_threshold(&r, threshold);
-        let high = self.avail_watermark_high.entry(r.0).or_insert(0);
+        let author = self.index.slot(&r.0);
+        let high = self.avail_watermark_high.entry(&author);
         if r.1 > *high {
             *high = r.1;
         }
@@ -1544,7 +1567,7 @@ impl LaneManager {
             let learned_claim_quorum = self.quorum_claim_refs.insert(r.clone());
             let learned_core_quorum = promote_core && self.quorum_direct_refs.insert(r.clone());
             if learned_claim_quorum || learned_core_quorum {
-                self.refresh_registers(r.0);
+                self.refresh_registers(&author);
             }
         }
         Vec::new()
@@ -1553,8 +1576,8 @@ impl LaneManager {
     /// Returns whether the exact reference has accumulated at least stake `q`.
     pub fn is_q_available(&self, r: &BlockRef, q: Stake) -> bool {
         match self.ack_availability.get(r) {
-            Some(AckThreshold::Quorum) => q <= self.committee.quorum_threshold(),
-            Some(AckThreshold::Validity) => q <= self.committee.validity_threshold(),
+            Some(AckThreshold::Quorum) => q <= self.index.quorum_threshold(),
+            Some(AckThreshold::Validity) => q <= self.index.validity_threshold(),
             None => false,
         }
     }
@@ -1600,12 +1623,12 @@ impl LaneManager {
 
     /// Returns true for a locally held valid prefix or a validity-threshold certificate.
     pub fn locally_available(&mut self, r: &BlockRef) -> bool {
-        self.holds_prefix(r) || self.is_q_available(r, self.committee.validity_threshold())
+        self.holds_prefix(r) || self.is_q_available(r, self.index.validity_threshold())
     }
 
     /// Returns true for direct publication or a validity-threshold certificate.
     pub fn author_ok(&self, r: &BlockRef) -> bool {
-        self.is_q_available(r, self.committee.validity_threshold()) || self.direct_pub(r)
+        self.is_q_available(r, self.index.validity_threshold()) || self.direct_pub(r)
     }
 
     /// Verifies and retains the exact reference's valid prefix when locally held.
@@ -1638,31 +1661,43 @@ impl LaneManager {
     }
 
     pub fn c_candidate(&self, author: &PublicKey) -> Option<BlockRef> {
-        self.c_candidate.get(author).cloned()
+        self.candidate(&self.c_candidate, author)
     }
 
     pub fn t_candidate(&self, author: &PublicKey) -> Option<BlockRef> {
-        self.t_candidate.get(author).cloned()
+        self.candidate(&self.t_candidate, author)
     }
 
     pub fn confirmation_candidate(&self, author: &PublicKey) -> Option<BlockRef> {
-        self.confirmation_candidate.get(author).cloned()
+        self.candidate(&self.confirmation_candidate, author)
+    }
+
+    fn candidate(
+        &self,
+        candidates: &ByAuthor<Option<BlockRef>>,
+        author: &PublicKey,
+    ) -> Option<BlockRef> {
+        candidates
+            .get(&self.index.slot(author))
+            .and_then(Clone::clone)
     }
 
     fn record_direct_pub(&mut self, r: &BlockRef) {
         self.direct_pub_refs.insert(r.clone());
-        if self.is_q_available(r, self.committee.quorum_threshold()) {
+        if self.is_q_available(r, self.index.quorum_threshold()) {
             self.quorum_claim_refs.insert(r.clone());
         }
         if self.avail.is_exact_quorum(r) {
             self.quorum_direct_refs.insert(r.clone());
         }
-        let advances = match self.own_avail_watermark.get(&r.0) {
+        let author = self.index.slot(&r.0);
+        let watermark = self.own_avail_watermark.entry(&author);
+        let advances = match watermark {
             Some((h, _)) => r.1 > *h,
             None => true,
         };
         if advances {
-            self.own_avail_watermark.insert(r.0, (r.1, r.2.clone()));
+            *watermark = Some((r.1, r.2.clone()));
             self.avail_dirty = true;
         }
     }
@@ -1676,10 +1711,12 @@ impl LaneManager {
         Some(
             self.own_avail_watermark
                 .iter()
-                .map(|(author, (height, head))| AvailEntry {
-                    author: *author,
-                    height: *height,
-                    head: head.clone(),
+                .filter_map(|(author, watermark)| {
+                    watermark.as_ref().map(|(height, head)| AvailEntry {
+                        author: author.key(),
+                        height: *height,
+                        head: head.clone(),
+                    })
                 })
                 .collect(),
         )
@@ -1688,9 +1725,9 @@ impl LaneManager {
     /// Returns this node's contiguous direct-prefix height for `author`, or zero.
     pub fn own_direct_frontier(&self, author: &PublicKey) -> Height {
         self.own_avail_watermark
-            .get(author)
-            .map(|(h, _)| *h)
-            .unwrap_or(0)
+            .get(&self.index.slot(author))
+            .and_then(Option::as_ref)
+            .map_or(0, |(h, _)| *h)
     }
 
     /// Claims a proposal tip only when its exact coordinate is held and validated.
@@ -1733,7 +1770,10 @@ impl LaneManager {
     }
 
     pub fn avail_high(&self, author: &PublicKey) -> Height {
-        self.avail_watermark_high.get(author).copied().unwrap_or(0)
+        self.avail_watermark_high
+            .get(&self.index.slot(author))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn own_tip_height(&self) -> Height {
@@ -1771,7 +1811,8 @@ impl LaneManager {
             }
         }
         for author in changed {
-            self.refresh_registers(author);
+            let slot = self.index.slot(&author);
+            self.refresh_registers(&slot);
         }
         credits.references
     }
@@ -1785,14 +1826,15 @@ impl LaneManager {
     }
 
     /// Refreshes candidates using greatest height and smallest-digest tie-breaking.
-    fn refresh_registers(&mut self, author: PublicKey) {
+    fn refresh_registers(&mut self, slot: &Slot) {
+        let author = slot.key();
         let c = newest_indexed(&self.quorum_direct_refs, author);
-        set_candidate(&mut self.c_candidate, author, c.clone());
+        set_candidate(&mut self.c_candidate, slot, c.clone());
 
         let confirmation = self.least_confirmation_candidate(author, c.as_ref());
-        set_candidate(&mut self.confirmation_candidate, author, confirmation);
+        set_candidate(&mut self.confirmation_candidate, slot, confirmation);
         let t = self.newest_t_candidate(author, c.as_ref());
-        set_candidate(&mut self.t_candidate, author, t);
+        set_candidate(&mut self.t_candidate, slot, t);
     }
 
     /// Selects the least-height generally quorum-known prefix above `C` that

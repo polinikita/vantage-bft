@@ -4,6 +4,7 @@ pub mod block;
 pub mod claim;
 pub mod cursor;
 pub mod frontier;
+pub(crate) mod index;
 pub mod install;
 pub mod lanes;
 pub mod node;

@@ -1,5 +1,6 @@
 use crate::primary::Height;
 use crate::vantage::claim::ClaimRef;
+use crate::vantage::index::{ByAuthor, ByPair, CommitteeIndex, Slot, SlotSet};
 use crate::vantage::lanes::{AckAggregator, AckThreshold, AncestorWalk, AvailEntry, SharedBlocks};
 use crate::vantage::BlockRef;
 use config::Committee;
@@ -117,26 +118,27 @@ pub(crate) struct ClaimCredits {
 
 pub struct AvailResolver {
     committee: Committee,
+    index: Arc<CommitteeIndex>,
     sid: Digest,
     genesis: Digest,
     max_block_payload: usize,
     blocks: SharedBlocks,
 
     /// Credited prefix and fork digest for each `(sender, author)` pair.
-    credited_floor: HashMap<(PublicKey, PublicKey), (Height, Digest)>,
+    credited_floor: ByPair<(Height, Digest)>,
     /// Latest unresolved watermark for each `(sender, author)` pair.
-    pending_avail: HashMap<(PublicKey, PublicKey), AvailEntry>,
+    pending_avail: ByPair<AvailEntry>,
     /// Exact author-indexed mirror of the `pending_avail` keys.
-    pending_avail_by_author: HashMap<PublicKey, HashSet<PublicKey>>,
+    pending_avail_by_author: ByAuthor<SlotSet>,
     /// Tuple-specific unresolved digest-free ECHO claims.
     pending_relative: HashSet<PendingRelativeClaim>,
     /// Exact author-indexed mirror of `pending_relative`.
     pending_relative_by_author: HashMap<PublicKey, HashSet<PendingRelativeClaim>>,
     /// Recent quorum references keyed by height and digest to distinguish forks.
-    at_quorum: HashMap<PublicKey, BTreeSet<(Height, Digest)>>,
+    at_quorum: ByAuthor<BTreeSet<(Height, Digest)>>,
 
     /// Highest verified claim by each sender for each author.
-    claimed: HashMap<PublicKey, HashMap<PublicKey, (Height, Digest)>>,
+    claimed: ByPair<(Height, Digest)>,
     /// Exact-position claims have bounded commonality and alone may promote `C`.
     exact_claims: AckAggregator,
 
@@ -144,9 +146,9 @@ pub struct AvailResolver {
     ///
     /// Positional claims name the same targets for all senders, so the segment between a
     /// sender's floor and its claim is walked once per author and sliced afterwards.
-    chain_segments: HashMap<PublicKey, ChainSegment>,
+    chain_segments: ByAuthor<ChainSegment>,
     /// Derived ancestors per author for anchors the shared run does not cover.
-    relative_targets: HashMap<PublicKey, RelativeTargets>,
+    relative_targets: ByAuthor<RelativeTargets>,
 
     metrics: Option<Arc<Metrics>>,
 
@@ -163,22 +165,24 @@ impl AvailResolver {
         blocks: SharedBlocks,
     ) -> Self {
         let exact_claims = AckAggregator::new(committee.clone());
+        let index = CommitteeIndex::new(&committee);
         Self {
             committee,
             sid,
             genesis,
             max_block_payload,
             blocks,
-            credited_floor: HashMap::new(),
-            pending_avail: HashMap::new(),
-            pending_avail_by_author: HashMap::new(),
+            credited_floor: ByPair::new(index.clone()),
+            pending_avail: ByPair::new(index.clone()),
+            pending_avail_by_author: ByAuthor::new(index.clone()),
             pending_relative: HashSet::new(),
             pending_relative_by_author: HashMap::new(),
-            at_quorum: HashMap::new(),
-            claimed: HashMap::new(),
+            at_quorum: ByAuthor::new(index.clone()),
+            claimed: ByPair::new(index.clone()),
             exact_claims,
-            chain_segments: HashMap::new(),
-            relative_targets: HashMap::new(),
+            chain_segments: ByAuthor::new(index.clone()),
+            relative_targets: ByAuthor::new(index.clone()),
+            index,
             metrics: None,
             #[cfg(test)]
             segment_walks: 0,
@@ -192,33 +196,34 @@ impl AvailResolver {
 
     /// Resets one author to a checkpoint-certified lane tip.
     pub fn reset_author(&mut self, author: PublicKey, anchor: &BlockRef) {
-        self.credited_floor.retain(|(_, a), _| *a != author);
-        let senders: Vec<_> = self.committee.authorities.keys().copied().collect();
-        for sender in senders {
+        let lane = self.index.slot(&author);
+        self.credited_floor.clear_author(&lane);
+        for position in 0..self.index.size() {
+            let sender = self.index.at(position);
             self.credited_floor
-                .insert((sender, author), (anchor.1, anchor.2.clone()));
+                .insert(&sender, &lane, (anchor.1, anchor.2.clone()));
         }
-        self.pending_avail.retain(|(_, a), _| *a != author);
-        self.pending_avail_by_author.remove(&author);
+        self.pending_avail.clear_author(&lane);
+        self.pending_avail_by_author.clear(&lane);
         self.pending_relative
             .retain(|pending| pending.anchor.0 != author);
         self.pending_relative_by_author.remove(&author);
-        self.at_quorum
-            .insert(author, [(anchor.1, anchor.2.clone())].into());
-        self.claimed.remove(&author);
+        *self.at_quorum.entry(&lane) = [(anchor.1, anchor.2.clone())].into();
+        self.claimed.clear_author(&lane);
         self.exact_claims.reset_author(author);
         // The anchor replaces this lane's history, so nothing remembered below it may still
         // answer a claim.
-        self.chain_segments.remove(&author);
-        self.relative_targets.remove(&author);
+        self.chain_segments.clear(&lane);
+        self.relative_targets.clear(&lane);
     }
 
     /// Records monotonic positional claims and returns newly credited exact references.
     /// Digest-free ancestor claims remain pending until the anchor walk is locally verified.
     pub(crate) fn note_claim(&mut self, sender: PublicKey, claims: &[ClaimRef]) -> ClaimCredits {
-        if !self.committee.authorities.contains_key(&sender) {
+        if !self.index.is_member(&sender) {
             return ClaimCredits::default();
         }
+        let sender_slot = self.index.slot(&sender);
         let mut out = ClaimCredits::default();
         for claim in claims {
             match claim {
@@ -227,7 +232,7 @@ impl AvailResolver {
                     if self.note_exact_claim(sender, r.clone()) {
                         out.newly_exact_quorum.push(r.clone());
                     }
-                    let mut credited = self.credit_claim_prefix(sender, r.clone());
+                    let mut credited = self.credit_claim_prefix(&sender_slot, r.clone());
                     // A direct prefix claim covers every ancestor.  A forked or
                     // lower exact tuple still counts on its own even when the
                     // monotone prefix cursor cannot backfill that branch.
@@ -243,7 +248,7 @@ impl AvailResolver {
                     match self.resolve_relative(anchor, *delta) {
                         AncestorWalk::Ready(r) => {
                             out.references
-                                .extend(self.credit_relative_target(sender, r));
+                                .extend(self.credit_relative_target(&sender_slot, r));
                         }
                         AncestorWalk::Pending => {
                             self.remember_relative(sender, anchor.clone(), *delta);
@@ -287,14 +292,15 @@ impl AvailResolver {
 
     fn cached_relative(&self, anchor: &BlockRef, delta: Height) -> Option<BlockRef> {
         let target_height = anchor.1 - delta;
+        let lane = self.index.slot(&anchor.0);
         let from_segment = self
             .chain_segments
-            .get(&anchor.0)
+            .get(&lane)
             .and_then(|segment| segment.ancestor(anchor.1, &anchor.2, target_height))
             .map(|digest| (anchor.0, target_height, digest.clone()));
         from_segment.or_else(|| {
             self.relative_targets
-                .get(&anchor.0)?
+                .get(&lane)?
                 .get(&(anchor.1, anchor.2.clone(), delta))
                 .cloned()
         })
@@ -302,7 +308,8 @@ impl AvailResolver {
 
     /// Remembers one derived ancestor for the exact `(anchor, delta)` tuple.
     fn memoize_relative(&mut self, anchor: &BlockRef, delta: Height, target: BlockRef) {
-        let memo = self.relative_targets.entry(anchor.0).or_default();
+        let lane = self.index.slot(&anchor.0);
+        let memo = self.relative_targets.entry(&lane);
         memo.insert((anchor.1, anchor.2.clone(), delta), target);
         // Anchor height orders the memo, so one split bounds how far back anchors are kept.
         if let Some(cut) = memo
@@ -320,14 +327,19 @@ impl AvailResolver {
         }
     }
 
-    fn credit_claim_prefix(&mut self, sender: PublicKey, r: BlockRef) -> Vec<BlockRef> {
+    fn credit_claim_prefix(&mut self, sender: &Slot, r: BlockRef) -> Vec<BlockRef> {
         let (author, height, digest) = (r.0, r.1, r.2.clone());
-        let per_author = self.claimed.entry(author).or_default();
-        if per_author.get(&sender).is_none_or(|(h, _)| *h < height) {
-            per_author.insert(sender, (height, digest.clone()));
+        let lane = self.index.slot(&author);
+        if self
+            .claimed
+            .get(sender, &lane)
+            .is_none_or(|(h, _)| *h < height)
+        {
+            self.claimed.insert(sender, &lane, (height, digest.clone()));
         }
         self.resolve_one(
             sender,
+            &lane,
             &AvailEntry {
                 author,
                 height,
@@ -352,7 +364,7 @@ impl AvailResolver {
             .insert(pending);
     }
 
-    fn credit_relative_target(&mut self, sender: PublicKey, r: BlockRef) -> Vec<BlockRef> {
+    fn credit_relative_target(&mut self, sender: &Slot, r: BlockRef) -> Vec<BlockRef> {
         let mut credited = self.credit_claim_prefix(sender, r.clone());
         // The prefix cursor is only an optimization and may already point to a
         // different fork.  The exact derived tuple must still reach the
@@ -376,18 +388,17 @@ impl AvailResolver {
 
     /// Returns the greatest height supported by quorum stake for `author`.
     pub fn avail_height(&self, author: &PublicKey) -> Height {
-        let Some(per_author) = self.claimed.get(author) else {
-            return 0;
-        };
-        let mut by_height: Vec<(Height, config::Stake)> = per_author
-            .iter()
-            .map(|(s, (h, _))| (*h, self.committee.stake(s)))
+        let lane = self.index.slot(author);
+        let mut by_height: Vec<(Height, config::Stake)> = self
+            .claimed
+            .row(&lane)
+            .map(|(sender, (h, _))| (*h, self.index.stake_of(&sender)))
             .collect();
         by_height.sort_unstable_by_key(|(h, _)| std::cmp::Reverse(*h));
         let mut acc: config::Stake = 0;
         for (h, stake) in by_height {
             acc += stake;
-            if acc >= self.committee.quorum_threshold() {
+            if acc >= self.index.quorum_threshold() {
                 return h;
             }
         }
@@ -396,7 +407,7 @@ impl AvailResolver {
 
     #[cfg(test)]
     pub(crate) fn claimed_len_for_test(&self) -> usize {
-        self.claimed.values().map(|m| m.len()).sum()
+        self.claimed.pairs().len()
     }
 
     /// Remembers terminal quorum references and prunes only the optimization cache.
@@ -404,7 +415,8 @@ impl AvailResolver {
         if threshold != AckThreshold::Quorum {
             return;
         }
-        let per_author = self.at_quorum.entry(r.0).or_default();
+        let lane = self.index.slot(&r.0);
+        let per_author = self.at_quorum.entry(&lane);
         per_author.insert((r.1, r.2.clone()));
         if per_author.len() > AT_QUORUM_HEIGHTS {
             if let Some(&(cut, _)) = per_author.iter().nth(per_author.len() - AT_QUORUM_HEIGHTS) {
@@ -415,9 +427,13 @@ impl AvailResolver {
     }
 
     fn is_at_quorum(&self, r: &BlockRef) -> bool {
+        self.lane_at_quorum(&self.index.slot(&r.0), r.1, &r.2)
+    }
+
+    fn lane_at_quorum(&self, lane: &Slot, height: Height, digest: &Digest) -> bool {
         self.at_quorum
-            .get(&r.0)
-            .is_some_and(|set| set.contains(&(r.1, r.2.clone())))
+            .get(lane)
+            .is_some_and(|set| set.contains(&(height, digest.clone())))
     }
 
     pub fn resolve_watermark(
@@ -425,9 +441,11 @@ impl AvailResolver {
         sender: PublicKey,
         entries: &[AvailEntry],
     ) -> Vec<BlockRef> {
+        let sender = self.index.slot(&sender);
         let mut refs = Vec::new();
         for entry in entries {
-            refs.extend(self.resolve_one(sender, entry));
+            let lane = self.index.slot(&entry.author);
+            refs.extend(self.resolve_one(&sender, &lane, entry));
         }
         refs
     }
@@ -441,19 +459,19 @@ impl AvailResolver {
         let Some(author) = author else {
             return Vec::new();
         };
-        let keys: Vec<(PublicKey, PublicKey)> = self
+        let lane = self.index.slot(&author);
+        let senders: Vec<Slot> = self
             .pending_avail_by_author
-            .get(&author)
-            .map(|senders| senders.iter().map(|sender| (*sender, author)).collect())
+            .get(&lane)
+            .map(|senders| senders.iter(&self.index).collect())
             .unwrap_or_default();
         let mut out = Vec::new();
-        for key in keys {
-            let sender = key.0;
-            let Some(entry) = self.pending_avail.get(&key).cloned() else {
+        for sender in senders {
+            let Some(entry) = self.pending_avail.get(&sender, &lane).cloned() else {
                 continue;
             };
-            for r in self.resolve_one(sender, &entry) {
-                out.push((sender, r));
+            for r in self.resolve_one(&sender, &lane, &entry) {
+                out.push((sender.key(), r));
             }
         }
         let relative_claims: Vec<PendingRelativeClaim> = self
@@ -468,7 +486,8 @@ impl AvailResolver {
             match self.resolve_relative(&pending.anchor, pending.delta) {
                 AncestorWalk::Ready(r) => {
                     self.remove_relative(&pending);
-                    for r in self.credit_relative_target(pending.sender, r) {
+                    let sender = self.index.slot(&pending.sender);
+                    for r in self.credit_relative_target(&sender, r) {
                         out.push((pending.sender, r));
                     }
                 }
@@ -479,9 +498,8 @@ impl AvailResolver {
         out
     }
 
-    fn resolve_one(&mut self, sender: PublicKey, entry: &AvailEntry) -> Vec<BlockRef> {
-        let key = (sender, entry.author);
-        let floor = self.credited_floor.get(&key);
+    fn resolve_one(&mut self, sender: &Slot, lane: &Slot, entry: &AvailEntry) -> Vec<BlockRef> {
+        let floor = self.credited_floor.get(sender, lane);
         // The floor probe compares heights before cloning anything, and it also covers the
         // never-credited key: that floor is genesis, where an entry at height zero claims
         // nothing to walk.
@@ -493,41 +511,36 @@ impl AvailResolver {
             Some((_, digest)) => digest.clone(),
             None => self.genesis.clone(),
         };
-        let segment = self.verified_segment(entry, floor_height, &floor_digest);
+        let segment = self.verified_segment(lane, entry, floor_height, &floor_digest);
         match segment {
             Some(suffix) => {
                 let mut refs = Vec::with_capacity(suffix.len());
                 for (i, d) in suffix.iter().enumerate() {
-                    let r = (entry.author, floor_height + 1 + i as Height, d.clone());
-                    if self.is_at_quorum(&r) {
+                    let height = floor_height + 1 + i as Height;
+                    if self.lane_at_quorum(lane, height, d) {
                         if let Some(metrics) = &self.metrics {
                             metrics.vantage_avail_credit_skipped_total.inc();
                         }
                     } else {
-                        refs.push(r);
+                        refs.push((entry.author, height, d.clone()));
                     }
                 }
                 if let Some(last) = suffix.last() {
-                    self.credited_floor
-                        .insert(key, (floor_height + suffix.len() as Height, last.clone()));
+                    self.credited_floor.insert(
+                        sender,
+                        lane,
+                        (floor_height + suffix.len() as Height, last.clone()),
+                    );
                 }
-                self.pending_avail.remove(&key);
-                if let Some(senders) = self.pending_avail_by_author.get_mut(&key.1) {
-                    senders.remove(&key.0);
-                    if senders.is_empty() {
-                        self.pending_avail_by_author.remove(&key.1);
-                    }
-                }
+                self.pending_avail.remove(sender, lane);
+                self.pending_avail_by_author.entry(lane).remove(sender);
                 refs
             }
             None => {
-                self.pending_avail_by_author
-                    .entry(key.1)
-                    .or_default()
-                    .insert(key.0);
-                self.pending_avail.insert(key, entry.clone());
+                self.pending_avail_by_author.entry(lane).insert(sender);
+                self.pending_avail.insert(sender, lane, entry.clone());
                 let head = (entry.author, entry.height, entry.head.clone());
-                if self.is_at_quorum(&head) {
+                if self.lane_at_quorum(lane, head.1, &head.2) {
                     if let Some(metrics) = &self.metrics {
                         metrics.vantage_avail_credit_skipped_total.inc();
                     }
@@ -543,11 +556,12 @@ impl AvailResolver {
     /// it covers the same fork and walked under the blocks lock otherwise.
     fn verified_segment(
         &mut self,
+        lane: &Slot,
         entry: &AvailEntry,
         floor_height: Height,
         floor_digest: &Digest,
     ) -> Option<Vec<Digest>> {
-        if let Some(suffix) = self.chain_segments.get(&entry.author).and_then(|segment| {
+        if let Some(suffix) = self.chain_segments.get(lane).and_then(|segment| {
             segment.suffix(floor_height, floor_digest, entry.height, &entry.head)
         }) {
             return Some(suffix);
@@ -568,7 +582,7 @@ impl AvailResolver {
             )
         };
         if let Some(suffix) = &walked {
-            self.memoize_segment(entry.author, floor_height, floor_digest, suffix);
+            self.memoize_segment(lane, floor_height, floor_digest, suffix);
         }
         walked
     }
@@ -580,7 +594,7 @@ impl AvailResolver {
     /// spans -- replaces the run rather than merging into it.
     fn memoize_segment(
         &mut self,
-        author: PublicKey,
+        lane: &Slot,
         floor_height: Height,
         floor_digest: &Digest,
         suffix: &[Digest],
@@ -596,7 +610,7 @@ impl AvailResolver {
             }
         };
         let walked_top = floor_height + suffix.len() as Height;
-        let segment = self.chain_segments.entry(author).or_default();
+        let segment = self.chain_segments.entry(lane);
         let agrees = segment
             .shared_height(floor_height, walked_top)
             .is_some_and(|height| segment.digest_at(height) == Some(walked_at(height)));
@@ -621,7 +635,9 @@ impl AvailResolver {
 
     #[cfg(test)]
     pub(crate) fn at_quorum_len_for_test(&self, author: &PublicKey) -> usize {
-        self.at_quorum.get(author).map_or(0, |s| s.len())
+        self.at_quorum
+            .get(&self.index.slot(author))
+            .map_or(0, |s| s.len())
     }
 
     #[cfg(test)]
@@ -633,13 +649,17 @@ impl AvailResolver {
     pub(crate) fn pending_avail_index_for_test(&self) -> HashSet<(PublicKey, PublicKey)> {
         self.pending_avail_by_author
             .iter()
-            .flat_map(|(author, senders)| senders.iter().map(move |s| (*s, *author)))
+            .flat_map(|(author, senders)| {
+                senders
+                    .iter(&self.index)
+                    .map(move |sender| (sender.key(), author.key()))
+            })
             .collect()
     }
 
     #[cfg(test)]
     pub(crate) fn pending_avail_keys_for_test(&self) -> HashSet<(PublicKey, PublicKey)> {
-        self.pending_avail.keys().copied().collect()
+        self.pending_avail.pairs().into_iter().collect()
     }
 
     #[cfg(test)]

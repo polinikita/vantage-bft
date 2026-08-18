@@ -3,6 +3,7 @@ mod avail_tests;
 mod chain_tests;
 mod claim_tests;
 mod common;
+mod index_tests;
 mod install_tests;
 mod metrics_tests;
 mod registers_tests;

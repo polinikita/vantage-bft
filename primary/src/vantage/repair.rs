@@ -1,6 +1,7 @@
 use crate::messages::Header;
 use crate::primary::Height;
 use crate::vantage::block::block_ok;
+use crate::vantage::index::{ByPair, ByRef, CommitteeIndex, Slot};
 use crate::vantage::lanes::SharedBlocks;
 use crate::vantage::{BlockRef, Effect};
 use config::Committee;
@@ -53,24 +54,32 @@ struct FanoutState {
     asked_at: u64,
 }
 
+/// Repair state for one exact `(author, height, digest)` reference.
+#[derive(Default)]
+struct RepairPosition {
+    /// Verified through genesis and retained; this flag is permanent.
+    settled: bool,
+    /// Authorized and not yet settled.
+    pending_settle: bool,
+    /// The missing digest this reference waits for; each reference waits on at most one.
+    blocked_at: Option<Digest>,
+}
+
 pub struct Repairer {
     committee: Committee,
+    index: Arc<CommitteeIndex>,
     peers: Vec<PublicKey>,
     sid: Digest,
     genesis: Digest,
     max_block_payload: usize,
     blocks: SharedBlocks,
 
-    /// Exact `(author, height, digest)` references admitted for repair.
-    authorized: HashSet<BlockRef>,
-    /// References verified through genesis and retained; membership is permanent.
-    settled: HashSet<BlockRef>,
-    /// Authorized references not present in `settled`.
-    pending_settle: HashSet<BlockRef>,
+    /// Settlement state of every reference admitted for repair.
+    positions: ByRef<RepairPosition>,
+    /// References not yet settled.
+    pending_settle: usize,
     /// References waiting for each missing digest.
     blocked_on: HashMap<Digest, HashSet<BlockRef>>,
-    /// Inverse of `blocked_on`; each pending reference belongs to at most one bucket.
-    blocked_at: HashMap<BlockRef, Digest>,
     settle_calls: u64,
     /// `(peer, digest)` requests emitted at most once per request cycle.
     requested: HashSet<(PublicKey, Digest)>,
@@ -80,7 +89,7 @@ pub struct Repairer {
     /// Outstanding fan-out entries ordered by ascending block height.
     fanout_queue: BTreeSet<(Height, Digest)>,
     /// Highest confirmed height for each `(author, peer)` pair.
-    holders: HashMap<PublicKey, HashMap<PublicKey, Height>>,
+    holders: ByPair<Height>,
     /// Earliest one-second tick for each digest's next request cycle.
     refetch_at: HashMap<Digest, u64>,
     emit_budget: usize,
@@ -111,6 +120,7 @@ impl Repairer {
         max_block_payload: usize,
         blocks: SharedBlocks,
     ) -> Self {
+        let index = CommitteeIndex::new(&committee);
         Self {
             peers: committee
                 .others_primaries(&name)
@@ -118,15 +128,15 @@ impl Repairer {
                 .map(|(pk, _)| pk)
                 .collect(),
             committee,
+            positions: ByRef::new(&index),
+            holders: ByPair::new(index.clone()),
+            index,
             sid,
             genesis,
             max_block_payload,
             blocks,
-            authorized: HashSet::new(),
-            settled: HashSet::new(),
-            pending_settle: HashSet::new(),
+            pending_settle: 0,
             blocked_on: HashMap::new(),
-            blocked_at: HashMap::new(),
             settle_calls: 0,
             ut_settle: None,
             requested: HashSet::new(),
@@ -134,7 +144,6 @@ impl Repairer {
             refetch_at: HashMap::new(),
             fanout: HashMap::new(),
             fanout_queue: BTreeSet::new(),
-            holders: HashMap::new(),
             emit_budget: RECOVERY_EMIT_START,
             emit_ceiling: RECOVERY_EMIT_START,
             last_bulk_drops: 0,
@@ -156,8 +165,11 @@ impl Repairer {
     /// Authorizes an exact block reference and attempts to verify and retain its prefix.
     pub fn authorize(&mut self, r: BlockRef) -> Vec<Effect> {
         let mut effects = Vec::new();
-        self.note_authorized(r.clone());
-        self.settle(r, &mut effects);
+        // One walk covers one author, so the lane resolves once for the authorization and
+        // every settlement step below it.
+        let lane = self.index.slot(&r.0);
+        self.note_authorized(&lane, r.1, &r.2);
+        self.settle(&lane, r, &mut effects);
         effects
     }
 
@@ -166,16 +178,21 @@ impl Repairer {
         self.requested_hashes.insert(digest);
     }
 
-    fn note_authorized(&mut self, r: BlockRef) {
-        self.authorized.insert(r.clone());
-        if !self.settled.contains(&r) {
-            self.pending_settle.insert(r);
+    fn note_authorized(&mut self, lane: &Slot, height: Height, digest: &Digest) {
+        let (position, _) = self.positions.entry(lane, height, digest);
+        if !position.settled && !position.pending_settle {
+            position.pending_settle = true;
+            self.pending_settle += 1;
         }
     }
 
-    fn mark_settled(&mut self, r: BlockRef) {
-        self.settled.insert(r.clone());
-        self.pending_settle.remove(&r);
+    fn mark_settled(&mut self, lane: &Slot, height: Height, digest: &Digest) {
+        let (position, _) = self.positions.entry(lane, height, digest);
+        position.settled = true;
+        if position.pending_settle {
+            position.pending_settle = false;
+            self.pending_settle -= 1;
+        }
     }
 
     /// Retries only references indexed as waiting for `digest`.
@@ -189,31 +206,39 @@ impl Repairer {
             return effects;
         };
         for r in waiting {
-            if self.pending_settle.contains(&r) {
-                self.blocked_at.remove(&r);
-                self.settle(r, &mut effects);
-            } else {
-                self.blocked_at.remove(&r);
+            let lane = self.index.slot(&r.0);
+            let mut pending = false;
+            if let Some(position) = self.positions.get_mut(&lane, r.1, &r.2) {
+                position.blocked_at = None;
+                pending = position.pending_settle;
+            }
+            if pending {
+                self.settle(&lane, r, &mut effects);
             }
         }
         effects
     }
 
     /// Moves each reference to the bucket for its current missing digest.
-    fn record_blocked(&mut self, refs: &[BlockRef], h: &Digest) {
+    ///
+    /// One settlement walk pins one author, so every reference here shares `lane`.
+    fn record_blocked(&mut self, lane: &Slot, refs: &[BlockRef], h: &Digest) {
         for r in refs {
-            if let Some(prev) = self.blocked_at.get(r) {
-                if prev == h {
+            let previous = self
+                .positions
+                .get_mut(lane, r.1, &r.2)
+                .and_then(|position| position.blocked_at.replace(h.clone()));
+            if let Some(prev) = previous {
+                if prev == *h {
                     continue;
                 }
-                if let Some(bucket) = self.blocked_on.get_mut(prev) {
+                if let Some(bucket) = self.blocked_on.get_mut(&prev) {
                     bucket.remove(r);
                     if bucket.is_empty() {
-                        self.blocked_on.remove(prev);
+                        self.blocked_on.remove(&prev);
                     }
                 }
             }
-            self.blocked_at.insert(r.clone(), h.clone());
             self.blocked_on
                 .entry(h.clone())
                 .or_default()
@@ -365,15 +390,14 @@ impl Repairer {
     }
 
     /// Records a monotonic claim that `peer` holds `author` through `height`.
+    ///
+    /// An unclaimed pair reads as height zero, and every query names a height of at least
+    /// one, so an explicit zero claim and no claim select the same peers.
     pub fn note_holder(&mut self, peer: PublicKey, author: PublicKey, height: Height) {
-        let entry = self
-            .holders
-            .entry(author)
-            .or_default()
-            .entry(peer)
-            .or_insert(0);
-        if height > *entry {
-            *entry = height;
+        let peer = self.index.slot(&peer);
+        let lane = self.index.slot(&author);
+        if height > self.holders.get(&peer, &lane).copied().unwrap_or(0) {
+            self.holders.insert(&peer, &lane, height);
         }
     }
 
@@ -384,13 +408,12 @@ impl Repairer {
         want: usize,
         h: &Digest,
     ) -> Vec<PublicKey> {
-        let Some(by_peer) = self.holders.get(author) else {
-            return Vec::new();
-        };
-        let mut candidates: Vec<(Height, PublicKey)> = by_peer
-            .iter()
-            .filter(|(_, &h)| h >= height)
-            .map(|(p, &h)| (h, *p))
+        let lane = self.index.slot(author);
+        let mut candidates: Vec<(Height, PublicKey)> = self
+            .holders
+            .row(&lane)
+            .filter(|(_, held)| **held >= height)
+            .map(|(peer, held)| (*held, peer.key()))
             .collect();
         // Prefer greater confirmed heights, then use a deterministic per-digest order.
         candidates.sort_unstable_by(|a, b| {
@@ -535,7 +558,7 @@ impl Repairer {
         self.walk_steps_settle
     }
 
-    fn settle(&mut self, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
+    fn settle(&mut self, lane: &Slot, r: BlockRef, effects: &mut Vec<Effect>) -> bool {
         self.settle_calls += 1;
         let _timer = self.metrics.as_ref().map(|metrics| {
             // Settling is reached from several top-level sections, so its time goes to the
@@ -552,7 +575,11 @@ impl Repairer {
         let mut steps: u64 = 0;
         let verified = loop {
             steps += 1;
-            if self.settled.contains(&cur) {
+            if self
+                .positions
+                .get(lane, cur.1, &cur.2)
+                .is_some_and(|position| position.settled)
+            {
                 break true;
             }
             let (author, height, h) = cur.clone();
@@ -609,7 +636,7 @@ impl Repairer {
                     }
                 }
                 frames.push(cur.clone());
-                self.record_blocked(&frames, &h);
+                self.record_blocked(lane, &frames, &h);
                 break false;
             };
 
@@ -622,10 +649,9 @@ impl Repairer {
                 break true;
             }
 
-            let parent_ref = (author, height - 1, parent_h);
-            self.note_authorized(parent_ref.clone());
+            self.note_authorized(lane, height - 1, &parent_h);
             frames.push(cur);
-            cur = parent_ref;
+            cur = (author, height - 1, parent_h);
         };
         self.walk_steps_settle += steps;
 
@@ -633,7 +659,7 @@ impl Repairer {
             // Retain ancestors before descendants so retention remains prefix-closed.
             while let Some(frame) = frames.pop() {
                 self.retain_and_serve(&frame, effects);
-                self.mark_settled(frame);
+                self.mark_settled(lane, frame.1, &frame.2);
             }
         }
         verified
@@ -705,7 +731,7 @@ impl Repairer {
     }
 
     pub fn pending_settle_len(&self) -> usize {
-        self.pending_settle.len()
+        self.pending_settle
     }
 
     #[cfg(test)]
@@ -745,12 +771,16 @@ impl Repairer {
 
     #[cfg(test)]
     pub(crate) fn is_settled(&self, r: &BlockRef) -> bool {
-        self.settled.contains(r)
+        self.positions
+            .get(&self.index.slot(&r.0), r.1, &r.2)
+            .is_some_and(|position| position.settled)
     }
 
     #[cfg(test)]
     pub(crate) fn is_pending_settle(&self, r: &BlockRef) -> bool {
-        self.pending_settle.contains(r)
+        self.positions
+            .get(&self.index.slot(&r.0), r.1, &r.2)
+            .is_some_and(|position| position.pending_settle)
     }
 
     #[cfg(test)]
