@@ -1,7 +1,7 @@
 # Monitoring
 
-The shared Prometheus and Grafana stack supports native local benchmarks,
-Docker benchmarks, and AWS deployments.
+The shared Prometheus and Grafana stack supports native local benchmarks and
+Docker benchmarks.
 
 ## Services
 
@@ -47,20 +47,6 @@ to the validator network:
 ```
 
 Validators stop after the run. Monitoring remains active.
-
-## AWS Benchmark
-
-After `fab remote` has generated `benchmark/.committee.json`:
-
-```bash
-cd benchmark
-fab monitor
-cd ..
-PROMETHEUS_CONFIG=../monitoring/prometheus-remote.yaml \
-  docker compose -f monitoring/docker-compose.yml up -d
-```
-
-Run `fab monitor` again after the remote committee changes.
 
 ## Dashboard
 

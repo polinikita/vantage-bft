@@ -101,8 +101,8 @@ Configuration is in `local-dryrun/config.yml`. See
 
 - [Docker benchmark](docker-bench/README.md): one container per validator with
   traffic shaping and recovery scenarios.
-- [AWS benchmark](benchmark/README.md): multi-instance deployment through
-  Fabric.
+- [Benchmark scripts](benchmark/README.md): local sweeps and the CI
+  regression gate; AWS campaigns run from the separate `wan-bench` harness.
 - [Monitoring](monitoring/README.md): shared Prometheus and Grafana stack.
 
 ## License
