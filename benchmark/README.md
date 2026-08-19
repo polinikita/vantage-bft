@@ -3,7 +3,8 @@
 Local measurement and regression harnesses for the five in-tree protocols.
 For interactive local experiments, use `node local-benchmark` or
 [`docker-bench`](../docker-bench/README.md); AWS campaigns run from the
-separate `wan-bench` harness on fresh fleets.
+separate [wan-bench](https://github.com/polinikita/wan-bench) harness on
+fresh fleets.
 
 ## Local Five-Protocol Publication Study
 

@@ -102,7 +102,8 @@ Configuration is in `local-dryrun/config.yml`. See
 - [Docker benchmark](docker-bench/README.md): one container per validator with
   traffic shaping and recovery scenarios.
 - [Benchmark scripts](benchmark/README.md): local sweeps and the CI
-  regression gate; AWS campaigns run from the separate `wan-bench` harness.
+  regression gate; AWS campaigns run from the separate
+  [wan-bench](https://github.com/polinikita/wan-bench) harness.
 - [Monitoring](monitoring/README.md): shared Prometheus and Grafana stack.
 
 ## License
