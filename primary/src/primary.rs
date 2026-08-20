@@ -878,16 +878,21 @@ impl PrimaryReceiverHandler {
     /// cache. Returns false (after counting the drop) when verification
     /// fails; the Core would reject the message identically, so dropping it
     /// here changes no acceptance decision.
+    /// A header is admitted with its own signature and its parent PoA both
+    /// verified (or already cached).
+    fn header_verified(&self, header: &Header) -> bool {
+        self.verified
+            .check_header(header, &self.committee)
+            .and_then(|_| {
+                self.verified
+                    .check_certificate(&header.parent_cert, &self.committee)
+            })
+            .is_ok()
+    }
+
     fn ingress_verified(&self, message: &PrimaryMessage) -> bool {
         let verdict = match message {
-            PrimaryMessage::Header(header, _) => self
-                .verified
-                .check_header(header, &self.committee)
-                .and_then(|_| {
-                    self.verified
-                        .check_certificate(&header.parent_cert, &self.committee)
-                })
-                .is_ok(),
+            PrimaryMessage::Header(header, _) => self.header_verified(header),
             PrimaryMessage::Vote(vote) => self.verified.check_vote(vote, &self.committee).is_ok(),
             PrimaryMessage::Certificate(certificate) => self
                 .verified
@@ -957,15 +962,28 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .await
                 .expect("Failed to send proposal suffix request"),
             PrimaryMessage::ProposalHeaders(headers) => {
-                for header in headers {
-                    let message = PrimaryMessage::Header(header, true);
-                    if !self.ingress_verified(&message) {
-                        continue;
-                    }
+                // Verify here (mostly cache hits for headers already seen on
+                // the wire), drop what fails, and hand the suffix to the Core
+                // as one unit instead of one message per header.
+                let verified: Vec<_> = headers
+                    .into_iter()
+                    .filter(|header| {
+                        let admitted = self.header_verified(header);
+                        if !admitted {
+                            warn!("Dropping a suffix header that failed ingress verification");
+                            self.metrics
+                                .primary_ingress_verify_failures_total
+                                .with_label_values(&["ProposalHeaders"])
+                                .inc();
+                        }
+                        admitted
+                    })
+                    .collect();
+                if !verified.is_empty() {
                     self.tx_primary_messages
-                        .send(message)
+                        .send(PrimaryMessage::ProposalHeaders(verified))
                         .await
-                        .expect("Failed to deliver proposal suffix header");
+                        .expect("Failed to deliver proposal suffix headers");
                 }
             }
             request => {

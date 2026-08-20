@@ -479,10 +479,41 @@ impl Core {
         self.process_header(header, false).await
     }
 
+    /// Ingests one repaired lane suffix as a unit, oldest header first, so
+    /// each car finds its parent already processed and vote continuity holds
+    /// without a loopback round-trip per header. One malformed or stale
+    /// header does not discard the rest of the suffix, matching the previous
+    /// one-message-per-header behavior.
+    async fn process_header_suffix(&mut self, mut headers: Vec<Header>) -> DagResult<()> {
+        headers.sort_by_key(|header| header.height);
+        for header in headers {
+            let outcome = match self.sanitize_header(&header) {
+                Ok(()) => self.process_header(header, true).await,
+                error => error,
+            };
+            if let Err(error) = outcome {
+                debug!("Skipping one repaired suffix header: {}", error);
+            }
+        }
+        Ok(())
+    }
+
     #[async_recursion]
     async fn process_header(&mut self, header: Header, sync: bool) -> DagResult<()> {
         debug!("Processing Header:  {:?}", header);
         debug!("Processing the header with height {:?}", header.height);
+
+        // A car already voted at this exact coordinate has been fully
+        // processed and stored; duplicate deliveries (rebroadcasts, repeated
+        // suffix replies) end here before any store round-trip.
+        if self
+            .last_voted
+            .get(&header.height)
+            .and_then(|lane| lane.get(&header.author))
+            .is_some_and(|voted| *voted == header.id)
+        {
+            return Ok(());
+        }
 
         // Every car names its lane predecessor and carries an f+1 PoA for it.
         self.verified
@@ -2547,6 +2578,7 @@ impl Core {
                         PrimaryMessage::ConsensusMessage(consensus_message) => self.process_forwarded_message(consensus_message).await,
                         PrimaryMessage::ConsensusRequest(consensus_req) => self.process_consensus_request(consensus_req).await,
                         PrimaryMessage::ConsensusVote(consensus_vote) => self.process_consensus_vote(consensus_vote, false).await,
+                        PrimaryMessage::ProposalHeaders(headers) => self.process_header_suffix(headers).await,
                         _ => panic!("Unexpected core message")
                     }
                 },
