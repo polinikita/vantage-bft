@@ -179,6 +179,7 @@ pub fn certificate(header: &Header) -> Certificate {
             .into_iter()
             .map(|x| (x.author, x.signature))
             .collect(),
+        ..Default::default()
     }
 }
 

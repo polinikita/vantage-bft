@@ -560,6 +560,7 @@ mod alignment_tests {
             header_digest: Digest([42; 32]),
             height: certified_parent.height + 1,
             poa: certified_parent.poa.clone(),
+            ..Default::default()
         };
         let (tx, mut rx) = channel(4);
         let path = ".db_test_optimistic_prepare_alignment";
@@ -596,6 +597,7 @@ mod alignment_tests {
             header_digest: Digest([43; 32]),
             height: certified_parent.height + 1,
             poa: certified_parent.poa.clone(),
+            ..Default::default()
         };
         let proposals = cut_with(&committee, lane, optimistic);
         let high_prepare = ConsensusMessage::Prepare {
@@ -686,6 +688,7 @@ mod alignment_tests {
             header_digest: Digest([7; 32]),
             height: parent.height + 1,
             poa: parent.poa,
+            ..Default::default()
         };
         assert_eq!(
             proposal.verify(&lane, &committee).unwrap(),

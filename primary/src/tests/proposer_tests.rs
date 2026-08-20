@@ -195,6 +195,7 @@ async fn propose_normal() {
         header_digest: header.digest(),
         height: header.height,
         votes,
+        ..Default::default()
     };
     tx_parents.send(certificate).await.unwrap();
 

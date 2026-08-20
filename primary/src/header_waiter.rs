@@ -982,6 +982,7 @@ mod tests {
             header_digest: Digest([17; 32]),
             height: 9,
             poa: None,
+            ..Default::default()
         };
         let pending = PendingProposalRequest {
             proposal: proposal.clone(),
@@ -1025,11 +1026,13 @@ mod tests {
             header_digest: Digest([7; 32]),
             height: 11,
             poa: None,
+            ..Default::default()
         };
         let second = Proposal {
             header_digest: Digest([8; 32]),
             height: 13,
             poa: None,
+            ..Default::default()
         };
         let mut sources = HashMap::new();
 

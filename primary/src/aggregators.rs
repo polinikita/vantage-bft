@@ -57,6 +57,7 @@ impl VotesAggregator {
                     header_digest: vote.id,
                     height: vote.height,
                     votes: self.votes.clone(),
+                    ..Default::default()
                 };
 
                 self.diss_cert = Some(dissemination_cert);
@@ -133,6 +134,7 @@ impl QCMaker {
                 Some(QC {
                     id: vote.0,
                     votes: self.votes.clone(),
+                    ..Default::default()
                 }),
             ));
         }
@@ -154,6 +156,7 @@ impl QCMaker {
                 Some(QC {
                     id: vote_dig,
                     votes: self.votes.clone(),
+                    ..Default::default()
                 }),
             ));
         } else if self.weight >= committee.quorum_threshold() {
@@ -180,6 +183,7 @@ impl QCMaker {
             Some(QC {
                 id: self.qc_dig.clone(),
                 votes: self.votes.clone(),
+                ..Default::default()
             }),
         ))
     }

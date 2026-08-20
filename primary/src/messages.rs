@@ -8,6 +8,7 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::sync::OnceLock;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Proposal {
@@ -18,6 +19,9 @@ pub struct Proposal {
     /// it carries availability evidence in its own cut protocol.
     #[serde(default)]
     pub poa: Option<Certificate>,
+    /// Memoized content digest; a proposal must not be mutated after `digest()`.
+    #[serde(skip)]
+    pub(crate) digest_memo: OnceLock<Digest>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -33,6 +37,7 @@ impl Proposal {
             header_digest,
             height,
             poa: None,
+            digest_memo: OnceLock::new(),
         }
     }
 
@@ -41,6 +46,7 @@ impl Proposal {
             header_digest: poa.header_digest.clone(),
             height: poa.height,
             poa: Some(poa),
+            digest_memo: OnceLock::new(),
         }
     }
 
@@ -49,6 +55,7 @@ impl Proposal {
             header_digest: header.id.clone(),
             height: header.height,
             poa: Some(header.parent_cert.clone()),
+            digest_memo: OnceLock::new(),
         }
     }
 
@@ -107,25 +114,30 @@ impl fmt::Display for Proposal {
 
 impl Hash for Proposal {
     fn digest(&self) -> Digest {
-        let mut hasher = Blake3Hasher::new();
-        // Preserve Simple-IT's pre-existing coordinate digest. Autobahn cuts
-        // always carry `Some(PoA)` and use the evidence-bound domain below.
-        if self.poa.is_none() {
-            hasher.update(&self.header_digest.0);
-            hasher.update(&self.height.to_le_bytes());
-            return Digest(hasher.finalize().into());
-        }
-        hasher.update(b"autobahn-tip-v1");
-        hasher.update(&self.header_digest.0);
-        hasher.update(&self.height.to_le_bytes());
-        match &self.poa {
-            Some(poa) => {
-                hasher.update(&[1]);
-                hasher.update(&poa.evidence_digest().0);
-            }
-            None => unreachable!("proof-free proposals returned above"),
-        };
-        Digest(hasher.finalize().into())
+        self.digest_memo
+            .get_or_init(|| {
+                let mut hasher = Blake3Hasher::new();
+                // Preserve Simple-IT's pre-existing coordinate digest. Autobahn
+                // cuts always carry `Some(PoA)` and use the evidence-bound
+                // domain below.
+                if self.poa.is_none() {
+                    hasher.update(&self.header_digest.0);
+                    hasher.update(&self.height.to_le_bytes());
+                    return Digest(hasher.finalize().into());
+                }
+                hasher.update(b"autobahn-tip-v1");
+                hasher.update(&self.header_digest.0);
+                hasher.update(&self.height.to_le_bytes());
+                match &self.poa {
+                    Some(poa) => {
+                        hasher.update(&[1]);
+                        hasher.update(&poa.evidence_digest().0);
+                    }
+                    None => unreachable!("proof-free proposals returned above"),
+                };
+                Digest(hasher.finalize().into())
+            })
+            .clone()
     }
 }
 
@@ -473,6 +485,7 @@ impl Header {
             header_digest: prev_digest,
             height: height.saturating_sub(1),
             votes: Vec::new(),
+            evidence_memo: OnceLock::new(),
         };
         let header = Self {
             author,
@@ -881,6 +894,10 @@ pub struct Certificate {
     pub header_digest: Digest,
     pub height: Height,
     pub votes: Vec<(PublicKey, Signature)>,
+    /// Memoized evidence digest; `votes` must not be mutated after
+    /// `evidence_digest()`.
+    #[serde(skip)]
+    pub(crate) evidence_memo: OnceLock<Digest>,
 }
 
 impl Certificate {
@@ -911,6 +928,7 @@ impl Certificate {
             .digest(),
             height: 0,
             votes: Vec::new(),
+            evidence_memo: OnceLock::new(),
         }
     }
 
@@ -954,22 +972,28 @@ impl Certificate {
 
     /// Hashes the complete evidence canonically, independent of vote arrival order.
     pub fn evidence_digest(&self) -> Digest {
-        let mut votes: Vec<_> = self.votes.iter().collect();
-        votes.sort_unstable_by_key(|(author, _)| *author);
-        let mut hasher = Blake3Hasher::new();
-        hasher.update(b"autobahn-poa-v1");
-        hasher.update(&self.author.0);
-        hasher.update(&self.height.to_le_bytes());
-        hasher.update(&self.header_digest.0);
-        hasher.update(&(votes.len() as u64).to_le_bytes());
-        for (author, signature) in votes {
-            hasher.update(&author.0);
-            let encoded =
-                bincode::serialize(signature).expect("signature serialization cannot fail");
-            hasher.update(&(encoded.len() as u64).to_le_bytes());
-            hasher.update(&encoded);
-        }
-        Digest(hasher.finalize().into())
+        self.evidence_memo
+            .get_or_init(|| {
+                let mut votes: Vec<_> = self.votes.iter().collect();
+                votes.sort_unstable_by_key(|(author, _)| *author);
+                let mut hasher = Blake3Hasher::new();
+                hasher.update(b"autobahn-poa-v1");
+                hasher.update(&self.author.0);
+                hasher.update(&self.height.to_le_bytes());
+                hasher.update(&self.header_digest.0);
+                hasher.update(&(votes.len() as u64).to_le_bytes());
+                for (author, signature) in votes {
+                    hasher.update(&author.0);
+                    // The raw 64 bytes are exactly the bincode encoding of the
+                    // signature's two fixed-size parts, so the digest is
+                    // unchanged while skipping the per-vote allocation.
+                    let encoded = signature.to_bytes();
+                    hasher.update(&(encoded.len() as u64).to_le_bytes());
+                    hasher.update(&encoded);
+                }
+                Digest(hasher.finalize().into())
+            })
+            .clone()
     }
 
     pub fn height(&self) -> Height {
@@ -1013,6 +1037,9 @@ impl Eq for Certificate {}
 pub struct QC {
     pub id: Digest,
     pub votes: Vec<(PublicKey, Signature)>,
+    /// Memoized content digest; `votes` must not be mutated after `digest()`.
+    #[serde(skip)]
+    pub(crate) digest_memo: OnceLock<Digest>,
 }
 
 impl QC {
@@ -1048,20 +1075,24 @@ impl QC {
 
 impl Hash for QC {
     fn digest(&self) -> Digest {
-        let mut votes: Vec<_> = self.votes.iter().collect();
-        votes.sort_unstable_by_key(|(author, _)| *author);
-        let mut hasher = Blake3Hasher::new();
-        hasher.update(b"autobahn-qc-v1");
-        hasher.update(&self.id.0);
-        hasher.update(&(votes.len() as u64).to_le_bytes());
-        for (author, signature) in votes {
-            hasher.update(&author.0);
-            let encoded =
-                bincode::serialize(signature).expect("signature serialization cannot fail");
-            hasher.update(&(encoded.len() as u64).to_le_bytes());
-            hasher.update(&encoded);
-        }
-        Digest(hasher.finalize().into())
+        self.digest_memo
+            .get_or_init(|| {
+                let mut votes: Vec<_> = self.votes.iter().collect();
+                votes.sort_unstable_by_key(|(author, _)| *author);
+                let mut hasher = Blake3Hasher::new();
+                hasher.update(b"autobahn-qc-v1");
+                hasher.update(&self.id.0);
+                hasher.update(&(votes.len() as u64).to_le_bytes());
+                for (author, signature) in votes {
+                    hasher.update(&author.0);
+                    // Raw 64 bytes == the bincode encoding; digest unchanged.
+                    let encoded = signature.to_bytes();
+                    hasher.update(&(encoded.len() as u64).to_le_bytes());
+                    hasher.update(&encoded);
+                }
+                Digest(hasher.finalize().into())
+            })
+            .clone()
     }
 }
 
@@ -1420,6 +1451,50 @@ mod autobahn_alignment_tests {
             .is_err());
     }
 
+    /// The digests must stay byte-identical to the original formulation that
+    /// hashed each signature through `bincode::serialize`.
+    #[test]
+    fn evidence_and_qc_digests_match_the_bincode_formulation() {
+        let (_, certificate) = poa_with_votes(2);
+        let mut votes: Vec<_> = certificate.votes.iter().collect();
+        votes.sort_unstable_by_key(|(author, _)| *author);
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"autobahn-poa-v1");
+        hasher.update(&certificate.author.0);
+        hasher.update(&certificate.height.to_le_bytes());
+        hasher.update(&certificate.header_digest.0);
+        hasher.update(&(votes.len() as u64).to_le_bytes());
+        for (author, signature) in &votes {
+            hasher.update(&author.0);
+            let encoded = bincode::serialize(signature).unwrap();
+            hasher.update(&(encoded.len() as u64).to_le_bytes());
+            hasher.update(&encoded);
+        }
+        assert_eq!(
+            certificate.evidence_digest(),
+            Digest(hasher.finalize().into())
+        );
+
+        let qc = QC {
+            id: Digest([5; 32]),
+            votes: certificate.votes.clone(),
+            ..Default::default()
+        };
+        let mut votes: Vec<_> = qc.votes.iter().collect();
+        votes.sort_unstable_by_key(|(author, _)| *author);
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"autobahn-qc-v1");
+        hasher.update(&qc.id.0);
+        hasher.update(&(votes.len() as u64).to_le_bytes());
+        for (author, signature) in &votes {
+            hasher.update(&author.0);
+            let encoded = bincode::serialize(signature).unwrap();
+            hasher.update(&(encoded.len() as u64).to_le_bytes());
+            hasher.update(&encoded);
+        }
+        assert_eq!(qc.digest(), Digest(hasher.finalize().into()));
+    }
+
     #[test]
     fn cut_digest_is_canonical_across_hashmap_order() {
         let committee = crate::common::committee();
@@ -1437,6 +1512,7 @@ mod autobahn_alignment_tests {
             header_digest: Digest([17; 32]),
             height: 9,
             poa: None,
+            ..Default::default()
         };
         let mut expected = Blake3Hasher::new();
         expected.update(&proposal.header_digest.0);
@@ -1470,6 +1546,7 @@ mod autobahn_alignment_tests {
         let qc = QC {
             id: prepare_id,
             votes,
+            ..Default::default()
         };
         let confirm = ConsensusMessage::Confirm {
             slot: 7,
@@ -1481,7 +1558,13 @@ mod autobahn_alignment_tests {
 
         let mut changed = cut;
         let lane = *changed.keys().next().unwrap();
-        changed.get_mut(&lane).unwrap().height += 1;
+        let bumped = Proposal {
+            header_digest: changed[&lane].header_digest.clone(),
+            height: changed[&lane].height + 1,
+            poa: changed[&lane].poa.clone(),
+            ..Default::default()
+        };
+        changed.insert(lane, bumped);
         let forged = ConsensusMessage::Confirm {
             slot: 7,
             view: 2,

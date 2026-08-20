@@ -585,6 +585,7 @@ impl SimpleItCore {
                             header_digest: digest,
                             height,
                             poa: None,
+                            ..Default::default()
                         },
                     )
                 })
@@ -1249,6 +1250,7 @@ mod tests {
                         header_digest: header.id.clone(),
                         height: header.height,
                         poa: None,
+                        ..Default::default()
                     },
                 )
             })

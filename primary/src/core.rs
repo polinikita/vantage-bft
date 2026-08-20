@@ -2711,6 +2711,7 @@ mod slot_gc_tests {
             header_digest: Digest([99; 32]),
             height: certificate.height + 1,
             poa: Some(certificate),
+            ..Default::default()
         };
         let mut cut = Header::genesis_proposals(&committee);
         cut.insert(lane, optimistic.clone());
@@ -2727,6 +2728,7 @@ mod slot_gc_tests {
                 )),
                 header_digest: Digest([100; 32]),
                 height: 1,
+                ..Default::default()
             },
         );
         assert!(!autobahn_cut_is_valid(&committee, false, &leader_cut));
@@ -2741,6 +2743,7 @@ mod slot_gc_tests {
             poa: Some(crate::messages::Certificate::genesis_for(lane, &committee)),
             header_digest: Digest([101; 32]),
             height: 1,
+            ..Default::default()
         };
 
         assert!(autobahn_own_tip_is_admissible(

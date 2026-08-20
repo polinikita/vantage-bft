@@ -365,6 +365,12 @@ impl Signature {
             .expect("Unexpected signature length")
     }
 
+    /// The canonical 64-byte encoding; identical to the bincode encoding of
+    /// the two fixed-size parts.
+    pub fn to_bytes(&self) -> [u8; 64] {
+        self.flatten()
+    }
+
     pub fn verify(&self, digest: &Digest, public_key: &PublicKey) -> Result<(), CryptoError> {
         let signature = dalek::Signature::from_bytes(&self.flatten());
         let key = dalek::VerifyingKey::from_bytes(&public_key.0)?;
