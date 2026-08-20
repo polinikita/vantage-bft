@@ -1120,7 +1120,7 @@ impl PartialEq for QC {
 
 impl Eq for QC {}
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Timeout {
     pub slot: Slot,
     pub view: View,
@@ -1263,7 +1263,7 @@ impl PartialEq for Timeout {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Default)]
 pub struct TC {
     pub slot: Slot,
     pub view: View,
@@ -1434,6 +1434,327 @@ impl fmt::Debug for TC {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Deduplicated wire encoding for Timeout and TC.
+//
+// A Timeout carries up to two evidence messages whose cuts are usually the
+// same map, and a TC carries 2f+1 timeouts that in the honest case all cite
+// the same one or two messages. Encoding each distinct cut and each distinct
+// evidence message once (index-referenced) shrinks a TC at n=100 from tens of
+// megabytes to roughly one cut. Only the encoding changes: reconstruction is
+// byte-exact per referenced object, so digests, signatures, and verification
+// outcomes are unaffected. Evidence entries are interned by their complete
+// serialized content, never by the (vote-set-blind) message digest.
+// ---------------------------------------------------------------------------
+
+type Cut = HashMap<PublicKey, Proposal>;
+
+#[derive(Serialize, Deserialize, Clone)]
+enum ConsensusMessageWire {
+    Prepare {
+        slot: Slot,
+        view: View,
+        tc: Option<TC>,
+        qc_ticket: Option<CommitQC>,
+        cut: u16,
+    },
+    Confirm {
+        slot: Slot,
+        view: View,
+        qc: QC,
+        cut: u16,
+    },
+    Commit {
+        slot: Slot,
+        view: View,
+        qc: QC,
+        cut: u16,
+    },
+}
+
+fn intern_cut(cuts: &mut Vec<Cut>, index: &mut HashMap<Digest, u16>, cut: &Cut) -> u16 {
+    let digest = proposals_digest(cut);
+    *index.entry(digest).or_insert_with(|| {
+        let position = u16::try_from(cuts.len()).expect("too many distinct cuts in one timeout");
+        cuts.push(cut.clone());
+        position
+    })
+}
+
+fn message_to_wire(
+    message: &ConsensusMessage,
+    cuts: &mut Vec<Cut>,
+    cut_index: &mut HashMap<Digest, u16>,
+) -> ConsensusMessageWire {
+    match message {
+        ConsensusMessage::Prepare {
+            slot,
+            view,
+            tc,
+            qc_ticket,
+            proposals,
+        } => ConsensusMessageWire::Prepare {
+            slot: *slot,
+            view: *view,
+            tc: tc.clone(),
+            qc_ticket: qc_ticket.clone(),
+            cut: intern_cut(cuts, cut_index, proposals),
+        },
+        ConsensusMessage::Confirm {
+            slot,
+            view,
+            qc,
+            proposals,
+        } => ConsensusMessageWire::Confirm {
+            slot: *slot,
+            view: *view,
+            qc: qc.clone(),
+            cut: intern_cut(cuts, cut_index, proposals),
+        },
+        ConsensusMessage::Commit {
+            slot,
+            view,
+            qc,
+            proposals,
+        } => ConsensusMessageWire::Commit {
+            slot: *slot,
+            view: *view,
+            qc: qc.clone(),
+            cut: intern_cut(cuts, cut_index, proposals),
+        },
+    }
+}
+
+fn message_from_wire(
+    wire: &ConsensusMessageWire,
+    cuts: &[Cut],
+) -> Result<ConsensusMessage, String> {
+    let resolve = |cut: u16| {
+        cuts.get(cut as usize)
+            .cloned()
+            .ok_or_else(|| "dangling cut index in a timeout certificate".to_string())
+    };
+    Ok(match wire {
+        ConsensusMessageWire::Prepare {
+            slot,
+            view,
+            tc,
+            qc_ticket,
+            cut,
+        } => ConsensusMessage::Prepare {
+            slot: *slot,
+            view: *view,
+            tc: tc.clone(),
+            qc_ticket: qc_ticket.clone(),
+            proposals: resolve(*cut)?,
+        },
+        ConsensusMessageWire::Confirm {
+            slot,
+            view,
+            qc,
+            cut,
+        } => ConsensusMessage::Confirm {
+            slot: *slot,
+            view: *view,
+            qc: qc.clone(),
+            proposals: resolve(*cut)?,
+        },
+        ConsensusMessageWire::Commit {
+            slot,
+            view,
+            qc,
+            cut,
+        } => ConsensusMessage::Commit {
+            slot: *slot,
+            view: *view,
+            qc: qc.clone(),
+            proposals: resolve(*cut)?,
+        },
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+struct TimeoutWire {
+    slot: Slot,
+    view: View,
+    author: PublicKey,
+    signature: Signature,
+    cuts: Vec<Cut>,
+    high_qc: Option<ConsensusMessageWire>,
+    high_prop: Option<ConsensusMessageWire>,
+}
+
+impl Serialize for Timeout {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut cuts = Vec::new();
+        let mut cut_index = HashMap::new();
+        let high_qc = self
+            .high_qc
+            .as_ref()
+            .map(|message| message_to_wire(message, &mut cuts, &mut cut_index));
+        let high_prop = self
+            .high_prop
+            .as_ref()
+            .map(|message| message_to_wire(message, &mut cuts, &mut cut_index));
+        TimeoutWire {
+            slot: self.slot,
+            view: self.view,
+            author: self.author,
+            signature: self.signature.clone(),
+            cuts,
+            high_qc,
+            high_prop,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timeout {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = TimeoutWire::deserialize(deserializer)?;
+        if wire.cuts.len() > 2 {
+            return Err(serde::de::Error::custom(
+                "a timeout references at most two cuts",
+            ));
+        }
+        let high_qc = wire
+            .high_qc
+            .as_ref()
+            .map(|message| message_from_wire(message, &wire.cuts))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let high_prop = wire
+            .high_prop
+            .as_ref()
+            .map(|message| message_from_wire(message, &wire.cuts))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        Ok(Timeout {
+            slot: wire.slot,
+            view: wire.view,
+            high_qc,
+            high_prop,
+            author: wire.author,
+            signature: wire.signature,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct TimeoutLite {
+    slot: Slot,
+    view: View,
+    author: PublicKey,
+    signature: Signature,
+    high_qc: Option<u16>,
+    high_prop: Option<u16>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TCWire {
+    slot: Slot,
+    view: View,
+    cuts: Vec<Cut>,
+    evidence: Vec<ConsensusMessageWire>,
+    timeouts: Vec<TimeoutLite>,
+}
+
+/// Interns an evidence message by its complete serialized content, so two
+/// evidence values collapse only when they are byte-identical.
+fn intern_evidence(
+    evidence: &mut Vec<ConsensusMessageWire>,
+    index: &mut HashMap<Digest, u16>,
+    wire: ConsensusMessageWire,
+) -> u16 {
+    let bytes = bincode::serialize(&wire).expect("evidence serialization cannot fail");
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(&bytes);
+    let key = Digest(hasher.finalize().into());
+    *index.entry(key).or_insert_with(|| {
+        let position =
+            u16::try_from(evidence.len()).expect("too many distinct evidence messages in one TC");
+        evidence.push(wire);
+        position
+    })
+}
+
+impl Serialize for TC {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut cuts = Vec::new();
+        let mut cut_index = HashMap::new();
+        let mut evidence = Vec::new();
+        let mut evidence_index = HashMap::new();
+        let timeouts = self
+            .timeouts
+            .iter()
+            .map(|timeout| TimeoutLite {
+                slot: timeout.slot,
+                view: timeout.view,
+                author: timeout.author,
+                signature: timeout.signature.clone(),
+                high_qc: timeout.high_qc.as_ref().map(|message| {
+                    let wire = message_to_wire(message, &mut cuts, &mut cut_index);
+                    intern_evidence(&mut evidence, &mut evidence_index, wire)
+                }),
+                high_prop: timeout.high_prop.as_ref().map(|message| {
+                    let wire = message_to_wire(message, &mut cuts, &mut cut_index);
+                    intern_evidence(&mut evidence, &mut evidence_index, wire)
+                }),
+            })
+            .collect();
+        TCWire {
+            slot: self.slot,
+            view: self.view,
+            cuts,
+            evidence,
+            timeouts,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TC {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = TCWire::deserialize(deserializer)?;
+        let reference_budget = wire.timeouts.len().saturating_mul(2);
+        if wire.evidence.len() > reference_budget || wire.cuts.len() > reference_budget {
+            return Err(serde::de::Error::custom(
+                "timeout certificate carries unreferenced evidence",
+            ));
+        }
+        let timeouts = wire
+            .timeouts
+            .iter()
+            .map(|lite| {
+                let rebuild = |index: Option<u16>| {
+                    index
+                        .map(|index| {
+                            let message = wire.evidence.get(index as usize).ok_or_else(|| {
+                                "dangling evidence index in a timeout certificate".to_string()
+                            })?;
+                            message_from_wire(message, &wire.cuts)
+                        })
+                        .transpose()
+                };
+                Ok(Timeout {
+                    slot: lite.slot,
+                    view: lite.view,
+                    high_qc: rebuild(lite.high_qc)?,
+                    high_prop: rebuild(lite.high_prop)?,
+                    author: lite.author,
+                    signature: lite.signature.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(serde::de::Error::custom)?;
+        Ok(TC {
+            slot: wire.slot,
+            view: wire.view,
+            timeouts,
+        })
+    }
+}
+
 #[cfg(test)]
 mod autobahn_alignment_tests {
     use super::*;
@@ -1481,6 +1802,134 @@ mod autobahn_alignment_tests {
         assert!(Certificate::genesis_for(outsider, &committee)
             .verify(&committee)
             .is_err());
+    }
+
+    fn signed_timeout(author_index: usize, slot: Slot, view: View) -> Timeout {
+        let committee = crate::common::committee();
+        let keys = crate::common::keys();
+        let cut = Header::genesis_proposals(&committee);
+        let prepare_id = prepare_digest(slot, view, &cut);
+        let votes: Vec<_> = keys
+            .iter()
+            .take(committee.quorum_threshold() as usize)
+            .map(|(author, secret)| (*author, Signature::new(&prepare_id, secret)))
+            .collect();
+        let high_prop = ConsensusMessage::Prepare {
+            slot,
+            view,
+            tc: None,
+            qc_ticket: None,
+            proposals: cut.clone(),
+        };
+        let high_qc = ConsensusMessage::Confirm {
+            slot,
+            view,
+            qc: QC {
+                id: prepare_id,
+                votes,
+                ..Default::default()
+            },
+            proposals: cut,
+        };
+        let (author, secret) = &keys[author_index];
+        Timeout::new_from_key(Some(high_prop), Some(high_qc), slot, view, *author, secret)
+    }
+
+    #[test]
+    fn timeout_and_tc_wire_roundtrip_is_exact() {
+        let committee = crate::common::committee();
+        let timeout = signed_timeout(0, 7, 2);
+        let bytes = bincode::serialize(&timeout).unwrap();
+        let back: Timeout = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(timeout.digest(), back.digest());
+        assert!(back.verify(&committee).is_ok());
+
+        let timeouts: Vec<_> = (0..3).map(|i| signed_timeout(i, 7, 2)).collect();
+        let tc = TC::new(&committee, 7, 2, timeouts);
+        let bytes = bincode::serialize(&tc).unwrap();
+        let back: TC = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(tc, back);
+        assert_eq!(
+            tc.verify(&committee).is_ok(),
+            back.verify(&committee).is_ok()
+        );
+        for (original, rebuilt) in tc.timeouts.iter().zip(back.timeouts.iter()) {
+            let (
+                Some(ConsensusMessage::Confirm { qc: a, .. }),
+                Some(ConsensusMessage::Confirm { qc: b, .. }),
+            ) = (&original.high_qc, &rebuilt.high_qc)
+            else {
+                panic!("round trip changed the evidence variant");
+            };
+            assert_eq!(a.digest(), b.digest());
+        }
+    }
+
+    /// The 2f+1 timeouts of an honest TC cite the same evidence; the wire
+    /// encoding must carry the shared cut once, not once per timeout.
+    #[test]
+    fn tc_wire_encoding_deduplicates_shared_evidence() {
+        let committee = crate::common::committee();
+        let one = bincode::serialize(&signed_timeout(0, 7, 2)).unwrap().len();
+        let timeouts: Vec<_> = (0..3).map(|i| signed_timeout(i, 7, 2)).collect();
+        let tc = bincode::serialize(&TC::new(&committee, 7, 2, timeouts))
+            .unwrap()
+            .len();
+        assert!(
+            tc < one + one / 2,
+            "three timeouts encoded to {} bytes, one alone is {}",
+            tc,
+            one
+        );
+    }
+
+    #[test]
+    fn tc_wire_rejects_dangling_and_unreferenced_evidence() {
+        // Mirror of the private wire layout (bincode is positional).
+        #[derive(Serialize)]
+        struct LiteMirror {
+            slot: Slot,
+            view: View,
+            author: PublicKey,
+            signature: Signature,
+            high_qc: Option<u16>,
+            high_prop: Option<u16>,
+        }
+        #[derive(Serialize)]
+        struct TCMirror {
+            slot: Slot,
+            view: View,
+            cuts: Vec<HashMap<PublicKey, Proposal>>,
+            evidence: Vec<u8>, // empty vec encodes identically for any element type
+            timeouts: Vec<LiteMirror>,
+        }
+
+        let dangling = TCMirror {
+            slot: 7,
+            view: 2,
+            cuts: Vec::new(),
+            evidence: Vec::new(),
+            timeouts: vec![LiteMirror {
+                slot: 7,
+                view: 2,
+                author: PublicKey::default(),
+                signature: Signature::default(),
+                high_qc: Some(3),
+                high_prop: None,
+            }],
+        };
+        let bytes = bincode::serialize(&dangling).unwrap();
+        assert!(bincode::deserialize::<TC>(&bytes).is_err());
+
+        let unreferenced = TCMirror {
+            slot: 7,
+            view: 2,
+            cuts: vec![HashMap::new()],
+            evidence: Vec::new(),
+            timeouts: Vec::new(),
+        };
+        let bytes = bincode::serialize(&unreferenced).unwrap();
+        assert!(bincode::deserialize::<TC>(&bytes).is_err());
     }
 
     /// The digests must stay byte-identical to the original formulation that
