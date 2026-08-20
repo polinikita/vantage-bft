@@ -124,9 +124,34 @@ pub struct Synchronizer {
     network: SimpleSender,
     /// Primary round used for cleanup.
     round: Round,
-    /// Digests awaiting their batches, with cleanup round, request time, and
-    /// exact protocol-derived repair policy.
-    pending: HashMap<Digest, (Round, Sender<()>, u128, SyncPolicy)>,
+    /// Digests awaiting their batches, with cleanup round, request time,
+    /// exact protocol-derived repair policy, and escalation attempt.
+    pending: HashMap<Digest, (Round, Sender<()>, u128, SyncPolicy, u32)>,
+}
+
+/// Deterministic escalation ladder over proof-holder targets: attempt 0
+/// contacts one holder, attempt 1 the sync-retry quorum, later attempts all
+/// of them. The rotation varies with the attempt so a crashed pick does not
+/// stall two rounds.
+fn staged_proof_targets(
+    sources: &[PublicKey],
+    attempt: u32,
+    retry_nodes: usize,
+    seed: &Digest,
+) -> Vec<PublicKey> {
+    let width = match attempt {
+        0 => 1,
+        1 => retry_nodes.max(1),
+        _ => sources.len(),
+    };
+    if width >= sources.len() {
+        return sources.to_vec();
+    }
+    let seed = u64::from_le_bytes(seed.0[..8].try_into().expect("digest holds eight bytes"));
+    let start = (seed as usize).wrapping_add(attempt as usize) % sources.len();
+    (0..width)
+        .map(|i| sources[(start + i) % sources.len()])
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -242,13 +267,15 @@ impl Synchronizer {
                 continue;
             }
 
-            if let Some((_, _, timestamp, previous_policy)) = self.pending.get_mut(&digest) {
+            if let Some((_, _, timestamp, previous_policy, attempt)) = self.pending.get_mut(&digest)
+            {
                 // Commit is a one-way boundary: it may widen an existing
                 // pre-commit request, but a late header must never narrow a
                 // committed materialization request again.
                 if *previous_policy != policy && !matches!(previous_policy, SyncPolicy::Committed) {
                     *timestamp = now;
                     *previous_policy = policy.clone();
+                    *attempt = 0;
                     missing.push(digest);
                 }
                 continue;
@@ -267,16 +294,16 @@ impl Synchronizer {
                 let _ = tx_result.send(result).await;
             });
             self.pending
-                .insert(digest, (self.round, tx_cancel, now, policy.clone()));
+                .insert(digest, (self.round, tx_cancel, now, policy.clone(), 0));
         }
 
         if missing.is_empty() {
             return;
         }
-        self.send_requests(missing, &policy).await;
+        self.send_requests(missing, &policy, 0).await;
     }
 
-    async fn send_requests(&mut self, missing: Vec<Digest>, policy: &SyncPolicy) {
+    async fn send_requests(&mut self, missing: Vec<Digest>, policy: &SyncPolicy, attempt: u32) {
         let missing_count = missing.len();
         if matches!(policy, SyncPolicy::Committed) {
             let addresses = self
@@ -314,11 +341,14 @@ impl Synchronizer {
                 WorkerMessage::OptimisticBatchRequest(missing, self.name),
                 "OptimisticBatchRequest",
             ),
-            SyncPolicy::ProofSources(sources) => (
-                sources.clone(),
-                WorkerMessage::BatchRequest(missing, self.name),
-                "ProofSourceBatchRequest",
-            ),
+            SyncPolicy::ProofSources(sources) => {
+                let seed = missing.first().cloned().unwrap_or_default();
+                (
+                    staged_proof_targets(sources, attempt, self.sync_retry_nodes, &seed),
+                    WorkerMessage::BatchRequest(missing, self.name),
+                    "ProofSourceBatchRequest",
+                )
+            }
             SyncPolicy::Committed => unreachable!("handled above"),
         };
         debug!(
@@ -391,12 +421,12 @@ impl Synchronizer {
                         }
 
                         let mut gc_round = self.round - self.gc_depth;
-                        for (r, handler, _, _) in self.pending.values() {
+                        for (r, handler, _, _, _) in self.pending.values() {
                             if r <= &gc_round {
                                 let _ = handler.send(()).await;
                             }
                         }
-                        self.pending.retain(|_, (r, _, _, _)| r > &mut gc_round);
+                        self.pending.retain(|_, (r, _, _, _, _)| r > &mut gc_round);
                     }
                     PrimaryWorkerMessage::Committed(_, digests) => {
                         self.synchronize(digests, SyncPolicy::Committed, &tx_waiter).await;
@@ -418,26 +448,30 @@ impl Synchronizer {
                         .as_millis();
 
                     let mut retry = Vec::new();
-                    for (digest, (_, _, timestamp, _)) in &self.pending {
+                    for (digest, (_, _, timestamp, _, _)) in &self.pending {
                         if timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting sync for batch {} (retry)", digest);
                             retry.push(digest.clone());
                         }
                     }
                     for digest in &retry {
-                        if let Some((_, _, timestamp, _)) = self.pending.get_mut(digest) {
+                        if let Some((_, _, timestamp, _, attempt)) = self.pending.get_mut(digest) {
                             *timestamp = now;
+                            *attempt = attempt.saturating_add(1);
                         }
                     }
                     if !retry.is_empty() {
-                        let mut by_policy: HashMap<SyncPolicy, Vec<Digest>> = HashMap::new();
+                        let mut by_policy: HashMap<(SyncPolicy, u32), Vec<Digest>> = HashMap::new();
                         for digest in retry {
-                            if let Some((_, _, _, policy)) = self.pending.get(&digest) {
-                                by_policy.entry(policy.clone()).or_default().push(digest);
+                            if let Some((_, _, _, policy, attempt)) = self.pending.get(&digest) {
+                                by_policy
+                                    .entry((policy.clone(), *attempt))
+                                    .or_default()
+                                    .push(digest);
                             }
                         }
-                        for (policy, digests) in by_policy {
-                            self.send_requests(digests, &policy).await;
+                        for ((policy, attempt), digests) in by_policy {
+                            self.send_requests(digests, &policy, attempt).await;
                         }
                     }
 

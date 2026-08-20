@@ -285,12 +285,13 @@ async fn optimistic_synchronize_retargets_a_pending_batch_to_the_new_leader() {
 }
 
 #[tokio::test]
-async fn proof_source_synchronize_targets_every_and_only_named_holder() {
+async fn proof_source_synchronize_escalates_within_named_holders_only() {
     let (tx_message, rx_message) = channel(1);
     let mut keys = keys();
     let (name, _) = keys.pop().unwrap();
     let (first, _) = keys.pop().unwrap();
     let (second, _) = keys.pop().unwrap();
+    let (unrelated, _) = keys.pop().unwrap();
     let id = 0;
     let committee = committee_with_base_port(9_300);
     let path = ".db_test_proof_source_synchronize";
@@ -302,7 +303,7 @@ async fn proof_source_synchronize_targets_every_and_only_named_holder() {
         committee.clone(),
         store,
         50,
-        1_000_000,
+        /* sync_retry_delay */ 200,
         3,
         rx_message,
         std::collections::HashMap::new(),
@@ -314,13 +315,20 @@ async fn proof_source_synchronize_targets_every_and_only_named_holder() {
     let missing = vec![batch_digest()];
     let expected = WorkerMessage::BatchRequest(missing.clone(), name);
     let serialized = Bytes::from(bincode::serialize(&expected).unwrap());
-    let first_listener = listener(
+    let first_listener = listener_n(
         committee.worker(&first, &id).unwrap().worker_to_worker,
-        Some(serialized.clone()),
+        serialized.clone(),
+        1,
     );
-    let second_listener = listener(
+    let second_listener = listener_n(
         committee.worker(&second, &id).unwrap().worker_to_worker,
-        Some(serialized),
+        serialized.clone(),
+        1,
+    );
+    let mut unrelated_listener = listener_n(
+        committee.worker(&unrelated, &id).unwrap().worker_to_worker,
+        serialized,
+        1,
     );
 
     tx_message
@@ -331,8 +339,25 @@ async fn proof_source_synchronize_targets_every_and_only_named_holder() {
         .await
         .unwrap();
 
-    assert!(first_listener.await.is_ok());
-    assert!(second_listener.await.is_ok());
+    // Attempt 0 contacts one named holder; the first retry escalates to the
+    // sync-retry quorum, which covers both. No request may ever leave the
+    // named holder set.
+    timeout(Duration::from_secs(5), first_listener)
+        .await
+        .expect("the first named holder was never contacted")
+        .unwrap();
+    timeout(Duration::from_secs(5), second_listener)
+        .await
+        .expect("the second named holder was never contacted")
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), &mut unrelated_listener)
+            .await
+            .is_err(),
+        "a proof-source request reached a peer outside the named holders"
+    );
+    unrelated_listener.abort();
+    let _ = fs::remove_dir_all(path);
 }
 
 /// Deferred misses are retried and stale entries are evicted.

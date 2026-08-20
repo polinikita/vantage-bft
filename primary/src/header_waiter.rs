@@ -56,8 +56,48 @@ enum BatchSyncSource {
 struct PendingProposalRequest {
     proposal: Proposal,
     stop_height: Height,
+    /// The complete protocol-justified source set; each attempt contacts a
+    /// staged subset of it.
     sources: Vec<PublicKey>,
     requested_at: u128,
+    /// Escalation counter: attempt 0 contacts one source, attempt 1 the
+    /// sync-retry quorum, and later attempts every justified source.
+    attempt: u32,
+}
+
+/// Deterministic escalation ladder over protocol-justified repair sources.
+/// The lane author is skipped while other holders remain (it is the
+/// presumed-faulty party in the Byzantine repair scenarios); the rotation
+/// varies with the attempt so a crashed pick does not stall two rounds. A
+/// single-element source set (the optimistic leader) is returned unchanged at
+/// every stage: the ladder selects among justified sources, never widens
+/// beyond them.
+fn staged_repair_targets(
+    sources: &[PublicKey],
+    lane: Option<&PublicKey>,
+    attempt: u32,
+    retry_nodes: usize,
+    seed: &Digest,
+) -> Vec<PublicKey> {
+    let mut pool: Vec<PublicKey> = sources
+        .iter()
+        .filter(|source| lane != Some(source))
+        .copied()
+        .collect();
+    if pool.is_empty() {
+        pool = sources.to_vec();
+    }
+    let width = match attempt {
+        0 => 1,
+        1 => retry_nodes.max(1),
+        _ => pool.len(),
+    };
+    if width >= pool.len() {
+        return pool;
+    }
+    let seed = u64::from_le_bytes(seed.0[..8].try_into().expect("digest holds eight bytes"));
+    let start = (seed as usize).wrapping_add(attempt as usize) % pool.len();
+    (0..width).map(|i| pool[(start + i) % pool.len()]).collect()
 }
 
 fn proposal_request_needs_update(
@@ -367,14 +407,23 @@ impl HeaderWaiter {
         proposal: Proposal,
         stop_height: Height,
         mut sources: Vec<PublicKey>,
+        attempt: u32,
     ) {
         sources.sort_unstable();
         sources.dedup();
+        let lane = proposal.poa.as_ref().map(|poa| poa.author);
+        let targets = staged_repair_targets(
+            &sources,
+            lane.as_ref(),
+            attempt,
+            self.sync_retry_nodes,
+            &proposal.header_digest,
+        );
         let message =
             PrimaryMessage::ProposalHeadersRequest(proposal.clone(), stop_height, self.name);
         let bytes =
             bincode::serialize(&message).expect("Failed to serialize proposal suffix request");
-        for source in &sources {
+        for source in &targets {
             if *source == self.name {
                 continue;
             }
@@ -403,6 +452,7 @@ impl HeaderWaiter {
                 stop_height,
                 sources,
                 requested_at: now,
+                attempt,
             },
         );
     }
@@ -425,7 +475,8 @@ impl HeaderWaiter {
             &sources,
         );
         if needs_request {
-            self.send_proposal_suffix_request(proposal, stop_height, sources)
+            // Fresh or stronger evidence restarts the escalation ladder.
+            self.send_proposal_suffix_request(proposal, stop_height, sources, 0)
                 .await;
         }
     }
@@ -871,6 +922,7 @@ impl HeaderWaiter {
                             request.proposal,
                             request.stop_height,
                             request.sources,
+                            request.attempt.saturating_add(1),
                         ).await;
                     }
 
@@ -910,6 +962,47 @@ impl HeaderWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_ladder_escalates_and_never_leaves_the_source_set() {
+        let keys: Vec<_> = crate::common::keys().iter().map(|(key, _)| *key).collect();
+        let lane = keys[0];
+        let sources = vec![keys[0], keys[1], keys[2], keys[3]];
+        let seed = Digest([7; 32]);
+
+        let stage0 = staged_repair_targets(&sources, Some(&lane), 0, 3, &seed);
+        assert_eq!(stage0.len(), 1);
+        assert_ne!(stage0[0], lane, "the lane author must be skipped");
+
+        let stage1 = staged_repair_targets(&sources, Some(&lane), 1, 3, &seed);
+        assert_eq!(stage1.len(), 3);
+        assert!(stage1.iter().all(|target| sources.contains(target)));
+        assert!(!stage1.contains(&lane));
+
+        let stage2 = staged_repair_targets(&sources, Some(&lane), 2, 3, &seed);
+        assert_eq!(stage2.len(), 3, "all non-author sources");
+
+        // Consecutive attempts rotate the single pick.
+        let next = staged_repair_targets(&sources, Some(&lane), 3, 3, &seed);
+        assert_eq!(next.len(), 3);
+
+        // A single justified source (the optimistic leader) is used at every
+        // stage and never widened.
+        let leader_only = vec![keys[1]];
+        for attempt in 0..4 {
+            assert_eq!(
+                staged_repair_targets(&leader_only, None, attempt, 3, &seed),
+                leader_only
+            );
+        }
+
+        // An author-only set falls back to the author rather than stalling.
+        let author_only = vec![lane];
+        assert_eq!(
+            staged_repair_targets(&author_only, Some(&lane), 0, 3, &seed),
+            author_only
+        );
+    }
 
     #[test]
     fn certified_forks_retain_all_proof_derived_sources() {
@@ -989,6 +1082,7 @@ mod tests {
             stop_height: 8,
             sources: vec![old_leader],
             requested_at: 0,
+            attempt: 0,
         };
 
         assert!(proposal_request_needs_update(
