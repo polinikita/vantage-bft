@@ -4,12 +4,13 @@ use crate::delayed_header::DelayedHeaderSender;
 use crate::error::{DagError, DagResult};
 use crate::leader::LeaderElector;
 use crate::messages::{
-    transform_commit_qc, verify_commit, verify_confirm, Certificate, CommitQC, ConsensusMessage,
-    ConsensusRequest, ConsensusVote, Header, Proposal, ProposalKind, Timeout, Vote, QC, TC,
+    transform_commit_qc, Certificate, CommitQC, ConsensusMessage, ConsensusRequest, ConsensusVote,
+    Header, Proposal, ProposalKind, Timeout, Vote, QC, TC,
 };
 use crate::primary::{Height, PrimaryMessage, Slot, View};
 use crate::synchronizer::Synchronizer;
 use crate::timer::{CarTimer, FastTimer, Timer};
+use crate::verified::VerifiedCache;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use config::Committee;
@@ -101,29 +102,6 @@ fn record_car_vote(
     }
 }
 
-fn autobahn_cut_is_valid(
-    committee: &Committee,
-    allow_optimistic_tips: bool,
-    proposals: &HashMap<PublicKey, Proposal>,
-) -> bool {
-    if proposals.len() != committee.size() {
-        return false;
-    }
-    committee.authorities.keys().all(|lane| {
-        let Some(proposal) = proposals.get(lane) else {
-            return false;
-        };
-        match proposal.verify(lane, committee) {
-            Ok(ProposalKind::Genesis | ProposalKind::Certified) => true,
-            Ok(ProposalKind::Optimistic) => allow_optimistic_tips,
-            Err(error) => {
-                debug!("invalid Autobahn cut entry for lane {}: {}", lane, error);
-                false
-            }
-        }
-    })
-}
-
 fn autobahn_own_tip_is_admissible(
     committee: &Committee,
     lane: &PublicKey,
@@ -150,6 +128,8 @@ pub struct Core {
     committee: Committee,
     store: Store,
     synchronizer: Synchronizer,
+    /// Shared memo of objects already verified against the committee.
+    verified: VerifiedCache,
     signature_service: SignatureService,
     consensus_round: Arc<AtomicU64>,
     gc_depth: Height,
@@ -308,6 +288,7 @@ impl Core {
                 name,
                 committee,
                 store,
+                verified: synchronizer.verified(),
                 synchronizer,
                 signature_service,
                 consensus_round,
@@ -504,7 +485,8 @@ impl Core {
         debug!("Processing the header with height {:?}", header.height);
 
         // Every car names its lane predecessor and carries an f+1 PoA for it.
-        header.parent_cert.verify(&self.committee)?;
+        self.verified
+            .check_certificate(&header.parent_cert, &self.committee)?;
         ensure!(
             header.parent_cert.author == header.author
                 && header.parent_cert.height().checked_add(1) == Some(header.height()),
@@ -539,7 +521,7 @@ impl Core {
                     return Ok(());
                 }
                 ParentVoteState::Missing => {
-                    parent.verify(&self.committee)?;
+                    self.verified.check_header(&parent, &self.committee)?;
                     ensure!(
                         parent.author == header.author
                             && parent.height == header.parent_cert.height
@@ -1404,14 +1386,15 @@ impl Core {
         proposals: &HashMap<PublicKey, Proposal>,
         _proposal_leader: PublicKey,
     ) -> bool {
-        autobahn_cut_is_valid(&self.committee, self.use_optimistic_tips, proposals)
+        self.verified
+            .cut_is_valid(&self.committee, self.use_optimistic_tips, proposals)
     }
 
     /// Validates the self-contained shape and proofs of a cut, independently
     /// of which view originally admitted its optimistic tips. A QC or TC
     /// supplies that missing admission evidence.
     fn validate_proven_cut(&self, proposals: &HashMap<PublicKey, Proposal>) -> bool {
-        autobahn_cut_is_valid(&self.committee, true, proposals)
+        self.verified.cut_is_valid(&self.committee, true, proposals)
     }
 
     /// A TC without a winner starts from a fully certified cut.
@@ -1420,7 +1403,8 @@ impl Core {
         proposals: &HashMap<PublicKey, Proposal>,
         _proposal_leader: PublicKey,
     ) -> bool {
-        autobahn_cut_is_valid(&self.committee, false, proposals)
+        self.verified
+            .cut_is_valid(&self.committee, false, proposals)
     }
 
     fn validate_timeout_evidence(&self, timeout: &Timeout) -> bool {
@@ -1525,7 +1509,7 @@ impl Core {
                         {
                             return false;
                         }
-                        if tc.verify(&self.committee).is_err()
+                        if self.verified.check_tc(tc, &self.committee).is_err()
                             || !tc
                                 .timeouts
                                 .iter()
@@ -1555,7 +1539,10 @@ impl Core {
                             if commit_qc.slot.checked_add(self.k) != Some(*slot) {
                                 return false;
                             }
-                            verify_commit(&transform_commit_qc(commit_qc.clone()), &self.committee)
+                            self.verified.check_commit(
+                                &transform_commit_qc(commit_qc.clone()),
+                                &self.committee,
+                            )
                         } else {
                             qc_ticket.is_none()
                         }
@@ -1597,7 +1584,9 @@ impl Core {
                 if curr_view <= *view
                     && !self.sent_timeouts.contains(&(*slot, *view))
                     && !self.last_confirmed_consensus.contains(&(*slot, *view))
-                    && verify_confirm(consensus_message, &self.committee)
+                    && self
+                        .verified
+                        .check_confirm(consensus_message, &self.committee)
                 {
                     self.enter_consensus_view(*slot, *view);
                     return true;
@@ -1609,7 +1598,9 @@ impl Core {
                 view: _,
                 qc: _,
                 proposals: _,
-            } => verify_commit(consensus_message, &self.committee),
+            } => self
+                .verified
+                .check_commit(consensus_message, &self.committee),
         }
     }
 
@@ -2091,6 +2082,9 @@ impl Core {
     fn clean_slot_periods(&mut self, slot: Slot) {
         let k = self.k;
 
+        // Bound the verified-object memo even during long quiet stretches.
+        self.verified.advance_if_full();
+
         self.consensus_instances
             .retain(|(s, _), _| keep_after_slot_period_gc(*s, slot, k));
         if self.all_to_all {
@@ -2213,7 +2207,9 @@ impl Core {
             ..
         } = &consensus_message
         {
-            if verify_commit(&consensus_message, &self.committee)
+            if self
+                .verified
+                .check_commit(&consensus_message, &self.committee)
                 && self.validate_proven_cut(proposals)
             {
                 let header = self.current_header.clone();
@@ -2308,7 +2304,7 @@ impl Core {
     async fn handle_timeout(&mut self, timeout: &Timeout) -> DagResult<()> {
         debug!("Processing timeout {:?}", timeout);
 
-        timeout.verify(&self.committee)?;
+        self.verified.check_timeout(timeout, &self.committee)?;
         ensure!(
             self.validate_timeout_evidence(timeout),
             DagError::MalformedTimeout(timeout.digest())
@@ -2418,7 +2414,7 @@ impl Core {
     async fn handle_tc(&mut self, tc: &TC) -> DagResult<()> {
         debug!("Processing TC {:?}", tc);
         ensure!(
-            tc.verify(&self.committee).is_ok(),
+            self.verified.check_tc(tc, &self.committee).is_ok(),
             DagError::InvalidQCTicket
         );
         ensure!(
@@ -2447,7 +2443,7 @@ impl Core {
             DagError::HeaderTooOld(header.id.clone(), header.height)
         );
 
-        header.verify(&self.committee)?;
+        self.verified.check_header(header, &self.committee)?;
         Ok(())
     }
 
@@ -2477,7 +2473,8 @@ impl Core {
             self.gc_round <= certificate.height(),
             DagError::CertificateTooOld(certificate.digest(), certificate.height())
         );
-        certificate.verify(&self.committee)
+        self.verified
+            .check_certificate(certificate, &self.committee)
     }
 
     /// Processes primary events.
@@ -2637,9 +2634,9 @@ impl Core {
 #[cfg(test)]
 mod slot_gc_tests {
     use super::{
-        allow_optimistic_leader_cut, autobahn_cut_is_valid, autobahn_own_tip_is_admissible,
-        keep_after_slot_period_gc, keep_all_to_all_delivery, latest_pipeline_tickets,
-        parallel_timer_slot, parent_vote_state, record_car_vote, ParentVoteState,
+        allow_optimistic_leader_cut, autobahn_own_tip_is_admissible, keep_after_slot_period_gc,
+        keep_all_to_all_delivery, latest_pipeline_tickets, parallel_timer_slot, parent_vote_state,
+        record_car_vote, ParentVoteState,
     };
     use crate::messages::{Header, Proposal};
     use crypto::Digest;
@@ -2716,8 +2713,9 @@ mod slot_gc_tests {
         let mut cut = Header::genesis_proposals(&committee);
         cut.insert(lane, optimistic.clone());
 
-        assert!(!autobahn_cut_is_valid(&committee, false, &cut));
-        assert!(autobahn_cut_is_valid(&committee, true, &cut));
+        let verified = crate::verified::VerifiedCache::for_committee(&committee);
+        assert!(!verified.cut_is_valid(&committee, false, &cut));
+        assert!(verified.cut_is_valid(&committee, true, &cut));
 
         let mut leader_cut = Header::genesis_proposals(&committee);
         leader_cut.insert(
@@ -2731,8 +2729,8 @@ mod slot_gc_tests {
                 ..Default::default()
             },
         );
-        assert!(!autobahn_cut_is_valid(&committee, false, &leader_cut));
-        assert!(autobahn_cut_is_valid(&committee, true, &leader_cut));
+        assert!(!verified.cut_is_valid(&committee, false, &leader_cut));
+        assert!(verified.cut_is_valid(&committee, true, &leader_cut));
     }
 
     #[test]

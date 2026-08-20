@@ -5,6 +5,7 @@ use crate::messages::{
     proposals_digest, Certificate, ConsensusMessage, Header, Proposal, ProposalKind,
 };
 use crate::primary::Slot;
+use crate::verified::VerifiedCache;
 use crate::Height;
 use config::Committee;
 use crypto::Hash as _;
@@ -37,6 +38,10 @@ pub struct Synchronizer {
     /// phases omit the TC, so retain the witnesses by slot and canonical cut
     /// digest until that slot is fully materialized.
     implicit_cut_sources: CutSourceCache,
+    /// Digest-keyed memo of objects already verified against the committee.
+    /// Constructed here and shared (via [`Self::verified`]) with every
+    /// component of the same primary.
+    verified: VerifiedCache,
 }
 
 impl Synchronizer {
@@ -60,7 +65,13 @@ impl Synchronizer {
                     .collect(),
             )),
             implicit_cut_sources: Arc::new(RwLock::new(HashMap::new())),
+            verified: VerifiedCache::for_committee(committee),
         }
+    }
+
+    /// A clone of the shared verified-object cache.
+    pub fn verified(&self) -> VerifiedCache {
+        self.verified.clone()
     }
 
     /// Returns whether payload synchronization was scheduled.
@@ -188,7 +199,8 @@ impl Synchronizer {
             if header.height == 0 {
                 break;
             }
-            header.parent_cert.verify(&self.committee)?;
+            self.verified
+                .check_certificate(&header.parent_cert, &self.committee)?;
             if header.parent_cert.author != *lane
                 || header.parent_cert.height.checked_add(1) != Some(header.height)
             {
@@ -274,7 +286,7 @@ impl Synchronizer {
                 tc: Some(tc),
                 proposals,
                 ..
-            } if tc.verify(&self.committee).is_ok() => tc
+            } if self.verified.check_tc(tc, &self.committee).is_ok() => tc
                 .get_winning_proposal(&self.committee)
                 .filter(|(winner, _)| winner == proposals)
                 .map(|(_, sources)| self.note_implicit_cut_sources(slot, proposals, sources)),
@@ -294,7 +306,10 @@ impl Synchronizer {
 
         for (lane, proposal) in proposals {
             let stop_height = self.executed_height(lane);
-            match proposal.verify(lane, &self.committee)? {
+            match self
+                .verified
+                .check_proposal(proposal, lane, &self.committee)?
+            {
                 ProposalKind::Genesis => continue,
                 ProposalKind::Certified => {
                     if let Some(missing) = self

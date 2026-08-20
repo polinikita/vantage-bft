@@ -17,6 +17,7 @@ pub mod simpleit;
 mod synchronizer;
 pub mod timer;
 pub mod vantage;
+mod verified;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]

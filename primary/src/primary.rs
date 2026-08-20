@@ -701,6 +701,7 @@ impl Primary {
                     store.clone(),
                     /* tx_header_waiter */ tx_sync_headers,
                 );
+                let verified = synchronizer.verified();
 
                 // Core handles headers, votes, and certificates.
                 Core::spawn(
@@ -831,6 +832,7 @@ impl Primary {
                     channel_auth.clone(),
                     suppressed_repair_destinations,
                     parameters.withhold_window.clone(),
+                    verified,
                 );
 
                 // Parsed by benchmark tooling.

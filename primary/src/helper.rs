@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Header, Proposal};
 use crate::primary::{Height, PrimaryMessage};
+use crate::verified::VerifiedCache;
 use bytes::Bytes;
 use config::Committee;
 use crypto::{Digest, PublicKey};
@@ -38,6 +39,8 @@ pub struct Helper {
     suppressed_repair_destinations: Option<HashSet<PublicKey>>,
     /// Shared time window controlling when repair suppression is active.
     withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
+    /// Shared memo of objects already verified against the committee.
+    verified: VerifiedCache,
 }
 
 impl Helper {
@@ -54,6 +57,7 @@ impl Helper {
         auth: Option<Arc<ChannelAuth>>,
         suppressed_repair_destinations: Option<HashSet<PublicKey>>,
         withhold_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
+        verified: VerifiedCache,
     ) {
         tokio::spawn(async move {
             Self {
@@ -70,6 +74,7 @@ impl Helper {
                 metrics,
                 suppressed_repair_destinations,
                 withhold_window,
+                verified,
             }
             .run()
             .await;
@@ -163,7 +168,10 @@ impl Helper {
                     };
                     let lane = poa.author;
                     if stop_height >= proposal.height
-                        || proposal.verify(&lane, &self.committee).is_err()
+                        || self
+                            .verified
+                            .check_proposal(&proposal, &lane, &self.committee)
+                            .is_err()
                     {
                         warn!("Ignoring malformed Autobahn suffix request");
                         continue;

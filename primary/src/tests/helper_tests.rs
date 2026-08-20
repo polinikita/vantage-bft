@@ -40,6 +40,7 @@ async fn honest_author_replies_to_header_repair_requests() {
         None,
         None,
         None,
+        crate::verified::VerifiedCache::for_committee(&committee),
     );
     drop(tx_certificates);
     drop(tx_proposals);
@@ -85,6 +86,7 @@ async fn byzantine_author_does_not_reply_to_header_repair_requests() {
         None,
         suppressed,
         None,
+        crate::verified::VerifiedCache::for_committee(&committee),
     );
 
     let address = committee.primary(&requestor).unwrap().primary_to_primary;

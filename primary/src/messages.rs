@@ -65,6 +65,17 @@ impl Proposal {
 
     /// Verifies the proof shape and signatures without requiring the tip body.
     pub fn verify(&self, lane: &PublicKey, committee: &Committee) -> DagResult<ProposalKind> {
+        let kind = self.classify(lane, committee)?;
+        self.poa
+            .as_ref()
+            .expect("classified proposals carry a PoA")
+            .verify(committee)?;
+        Ok(kind)
+    }
+
+    /// The crypto-free part of [`Self::verify`]: shape and coordinate checks
+    /// only. The caller is responsible for verifying the PoA signatures.
+    pub fn classify(&self, lane: &PublicKey, committee: &Committee) -> DagResult<ProposalKind> {
         let poa = self
             .poa
             .as_ref()
@@ -73,7 +84,6 @@ impl Proposal {
             poa.author == *lane,
             DagError::InvalidProposal(self.header_digest.clone())
         );
-        poa.verify(committee)?;
 
         if self.height == 0 {
             ensure!(
@@ -1147,6 +1157,17 @@ impl Timeout {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
+        self.verify_with(committee, &mut verify_confirm)
+    }
+
+    /// [`Self::verify`] with the (expensive) embedded-Confirm check supplied
+    /// by the caller, so a verification cache can be threaded through without
+    /// duplicating this logic.
+    pub fn verify_with(
+        &self,
+        committee: &Committee,
+        check_confirm: &mut dyn FnMut(&ConsensusMessage, &Committee) -> bool,
+    ) -> DagResult<()> {
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
@@ -1156,7 +1177,7 @@ impl Timeout {
         if let Some(high_qc) = &self.high_qc {
             let well_formed = match high_qc {
                 ConsensusMessage::Confirm { slot, view, .. } => {
-                    *slot == self.slot && *view <= self.view && verify_confirm(high_qc, committee)
+                    *slot == self.slot && *view <= self.view && check_confirm(high_qc, committee)
                 }
                 ConsensusMessage::Prepare { .. } | ConsensusMessage::Commit { .. } => false,
             };
@@ -1366,6 +1387,17 @@ impl TC {
 
     #[allow(clippy::result_large_err)]
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
+        self.verify_with(committee, &mut verify_confirm)
+    }
+
+    /// [`Self::verify`] with the embedded-Confirm check supplied by the
+    /// caller, so a verification cache can be threaded through.
+    #[allow(clippy::result_large_err)]
+    pub fn verify_with(
+        &self,
+        committee: &Committee,
+        check_confirm: &mut dyn FnMut(&ConsensusMessage, &Committee) -> bool,
+    ) -> ConsensusResult<()> {
         if self.slot == 0 && self.view == 0 && self.timeouts.is_empty() {
             return Ok(());
         }
@@ -1390,7 +1422,7 @@ impl TC {
         );
 
         for timeout in &self.timeouts {
-            timeout.verify(committee)?;
+            timeout.verify_with(committee, check_confirm)?;
         }
         Ok(())
     }
