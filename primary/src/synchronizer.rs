@@ -1,6 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::core::keep_after_slot_period_gc;
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
+use crate::leader::LeaderElector;
 use crate::messages::{
     proposals_digest, Certificate, ConsensusMessage, Header, Proposal, ProposalKind,
 };
@@ -18,6 +20,9 @@ use tokio::sync::mpsc::Sender;
 
 type CutCoordinate = (Slot, Digest);
 type CutSourceCache = Arc<RwLock<HashMap<CutCoordinate, Vec<PublicKey>>>>;
+
+/// Bound on the suffix-walk memo; clearing it only costs re-walks.
+const WALKED_FLOOR_CAP: usize = 8192;
 
 /// Checks header dependencies and requests missing data.
 #[derive(Clone)]
@@ -42,6 +47,13 @@ pub struct Synchronizer {
     /// Constructed here and shared (via [`Self::verified`]) with every
     /// component of the same primary.
     verified: VerifiedCache,
+    /// The immutable round-robin schedule, built once instead of per call.
+    leader_elector: LeaderElector,
+    /// Per-instance memo: a tip header digest maps to a height `floor` such
+    /// that the tip's whole lane suffix down to `floor` was locally present
+    /// when last walked. Headers above the executed height are never removed
+    /// from the store, so presence is monotonic and the memo cannot go stale.
+    walked_floor: HashMap<Digest, Height>,
 }
 
 impl Synchronizer {
@@ -66,6 +78,8 @@ impl Synchronizer {
             )),
             implicit_cut_sources: Arc::new(RwLock::new(HashMap::new())),
             verified: VerifiedCache::for_committee(committee),
+            leader_elector: LeaderElector::new(committee.clone()),
+            walked_floor: HashMap::new(),
         }
     }
 
@@ -190,6 +204,14 @@ impl Synchronizer {
     ) -> DagResult<Option<Proposal>> {
         let mut current = proposal.clone();
         while current.height > stop_height {
+            // A previously walked coordinate proves the rest of the suffix.
+            if self
+                .walked_floor
+                .get(&current.header_digest)
+                .is_some_and(|floor| *floor <= stop_height)
+            {
+                break;
+            }
             let Some(header) = self
                 .read_proposal_header(lane, &current, delivered_header)
                 .await?
@@ -208,13 +230,21 @@ impl Synchronizer {
             }
             current = Proposal::certified(header.parent_cert);
         }
+        if self.walked_floor.len() >= WALKED_FLOOR_CAP {
+            self.walked_floor.clear();
+        }
+        let floor = self
+            .walked_floor
+            .entry(proposal.header_digest.clone())
+            .or_insert(stop_height);
+        *floor = (*floor).min(stop_height);
         Ok(None)
     }
 
     fn note_implicit_cut_sources(
         &self,
         slot: Slot,
-        proposals: &HashMap<PublicKey, Proposal>,
+        cut_digest: &Digest,
         mut sources: Vec<PublicKey>,
     ) -> Vec<PublicKey> {
         sources.sort_unstable();
@@ -222,19 +252,19 @@ impl Synchronizer {
         self.implicit_cut_sources
             .write()
             .expect("implicit-cut lock poisoned")
-            .insert((slot, proposals_digest(proposals)), sources.clone());
+            .insert((slot, cut_digest.clone()), sources.clone());
         sources
     }
 
     fn known_implicit_cut_sources(
         &self,
         slot: Slot,
-        proposals: &HashMap<PublicKey, Proposal>,
+        cut_digest: &Digest,
     ) -> Option<Vec<PublicKey>> {
         self.implicit_cut_sources
             .read()
             .expect("implicit-cut lock poisoned")
-            .get(&(slot, proposals_digest(proposals)))
+            .get(&(slot, cut_digest.clone()))
             .cloned()
     }
 
@@ -243,6 +273,18 @@ impl Synchronizer {
             .write()
             .expect("implicit-cut lock poisoned")
             .retain(|(candidate_slot, _), _| *candidate_slot != slot);
+    }
+
+    /// Drops witnesses for slots already collected by the slot-period GC.
+    /// Without this, entries for abandoned views and superseded cut digests
+    /// of live slots would accumulate forever.
+    pub fn gc_implicit_cut_sources(&self, committed: Slot, k: Slot) {
+        self.implicit_cut_sources
+            .write()
+            .expect("implicit-cut lock poisoned")
+            .retain(|(candidate_slot, _), _| {
+                keep_after_slot_period_gc(*candidate_slot, committed, k)
+            });
     }
 
     /// Applies the paper's phase-specific availability rule. Certified suffix
@@ -274,8 +316,8 @@ impl Synchronizer {
             } => (*slot, *view, proposals, false, true),
         };
 
-        let proposal_leader =
-            crate::leader::LeaderElector::new(self.committee.clone()).get_leader(slot, view);
+        let proposal_leader = self.leader_elector.get_leader(slot, view);
+        let cut_digest = proposals_digest(proposals);
 
         // A winning proposal carried by a TC is implicitly certified: either
         // f+1 timeout reporters named the same Prepare, or a PrepareQC names a
@@ -289,16 +331,24 @@ impl Synchronizer {
             } if self.verified.check_tc(tc, &self.committee).is_ok() => tc
                 .get_winning_proposal(&self.committee)
                 .filter(|(winner, _)| winner == proposals)
-                .map(|(_, sources)| self.note_implicit_cut_sources(slot, proposals, sources)),
-            ConsensusMessage::Confirm { qc, proposals, .. }
-            | ConsensusMessage::Commit { qc, proposals, .. } => self
-                .known_implicit_cut_sources(slot, proposals)
+                .map(|(_, sources)| self.note_implicit_cut_sources(slot, &cut_digest, sources)),
+            ConsensusMessage::Confirm { qc, .. } | ConsensusMessage::Commit { qc, .. } => self
+                .known_implicit_cut_sources(slot, &cut_digest)
                 .or_else(|| {
                     let sources = qc.votes.iter().map(|(author, _)| *author).collect();
-                    Some(self.note_implicit_cut_sources(slot, proposals, sources))
+                    Some(self.note_implicit_cut_sources(slot, &cut_digest, sources))
                 }),
             ConsensusMessage::Prepare { .. } => None,
         };
+
+        // A Confirm is never data-gated and both of its callers ignore the
+        // verdict: the Prepare for this cut already scheduled its certified
+        // repairs, and Commit re-checks materialization. Keeping only the
+        // implicit-source registration removes a full lane walk per Confirm.
+        if !is_prepare && !is_commit {
+            return Ok(true);
+        }
+
         let mut certified_repairs = Vec::new();
         let mut optimistic_repairs = Vec::new();
         let mut implicit_repairs = Vec::new();

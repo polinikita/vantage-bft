@@ -4,6 +4,7 @@ use crypto::PublicKey;
 
 pub type LeaderElector = SemiParallelRRLeaderElector;
 
+#[derive(Clone)]
 pub(crate) struct RoundRobin {
     authorities: Vec<PublicKey>,
 }
@@ -38,6 +39,7 @@ fn wrapped_index(authority_count: usize, position: u64) -> usize {
     (position % authority_count as u64) as usize
 }
 
+#[derive(Clone)]
 pub struct SemiParallelRRLeaderElector {
     leaders: RoundRobin,
     leader_count: u64,

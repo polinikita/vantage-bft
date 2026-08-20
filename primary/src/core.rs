@@ -39,7 +39,7 @@ pub mod core_tests;
 /// Timer future shared by normal and injected-asynchrony paths.
 type SlotViewTimerFuture = Pin<Box<dyn Future<Output = (Slot, View)> + Send>>;
 
-fn keep_after_slot_period_gc(candidate: Slot, committed: Slot, k: Slot) -> bool {
+pub(crate) fn keep_after_slot_period_gc(candidate: Slot, committed: Slot, k: Slot) -> bool {
     debug_assert!(k > 0);
     candidate > committed || candidate % k != committed % k
 }
@@ -2085,6 +2085,7 @@ impl Core {
 
         // Bound the verified-object memo even during long quiet stretches.
         self.verified.advance_if_full();
+        self.synchronizer.gc_implicit_cut_sources(slot, k);
 
         self.consensus_instances
             .retain(|(s, _), _| keep_after_slot_period_gc(*s, slot, k));
