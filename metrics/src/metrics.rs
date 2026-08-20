@@ -412,6 +412,8 @@ pub struct Metrics {
     pub network_messages_sent_total: IntCounterVec,
     /// Wire messages received, by `type`, counted at receiver dispatch post-deserialize.
     pub network_messages_received_total: IntCounterVec,
+    /// Messages dropped at the primary ingress because verification failed.
+    pub primary_ingress_verify_failures_total: IntCounterVec,
     /// Serialized (pre-frame-prefix) bytes sent, by `type`.
     pub network_bytes_sent_total: IntCounterVec,
     /// Serialized (pre-frame-prefix) bytes received, by `type`.
@@ -1265,6 +1267,13 @@ impl Metrics {
             network_messages_received_total: register_int_counter_vec_with_registry!(
                 "network_messages_received_total",
                 "Wire messages received, by type",
+                &["type"],
+                registry,
+            )
+            .unwrap(),
+            primary_ingress_verify_failures_total: register_int_counter_vec_with_registry!(
+                "primary_ingress_verify_failures_total",
+                "Messages dropped at the primary ingress because verification failed, by type",
                 &["type"],
                 registry,
             )

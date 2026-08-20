@@ -855,7 +855,7 @@ impl Core {
             if self.all_to_all && !is_loopback {
                 // Authenticate before buffering. In particular, a wire sender
                 // cannot bypass verification by claiming our own public key.
-                vote.verify(&self.committee)?;
+                self.verified.check_consensus_vote(&vote, &self.committee)?;
                 if self.is_sane_pending_vote_slot(vote.slot) {
                     self.buffer_pending_consensus_vote(vote);
                 }
@@ -866,7 +866,7 @@ impl Core {
         }
 
         if !is_loopback {
-            vote.verify(&self.committee)?;
+            self.verified.check_consensus_vote(&vote, &self.committee)?;
         }
 
         let current_instance = opt_curr_instance.unwrap();
@@ -1738,7 +1738,8 @@ impl Core {
             }
         }
         debug!("try to verify");
-        consensus_req.verify(&self.committee)?;
+        self.verified
+            .check_consensus_request(&consensus_req, &self.committee)?;
         debug!("check validity");
         if !self.is_valid(consensus_message, consensus_req.author).await {
             return Ok(());
@@ -2465,7 +2466,7 @@ impl Core {
             return Err(DagError::CarAlreadySatisfied);
         }
 
-        vote.verify(&self.committee)
+        self.verified.check_vote(vote, &self.committee)
     }
 
     fn sanitize_certificate(&mut self, certificate: &Certificate) -> DagResult<()> {

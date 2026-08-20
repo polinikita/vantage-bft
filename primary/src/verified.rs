@@ -12,8 +12,8 @@
 
 use crate::error::{ConsensusResult, DagResult};
 use crate::messages::{
-    proposals_digest, verify_commit, verify_confirm, Certificate, ConsensusMessage, Header,
-    Proposal, ProposalKind, Timeout, TC,
+    proposals_digest, verify_commit, verify_confirm, Certificate, ConsensusMessage,
+    ConsensusRequest, ConsensusVote, Header, Proposal, ProposalKind, Timeout, Vote, TC,
 };
 use config::Committee;
 use crypto::{Blake3Hasher, Digest, Hash as _, PublicKey};
@@ -205,6 +205,66 @@ impl VerifiedCache {
         } else {
             false
         }
+    }
+
+    /// `Vote::verify` once per (vote digest, author, signature). The embedded
+    /// consensus votes are not covered by the car-vote signature in the first
+    /// place; they are verified individually where they are counted.
+    pub fn check_vote(&self, vote: &Vote, committee: &Committee) -> DagResult<()> {
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"vote-verified-v1");
+        hasher.update(&vote.digest().0);
+        hasher.update(&vote.author.0);
+        hasher.update(&vote.signature.to_bytes());
+        let key = Digest(hasher.finalize().into());
+        if self.lookup(&key).is_some() {
+            return Ok(());
+        }
+        vote.verify(committee)?;
+        self.record(key, None);
+        Ok(())
+    }
+
+    /// `ConsensusVote::verify` once per (voted digest, author, signature).
+    pub fn check_consensus_vote(
+        &self,
+        vote: &ConsensusVote,
+        committee: &Committee,
+    ) -> DagResult<()> {
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"consensus-vote-verified-v1");
+        hasher.update(&vote.digest.0);
+        hasher.update(&vote.author.0);
+        hasher.update(&vote.sig.to_bytes());
+        let key = Digest(hasher.finalize().into());
+        if self.lookup(&key).is_some() {
+            return Ok(());
+        }
+        vote.verify(committee)?;
+        self.record(key, None);
+        Ok(())
+    }
+
+    /// `ConsensusRequest::verify` once per (message digest, author, signature).
+    /// A carried TC or QC ticket is outside the envelope signature by design
+    /// and stays independently verified where it is used.
+    pub fn check_consensus_request(
+        &self,
+        request: &ConsensusRequest,
+        committee: &Committee,
+    ) -> DagResult<()> {
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(b"consensus-request-verified-v1");
+        hasher.update(&request.message.digest().0);
+        hasher.update(&request.author.0);
+        hasher.update(&request.sig.to_bytes());
+        let key = Digest(hasher.finalize().into());
+        if self.lookup(&key).is_some() {
+            return Ok(());
+        }
+        request.verify(committee)?;
+        self.record(key, None);
+        Ok(())
     }
 
     /// `Timeout::verify` with the embedded Confirm checked through the cache.

@@ -19,11 +19,12 @@ use crate::vantage::sequence::{
     SequenceDeltaRequest, SequenceOutcomeRequest, SequenceOutcomeServe, SequenceRecordChunk,
     SequenceRequest, SequenceUnavailable,
 };
+use crate::verified::VerifiedCache;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, Protocol, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
-use log::info;
+use log::{info, warn};
 use metrics::{spawn_queue_sampler, start_prometheus_server, MetricReporter, Metrics, StoreProbe};
 use network::{ChannelAuth, MessageHandler, Receiver as NetworkReceiver, Writer};
 use prometheus::Registry;
@@ -637,6 +638,16 @@ impl Primary {
                     .then_some(withholding_dests)
                     .flatten();
 
+                // Build the dependency synchronizer (and the verified-object
+                // cache it owns) before the receiver, which shares the cache.
+                let synchronizer = Synchronizer::new(
+                    name,
+                    &committee,
+                    store.clone(),
+                    /* tx_header_waiter */ tx_sync_headers,
+                );
+                let verified = synchronizer.verified();
+
                 // Receive messages from other primaries.
                 let mut address = committee
                     .primary(&name)
@@ -652,6 +663,8 @@ impl Primary {
                         tx_header_requests,
                         tx_proposal_header_requests,
                         metrics: metrics.clone(),
+                        committee: committee.clone(),
+                        verified,
                     },
                     Some(metrics.clone()),
                     // Acknowledge each received frame.
@@ -694,13 +707,6 @@ impl Primary {
                     name, address
                 );
 
-                // Build the dependency synchronizer.
-                let synchronizer = Synchronizer::new(
-                    name,
-                    &committee,
-                    store.clone(),
-                    /* tx_header_waiter */ tx_sync_headers,
-                );
                 let verified = synchronizer.verified();
 
                 // Core handles headers, votes, and certificates.
@@ -860,6 +866,60 @@ struct PrimaryReceiverHandler {
     tx_header_requests: Sender<(Vec<Digest>, PublicKey, bool)>,
     tx_proposal_header_requests: Sender<(Proposal, Height, PublicKey)>,
     metrics: Arc<Metrics>,
+    /// The committee and shared verified-object cache: signatures are checked
+    /// here, on the per-peer connection task, so the single Core task only
+    /// performs cache lookups on its hot path.
+    committee: Committee,
+    verified: VerifiedCache,
+}
+
+impl PrimaryReceiverHandler {
+    /// Verifies a message on the connection task and marks it in the shared
+    /// cache. Returns false (after counting the drop) when verification
+    /// fails; the Core would reject the message identically, so dropping it
+    /// here changes no acceptance decision.
+    fn ingress_verified(&self, message: &PrimaryMessage) -> bool {
+        let verdict = match message {
+            PrimaryMessage::Header(header, _) => self
+                .verified
+                .check_header(header, &self.committee)
+                .and_then(|_| {
+                    self.verified
+                        .check_certificate(&header.parent_cert, &self.committee)
+                })
+                .is_ok(),
+            PrimaryMessage::Vote(vote) => self.verified.check_vote(vote, &self.committee).is_ok(),
+            PrimaryMessage::Certificate(certificate) => self
+                .verified
+                .check_certificate(certificate, &self.committee)
+                .is_ok(),
+            PrimaryMessage::Timeout(timeout) => self
+                .verified
+                .check_timeout(timeout, &self.committee)
+                .is_ok(),
+            PrimaryMessage::TC(tc) => self.verified.check_tc(tc, &self.committee).is_ok(),
+            PrimaryMessage::ConsensusRequest(request) => self
+                .verified
+                .check_consensus_request(request, &self.committee)
+                .is_ok(),
+            PrimaryMessage::ConsensusVote(vote) => self
+                .verified
+                .check_consensus_vote(vote, &self.committee)
+                .is_ok(),
+            _ => true,
+        };
+        if !verdict {
+            warn!(
+                "Dropping {} that failed ingress verification",
+                message.type_name()
+            );
+            self.metrics
+                .primary_ingress_verify_failures_total
+                .with_label_values(&[message.type_name()])
+                .inc();
+        }
+        verdict
+    }
 }
 
 #[async_trait]
@@ -898,17 +958,25 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .expect("Failed to send proposal suffix request"),
             PrimaryMessage::ProposalHeaders(headers) => {
                 for header in headers {
+                    let message = PrimaryMessage::Header(header, true);
+                    if !self.ingress_verified(&message) {
+                        continue;
+                    }
                     self.tx_primary_messages
-                        .send(PrimaryMessage::Header(header, true))
+                        .send(message)
                         .await
                         .expect("Failed to deliver proposal suffix header");
                 }
             }
-            request => self
-                .tx_primary_messages
-                .send(request)
-                .await
-                .expect("Failed to send certificate"),
+            request => {
+                if !self.ingress_verified(&request) {
+                    return Ok(());
+                }
+                self.tx_primary_messages
+                    .send(request)
+                    .await
+                    .expect("Failed to send certificate")
+            }
         }
         Ok(())
     }
