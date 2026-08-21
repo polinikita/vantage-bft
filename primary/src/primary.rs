@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, Protocol, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
-use log::{info, warn};
+use log::{debug, info, warn};
 use metrics::{spawn_queue_sampler, start_prometheus_server, MetricReporter, Metrics, StoreProbe};
 use network::{ChannelAuth, MessageHandler, Receiver as NetworkReceiver, Writer};
 use prometheus::Registry;
@@ -940,27 +940,31 @@ impl MessageHandler for PrimaryReceiverHandler {
         let message: PrimaryMessage =
             bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
         record_typed_received(&self.metrics, message.type_name(), serialized.len());
+        // A closed channel below means the primary is shutting down while
+        // this connection task still holds a frame; drop the message exactly
+        // as a stopped node would, instead of panicking mid-teardown.
         match message {
-            PrimaryMessage::CertificatesRequest(missing, requestor) => self
-                .tx_cert_requests
-                .send((missing, requestor))
-                .await
-                .expect("Failed to send primary message"),
-            PrimaryMessage::HeadersRequest(missing, requestor) => self
-                .tx_header_requests
-                .send((missing, requestor, false))
-                .await
-                .expect("Failed to send primary message"),
-            PrimaryMessage::PrepareHeadersRequest(missing, requestor) => self
-                .tx_header_requests
-                .send((missing, requestor, true))
-                .await
-                .expect("Failed to send primary message"),
-            PrimaryMessage::ProposalHeadersRequest(proposal, stop_height, requestor) => self
-                .tx_proposal_header_requests
-                .send((proposal, stop_height, requestor))
-                .await
-                .expect("Failed to send proposal suffix request"),
+            PrimaryMessage::CertificatesRequest(missing, requestor) => {
+                let _ = self.tx_cert_requests.send((missing, requestor)).await;
+            }
+            PrimaryMessage::HeadersRequest(missing, requestor) => {
+                let _ = self
+                    .tx_header_requests
+                    .send((missing, requestor, false))
+                    .await;
+            }
+            PrimaryMessage::PrepareHeadersRequest(missing, requestor) => {
+                let _ = self
+                    .tx_header_requests
+                    .send((missing, requestor, true))
+                    .await;
+            }
+            PrimaryMessage::ProposalHeadersRequest(proposal, stop_height, requestor) => {
+                let _ = self
+                    .tx_proposal_header_requests
+                    .send((proposal, stop_height, requestor))
+                    .await;
+            }
             PrimaryMessage::ProposalHeaders(headers) => {
                 // Verify here (mostly cache hits for headers already seen on
                 // the wire), drop what fails, and hand the suffix to the Core
@@ -979,21 +983,23 @@ impl MessageHandler for PrimaryReceiverHandler {
                         admitted
                     })
                     .collect();
-                if !verified.is_empty() {
-                    self.tx_primary_messages
+                if !verified.is_empty()
+                    && self
+                        .tx_primary_messages
                         .send(PrimaryMessage::ProposalHeaders(verified))
                         .await
-                        .expect("Failed to deliver proposal suffix headers");
+                        .is_err()
+                {
+                    debug!("Dropping a repaired suffix received during shutdown");
                 }
             }
             request => {
                 if !self.ingress_verified(&request) {
                     return Ok(());
                 }
-                self.tx_primary_messages
-                    .send(request)
-                    .await
-                    .expect("Failed to send certificate")
+                if self.tx_primary_messages.send(request).await.is_err() {
+                    debug!("Dropping a wire message received during shutdown");
+                }
             }
         }
         Ok(())
