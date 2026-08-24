@@ -216,6 +216,9 @@ pub struct ResolutionChain {
     eligible: BTreeSet<AnchorRef>,
     decided_anchors: BTreeSet<AnchorRef>,
     anchored_targets: BTreeSet<View>,
+    /// Targets sealed locally by any data-plane path. This is only a batching
+    /// priority hint; `anchored_targets` retains its proof-facing meaning.
+    locally_sealed_targets: BTreeSet<View>,
 
     decided_height: ResolutionHeight,
     head: Digest,
@@ -261,6 +264,7 @@ impl ResolutionChain {
             eligible: BTreeSet::new(),
             decided_anchors: BTreeSet::new(),
             anchored_targets: BTreeSet::new(),
+            locally_sealed_targets: BTreeSet::new(),
             decided_height: 0,
             head: genesis,
             decided_blocks: BTreeMap::new(),
@@ -394,16 +398,26 @@ impl ResolutionChain {
         }
         if self.matching_witness_count(view, &digest) >= self.quorum && self.eligible.insert(anchor)
         {
+            let targets: Vec<_> = self
+                .carrier_bodies
+                .get(&(view, digest.clone()))
+                .expect("held carrier checked above")
+                .entries()
+                .iter()
+                .map(ResolutionEntry::target_view)
+                .collect();
             #[cfg(feature = "benchmark")]
             log::info!(
-                "VANTAGE_RECOVERY_EVENT kind=resolver_eligible view={} epoch_ms={} height={} pending={}",
+                "VANTAGE_RECOVERY_EVENT kind=resolver_eligible view={} epoch_ms={} height={} targets={} pending={}",
                 view,
                 recovery_epoch_ms(),
                 self.active
                     .as_ref()
                     .map_or(self.decided_height + 1, |active| active.height),
+                targets.len(),
                 self.pending_anchors().len()
             );
+            effects.push(Effect::ResolutionCarrierEligible(targets));
             effects.extend(self.activate_if_pending());
             effects.extend(self.retry_active());
         }
@@ -479,6 +493,62 @@ impl ResolutionChain {
             .filter(|a| !self.decided_anchors.contains(*a))
             .cloned()
             .collect()
+    }
+
+    fn unresolved_targets(&self, anchor: &AnchorRef) -> BTreeSet<View> {
+        self.carrier_bodies
+            .get(&(anchor.view, anchor.digest.clone()))
+            .into_iter()
+            .flat_map(ProposalOut::entries)
+            .map(ResolutionEntry::target_view)
+            .filter(|target| {
+                !self.is_anchor_resolved(*target) && !self.locally_sealed_targets.contains(target)
+            })
+            .collect()
+    }
+
+    /// Selects a bounded, deterministic block without sacrificing anchor
+    /// fairness. The oldest anchor is always retained; remaining slots first
+    /// add distinct unresolved targets and then fill in lexicographic order.
+    fn select_pending_anchors(&self) -> Vec<AnchorRef> {
+        let pending = self.pending_anchors();
+        let Some(oldest) = pending.first().cloned() else {
+            return Vec::new();
+        };
+        if pending.len() <= self.batch_cap {
+            return pending;
+        }
+
+        let mut selected = vec![oldest.clone()];
+        let mut selected_set = BTreeSet::from([oldest.clone()]);
+        let mut covered = self.unresolved_targets(&oldest);
+
+        for anchor in pending.iter().skip(1) {
+            if selected.len() == self.batch_cap {
+                break;
+            }
+            let targets = self.unresolved_targets(anchor);
+            if targets.iter().any(|target| !covered.contains(target)) {
+                covered.extend(targets);
+                selected.push(anchor.clone());
+                selected_set.insert(anchor.clone());
+            }
+        }
+
+        if selected.len() < self.batch_cap {
+            for anchor in &pending {
+                if selected.len() == self.batch_cap {
+                    break;
+                }
+                if selected_set.insert(anchor.clone()) {
+                    selected.push(anchor.clone());
+                }
+            }
+        }
+        selected.sort();
+        debug_assert_eq!(selected.len(), self.batch_cap);
+        debug_assert!(selected.contains(&oldest));
+        selected
     }
 
     fn activate_if_pending(&mut self) -> Vec<Effect> {
@@ -884,11 +954,7 @@ impl ResolutionChain {
             }
             (max.key3_view, block)
         } else {
-            let anchors: Vec<_> = self
-                .pending_anchors()
-                .into_iter()
-                .take(self.batch_cap)
-                .collect();
+            let anchors = self.select_pending_anchors();
             if anchors.is_empty() {
                 return Vec::new();
             }
@@ -1468,7 +1534,16 @@ impl ResolutionChain {
             return;
         }
         self.anchored_targets = self.anchored_targets.split_off(&floor);
+        self.locally_sealed_targets = self.locally_sealed_targets.split_off(&floor);
         self.resolved_target_floor = floor;
+    }
+
+    /// Records a target sealed by any data-plane path so fresh resolver blocks
+    /// can prioritize anchors that still add useful outcomes.
+    pub fn note_target_resolved(&mut self, view: View) {
+        if view >= self.resolved_target_floor {
+            self.locally_sealed_targets.insert(view);
+        }
     }
 
     pub fn is_anchor_resolved(&self, view: View) -> bool {
@@ -1489,6 +1564,15 @@ impl ResolutionChain {
 
     pub fn batch_cap(&self) -> usize {
         self.batch_cap
+    }
+
+    pub(crate) fn unresolved_target_count(&self, block: &ResolutionBlock) -> usize {
+        block
+            .anchors
+            .iter()
+            .flat_map(|anchor| self.unresolved_targets(anchor))
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     pub fn head(&self) -> &Digest {

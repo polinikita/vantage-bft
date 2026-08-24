@@ -791,6 +791,7 @@ impl SimpleItCore {
                 | Effect::SequenceFinalized { .. }
                 | Effect::RecoverOwnLane(_)
                 | Effect::CompletionReportable(_, _)
+                | Effect::ResolutionCarrierEligible(_)
                 | Effect::BroadcastResolutionWitness(_)
                 | Effect::BroadcastResolutionWish(_)
                 | Effect::ResolutionSuggestTo(_, _)

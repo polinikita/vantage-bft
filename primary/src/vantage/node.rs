@@ -4078,6 +4078,7 @@ impl VantageCore {
                     Effect::Sealed(view, outcome) => {
                         #[cfg(feature = "pipeline-tracing")]
                         self.pipeline.note_sealed(view);
+                        self.resolution_chain.note_target_resolved(view);
                         queue.extend(self.cursor.on_sealed(view, outcome));
                     }
                     Effect::ArmTimer(view, kind, deadline) => {
@@ -4163,6 +4164,9 @@ impl VantageCore {
                                 .on_completion_reportable(view, proposal),
                         );
                     }
+                    Effect::ResolutionCarrierEligible(targets) => {
+                        self.resolver.note_eligible_carrier_targets(targets);
+                    }
 
                     Effect::BroadcastResolutionWitness(witness) => {
                         if self.suppress_mixed_open_response("resolution-witness") {
@@ -4199,11 +4203,13 @@ impl VantageCore {
                         }
                         #[cfg(feature = "benchmark")]
                         log::info!(
-                            "VANTAGE_RECOVERY_EVENT kind=resolver_proposal_sent view={} epoch_ms={} height={} anchors={} pending={} beta={}",
+                            "VANTAGE_RECOVERY_EVENT kind=resolver_proposal_sent view={} epoch_ms={} height={} anchors={} distinct_unresolved_targets={} pending={} beta={}",
                             proposal.view,
                             recovery_epoch_ms(),
                             proposal.height,
                             proposal.block.anchors.len(),
+                            self.resolution_chain
+                                .unresolved_target_count(&proposal.block),
                             self.resolution_chain.pending_anchor_count(),
                             self.resolution_chain.batch_cap()
                         );

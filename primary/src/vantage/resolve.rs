@@ -1,7 +1,7 @@
 use crate::primary::View;
 use crate::vantage::agb::{AgbEngine, ResolutionEntry};
 use crate::vantage::Thresholds;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 /// Selects justified recovery entries for proposer turns.
@@ -16,6 +16,10 @@ pub struct Resolver {
     in_flight: BTreeMap<View, Instant>,
     /// Finite suppression interval that prevents one missed attempt from blocking recovery.
     expiry: Duration,
+    /// Targets already carried by a quorum-eligible anchor. Unlike a tentative
+    /// carrier attempt, stable eligibility needs no expiry: the resolution
+    /// chain eventually orders the retained carrier under its liveness assumptions.
+    eligible_carrier_targets: BTreeSet<View>,
     /// Alternates batched and single-entry attempts for the oldest target.
     alternation_target: Option<View>,
     alternation_force_single: bool,
@@ -35,14 +39,17 @@ impl Resolver {
             alternation_force_single: false,
             in_flight: BTreeMap::new(),
             expiry: Duration::from_millis(12 * delta_ms),
+            eligible_carrier_targets: BTreeSet::new(),
             resolved_watermark: 1,
         }
     }
 
     fn is_in_flight(&self, u: View, now: Instant) -> bool {
-        self.in_flight
-            .get(&u)
-            .is_some_and(|t| now.saturating_duration_since(*t) < self.expiry)
+        self.eligible_carrier_targets.contains(&u)
+            || self
+                .in_flight
+                .get(&u)
+                .is_some_and(|t| now.saturating_duration_since(*t) < self.expiry)
     }
 
     pub fn note_carrier_report(&mut self, u: View, now: Instant) {
@@ -50,6 +57,19 @@ impl Resolver {
             return;
         }
         self.in_flight.insert(u, now);
+    }
+
+    /// Suppresses new metadata for targets backed by a stable eligible carrier.
+    ///
+    /// Eligibility includes a witness quorum and a retained verified body, so
+    /// unlike a merely completed carrier this state cannot disappear when its
+    /// finite attempt timer expires.
+    pub fn note_eligible_carrier_targets(&mut self, targets: impl IntoIterator<Item = View>) {
+        self.eligible_carrier_targets.extend(
+            targets
+                .into_iter()
+                .filter(|target| *target >= self.resolved_watermark),
+        );
     }
 
     pub fn resolved_watermark(&self) -> View {
@@ -65,12 +85,16 @@ impl Resolver {
         let next = view.saturating_add(1);
         if next > self.resolved_watermark {
             self.resolved_watermark = next;
+            self.candidate_pointer = self.candidate_pointer.split_off(&next);
+            self.in_flight = self.in_flight.split_off(&next);
+            self.eligible_carrier_targets = self.eligible_carrier_targets.split_off(&next);
         }
     }
 
     pub fn gc_below(&mut self, floor: View) {
         self.candidate_pointer = self.candidate_pointer.split_off(&floor);
         self.in_flight = self.in_flight.split_off(&floor);
+        self.eligible_carrier_targets = self.eligible_carrier_targets.split_off(&floor);
     }
 
     fn canonical_key(entry: &ResolutionEntry) -> (bool, Vec<u8>, u8) {
@@ -269,5 +293,10 @@ impl Resolver {
     #[cfg(test)]
     pub(crate) fn pointer_for_test(&self, target: View) -> Option<ResolutionEntry> {
         self.candidate_pointer.get(&target).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_eligible_carrier_for_test(&self, target: View) -> bool {
+        self.eligible_carrier_targets.contains(&target)
     }
 }

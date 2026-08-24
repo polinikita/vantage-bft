@@ -106,6 +106,8 @@ pub enum Effect {
 
     /// Reports the first genuine completion of a proposal carrying recovery entries.
     CompletionReportable(View, ProposalOut),
+    /// Reports targets backed by a newly quorum-eligible retained carrier.
+    ResolutionCarrierEligible(Vec<View>),
     BroadcastResolutionWitness(ResolutionWitness),
     BroadcastResolutionWish(ResolutionWish),
     ResolutionSuggestTo(PublicKey, ResolutionSuggest),

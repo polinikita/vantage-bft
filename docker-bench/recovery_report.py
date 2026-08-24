@@ -101,6 +101,12 @@ def add_check(checks: list[dict], name: str, passed: bool, detail: str) -> None:
     checks.append({"name": name, "passed": passed, "detail": detail})
 
 
+def compact_list(values: list, limit: int = 12) -> str:
+    if len(values) <= limit:
+        return str(values)
+    return f"{values[:limit]} ... (+{len(values) - limit} more)"
+
+
 def distribution_summary(values: list[int]) -> dict:
     if not values:
         return {"count": 0, "minimum": None, "median": None, "p95": None, "maximum": None}
@@ -155,6 +161,11 @@ def resolver_dynamics(
         applied_targets = [int(event.get("applied_targets", 0)) for event in decisions]
         pending_before = [int(event.get("pending_before", 0)) for event in decisions]
         pending_after = [int(event.get("pending_after", 0)) for event in decisions]
+        proposed_distinct_targets = [
+            int(event["distinct_unresolved_targets"])
+            for event in proposals
+            if "distinct_unresolved_targets" in event
+        ]
         rows.append({
             "height": height,
             "resolver_view": max(int(event.get("view", 0)) for event in decisions),
@@ -175,6 +186,9 @@ def resolver_dynamics(
             "applied_targets": int(statistics.median(applied_targets)),
             "pending_before": int(statistics.median(pending_before)),
             "pending_after": int(statistics.median(pending_after)),
+            "max_proposed_distinct_unresolved_targets": (
+                max(proposed_distinct_targets) if proposed_distinct_targets else None
+            ),
         })
 
     queue_peaks = {}
@@ -212,6 +226,11 @@ def resolver_dynamics(
         row["proposal_to_all_decided_ms"]
         for row in rows if row["proposal_to_all_decided_ms"] is not None
     ]
+    proposed_distinct = [
+        row["max_proposed_distinct_unresolved_targets"]
+        for row in rows
+        if row["max_proposed_distinct_unresolved_targets"] is not None
+    ]
     successful_start = min(
         (row["first_proposal_ms"] for row in rows if row["first_proposal_ms"] is not None),
         default=None,
@@ -231,6 +250,9 @@ def resolver_dynamics(
         "height_rows": rows,
         "anchors_per_block": distribution_summary(anchors),
         "applied_targets_per_block": distribution_summary(applied),
+        "max_proposed_distinct_unresolved_targets_per_height": distribution_summary(
+            proposed_distinct
+        ),
         "full_blocks": sum(value == beta for value in anchors),
         "batch_utilization": (
             statistics.median(value / beta for value in anchors)
@@ -251,6 +273,110 @@ def resolver_dynamics(
         "carrier_anchor_service_per_second": (
             sum(anchors) / successful_seconds if successful_seconds else None
         ),
+        "applied_target_service_per_second": (
+            sum(applied) / successful_seconds if successful_seconds else None
+        ),
+    }
+
+
+def sustained_attack_dynamics(
+    common_open: set[int],
+    open_maps: dict[int, dict[int, dict]],
+    seal_maps: dict[int, dict[int, dict]],
+    fault_start_ms: int,
+    fault_end_ms: int,
+    guard_ms: int,
+) -> dict:
+    """Compare globally visible mixed-open arrivals with all-correct seals."""
+    attack_ms = fault_end_ms - fault_start_ms
+    # Discard the attack's first third as a queue warmup, then stop before the
+    # 7*Delta containment guard so every counted arrival remains fault-contained.
+    window_start_ms = fault_start_ms + max(guard_ms, attack_ms // 3)
+    window_end_ms = fault_end_ms - guard_ms
+    window_ms = max(0, window_end_ms - window_start_ms)
+
+    arrivals = {
+        view: max(int(mapping[view]["epoch_ms"]) for mapping in open_maps.values())
+        for view in common_open
+    }
+    services = {
+        view: max(int(mapping[view]["epoch_ms"]) for mapping in seal_maps.values())
+        for view in common_open
+        if all(view in mapping for mapping in seal_maps.values())
+    }
+
+    def backlog_before(epoch_ms: int) -> int:
+        return sum(
+            arrival < epoch_ms and services.get(view, sys.maxsize) >= epoch_ms
+            for view, arrival in arrivals.items()
+        )
+
+    arrivals_in_window = sum(
+        window_start_ms <= epoch_ms < window_end_ms for epoch_ms in arrivals.values()
+    )
+    services_in_window = sum(
+        window_start_ms <= epoch_ms < window_end_ms for epoch_ms in services.values()
+    )
+    backlog_start = backlog_before(window_start_ms)
+    backlog_end = backlog_before(window_end_ms)
+
+    outstanding = backlog_start
+    peak = outstanding
+    timeline = [
+        (epoch_ms, 1, view)
+        for view, epoch_ms in arrivals.items()
+        if window_start_ms <= epoch_ms < window_end_ms
+    ] + [
+        (epoch_ms, -1, view)
+        for view, epoch_ms in services.items()
+        if window_start_ms <= epoch_ms < window_end_ms
+    ]
+    timeline.sort(key=lambda item: (item[0], -item[1], item[2]))
+    for _, delta, _ in timeline:
+        outstanding += delta
+        peak = max(peak, outstanding)
+
+    samples = []
+    if window_ms > 0:
+        epoch_ms = window_start_ms
+        while epoch_ms < window_end_ms:
+            samples.append((epoch_ms, backlog_before(epoch_ms)))
+            epoch_ms += 1_000
+        samples.append((window_end_ms, backlog_end))
+
+    linear_slope_per_second = None
+    if len(samples) >= 2:
+        xs = [(epoch_ms - window_start_ms) / 1_000 for epoch_ms, _ in samples]
+        ys = [value for _, value in samples]
+        x_mean = statistics.mean(xs)
+        y_mean = statistics.mean(ys)
+        denominator = sum((x - x_mean) ** 2 for x in xs)
+        if denominator:
+            linear_slope_per_second = sum(
+                (x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)
+            ) / denominator
+
+    seconds = window_ms / 1_000
+    accounting_error = backlog_end - (
+        backlog_start + arrivals_in_window - services_in_window
+    )
+    return {
+        "window_start_ms": window_start_ms,
+        "window_end_ms": window_end_ms,
+        "window_seconds": seconds,
+        "arrivals": arrivals_in_window,
+        "all_correct_seals": services_in_window,
+        "arrival_rate_per_second": arrivals_in_window / seconds if seconds else None,
+        "service_rate_per_second": services_in_window / seconds if seconds else None,
+        "service_headroom_per_second": (
+            (services_in_window - arrivals_in_window) / seconds if seconds else None
+        ),
+        "backlog_at_start": backlog_start,
+        "backlog_at_end": backlog_end,
+        "backlog_peak": peak,
+        "backlog_net_growth": backlog_end - backlog_start,
+        "backlog_accounting_error": accounting_error,
+        "backlog_linear_fit_per_second": linear_slope_per_second,
     }
 
 
@@ -501,6 +627,7 @@ def validate_mixed(
         view for view in mature_stress if all(view in mapping for mapping in open_maps.values())
     }
     split_violations = []
+    missing_seals = []
     route_mismatches = []
     missing_finalized = []
     recovery_rows = []
@@ -523,7 +650,10 @@ def validate_mixed(
             for event in opens
         ):
             split_violations.append(view)
-        if any(event is None or event.get("route") not in ANCHOR_ROUTES for event in seals):
+        if any(event is None for event in seals):
+            missing_seals.append(view)
+            continue
+        if any(event.get("route") not in ANCHOR_ROUTES for event in seals):
             route_mismatches.append(view)
             continue
         if any(view not in mapping for mapping in finalized_maps.values()):
@@ -583,41 +713,52 @@ def validate_mixed(
         resolver_window_start,
         resolver_window_end,
     )
+    sustained = sustained_attack_dynamics(
+        common_open,
+        open_maps,
+        seal_maps,
+        fault_start,
+        fault_end,
+        fault_containment_guard_ms,
+    )
 
     add_check(
         checks,
         "deterministic stress proposals",
         len(mature_stress) >= minimum_open_views and not bad_tips,
-        f"mature={len(mature_stress)}, one-tip violations={bad_tips}",
+        f"mature={len(mature_stress)}, one-tip violations={compact_list(bad_tips)}",
     )
     add_check(
         checks,
         "residual mixed views observed",
         len(common_open) >= minimum_open_views,
         f"common-open={len(common_open)}; other mature stress views refined or did not "
-        f"complete open everywhere={missing_open}",
+        f"complete open everywhere={compact_list(missing_open)}",
     )
     add_check(
         checks,
         "bounded direct-holder split",
         bool(common_open) and not split_violations,
         f"completion quorum has grade1<=f={expected_g1} and "
-        f"grade0>=n-2f={expected_g0}; violations={split_violations}",
+        f"grade0>=n-2f={expected_g0}; violations={compact_list(split_violations)}",
     )
     add_check(
         checks,
         "hash-chained resolver recovery",
-        len(recovery_rows) == len(common_open) and not route_mismatches,
+        len(recovery_rows) == len(common_open) and not missing_seals and not route_mismatches,
         f"anchor-sealed={len(recovery_rows)}/{len(common_open)}; completion-to-all ms "
         f"median/p95/max={recovery_latency_summary['median']}/"
         f"{recovery_latency_summary['p95']}/{recovery_latency_summary['maximum']}; "
-        f"mismatches={route_mismatches}",
+        f"unsealed={compact_list(missing_seals)}; "
+        f"wrong-route={compact_list(route_mismatches)}",
     )
     add_check(
         checks,
         "ordered output passed recovered views",
         not missing_finalized,
-        "every recovered view finalized" if not missing_finalized else f"missing={missing_finalized}",
+        "every recovered view finalized"
+        if not missing_finalized
+        else f"missing={compact_list(missing_finalized)}",
     )
     add_check(
         checks,
@@ -639,6 +780,29 @@ def validate_mixed(
         all(count > 0 for count in post_fault_progress.values()),
         f"minimum post-fault finalized events={min(post_fault_progress.values(), default=0)}",
     )
+    if int(parameters["withhold_for_ms"]) >= 30_000:
+        arrival_rate = sustained["arrival_rate_per_second"]
+        service_rate = sustained["service_rate_per_second"]
+        arrival_rate_text = f"{arrival_rate:.3f}" if arrival_rate is not None else "n/a"
+        service_rate_text = f"{service_rate:.3f}" if service_rate is not None else "n/a"
+        sustained_ok = (
+            sustained["window_seconds"] > 0
+            and sustained["arrivals"] >= minimum_open_views
+            and sustained["all_correct_seals"] >= sustained["arrivals"]
+            and sustained["backlog_net_growth"] <= 0
+            and sustained["backlog_accounting_error"] == 0
+        )
+        add_check(
+            checks,
+            "sustained resolver keeps pace with mixed-open arrivals",
+            sustained_ok,
+            f"arrivals={sustained['arrivals']} "
+            f"({arrival_rate_text}/s), "
+            f"all-correct seals={sustained['all_correct_seals']} "
+            f"({service_rate_text}/s); "
+            f"backlog start/end/peak={sustained['backlog_at_start']}/"
+            f"{sustained['backlog_at_end']}/{sustained['backlog_peak']}",
+        )
     route_counts = {}
     for row in recovery_rows:
         for route in row["routes"]:
@@ -651,6 +815,7 @@ def validate_mixed(
         "mature_stress_views": sorted(mature_stress),
         "common_open_views": sorted(common_open),
         "split_violations": split_violations,
+        "missing_seals": missing_seals,
         "route_mismatches": route_mismatches,
         "missing_finalized": missing_finalized,
         "backlog_peak_and_final_by_node": backlog,
@@ -668,6 +833,7 @@ def validate_mixed(
         "anchor_seal_spread_ms": distribution_summary(recovery_spreads),
         "anchor_route_counts": route_counts,
         "resolver_dynamics": dynamics,
+        "sustained_attack_dynamics": sustained,
     }
 
 

@@ -101,6 +101,7 @@ fn drain_resolution(
                     }
                 }
             }
+            Effect::ResolutionCarrierEligible(_) => {}
             Effect::ApplyAnchor(view, _, _) => applied[origin].push(view),
             Effect::ArmResolutionTimer(..) => {}
             other => panic!("unexpected resolution effect: {other:?}"),
@@ -159,6 +160,35 @@ fn enter_resolver_view(chain: &mut ResolutionChain, names: &[PublicKey], view: u
     }
     assert_eq!(chain.current_resolver_view(), view);
     effects
+}
+
+fn elicit_zero_key_primary_proposal(
+    chain: &mut ResolutionChain,
+    names: &[PublicKey],
+    view: u64,
+) -> ResolutionProposal {
+    let height = chain.decided_height() + 1;
+    let parent = chain.head().clone();
+    let leader = chain.resolution_leader(height, view);
+    for sender in names.iter().copied().filter(|sender| *sender != leader) {
+        for effect in chain.on_resolution_suggest(ResolutionSuggest {
+            height,
+            parent: parent.clone(),
+            view,
+            sender,
+            key3_view: 0,
+            key3_value: Digest::default(),
+            key2_view: 0,
+            key2_value: Digest::default(),
+            prev_key2: 0,
+            block: None,
+        }) {
+            if let Effect::BroadcastResolutionProposal(proposal) = effect {
+                return proposal;
+            }
+        }
+    }
+    panic!("correct primary did not propose after a suggestion quorum");
 }
 
 fn drive_to_lock(
@@ -419,6 +449,41 @@ fn a_precreated_height_still_raises_wish_when_an_anchor_becomes_eligible() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, Effect::BroadcastResolutionWish(_))));
+}
+
+#[test]
+fn newly_eligible_carrier_reports_its_targets_once() {
+    let committee = test_committee();
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let mut chain = ResolutionChain::new(names[3], committee, test_sid(), TEST_DELTA_MS);
+    let carrier = resolution_carrier(9, 4);
+    let digest = carrier.digest(&test_sid());
+    chain.on_completion_reportable(9, carrier);
+
+    let mut effects = Vec::new();
+    for sender in &names {
+        effects.extend(chain.on_resolution_witness(ResolutionWitness {
+            carrier_view: 9,
+            carrier_digest: digest.clone(),
+            sender: *sender,
+        }));
+    }
+    let target_reports: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ResolutionCarrierEligible(targets) => Some(targets.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(target_reports, vec![vec![4]]);
+
+    assert!(chain
+        .on_resolution_witness(ResolutionWitness {
+            carrier_view: 9,
+            carrier_digest: digest,
+            sender: names[0],
+        })
+        .is_empty());
 }
 
 #[test]
@@ -691,37 +756,40 @@ fn configured_batch_cap_bounds_a_primary_proposal() {
     make_anchor_eligible(&mut chain, &names, 10, 2);
     enter_resolver_view(&mut chain, &names, 1);
 
-    let mut effects = Vec::new();
-    for sender in names.iter().copied().filter(|sender| *sender != leader) {
-        effects.extend(chain.on_resolution_suggest(ResolutionSuggest {
-            height: 1,
-            parent: chain.head().clone(),
-            view: 1,
-            sender,
-            key3_view: 0,
-            key3_value: Digest::default(),
-            key2_view: 0,
-            key2_value: Digest::default(),
-            prev_key2: 0,
-            block: None,
-        }));
-        if effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::BroadcastResolutionProposal(_)))
-        {
-            break;
-        }
-    }
-
-    let proposal = effects
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::BroadcastResolutionProposal(proposal) => Some(proposal),
-            _ => None,
-        })
-        .expect("correct primary proposes after a suggestion quorum");
+    let proposal = elicit_zero_key_primary_proposal(&mut chain, &names, 1);
     assert_eq!(proposal.block.anchors.len(), 1);
+    assert_eq!(proposal.block.anchors[0].view, 9);
     assert_eq!(chain.pending_anchor_count(), 2);
+}
+
+#[test]
+fn correct_primary_prioritizes_distinct_targets_after_the_oldest_anchor() {
+    let committee = test_committee();
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let sid = test_sid();
+    let probe = ResolutionChain::new_with_batch_cap(
+        names[0],
+        committee.clone(),
+        sid.clone(),
+        TEST_DELTA_MS,
+        4,
+    );
+    let leader = probe.resolution_leader(1, 1);
+    let mut chain = ResolutionChain::new_with_batch_cap(leader, committee, sid, TEST_DELTA_MS, 4);
+    for (carrier_view, target_view) in [(9, 1), (10, 1), (11, 2), (12, 2), (13, 3), (14, 1)] {
+        make_anchor_eligible(&mut chain, &names, carrier_view, target_view);
+    }
+    enter_resolver_view(&mut chain, &names, 1);
+
+    let proposal = elicit_zero_key_primary_proposal(&mut chain, &names, 1);
+    let selected_views: Vec<_> = proposal
+        .block
+        .anchors
+        .iter()
+        .map(|anchor| anchor.view)
+        .collect();
+    assert_eq!(selected_views, vec![9, 10, 11, 13]);
+    assert_eq!(chain.unresolved_target_count(&proposal.block), 3);
 }
 
 #[test]
@@ -811,6 +879,24 @@ fn data_gc_does_not_invalidate_an_eligible_resolution_anchor() {
     assert!(chain.is_anchor_resolved(1));
     assert!(chain.is_eligible_for_test(9, &digest));
     assert!(chain.held_carrier_for_test(9, &digest));
+}
+
+#[test]
+fn direct_seal_is_only_a_batching_hint_not_an_anchor_resolution() {
+    let committee = test_committee();
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let mut chain = ResolutionChain::new(names[3], committee, test_sid(), TEST_DELTA_MS);
+    let anchor = make_anchor_eligible(&mut chain, &names, 9, 4);
+    let block = ResolutionBlock {
+        height: 1,
+        parent: chain.head().clone(),
+        anchors: vec![anchor],
+    };
+
+    chain.note_target_resolved(4);
+
+    assert!(!chain.is_anchor_resolved(4));
+    assert_eq!(chain.unresolved_target_count(&block), 0);
 }
 
 #[test]

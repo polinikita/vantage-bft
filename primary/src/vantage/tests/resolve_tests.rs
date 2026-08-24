@@ -434,3 +434,35 @@ async fn d7_1_note_carrier_report_suppresses_like_our_own_attempt() {
         Some(ResolutionEntry::Skip(1))
     );
 }
+
+#[tokio::test]
+async fn quorum_eligible_carrier_suppression_does_not_expire() {
+    let (name, _) = authors()[3];
+    let mut agb = new_agb_engine(name);
+    let delta_ms = 10u64;
+    let mut resolver = Resolver::new(4, delta_ms);
+    let all = authors();
+    for sender in all.iter().take(3) {
+        agb.on_noready(1, sender.0);
+    }
+
+    let t0 = Instant::now();
+    resolver.note_carrier_report(1, t0);
+    resolver.note_eligible_carrier_targets([1, 2]);
+    assert!(resolver.has_eligible_carrier_for_test(1));
+    assert!(resolver.has_eligible_carrier_for_test(2));
+
+    let after_attempt_expiry = t0 + Duration::from_millis(12 * delta_ms + 1);
+    assert_eq!(
+        resolver.decide(&agb, 5, after_attempt_expiry, |_| false),
+        None,
+        "eligibility, unlike a tentative carrier attempt, remains suppressed"
+    );
+    assert!(!resolver.next_is_recovery_for_test());
+
+    resolver.note_resolved_through(1);
+    assert!(!resolver.has_eligible_carrier_for_test(1));
+    assert!(resolver.has_eligible_carrier_for_test(2));
+    resolver.gc_below(3);
+    assert!(!resolver.has_eligible_carrier_for_test(2));
+}

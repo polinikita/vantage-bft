@@ -677,6 +677,7 @@ pub fn drain_local(
                     queue.extend(nodes[idx].cursor.on_completed(view, c, t));
                 }
                 Effect::Sealed(view, outcome) => {
+                    nodes[idx].resolution_chain.note_target_resolved(view);
                     queue.extend(nodes[idx].cursor.on_sealed(view, outcome));
                 }
                 Effect::ArmTimer(view, kind, deadline) => {
@@ -703,6 +704,9 @@ pub fn drain_local(
                             .resolution_chain
                             .on_completion_reportable(view, proposal),
                     );
+                }
+                Effect::ResolutionCarrierEligible(targets) => {
+                    nodes[idx].resolver.note_eligible_carrier_targets(targets);
                 }
                 Effect::BroadcastResolutionWitness(witness) => {
                     for j in 0..n {
