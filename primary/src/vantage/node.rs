@@ -2268,11 +2268,12 @@ impl VantageCore {
                     .map(ProposalOut::Single)
             };
             if let Some(proposal) = proposal {
-                if mixed_open_fault && self.mixed_open_single_target {
+                let residual_injected = mixed_open_fault && !proposal.t().is_empty();
+                if residual_injected && self.mixed_open_single_target {
                     self.mixed_open_single_target_used = true;
                 }
                 #[cfg(feature = "benchmark")]
-                if mixed_open_fault {
+                if residual_injected {
                     log::info!(
                         "VANTAGE_RECOVERY_EVENT kind=stress_propose view={} epoch_ms={} tips={}",
                         proposal.view(),
