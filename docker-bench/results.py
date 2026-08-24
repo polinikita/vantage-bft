@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -173,7 +174,12 @@ def counter_deltas(
 
 
 def snapshot_all(manifest: dict) -> list[NodeSnapshot]:
-    return [snapshot_node(manifest, i) for i in range(manifest["nodes"])]
+    nodes = manifest["nodes"]
+    # A sequential scrape can take O(n * timeout) and made an n=31 nominal
+    # 10-second sample last roughly a minute. Scrape validators concurrently so
+    # the watch clock and its rate denominator continue to mean wall time.
+    with ThreadPoolExecutor(max_workers=min(nodes, 32)) as executor:
+        return list(executor.map(lambda i: snapshot_node(manifest, i), range(nodes)))
 
 
 def committed_total(snapshots: list[NodeSnapshot]) -> int:
@@ -259,14 +265,21 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     first_total: int | None = None
     first_submitted: int | None = None
     first_snapshots: list[NodeSnapshot] | None = None
-    first_elapsed = 0
+    first_elapsed = 0.0
     last_snapshots: list[NodeSnapshot] = []
-    elapsed = 0
+    started_at = time.monotonic()
+    last_sample_at = started_at
+    next_sample_at = started_at + interval
+    deadline = None if duration is None else started_at + duration
+    elapsed = 0.0
     try:
-        while duration is None or elapsed < duration:
-            time.sleep(interval)
-            elapsed += interval
+        while True:
+            target = next_sample_at if deadline is None else min(next_sample_at, deadline)
+            time.sleep(max(0.0, target - time.monotonic()))
             snapshots = snapshot_all(manifest)
+            sampled_at = time.monotonic()
+            elapsed = sampled_at - started_at
+            sample_window = max(sampled_at - last_sample_at, 1e-9)
             last_snapshots = snapshots
             total = committed_total(snapshots)
             if first_total is None:
@@ -276,13 +289,19 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
                 first_elapsed = elapsed
             delta = max(0, total - prev_total)
             print(
-                f"TIMELINE: sec={elapsed} committed_total={total} "
-                f"committed_delta={delta} tps={delta / interval:.0f} "
+                f"TIMELINE: sec={elapsed:.1f} committed_total={total} "
+                f"committed_delta={delta} tps={delta / sample_window:.0f} "
                 f"p50_ms={median_p50_ms(snapshots, 'p50')} "
                 f"mat_p50_ms={median_p50_ms(snapshots, 'm50')}"
             )
             sys.stdout.flush()
             prev_total = total
+            last_sample_at = sampled_at
+            if deadline is not None and sampled_at >= deadline:
+                break
+            next_sample_at += interval
+            while next_sample_at <= sampled_at:
+                next_sample_at += interval
     except KeyboardInterrupt:
         print()
 
@@ -317,9 +336,9 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     total_sync_completed = sum(sync_completed)
     total_sync_wait_micros = sum(sync_wait_micros)
     print("-----------------------------------------")
-    print(f" docker-bench SUMMARY (measured over this {window}s watch window):")
+    print(f" docker-bench SUMMARY (measured over this {window:.1f}s watch window):")
     print("-----------------------------------------")
-    print(f" Consensus TPS: {rate:.0f} tx/s  (delta {committed_delta} tx / {window}s)")
+    print(f" Consensus TPS: {rate:.0f} tx/s  (delta {committed_delta} tx / {window:.1f}s)")
     if uncounted_delta:
         print(
             " Committed adversarial payload: "
