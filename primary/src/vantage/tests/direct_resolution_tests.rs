@@ -251,6 +251,44 @@ fn resolver_timer_budgets_keep_the_full_view_bound() {
 }
 
 #[test]
+fn initial_wish_retries_until_quorum_entry() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 8;
+    let mut resolver = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let initial = resolver.update_candidates(target, [ResolutionEntry::Skip(target)]);
+    assert!(initial.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::ArmTimer(
+            t,
+            1,
+            DirectResolutionTimerKind::Entry,
+            _,
+        ) if *t == target
+    )));
+
+    let retry = resolver.on_timer(target, 1, DirectResolutionTimerKind::Entry);
+    assert!(retry.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::BroadcastWish(wish)
+            if wish.target == target && wish.view == 1
+    )));
+    assert!(retry.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::ArmTimer(
+            t,
+            1,
+            DirectResolutionTimerKind::Entry,
+            _,
+        ) if *t == target
+    )));
+
+    enter_view(&mut resolver, &names, target, 1);
+    assert!(resolver
+        .on_timer(target, 1, DirectResolutionTimerKind::Entry)
+        .is_empty());
+}
+
+#[test]
 fn fresh_non_skip_is_backed_only_after_origins_and_a_witness_quorum() {
     let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
     let target = 9;
@@ -432,6 +470,42 @@ fn one_member_cannot_allocate_arbitrary_future_resolver_views() {
 
     assert!(effects.is_empty());
     assert_eq!(resolver.buffered_views_for_test(target), 0);
+}
+
+#[test]
+fn unsolicited_resolver_traffic_cannot_allocate_targets() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 1_000_000;
+    let mut resolver = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let entry = ResolutionEntry::Skip(target);
+    let value = resolver.value_digest(&entry);
+
+    assert!(resolver
+        .on_wish(DirectResolutionWish {
+            target,
+            view: 1,
+            sender: names[1],
+        })
+        .is_empty());
+    assert!(resolver
+        .on_statement(DirectResolutionStatement {
+            target,
+            view: 1,
+            value: value.clone(),
+            phase: DirectResolutionPhase::Echo,
+            origin: None,
+            sender: names[1],
+        })
+        .is_empty());
+    assert!(resolver
+        .on_done(crate::vantage::DirectResolutionDone {
+            target,
+            value,
+            entry,
+            sender: names[1],
+        })
+        .is_empty());
+    assert_eq!(resolver.active_len(), 0);
 }
 
 #[test]
