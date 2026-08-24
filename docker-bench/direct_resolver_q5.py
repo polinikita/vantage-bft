@@ -113,7 +113,12 @@ def common_target_rows(
     return rows
 
 
-def load_run(path: Path, single_target: bool) -> dict:
+def load_run(
+    path: Path,
+    single_target: bool,
+    expected_duration_s: int,
+    expected_fault_duration_s: int,
+) -> dict:
     data = path / "data"
     manifest = json.loads((data / "manifest.json").read_text())
     parameters = json.loads((data / "parameters.json").read_text())
@@ -145,9 +150,9 @@ def load_run(path: Path, single_target: bool) -> dict:
     if (
         n != 10
         or f != 3
-        or int(manifest["duration"]) != 150
+        or int(manifest["duration"]) != expected_duration_s
         or int(parameters["withhold_at_ms"]) != 20_000
-        or int(parameters["withhold_for_ms"]) != 30_000
+        or int(parameters["withhold_for_ms"]) != expected_fault_duration_s * 1_000
         or int(manifest["honest_offered_tps"]) != 1_000
         or int(manifest["adversarial_rate"]) != 600
         or not manifest["latency"]
@@ -239,6 +244,14 @@ def load_run(path: Path, single_target: bool) -> dict:
             "in_attack_backlog_start": int(sustained["backlog_at_start"]),
             "in_attack_backlog_end": int(sustained["backlog_at_end"]),
             "in_attack_backlog_peak": int(sustained["backlog_peak"]),
+            "in_attack_backlog_net_growth": int(sustained["backlog_net_growth"]),
+            "in_attack_backlog_slope_views_per_second": float(
+                sustained["backlog_linear_fit_per_second"]
+            ),
+            "in_attack_service_headroom_views_per_second": float(
+                sustained["service_headroom_per_second"]
+            ),
+            "in_attack_window_seconds": float(sustained["window_seconds"]),
             "fault_end_outstanding_views": outstanding_at_end,
             "fault_end_to_all_sealed_s": drain_seconds,
             "post_attack_drain_rate_views_per_second": tail_rate,
@@ -310,6 +323,8 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--profile", choices=("sustained", "single"), default="sustained"
     )
+    parser.add_argument("--expected-duration-s", type=int, default=150)
+    parser.add_argument("--expected-fault-duration-s", type=int, default=30)
     args = parser.parse_args(argv)
 
     single_target = args.profile == "single"
@@ -317,7 +332,15 @@ def main(argv=None) -> None:
     repetitions = sorted(args.campaign_root.glob(f"rep-*/{run_dir}"))
     if len(repetitions) != 3:
         parser.error(f"expected exactly three repetitions, found {len(repetitions)}")
-    runs = [load_run(path, single_target) for path in repetitions]
+    runs = [
+        load_run(
+            path,
+            single_target,
+            args.expected_duration_s,
+            args.expected_fault_duration_s,
+        )
+        for path in repetitions
+    ]
     if single_target:
         for run in runs:
             if (
@@ -378,10 +401,20 @@ def main(argv=None) -> None:
     backlog_axis = figure.add_subplot(grid[1, 0])
     latency_axis = figure.add_subplot(grid[1, 1])
     axes = (throughput_axis, backlog_axis, latency_axis)
+    fault_start_s = int(runs[0]["parameters"]["withhold_at_ms"]) / 1_000
+    fault_duration_s = int(runs[0]["parameters"]["withhold_for_ms"]) / 1_000
+    fault_end_s = fault_start_s + fault_duration_s
+    duration_s = int(runs[0]["manifest"]["duration"])
     for axis in axes:
-        axis.axvspan(20, 50, color="#b8b8b8", alpha=0.34, linewidth=0)
+        axis.axvspan(
+            fault_start_s,
+            fault_end_s,
+            color="#b8b8b8",
+            alpha=0.34,
+            linewidth=0,
+        )
         axis.grid(axis="y", color="#d5d5d5", linewidth=0.6)
-        axis.set_xlim(0, 150)
+        axis.set_xlim(0, duration_s)
 
     plot_band(
         throughput_axis,
@@ -463,9 +496,9 @@ def main(argv=None) -> None:
             "fault_budget": 3,
             "correct_offered_tps": 1_000,
             "uncounted_adversarial_tps": 600,
-            "duration_s": 150,
-            "fault_start_s": 20,
-            "fault_duration_s": 30,
+            "duration_s": duration_s,
+            "fault_start_s": fault_start_s,
+            "fault_duration_s": fault_duration_s,
             "delta_ms": 200,
             "netem_limit_pkts": 100_000,
             "state_sync": False,
