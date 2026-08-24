@@ -14,6 +14,7 @@ fi
 NODES="${NODES:-10}"
 FAULTS=$(( (NODES - 1) / 3 ))
 REPETITIONS="${REPETITIONS:-3}"
+SINGLE_TARGET="${SINGLE_TARGET:-0}"
 DURATION="${DURATION:-150}"
 START_DELAY="${START_DELAY:-30}"
 FAULT_START="${FAULT_START:-20}"
@@ -32,6 +33,15 @@ fi
 if [ "$REPETITIONS" -lt 1 ]; then
     echo "direct_resolver_q5.sh: REPETITIONS must be positive" >&2
     exit 2
+fi
+if [ "$SINGLE_TARGET" != 0 ] && [ "$SINGLE_TARGET" != 1 ]; then
+    echo "direct_resolver_q5.sh: SINGLE_TARGET must be 0 or 1" >&2
+    exit 2
+fi
+
+profile=mixed
+if [ "$SINGLE_TARGET" = 1 ]; then
+    profile=mixed-single
 fi
 
 archive_data() {
@@ -82,7 +92,7 @@ export_prometheus() {
 mkdir -p "$RUN_ROOT"
 overall=0
 for repetition in $(seq 1 "$REPETITIONS"); do
-    destination="$RUN_ROOT/rep-$repetition/mixed"
+    destination="$RUN_ROOT/rep-$repetition/$profile"
     mkdir -p "$destination"
     command=(
         ./run.sh
@@ -104,6 +114,9 @@ for repetition in $(seq 1 "$REPETITIONS"); do
         --withhold-at "$FAULT_START"
         --withhold-for "$FAULT_DURATION"
     )
+    if [ "$SINGLE_TARGET" = 1 ]; then
+        command+=(--mixed-open-single-target)
+    fi
     if [ "$repetition" -gt 1 ]; then
         command+=(--no-build)
     fi

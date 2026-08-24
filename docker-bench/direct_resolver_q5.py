@@ -113,7 +113,7 @@ def common_target_rows(
     return rows
 
 
-def load_run(path: Path) -> dict:
+def load_run(path: Path, single_target: bool) -> dict:
     data = path / "data"
     manifest = json.loads((data / "manifest.json").read_text())
     parameters = json.loads((data / "parameters.json").read_text())
@@ -153,6 +153,8 @@ def load_run(path: Path) -> dict:
         or not manifest["latency"]
         or int(manifest["netem_limit_pkts"]) != 100_000
         or manifest["sequence_install_enabled"]
+        or bool(parameters.get("vantage_mixed_open_single_target", False))
+        != single_target
     ):
         raise ValueError(f"unexpected Q5 configuration in {path}")
 
@@ -305,12 +307,26 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--profile", choices=("sustained", "single"), default="sustained"
+    )
     args = parser.parse_args(argv)
 
-    repetitions = sorted(args.campaign_root.glob("rep-*/mixed"))
+    single_target = args.profile == "single"
+    run_dir = "mixed-single" if single_target else "mixed"
+    repetitions = sorted(args.campaign_root.glob(f"rep-*/{run_dir}"))
     if len(repetitions) != 3:
         parser.error(f"expected exactly three repetitions, found {len(repetitions)}")
-    runs = [load_run(path) for path in repetitions]
+    runs = [load_run(path, single_target) for path in repetitions]
+    if single_target:
+        for run in runs:
+            if (
+                run["record"]["guarded_views"] != 1
+                or run["record"]["all_fault_cohort_views"] != 1
+            ):
+                raise ValueError(
+                    f"single-target profile did not create exactly one common-open view in {run['path']}"
+                )
     committees = [
         (run["path"] / "data" / "committee.json").read_bytes() for run in runs
     ]
@@ -340,7 +356,8 @@ def main(argv=None) -> None:
             [run["latency_series"] for run in runs]
         ),
     }
-    write_series_csv(args.output_dir / "direct-resolver-q5.csv", seconds, bands)
+    output_stem = "direct-resolver-q5-single" if single_target else "direct-resolver-q5"
+    write_series_csv(args.output_dir / f"{output_stem}.csv", seconds, bands)
 
     plt.rcParams.update(
         {
@@ -408,10 +425,10 @@ def main(argv=None) -> None:
     latency_axis.legend(loc="upper right", frameon=False)
 
     figure.savefig(
-        args.output_dir / "direct-resolver-q5.pdf", bbox_inches="tight", dpi=300
+        args.output_dir / f"{output_stem}.pdf", bbox_inches="tight", dpi=300
     )
     figure.savefig(
-        args.output_dir / "direct-resolver-q5.png", bbox_inches="tight", dpi=220
+        args.output_dir / f"{output_stem}.png", bbox_inches="tight", dpi=220
     )
     plt.close(figure)
 
@@ -438,6 +455,7 @@ def main(argv=None) -> None:
     }
     summary = {
         "campaign_root": str(args.campaign_root),
+        "profile": args.profile,
         "image_sha256": image_match.group(1),
         "repetitions": len(runs),
         "configuration": {
@@ -452,12 +470,13 @@ def main(argv=None) -> None:
             "netem_limit_pkts": 100_000,
             "state_sync": False,
             "prometheus_step_s": 1,
+            "single_target": single_target,
         },
         "per_repetition": records,
         "aggregate": aggregate,
         "timeline": timeline_summary,
     }
-    (args.output_dir / "direct-resolver-q5-summary.json").write_text(
+    (args.output_dir / f"{output_stem}-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
     print(json.dumps(summary, indent=2, sort_keys=True))

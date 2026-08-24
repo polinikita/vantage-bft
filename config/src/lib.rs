@@ -373,6 +373,12 @@ pub struct Parameters {
     #[serde(default)]
     pub vantage_mixed_open_stress: bool,
 
+    /// Restricts the mixed-open benchmark to one proposal from the first
+    /// selected Byzantine publisher while every selected publisher continues
+    /// suppressing AGB and resolver responses for the full fault window.
+    #[serde(default)]
+    pub vantage_mixed_open_single_target: bool,
+
     /// Byzantine authors whose original header publication is delayed to a
     /// fixed receiver subset. Repair traffic is never delayed.
     #[serde(default)]
@@ -868,6 +874,7 @@ impl Default for Parameters {
             withhold_headers: default_withhold_headers(),
             leader_relay_attack: false,
             vantage_mixed_open_stress: false,
+            vantage_mixed_open_single_target: false,
             late_header_publishers: Vec::new(),
             late_header_receivers: Vec::new(),
             late_header_delay_ms: 0,
@@ -1133,6 +1140,11 @@ impl Parameters {
                 info!(
                     "Vantage mixed-open stress: each Byzantine proposer publishes its own tip to f correct holders and withholds AGB/resolver responses during the finite fault window"
                 );
+                if self.vantage_mixed_open_single_target {
+                    info!(
+                        "Vantage mixed-open single-target mode: only the first selected Byzantine publisher injects one residual proposal"
+                    );
+                }
             }
         }
         if !self.late_header_publishers.is_empty() {
@@ -1262,6 +1274,9 @@ impl Parameters {
                         .to_string(),
                 );
             }
+        }
+        if self.vantage_mixed_open_single_target && !self.vantage_mixed_open_stress {
+            return Err("mixed-open single-target mode requires mixed-open stress".to_string());
         }
         if self.withhold_senders > 0 && !self.withhold_publishers.is_empty() {
             return Err(

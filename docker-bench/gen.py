@@ -263,6 +263,7 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         "withhold_headers": not (args.withhold_batches_only or args.leader_relay),
         "leader_relay_attack": args.leader_relay,
         "vantage_mixed_open_stress": args.mixed_open_stress,
+        "vantage_mixed_open_single_target": args.mixed_open_single_target,
         "withhold_at_ms": None if args.withhold_at is None else args.withhold_at * 1000,
         "withhold_for_ms": args.withhold_for * 1000,
         "resume_check_period_ms": 1000,
@@ -668,6 +669,12 @@ def parse_args(argv=None) -> argparse.Namespace:
              "narrowcasts its own tip to f correct holders and withholds AGB/resolver "
              "responses during --withhold-at/--withhold-for",
     )
+    p.add_argument(
+        "--mixed-open-single-target",
+        action="store_true",
+        help="with --mixed-open-stress, inject exactly one residual proposal from "
+             "the first selected Byzantine publisher while all f publishers suppress responses",
+    )
     p.add_argument("--correct-load-only", action="store_true",
                    help="distribute counted client load only across non-withholding authors")
     p.add_argument("--adversarial-rate", type=int, default=0,
@@ -753,6 +760,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                 "--mixed-open-stress requires --correct-load-only and positive "
                 "--adversarial-rate so attacked data is uncounted"
             )
+    if args.mixed_open_single_target and not args.mixed_open_stress:
+        p.error("--mixed-open-single-target requires --mixed-open-stress")
     if args.correct_load_only and args.withhold == 0:
         p.error("--correct-load-only requires --withhold > 0")
     if args.correct_load_only and args.withhold == args.nodes:

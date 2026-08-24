@@ -861,6 +861,12 @@ pub struct VantageCore {
 
     /// True only for one of the benchmark profile's Byzantine publishers.
     mixed_open_stress_publisher: bool,
+    /// Restricts residual-proposal injection to one designated target.
+    mixed_open_single_target: bool,
+    /// In single-target mode, true only at the first selected Byzantine publisher.
+    mixed_open_single_target_injector: bool,
+    /// Prevents the single-target injector from creating a second residual proposal.
+    mixed_open_single_target_used: bool,
     /// Common finite benchmark window, armed from one absolute epoch.
     mixed_open_stress_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 
@@ -1063,6 +1069,12 @@ impl VantageCore {
         );
         let mixed_open_stress_publisher =
             parameters.vantage_mixed_open_stress && withholding_publishers.contains(&name);
+        let mixed_open_single_target_injector = parameters.vantage_mixed_open_single_target
+            && committee
+                .authorities
+                .keys()
+                .find(|key| withholding_publishers.contains(*key))
+                .is_some_and(|key| *key == name);
         let withholding_dests = if parameters.vantage_mixed_open_stress {
             config::mixed_open_withheld_destinations(
                 &committee,
@@ -1297,6 +1309,9 @@ impl VantageCore {
             gc_window: parameters.vantage_gc_window_views.max(1),
             last_gc_floor: 1,
             mixed_open_stress_publisher,
+            mixed_open_single_target: parameters.vantage_mixed_open_single_target,
+            mixed_open_single_target_injector,
+            mixed_open_single_target_used: false,
             mixed_open_stress_window: parameters.withhold_window.clone(),
             metrics: core_metrics,
             ut_inbound_dispatch: None,
@@ -2180,6 +2195,16 @@ impl VantageCore {
         suppressed
     }
 
+    /// Selects one benchmark-only residual proposal without shortening the
+    /// interval during which all Byzantine publishers suppress responses.
+    fn mixed_open_proposal_fault_active(&self, now: Instant) -> bool {
+        if !self.mixed_open_fault_active(now) {
+            return false;
+        }
+        !self.mixed_open_single_target
+            || (self.mixed_open_single_target_injector && !self.mixed_open_single_target_used)
+    }
+
     /// Starts every locally justified per-target resolver through the current
     /// proposal horizon. Instances are independent, so no global resolution
     /// height or carrier selection serializes this scan.
@@ -2232,7 +2257,7 @@ impl VantageCore {
                 continue;
             }
 
-            let mixed_open_fault = self.mixed_open_fault_active(now);
+            let mixed_open_fault = self.mixed_open_proposal_fault_active(now);
             let proposal = if mixed_open_fault {
                 self.frontier
                     .propose_view_mixed_open(view, &self.lm)
@@ -2243,6 +2268,9 @@ impl VantageCore {
                     .map(ProposalOut::Single)
             };
             if let Some(proposal) = proposal {
+                if mixed_open_fault && self.mixed_open_single_target {
+                    self.mixed_open_single_target_used = true;
+                }
                 #[cfg(feature = "benchmark")]
                 if mixed_open_fault {
                     log::info!(
