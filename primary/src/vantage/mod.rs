@@ -76,7 +76,7 @@ pub enum Effect {
     QuarantineTips(Manifest),
     BroadcastReady(ReadyOut),
     BroadcastNoReady(View),
-    /// Broadcasts a skip vote after the local no-ready and `2f + 1` skip predicates.
+    /// Broadcasts a skip vote after the local no-ready and `Q = n - f` skip predicates.
     BroadcastSkipVote(View),
     /// Reports whether the fixed proposal for a view is well formed.
     Fixed(View, bool),

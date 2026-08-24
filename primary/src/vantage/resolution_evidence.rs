@@ -11,7 +11,7 @@ use crate::vantage::Thresholds;
 /// Deterministically derives resolver candidates from one party's AGB state.
 pub struct ResolutionEvidence {
     f_plus_1_parties: usize,
-    two_f_plus_1_parties: usize,
+    quorum_parties: usize,
     resolved_watermark: View,
 }
 
@@ -20,7 +20,7 @@ impl ResolutionEvidence {
         let thresholds = Thresholds::from_party_count(n);
         Self {
             f_plus_1_parties: thresholds.f_plus_1_parties,
-            two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
+            quorum_parties: thresholds.n_minus_f_parties,
             resolved_watermark: 1,
         }
     }
@@ -56,17 +56,16 @@ impl ResolutionEvidence {
 
     /// Returns candidates in canonical payload order, with full before core and skip last.
     ///
-    /// Every candidate requires `2f + 1` ready-stage statements. Full and core
+    /// Every candidate requires `Q = n - f` ready-stage statements. Full and core
     /// candidates additionally require their respective `f + 1` ECHO predicates.
     pub fn justified_candidates(&self, agb: &AgbEngine, target: View) -> Vec<ResolutionEntry> {
-        if agb.ready_stage_total(target) < self.two_f_plus_1_parties {
+        if agb.ready_stage_total(target) < self.quorum_parties {
             return Vec::new();
         }
 
         let mut candidates = Vec::new();
         let payloads = agb.candidate_payloads(target);
-        let core_ready_clause =
-            agb.ready_stage_non_grade1_count(target) >= self.two_f_plus_1_parties;
+        let core_ready_clause = agb.ready_stage_non_grade1_count(target) >= self.quorum_parties;
         for (core, tip) in &payloads {
             if agb.echo_grade1_count_for(target, core, tip) >= self.f_plus_1_parties {
                 candidates.push(ResolutionEntry::Full(target, core.clone(), tip.clone()));
@@ -77,7 +76,7 @@ impl ResolutionEvidence {
                 candidates.push(ResolutionEntry::Core(target, core.clone(), tip.clone()));
             }
         }
-        if agb.noready_count(target) >= self.two_f_plus_1_parties {
+        if agb.noready_count(target) >= self.quorum_parties {
             candidates.push(ResolutionEntry::Skip(target));
         }
         candidates

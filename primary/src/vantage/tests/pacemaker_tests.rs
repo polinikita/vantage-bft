@@ -78,7 +78,7 @@ fn w2_omega_plus_boundary_exactly_f_plus_1_senders() {
 }
 
 #[test]
-fn w2_omega_q_boundary_exactly_two_f_plus_1_senders_independent_of_amplification() {
+fn w2_omega_q_boundary_is_independent_of_amplification() {
     let all = authors();
     let (name, _) = all[3];
     let (p1, _) = all[0];
@@ -86,13 +86,13 @@ fn w2_omega_q_boundary_exactly_two_f_plus_1_senders_independent_of_amplification
     let mut pm = Pacemaker::new(name, &test_committee());
     assert!(
         pm.raise_own_wish(5).is_empty(),
-        "1 of 4 slots at 5 is nowhere near 2f+1=3"
+        "1 of 4 slots at 5 is below Q=3"
     );
 
     let effects = pm.on_wish(p1, 5);
     assert!(
         entries(&effects).is_empty(),
-        "2f+1 boundary not yet met with only 2 of 3 (self + 1 external)"
+        "Q boundary not yet met with only 2 of 3 (self + 1 external)"
     );
 
     let effects = pm.on_wish(p2, 5);
@@ -100,7 +100,7 @@ fn w2_omega_q_boundary_exactly_two_f_plus_1_senders_independent_of_amplification
         broadcast_wish(&effects).is_none(),
         "own watermark already at the target -- no re-amplification"
     );
-    assert_eq!(entries(&effects), vec![1, 2, 3, 4, 5], "the 3rd (= 2f+1) party crossing the target must enter every missing view through it, in order");
+    assert_eq!(entries(&effects), vec![1, 2, 3, 4, 5], "the 3rd (= Q) party crossing the target must enter every missing view through it, in order");
 }
 
 #[test]

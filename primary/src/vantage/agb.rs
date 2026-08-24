@@ -646,8 +646,8 @@ pub struct AgbEngine {
     delta: Duration,
     n: usize,
     f_plus_1_parties: usize,
-    /// Skip quorums count parties: `Q = 2f + 1`.
-    two_f_plus_1_parties: usize,
+    /// Skip quorums count parties: `Q = n - f`.
+    quorum_parties: usize,
     quorum: Stake,
     proposers: RoundRobin,
     views: BTreeMap<View, ViewState>,
@@ -699,7 +699,7 @@ impl AgbEngine {
             delta: Duration::from_millis(delta_ms),
             n,
             f_plus_1_parties: thresholds.f_plus_1_parties,
-            two_f_plus_1_parties: thresholds.two_f_plus_1_parties,
+            quorum_parties: thresholds.n_minus_f_parties,
             quorum,
             proposers,
             views: BTreeMap::new(),
@@ -1386,8 +1386,9 @@ impl AgbEngine {
     /// positive-key value has already reached the resolver's stable Backed
     /// predicate: the underlying fresh-ECHO quorum excludes a skip-vote
     /// quorum, so an individual earlier skip stance must not strand view
-    /// change.  A terminal target needs no second agreement path and is not
-    /// voted again.
+    /// change.  A locally terminal target may still vote for the exact
+    /// compatible fresh value when `f + 1` peers need resolution; otherwise a
+    /// selectively delivered local seal could remove a correct participant.
     pub fn try_direct_resolution_vote(
         &mut self,
         entry: &ResolutionEntry,
@@ -1395,16 +1396,28 @@ impl AgbEngine {
         lm: &mut LaneManager,
     ) -> Option<Option<u8>> {
         let target = entry.target_view();
-        if self.is_pruned(target)
-            || self
-                .views
-                .get(&target)
-                .is_some_and(|state| state.sealed.is_some())
-        {
+        if self.is_pruned(target) {
             return None;
         }
         if !fresh {
             return Some(None);
+        }
+        if let Some(sealed) = self
+            .views
+            .get(&target)
+            .and_then(|state| state.sealed.as_ref())
+        {
+            let compatible = match (sealed, entry) {
+                (Outcome::Full(sealed_c, sealed_t), ResolutionEntry::Full(_, c, t)) => {
+                    sealed_c == c && sealed_t == t
+                }
+                (Outcome::Core(sealed_c), ResolutionEntry::Core(_, c, _)) => sealed_c == c,
+                (Outcome::Skip, ResolutionEntry::Skip(_)) => true,
+                _ => false,
+            };
+            if !compatible {
+                return None;
+            }
         }
         if self.stance_excludes(entry) {
             return None;
@@ -1421,7 +1434,7 @@ impl AgbEngine {
         Some(self.compute_origin_entry(entry))
     }
 
-    /// Counts echo-skip responses toward the `2f + 1` skip-vote threshold.
+    /// Counts echo-skip responses toward the `Q = n - f` skip-vote threshold.
     fn echo_skip_count(&self, view: View) -> usize {
         self.views.get(&view).map_or(0, |s| s.echo_skip_parties)
     }
@@ -1439,7 +1452,7 @@ impl AgbEngine {
                 )
                 && !matches!(s.sealed, Some(Outcome::Full(..)) | Some(Outcome::Core(..)))
         });
-        if !ready_for_vote || self.echo_skip_count(u) < self.two_f_plus_1_parties {
+        if !ready_for_vote || self.echo_skip_count(u) < self.quorum_parties {
             return effects;
         }
         self.state_mut(u).stance = Stance::SkipVoted;
@@ -1461,7 +1474,7 @@ impl AgbEngine {
         self.state_mut(view).skip_vote_statements.insert(sender)
     }
 
-    /// Submits skip after `2f + 1` distinct skip votes.
+    /// Submits skip after `Q = n - f` distinct skip votes.
     /// The submission uses the same terminal arbiter as other seal routes.
     fn recheck_skip_seal_trigger(&mut self, u: View) -> Vec<Effect> {
         let mut effects = Vec::new();
@@ -1475,7 +1488,7 @@ impl AgbEngine {
             .views
             .get(&u)
             .map_or(0, |s| s.skip_vote_statements.len());
-        if count < self.two_f_plus_1_parties {
+        if count < self.quorum_parties {
             return effects;
         }
         self.state_mut(u).skip_sealed = true;

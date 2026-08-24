@@ -2148,7 +2148,9 @@ impl VantageCore {
             return effects;
         }
         for target in start..=scan_limit {
-            if self.agb.is_sealed(target) || self.direct_resolver.is_decided(target) {
+            if self.direct_resolver.is_decided(target)
+                || (self.agb.is_sealed(target) && !self.direct_resolver.has_instance(target))
+            {
                 continue;
             }
             let candidates = self
@@ -3464,12 +3466,38 @@ impl VantageCore {
                 effects
             }
 
-            Inbound::DirectResolutionWish(message) => self
-                .direct_resolver
-                .on_wish(message)
-                .into_iter()
-                .map(Effect::DirectResolution)
-                .collect(),
+            Inbound::DirectResolutionWish(message) => {
+                let target = message.target;
+                let mut effects: Vec<_> = Vec::new();
+                if self.agb.is_sealed(target) && !self.direct_resolver.is_decided(target) {
+                    effects.extend(
+                        self.direct_resolver
+                            .activate_with_local_terminal(target)
+                            .into_iter()
+                            .map(Effect::DirectResolution),
+                    );
+                }
+                effects.extend(
+                    self.direct_resolver
+                        .on_wish(message)
+                        .into_iter()
+                        .map(Effect::DirectResolution),
+                );
+                if self.direct_resolver.has_instance(target)
+                    && !self.direct_resolver.is_decided(target)
+                {
+                    let candidates = self
+                        .resolution_evidence
+                        .justified_candidates(&self.agb, target);
+                    effects.extend(
+                        self.direct_resolver
+                            .update_candidates(target, candidates)
+                            .into_iter()
+                            .map(Effect::DirectResolution),
+                    );
+                }
+                effects
+            }
             Inbound::DirectResolutionSuggest(message) => self
                 .direct_resolver
                 .on_suggest(message)
@@ -4070,7 +4098,6 @@ impl VantageCore {
                     Effect::Sealed(view, outcome) => {
                         #[cfg(feature = "pipeline-tracing")]
                         self.pipeline.note_sealed(view);
-                        self.direct_resolver.note_terminal(view);
                         queue.extend(self.cursor.on_sealed(view, outcome));
                     }
                     Effect::ArmTimer(view, kind, deadline) => {

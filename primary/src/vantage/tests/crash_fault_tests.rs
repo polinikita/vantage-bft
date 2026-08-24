@@ -85,7 +85,6 @@ async fn crash_fault_dead_proposer_view_seals_via_grounded_skip_vote() {
             "node {} must have sealed gskip for the dead view via the grounded skip-vote quorum",
             i
         );
-        assert!(!nodes[i].direct_resolver.is_decided(dead_view));
     }
 
     run_to_quiescence(

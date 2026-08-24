@@ -192,6 +192,10 @@ struct DirectInstance {
     wishes: HashMap<PublicKey, DirectResolverView>,
     views: BTreeMap<DirectResolverView, DirectViewState>,
     candidates: Vec<ResolutionEntry>,
+    /// The next locally justified fresh value to try on one of our primary
+    /// turns.  Store the value rather than a vector index so monotone insertion
+    /// into the canonical candidate order cannot skip an existing candidate.
+    next_candidate: Option<ResolutionEntry>,
 
     key1_view: DirectResolverView,
     key1_value: Digest,
@@ -218,6 +222,7 @@ impl DirectInstance {
             wishes: HashMap::new(),
             views: BTreeMap::new(),
             candidates: Vec::new(),
+            next_candidate: None,
             key1_view: 0,
             key1_value: Digest::default(),
             prev_key1: 0,
@@ -245,9 +250,11 @@ pub struct DirectResolver {
     instances: BTreeMap<View, DirectInstance>,
     values: BTreeMap<(View, Digest), ResolutionEntry>,
     decisions: BTreeMap<View, (Digest, ResolutionEntry)>,
-    /// Targets sealed by any Vantage path. Retained until the sequence GC floor
-    /// passes them so stale traffic cannot recreate dead instances.
-    terminals: BTreeSet<View>,
+    /// WISHes for a target that has not locally needed resolution. Without a
+    /// local terminal seal, `f + 1` distinct members are required before an
+    /// instance is created, so one Byzantine member cannot activate arbitrary
+    /// targets.
+    passive_wishes: BTreeMap<View, HashMap<PublicKey, DirectResolverView>>,
     pending_fetch: BTreeMap<View, BTreeSet<Digest>>,
     fetch_requested: BTreeMap<View, BTreeSet<(Digest, PublicKey)>>,
     fetch_answered: BTreeMap<View, BTreeSet<(Digest, PublicKey)>>,
@@ -266,7 +273,7 @@ impl DirectResolver {
             instances: BTreeMap::new(),
             values: BTreeMap::new(),
             decisions: BTreeMap::new(),
-            terminals: BTreeSet::new(),
+            passive_wishes: BTreeMap::new(),
             pending_fetch: BTreeMap::new(),
             fetch_requested: BTreeMap::new(),
             fetch_answered: BTreeMap::new(),
@@ -322,13 +329,35 @@ impl DirectResolver {
         bincode::serialize(entry).expect("ResolutionEntry always serializes")
     }
 
+    /// Selects one fresh candidate and advances this party's target-local
+    /// cursor.  Advancing on our own primary turns, rather than indexing by the
+    /// global resolver view, guarantees that every stable candidate is retried
+    /// even when the committee size and candidate count share a divisor.
+    fn take_next_candidate(&mut self, target: View) -> Option<ResolutionEntry> {
+        let instance = self.instances.get_mut(&target)?;
+        let selected = instance
+            .next_candidate
+            .as_ref()
+            .and_then(|candidate| {
+                instance
+                    .candidates
+                    .iter()
+                    .position(|entry| entry == candidate)
+            })
+            .unwrap_or(0);
+        let entry = instance.candidates.get(selected)?.clone();
+        let next = selected.saturating_add(1) % instance.candidates.len();
+        instance.next_candidate = Some(instance.candidates[next].clone());
+        Some(entry)
+    }
+
     /// Adds locally justified values and starts the target's WISH instance.
     pub fn update_candidates(
         &mut self,
         target: View,
         candidates: impl IntoIterator<Item = ResolutionEntry>,
     ) -> Vec<DirectResolutionEffect> {
-        if target == 0 || self.decisions.contains_key(&target) || self.terminals.contains(&target) {
+        if target == 0 || self.decisions.contains_key(&target) {
             return Vec::new();
         }
         let mut accepted = Vec::new();
@@ -346,12 +375,39 @@ impl DirectResolver {
             .instances
             .entry(target)
             .or_insert_with(|| DirectInstance::new(target));
+        if let Some(wishes) = self.passive_wishes.remove(&target) {
+            for (sender, view) in wishes {
+                let slot = instance.wishes.entry(sender).or_default();
+                *slot = (*slot).max(view);
+            }
+        }
         for entry in accepted {
             if !instance.candidates.contains(&entry) {
                 instance.candidates.push(entry);
             }
         }
         instance.candidates.sort_by_key(Self::canonical_entry_key);
+        let mut effects = self.raise_own_wish(target, 1);
+        effects.extend(self.recheck_wishes(target));
+        effects
+    }
+
+    /// Activates a target for which the caller already holds a terminal AGB
+    /// seal.  The local seal is sufficient evidence that the target is real,
+    /// so one peer's WISH may make us relay our own WISH; waiting for `f + 1`
+    /// peers here could strand the last correct party that missed the seal.
+    pub fn activate_with_local_terminal(&mut self, target: View) -> Vec<DirectResolutionEffect> {
+        if target == 0
+            || self.decisions.contains_key(&target)
+            || self.instances.contains_key(&target)
+        {
+            return Vec::new();
+        }
+        let mut instance = DirectInstance::new(target);
+        if let Some(wishes) = self.passive_wishes.remove(&target) {
+            instance.wishes = wishes;
+        }
+        self.instances.insert(target, instance);
         let mut effects = self.raise_own_wish(target, 1);
         effects.extend(self.recheck_wishes(target));
         effects
@@ -418,16 +474,23 @@ impl DirectResolver {
                 },
             )];
         }
-        if self.terminals.contains(&wish.target) {
-            return Vec::new();
+        if !self.instances.contains_key(&wish.target) {
+            let pending = self.passive_wishes.entry(wish.target).or_default();
+            let slot = pending.entry(wish.sender).or_default();
+            if wish.view <= *slot {
+                return Vec::new();
+            }
+            *slot = wish.view;
+            if pending.len() < self.f_plus_1 {
+                return Vec::new();
+            }
+            let wishes = self.passive_wishes.remove(&wish.target).unwrap_or_default();
+            let mut instance = DirectInstance::new(wish.target);
+            instance.wishes = wishes;
+            self.instances.insert(wish.target, instance);
+            return self.recheck_wishes(wish.target);
         }
-        // Only local AGB evidence may allocate a target.  Correct parties
-        // retransmit their initial WISH until all peers have created the same
-        // locally justified instance, so dropping an early unsolicited WISH
-        // does not weaken liveness.
-        let Some(instance) = self.instances.get_mut(&wish.target) else {
-            return Vec::new();
-        };
+        let instance = self.instances.get_mut(&wish.target).unwrap();
         let slot = instance.wishes.entry(wish.sender).or_default();
         if wish.view <= *slot {
             return Vec::new();
@@ -887,12 +950,10 @@ impl DirectResolver {
             };
             (max.key3_view, entry)
         } else {
-            let candidates = &instance.candidates;
-            if candidates.is_empty() {
+            let Some(entry) = self.take_next_candidate(target) else {
                 return Vec::new();
-            }
-            let index = usize::try_from(view.saturating_sub(1)).unwrap_or(0) % candidates.len();
-            (0, candidates[index].clone())
+            };
+            (0, entry)
         };
         let value = self.value_digest(&entry);
         let proposal = DirectResolutionProposal {
@@ -1420,7 +1481,7 @@ impl DirectResolver {
         {
             return Vec::new();
         }
-        if self.decisions.contains_key(&done.target) || self.terminals.contains(&done.target) {
+        if self.decisions.contains_key(&done.target) {
             return Vec::new();
         }
         if !self.instances.contains_key(&done.target) {
@@ -1554,17 +1615,6 @@ impl DirectResolver {
         self.decisions.get(&target).map(|(_, entry)| entry)
     }
 
-    /// Stops redundant resolver work after another compatible Vantage path
-    /// has already sealed the target.  The ordered sequence/checkpoint path is
-    /// responsible for lagging-node recovery in this case.
-    pub fn note_terminal(&mut self, target: View) {
-        self.terminals.insert(target);
-        self.instances.remove(&target);
-        self.pending_fetch.remove(&target);
-        self.fetch_requested.remove(&target);
-        self.fetch_answered.remove(&target);
-    }
-
     pub fn current_view(&self, target: View) -> DirectResolverView {
         self.instances
             .get(&target)
@@ -1583,6 +1633,10 @@ impl DirectResolver {
         self.instances.len()
     }
 
+    pub fn has_instance(&self, target: View) -> bool {
+        self.instances.contains_key(&target)
+    }
+
     /// Drops target-local resolver history below the caller's retained
     /// sequence floor.  Decisions below that floor are recovered through the
     /// existing sequence checkpoint path, not by replaying ancient DONEs.
@@ -1593,7 +1647,7 @@ impl DirectResolver {
         self.instances = self.instances.split_off(&floor);
         self.values = self.values.split_off(&(floor, Digest::default()));
         self.decisions = self.decisions.split_off(&floor);
-        self.terminals = self.terminals.split_off(&floor);
+        self.passive_wishes = self.passive_wishes.split_off(&floor);
         self.pending_fetch = self.pending_fetch.split_off(&floor);
         self.fetch_requested = self.fetch_requested.split_off(&floor);
         self.fetch_answered = self.fetch_answered.split_off(&floor);
