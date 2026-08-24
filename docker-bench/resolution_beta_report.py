@@ -39,10 +39,24 @@ def load_runs(root: Path) -> list[dict]:
         dynamics = details.get("resolver_dynamics", {})
         result = details.get("throughput") or {}
         height_rows = dynamics.get("height_rows", [])
+        failed_checks = {
+            check["name"]
+            for check in report.get("checks", [])
+            if not check.get("passed", False)
+        }
+        final_backlogs = [
+            int(values[1])
+            for values in details.get("backlog_peak_and_final_by_node", {}).values()
+        ]
         runs.append({
             "beta": int(match.group("beta")),
             "repetition": int(match.group("rep")),
             "passed": bool(report["passed"]),
+            # Endpoint collection is diagnostic and must not turn a successful
+            # resolver trial into a protocol failure in this comparison.
+            "resolver_checks_passed": failed_checks <= {"run result captured"},
+            "metrics_captured": "run result captured" not in failed_checks,
+            "failed_checks": sorted(failed_checks),
             "common_open_views": len(details.get("common_open_views", [])),
             "recovery_ms": [
                 float(row["completion_to_all_anchor_sealed_ms"])
@@ -69,7 +83,11 @@ def load_runs(root: Path) -> list[dict]:
             "timed_out_height_views": len(
                 dynamics.get("distinct_timed_out_height_views", [])
             ),
-            "committed_tps": float(result.get("committed_tps", 0.0)),
+            "residual_open_max": max(final_backlogs, default=0),
+            "committed_tps": (
+                float(result["committed_tps"])
+                if "committed_tps" in result else None
+            ),
             "materialised_p50_ms": result.get("materialised_latency_ms", {}).get("p50"),
             "median_node_cpu_cores": result.get("median_node_cpu_cores"),
             "max_node_cpu_cores": result.get("max_node_cpu_cores"),
@@ -107,10 +125,20 @@ def aggregate(runs: list[dict]) -> list[dict]:
             float(run["materialised_p50_ms"])
             for run in group if run["materialised_p50_ms"] is not None
         ]
+        committed = [
+            float(run["committed_tps"])
+            for run in group if run["committed_tps"] is not None
+        ]
         rows.append({
             "beta": beta,
             "repetitions": len(group),
             "passing_repetitions": sum(run["passed"] for run in group),
+            "resolver_passing_repetitions": sum(
+                run["resolver_checks_passed"] for run in group
+            ),
+            "metrics_captured_repetitions": sum(
+                run["metrics_captured"] for run in group
+            ),
             "common_open_views_median": median([
                 float(run["common_open_views"]) for run in group
             ]),
@@ -149,9 +177,10 @@ def aggregate(runs: list[dict]) -> list[dict]:
             "timed_out_height_views_median": median([
                 float(run["timed_out_height_views"]) for run in group
             ]),
-            "committed_tps_median": median([
-                run["committed_tps"] for run in group
-            ]),
+            "residual_open_max": max(
+                (run["residual_open_max"] for run in group), default=0
+            ),
+            "committed_tps_median": median(committed),
             "materialised_p50_ms_median": median(materialised),
             "median_node_cpu_cores": median(cpu),
             "max_node_cpu_cores_median": median(max_cpu),
@@ -162,10 +191,10 @@ def aggregate(runs: list[dict]) -> list[dict]:
 
 def markdown(rows: list[dict]) -> str:
     lines = [
-        "| beta | reps pass | mixed opens | decisions | anchors/block | "
+        "| beta | resolver checks | metrics | mixed opens | decisions | anchors/block | "
         "completion p50/p95 (s) | post-fault drain (s) | height service p50 (s) | "
-        "TPS | mat. p50 (ms) | CPU cores med/max | max wire (Mbit/s) |",
-        "|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "residual open | TPS | mat. p50 (ms) | CPU cores med/max | max wire (Mbit/s) |",
+        "|---:|:---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         completion = row["completion_to_all_sealed_ms"]
@@ -173,7 +202,8 @@ def markdown(rows: list[dict]) -> str:
         service = row["height_service_ms"]
         anchors = row["anchors_per_block"]
         lines.append(
-            f"| {row['beta']} | {row['passing_repetitions']}/{row['repetitions']} | "
+            f"| {row['beta']} | {row['resolver_passing_repetitions']}/{row['repetitions']} | "
+            f"{row['metrics_captured_repetitions']}/{row['repetitions']} | "
             f"{fmt(row['common_open_views_median'], 0)} | "
             f"{fmt(row['decision_heights_median'], 0)} | "
             f"{fmt(anchors['median'], 1)}/{fmt(anchors['maximum'], 0)} | "
@@ -181,6 +211,7 @@ def markdown(rows: list[dict]) -> str:
             f"{fmt(completion['p95'] / 1000 if completion['p95'] is not None else None, 2)} | "
             f"{fmt(drain['median'] / 1000 if drain['median'] is not None else None, 2)} | "
             f"{fmt(service['median'] / 1000 if service['median'] is not None else None, 2)} | "
+            f"{row['residual_open_max']} | "
             f"{fmt(row['committed_tps_median'], 1)} | "
             f"{fmt(row['materialised_p50_ms_median'], 1)} | "
             f"{fmt(row['median_node_cpu_cores'], 2)}/{fmt(row['max_node_cpu_cores_median'], 2)} | "
