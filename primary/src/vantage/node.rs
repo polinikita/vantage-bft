@@ -415,7 +415,41 @@ fn expected_vantage_sender(committee: &Committee, message: &PrimaryMessage) -> O
         PrimaryMessage::VantageResolutionProposal(message) => Some(message.sender),
         PrimaryMessage::VantageResolutionStatement(message) => Some(message.sender),
         PrimaryMessage::VantageResolutionDone(message) => Some(message.sender),
-        _ => None,
+        PrimaryMessage::Header(_, true)
+        | PrimaryMessage::Vote(..)
+        | PrimaryMessage::Certificate(..)
+        | PrimaryMessage::Timeout(..)
+        | PrimaryMessage::TC(..)
+        | PrimaryMessage::ConsensusMessage(..)
+        | PrimaryMessage::ConsensusRequest(..)
+        | PrimaryMessage::ConsensusVote(..)
+        | PrimaryMessage::CertificatesRequest(..)
+        | PrimaryMessage::ProposalHeadersRequest(..)
+        | PrimaryMessage::CompReport(..)
+        | PrimaryMessage::ControlInit(..)
+        | PrimaryMessage::ControlEcho(..)
+        | PrimaryMessage::ControlReady(..)
+        | PrimaryMessage::ControlFetch(..)
+        | PrimaryMessage::ControlServe(..)
+        | PrimaryMessage::ControlCommit(..)
+        | PrimaryMessage::ControlTimeoutVote(..)
+        | PrimaryMessage::ControlTimeoutAccept(..)
+        | PrimaryMessage::SimpleItCutProposal(..)
+        | PrimaryMessage::SimpleItCutVote(..)
+        | PrimaryMessage::SimpleItDecide(..)
+        | PrimaryMessage::SimpleItTimeout(..)
+        | PrimaryMessage::SimpleItTimeoutAccept(..)
+        | PrimaryMessage::SimpleItCutFetch(..)
+        | PrimaryMessage::SimpleItCutServe(..)
+        | PrimaryMessage::ControlInitBatch(..)
+        | PrimaryMessage::ControlServeBatch(..)
+        | PrimaryMessage::VantageBodyServe(..)
+        | PrimaryMessage::SimpleItCutReady(..)
+        | PrimaryMessage::PrepareHeadersRequest(..)
+        | PrimaryMessage::ProposalHeaders(..)
+        | PrimaryMessage::VantageResolutionCarrierServe(..)
+        | PrimaryMessage::VantageResolutionCarrierServeBatch(..)
+        | PrimaryMessage::VantageResolutionBlockServe(..) => None,
     }
 }
 
@@ -584,6 +618,23 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageResolutionDecisionRequest(height, requester) => {
                 Inbound::ResolutionDecisionRequest(height, requester)
             }
+
+            // These obsolete Vantage control-log frames retain their enum
+            // positions solely for bincode compatibility.  They are not a
+            // rolling-upgrade bridge to the resolution chain; the typed wire
+            // counters above still expose any old peer that sends them.  Drop
+            // the variants only as part of a versioned wire-format migration.
+            PrimaryMessage::CompReport(..)
+            | PrimaryMessage::ControlInit(..)
+            | PrimaryMessage::ControlEcho(..)
+            | PrimaryMessage::ControlReady(..)
+            | PrimaryMessage::ControlFetch(..)
+            | PrimaryMessage::ControlServe(..)
+            | PrimaryMessage::ControlCommit(..)
+            | PrimaryMessage::ControlTimeoutVote(..)
+            | PrimaryMessage::ControlTimeoutAccept(..)
+            | PrimaryMessage::ControlInitBatch(..)
+            | PrimaryMessage::ControlServeBatch(..) => return Ok(()),
 
             _ => return Ok(()),
         };

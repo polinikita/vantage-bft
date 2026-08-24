@@ -1,3 +1,14 @@
+//! On-demand agreement for resolution-bearing Vantage proposals.
+//!
+//! A completed carrier first gathers stable, first-hand witnesses.  A quorum
+//! makes its hash eligible and activates a WISH-synchronized resolver height.
+//! Each resolver view then follows the IT-HS path: suggestions and lock-opening
+//! proofs, a leader proposal, ECHO, KEY1--KEY3, LOCK, and DONE.  A DONE quorum
+//! appends one nonempty block to the hash chain and applies its carrier anchors.
+//!
+//! Witnesses, carrier bodies, and decided chain blocks are intentionally
+//! retained until a future certified resolver checkpoint can replace them.
+
 use crate::leader::one_based_authority;
 use crate::primary::View;
 use crate::vantage::agb::{Outcome, ProposalOut, ResolutionEntry};
@@ -6,7 +17,7 @@ use crate::vantage::{Effect, Thresholds};
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 pub type ResolutionHeight = u64;
@@ -202,12 +213,13 @@ pub struct ResolutionChain {
     decided_blocks: BTreeMap<ResolutionHeight, ResolutionBlock>,
     resolution_blocks: HashMap<Digest, ResolutionBlock>,
     active: Option<ActiveHeight>,
-    future_done: BTreeMap<ResolutionHeight, HashMap<PublicKey, ResolutionDone>>,
+    future_height_hints: BTreeMap<PublicKey, ResolutionHeight>,
+    decision_request_pending: Option<ResolutionHeight>,
 
     pending_carrier_fetch: BTreeSet<(View, Digest)>,
-    carrier_fetch_requested: BTreeSet<(View, Digest, PublicKey)>,
+    carrier_fetch_requested: BTreeMap<(View, Digest), BTreeSet<PublicKey>>,
     carrier_fetch_answered: BTreeSet<(View, Digest, PublicKey)>,
-    pending_block_fetch: HashSet<(ResolutionHeight, Digest)>,
+    pending_block_fetch: BTreeMap<ResolutionHeight, BTreeSet<Digest>>,
     resolved_target_floor: View,
 }
 
@@ -233,11 +245,12 @@ impl ResolutionChain {
             decided_blocks: BTreeMap::new(),
             resolution_blocks: HashMap::new(),
             active: None,
-            future_done: BTreeMap::new(),
+            future_height_hints: BTreeMap::new(),
+            decision_request_pending: None,
             pending_carrier_fetch: BTreeSet::new(),
-            carrier_fetch_requested: BTreeSet::new(),
+            carrier_fetch_requested: BTreeMap::new(),
             carrier_fetch_answered: BTreeSet::new(),
-            pending_block_fetch: HashSet::new(),
+            pending_block_fetch: BTreeMap::new(),
             resolved_target_floor: 1,
         }
     }
@@ -375,7 +388,9 @@ impl ResolutionChain {
             .into_iter()
             .filter(|peer| {
                 self.carrier_fetch_requested
-                    .insert((view, digest.clone(), *peer))
+                    .entry((view, digest.clone()))
+                    .or_default()
+                    .insert(*peer)
             })
             .map(|peer| Effect::ResolutionCarrierFetchTo(peer, view, digest.clone()))
             .collect()
@@ -400,6 +415,9 @@ impl ResolutionChain {
         if !self.verify_carrier(view, &digest, body) {
             return Vec::new();
         }
+        // The runtime dispatches this effect through its reliable sender.  It
+        // is therefore safe to mark the request answered before emitting the
+        // at-most-once serve effect.
         self.carrier_fetch_answered.insert(key);
         vec![Effect::ResolutionCarrierServeTo(
             requester,
@@ -419,8 +437,7 @@ impl ResolutionChain {
             return Vec::new();
         }
         self.pending_carrier_fetch.remove(&(view, digest.clone()));
-        self.carrier_fetch_requested
-            .retain(|(v, d, _)| *v != view || d != &digest);
+        self.carrier_fetch_requested.remove(&(view, digest.clone()));
         self.carrier_bodies.insert((view, digest.clone()), proposal);
         self.recheck_witness(view, digest)
     }
@@ -492,10 +509,7 @@ impl ResolutionChain {
             return self.on_decision_request(wish.height, wish.sender);
         }
         if wish.height > self.decided_height + 1 {
-            return vec![Effect::BroadcastResolutionDecisionRequest(
-                self.decided_height + 1,
-                self.name,
-            )];
+            return self.record_future_height_hint(wish.sender, wish.height.saturating_sub(1));
         }
         if !self.ensure_active_coordinate(wish.height, &wish.parent) {
             return Vec::new();
@@ -513,6 +527,29 @@ impl ResolutionChain {
         let mut values: Vec<_> = values.collect();
         values.sort_unstable_by(|a, b| b.cmp(a));
         values.get(k.saturating_sub(1)).copied().unwrap_or(0)
+    }
+
+    fn record_future_height_hint(
+        &mut self,
+        sender: PublicKey,
+        decided_through: ResolutionHeight,
+    ) -> Vec<Effect> {
+        let high_watermark = self.future_height_hints.entry(sender).or_default();
+        *high_watermark = (*high_watermark).max(decided_through);
+        self.maybe_request_missing_decision()
+    }
+
+    fn maybe_request_missing_decision(&mut self) -> Vec<Effect> {
+        let missing = self.decided_height.saturating_add(1);
+        let supported =
+            Self::kth_largest(self.future_height_hints.values().copied(), self.f_plus_1);
+        if supported < missing || self.decision_request_pending == Some(missing) {
+            return Vec::new();
+        }
+        self.decision_request_pending = Some(missing);
+        vec![Effect::BroadcastResolutionDecisionRequest(
+            missing, self.name,
+        )]
     }
 
     fn recheck_wishes(&mut self) -> Vec<Effect> {
@@ -726,6 +763,7 @@ impl ResolutionChain {
         self.try_echo(proof.view)
     }
 
+    /// Checks the IT-HS second-key proof that makes a positive KEY3 suggestion usable.
     fn accept_key(&self, view: ResolverView, key: ResolverView, value: &Digest) -> bool {
         if key == 0 {
             return true;
@@ -861,6 +899,7 @@ impl ResolutionChain {
         self.try_echo(proposal.view)
     }
 
+    /// Checks the IT-HS first-key proof that permits moving away from a local lock.
     fn open_lock(&self, view: ResolverView) -> bool {
         let Some(active) = self.active.as_ref() else {
             return false;
@@ -1011,7 +1050,11 @@ impl ResolutionChain {
         peers: Vec<PublicKey>,
     ) -> Vec<Effect> {
         if self.resolution_blocks.contains_key(&value)
-            || !self.pending_block_fetch.insert((height, value.clone()))
+            || !self
+                .pending_block_fetch
+                .entry(height)
+                .or_default()
+                .insert(value.clone())
         {
             return Vec::new();
         }
@@ -1064,6 +1107,9 @@ impl ResolutionChain {
                 if let Some(active) = self.active.as_mut() {
                     match to {
                         ResolutionPhase::Key1 => {
+                            // IT-HS advances `prev` only when the carried value
+                            // changes; repeated support for one value only
+                            // raises that value's key view.
                             if active.key1_value != value {
                                 active.prev_key1 = active.key1_view;
                                 active.key1_value = value.clone();
@@ -1071,6 +1117,8 @@ impl ResolutionChain {
                             active.key1_view = view;
                         }
                         ResolutionPhase::Key2 => {
+                            // Keep the same conditional-previous-key rule for
+                            // the AcceptKey proof chain.
                             if active.key2_value != value {
                                 active.prev_key2 = active.key2_view;
                                 active.key2_value = value.clone();
@@ -1145,15 +1193,7 @@ impl ResolutionChain {
             return Vec::new();
         }
         if done.height > self.decided_height + 1 {
-            self.future_done
-                .entry(done.height)
-                .or_default()
-                .entry(done.sender)
-                .or_insert(done);
-            return vec![Effect::BroadcastResolutionDecisionRequest(
-                self.decided_height + 1,
-                self.name,
-            )];
+            return self.record_future_height_hint(done.sender, done.height);
         }
         if !self.ensure_active_coordinate(done.height, &done.parent) {
             return Vec::new();
@@ -1222,6 +1262,15 @@ impl ResolutionChain {
                 .get(&(anchor.view, anchor.digest.clone()))
                 .cloned()
             else {
+                log::error!(
+                    "valid resolution block lost retained carrier body for view {} and digest {:?}",
+                    anchor.view,
+                    anchor.digest
+                );
+                debug_assert!(
+                    false,
+                    "valid resolution block must retain every carrier body"
+                );
                 continue;
             };
             for entry in carrier.entries() {
@@ -1238,14 +1287,12 @@ impl ResolutionChain {
         self.head = value;
         self.decided_blocks.insert(block.height, block.clone());
         self.active = None;
-        self.pending_block_fetch
-            .retain(|(h, _)| *h > self.decided_height);
-
-        if let Some(future) = self.future_done.remove(&(self.decided_height + 1)) {
-            for done in future.into_values() {
-                effects.extend(self.on_resolution_done(done));
-            }
-        }
+        self.resolution_blocks.clear();
+        self.pending_block_fetch = self
+            .pending_block_fetch
+            .split_off(&self.decided_height.saturating_add(1));
+        self.decision_request_pending = None;
+        effects.extend(self.maybe_request_missing_decision());
         effects.extend(self.activate_if_pending());
         effects
     }
@@ -1273,7 +1320,11 @@ impl ResolutionChain {
         if !self.is_member(&requester) {
             return Vec::new();
         }
-        let Some(block) = self.resolution_blocks.get(&digest) else {
+        let Some(block) = self
+            .resolution_blocks
+            .get(&digest)
+            .or_else(|| self.decided_blocks.get(&height))
+        else {
             return Vec::new();
         };
         if block.height != height || block.digest(&self.sid) != digest {
@@ -1284,12 +1335,22 @@ impl ResolutionChain {
 
     pub fn on_resolution_block_serve(&mut self, block: ResolutionBlock) -> Vec<Effect> {
         let digest = block.digest(&self.sid);
-        if !self
-            .pending_block_fetch
-            .remove(&(block.height, digest.clone()))
-            || !self.structurally_valid_block(&block)
-        {
+        if !self.structurally_valid_block(&block) {
             return Vec::new();
+        }
+        let requested = self
+            .pending_block_fetch
+            .get_mut(&block.height)
+            .is_some_and(|digests| digests.remove(&digest));
+        if !requested {
+            return Vec::new();
+        }
+        if self
+            .pending_block_fetch
+            .get(&block.height)
+            .is_some_and(BTreeSet::is_empty)
+        {
+            self.pending_block_fetch.remove(&block.height);
         }
         self.resolution_blocks.insert(digest, block);
         self.retry_active()
