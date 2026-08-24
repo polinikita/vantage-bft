@@ -134,12 +134,17 @@ for repetition in $(seq 1 "$REPETITIONS"); do
     archive_data "$destination"
     export_prometheus "$destination" || overall=1
 
-    python3 recovery_report.py \
-        --scenario mixed \
-        --data-dir "$destination/data" \
-        --run-log "$destination/run.log" \
-        --output "$destination/report.json" \
-        2>&1 | tee "$destination/report.txt"
+    report_args=(
+        python3 recovery_report.py
+        --scenario mixed
+        --data-dir "$destination/data"
+        --run-log "$destination/run.log"
+        --output "$destination/report.json"
+    )
+    if [ "$SINGLE_TARGET" = 1 ]; then
+        report_args+=(--minimum-open-views 1)
+    fi
+    "${report_args[@]}" 2>&1 | tee "$destination/report.txt"
     report_status=${PIPESTATUS[0]}
     if [ "$run_status" -ne 0 ] || [ "$report_status" -ne 0 ]; then
         overall=1
