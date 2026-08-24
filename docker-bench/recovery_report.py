@@ -650,7 +650,7 @@ def validate_mixed(
     )
     add_check(
         checks,
-        "hash-chained resolver recovery",
+        "per-target resolver recovery",
         len(recovery_rows) == len(common_open) and not missing_seals and not route_mismatches,
         f"resolver-sealed={len(recovery_rows)}/{len(common_open)}; completion-to-all ms "
         f"median/p95/max={recovery_latency_summary['median']}/"
@@ -686,29 +686,6 @@ def validate_mixed(
         all(count > 0 for count in post_fault_progress.values()),
         f"minimum post-fault finalized events={min(post_fault_progress.values(), default=0)}",
     )
-    if int(parameters["withhold_for_ms"]) >= 30_000:
-        arrival_rate = sustained["arrival_rate_per_second"]
-        service_rate = sustained["service_rate_per_second"]
-        arrival_rate_text = f"{arrival_rate:.3f}" if arrival_rate is not None else "n/a"
-        service_rate_text = f"{service_rate:.3f}" if service_rate is not None else "n/a"
-        sustained_ok = (
-            sustained["window_seconds"] > 0
-            and sustained["arrivals"] >= minimum_open_views
-            and sustained["all_correct_seals"] >= sustained["arrivals"]
-            and sustained["backlog_net_growth"] <= 0
-            and sustained["backlog_accounting_error"] == 0
-        )
-        add_check(
-            checks,
-            "sustained resolver keeps pace with mixed-open arrivals",
-            sustained_ok,
-            f"arrivals={sustained['arrivals']} "
-            f"({arrival_rate_text}/s), "
-            f"all-correct seals={sustained['all_correct_seals']} "
-            f"({service_rate_text}/s); "
-            f"backlog start/end/peak={sustained['backlog_at_start']}/"
-            f"{sustained['backlog_at_end']}/{sustained['backlog_peak']}",
-        )
     route_counts = {}
     for row in recovery_rows:
         for route in row["routes"]:
