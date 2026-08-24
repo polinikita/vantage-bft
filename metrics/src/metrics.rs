@@ -312,6 +312,12 @@ pub struct Metrics {
     // --- Per-view seal-route breakdown.
     /// View seal route, labeled by `route`, counted at first acceptance.
     pub vantage_seals: IntCounterVec,
+    /// Views that completed with a nonempty tip and no homogeneous READY quorum.
+    pub vantage_completed_open_total: IntCounter,
+    /// Completed-open views that have not yet reached a terminal seal locally.
+    pub vantage_open_unsealed_views: IntGauge,
+    /// Benchmark mixed-open responses deliberately suppressed, labeled by family.
+    pub vantage_mixed_open_suppressed_total: IntCounterVec,
 
     // --- Grounded post-ready skip.
     /// `SKIP-VOTE(u)` statements broadcast by this node.
@@ -1002,6 +1008,25 @@ impl Metrics {
                 "vantage_seals",
                 "Vantage views sealed, by route (fast_full/direct_full/direct_core/anchor_full/anchor_core/anchor_skip/vote_skip)",
                 &["route"],
+                registry,
+            )
+            .unwrap(),
+            vantage_completed_open_total: register_int_counter_with_registry!(
+                "vantage_completed_open_total",
+                "Vantage views completed with a nonempty tip and no homogeneous READY quorum",
+                registry,
+            )
+            .unwrap(),
+            vantage_open_unsealed_views: register_int_gauge_with_registry!(
+                "vantage_open_unsealed_views",
+                "Vantage completed-open views not yet terminally sealed at this node",
+                registry,
+            )
+            .unwrap(),
+            vantage_mixed_open_suppressed_total: register_int_counter_vec_with_registry!(
+                "vantage_mixed_open_suppressed_total",
+                "Benchmark mixed-open outbound responses deliberately suppressed by family",
+                &["family"],
                 registry,
             )
             .unwrap(),

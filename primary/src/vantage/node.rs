@@ -94,10 +94,18 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+
+#[cfg(feature = "benchmark")]
+fn recovery_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 /// Capacity of the droppable service-request queue.
 const BULK_CHANNEL_CAPACITY: usize = 2048;
@@ -843,6 +851,11 @@ pub struct VantageCore {
     gc_window: View,
     last_gc_floor: View,
 
+    /// True only for one of the benchmark profile's Byzantine publishers.
+    mixed_open_stress_publisher: bool,
+    /// Common finite benchmark window, armed from one absolute epoch.
+    mixed_open_stress_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
+
     metrics: Option<Arc<Metrics>>,
 
     ut_inbound_dispatch: Option<IntCounter>,
@@ -1035,15 +1048,31 @@ impl VantageCore {
 
         let (reconnect_tx, reconnect_rx) = channel(committee.size().max(1));
 
-        let withholding_dests = config::withheld_destinations(
+        let withholding_publishers = config::withholding_publishers(
             &committee,
-            &name,
             parameters.withhold_senders,
             &parameters.withhold_publishers,
-            parameters.withhold_count,
-            parameters.withhold_stride,
-            &parameters.withhold_receivers,
         );
+        let mixed_open_stress_publisher =
+            parameters.vantage_mixed_open_stress && withholding_publishers.contains(&name);
+        let withholding_dests = if parameters.vantage_mixed_open_stress {
+            config::mixed_open_withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+            )
+        } else {
+            config::withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+                parameters.withhold_count,
+                parameters.withhold_stride,
+                &parameters.withhold_receivers,
+            )
+        };
         let withheld_header_dests: wire::WithheldHeaderDests = parameters
             .withhold_headers
             .then(|| withholding_dests.clone())
@@ -1259,6 +1288,8 @@ impl VantageCore {
             // Keep state for the current view when the window is zero.
             gc_window: parameters.vantage_gc_window_views.max(1),
             last_gc_floor: 1,
+            mixed_open_stress_publisher,
+            mixed_open_stress_window: parameters.withhold_window.clone(),
             metrics: core_metrics,
             ut_inbound_dispatch: None,
             ut_inbound_family: std::array::from_fn(|_| None),
@@ -2111,6 +2142,26 @@ impl VantageCore {
         );
     }
 
+    /// Returns whether this benchmark-only Byzantine fault is currently active.
+    fn mixed_open_fault_active(&self, now: Instant) -> bool {
+        self.mixed_open_stress_publisher
+            && config::withhold_active(self.mixed_open_stress_window.as_deref(), now)
+    }
+
+    fn suppress_mixed_open_response(&self, family: &'static str) -> bool {
+        let suppressed = self.mixed_open_fault_active(Instant::now());
+        if suppressed {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_mixed_open_suppressed_total
+                    .with_label_values(&[family])
+                    .inc();
+            }
+            log::debug!("mixed-open stress: suppressing outbound {family}");
+        }
+        suppressed
+    }
+
     /// Proposes eligible owned views in increasing order through the early-wish bound.
     fn try_propose_effects(&mut self, now: Instant) -> Vec<Effect> {
         if self.sequence_sync_recovery_active
@@ -2128,27 +2179,45 @@ impl VantageCore {
                 continue;
             }
 
-            let entries: Vec<crate::vantage::ResolutionEntry> = {
+            let mixed_open_fault = self.mixed_open_fault_active(now);
+            let entries: Vec<crate::vantage::ResolutionEntry> = if mixed_open_fault {
+                Vec::new()
+            } else {
                 let agb = &self.agb;
                 let resolution_chain = &self.resolution_chain;
                 let resolved = |u: View| agb.is_sealed(u) || resolution_chain.is_anchor_resolved(u);
                 self.resolver.decide_prefix(agb, view, now, resolved)
             };
-            let proposal = match entries.len() {
-                0 => self
-                    .frontier
-                    .propose_view(view, &self.lm, None)
-                    .map(ProposalOut::Single),
-                1 => self
-                    .frontier
-                    .propose_view(view, &self.lm, entries.into_iter().next())
-                    .map(ProposalOut::Single),
-                _ => self
-                    .frontier
-                    .propose_view_batch(view, &self.lm, entries)
-                    .map(ProposalOut::Batch),
+            let proposal = if mixed_open_fault {
+                self.frontier
+                    .propose_view_mixed_open(view, &self.lm)
+                    .map(ProposalOut::Single)
+            } else {
+                match entries.len() {
+                    0 => self
+                        .frontier
+                        .propose_view(view, &self.lm, None)
+                        .map(ProposalOut::Single),
+                    1 => self
+                        .frontier
+                        .propose_view(view, &self.lm, entries.into_iter().next())
+                        .map(ProposalOut::Single),
+                    _ => self
+                        .frontier
+                        .propose_view_batch(view, &self.lm, entries)
+                        .map(ProposalOut::Batch),
+                }
             };
             if let Some(proposal) = proposal {
+                #[cfg(feature = "benchmark")]
+                if mixed_open_fault {
+                    log::info!(
+                        "VANTAGE_RECOVERY_EVENT kind=stress_propose view={} epoch_ms={} tips={}",
+                        proposal.view(),
+                        recovery_epoch_ms(),
+                        proposal.t().len()
+                    );
+                }
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_own_proposals_made_total.inc();
                 }
@@ -3871,6 +3940,9 @@ impl VantageCore {
                     },
 
                     Effect::BroadcastEcho(mut e) => {
+                        if self.suppress_mixed_open_response("echo") {
+                            continue;
+                        }
                         // Stamp mutable protocol metadata at the serialization boundary.
                         e.set_wish(self.pacemaker.own_watermark());
 
@@ -3925,6 +3997,9 @@ impl VantageCore {
                         }
                     }
                     Effect::BroadcastEchoSkip(view) => {
+                        if self.suppress_mixed_open_response("echo-skip") {
+                            continue;
+                        }
                         let wish = self.pacemaker.own_watermark();
                         self.broadcast_recorded(PrimaryMessage::VantageEchoSkip(
                             view, self.name, wish,
@@ -3935,6 +4010,9 @@ impl VantageCore {
                         self.frontier.quarantine_tips(&tips, &self.lm);
                     }
                     Effect::BroadcastReady(mut r) => {
+                        if self.suppress_mixed_open_response("ready") {
+                            continue;
+                        }
                         r.set_wish(self.pacemaker.own_watermark());
                         match r {
                             ReadyOut::Single(r) if self.digest_statements => {
@@ -3953,6 +4031,9 @@ impl VantageCore {
                         }
                     }
                     Effect::BroadcastNoReady(view) => {
+                        if self.suppress_mixed_open_response("no-ready") {
+                            continue;
+                        }
                         let wish = self.pacemaker.own_watermark();
                         self.broadcast_recorded(PrimaryMessage::VantageNoReady(
                             view, self.name, wish,
@@ -3961,6 +4042,9 @@ impl VantageCore {
                     }
 
                     Effect::BroadcastSkipVote(view) => {
+                        if self.suppress_mixed_open_response("skip-vote") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageSkipVote(view, self.name))
                             .await;
                     }
@@ -4044,6 +4128,12 @@ impl VantageCore {
                         outcome,
                         output_delta,
                     } => {
+                        #[cfg(feature = "benchmark")]
+                        log::info!(
+                            "VANTAGE_RECOVERY_EVENT kind=finalized view={} epoch_ms={}",
+                            view,
+                            recovery_epoch_ms()
+                        );
                         #[cfg(feature = "pipeline-tracing")]
                         if let (Some(metrics), Some(elapsed)) =
                             (&self.metrics, self.pipeline.note_finalized(view))
@@ -4070,39 +4160,63 @@ impl VantageCore {
                     }
 
                     Effect::BroadcastResolutionWitness(witness) => {
+                        if self.suppress_mixed_open_response("resolution-witness") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageResolutionWitness(witness))
                             .await;
                     }
                     Effect::BroadcastResolutionWish(wish) => {
+                        if self.suppress_mixed_open_response("resolution-wish") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageResolutionWish(wish))
                             .await;
                     }
                     Effect::ResolutionSuggestTo(peer, suggest) => {
+                        if self.suppress_mixed_open_response("resolution-suggest") {
+                            continue;
+                        }
                         self.wire
                             .send_message(peer, PrimaryMessage::VantageResolutionSuggest(suggest))
                             .await;
                     }
                     Effect::BroadcastResolutionProof(proof) => {
+                        if self.suppress_mixed_open_response("resolution-proof") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageResolutionProof(proof))
                             .await;
                     }
                     Effect::BroadcastResolutionProposal(proposal) => {
+                        if self.suppress_mixed_open_response("resolution-proposal") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageResolutionProposal(
                             proposal,
                         ))
                         .await;
                     }
                     Effect::BroadcastResolutionStatement(statement) => {
+                        if self.suppress_mixed_open_response("resolution-statement") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageResolutionStatement(
                             statement,
                         ))
                         .await;
                     }
                     Effect::BroadcastResolutionDone(done) => {
+                        if self.suppress_mixed_open_response("resolution-done") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageResolutionDone(done))
                             .await;
                     }
                     Effect::ResolutionDoneTo(peer, done) => {
+                        if self.suppress_mixed_open_response("resolution-done") {
+                            continue;
+                        }
                         self.wire
                             .send_message(peer, PrimaryMessage::VantageResolutionDone(done))
                             .await;

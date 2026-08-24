@@ -163,6 +163,28 @@ async fn completed_open_tip_reprobes_at_exponential_own_turns_and_clears() {
 }
 
 #[tokio::test]
+async fn mixed_open_fault_proposal_keeps_only_own_tip_despite_quarantine() {
+    let proposer1 = crate::vantage::agb::proposer(&test_committee(), 1);
+    let other = authors()
+        .into_iter()
+        .map(|(author, _)| author)
+        .find(|author| *author != proposer1)
+        .unwrap();
+    let (mut lm, _store) = new_lane_manager(proposer1, ".db_test_frontier_mixed_fault");
+    let mut frontier = Frontier::new(proposer1, test_committee());
+    let own = block_ref(&direct_chain(&mut lm, proposer1, 1).await[0]);
+    let other = block_ref(&direct_chain(&mut lm, other, 1).await[0]);
+
+    let ordinary = frontier.propose_view(1, &lm, None).unwrap();
+    assert!(ordinary.t.contains(&own) && ordinary.t.contains(&other));
+    frontier.quarantine_tips(&ordinary.t, &lm);
+
+    let faulty = frontier.propose_view_mixed_open(5, &lm).unwrap();
+    assert_eq!(faulty.t, vec![own]);
+    assert!(faulty.m.is_none());
+}
+
+#[tokio::test]
 async fn reprobe_selects_one_eligible_author_and_skips_an_ineligible_earlier_one() {
     let proposer1 = crate::vantage::agb::proposer(&test_committee(), 1);
     let all = authors();

@@ -2,6 +2,7 @@
 /data/
 /docker-compose.yml
 /joiner-runs/
+/recovery-runs/
 
 __pycache__/
 *.pyc

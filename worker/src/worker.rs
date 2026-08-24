@@ -167,15 +167,24 @@ impl Worker {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
-        let withheld_destinations = config::withheld_destinations(
-            &committee,
-            &name,
-            parameters.withhold_senders,
-            &parameters.withhold_publishers,
-            parameters.withhold_count,
-            parameters.withhold_stride,
-            &parameters.withhold_receivers,
-        );
+        let withheld_destinations = if parameters.vantage_mixed_open_stress {
+            config::mixed_open_withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+            )
+        } else {
+            config::withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+                parameters.withhold_count,
+                parameters.withhold_stride,
+                &parameters.withhold_receivers,
+            )
+        };
 
         let withhold_window = parameters.withhold_window.clone();
 

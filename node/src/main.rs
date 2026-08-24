@@ -487,6 +487,16 @@ async fn run(matches: &ArgMatches) -> Result<()> {
     };
 
     parameters.reconcile_protocol();
+    if parameters
+        .arm_withhold_window()
+        .map_err(anyhow::Error::msg)?
+    {
+        log::info!(
+            "Armed finite data-plane fault window from metrics epoch: offset={} ms, duration={} ms",
+            parameters.withhold_at_ms.unwrap_or_default(),
+            parameters.withhold_for_ms
+        );
+    }
 
     if parameters.latency_table.is_none() {
         parameters.latency_table = Some(std::sync::Arc::new(match parameters.mimic_latency_ms {
