@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import sys
 import time
 import urllib.error
@@ -62,6 +63,11 @@ def counter(samples: dict, name: str) -> int:
     return int(vals[0][1]) if vals else 0
 
 
+def scalar(samples: dict, name: str) -> float:
+    vals = samples.get(name)
+    return float(vals[0][1]) if vals else 0.0
+
+
 def gauge_by_label(samples: dict, name: str, label: str, value: str) -> int | None:
     for labels, v in samples.get(name, []):
         if labels.get(label) == value:
@@ -99,6 +105,7 @@ class NodeSnapshot:
                  "committed_uncounted_transactions", "submitted_transactions",
                  "count", "p50", "p90", "p99", "m50", "m90", "m99",
                  "wire_bytes_sent", "optimistic_batch_bytes_sent",
+                 "process_cpu_seconds",
                  "prepare_sync_events", "prepare_missing_headers",
                  "prepare_sync_completed", "prepare_sync_wait_micros")
 
@@ -112,6 +119,7 @@ class NodeSnapshot:
         self.m50 = self.m90 = self.m99 = None
         self.wire_bytes_sent = 0
         self.optimistic_batch_bytes_sent = 0
+        self.process_cpu_seconds = 0.0
         self.prepare_sync_events = 0
         self.prepare_missing_headers = 0
         self.prepare_sync_completed = 0
@@ -130,6 +138,7 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
     )
     s.submitted_transactions = counter(worker_samples, "submitted_transactions")
     s.wire_bytes_sent = counter(worker_samples, "bytes_sent_total")
+    s.process_cpu_seconds = scalar(worker_samples, "process_cpu_seconds_total")
     s.optimistic_batch_bytes_sent = counter_by_label(
         worker_samples, "network_bytes_sent_total", "type", "OptimisticBatch"
     )
@@ -148,6 +157,7 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
     primary_samples = scrape(primary_url(manifest, i))
     if primary_samples is not None:
         s.wire_bytes_sent += counter(primary_samples, "bytes_sent_total")
+        s.process_cpu_seconds += scalar(primary_samples, "process_cpu_seconds_total")
         s.prepare_sync_events = counter(
             primary_samples, "autobahn_prepare_sync_events_total"
         )
@@ -168,6 +178,16 @@ def counter_deltas(
 ) -> list[int]:
     return [
         max(0, int(getattr(after, field)) - int(getattr(before, field)))
+        for before, after in zip(first, last)
+        if after.reachable
+    ]
+
+
+def scalar_deltas(
+    first: list[NodeSnapshot], last: list[NodeSnapshot], field: str
+) -> list[float]:
+    return [
+        max(0.0, float(getattr(after, field)) - float(getattr(before, field)))
         for before, after in zip(first, last)
         if after.reachable
     ]
@@ -322,6 +342,8 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         first_snapshots, last_snapshots, "optimistic_batch_bytes_sent"
     )
     wire_bytes = counter_deltas(first_snapshots, last_snapshots, "wire_bytes_sent")
+    cpu_seconds = scalar_deltas(first_snapshots, last_snapshots, "process_cpu_seconds")
+    node_cpu_cores = [seconds / window for seconds in cpu_seconds]
     sync_events = counter_deltas(first_snapshots, last_snapshots, "prepare_sync_events")
     sync_missing = counter_deltas(
         first_snapshots, last_snapshots, "prepare_missing_headers"
@@ -353,6 +375,12 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             f"{sum(relay_bytes) / window / 1_000_000:.2f} MB/s aggregate, "
             f"peak node {max(relay_bytes) * 8 / window / 1_000_000:.2f} Mbit/s"
         )
+    if node_cpu_cores:
+        print(
+            " Validator process CPU: "
+            f"median {statistics.median(node_cpu_cores):.2f} cores, "
+            f"maximum {max(node_cpu_cores):.2f} cores"
+        )
     print("-----------------------------------------")
     result = {
         "measurement_seconds": window,
@@ -380,6 +408,10 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             max(relay_bytes, default=0) * 8 / window / 1_000_000
         ),
         "max_node_wire_mbps": max(wire_bytes, default=0) * 8 / window / 1_000_000,
+        "median_node_cpu_cores": (
+            statistics.median(node_cpu_cores) if node_cpu_cores else 0.0
+        ),
+        "max_node_cpu_cores": max(node_cpu_cores, default=0.0),
         "real_latency_ms": latency_quantiles_ms(last_snapshots, materialised=False),
         "materialised_latency_ms": latency_quantiles_ms(
             last_snapshots, materialised=True

@@ -674,6 +674,57 @@ fn a_noneligible_anchor_never_receives_a_resolver_echo() {
 }
 
 #[test]
+fn configured_batch_cap_bounds_a_primary_proposal() {
+    let committee = test_committee();
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let sid = test_sid();
+    let probe = ResolutionChain::new_with_batch_cap(
+        names[0],
+        committee.clone(),
+        sid.clone(),
+        TEST_DELTA_MS,
+        1,
+    );
+    let leader = probe.resolution_leader(1, 1);
+    let mut chain = ResolutionChain::new_with_batch_cap(leader, committee, sid, TEST_DELTA_MS, 1);
+    make_anchor_eligible(&mut chain, &names, 9, 1);
+    make_anchor_eligible(&mut chain, &names, 10, 2);
+    enter_resolver_view(&mut chain, &names, 1);
+
+    let mut effects = Vec::new();
+    for sender in names.iter().copied().filter(|sender| *sender != leader) {
+        effects.extend(chain.on_resolution_suggest(ResolutionSuggest {
+            height: 1,
+            parent: chain.head().clone(),
+            view: 1,
+            sender,
+            key3_view: 0,
+            key3_value: Digest::default(),
+            key2_view: 0,
+            key2_value: Digest::default(),
+            prev_key2: 0,
+            block: None,
+        }));
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BroadcastResolutionProposal(_)))
+        {
+            break;
+        }
+    }
+
+    let proposal = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::BroadcastResolutionProposal(proposal) => Some(proposal),
+            _ => None,
+        })
+        .expect("correct primary proposes after a suggestion quorum");
+    assert_eq!(proposal.block.anchors.len(), 1);
+    assert_eq!(chain.pending_anchor_count(), 2);
+}
+
+#[test]
 fn future_height_repair_requires_f_plus_one_hints_and_is_deduplicated() {
     let committee = test_committee();
     let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();

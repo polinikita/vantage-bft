@@ -113,6 +113,145 @@ def distribution_summary(values: list[int]) -> dict:
     }
 
 
+def resolver_dynamics(
+    per_node: dict[int, list[dict]],
+    all_events: dict[int, list[dict]],
+    beta: int,
+    window_start_ms: int,
+    window_end_ms: int,
+) -> dict:
+    """Summarize resolver heights that decide during the attacked-view drain."""
+    correct_events = [event for events in per_node.values() for event in events]
+    every_event = [event for events in all_events.values() for event in events]
+    heights = sorted({
+        int(event["height"])
+        for event in correct_events
+        if event["kind"] == "resolver_decide"
+        and window_start_ms <= int(event["epoch_ms"]) <= window_end_ms
+        and "height" in event
+    })
+    rows = []
+    for height in heights:
+        enters = [
+            event for event in correct_events
+            if event["kind"] == "resolver_enter" and event.get("height") == height
+        ]
+        proposals = [
+            event for event in every_event
+            if event["kind"] == "resolver_proposal_sent" and event.get("height") == height
+        ]
+        decisions = [
+            event for event in correct_events
+            if event["kind"] == "resolver_decide" and event.get("height") == height
+        ]
+        if not decisions:
+            continue
+        first_enter = min((int(event["epoch_ms"]) for event in enters), default=None)
+        first_proposal = min((int(event["epoch_ms"]) for event in proposals), default=None)
+        all_correct_decided = max(int(event["epoch_ms"]) for event in decisions)
+        anchors = [int(event.get("anchors", 0)) for event in decisions]
+        applied_targets = [int(event.get("applied_targets", 0)) for event in decisions]
+        pending_before = [int(event.get("pending_before", 0)) for event in decisions]
+        pending_after = [int(event.get("pending_after", 0)) for event in decisions]
+        rows.append({
+            "height": height,
+            "resolver_view": max(int(event.get("view", 0)) for event in decisions),
+            "first_enter_ms": first_enter,
+            "first_proposal_ms": first_proposal,
+            "all_correct_decided_ms": all_correct_decided,
+            "enter_to_proposal_ms": (
+                first_proposal - first_enter
+                if first_enter is not None and first_proposal is not None else None
+            ),
+            "proposal_to_all_decided_ms": (
+                all_correct_decided - first_proposal if first_proposal is not None else None
+            ),
+            "enter_to_all_decided_ms": (
+                all_correct_decided - first_enter if first_enter is not None else None
+            ),
+            "anchors": int(statistics.median(anchors)),
+            "applied_targets": int(statistics.median(applied_targets)),
+            "pending_before": int(statistics.median(pending_before)),
+            "pending_after": int(statistics.median(pending_after)),
+        })
+
+    queue_peaks = {}
+    for node, events in per_node.items():
+        values = [
+            int(event.get(field, 0))
+            for event in events
+            for field in (
+                ("pending",) if event["kind"] == "resolver_eligible"
+                else ("pending_before", "pending_after")
+                if event["kind"] == "resolver_decide"
+                else ()
+            )
+        ]
+        queue_peaks[node] = max(values, default=0)
+
+    timeout_height_views = sorted({
+        (int(event["height"]), int(event["view"]))
+        for event in correct_events
+        if event["kind"] == "resolver_timeout"
+        and window_start_ms <= int(event["epoch_ms"]) <= window_end_ms
+        and "height" in event
+    })
+    anchors = [row["anchors"] for row in rows]
+    applied = [row["applied_targets"] for row in rows]
+    service = [
+        row["enter_to_all_decided_ms"]
+        for row in rows if row["enter_to_all_decided_ms"] is not None
+    ]
+    enter_to_proposal = [
+        row["enter_to_proposal_ms"]
+        for row in rows if row["enter_to_proposal_ms"] is not None
+    ]
+    proposal_to_decide = [
+        row["proposal_to_all_decided_ms"]
+        for row in rows if row["proposal_to_all_decided_ms"] is not None
+    ]
+    successful_start = min(
+        (row["first_proposal_ms"] for row in rows if row["first_proposal_ms"] is not None),
+        default=None,
+    )
+    successful_end = max(
+        (row["all_correct_decided_ms"] for row in rows),
+        default=None,
+    )
+    successful_seconds = (
+        (successful_end - successful_start) / 1_000
+        if successful_start is not None and successful_end is not None
+        and successful_end > successful_start else None
+    )
+    return {
+        "beta": beta,
+        "decision_heights": len(rows),
+        "height_rows": rows,
+        "anchors_per_block": distribution_summary(anchors),
+        "applied_targets_per_block": distribution_summary(applied),
+        "full_blocks": sum(value == beta for value in anchors),
+        "batch_utilization": (
+            statistics.median(value / beta for value in anchors)
+            if anchors and beta > 0 else None
+        ),
+        "resolver_height_service_ms": distribution_summary(service),
+        "enter_to_proposal_ms": distribution_summary(enter_to_proposal),
+        "proposal_to_all_decided_ms": distribution_summary(proposal_to_decide),
+        "distinct_timed_out_height_views": timeout_height_views,
+        "queue_peak_by_correct_node": queue_peaks,
+        "queue_peak_range": {
+            "minimum": min(queue_peaks.values(), default=0),
+            "maximum": max(queue_peaks.values(), default=0),
+        },
+        "decided_carrier_anchors": sum(anchors),
+        "applied_targets": sum(applied),
+        "successful_service_seconds": successful_seconds,
+        "carrier_anchor_service_per_second": (
+            sum(anchors) / successful_seconds if successful_seconds else None
+        ),
+    }
+
+
 def validate_common(
     scenario: str,
     manifest: dict,
@@ -383,6 +522,8 @@ def validate_mixed(
             {
                 "view": view,
                 "publisher_node": stress[view]["publisher_node"],
+                "completion_first_ms": completion_first,
+                "all_anchor_sealed_ms": seal_last,
                 "completion_to_all_anchor_sealed_ms": seal_last - completion_first,
                 "seal_spread_ms": max(event["epoch_ms"] for event in seals)
                 - min(event["epoch_ms"] for event in seals),
@@ -407,6 +548,22 @@ def validate_mixed(
     recovery_latencies = [row["completion_to_all_anchor_sealed_ms"] for row in recovery_rows]
     recovery_latency_summary = distribution_summary(recovery_latencies)
     recovery_spreads = [row["seal_spread_ms"] for row in recovery_rows]
+    resolver_window_start = min(
+        (row["completion_first_ms"] for row in recovery_rows),
+        default=fault_start,
+    )
+    resolver_window_end = max(
+        (row["all_anchor_sealed_ms"] for row in recovery_rows),
+        default=fault_end,
+    )
+    beta = int(parameters.get("resolution_batch_cap", 16))
+    dynamics = resolver_dynamics(
+        per_node,
+        all_events,
+        beta,
+        resolver_window_start,
+        resolver_window_end,
+    )
 
     add_check(
         checks,
@@ -479,9 +636,19 @@ def validate_mixed(
         "missing_finalized": missing_finalized,
         "backlog_peak_and_final_by_node": backlog,
         "recovery_count": len(recovery_rows),
+        "recovery_rows": recovery_rows,
         "completion_to_all_anchor_sealed_ms": recovery_latency_summary,
+        "fault_end_to_all_anchor_sealed_ms": (
+            max((row["all_anchor_sealed_ms"] for row in recovery_rows), default=fault_end)
+            - fault_end
+        ),
+        "common_open_views_per_fault_second": (
+            len(common_open) / (int(parameters["withhold_for_ms"]) / 1_000)
+            if int(parameters["withhold_for_ms"]) > 0 else None
+        ),
         "anchor_seal_spread_ms": distribution_summary(recovery_spreads),
         "anchor_route_counts": route_counts,
+        "resolver_dynamics": dynamics,
     }
 
 

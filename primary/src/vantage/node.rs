@@ -1026,8 +1026,13 @@ impl VantageCore {
             // Certification still requires matching members.
             CheckpointCollector::new(f + 1, SEQUENCE_CANDIDATE_WINDOWS, View::MAX)
         });
-        let resolution_chain =
-            ResolutionChain::new(name, committee.clone(), sid, parameters.delta_ms);
+        let resolution_chain = ResolutionChain::new_with_batch_cap(
+            name,
+            committee.clone(),
+            sid,
+            parameters.delta_ms,
+            parameters.resolution_batch_cap,
+        );
 
         let other_primaries: Vec<(PublicKey, SocketAddr)> = committee
             .others_primaries(&name)
@@ -4192,6 +4197,16 @@ impl VantageCore {
                         if self.suppress_mixed_open_response("resolution-proposal") {
                             continue;
                         }
+                        #[cfg(feature = "benchmark")]
+                        log::info!(
+                            "VANTAGE_RECOVERY_EVENT kind=resolver_proposal_sent view={} epoch_ms={} height={} anchors={} pending={} beta={}",
+                            proposal.view,
+                            recovery_epoch_ms(),
+                            proposal.height,
+                            proposal.block.anchors.len(),
+                            self.resolution_chain.pending_anchor_count(),
+                            self.resolution_chain.batch_cap()
+                        );
                         self.broadcast_recorded(PrimaryMessage::VantageResolutionProposal(
                             proposal,
                         ))

@@ -220,6 +220,7 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         # their certified/available cuts.
         "max_block_payload": 16,
         "delta_ms": args.delta_ms,
+        "resolution_batch_cap": args.resolution_batch_cap,
         "channel_auth": not args.no_channel_auth,
         # One seed per generated run: every node reads the same document, so all pairs
         # expand the same key material. Stands in for out-of-band provisioning.
@@ -537,6 +538,7 @@ def write_manifest(
         "adversarial_node_indices": adversarial_node_indices,
         "egress_mbps": args.egress_mbps,
         "netem_limit_pkts": args.netem_limit_pkts,
+        "resolution_batch_cap": args.resolution_batch_cap,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -585,6 +587,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="first host port for worker metrics (default 9100)")
     # Match local-benchmark parameter names.
     p.add_argument("--delta-ms", type=int, default=200)
+    p.add_argument(
+        "--resolution-batch-cap",
+        type=int,
+        default=16,
+        help="maximum carrier anchors in one Vantage hash-resolver block (default 16)",
+    )
     p.add_argument("--timeout-delay-ms", type=int, default=None,
                    help="override the proof-calibrated round timeout: Autobahn "
                         "10*Delta, Simple-IT Opt 8*Delta, Bracha 5*Delta")
@@ -687,6 +695,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error(f"--nodes must be between 1 and {MAX_NODES}")
     if args.tx_size < 17:
         p.error("--tx-size must be at least 17 bytes (1 B marker + 8 B id + 8 B timestamp)")
+    if args.resolution_batch_cap < 1:
+        p.error("--resolution-batch-cap must be positive")
     if not (0 <= args.withhold <= args.nodes):
         p.error("--withhold must be between 0 and --nodes")
     fault_budget = (args.nodes - 1) // 3

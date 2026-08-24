@@ -23,8 +23,16 @@ use std::time::{Duration, Instant};
 pub type ResolutionHeight = u64;
 pub type ResolverView = u64;
 
-/// A fixed cap keeps one resolution value bounded while allowing burst drain.
-pub const RESOLUTION_BATCH_CAP: usize = 16;
+/// The default cap keeps one resolution value bounded while allowing burst drain.
+pub const DEFAULT_RESOLUTION_BATCH_CAP: usize = 16;
+
+#[cfg(feature = "benchmark")]
+fn recovery_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock precedes UNIX epoch")
+        .as_millis()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AnchorRef {
@@ -198,6 +206,7 @@ pub struct ResolutionChain {
     committee: Committee,
     sid: Digest,
     delta: Duration,
+    batch_cap: usize,
     f_plus_1: usize,
     quorum: usize,
 
@@ -225,6 +234,17 @@ pub struct ResolutionChain {
 
 impl ResolutionChain {
     pub fn new(name: PublicKey, committee: Committee, sid: Digest, delta_ms: u64) -> Self {
+        Self::new_with_batch_cap(name, committee, sid, delta_ms, DEFAULT_RESOLUTION_BATCH_CAP)
+    }
+
+    pub fn new_with_batch_cap(
+        name: PublicKey,
+        committee: Committee,
+        sid: Digest,
+        delta_ms: u64,
+        batch_cap: usize,
+    ) -> Self {
+        assert!(batch_cap > 0, "resolution batch cap must be positive");
         let thresholds = Thresholds::from_party_count(committee.size());
         let genesis = block::domain_hash(b"vantage-resolution-genesis", &sid, b"genesis");
         Self {
@@ -232,6 +252,7 @@ impl ResolutionChain {
             committee,
             sid,
             delta: Duration::from_millis(delta_ms),
+            batch_cap,
             f_plus_1: thresholds.f_plus_1_parties,
             quorum: thresholds.n_minus_f_parties,
             witness_statements: BTreeMap::new(),
@@ -373,6 +394,16 @@ impl ResolutionChain {
         }
         if self.matching_witness_count(view, &digest) >= self.quorum && self.eligible.insert(anchor)
         {
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                "VANTAGE_RECOVERY_EVENT kind=resolver_eligible view={} epoch_ms={} height={} pending={}",
+                view,
+                recovery_epoch_ms(),
+                self.active
+                    .as_ref()
+                    .map_or(self.decided_height + 1, |active| active.height),
+                self.pending_anchors().len()
+            );
             effects.extend(self.activate_if_pending());
             effects.extend(self.retry_active());
         }
@@ -609,6 +640,14 @@ impl ResolutionChain {
             )
         };
         let leader = self.resolution_leader(height, view);
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            "VANTAGE_RECOVERY_EVENT kind=resolver_enter view={} epoch_ms={} height={} pending={}",
+            view,
+            recovery_epoch_ms(),
+            height,
+            self.pending_anchors().len()
+        );
         let block = (key3_view > 0)
             .then(|| self.resolution_blocks.get(&key3_value).cloned())
             .flatten();
@@ -671,6 +710,14 @@ impl ResolutionChain {
         if active.height != height || active.current_view != view {
             return Vec::new();
         }
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            "VANTAGE_RECOVERY_EVENT kind=resolver_timeout view={} epoch_ms={} height={} pending={}",
+            view,
+            recovery_epoch_ms(),
+            height,
+            self.pending_anchors().len()
+        );
         let mut effects = self.raise_own_wish(view.saturating_add(1));
         effects.extend(self.recheck_wishes());
         effects
@@ -680,7 +727,7 @@ impl ResolutionChain {
         block.height == self.decided_height + 1
             && block.parent == self.head
             && !block.anchors.is_empty()
-            && block.anchors.len() <= RESOLUTION_BATCH_CAP
+            && block.anchors.len() <= self.batch_cap
             && block.anchors.windows(2).all(|w| w[0] < w[1])
             && block
                 .anchors
@@ -840,7 +887,7 @@ impl ResolutionChain {
             let anchors: Vec<_> = self
                 .pending_anchors()
                 .into_iter()
-                .take(RESOLUTION_BATCH_CAP)
+                .take(self.batch_cap)
                 .collect();
             if anchors.is_empty() {
                 return Vec::new();
@@ -1247,6 +1294,7 @@ impl ResolutionChain {
         let Some(active) = self.active.as_ref() else {
             return Vec::new();
         };
+        let resolver_view = active.current_view;
         if block.height != active.height
             || block.parent != active.parent
             || block.digest(&self.sid) != value
@@ -1254,7 +1302,9 @@ impl ResolutionChain {
         {
             return Vec::new();
         }
+        let pending_before = self.pending_anchors().len();
         let mut effects = Vec::new();
+        let mut applied_targets = 0usize;
         for anchor in &block.anchors {
             self.decided_anchors.insert(anchor.clone());
             let Some(carrier) = self
@@ -1279,6 +1329,7 @@ impl ResolutionChain {
                     continue;
                 }
                 self.anchored_targets.insert(target);
+                applied_targets += 1;
                 let (outcome, refs) = Self::derive_anchor(entry);
                 effects.push(Effect::ApplyAnchor(target, outcome, refs));
             }
@@ -1286,6 +1337,19 @@ impl ResolutionChain {
         self.decided_height = block.height;
         self.head = value;
         self.decided_blocks.insert(block.height, block.clone());
+        let pending_after = self.pending_anchors().len();
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            "VANTAGE_RECOVERY_EVENT kind=resolver_decide view={} epoch_ms={} height={} anchors={} applied_targets={} pending_before={} pending_after={} beta={}",
+            resolver_view,
+            recovery_epoch_ms(),
+            block.height,
+            block.anchors.len(),
+            applied_targets,
+            pending_before,
+            pending_after,
+            self.batch_cap
+        );
         self.active = None;
         self.resolution_blocks.clear();
         self.pending_block_fetch = self
@@ -1421,6 +1485,10 @@ impl ResolutionChain {
 
     pub fn pending_anchor_count(&self) -> usize {
         self.pending_anchors().len()
+    }
+
+    pub fn batch_cap(&self) -> usize {
+        self.batch_cap
     }
 
     pub fn head(&self) -> &Digest {

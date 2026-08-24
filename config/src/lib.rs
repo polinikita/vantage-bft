@@ -185,6 +185,10 @@ pub struct Parameters {
     #[serde(default = "default_delta_ms")]
     pub delta_ms: u64,
 
+    /// Maximum carrier anchors in one hash-resolver block.
+    #[serde(default = "default_resolution_batch_cap")]
+    pub resolution_batch_cap: usize,
+
     /// Epoch-millisecond start time for commit metrics. `None` counts all transactions.
     #[serde(default)]
     pub metrics_active_at_ms: Option<u64>,
@@ -582,6 +586,10 @@ fn default_delta_ms() -> u64 {
     200
 }
 
+fn default_resolution_batch_cap() -> usize {
+    16
+}
+
 /// Default Vantage retention window, in views.
 fn default_vantage_gc_window_views() -> u64 {
     200
@@ -852,6 +860,7 @@ impl Default for Parameters {
             tx_mode: None,
             max_block_payload: default_max_block_payload(),
             delta_ms: default_delta_ms(),
+            resolution_batch_cap: default_resolution_batch_cap(),
             // Count every observation by default.
             metrics_active_at_ms: None,
             latency_table: None,
@@ -1027,6 +1036,10 @@ impl Parameters {
             self.max_block_payload
         );
         info!("Vantage delta set to {} ms", self.delta_ms);
+        info!(
+            "Vantage hash-resolver batch cap set to {} carrier anchors",
+            self.resolution_batch_cap
+        );
         match &self.latency_table {
             Some(table) if table.injects_delay() => {
                 info!(
