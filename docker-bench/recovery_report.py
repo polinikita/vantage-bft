@@ -72,9 +72,11 @@ def finalization_summary(per_node: dict[int, list[dict]]) -> dict:
     }
 
 
-def open_backlog(events: list[dict]) -> tuple[int, int]:
+def open_backlog(events: list[dict], cutoff_ms: int | None = None) -> tuple[int, int]:
     timeline = []
     for event in events:
+        if cutoff_ms is not None and event["epoch_ms"] > cutoff_ms:
+            continue
         if event["kind"] == "completed_open":
             timeline.append((event["epoch_ms"], 1, event["view"]))
         elif event["kind"] == "seal":
@@ -543,7 +545,14 @@ def validate_mixed(
 
     missing_open = sorted(set(mature_stress) - common_open)
     bad_tips = sorted(view for view, event in mature_stress.items() if event.get("tips") != 1)
-    backlog = {node: open_backlog(events) for node, events in per_node.items()}
+    measurement_end = manifest.get("ended_at_ms")
+    backlog = {
+        node: open_backlog(
+            events,
+            int(measurement_end) if measurement_end is not None else None,
+        )
+        for node, events in per_node.items()
+    }
     peak_min = min((peak for peak, _ in backlog.values()), default=0)
     peak_max = max((peak for peak, _ in backlog.values()), default=0)
     residual = {node: tail for node, (_, tail) in backlog.items() if tail}
