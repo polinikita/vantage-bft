@@ -10,8 +10,8 @@ use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::repair::Repairer;
 use crate::vantage::resolution_evidence::ResolutionEvidence;
 use crate::vantage::{
-    Cursor, DirectResolutionEffect, DirectResolutionVote, DirectResolver, DirectResolverView,
-    Effect,
+    Cursor, DirectResolutionEffect, DirectResolutionTimerKind, DirectResolutionVote,
+    DirectResolver, DirectResolverView, Effect,
 };
 use config::Committee;
 use crypto::PublicKey;
@@ -37,7 +37,7 @@ pub struct Node {
     pub max_views: View,
     pub alive: bool,
     pub timers: Vec<(Instant, View, TimerKind)>,
-    pub resolution_timers: Vec<(Instant, View, DirectResolverView)>,
+    pub resolution_timers: Vec<(Instant, View, DirectResolverView, DirectResolutionTimerKind)>,
     pub wish_partitioned: bool,
     pub held_wishes: Vec<(PublicKey, View)>,
     pub metrics: Arc<Metrics>,
@@ -449,19 +449,19 @@ impl Node {
             return Vec::new();
         }
         let mut due = Vec::new();
-        self.resolution_timers.retain(|(d, target, view)| {
+        self.resolution_timers.retain(|(d, target, view, kind)| {
             if *d <= now {
-                due.push((*target, *view));
+                due.push((*target, *view, *kind));
                 false
             } else {
                 true
             }
         });
         let mut effects = Vec::new();
-        for (target, view) in due {
+        for (target, view, kind) in due {
             effects.extend(
                 self.direct_resolver
-                    .on_timer(target, view)
+                    .on_timer(target, view, kind)
                     .into_iter()
                     .map(Effect::DirectResolution),
             );
@@ -836,8 +836,10 @@ pub fn drain_local(
                             }
                         }
                     }
-                    DirectResolutionEffect::ArmTimer(target, view, deadline) => {
-                        nodes[idx].resolution_timers.push((deadline, target, view));
+                    DirectResolutionEffect::ArmTimer(target, view, kind, deadline) => {
+                        nodes[idx]
+                            .resolution_timers
+                            .push((deadline, target, view, kind));
                     }
                     DirectResolutionEffect::ValidateVote {
                         target,

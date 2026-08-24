@@ -9,9 +9,9 @@ use crate::vantage::agb::{
 use crate::vantage::block::{self, BlockRef};
 use crate::vantage::direct_resolution::{
     DirectResolutionDone, DirectResolutionEffect, DirectResolutionProof, DirectResolutionProposal,
-    DirectResolutionStatement, DirectResolutionSuggest, DirectResolutionValueFetch,
-    DirectResolutionValueServe, DirectResolutionVote, DirectResolutionWish,
-    DirectResolutionWitness, DirectResolver, DirectResolverView,
+    DirectResolutionStatement, DirectResolutionSuggest, DirectResolutionTimerKind,
+    DirectResolutionValueFetch, DirectResolutionValueServe, DirectResolutionVote,
+    DirectResolutionWish, DirectResolutionWitness, DirectResolver, DirectResolverView,
 };
 
 /// Maximum retained certified checkpoint candidates.
@@ -851,7 +851,8 @@ pub struct VantageCore {
     timers: BinaryHeap<Reverse<(Instant, View, TimerKind)>>,
 
     /// Direct resolver timers keyed by `(target, resolver view)`.
-    resolution_timers: BinaryHeap<Reverse<(Instant, View, DirectResolverView)>>,
+    resolution_timers:
+        BinaryHeap<Reverse<(Instant, View, DirectResolverView, DirectResolutionTimerKind)>>,
 
     payload: PayloadIo,
 
@@ -1417,8 +1418,10 @@ impl VantageCore {
             };
             tokio::pin!(agb_sleep);
 
-            let next_resolution_deadline =
-                self.resolution_timers.peek().map(|Reverse((d, _, _))| *d);
+            let next_resolution_deadline = self
+                .resolution_timers
+                .peek()
+                .map(|Reverse((d, _, _, _))| *d);
             let resolution_sleep = async {
                 match next_resolution_deadline {
                     Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
@@ -2001,14 +2004,14 @@ impl VantageCore {
     /// Fires due direct per-target resolver timers in deadline order.
     fn fire_resolution_timers(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
-        while let Some(&Reverse((deadline, height, view))) = self.resolution_timers.peek() {
+        while let Some(&Reverse((deadline, height, view, kind))) = self.resolution_timers.peek() {
             if deadline > now {
                 break;
             }
             self.resolution_timers.pop();
             effects.extend(
                 self.direct_resolver
-                    .on_timer(height, view)
+                    .on_timer(height, view, kind)
                     .into_iter()
                     .map(Effect::DirectResolution),
             );
@@ -2163,7 +2166,7 @@ impl VantageCore {
         self.resolution_evidence.gc_below(floor);
         self.timers.retain(|Reverse((_, view, _))| *view >= floor);
         self.resolution_timers
-            .retain(|Reverse((_, target, _))| *target >= floor);
+            .retain(|Reverse((_, target, _, _))| *target >= floor);
         #[cfg(feature = "pipeline-tracing")]
         self.pipeline.gc_below(floor);
         self.last_gc_floor = floor;
@@ -4359,9 +4362,9 @@ impl VantageCore {
                                 )
                                 .await;
                         }
-                        DirectResolutionEffect::ArmTimer(target, view, deadline) => {
+                        DirectResolutionEffect::ArmTimer(target, view, kind, deadline) => {
                             self.resolution_timers
-                                .push(Reverse((deadline, target, view)));
+                                .push(Reverse((deadline, target, view, kind)));
                         }
                         DirectResolutionEffect::ValidateVote {
                             target,
