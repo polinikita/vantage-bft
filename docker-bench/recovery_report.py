@@ -310,6 +310,8 @@ def validate_common(
     if result is not None:
         expected_workers = manifest["nodes"] - manifest.get("crash", 0)
         reachable = int(result.get("reachable_workers", 0))
+        measured_seconds = float(result.get("measurement_seconds", 0.0))
+        minimum_seconds = 0.70 * float(manifest.get("duration", 0))
         offered = float(manifest.get("honest_offered_tps", manifest.get("rate", 0)))
         committed = float(result.get("committed_tps", 0))
         add_check(
@@ -317,6 +319,14 @@ def validate_common(
             "workers remained reachable",
             reachable == expected_workers,
             f"reachable={reachable}/{expected_workers}",
+        )
+        add_check(
+            checks,
+            "measurement coverage",
+            measured_seconds >= minimum_seconds,
+            f"complete-snapshot window={measured_seconds:.1f}s "
+            f"(minimum {minimum_seconds:.1f}s); incomplete scrapes="
+            f"{int(result.get('incomplete_scrape_samples', 0))}",
         )
         add_check(
             checks,

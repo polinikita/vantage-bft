@@ -281,14 +281,18 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     """Print interval rates and latency gauges, then a watch-window summary."""
     print(f"Grafana dashboard: {GRAFANA_DASHBOARD_URL}")
     sys.stdout.flush()
-    prev_total = 0
+    expected_reachable = manifest["nodes"] - manifest.get("crash", 0)
+    prev_total: int | None = None
     first_total: int | None = None
     first_submitted: int | None = None
     first_snapshots: list[NodeSnapshot] | None = None
     first_elapsed = 0.0
-    last_snapshots: list[NodeSnapshot] = []
+    last_complete_snapshots: list[NodeSnapshot] = []
+    last_complete_elapsed = 0.0
+    complete_samples = 0
+    incomplete_samples = 0
     started_at = time.monotonic()
-    last_sample_at = started_at
+    last_complete_sample_at = started_at
     next_sample_at = started_at + interval
     deadline = None if duration is None else started_at + duration
     elapsed = 0.0
@@ -299,15 +303,30 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             snapshots = snapshot_all(manifest)
             sampled_at = time.monotonic()
             elapsed = sampled_at - started_at
-            sample_window = max(sampled_at - last_sample_at, 1e-9)
-            last_snapshots = snapshots
+            reachable = sum(snapshot.reachable for snapshot in snapshots)
+            if reachable != expected_reachable:
+                incomplete_samples += 1
+                print(
+                    f"TIMELINE: sec={elapsed:.1f} scrape_incomplete="
+                    f"{reachable}/{expected_reachable}"
+                )
+                sys.stdout.flush()
+                if deadline is not None and sampled_at >= deadline:
+                    break
+                next_sample_at += interval
+                while next_sample_at <= sampled_at:
+                    next_sample_at += interval
+                continue
+
+            complete_samples += 1
+            sample_window = max(sampled_at - last_complete_sample_at, 1e-9)
             total = committed_total(snapshots)
             if first_total is None:
                 first_total = total
                 first_submitted = submitted_total(snapshots)
                 first_snapshots = snapshots
                 first_elapsed = elapsed
-            delta = max(0, total - prev_total)
+            delta = total if prev_total is None else max(0, total - prev_total)
             print(
                 f"TIMELINE: sec={elapsed:.1f} committed_total={total} "
                 f"committed_delta={delta} tps={delta / sample_window:.0f} "
@@ -316,7 +335,9 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             )
             sys.stdout.flush()
             prev_total = total
-            last_sample_at = sampled_at
+            last_complete_snapshots = snapshots
+            last_complete_elapsed = elapsed
+            last_complete_sample_at = sampled_at
             if deadline is not None and sampled_at >= deadline:
                 break
             next_sample_at += interval
@@ -325,11 +346,13 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     except KeyboardInterrupt:
         print()
 
-    if (not last_snapshots or first_total is None or first_submitted is None
+    if (not last_complete_snapshots or first_total is None or first_submitted is None
             or first_snapshots is None
-            or elapsed <= first_elapsed):
+            or last_complete_elapsed <= first_elapsed):
         return  # Too short a window to derive a rate.
-    window = elapsed - first_elapsed
+    window = last_complete_elapsed - first_elapsed
+    last_snapshots = last_complete_snapshots
+    prev_total = committed_total(last_snapshots)
     committed_delta = prev_total - first_total
     uncounted_deltas = counter_deltas(
         first_snapshots, last_snapshots, "committed_uncounted_transactions"
@@ -384,6 +407,8 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     print("-----------------------------------------")
     result = {
         "measurement_seconds": window,
+        "complete_scrape_samples": complete_samples,
+        "incomplete_scrape_samples": incomplete_samples,
         "committed_transactions": committed_delta,
         "committed_tps": rate,
         "committed_uncounted_transactions": uncounted_delta,
