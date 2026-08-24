@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import statistics
+import subprocess
 import sys
 import time
 import urllib.error
@@ -56,6 +57,32 @@ def scrape(url: str, timeout: float = 2.0) -> dict | None:
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
     return parse_prometheus_text(text)
+
+
+def scrape_in_container(manifest: dict, i: int, port: int) -> dict | None:
+    """Bypass an intermittently stalled host-published Docker metrics port."""
+    name = f"{manifest.get('container_name_prefix', 'vantage-node-')}{i}"
+    try:
+        completed = subprocess.run(
+            [
+                "docker",
+                "exec",
+                name,
+                "curl",
+                "-fsS",
+                "--max-time",
+                "2",
+                f"http://127.0.0.1:{port}/metrics",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_prometheus_text(completed.stdout.decode("utf-8", "replace"))
 
 
 def counter(samples: dict, name: str) -> int:
@@ -128,7 +155,11 @@ class NodeSnapshot:
 
 def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
     s = NodeSnapshot()
-    worker_samples = scrape(worker_url(manifest, i))
+    worker_samples = scrape(worker_url(manifest, i), timeout=1.0)
+    if worker_samples is None:
+        worker_samples = scrape_in_container(
+            manifest, i, int(manifest["ports"]["worker_metrics"])
+        )
     if worker_samples is None:
         return s
     s.reachable = True
@@ -154,7 +185,11 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         s.m90 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p90")
         s.m99 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p99")
 
-    primary_samples = scrape(primary_url(manifest, i))
+    primary_samples = scrape(primary_url(manifest, i), timeout=1.0)
+    if primary_samples is None:
+        primary_samples = scrape_in_container(
+            manifest, i, int(manifest["ports"]["primary_metrics"])
+        )
     if primary_samples is not None:
         s.wire_bytes_sent += counter(primary_samples, "bytes_sent_total")
         s.process_cpu_seconds += scalar(primary_samples, "process_cpu_seconds_total")
