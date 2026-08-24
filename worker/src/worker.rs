@@ -167,15 +167,24 @@ impl Worker {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
-        let withheld_destinations = config::withheld_destinations(
-            &committee,
-            &name,
-            parameters.withhold_senders,
-            &parameters.withhold_publishers,
-            parameters.withhold_count,
-            parameters.withhold_stride,
-            &parameters.withhold_receivers,
-        );
+        let withheld_destinations = if parameters.vantage_mixed_open_stress {
+            config::mixed_open_withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+            )
+        } else {
+            config::withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+                parameters.withhold_count,
+                parameters.withhold_stride,
+                &parameters.withhold_receivers,
+            )
+        };
 
         let withhold_window = parameters.withhold_window.clone();
 
@@ -508,7 +517,12 @@ const TX_YIELD_EVERY: u64 = 128;
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(
+        &self,
+        _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
+        message: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
         // Forward the owned frame without copying.
         self.tx_batch_maker
             .send(message)
@@ -541,6 +555,7 @@ impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         match route_worker_message(&serialized) {
@@ -624,6 +639,7 @@ impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize::<PrimaryWorkerMessage>(&serialized) {

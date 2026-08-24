@@ -482,7 +482,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     if late_header_publishers > 0 {
         println!(
             "Late headers: node-0..{} publish original headers to node-{}..{} with {} ms \
-             additional one-way delay; all repair and control traffic is normal",
+             additional one-way delay; all repair and resolver traffic is normal",
             late_header_publishers - 1,
             late_header_publishers,
             late_header_publishers + late_header_receivers - 1,
@@ -684,7 +684,7 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
         // Print one diagnostic line per live primary each second.
         if protocol == Protocol::Vantage {
             println!(
-                " [timeline] T+s   node       entered   a_i   cursor   round   delivered   consume   wish   target   omega_q"
+                " [timeline] T+s   node       entered   a_i   cursor   dview   resolved   active   wish   target   omega_q"
             );
         }
         let mut elapsed: u64 = 0;
@@ -698,9 +698,9 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
                         for (i, registry, _reporter) in &primary_metrics {
                             if let Some(p) = read_vantage_progress(registry) {
                                 println!(
-                                    " [timeline] T+{:<4} node-{:<3} entered={:<7} a_i={:<5} cursor={:<7} round={:<6} delivered={:<9} consume={:<6} wish={:<6} target={:<6} omega_q={:<6} cache={}",
-                                    elapsed, i, p.entered_view, p.frontier_a_i, p.cursor_next_view, p.control_round,
-                                    p.control_delivered_len, p.control_consume_pos,
+                                    " [timeline] T+{:<4} node-{:<3} entered={:<7} a_i={:<5} cursor={:<7} dview={:<6} resolved={:<7} active={:<8} wish={:<6} target={:<6} omega_q={:<6} cache={}",
+                                    elapsed, i, p.entered_view, p.frontier_a_i, p.cursor_next_view, p.direct_resolver_max_view,
+                                    p.resolved_through_view, p.direct_resolver_active_targets,
                                     p.own_watermark, p.entry_target, p.omega_q, p.block_cache_len
                                 );
                                 // Keep walk counters on a separate parseable line.
@@ -854,17 +854,15 @@ fn categorize(protocol: Protocol, msg_type: &str) -> &'static str {
             | "VantageSequenceUnavailable"
             | "VantageSequenceHeadersRequest"
             | "VantageSequenceHeaders" => "state-sync",
-            "CompReport"
-            | "ControlInit"
-            | "ControlEcho"
-            | "ControlReady"
-            | "ControlTimeoutVote"
-            | "ControlTimeoutAccept"
-            | "ControlCommit"
-            | "ControlFetch"
-            | "ControlServe"
-            | "ControlInitBatch"
-            | "ControlServeBatch" => "control",
+            "VantageDirectResolutionWish"
+            | "VantageDirectResolutionSuggest"
+            | "VantageDirectResolutionProof"
+            | "VantageDirectResolutionProposal"
+            | "VantageDirectResolutionStatement"
+            | "VantageDirectResolutionDone"
+            | "VantageDirectResolutionValueFetch"
+            | "VantageDirectResolutionValueServe"
+            | "VantageDirectResolutionWitness" => "resolution",
             _ => "uncategorized",
         },
         // Simple-IT shares the Vantage data plane and adds cut-consensus messages.

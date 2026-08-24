@@ -312,6 +312,12 @@ pub struct Metrics {
     // --- Per-view seal-route breakdown.
     /// View seal route, labeled by `route`, counted at first acceptance.
     pub vantage_seals: IntCounterVec,
+    /// Views that completed with a nonempty tip and no homogeneous READY quorum.
+    pub vantage_completed_open_total: IntCounter,
+    /// Completed-open views that have not yet reached a terminal seal locally.
+    pub vantage_open_unsealed_views: IntGauge,
+    /// Benchmark mixed-open responses deliberately suppressed, labeled by family.
+    pub vantage_mixed_open_suppressed_total: IntCounterVec,
 
     // --- Grounded post-ready skip.
     /// `SKIP-VOTE(u)` statements broadcast by this node.
@@ -360,12 +366,12 @@ pub struct Metrics {
     pub vantage_cursor_next_view: IntGauge,
     /// Entries dropped because an author's lane contradicted delivered output.
     pub vantage_cursor_forked_entries_dropped: IntGauge,
-    /// Current control-log round.
-    pub vantage_control_round: IntGauge,
-    /// Control-log entries delivered by reliable broadcast.
-    pub vantage_control_delivered_len: IntGauge,
-    /// Number of delivered control-log entries consumed.
-    pub vantage_control_consume_pos: IntGauge,
+    /// Largest active view among all target-local resolver instances.
+    pub vantage_direct_resolver_max_view: IntGauge,
+    /// Largest contiguous data view known terminal.
+    pub vantage_resolved_through_view: IntGauge,
+    /// Number of active target-local resolver instances.
+    pub vantage_direct_resolver_active_targets: IntGauge,
     /// Active and fixed views waiting for an echo.
     pub vantage_pending_gate_len: IntGauge,
     /// Outstanding AGB body fetches. Bounded by `agb::MAX_PENDING_FETCH`.
@@ -540,7 +546,7 @@ pub struct Metrics {
     pub vantage_sequence_install_completed_total: IntCounter,
     /// Highest view installed from verified checkpoint state.
     pub vantage_sequence_install_completed_view: IntGauge,
-    /// Consensus, control, and service messages discarded while sequence recovery is active.
+    /// Consensus, resolver, and service messages discarded while sequence recovery is active.
     pub vantage_sequence_install_obsolete_inbound_dropped_total: IntCounter,
 
     /// `SimpleSender` frames discarded while waiting for a connection.
@@ -1000,8 +1006,27 @@ impl Metrics {
             .unwrap(),
             vantage_seals: register_int_counter_vec_with_registry!(
                 "vantage_seals",
-                "Vantage views sealed, by route (fast_full/direct_full/direct_core/anchor_full/anchor_core/anchor_skip/vote_skip)",
+                "Vantage views sealed, by route (fast_full/direct_full/direct_core/resolver_full/resolver_core/resolver_skip/vote_skip)",
                 &["route"],
+                registry,
+            )
+            .unwrap(),
+            vantage_completed_open_total: register_int_counter_with_registry!(
+                "vantage_completed_open_total",
+                "Vantage views completed with a nonempty tip and no homogeneous READY quorum",
+                registry,
+            )
+            .unwrap(),
+            vantage_open_unsealed_views: register_int_gauge_with_registry!(
+                "vantage_open_unsealed_views",
+                "Vantage completed-open views not yet terminally sealed at this node",
+                registry,
+            )
+            .unwrap(),
+            vantage_mixed_open_suppressed_total: register_int_counter_vec_with_registry!(
+                "vantage_mixed_open_suppressed_total",
+                "Benchmark mixed-open outbound responses deliberately suppressed by family",
+                &["family"],
                 registry,
             )
             .unwrap(),
@@ -1119,21 +1144,21 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
-            vantage_control_round: register_int_gauge_with_registry!(
-                "vantage_control_round",
-                "Current control-log round",
+            vantage_direct_resolver_max_view: register_int_gauge_with_registry!(
+                "vantage_direct_resolver_max_view",
+                "Largest active view among target-local resolver instances",
                 registry,
             )
             .unwrap(),
-            vantage_control_delivered_len: register_int_gauge_with_registry!(
-                "vantage_control_delivered_len",
-                "Control-log entries delivered by reliable broadcast",
+            vantage_resolved_through_view: register_int_gauge_with_registry!(
+                "vantage_resolved_through_view",
+                "Largest contiguous data view known terminal",
                 registry,
             )
             .unwrap(),
-            vantage_control_consume_pos: register_int_gauge_with_registry!(
-                "vantage_control_consume_pos",
-                "Delivered control-log entries consumed",
+            vantage_direct_resolver_active_targets: register_int_gauge_with_registry!(
+                "vantage_direct_resolver_active_targets",
+                "Active target-local resolver instances",
                 registry,
             )
             .unwrap(),
@@ -1628,7 +1653,7 @@ impl Metrics {
             vantage_sequence_install_obsolete_inbound_dropped_total:
                 register_int_counter_with_registry!(
                     "vantage_sequence_install_obsolete_inbound_dropped_total",
-                    "Consensus/control/service messages discarded while a sequence install makes them stale",
+                    "Consensus/resolver/service messages discarded while a sequence install makes them stale",
                     registry,
                 )
                 .unwrap(),

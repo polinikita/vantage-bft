@@ -8,7 +8,8 @@
 #       --withhold-for 20
 #
 # --crash leaves the first N validators absent from genesis. --no-build reuses
-# vantage-docker-bench:latest. Other flags are passed to gen.py.
+# vantage-docker-bench:latest. --start-delay gives every container a common
+# future metrics/client epoch. Other flags are passed to gen.py.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -29,7 +30,10 @@ DURATION=60
 PROTOCOL=vantage
 CRASH=0
 BUILD_IMAGE=1
+START_DELAY=30
 EXTRA=()
+HOST_DATA_UID="$(id -u)"
+HOST_DATA_GID="$(id -g)"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -38,6 +42,7 @@ while [ $# -gt 0 ]; do
         --duration) DURATION="$2"; shift 2 ;;
         --protocol) PROTOCOL="$2"; shift 2 ;;
         --crash) CRASH="$2"; shift 2 ;;
+        --start-delay) START_DELAY="$2"; shift 2 ;;
         --no-build) BUILD_IMAGE=0; shift ;;
         -h|--help)
             sed -n '2,15p' "$SCRIPT_DIR/run.sh"
@@ -53,6 +58,9 @@ esac
 [ "$NODES" -gt 0 ] || { echo "run.sh: --nodes must be positive" >&2; exit 2; }
 case "$CRASH" in
     ''|*[!0-9]*) echo "run.sh: --crash must be a non-negative integer" >&2; exit 2 ;;
+esac
+case "$START_DELAY" in
+    ''|*[!0-9]*) echo "run.sh: --start-delay must be a non-negative integer" >&2; exit 2 ;;
 esac
 FAULT_BUDGET=$(( (NODES - 1) / 3 ))
 [ "$CRASH" -le "$FAULT_BUDGET" ] || {
@@ -86,10 +94,24 @@ disconnect_monitoring_network() {
     fi
 }
 
+repair_data_ownership() {
+    # Native-Linux bind mounts retain the root ownership created by the
+    # benchmark container. Restore the invoking user so the next generated
+    # scenario can rotate logs and RocksDB stores. Docker Desktop maps this
+    # back to the same host user as well.
+    [ -d "$SCRIPT_DIR/data" ] || return 0
+    docker image inspect vantage-docker-bench:latest >/dev/null 2>&1 || return 0
+    docker run --rm --entrypoint chown \
+        -v "$SCRIPT_DIR/data:/data" \
+        vantage-docker-bench:latest \
+        -R "$HOST_DATA_UID:$HOST_DATA_GID" /data >/dev/null
+}
+
 down_benchmark() {
     # Preserve Prometheus samples before removing the network.
     disconnect_monitoring_network
     docker compose -f docker-compose.yml down
+    repair_data_ownership
     BENCHMARK_RUNNING=0
 }
 
@@ -109,6 +131,9 @@ cleanup_on_exit() {
 trap cleanup_on_interrupt INT TERM
 trap cleanup_on_exit EXIT
 
+# Recover cleanly from an interrupted native-Linux run before regenerating.
+repair_data_ownership
+
 echo "==> [1/7] gen (nodes=$NODES crash=$CRASH rate=$RATE duration=$DURATION protocol=$PROTOCOL)"
 # Preserve empty-array behavior across Bash versions.
 python3 gen.py --nodes "$NODES" --crash "$CRASH" --rate "$RATE" --duration "$DURATION" --protocol "$PROTOCOL" \
@@ -126,6 +151,27 @@ else
         exit 1
     }
 fi
+
+# Arm one absolute epoch after the image build, so build time cannot consume a
+# finite fault window. Every primary, worker, and client receives this value.
+ACTIVE_AT_MS="$(python3 - "$START_DELAY" <<'PYEOF'
+import sys, time
+print(int(time.time() * 1000) + int(sys.argv[1]) * 1000)
+PYEOF
+)"
+python3 - "$ACTIVE_AT_MS" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+active = int(sys.argv[1])
+for name in ("parameters.json", "manifest.json"):
+    path = Path("data") / name
+    value = json.loads(path.read_text())
+    value["metrics_active_at_ms" if name == "parameters.json" else "active_at_ms"] = active
+    path.write_text(json.dumps(value, indent=2) + "\n")
+PYEOF
+export ACTIVATE_AT_MS="$ACTIVE_AT_MS"
+echo "    synchronized metrics/client epoch: $ACTIVE_AT_MS (${START_DELAY}s start delay)"
 
 echo "==> [3/7] starting $ACTIVE_COUNT/$NODES validators"
 BENCHMARK_RUNNING=1
@@ -203,9 +249,31 @@ echo "    validators, Prometheus, and Grafana ready after $((SECONDS - WAIT_STAR
 echo "    Grafana dashboard: http://localhost:3003/d/vantage-local-benchmark"
 echo "    Prometheus targets: http://localhost:9095/targets"
 
+NOW_MS="$(python3 -c 'import time;print(int(time.time()*1000))')"
+if [ "$NOW_MS" -ge "$ACTIVE_AT_MS" ]; then
+    echo "run.sh: validators became ready after the synchronized epoch; rerun with a larger --start-delay" >&2
+    down_benchmark || true
+    exit 1
+fi
+WAIT_SECONDS=$(( (ACTIVE_AT_MS - NOW_MS + 999) / 1000 ))
+if [ "$WAIT_SECONDS" -gt 0 ]; then
+    echo "    waiting ${WAIT_SECONDS}s for synchronized client/metrics activation"
+    sleep "$WAIT_SECONDS"
+fi
+
 echo "==> [6/7] running for ${DURATION}s (live timeline -- run blip.sh in another terminal to inject a blip)"
 # --watch reports progress and computes TPS over its measurement window.
 python3 results.py --watch --duration "$DURATION"
+
+ENDED_AT_MS="$(python3 -c 'import time;print(int(time.time()*1000))')"
+python3 - "$ENDED_AT_MS" <<'PYEOF'
+import json, sys
+from pathlib import Path
+path = Path("data/manifest.json")
+value = json.loads(path.read_text())
+value["ended_at_ms"] = int(sys.argv[1])
+path.write_text(json.dumps(value, indent=2) + "\n")
+PYEOF
 
 echo "==> [7/7] stopping validators"
 down_benchmark

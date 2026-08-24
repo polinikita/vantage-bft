@@ -157,6 +157,53 @@ impl Frontier {
         Some(ViewProposal { view, c, t, m })
     }
 
+    /// Benchmark-only Byzantine proposal used by the mixed-open stress. It
+    /// retains the ordinary core, names only this proposer's own current tip,
+    /// and deliberately ignores the local quarantine for that tip. The
+    /// quarantine state itself is preserved, so ordinary selection resumes as
+    /// soon as the finite fault window closes.
+    pub fn propose_view_mixed_open(
+        &mut self,
+        view: View,
+        lm: &LaneManager,
+    ) -> Option<ViewProposal> {
+        if view < self.min_live_view
+            || self.proposed.contains(&view)
+            || self.proposer(view) != self.name
+        {
+            return None;
+        }
+        self.proposed.insert(view);
+        self.own_proposal_turn = self.own_proposal_turn.saturating_add(1);
+        self.refresh_tip_quarantine(lm);
+
+        let mut seen = HashSet::new();
+        let mut c = Manifest::new();
+        for author in self.committee.authorities.keys() {
+            if let Some(reference) = lm.c_candidate(author) {
+                if seen.insert(reference.2.clone()) {
+                    c.push(reference);
+                }
+            }
+        }
+        let mut t = Manifest::new();
+        if let Some(reference) = lm
+            .confirmation_candidate(&self.name)
+            .or_else(|| lm.t_candidate(&self.name))
+        {
+            if seen.insert(reference.2.clone()) {
+                t.push(reference);
+            }
+        }
+        debug_assert!(formed(&self.committee, view, &c, &t, &None));
+        Some(ViewProposal {
+            view,
+            c,
+            t,
+            m: None,
+        })
+    }
+
     pub fn propose_view_batch(
         &mut self,
         view: View,

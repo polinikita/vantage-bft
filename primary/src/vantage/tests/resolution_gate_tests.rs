@@ -684,3 +684,100 @@ async fn d6_5_noready_counted_in_ready_stage_census_by_sender() {
         "noready counts as non-grade-1 too"
     );
 }
+
+#[tokio::test]
+async fn direct_resolver_fresh_vote_reuses_meta_ok_and_reports_origin() {
+    let (self_name, _) = authors()[3];
+    let (author_c, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(self_name, ".db_test_direct_resolver_fresh_vote");
+    let mut rep = new_repairer(self_name, &lm);
+    let mut agb = new_agb_engine(self_name);
+    let now = std::time::Instant::now();
+
+    let (c_ref, proposal) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    for (sender, _) in authors()
+        .into_iter()
+        .filter(|(sender, _)| *sender != self_name)
+        .take(2)
+    {
+        agb.on_echo(
+            Echo {
+                proposal: proposal.clone(),
+                grade: 1,
+                sender,
+                wish: 0,
+                origin: None,
+                avail: None,
+            },
+            &mut rep,
+        );
+    }
+    let entry = ResolutionEntry::Full(1, vec![c_ref], Vec::new());
+    assert_eq!(
+        agb.try_direct_resolution_vote(&entry, true, &mut lm),
+        Some(Some(1)),
+        "fresh direct ECHO must use the same target-local checks and origin as carrier MetaOK"
+    );
+}
+
+#[tokio::test]
+async fn direct_resolver_fresh_vote_waits_for_provisional_mix_to_close() {
+    let (self_name, _) = authors()[3];
+    let (author_c, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(self_name, ".db_test_direct_resolver_provisional_mix");
+    let mut rep = new_repairer(self_name, &lm);
+    let mut agb = new_agb_engine(self_name);
+    let now = std::time::Instant::now();
+
+    let (c_ref, proposal) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    for (sender, _) in authors()
+        .into_iter()
+        .filter(|(sender, _)| *sender != self_name)
+        .take(2)
+    {
+        agb.on_echo(
+            Echo {
+                proposal: proposal.clone(),
+                grade: 0,
+                sender,
+                wish: 0,
+                origin: None,
+                avail: None,
+            },
+            &mut rep,
+        );
+    }
+    let entry = ResolutionEntry::Full(1, vec![c_ref], Vec::new());
+    assert_eq!(agb.try_direct_resolution_vote(&entry, true, &mut lm), None);
+    agb.on_ready_timer(1, &mut rep);
+    assert!(agb.ready_finalized(1));
+    assert!(agb
+        .try_direct_resolution_vote(&entry, true, &mut lm)
+        .is_some());
+}
+
+#[tokio::test]
+async fn stable_backed_view_change_can_cross_one_local_skip_vote_stance() {
+    let (self_name, _) = authors()[3];
+    let (author_c, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(self_name, ".db_test_direct_resolver_skip_stance");
+    let mut rep = new_repairer(self_name, &lm);
+    let mut agb = new_agb_engine(self_name);
+    let now = std::time::Instant::now();
+
+    let chain = direct_chain(&mut lm, author_c, 1).await;
+    let entry = ResolutionEntry::Core(1, vec![block_ref(&chain[0])], Vec::new());
+    agb.enter(1, now, &mut lm, &mut rep);
+    agb.on_echo_absolute_timer(1, &mut rep);
+    agb.on_ready_timer(1, &mut rep);
+    for (sender, _) in authors() {
+        agb.on_echo_skip(1, sender);
+    }
+    assert_eq!(
+        agb.try_direct_resolution_vote(&entry, false, &mut lm),
+        Some(None),
+        "a stable Backed value proves that the conflicting skip-vote quorum cannot exist"
+    );
+}

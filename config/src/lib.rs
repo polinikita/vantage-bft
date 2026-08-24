@@ -9,7 +9,7 @@ use std::io::BufWriter;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -362,6 +362,16 @@ pub struct Parameters {
     /// live relay source for an optimistic tip.
     #[serde(default)]
     pub leader_relay_attack: bool,
+
+    /// Benchmark-only Vantage residual-view stress. Each selected Byzantine
+    /// publisher sends its lane only to `f` correct holders, withholds its
+    /// AGB/resolver responses during the configured finite window, and proposes
+    /// only its own partially published tip. Correct ECHOs therefore split
+    /// `f`/`n-2f`, completing the view without a homogeneous grade.
+    /// Keeping the direct group below `f+1` also prevents its ECHO-carried
+    /// availability claims from making the repaired tip author-valid elsewhere.
+    #[serde(default)]
+    pub vantage_mixed_open_stress: bool,
 
     /// Byzantine authors whose original header publication is delayed to a
     /// fixed receiver subset. Repair traffic is never delayed.
@@ -857,6 +867,7 @@ impl Default for Parameters {
             withhold_repair: false,
             withhold_headers: default_withhold_headers(),
             leader_relay_attack: false,
+            vantage_mixed_open_stress: false,
             late_header_publishers: Vec::new(),
             late_header_receivers: Vec::new(),
             late_header_delay_ms: 0,
@@ -920,6 +931,62 @@ impl Parameters {
                 self.timeout_delay = minimum;
             }
         }
+    }
+
+    /// Arms a serialized finite withholding window against the common metrics
+    /// epoch. Remote and Docker processes deserialize independent `Parameters`
+    /// values, so the absolute epoch is converted to each process's monotonic
+    /// clock after import. The in-process benchmark installs its shared window
+    /// directly and therefore bypasses this helper.
+    pub fn arm_withhold_window(&mut self) -> Result<bool, String> {
+        if self.withhold_at_ms.is_none() || self.withhold_window.is_some() {
+            return Ok(false);
+        }
+        let now_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock precedes UNIX epoch: {error}"))?
+            .as_millis() as u64;
+        self.arm_withhold_window_at(now_epoch_ms, Instant::now())
+    }
+
+    /// Deterministic form of [`Self::arm_withhold_window`] used by tests.
+    pub fn arm_withhold_window_at(
+        &mut self,
+        now_epoch_ms: u64,
+        now: Instant,
+    ) -> Result<bool, String> {
+        let Some(offset_ms) = self.withhold_at_ms else {
+            return Ok(false);
+        };
+        if self.withhold_window.is_some() {
+            return Ok(false);
+        }
+        let active_epoch_ms = self.metrics_active_at_ms.ok_or_else(|| {
+            "finite withholding requires metrics_active_at_ms as a common epoch".to_string()
+        })?;
+        let start_epoch_ms = active_epoch_ms
+            .checked_add(offset_ms)
+            .ok_or_else(|| "withholding start epoch overflows u64".to_string())?;
+        let end_epoch_ms = start_epoch_ms
+            .checked_add(self.withhold_for_ms)
+            .ok_or_else(|| "withholding end epoch overflows u64".to_string())?;
+
+        let to_instant = |epoch_ms: u64| {
+            if epoch_ms >= now_epoch_ms {
+                now.checked_add(Duration::from_millis(epoch_ms - now_epoch_ms))
+            } else {
+                now.checked_sub(Duration::from_millis(now_epoch_ms - epoch_ms))
+            }
+        };
+        let start = to_instant(start_epoch_ms)
+            .ok_or_else(|| "withholding start cannot be represented by Instant".to_string())?;
+        let end = to_instant(end_epoch_ms)
+            .ok_or_else(|| "withholding end cannot be represented by Instant".to_string())?;
+        let cell = Arc::new(OnceLock::new());
+        cell.set((start, end))
+            .map_err(|_| "withholding window was armed twice".to_string())?;
+        self.withhold_window = Some(cell);
+        Ok(true)
     }
 
     pub fn log(&self) {
@@ -1062,6 +1129,11 @@ impl Parameters {
                     "Leader-relay attack: each Byzantine lane has a fixed (f-1)-wide correct-holder group, staggered across lanes; every batch has f direct holders including its author, one below PoA"
                 );
             }
+            if self.vantage_mixed_open_stress {
+                info!(
+                    "Vantage mixed-open stress: each Byzantine proposer publishes its own tip to f correct holders and withholds AGB/resolver responses during the finite fault window"
+                );
+            }
         }
         if !self.late_header_publishers.is_empty() {
             info!(
@@ -1153,6 +1225,41 @@ impl Parameters {
             if publishers.len() >= n {
                 return Err(
                     "leader-relay attack requires at least one non-publisher target".to_string(),
+                );
+            }
+        }
+        if self.vantage_mixed_open_stress {
+            if self.protocol != Protocol::Vantage {
+                return Err("mixed-open stress is defined only for Vantage".to_string());
+            }
+            if self.leader_relay_attack {
+                return Err(
+                    "mixed-open stress and leader-relay attack are mutually exclusive".to_string(),
+                );
+            }
+            let fault_budget = n.saturating_sub(1) / 3;
+            if fault_budget == 0 {
+                return Err("mixed-open stress requires a positive fault budget".to_string());
+            }
+            let publishers =
+                withholding_publishers(committee, self.withhold_senders, &self.withhold_publishers);
+            if publishers.len() != fault_budget {
+                return Err(format!(
+                    "mixed-open stress requires exactly f={fault_budget} Byzantine publishers"
+                ));
+            }
+            if !self.withhold_headers || !self.withhold_repair {
+                return Err(
+                    "mixed-open stress requires header withholding and repair refusal".to_string(),
+                );
+            }
+            if self.withhold_at_ms.is_none() || self.withhold_for_ms == 0 {
+                return Err("mixed-open stress requires a nonempty finite fault window".to_string());
+            }
+            if self.withhold_count.is_some() || !self.withhold_receivers.is_empty() {
+                return Err(
+                    "mixed-open stress derives its f-correct-holder groups; omit explicit withholding destinations"
+                        .to_string(),
                 );
             }
         }
@@ -1628,6 +1735,57 @@ pub fn withheld_destinations(
     Some(
         (1..=width)
             .map(|offset| order[(i + offset * stride) % n])
+            .collect(),
+    )
+}
+
+/// Returns the destinations omitted by the deterministic mixed-open stress.
+///
+/// For `f=floor((n-1)/3)`, every Byzantine publisher sends its original lane
+/// traffic to exactly `f` correct validators and to no other peer. The `n-f`
+/// correct validators therefore split into `f` direct holders and `n-2f`
+/// repair-only holders. Staying below the `f+1` validity threshold prevents
+/// the direct holders' ECHO claims from upgrading the repaired group to grade
+/// 1.
+///
+/// The direct group rotates by publisher rank so one network region is not
+/// permanently assigned one grade.
+pub fn mixed_open_withheld_destinations(
+    committee: &Committee,
+    self_pk: &PublicKey,
+    withhold_senders: usize,
+    fixed_publishers: &[PublicKey],
+) -> Option<HashSet<PublicKey>> {
+    let publishers = withholding_publishers(committee, withhold_senders, fixed_publishers);
+    if !publishers.contains(self_pk) {
+        return None;
+    }
+    let publisher_order: Vec<_> = committee
+        .authorities
+        .keys()
+        .copied()
+        .filter(|key| publishers.contains(key))
+        .collect();
+    let correct: Vec<_> = committee
+        .authorities
+        .keys()
+        .copied()
+        .filter(|key| !publishers.contains(key))
+        .collect();
+    let fault_budget = committee.size().saturating_sub(1) / 3;
+    if correct.len() < fault_budget {
+        return None;
+    }
+    let rank = publisher_order.iter().position(|key| key == self_pk)?;
+    let direct: HashSet<_> = (0..fault_budget)
+        .map(|offset| correct[(rank + offset) % correct.len()])
+        .collect();
+    Some(
+        committee
+            .authorities
+            .keys()
+            .copied()
+            .filter(|key| key != self_pk && !direct.contains(key))
             .collect(),
     )
 }
@@ -2209,6 +2367,32 @@ mod tests {
     }
 
     #[test]
+    fn mixed_open_configuration_requires_full_fault_set_and_finite_window() {
+        let (committee, _) = Committee::local_benchmark(20, 1, 9000);
+        let mut params = Parameters {
+            protocol: Protocol::Vantage,
+            withhold_senders: 6,
+            withhold_repair: true,
+            withhold_headers: true,
+            withhold_at_ms: Some(1_000),
+            withhold_for_ms: 2_000,
+            vantage_mixed_open_stress: true,
+            ..Parameters::default()
+        };
+        let validation = params.validate_header_faults(&committee);
+        assert!(validation.is_ok(), "{validation:?}");
+
+        params.withhold_senders = 5;
+        assert!(params.validate_header_faults(&committee).is_err());
+        params.withhold_senders = 6;
+        params.withhold_at_ms = None;
+        assert!(params.validate_header_faults(&committee).is_err());
+        params.withhold_at_ms = Some(1_000);
+        params.withhold_count = Some(12);
+        assert!(params.validate_header_faults(&committee).is_err());
+    }
+
+    #[test]
     fn repair_suppression_requires_publishers_and_stride_must_be_coprime() {
         let (committee, _) = Committee::local_benchmark(20, 1, 9000);
         let mut params = Parameters {
@@ -2292,6 +2476,83 @@ mod tests {
             Some(&cell),
             base + Duration::from_secs(25)
         ));
+    }
+
+    #[test]
+    fn serialized_withhold_window_arms_from_common_epoch() {
+        let base = Instant::now();
+        let mut params = Parameters {
+            metrics_active_at_ms: Some(10_000),
+            withhold_at_ms: Some(1_000),
+            withhold_for_ms: 2_000,
+            ..Parameters::default()
+        };
+        assert!(params.arm_withhold_window_at(9_000, base).unwrap());
+        let window = params.withhold_window.as_deref().unwrap();
+        assert!(!withhold_active(
+            Some(window),
+            base + Duration::from_millis(1_999)
+        ));
+        assert!(withhold_active(
+            Some(window),
+            base + Duration::from_millis(2_000)
+        ));
+        assert!(withhold_active(
+            Some(window),
+            base + Duration::from_millis(3_999)
+        ));
+        assert!(!withhold_active(
+            Some(window),
+            base + Duration::from_millis(4_000)
+        ));
+        assert!(!params.arm_withhold_window_at(9_000, base).unwrap());
+    }
+
+    #[test]
+    fn finite_withholding_rejects_a_missing_common_epoch() {
+        let mut params = Parameters {
+            withhold_at_ms: Some(1_000),
+            ..Parameters::default()
+        };
+        assert!(params
+            .arm_withhold_window_at(9_000, Instant::now())
+            .unwrap_err()
+            .contains("metrics_active_at_ms"));
+    }
+
+    #[test]
+    fn mixed_open_mapping_uses_only_f_correct_holders() {
+        for n in [20, 31, 40] {
+            let (committee, _keypairs) = Committee::local_benchmark(n, 1, 9000);
+            let f = (n - 1) / 3;
+            let publishers = withholding_publishers(&committee, f, &[]);
+            assert_eq!(publishers.len(), f);
+            let correct: HashSet<_> = committee
+                .authorities
+                .keys()
+                .copied()
+                .filter(|key| !publishers.contains(key))
+                .collect();
+            let mut direct_groups = HashSet::new();
+            for publisher in &publishers {
+                let blocked = mixed_open_withheld_destinations(&committee, publisher, f, &[])
+                    .expect("publisher has a mixed-open omission set");
+                assert!(publishers
+                    .iter()
+                    .filter(|key| *key != publisher)
+                    .all(|key| blocked.contains(key)));
+                let direct_correct: HashSet<_> = correct
+                    .iter()
+                    .copied()
+                    .filter(|key| !blocked.contains(key))
+                    .collect();
+                assert_eq!(direct_correct.len(), f);
+                let mut canonical: Vec<_> = direct_correct.into_iter().collect();
+                canonical.sort();
+                direct_groups.insert(canonical);
+            }
+            assert!(direct_groups.len() > 1, "holder groups must rotate");
+        }
     }
 
     /// Reconnect replay defaults are enabled with a 2-second backoff ceiling.

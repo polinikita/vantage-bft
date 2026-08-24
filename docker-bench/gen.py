@@ -227,7 +227,7 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
             None if args.no_channel_auth
             else base64.b64encode(os.urandom(32)).decode()
         ),
-        "vantage_gc_window_views": 200,
+        "vantage_gc_window_views": args.vantage_gc_window_views,
         "simpleit_gc_window_rounds": 50,
         "ack_watermarks": not args.no_ack_watermarks,
         "ack_watermark_period_ms": args.ack_watermark_period_ms,
@@ -257,9 +257,12 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         "withhold_count": withhold_count,
         "withhold_stride": args.withhold_stride,
         "withhold_receivers": fixed_receivers,
-        "withhold_repair": args.withhold_repair or args.leader_relay,
+        "withhold_repair": (
+            args.withhold_repair or args.leader_relay or args.mixed_open_stress
+        ),
         "withhold_headers": not (args.withhold_batches_only or args.leader_relay),
         "leader_relay_attack": args.leader_relay,
+        "vantage_mixed_open_stress": args.mixed_open_stress,
         "withhold_at_ms": None if args.withhold_at is None else args.withhold_at * 1000,
         "withhold_for_ms": args.withhold_for * 1000,
         "resume_check_period_ms": 1000,
@@ -273,7 +276,12 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
 
 # Build one tc netem delay class per peer.
 def render_tc_script(
-    i: int, n: int, iface_hint: str, enabled: bool, egress_mbps: int = 0
+    i: int,
+    n: int,
+    iface_hint: str,
+    enabled: bool,
+    egress_mbps: int = 0,
+    netem_limit_pkts: int = NETEM_LIMIT_PKTS,
 ) -> str:
     lines = [
         "#!/usr/bin/env bash",
@@ -325,9 +333,10 @@ def render_tc_script(
             f'tc class add dev "$IFACE" parent 1:1 classid 1:{mid} htb '
             f'rate {egress_rate} ceil {egress_rate} quantum 60000'
         )
-        # Set a large queue for high-RTT links.
+        # Keep enough queue for high-RTT links without exhausting host kernel
+        # buffers when a diagnostic instantiates many local validators.
         lines.append(f'tc qdisc add dev "$IFACE" parent 1:{mid} handle {mid}: '
-                     f'netem limit {NETEM_LIMIT_PKTS} delay {delay:.1f}ms')
+                     f'netem limit {netem_limit_pkts} delay {delay:.1f}ms')
         lines.append(
             f'tc filter add dev "$IFACE" protocol ip parent 1:0 prio 1 u32 '
             f'match ip dst {peer_ip}/32 flowid 1:{mid}'
@@ -408,6 +417,7 @@ def render_compose(
             f"      TX_SIZE: \"{args.tx_size}\"",
             f"      TX_MODE: \"{args.mode}\"",
             f"      PROTOCOL: \"{args.protocol}\"",
+            '      ACTIVATE_AT_MS: "${ACTIVATE_AT_MS:-}"',
             # RUST_LOG overrides the default filter.
             *([f"      RUST_LOG: \"{args.rust_log}\""] if args.rust_log else []),
             "    volumes:",
@@ -459,6 +469,7 @@ def write_manifest(
     load_node_indices: list[int],
     adversarial_node_indices: list[int],
     uncounted_load_indices: list[int],
+    withholding_node_indices: list[int],
 ) -> None:
     load_rates = distribute_rate(args.rate, load_node_indices)
     uncounted_load = set(uncounted_load_indices)
@@ -490,13 +501,17 @@ def write_manifest(
         ),
         "vantage_compact_ids": not args.no_compact_ids,
         "withhold_senders": args.withhold,
+        "withholding_node_indices": withholding_node_indices,
         "withhold_publisher_stride": args.withhold_publisher_stride,
         "withhold_count": args.nodes - 1 if args.leader_relay else args.withhold_count,
         "withhold_stride": args.withhold_stride,
         "withhold_fixed_receivers": args.withhold_fixed_receivers,
         "withhold_batches_only": args.withhold_batches_only or args.leader_relay,
-        "withhold_repair": args.withhold_repair or args.leader_relay,
+        "withhold_repair": (
+            args.withhold_repair or args.leader_relay or args.mixed_open_stress
+        ),
         "leader_relay_attack": args.leader_relay,
+        "vantage_mixed_open_stress": args.mixed_open_stress,
         "leader_relay_batch_interval_ms": args.delta_ms if args.leader_relay else 0,
         "leader_relay_holder_group_mode": (
             "fixed-per-lane" if args.leader_relay else "disabled"
@@ -508,6 +523,12 @@ def write_manifest(
             args.withhold - 1 if args.leader_relay else 0
         ),
         "leader_relay_direct_holders": args.withhold if args.leader_relay else 0,
+        "mixed_open_correct_grade_one": (
+            (args.nodes - 1) // 3 if args.mixed_open_stress else 0
+        ),
+        "mixed_open_correct_grade_zero": (
+            args.nodes - 2 * ((args.nodes - 1) // 3) if args.mixed_open_stress else 0
+        ),
         "correct_load_only": args.correct_load_only,
         "load_node_indices": load_node_indices,
         "uncounted_load_node_indices": uncounted_load_indices,
@@ -515,6 +536,7 @@ def write_manifest(
         "adversarial_rate": args.adversarial_rate,
         "adversarial_node_indices": adversarial_node_indices,
         "egress_mbps": args.egress_mbps,
+        "netem_limit_pkts": args.netem_limit_pkts,
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -545,12 +567,22 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--egress-mbps", type=int, default=0,
                    help="aggregate per-container egress cap in Mbit/s; zero keeps the "
                         "historical 10 Gbit/s shaping ceiling")
+    p.add_argument(
+        "--netem-limit-pkts",
+        type=int,
+        default=NETEM_LIMIT_PKTS,
+        help=f"per-peer netem queue limit in packets (default {NETEM_LIMIT_PKTS})",
+    )
     p.add_argument("--node-bin", default=None, help="path to a prebuilt `node` binary "
                     "(default: target/release/node, built on demand)")
     p.add_argument("--subnet-base", default="172.28", metavar="A.B",
                     help="first two octets of the /16 docker bridge network (default "
                     "172.28, per spec); override only if that address space collides "
                     "with another docker-compose project already on this host")
+    p.add_argument("--host-primary-metrics-base", type=int, default=9000,
+                   help="first host port for primary metrics (default 9000)")
+    p.add_argument("--host-worker-metrics-base", type=int, default=9100,
+                   help="first host port for worker metrics (default 9100)")
     # Match local-benchmark parameter names.
     p.add_argument("--delta-ms", type=int, default=200)
     p.add_argument("--timeout-delay-ms", type=int, default=None,
@@ -573,6 +605,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="use periodic VantageAvail watermarks instead of echo claims")
     p.add_argument("--no-state-sync", action="store_true",
                    help="disable sequence checkpoint state sync and installation")
+    p.add_argument("--vantage-gc-window-views", type=int, default=200,
+                   help="retained Vantage view window (default 200; use a larger value "
+                        "when auditing recovery without state-sync installation)")
     p.add_argument("--sequence-checkpoint-interval", type=int, default=20,
                    help="checkpoint boundary interval K in views; must be small "
                         "enough that the run crosses several boundaries on 2+ nodes")
@@ -625,6 +660,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="keep each Byzantine batch at its author and narrowcast it only to an (f-1)-wide "
              "fixed correct group, staggered across Byzantine lanes (f direct holders, one below PoA); implies batch-only "
              "withholding from every other peer and repair refusal",
+    )
+    p.add_argument(
+        "--mixed-open-stress",
+        action="store_true",
+        help="Vantage-only finite residual-view stress: each of f Byzantine publishers "
+             "narrowcasts its own tip to f correct holders and withholds AGB/resolver "
+             "responses during --withhold-at/--withhold-for",
     )
     p.add_argument("--correct-load-only", action="store_true",
                    help="distribute counted client load only across non-withholding authors")
@@ -690,6 +732,27 @@ def parse_args(argv=None) -> argparse.Namespace:
             "--leader-relay uses one uniform total load and marks the Byzantine share "
             "uncounted; omit --correct-load-only and --adversarial-rate"
         )
+    if args.mixed_open_stress:
+        if args.protocol != "vantage":
+            p.error("--mixed-open-stress requires --protocol vantage")
+        if args.withhold != fault_budget or fault_budget == 0:
+            p.error(
+                f"--mixed-open-stress requires exactly f={fault_budget} withholding publishers"
+            )
+        if args.withhold_at is None or args.withhold_for <= 0:
+            p.error("--mixed-open-stress requires --withhold-at and positive --withhold-for")
+        if args.withhold_count is not None or args.withhold_fixed_receivers:
+            p.error(
+                "--mixed-open-stress derives its holder groups; omit --withhold-count "
+                "and --withhold-fixed-receivers"
+            )
+        if args.withhold_batches_only or args.leader_relay:
+            p.error("--mixed-open-stress cannot be combined with batch-only/leader-relay modes")
+        if not args.correct_load_only or args.adversarial_rate <= 0:
+            p.error(
+                "--mixed-open-stress requires --correct-load-only and positive "
+                "--adversarial-rate so attacked data is uncounted"
+            )
     if args.correct_load_only and args.withhold == 0:
         p.error("--correct-load-only requires --withhold > 0")
     if args.correct_load_only and args.withhold == args.nodes:
@@ -700,10 +763,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--adversarial-rate requires --withhold > 0")
     if args.egress_mbps < 0:
         p.error("--egress-mbps must be non-negative")
+    if args.netem_limit_pkts < 1:
+        p.error("--netem-limit-pkts must be positive")
     if args.withhold_at is not None and args.withhold == 0:
         p.error("--withhold-at requires --withhold > 0")
     if args.sequence_checkpoint_interval < 1:
         p.error("--sequence-checkpoint-interval must be at least 1")
+    if args.vantage_gc_window_views < 1:
+        p.error("--vantage-gc-window-views must be at least 1")
     if args.sequence_sync_min_gap_views < 0:
         p.error("--sequence-sync-min-gap-views must be non-negative")
     if args.sequence_sync_rearm_gap_views < 0:
@@ -721,15 +788,27 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--sequence-sync-chunk-outcome-items must be at least 1")
     if not re.fullmatch(r"\d{1,3}\.\d{1,3}", args.subnet_base):
         p.error("--subnet-base must look like 'A.B' (e.g. 172.28)")
+    metric_ranges = []
+    for label, base in (
+        ("--host-primary-metrics-base", args.host_primary_metrics_base),
+        ("--host-worker-metrics-base", args.host_worker_metrics_base),
+    ):
+        if base < 1 or base + args.nodes - 1 > 65_535:
+            p.error(f"{label} must leave room for all {args.nodes} host ports")
+        metric_ranges.append(set(range(base, base + args.nodes)))
+    if metric_ranges[0] & metric_ranges[1]:
+        p.error("primary and worker host-metrics port ranges must not overlap")
     return args
 
 
 def main(argv=None) -> None:
-    global SUBNET, NODE_IP_PREFIX
+    global SUBNET, NODE_IP_PREFIX, HOST_PRIMARY_METRICS_BASE, HOST_WORKER_METRICS_BASE
     args = parse_args(argv)
     n = args.nodes
     SUBNET = f"{args.subnet_base}.0.0/16"
     NODE_IP_PREFIX = f"{args.subnet_base}.1."
+    HOST_PRIMARY_METRICS_BASE = args.host_primary_metrics_base
+    HOST_WORKER_METRICS_BASE = args.host_worker_metrics_base
 
     # Keep the bind-mount root stable across back-to-back Docker Desktop runs.
     # Removing and recreating the root can race the host file-sharing layer,
@@ -788,6 +867,7 @@ def main(argv=None) -> None:
             iface_hint="eth0",
             enabled=args.latency,
             egress_mbps=args.egress_mbps,
+            netem_limit_pkts=args.netem_limit_pkts,
         )
         script_path = DATA_DIR / f"node-{i}" / "tc-setup.sh"
         script_path.write_text(script)
@@ -800,6 +880,7 @@ def main(argv=None) -> None:
         load_node_indices,
         adversarial_node_indices,
         uncounted_load_indices,
+        withholding_indices,
     )
 
     print("-- writing prometheus.yaml")
@@ -838,6 +919,12 @@ def main(argv=None) -> None:
             f"node(s) {uncounted_load_indices}; author plus an (f-1)-wide correct "
             f"group fixed per lane (f direct holders, one below PoA); lane groups are "
             f"staggered across every correct leader"
+        )
+    if args.mixed_open_stress:
+        fault_budget = (n - 1) // 3
+        print(
+            "   mixed-open stress: Byzantine proposer plus no Byzantine AGB/resolver "
+            f"responses; correct ECHOs split {fault_budget}/{n - 2 * fault_budget}"
         )
     print(f"   data dir: {DATA_DIR}")
     print(f"   compose file: {COMPOSE_PATH}")

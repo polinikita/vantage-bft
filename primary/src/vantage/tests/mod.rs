@@ -28,9 +28,9 @@ mod wish_trigger_tests;
 
 mod resolution_gate_tests;
 
-mod resolve_tests;
+mod resolution_evidence_tests;
 
-mod control_tests;
+mod direct_resolution_tests;
 
 mod byzantine_tests;
 

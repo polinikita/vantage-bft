@@ -3,10 +3,12 @@ pub mod avail;
 pub mod block;
 pub mod claim;
 pub mod cursor;
+pub mod direct_resolution;
 pub mod frontier;
 pub(crate) mod index;
 pub mod install;
 pub mod lanes;
+mod legacy_control_wire;
 pub mod node;
 pub mod outbox;
 pub mod pacemaker;
@@ -14,7 +16,7 @@ pub mod payload;
 #[cfg(feature = "pipeline-tracing")]
 mod pipeline;
 pub mod repair;
-pub mod resolve;
+pub mod resolution_evidence;
 pub mod resume;
 pub mod sequence;
 pub mod threshold;
@@ -27,12 +29,19 @@ pub use agb::{
 };
 pub use block::BlockRef;
 pub use cursor::Cursor;
+pub use direct_resolution::{
+    DirectResolutionDone, DirectResolutionEffect, DirectResolutionPhase, DirectResolutionProof,
+    DirectResolutionProposal, DirectResolutionStatement, DirectResolutionSuggest,
+    DirectResolutionValueFetch, DirectResolutionValueServe, DirectResolutionVote,
+    DirectResolutionWish, DirectResolutionWitness, DirectResolver, DirectResolverView,
+};
 pub use frontier::Frontier;
 pub use lanes::{AvailEntry, BlockCache, BlockEntry, LaneManager, SharedBlocks};
+pub use legacy_control_wire::LegacyControlProposal;
 pub use node::VantageCore;
 pub use pacemaker::Pacemaker;
 pub use repair::Repairer;
-pub use resolve::Resolver;
+pub use resolution_evidence::ResolutionEvidence;
 pub use threshold::Thresholds;
 
 use crate::messages::{Ack, Header};
@@ -98,24 +107,8 @@ pub enum Effect {
     /// Restores this node's lane from a checkpoint-certified committed header.
     RecoverOwnLane(Header),
 
-    /// Reports the first genuine completion of a proposal carrying recovery entries.
-    CompletionReportable(View, ProposalOut),
-    BroadcastCompReport(View, Digest),
-    BroadcastControlInit(control::ControlProposal, Option<ProposalOut>),
-    BroadcastControlEcho(control::ControlProposal),
-    BroadcastControlReady(control::ControlProposal),
-    /// Broadcasts the control protocol's commit vote.
-    BroadcastControlCommit(Round),
-    BroadcastControlTimeoutVote(Round),
-    BroadcastControlTimeoutAccept(Round),
-    ControlFetchTo(PublicKey, View, Digest),
-    /// Serves a held, verified control proposal body.
-    ControlServeTo(PublicKey, View, ProposalOut),
-    /// Arms a control-round timer at an absolute deadline.
-    ArmControlTimer(Round, Instant),
-
-    /// Applies an anchor outcome and its authorized non-skip block references.
-    ApplyAnchor(View, Outcome, Vec<BlockRef>),
+    /// Executes one step of the experimental per-target resolver.
+    DirectResolution(DirectResolutionEffect),
 
     BodyFetchTo(PublicKey, View, Digest),
     /// Serves a requested AGB proposal body.
@@ -126,9 +119,6 @@ pub enum Effect {
     /// Carries authenticated positional claims for local ancestry resolution.
     AvailClaimed(PublicKey, Vec<claim::ClaimRef>),
 }
-
-pub mod control;
-pub use control::{ControlLog, ControlProposal, Round};
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]

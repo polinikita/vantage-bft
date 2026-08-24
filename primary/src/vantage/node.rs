@@ -4,10 +4,15 @@ use crate::messages::{Ack, Header};
 use crate::primary::{Height, PrimaryMessage, View, CHANNEL_CAPACITY};
 use crate::vantage::agb::{
     AgbEngine, DigestStatements, EchoDigest, EchoOut, ProposalOut, ReadyDigest, ReadyOut,
-    TimerKind, ViewProposal,
+    ResolutionEntry, TimerKind, ViewProposal,
 };
 use crate::vantage::block::{self, BlockRef};
-use crate::vantage::control::{ControlLog, ControlProposal, Round};
+use crate::vantage::direct_resolution::{
+    DirectResolutionDone, DirectResolutionEffect, DirectResolutionProof, DirectResolutionProposal,
+    DirectResolutionStatement, DirectResolutionSuggest, DirectResolutionValueFetch,
+    DirectResolutionValueServe, DirectResolutionVote, DirectResolutionWish,
+    DirectResolutionWitness, DirectResolver, DirectResolverView,
+};
 
 /// Maximum retained certified checkpoint candidates.
 const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
@@ -47,7 +52,7 @@ use crate::vantage::outbox::Outbox;
 use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::payload::{append_missing_payload_sync, block_was_cached, PayloadIo};
 use crate::vantage::repair::Repairer;
-use crate::vantage::resolve::Resolver;
+use crate::vantage::resolution_evidence::ResolutionEvidence;
 use crate::vantage::resume::{
     in_flight_state, InFlightEntry, InFlightState, NudgeMemo, ReplayEpisodes, ResumeServe,
     ResumeTrigger, ServeBudget,
@@ -90,13 +95,26 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
+#[cfg(feature = "benchmark")]
+fn recovery_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Capacity of the droppable service-request queue.
 const BULK_CHANNEL_CAPACITY: usize = 2048;
+
+/// Bounds target-indexed resolver state created by authenticated Byzantine
+/// members ahead of this node's data-plane frontier.  Later correct WISHes are
+/// retried by the resolver timer, and a decided peer answers them with DONE.
+const DIRECT_RESOLUTION_FUTURE_TARGET_WINDOW: View = 256;
 
 /// Messages delivered to the Vantage core.
 #[derive(Debug, Clone)]
@@ -131,18 +149,15 @@ pub enum Inbound {
 
     Wish(View, PublicKey),
 
-    CompReport(View, Digest, PublicKey),
-
-    /// The sender is derived from the control round because the frame has no sender field.
-    ControlInit(ControlProposal, Option<ProposalOut>),
-    ControlEcho(PublicKey, ControlProposal),
-    ControlReady(PublicKey, ControlProposal),
-    ControlCommit(PublicKey, Round),
-    ControlTimeoutVote(PublicKey, Round),
-    ControlTimeoutAccept(PublicKey, Round),
-    ControlFetch(View, Digest, PublicKey),
-
-    ControlServe(View, ProposalOut),
+    DirectResolutionWish(DirectResolutionWish),
+    DirectResolutionSuggest(DirectResolutionSuggest),
+    DirectResolutionProof(DirectResolutionProof),
+    DirectResolutionProposal(DirectResolutionProposal),
+    DirectResolutionStatement(DirectResolutionStatement),
+    DirectResolutionWitness(DirectResolutionWitness),
+    DirectResolutionDone(DirectResolutionDone),
+    DirectResolutionValueFetch(DirectResolutionValueFetch),
+    DirectResolutionValueServe(DirectResolutionValueServe),
 
     /// Skip votes do not carry a wish watermark.
     SkipVote(View, PublicKey),
@@ -187,12 +202,27 @@ const INBOUND_FAMILY_LABELS: [&str; 8] = [
     "in_ready",
     "in_avail",
     "in_propose",
-    "in_control",
+    "in_resolver",
     "in_serve",
     "in_sync",
 ];
 
 impl Inbound {
+    fn direct_resolution_target(&self) -> Option<View> {
+        match self {
+            Inbound::DirectResolutionWish(message) => Some(message.target),
+            Inbound::DirectResolutionSuggest(message) => Some(message.target),
+            Inbound::DirectResolutionProof(message) => Some(message.target),
+            Inbound::DirectResolutionProposal(message) => Some(message.target),
+            Inbound::DirectResolutionStatement(message) => Some(message.target),
+            Inbound::DirectResolutionWitness(message) => Some(message.target),
+            Inbound::DirectResolutionDone(message) => Some(message.target),
+            Inbound::DirectResolutionValueFetch(message) => Some(message.target),
+            Inbound::DirectResolutionValueServe(message) => Some(message.target),
+            _ => None,
+        }
+    }
+
     /// Returns the `INBOUND_FAMILY_LABELS` index for this input, grouped by purpose.
     ///
     /// The match is exhaustive so that a new variant must be classified here.
@@ -203,18 +233,18 @@ impl Inbound {
             Inbound::Ready(_) | Inbound::NoReady(_, _, _) | Inbound::ReadyDigest(_) => 2,
             Inbound::Ack(_) | Inbound::AckAvailability(_) | Inbound::Avail(_, _) => 3,
             Inbound::Propose(_) => 4,
-            Inbound::ControlInit(_, _)
-            | Inbound::ControlEcho(_, _)
-            | Inbound::ControlReady(_, _)
-            | Inbound::ControlCommit(_, _)
-            | Inbound::ControlTimeoutVote(_, _)
-            | Inbound::ControlTimeoutAccept(_, _)
+            Inbound::DirectResolutionWish(_)
+            | Inbound::DirectResolutionSuggest(_)
+            | Inbound::DirectResolutionProof(_)
+            | Inbound::DirectResolutionProposal(_)
+            | Inbound::DirectResolutionStatement(_)
+            | Inbound::DirectResolutionWitness(_)
+            | Inbound::DirectResolutionDone(_)
             | Inbound::Wish(_, _)
-            | Inbound::CompReport(_, _, _)
             | Inbound::SkipVote(_, _) => 5,
             Inbound::HeadersRequest(_, _)
             | Inbound::LaneResume(_, _, _)
-            | Inbound::ControlFetch(_, _, _)
+            | Inbound::DirectResolutionValueFetch(_)
             | Inbound::BodyFetch(_, _, _)
             | Inbound::SequenceRequest(_, _)
             | Inbound::SequenceDeltaRequest(_, _)
@@ -222,7 +252,7 @@ impl Inbound {
             | Inbound::SequenceOutcomeRequest(_, _)
             | Inbound::SequenceHeadersRequest(_, _) => 6,
             Inbound::Serve(_)
-            | Inbound::ControlServe(_, _)
+            | Inbound::DirectResolutionValueServe(_)
             | Inbound::BodyServe(_, _)
             | Inbound::ResumeHello(_, _)
             | Inbound::ReplayDone(_, _, _, _)
@@ -242,7 +272,6 @@ impl Inbound {
         matches!(
             self,
             Inbound::HeadersRequest(_, _)
-                | Inbound::ControlFetch(_, _, _)
                 | Inbound::BodyFetch(_, _, _)
                 | Inbound::LaneResume(_, _, _)
                 | Inbound::ResumeHello(_, _)
@@ -294,12 +323,15 @@ impl Inbound {
             Inbound::Ready(r) => Some(r.proposal_view()),
             Inbound::NoReady(view, _, _) => Some(*view),
             Inbound::Wish(view, _) => Some(*view),
-            Inbound::CompReport(view, _, _) => Some(*view),
-            Inbound::ControlInit(proposal, _) => proposal.value.as_ref().map(|(view, _)| *view),
-            Inbound::ControlEcho(_, proposal) => proposal.value.as_ref().map(|(view, _)| *view),
-            Inbound::ControlReady(_, proposal) => proposal.value.as_ref().map(|(view, _)| *view),
-            Inbound::ControlFetch(view, _, _) => Some(*view),
-            Inbound::ControlServe(view, _) => Some(*view),
+            Inbound::DirectResolutionWish(message) => Some(message.target),
+            Inbound::DirectResolutionSuggest(message) => Some(message.target),
+            Inbound::DirectResolutionProof(message) => Some(message.target),
+            Inbound::DirectResolutionProposal(message) => Some(message.target),
+            Inbound::DirectResolutionStatement(message) => Some(message.target),
+            Inbound::DirectResolutionWitness(message) => Some(message.target),
+            Inbound::DirectResolutionDone(message) => Some(message.target),
+            Inbound::DirectResolutionValueFetch(message) => Some(message.target),
+            Inbound::DirectResolutionValueServe(message) => Some(message.target),
             Inbound::SkipVote(view, _) => Some(*view),
             Inbound::EchoDigest(msg) => Some(msg.view),
             Inbound::ReadyDigest(msg) => Some(msg.view),
@@ -331,6 +363,7 @@ fn author_label(author: &PublicKey) -> String {
 pub struct VantageReceiverHandler {
     pub tx: Sender<Inbound>,
     pub(crate) codec: wire::VantageWireCodec,
+    pub committee: Committee,
 
     /// Full bulk queues drop requests that the requester can retry.
     pub tx_bulk: Sender<Inbound>,
@@ -359,17 +392,130 @@ impl VantageReceiverHandler {
     }
 }
 
+/// Returns the first-hand sender a Vantage wire message must arrive from.
+/// Sender-less repair responses are validated against local request state instead.
+fn expected_vantage_sender(committee: &Committee, message: &PrimaryMessage) -> Option<PublicKey> {
+    match message {
+        PrimaryMessage::Header(header, false) => Some(header.author),
+        PrimaryMessage::HeadersRequest(_, requester) => Some(*requester),
+        PrimaryMessage::VantageAck(ack) => Some(ack.sender),
+        PrimaryMessage::VantageAvail(_, sender)
+        | PrimaryMessage::VantageEchoSkip(_, sender, _)
+        | PrimaryMessage::VantageNoReady(_, sender, _)
+        | PrimaryMessage::VantageWish(_, sender)
+        | PrimaryMessage::VantageSkipVote(_, sender)
+        | PrimaryMessage::VantageResumeHello(_, sender)
+        | PrimaryMessage::VantageReplayDone(_, _, _, sender)
+        | PrimaryMessage::VantageSequenceAnnounceBatch(_, sender)
+        | PrimaryMessage::VantageSequenceHeaders(_, sender) => Some(*sender),
+        PrimaryMessage::VantagePropose(proposal) => {
+            Some(crate::vantage::agb::proposer(committee, proposal.view))
+        }
+        PrimaryMessage::VantageProposeBatch(proposal) => {
+            Some(crate::vantage::agb::proposer(committee, proposal.view))
+        }
+        PrimaryMessage::VantageEcho(echo) => Some(echo.sender),
+        PrimaryMessage::VantageReady(ready) => Some(ready.sender),
+        PrimaryMessage::VantageEchoBatch(echo) => Some(echo.sender),
+        PrimaryMessage::VantageReadyBatch(ready) => Some(ready.sender),
+        PrimaryMessage::VantageEchoDigest(message) => Some(message.sender),
+        PrimaryMessage::VantageReadyDigest(message) => Some(message.sender),
+        PrimaryMessage::VantageBodyFetch(_, _, requester)
+        | PrimaryMessage::VantageLaneResume(_, _, requester)
+        | PrimaryMessage::VantageSequenceHeadersRequest(_, requester) => Some(*requester),
+        PrimaryMessage::VantageSequenceAnnounce(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceRecords(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceDeltaRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceDelta(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceDeltaRangeRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceDeltaRange(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceOutcomeRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceOutcome(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceUnavailable(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionWish(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionSuggest(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionProof(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionProposal(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionStatement(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionWitness(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionDone(message) => Some(message.sender),
+        PrimaryMessage::VantageDirectResolutionValueFetch(message) => Some(message.requester),
+        PrimaryMessage::Header(_, true)
+        | PrimaryMessage::Vote(..)
+        | PrimaryMessage::Certificate(..)
+        | PrimaryMessage::Timeout(..)
+        | PrimaryMessage::TC(..)
+        | PrimaryMessage::ConsensusMessage(..)
+        | PrimaryMessage::ConsensusRequest(..)
+        | PrimaryMessage::ConsensusVote(..)
+        | PrimaryMessage::CertificatesRequest(..)
+        | PrimaryMessage::ProposalHeadersRequest(..)
+        | PrimaryMessage::CompReport(..)
+        | PrimaryMessage::ControlInit(..)
+        | PrimaryMessage::ControlEcho(..)
+        | PrimaryMessage::ControlReady(..)
+        | PrimaryMessage::ControlFetch(..)
+        | PrimaryMessage::ControlServe(..)
+        | PrimaryMessage::ControlCommit(..)
+        | PrimaryMessage::ControlTimeoutVote(..)
+        | PrimaryMessage::ControlTimeoutAccept(..)
+        | PrimaryMessage::SimpleItCutProposal(..)
+        | PrimaryMessage::SimpleItCutVote(..)
+        | PrimaryMessage::SimpleItDecide(..)
+        | PrimaryMessage::SimpleItTimeout(..)
+        | PrimaryMessage::SimpleItTimeoutAccept(..)
+        | PrimaryMessage::SimpleItCutFetch(..)
+        | PrimaryMessage::SimpleItCutServe(..)
+        | PrimaryMessage::ControlInitBatch(..)
+        | PrimaryMessage::ControlServeBatch(..)
+        | PrimaryMessage::VantageBodyServe(..)
+        | PrimaryMessage::SimpleItCutReady(..)
+        | PrimaryMessage::PrepareHeadersRequest(..)
+        | PrimaryMessage::ProposalHeaders(..)
+        | PrimaryMessage::VantageDirectResolutionValueServe(..) => None,
+    }
+}
+
+fn authenticated_vantage_sender_matches(
+    committee: &Committee,
+    peer_index: u8,
+    message: &PrimaryMessage,
+) -> bool {
+    let Some(peer) = committee
+        .authorities
+        .keys()
+        .nth(peer_index as usize)
+        .copied()
+    else {
+        return false;
+    };
+    expected_vantage_sender(committee, message).is_none_or(|sender| sender == peer)
+}
+
 #[async_trait]
 impl MessageHandler for VantageReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         let message = self.codec.deserialize(&serialized)?;
 
         if let Some(metrics) = &self.metrics {
             crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
+        }
+        if authenticated_peer.is_some_and(|index| {
+            !authenticated_vantage_sender_matches(&self.committee, index, &message)
+        }) {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .primary_ingress_verify_failures_total
+                    .with_label_values(&[message.type_name()])
+                    .inc();
+            }
+            return Ok(());
         }
         let inbound = match message {
             PrimaryMessage::Header(h, false) => Inbound::Publish(h.author, h),
@@ -392,27 +538,9 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageReady(r) => Inbound::Ready(ReadyOut::Single(r)),
             PrimaryMessage::VantageNoReady(v, s, w) => Inbound::NoReady(v, s, w),
             PrimaryMessage::VantageWish(v, s) => Inbound::Wish(v, s),
-            PrimaryMessage::CompReport(v, d, s) => Inbound::CompReport(v, d, s),
-            PrimaryMessage::ControlInit(p, b) => {
-                Inbound::ControlInit(p, b.map(ProposalOut::Single))
-            }
-            PrimaryMessage::ControlEcho(p, s) => Inbound::ControlEcho(s, p),
-            PrimaryMessage::ControlReady(p, s) => Inbound::ControlReady(s, p),
-            PrimaryMessage::ControlCommit(r, s) => Inbound::ControlCommit(s, r),
-            PrimaryMessage::ControlTimeoutVote(r, s) => Inbound::ControlTimeoutVote(s, r),
-            PrimaryMessage::ControlTimeoutAccept(r, s) => Inbound::ControlTimeoutAccept(s, r),
-            PrimaryMessage::ControlFetch(v, d, s) => Inbound::ControlFetch(v, d, s),
-            PrimaryMessage::ControlServe(v, p) => Inbound::ControlServe(v, ProposalOut::Single(p)),
-
             PrimaryMessage::VantageProposeBatch(p) => Inbound::Propose(ProposalOut::Batch(p)),
             PrimaryMessage::VantageEchoBatch(e) => Inbound::Echo(EchoOut::Batch(e)),
             PrimaryMessage::VantageReadyBatch(r) => Inbound::Ready(ReadyOut::Batch(r)),
-            PrimaryMessage::ControlInitBatch(p, b) => {
-                Inbound::ControlInit(p, b.map(ProposalOut::Batch))
-            }
-            PrimaryMessage::ControlServeBatch(v, p) => {
-                Inbound::ControlServe(v, ProposalOut::Batch(p))
-            }
             PrimaryMessage::VantageSkipVote(v, s) => Inbound::SkipVote(v, s),
 
             PrimaryMessage::VantageEchoDigest(d) => Inbound::EchoDigest(d),
@@ -480,6 +608,49 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageSequenceHeaders(headers, sender) => {
                 Inbound::SequenceHeaders(headers, sender)
             }
+
+            PrimaryMessage::VantageDirectResolutionWish(message) => {
+                Inbound::DirectResolutionWish(message)
+            }
+            PrimaryMessage::VantageDirectResolutionSuggest(message) => {
+                Inbound::DirectResolutionSuggest(message)
+            }
+            PrimaryMessage::VantageDirectResolutionProof(message) => {
+                Inbound::DirectResolutionProof(message)
+            }
+            PrimaryMessage::VantageDirectResolutionProposal(message) => {
+                Inbound::DirectResolutionProposal(message)
+            }
+            PrimaryMessage::VantageDirectResolutionStatement(message) => {
+                Inbound::DirectResolutionStatement(message)
+            }
+            PrimaryMessage::VantageDirectResolutionWitness(message) => {
+                Inbound::DirectResolutionWitness(message)
+            }
+            PrimaryMessage::VantageDirectResolutionDone(message) => {
+                Inbound::DirectResolutionDone(message)
+            }
+            PrimaryMessage::VantageDirectResolutionValueFetch(message) => {
+                Inbound::DirectResolutionValueFetch(message)
+            }
+            PrimaryMessage::VantageDirectResolutionValueServe(message) => {
+                Inbound::DirectResolutionValueServe(message)
+            }
+
+            // Retired Vantage control paths retain their enum positions solely
+            // for bincode compatibility. They are not a rolling-upgrade bridge;
+            // typed wire counters above still expose any old peer that sends one.
+            PrimaryMessage::CompReport(..)
+            | PrimaryMessage::ControlInit(..)
+            | PrimaryMessage::ControlEcho(..)
+            | PrimaryMessage::ControlReady(..)
+            | PrimaryMessage::ControlFetch(..)
+            | PrimaryMessage::ControlServe(..)
+            | PrimaryMessage::ControlCommit(..)
+            | PrimaryMessage::ControlTimeoutVote(..)
+            | PrimaryMessage::ControlTimeoutAccept(..)
+            | PrimaryMessage::ControlInitBatch(..)
+            | PrimaryMessage::ControlServeBatch(..) => return Ok(()),
 
             _ => return Ok(()),
         };
@@ -610,8 +781,8 @@ pub struct VantageCore {
 
     last_announced: Option<(View, Instant)>,
     pacemaker: Pacemaker,
-    resolver: Resolver,
-    control: ControlLog,
+    resolution_evidence: ResolutionEvidence,
+    direct_resolver: DirectResolver,
 
     /// Translates digest statements into the by-value AGB representation.
     digest_stmts: DigestStatements,
@@ -679,14 +850,19 @@ pub struct VantageCore {
     /// AGB timers ordered by earliest deadline.
     timers: BinaryHeap<Reverse<(Instant, View, TimerKind)>>,
 
-    /// Control timers ordered by earliest deadline.
-    control_timers: BinaryHeap<Reverse<(Instant, Round)>>,
+    /// Direct resolver timers keyed by `(target, resolver view)`.
+    resolution_timers: BinaryHeap<Reverse<(Instant, View, DirectResolverView)>>,
 
     payload: PayloadIo,
 
     /// Internal-state retention window in views.
     gc_window: View,
     last_gc_floor: View,
+
+    /// True only for one of the benchmark profile's Byzantine publishers.
+    mixed_open_stress_publisher: bool,
+    /// Common finite benchmark window, armed from one absolute epoch.
+    mixed_open_stress_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
 
     metrics: Option<Arc<Metrics>>,
 
@@ -845,7 +1021,7 @@ impl VantageCore {
             blocks,
         );
         let pacemaker = Pacemaker::new(name, &committee);
-        let resolver = Resolver::new(committee.size(), parameters.delta_ms);
+        let resolution_evidence = ResolutionEvidence::new(committee.size(), parameters.delta_ms);
 
         let sequence = parameters.sequence_checkpoints.then(|| {
             SequenceStore::new(sid.clone(), parameters.sequence_checkpoint_interval_views)
@@ -858,7 +1034,8 @@ impl VantageCore {
             // Certification still requires matching members.
             CheckpointCollector::new(f + 1, SEQUENCE_CANDIDATE_WINDOWS, View::MAX)
         });
-        let control = ControlLog::new(name, committee.clone(), sid, parameters.delta_ms);
+        let direct_resolver =
+            DirectResolver::new(name, committee.clone(), sid.clone(), parameters.delta_ms);
 
         let other_primaries: Vec<(PublicKey, SocketAddr)> = committee
             .others_primaries(&name)
@@ -879,15 +1056,31 @@ impl VantageCore {
 
         let (reconnect_tx, reconnect_rx) = channel(committee.size().max(1));
 
-        let withholding_dests = config::withheld_destinations(
+        let withholding_publishers = config::withholding_publishers(
             &committee,
-            &name,
             parameters.withhold_senders,
             &parameters.withhold_publishers,
-            parameters.withhold_count,
-            parameters.withhold_stride,
-            &parameters.withhold_receivers,
         );
+        let mixed_open_stress_publisher =
+            parameters.vantage_mixed_open_stress && withholding_publishers.contains(&name);
+        let withholding_dests = if parameters.vantage_mixed_open_stress {
+            config::mixed_open_withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+            )
+        } else {
+            config::withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+                parameters.withhold_count,
+                parameters.withhold_stride,
+                &parameters.withhold_receivers,
+            )
+        };
         let withheld_header_dests: wire::WithheldHeaderDests = parameters
             .withhold_headers
             .then(|| withholding_dests.clone())
@@ -1013,8 +1206,8 @@ impl VantageCore {
             sequence_max_sources: parameters.sequence_sync_max_sources,
             last_announced: None,
             pacemaker,
-            resolver,
-            control,
+            resolution_evidence,
+            direct_resolver,
             digest_stmts,
             wire: Wire {
                 codec: wire_codec,
@@ -1097,12 +1290,14 @@ impl VantageCore {
             replay_serve_max_bytes: parameters.replay_serve_max_bytes,
             replay_episode_max_ms: parameters.replay_episode_max_ms,
             timers: BinaryHeap::new(),
-            control_timers: BinaryHeap::new(),
+            resolution_timers: BinaryHeap::new(),
             payload: PayloadIo::new(store, tx_payload_ready, tx_output, core_metrics.clone()),
 
             // Keep state for the current view when the window is zero.
             gc_window: parameters.vantage_gc_window_views.max(1),
             last_gc_floor: 1,
+            mixed_open_stress_publisher,
+            mixed_open_stress_window: parameters.withhold_window.clone(),
             metrics: core_metrics,
             ut_inbound_dispatch: None,
             ut_inbound_family: std::array::from_fn(|_| None),
@@ -1159,7 +1354,6 @@ impl VantageCore {
         effects.extend(self.enter_view_effects(1, boot));
         effects.extend(self.pacemaker.genesis());
 
-        effects.extend(self.control.genesis());
         self.execute(effects, boot).await;
 
         let header_timer = tokio::time::sleep(Duration::from_millis(self.max_header_delay));
@@ -1208,14 +1402,15 @@ impl VantageCore {
             };
             tokio::pin!(agb_sleep);
 
-            let next_control_deadline = self.control_timers.peek().map(|Reverse((d, _))| *d);
-            let control_sleep = async {
-                match next_control_deadline {
+            let next_resolution_deadline =
+                self.resolution_timers.peek().map(|Reverse((d, _, _))| *d);
+            let resolution_sleep = async {
+                match next_resolution_deadline {
                     Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
                     None => std::future::pending::<()>().await,
                 }
             };
-            tokio::pin!(control_sleep);
+            tokio::pin!(resolution_sleep);
 
             self.queue_len_peak = self.queue_len_peak.max(rx_vantage.len());
 
@@ -1262,10 +1457,10 @@ impl VantageCore {
                     self.execute(effects, now).await;
                 }
 
-                () = &mut control_sleep, if next_control_deadline.is_some() => {
+                () = &mut resolution_sleep, if next_resolution_deadline.is_some() => {
                     let now = Instant::now();
                     let timer_firing_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_timer_firing, "timer_firing");
-                    let effects = self.fire_control_timers(now);
+                    let effects = self.fire_resolution_timers(now);
                     drop(timer_firing_timer);
                     self.execute(effects, now).await;
                 }
@@ -1783,21 +1978,25 @@ impl VantageCore {
             }
         }
         effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
+        let through = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
+        effects.extend(self.refresh_direct_resolution(through));
         effects
     }
 
-    /// Fires due control timers in deadline order and discards obsolete rounds.
-    fn fire_control_timers(&mut self, now: Instant) -> Vec<Effect> {
+    /// Fires due direct per-target resolver timers in deadline order.
+    fn fire_resolution_timers(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
-        while let Some(&Reverse((d, round))) = self.control_timers.peek() {
-            if d > now {
+        while let Some(&Reverse((deadline, height, view))) = self.resolution_timers.peek() {
+            if deadline > now {
                 break;
             }
-            self.control_timers.pop();
-            if round != self.control.curr_round() || self.control.voted() {
-                continue;
-            }
-            effects.extend(self.control.on_control_round_timer(round));
+            self.resolution_timers.pop();
+            effects.extend(
+                self.direct_resolver
+                    .on_timer(height, view)
+                    .into_iter()
+                    .map(Effect::DirectResolution),
+            );
         }
         effects
     }
@@ -1901,19 +2100,21 @@ impl VantageCore {
             metrics.vantage_sequence_install_blocks_awaited.set(0);
         }
         metrics
-            .vantage_control_round
-            .set(self.control.curr_round() as i64);
+            .vantage_direct_resolver_max_view
+            .set(self.direct_resolver.max_current_view() as i64);
+        metrics.vantage_resolved_through_view.set(
+            self.resolution_evidence
+                .resolved_watermark()
+                .saturating_sub(1) as i64,
+        );
         metrics
-            .vantage_control_delivered_len
-            .set(self.control.delivered_log_len() as i64);
-        metrics
-            .vantage_control_consume_pos
-            .set(self.control.consume_pos() as i64);
+            .vantage_direct_resolver_active_targets
+            .set(self.direct_resolver.active_len() as i64);
 
         log::debug!(
-            "vantage node: timers.len()={} control_timers.len()={} cancel_handlers.len()={}",
+            "vantage node: timers.len()={} resolution_timers.len()={} cancel_handlers.len()={}",
             self.timers.len(),
-            self.control_timers.len(),
+            self.resolution_timers.len(),
             self.wire.cancel_handlers.len()
         );
     }
@@ -1934,46 +2135,96 @@ impl VantageCore {
             }
         }
 
-        let floor = self.resolver.gc_floor(self.gc_window);
+        let floor = self.resolution_evidence.gc_floor(self.gc_window);
         if floor <= self.last_gc_floor {
             return;
         }
 
-        let serve_floor = floor
-            .saturating_sub(
-                self.gc_window
-                    .saturating_mul(ControlLog::SERVE_MARGIN_WINDOWS),
-            )
-            .max(1);
         self.agb.gc_below(floor);
         self.digest_stmts.gc_below(floor);
         self.frontier.gc_below(floor);
 
-        self.control.gc_below(floor, serve_floor);
-        self.resolver.gc_below(floor);
+        self.direct_resolver.gc_below(floor);
+        self.resolution_evidence.gc_below(floor);
         self.timers.retain(|Reverse((_, view, _))| *view >= floor);
+        self.resolution_timers
+            .retain(|Reverse((_, target, _))| *target >= floor);
         #[cfg(feature = "pipeline-tracing")]
         self.pipeline.gc_below(floor);
         self.last_gc_floor = floor;
         log::debug!(
-            "vantage node: internal GC floor advanced to {} (serve floor {}, resolved_watermark={}, gc_window={})",
+            "vantage node: internal GC floor advanced to {} (resolved_watermark={}, gc_window={})",
             floor,
-            serve_floor,
-            self.resolver.resolved_watermark(),
+            self.resolution_evidence.resolved_watermark(),
             self.gc_window
         );
     }
 
+    /// Returns whether this benchmark-only Byzantine fault is currently active.
+    fn mixed_open_fault_active(&self, now: Instant) -> bool {
+        self.mixed_open_stress_publisher
+            && config::withhold_active(self.mixed_open_stress_window.as_deref(), now)
+    }
+
+    fn suppress_mixed_open_response(&self, family: &'static str) -> bool {
+        let suppressed = self.mixed_open_fault_active(Instant::now());
+        if suppressed {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_mixed_open_suppressed_total
+                    .with_label_values(&[family])
+                    .inc();
+            }
+            log::debug!("mixed-open stress: suppressing outbound {family}");
+        }
+        suppressed
+    }
+
+    /// Starts every locally justified per-target resolver through the current
+    /// proposal horizon. Instances are independent, so no global resolution
+    /// height or carrier selection serializes this scan.
+    fn refresh_direct_resolution(&mut self, through: View) -> Vec<Effect> {
+        let scan_limit = through.saturating_sub(3);
+        let start = self.resolution_evidence.resolved_watermark();
+        let mut effects: Vec<_> = self
+            .direct_resolver
+            .retry_external_validity()
+            .into_iter()
+            .map(Effect::DirectResolution)
+            .collect();
+        if scan_limit < start {
+            return effects;
+        }
+        for target in start..=scan_limit {
+            if self.agb.is_sealed(target) || self.direct_resolver.is_decided(target) {
+                continue;
+            }
+            let candidates = self
+                .resolution_evidence
+                .justified_candidates(&self.agb, target);
+            if candidates.is_empty() {
+                continue;
+            }
+            effects.extend(
+                self.direct_resolver
+                    .update_candidates(target, candidates)
+                    .into_iter()
+                    .map(Effect::DirectResolution),
+            );
+        }
+        effects
+    }
+
     /// Proposes eligible owned views in increasing order through the early-wish bound.
     fn try_propose_effects(&mut self, now: Instant) -> Vec<Effect> {
+        let bound = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
+        let mut effects = self.refresh_direct_resolution(bound);
         if self.sequence_sync_recovery_active
             || self.sequence_install.is_some()
             || self.large_sequence_sync_target().is_some()
         {
-            return Vec::new();
+            return effects;
         }
-        let mut effects = Vec::new();
-        let bound = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
         let mut view = self.frontier.a_i() + 1;
         while view <= bound {
             if self.agb.proposer(view) != self.name || self.frontier.already_proposed(view) {
@@ -1981,27 +2232,26 @@ impl VantageCore {
                 continue;
             }
 
-            let entries: Vec<crate::vantage::ResolutionEntry> = {
-                let agb = &self.agb;
-                let control = &self.control;
-                let resolved = |u: View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-                self.resolver.decide_prefix(agb, view, now, resolved)
-            };
-            let proposal = match entries.len() {
-                0 => self
-                    .frontier
+            let mixed_open_fault = self.mixed_open_fault_active(now);
+            let proposal = if mixed_open_fault {
+                self.frontier
+                    .propose_view_mixed_open(view, &self.lm)
+                    .map(ProposalOut::Single)
+            } else {
+                self.frontier
                     .propose_view(view, &self.lm, None)
-                    .map(ProposalOut::Single),
-                1 => self
-                    .frontier
-                    .propose_view(view, &self.lm, entries.into_iter().next())
-                    .map(ProposalOut::Single),
-                _ => self
-                    .frontier
-                    .propose_view_batch(view, &self.lm, entries)
-                    .map(ProposalOut::Batch),
+                    .map(ProposalOut::Single)
             };
             if let Some(proposal) = proposal {
+                #[cfg(feature = "benchmark")]
+                if mixed_open_fault {
+                    log::info!(
+                        "VANTAGE_RECOVERY_EVENT kind=stress_propose view={} epoch_ms={} tips={}",
+                        proposal.view(),
+                        recovery_epoch_ms(),
+                        proposal.t().len()
+                    );
+                }
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_own_proposals_made_total.inc();
                 }
@@ -2024,7 +2274,7 @@ impl VantageCore {
 
     /// Records one terminal view in order and compares an awaited verified target once.
     fn record_sequence(&mut self, view: View, outcome: &SequenceOutcome, output_delta: &[Digest]) {
-        self.resolver.note_resolved_through(view);
+        self.resolution_evidence.note_resolved_through(view);
 
         if self.agb.proposer(view) == self.name {
             log::debug!(
@@ -2623,7 +2873,7 @@ impl VantageCore {
                         .set(target as i64);
                 }
 
-                self.resolver.note_resolved_through(target);
+                self.resolution_evidence.note_resolved_through(target);
 
                 if let Some(anchor) = own_anchor {
                     effects.push(Effect::RecoverOwnLane(anchor));
@@ -2999,7 +3249,7 @@ impl VantageCore {
 
     /// Serves verified headers retained by the sequence or live block cache.
     fn serve_sequence_headers(&mut self, digests: &[Digest], to: &PublicKey) {
-        // Header transfer is lane repair, not control-log synchronization. A
+        // Header transfer is lane repair, not target-local agreement. A
         // selected Byzantine holder still serves sequence records and outcomes.
         if self.wire.repair_suppressed_for(to) {
             return;
@@ -3155,6 +3405,14 @@ impl VantageCore {
             }
             return Vec::new();
         }
+        if let Some(target) = inbound.direct_resolution_target() {
+            let frontier = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
+            if target < self.resolution_evidence.resolved_watermark()
+                || target > frontier.saturating_add(DIRECT_RESOLUTION_FUTURE_TARGET_WINDOW)
+            {
+                return Vec::new();
+            }
+        }
         match inbound {
             Inbound::Publish(sender, header) => {
                 let author = header.author;
@@ -3203,6 +3461,12 @@ impl VantageCore {
                 self.credit_refs(sender, refs, now, true)
             }
             Inbound::Propose(proposal) => {
+                // Direct-resolution deployments use data-only AGB proposals.
+                // Metadata-bearing and legacy batch proposals are not a second
+                // path into agreement on this branch.
+                if !proposal.entries().is_empty() {
+                    return Vec::new();
+                }
                 // Sender-less proposals are attributed to the designated proposer for the view.
                 let claimed_sender = self.agb.proposer(proposal.view());
                 match proposal {
@@ -3263,31 +3527,60 @@ impl VantageCore {
                 effects
             }
 
-            Inbound::CompReport(view, digest, sender) => {
-                self.control.on_comp_report(view, digest, sender)
-            }
-            Inbound::ControlInit(proposal, b_w) => {
-                // Sender-less control proposals are attributed to the designated round leader.
-                let claimed_sender = self.control.control_leader(proposal.round);
-                self.control.on_control_init(claimed_sender, proposal, b_w)
-            }
-            Inbound::ControlEcho(sender, proposal) => {
-                self.control.on_control_echo(sender, proposal)
-            }
-            Inbound::ControlReady(sender, proposal) => {
-                self.control.on_control_ready(sender, proposal)
-            }
-            Inbound::ControlCommit(sender, round) => self.control.on_control_commit(sender, round),
-            Inbound::ControlTimeoutVote(sender, round) => {
-                self.control.on_control_timeout_vote(sender, round)
-            }
-            Inbound::ControlTimeoutAccept(sender, round) => {
-                self.control.on_control_timeout_accept(sender, round)
-            }
-            Inbound::ControlFetch(view, digest, requester) => {
-                self.control.on_control_fetch(requester, view, digest)
-            }
-            Inbound::ControlServe(view, proposal) => self.control.on_control_serve(view, proposal),
+            Inbound::DirectResolutionWish(message) => self
+                .direct_resolver
+                .on_wish(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionSuggest(message) => self
+                .direct_resolver
+                .on_suggest(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionProof(message) => self
+                .direct_resolver
+                .on_proof(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionProposal(message) => self
+                .direct_resolver
+                .on_proposal(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionStatement(message) => self
+                .direct_resolver
+                .on_statement(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionWitness(message) => self
+                .direct_resolver
+                .on_witness(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionDone(message) => self
+                .direct_resolver
+                .on_done(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionValueFetch(message) => self
+                .direct_resolver
+                .on_value_fetch(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionValueServe(message) => self
+                .direct_resolver
+                .on_value_serve(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
 
             Inbound::SkipVote(view, sender) => {
                 // A skip vote only adds an exclusion and cannot unblock a pending gate.
@@ -3705,6 +3998,9 @@ impl VantageCore {
 
                         self.recheck_pending = true;
                         queue.extend(self.cursor.retry());
+                        let through =
+                            std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
+                        queue.extend(self.refresh_direct_resolution(through));
                     }
 
                     Effect::BroadcastPropose(p) => match p {
@@ -3719,6 +4015,9 @@ impl VantageCore {
                     },
 
                     Effect::BroadcastEcho(mut e) => {
+                        if self.suppress_mixed_open_response("echo") {
+                            continue;
+                        }
                         // Stamp mutable protocol metadata at the serialization boundary.
                         e.set_wish(self.pacemaker.own_watermark());
 
@@ -3773,6 +4072,9 @@ impl VantageCore {
                         }
                     }
                     Effect::BroadcastEchoSkip(view) => {
+                        if self.suppress_mixed_open_response("echo-skip") {
+                            continue;
+                        }
                         let wish = self.pacemaker.own_watermark();
                         self.broadcast_recorded(PrimaryMessage::VantageEchoSkip(
                             view, self.name, wish,
@@ -3783,6 +4085,9 @@ impl VantageCore {
                         self.frontier.quarantine_tips(&tips, &self.lm);
                     }
                     Effect::BroadcastReady(mut r) => {
+                        if self.suppress_mixed_open_response("ready") {
+                            continue;
+                        }
                         r.set_wish(self.pacemaker.own_watermark());
                         match r {
                             ReadyOut::Single(r) if self.digest_statements => {
@@ -3801,6 +4106,9 @@ impl VantageCore {
                         }
                     }
                     Effect::BroadcastNoReady(view) => {
+                        if self.suppress_mixed_open_response("no-ready") {
+                            continue;
+                        }
                         let wish = self.pacemaker.own_watermark();
                         self.broadcast_recorded(PrimaryMessage::VantageNoReady(
                             view, self.name, wish,
@@ -3809,6 +4117,9 @@ impl VantageCore {
                     }
 
                     Effect::BroadcastSkipVote(view) => {
+                        if self.suppress_mixed_open_response("skip-vote") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageSkipVote(view, self.name))
                             .await;
                     }
@@ -3837,6 +4148,7 @@ impl VantageCore {
                     Effect::Sealed(view, outcome) => {
                         #[cfg(feature = "pipeline-tracing")]
                         self.pipeline.note_sealed(view);
+                        self.direct_resolver.note_terminal(view);
                         queue.extend(self.cursor.on_sealed(view, outcome));
                     }
                     Effect::ArmTimer(view, kind, deadline) => {
@@ -3892,6 +4204,12 @@ impl VantageCore {
                         outcome,
                         output_delta,
                     } => {
+                        #[cfg(feature = "benchmark")]
+                        log::info!(
+                            "VANTAGE_RECOVERY_EVENT kind=finalized view={} epoch_ms={}",
+                            view,
+                            recovery_epoch_ms()
+                        );
                         #[cfg(feature = "pipeline-tracing")]
                         if let (Some(metrics), Some(elapsed)) =
                             (&self.metrics, self.pipeline.note_finalized(view))
@@ -3907,91 +4225,157 @@ impl VantageCore {
                         self.lm.recover_own_frontier(header).await;
                     }
 
-                    Effect::CompletionReportable(view, proposal) => {
-                        for entry in proposal.entries() {
-                            self.resolver.note_carrier_report(entry.target_view(), now);
-                        }
-                        queue.extend(self.control.on_completion_reportable(view, proposal));
-                    }
-
-                    Effect::BroadcastCompReport(view, digest) => {
-                        self.broadcast_recorded(PrimaryMessage::CompReport(
-                            view, digest, self.name,
-                        ))
-                        .await;
-                    }
-
-                    Effect::BroadcastControlInit(proposal, b_w) => match b_w {
-                        None => {
-                            self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, None))
-                                .await
-                        }
-                        Some(ProposalOut::Single(p)) => {
-                            self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, Some(p)))
-                                .await
-                        }
-                        Some(ProposalOut::Batch(p)) => {
-                            self.broadcast_recorded(PrimaryMessage::ControlInitBatch(
-                                proposal,
-                                Some(p),
+                    Effect::DirectResolution(effect) => match effect {
+                        DirectResolutionEffect::BroadcastWish(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-wish") {
+                                continue;
+                            }
+                            self.broadcast_recorded(PrimaryMessage::VantageDirectResolutionWish(
+                                message,
                             ))
-                            .await
+                            .await;
                         }
-                    },
-                    Effect::BroadcastControlEcho(proposal) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlEcho(proposal, self.name))
+                        DirectResolutionEffect::SuggestTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-suggest") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionSuggest(message),
+                                )
+                                .await;
+                        }
+                        DirectResolutionEffect::BroadcastProof(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proof") {
+                                continue;
+                            }
+                            self.broadcast_recorded(PrimaryMessage::VantageDirectResolutionProof(
+                                message,
+                            ))
                             .await;
-                    }
-                    Effect::BroadcastControlReady(proposal) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlReady(proposal, self.name))
-                            .await;
-                    }
-                    Effect::BroadcastControlCommit(round) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlCommit(round, self.name))
-                            .await;
-                    }
-                    Effect::BroadcastControlTimeoutVote(round) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlTimeoutVote(
-                            round, self.name,
-                        ))
-                        .await;
-                    }
-                    Effect::BroadcastControlTimeoutAccept(round) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlTimeoutAccept(
-                            round, self.name,
-                        ))
-                        .await;
-                    }
-                    Effect::ControlFetchTo(peer, view, digest) => {
-                        self.wire
-                            .send_message(
-                                peer,
-                                PrimaryMessage::ControlFetch(view, digest, self.name),
+                        }
+                        DirectResolutionEffect::BroadcastProposal(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proposal") {
+                                continue;
+                            }
+                            self.broadcast_recorded(
+                                PrimaryMessage::VantageDirectResolutionProposal(message),
                             )
                             .await;
-                    }
-
-                    Effect::ControlServeTo(peer, view, proposal) => {
-                        // A dropped enqueue must release the at-most-once mark, or the
-                        // requester's repeat fetch is refused and the hole is permanent.
-                        let message = match proposal {
-                            ProposalOut::Single(p) => PrimaryMessage::ControlServe(view, p),
-                            ProposalOut::Batch(p) => PrimaryMessage::ControlServeBatch(view, p),
-                        };
-                        if !self.wire.try_enqueue_serve(peer, message) {
-                            self.control.unanswer_fetch(&peer, view);
                         }
-                    }
-                    Effect::ArmControlTimer(round, deadline) => {
-                        self.control_timers.push(Reverse((deadline, round)));
-                    }
-
-                    Effect::ApplyAnchor(view, outcome, refs) => {
-                        for r in refs {
-                            queue.extend(self.rep.authorize(r));
+                        DirectResolutionEffect::BroadcastStatement(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-statement") {
+                                continue;
+                            }
+                            self.broadcast_recorded(
+                                PrimaryMessage::VantageDirectResolutionStatement(message),
+                            )
+                            .await;
                         }
-                        queue.extend(self.agb.submit_anchor(view, outcome));
-                    }
+                        DirectResolutionEffect::BroadcastWitness(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-witness") {
+                                continue;
+                            }
+                            self.broadcast_recorded(
+                                PrimaryMessage::VantageDirectResolutionWitness(message),
+                            )
+                            .await;
+                        }
+                        DirectResolutionEffect::BroadcastDone(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-done") {
+                                continue;
+                            }
+                            self.broadcast_recorded(PrimaryMessage::VantageDirectResolutionDone(
+                                message,
+                            ))
+                            .await;
+                        }
+                        DirectResolutionEffect::DoneTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-done") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionDone(message),
+                                )
+                                .await;
+                        }
+                        DirectResolutionEffect::ValueFetchTo(peer, message) => {
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionValueFetch(message),
+                                )
+                                .await;
+                        }
+                        DirectResolutionEffect::ValueServeTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-serve") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionValueServe(message),
+                                )
+                                .await;
+                        }
+                        DirectResolutionEffect::ArmTimer(target, view, deadline) => {
+                            self.resolution_timers
+                                .push(Reverse((deadline, target, view)));
+                        }
+                        DirectResolutionEffect::ValidateVote {
+                            target,
+                            view,
+                            value,
+                            entry,
+                            fresh,
+                        } => {
+                            for reference in entry.references().cloned() {
+                                queue.extend(self.rep.authorize(reference));
+                            }
+                            let vote = self
+                                .agb
+                                .try_direct_resolution_vote(&entry, fresh, &mut self.lm)
+                                .map_or(DirectResolutionVote::Reject, |origin| {
+                                    DirectResolutionVote::Accept { origin }
+                                });
+                            queue.extend(
+                                self.direct_resolver
+                                    .on_vote(target, view, value, vote)
+                                    .into_iter()
+                                    .map(Effect::DirectResolution),
+                            );
+                        }
+                        DirectResolutionEffect::Decide(entry) => {
+                            let target = entry.target_view();
+                            #[cfg(feature = "benchmark")]
+                            log::info!(
+                                "VANTAGE_RECOVERY_EVENT kind=direct_resolver_decide view={} epoch_ms={} active={}",
+                                target,
+                                recovery_epoch_ms(),
+                                self.direct_resolver.active_len()
+                            );
+                            let (outcome, refs) = match entry {
+                                ResolutionEntry::Full(_, c, t) => (
+                                    crate::vantage::Outcome::Full(c.clone(), t.clone()),
+                                    c.into_iter().chain(t).collect(),
+                                ),
+                                ResolutionEntry::Core(_, c, t) => (
+                                    crate::vantage::Outcome::Core(c.clone()),
+                                    c.into_iter().chain(t).collect(),
+                                ),
+                                ResolutionEntry::Skip(_) => {
+                                    (crate::vantage::Outcome::Skip, Vec::new())
+                                }
+                            };
+                            for reference in refs {
+                                queue.extend(self.rep.authorize(reference));
+                            }
+                            queue.extend(self.agb.submit_resolution(target, outcome));
+                        }
+                    },
 
                     Effect::BodyFetchTo(peer, view, digest) => {
                         self.wire
@@ -4052,7 +4436,6 @@ mod tests {
 
         for inbound in [
             Inbound::HeadersRequest(vec![d.clone()], k),
-            Inbound::ControlFetch(1, d.clone(), k),
             Inbound::BodyFetch(1, d.clone(), k),
             Inbound::LaneResume(k, 1, k),
             Inbound::ResumeHello(1, k),
@@ -4078,10 +4461,11 @@ mod tests {
             Inbound::EchoSkip(1, k, 1),
             Inbound::NoReady(1, k, 1),
             Inbound::Wish(1, k),
-            Inbound::CompReport(1, d.clone(), k),
-            Inbound::ControlCommit(k, 1),
-            Inbound::ControlTimeoutVote(k, 1),
-            Inbound::ControlTimeoutAccept(k, 1),
+            Inbound::DirectResolutionWish(DirectResolutionWish {
+                target: 1,
+                view: 1,
+                sender: k,
+            }),
             Inbound::SkipVote(1, k),
         ] {
             assert!(!inbound.is_bulk(), "must stay consensus-class: {inbound:?}");
@@ -4123,7 +4507,6 @@ mod tests {
 
     use super::*;
     use crate::vantage::agb::{Echo, Ready, ReadyGrade, ViewProposal};
-    use crate::vantage::control::ControlProposal;
     use crypto::{generate_keypair, Hash as _};
     use rand::rngs::StdRng;
     use rand::SeedableRng as _;
@@ -4225,9 +4608,9 @@ mod tests {
     async fn terminal_sequence_progress_advances_the_resolver_floor() {
         let mut core = test_core(0, "terminal_resolver_floor");
 
-        assert_eq!(core.resolver.resolved_watermark(), 1);
+        assert_eq!(core.resolution_evidence.resolved_watermark(), 1);
         core.record_sequence(1, &SequenceOutcome::Skip, &[]);
-        assert_eq!(core.resolver.resolved_watermark(), 2);
+        assert_eq!(core.resolution_evidence.resolved_watermark(), 2);
     }
 
     #[tokio::test]
@@ -4300,17 +4683,14 @@ mod tests {
         );
         assert!(ingress_replaces_inbound(&future_echo, true, 0));
 
-        let control = Inbound::ControlEcho(
-            member,
-            ControlProposal {
-                round: 1,
-                parent: 0,
-                value: None,
-            },
-        );
+        let resolution = Inbound::DirectResolutionWish(DirectResolutionWish {
+            target: 1,
+            view: 1,
+            sender: member,
+        });
         assert!(
-            core.install_replaces_inbound(&control),
-            "large-gap install must not park viewless control-round traffic"
+            core.install_replaces_inbound(&resolution),
+            "large-gap install must not park resolver traffic"
         );
 
         let sequence_request = Inbound::SequenceRequest(
@@ -5272,6 +5652,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authenticated_ingress_binds_first_hand_sender_and_designated_proposer() {
+        let committee = crate::common::committee();
+        let members: Vec<_> = committee.authorities.keys().copied().collect();
+        let witness = PrimaryMessage::VantageDirectResolutionWitness(DirectResolutionWitness {
+            target: 9,
+            view: 1,
+            value: Digest::default(),
+            entry: ResolutionEntry::Skip(9),
+            sender: members[1],
+        });
+        assert!(authenticated_vantage_sender_matches(
+            &committee, 1, &witness
+        ));
+        assert!(!authenticated_vantage_sender_matches(
+            &committee, 0, &witness
+        ));
+
+        let proposal = dummy_proposal();
+        let proposer = crate::vantage::agb::proposer(&committee, proposal.view);
+        let proposer_index = members
+            .iter()
+            .position(|member| *member == proposer)
+            .unwrap() as u8;
+        let wrong_index = (proposer_index + 1) % members.len() as u8;
+        let proposal = PrimaryMessage::VantagePropose(proposal);
+        assert!(authenticated_vantage_sender_matches(
+            &committee,
+            proposer_index,
+            &proposal,
+        ));
+        assert!(!authenticated_vantage_sender_matches(
+            &committee,
+            wrong_index,
+            &proposal,
+        ));
+        assert!(!authenticated_vantage_sender_matches(
+            &committee,
+            members.len() as u8,
+            &proposal,
+        ));
+    }
+
     #[tokio::test]
     async fn dispatch_drops_echo_from_nonmember_sender() {
         let mut core = test_core(0, "echo_nonmember");
@@ -5320,22 +5743,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_drops_control_echo_from_nonmember_sender() {
-        let mut core = test_core(0, "control_echo_nonmember");
+    async fn dispatch_drops_direct_resolution_witness_from_nonmember_sender() {
+        let mut core = test_core(0, "resolution_witness_nonmember");
         let fake = fabricated_key();
-        let proposal = ControlProposal {
-            round: 1,
-            parent: 0,
-            value: None,
+        let witness = DirectResolutionWitness {
+            target: 1,
+            view: 1,
+            value: Digest::default(),
+            entry: ResolutionEntry::Skip(1),
+            sender: fake,
         };
 
         let effects = core
-            .dispatch_inbound(Inbound::ControlEcho(fake, proposal), Instant::now())
+            .dispatch_inbound(Inbound::DirectResolutionWitness(witness), Instant::now())
             .await;
 
         assert!(
             effects.is_empty(),
-            "a fabricated non-member ControlEcho must be dropped with no effects"
+            "a fabricated non-member resolution witness must be dropped with no effects"
         );
         assert_eq!(rejected_count(&core), 1);
     }
@@ -5383,6 +5808,7 @@ mod tests {
         let handler = VantageReceiverHandler {
             tx: tx_vantage,
             codec: codec.clone(),
+            committee: committee.clone(),
             tx_bulk,
             tx_sequence,
             sequence_large_gap_drop: Arc::new(AtomicBool::new(false)),
@@ -6103,5 +6529,82 @@ mod tests {
             nudges_sent(&core),
             "no nudge must fire while disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn locally_justified_target_starts_direct_wish_without_a_later_agb_proposal() {
+        let mut core = test_core(0, "direct_resolver_activation");
+        let now = Instant::now();
+        core.agb.enter(1, now, &mut core.lm, &mut core.rep);
+        for (sender, _) in crate::common::keys().into_iter().take(3) {
+            core.agb.on_noready(1, sender);
+        }
+
+        let effects = core.refresh_direct_resolution(4);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DirectResolution(DirectResolutionEffect::BroadcastWish(message))
+                if message.target == 1 && message.view == 1
+        )));
+        assert_eq!(core.direct_resolver.active_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_legacy_resolution_metadata_from_agb_proposals() {
+        let mut core = test_core(0, "direct_resolver_rejects_metadata");
+        let view = 4;
+        let proposal = ViewProposal {
+            view,
+            c: Vec::new(),
+            t: Vec::new(),
+            m: Some(ResolutionEntry::Skip(1)),
+        };
+        let effects = core
+            .dispatch_inbound(
+                Inbound::Propose(ProposalOut::Single(proposal)),
+                Instant::now(),
+            )
+            .await;
+        assert!(effects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_resolver_rejects_targets_beyond_the_bounded_future_window() {
+        let mut core = test_core(0, "direct_resolver_future_target_bound");
+        let (sender, _) = crate::common::keys()[1];
+        let target = DIRECT_RESOLUTION_FUTURE_TARGET_WINDOW + 2;
+        let effects = core
+            .dispatch_inbound(
+                Inbound::DirectResolutionWish(DirectResolutionWish {
+                    target,
+                    view: 1,
+                    sender,
+                }),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(effects.is_empty());
+        assert_eq!(core.direct_resolver.active_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_resolver_rejects_targets_below_the_resolved_prefix() {
+        let mut core = test_core(0, "direct_resolver_past_target_bound");
+        core.resolution_evidence.note_resolved_through(12);
+        let (sender, _) = crate::common::keys()[1];
+        let effects = core
+            .dispatch_inbound(
+                Inbound::DirectResolutionWish(DirectResolutionWish {
+                    target: 12,
+                    view: 1,
+                    sender,
+                }),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(effects.is_empty());
+        assert_eq!(core.direct_resolver.active_len(), 0);
     }
 }

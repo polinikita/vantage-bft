@@ -3,14 +3,16 @@
 use super::common::*;
 use crate::primary::View;
 use crate::vantage::agb::{AgbEngine, DigestStatements, EchoOut, ProposalOut, ReadyOut, TimerKind};
-use crate::vantage::control::ControlLog;
 use crate::vantage::frontier::Frontier;
 use crate::vantage::lanes::{AckAggregator, AckAvailability, LaneManager, SharedAckAggregator};
 use crate::vantage::node::Inbound;
 use crate::vantage::pacemaker::Pacemaker;
 use crate::vantage::repair::Repairer;
-use crate::vantage::resolve::Resolver;
-use crate::vantage::{Cursor, Effect};
+use crate::vantage::resolution_evidence::ResolutionEvidence;
+use crate::vantage::{
+    Cursor, DirectResolutionEffect, DirectResolutionVote, DirectResolver, DirectResolverView,
+    Effect,
+};
 use config::Committee;
 use crypto::PublicKey;
 use metrics::Metrics;
@@ -28,14 +30,14 @@ pub struct Node {
     pub frontier: Frontier,
     pub cursor: Cursor,
     pub pacemaker: Pacemaker,
-    pub resolver: Resolver,
-    pub control: ControlLog,
+    pub resolution_evidence: ResolutionEvidence,
+    pub direct_resolver: DirectResolver,
     pub digest_stmts: DigestStatements,
     pub digest_statements: bool,
     pub max_views: View,
     pub alive: bool,
     pub timers: Vec<(Instant, View, TimerKind)>,
-    pub control_timers: Vec<(Instant, crate::vantage::control::Round)>,
+    pub resolution_timers: Vec<(Instant, View, DirectResolverView)>,
     pub wish_partitioned: bool,
     pub held_wishes: Vec<(PublicKey, View)>,
     pub metrics: Arc<Metrics>,
@@ -70,9 +72,9 @@ impl Node {
             lm.blocks_handle(),
         );
         let pacemaker = Pacemaker::new(name, &committee);
-        let resolver = Resolver::new(committee.size(), TEST_DELTA_MS);
-        let mut control = ControlLog::new(name, committee.clone(), lm.sid().clone(), TEST_DELTA_MS);
-        control.set_max_rounds_for_test(2000);
+        let resolution_evidence = ResolutionEvidence::new(committee.size(), TEST_DELTA_MS);
+        let direct_resolver =
+            DirectResolver::new(name, committee.clone(), lm.sid().clone(), TEST_DELTA_MS);
         Self {
             name,
             lm,
@@ -82,15 +84,15 @@ impl Node {
             frontier,
             cursor,
             pacemaker,
-            resolver,
-            control,
+            resolution_evidence,
+            direct_resolver,
             digest_stmts,
             digest_statements: false,
             max_views,
             recheck_pending: false,
             alive: true,
             timers: Vec::new(),
-            control_timers: Vec::new(),
+            resolution_timers: Vec::new(),
             wish_partitioned: false,
             held_wishes: Vec::new(),
             metrics,
@@ -119,34 +121,15 @@ impl Node {
         if !self.alive {
             return Vec::new();
         }
-        let mut effects = Vec::new();
+        let through = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
+        let mut effects = self.refresh_direct_resolution(through);
         if self.frontier.a_i() >= self.max_views {
             return effects; // Enforce the test view limit.
         }
-        let view = self.frontier.next_turn();
-        let entries: Vec<crate::vantage::ResolutionEntry> =
-            if self.agb.proposer(view) == self.name && !self.frontier.already_proposed(view) {
-                let agb = &self.agb;
-                let control = &self.control;
-                let resolved = |u: View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-                self.resolver.decide_prefix(agb, view, now, resolved)
-            } else {
-                Vec::new()
-            };
-        let proposal = match entries.len() {
-            0 => self
-                .frontier
-                .try_propose(&self.lm, None)
-                .map(ProposalOut::Single),
-            1 => self
-                .frontier
-                .try_propose(&self.lm, entries.into_iter().next())
-                .map(ProposalOut::Single),
-            _ => self
-                .frontier
-                .propose_view_batch(view, &self.lm, entries)
-                .map(ProposalOut::Batch),
-        };
+        let proposal = self
+            .frontier
+            .try_propose(&self.lm, None)
+            .map(ProposalOut::Single);
         if let Some(proposal) = proposal {
             effects.push(Effect::BroadcastPropose(proposal.clone()));
             effects.extend(match proposal {
@@ -159,6 +142,38 @@ impl Node {
                         .on_propose_batch(self.name, p, now, &mut self.lm, &mut self.rep)
                 }
             });
+        }
+        effects
+    }
+
+    pub fn refresh_direct_resolution(&mut self, through: View) -> Vec<Effect> {
+        let scan_limit = through.saturating_sub(3);
+        let start = self.resolution_evidence.resolved_watermark();
+        let mut effects: Vec<_> = self
+            .direct_resolver
+            .retry_external_validity()
+            .into_iter()
+            .map(Effect::DirectResolution)
+            .collect();
+        if scan_limit < start {
+            return effects;
+        }
+        for target in start..=scan_limit {
+            if self.agb.is_sealed(target) || self.direct_resolver.is_decided(target) {
+                continue;
+            }
+            let candidates = self
+                .resolution_evidence
+                .justified_candidates(&self.agb, target);
+            if candidates.is_empty() {
+                continue;
+            }
+            effects.extend(
+                self.direct_resolver
+                    .update_candidates(target, candidates)
+                    .into_iter()
+                    .map(Effect::DirectResolution),
+            );
         }
         effects
     }
@@ -266,6 +281,9 @@ impl Node {
                 effects
             }
             Inbound::Propose(proposal) => {
+                if !proposal.entries().is_empty() {
+                    return Vec::new();
+                }
                 let sender = self.agb.proposer(proposal.view());
                 match proposal {
                     ProposalOut::Single(p) => {
@@ -285,12 +303,14 @@ impl Node {
                     EchoOut::Batch(e) => self.agb.on_echo_batch(e, &mut self.rep),
                 });
                 effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::EchoSkip(view, sender, wish) => {
                 let mut effects = self.absorb_wish(sender, wish);
                 effects.extend(self.agb.on_echo_skip(view, sender));
                 effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::Ready(ready) => {
@@ -300,39 +320,75 @@ impl Node {
                     ReadyOut::Batch(r) => self.agb.on_ready_batch(r, &mut self.rep),
                 });
                 effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
             Inbound::NoReady(view, sender, wish) => {
                 let mut effects = self.absorb_wish(sender, wish);
                 effects.extend(self.agb.on_noready(view, sender));
                 effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
+                effects.extend(self.try_propose_effects(now));
                 effects
             }
-            Inbound::Wish(view, sender) => self.absorb_wish(sender, view),
-            Inbound::CompReport(view, digest, sender) => {
-                self.control.on_comp_report(view, digest, sender)
+            Inbound::Wish(view, sender) => {
+                let mut effects = self.absorb_wish(sender, view);
+                effects.extend(self.try_propose_effects(now));
+                effects
             }
-            Inbound::ControlInit(proposal, b_w) => {
-                let sender = self.control.control_leader(proposal.round);
-                self.control.on_control_init(sender, proposal, b_w)
-            }
-            Inbound::ControlEcho(sender, proposal) => {
-                self.control.on_control_echo(sender, proposal)
-            }
-            Inbound::ControlReady(sender, proposal) => {
-                self.control.on_control_ready(sender, proposal)
-            }
-            Inbound::ControlCommit(sender, round) => self.control.on_control_commit(sender, round),
-            Inbound::ControlTimeoutVote(sender, round) => {
-                self.control.on_control_timeout_vote(sender, round)
-            }
-            Inbound::ControlTimeoutAccept(sender, round) => {
-                self.control.on_control_timeout_accept(sender, round)
-            }
-            Inbound::ControlFetch(view, digest, requester) => {
-                self.control.on_control_fetch(requester, view, digest)
-            }
-            Inbound::ControlServe(view, proposal) => self.control.on_control_serve(view, proposal),
+            Inbound::DirectResolutionWish(message) => self
+                .direct_resolver
+                .on_wish(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionSuggest(message) => self
+                .direct_resolver
+                .on_suggest(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionProof(message) => self
+                .direct_resolver
+                .on_proof(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionProposal(message) => self
+                .direct_resolver
+                .on_proposal(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionStatement(message) => self
+                .direct_resolver
+                .on_statement(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionWitness(message) => self
+                .direct_resolver
+                .on_witness(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionDone(message) => self
+                .direct_resolver
+                .on_done(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionValueFetch(message) => self
+                .direct_resolver
+                .on_value_fetch(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
+            Inbound::DirectResolutionValueServe(message) => self
+                .direct_resolver
+                .on_value_serve(message)
+                .into_iter()
+                .map(Effect::DirectResolution)
+                .collect(),
             Inbound::SkipVote(view, sender) => self.agb.on_skip_vote(view, sender),
             Inbound::EchoDigest(msg) => {
                 let mut effects = self.absorb_wish(msg.sender, msg.wish);
@@ -388,22 +444,27 @@ impl Node {
         }
     }
 
-    pub fn fire_due_control_timers(&mut self, now: Instant) -> Vec<Effect> {
+    pub fn fire_due_resolution_timers(&mut self, now: Instant) -> Vec<Effect> {
         if !self.alive {
             return Vec::new();
         }
         let mut due = Vec::new();
-        self.control_timers.retain(|(d, r)| {
+        self.resolution_timers.retain(|(d, target, view)| {
             if *d <= now {
-                due.push(*r);
+                due.push((*target, *view));
                 false
             } else {
                 true
             }
         });
         let mut effects = Vec::new();
-        for round in due {
-            effects.extend(self.control.on_control_round_timer(round));
+        for (target, view) in due {
+            effects.extend(
+                self.direct_resolver
+                    .on_timer(target, view)
+                    .into_iter()
+                    .map(Effect::DirectResolution),
+            );
         }
         effects
     }
@@ -526,6 +587,9 @@ pub fn drain_local(
                     queue.extend(node.rep.on_block_available(digest));
                     node.recheck_pending = true;
                     queue.extend(node.cursor.retry());
+                    let through =
+                        std::cmp::max(node.frontier.a_i() + 1, node.pacemaker.omega_plus());
+                    queue.extend(node.refresh_direct_resolution(through));
                 }
                 Effect::BroadcastPropose(p) => {
                     for j in 0..n {
@@ -671,6 +735,7 @@ pub fn drain_local(
                     queue.extend(nodes[idx].cursor.on_completed(view, c, t));
                 }
                 Effect::Sealed(view, outcome) => {
+                    nodes[idx].direct_resolver.note_terminal(view);
                     queue.extend(nodes[idx].cursor.on_sealed(view, outcome));
                 }
                 Effect::ArmTimer(view, kind, deadline) => {
@@ -686,96 +751,140 @@ pub fn drain_local(
                     queue.extend(nodes[idx].pacemaker.raise_own_wish(target));
                 }
 
-                Effect::CompletionReportable(view, proposal) => {
-                    queue.extend(nodes[idx].control.on_completion_reportable(view, proposal));
-                }
-                Effect::BroadcastCompReport(view, digest) => {
-                    let sender = nodes[idx].name;
-                    for j in 0..n {
-                        if j != idx && nodes[j].alive {
-                            outbox
-                                .push_back((j, Inbound::CompReport(view, digest.clone(), sender)));
+                Effect::DirectResolution(effect) => match effect {
+                    DirectResolutionEffect::BroadcastWish(message) => {
+                        for j in 0..n {
+                            if j != idx && nodes[j].alive {
+                                outbox
+                                    .push_back((j, Inbound::DirectResolutionWish(message.clone())));
+                            }
                         }
                     }
-                }
-                Effect::BroadcastControlInit(proposal, b_w) => {
-                    for j in 0..n {
-                        if j != idx && nodes[j].alive {
-                            outbox.push_back((
-                                j,
-                                Inbound::ControlInit(proposal.clone(), b_w.clone()),
-                            ));
+                    DirectResolutionEffect::SuggestTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionSuggest(message)));
+                            }
                         }
                     }
-                }
-                Effect::BroadcastControlEcho(proposal) => {
-                    let sender = nodes[idx].name;
-                    for j in 0..n {
-                        if j != idx && nodes[j].alive {
-                            outbox.push_back((j, Inbound::ControlEcho(sender, proposal.clone())));
+                    DirectResolutionEffect::BroadcastProof(message) => {
+                        for j in 0..n {
+                            if j != idx && nodes[j].alive {
+                                outbox.push_back((
+                                    j,
+                                    Inbound::DirectResolutionProof(message.clone()),
+                                ));
+                            }
                         }
                     }
-                }
-                Effect::BroadcastControlReady(proposal) => {
-                    let sender = nodes[idx].name;
-                    for j in 0..n {
-                        if j != idx && nodes[j].alive {
-                            outbox.push_back((j, Inbound::ControlReady(sender, proposal.clone())));
+                    DirectResolutionEffect::BroadcastProposal(message) => {
+                        for j in 0..n {
+                            if j != idx && nodes[j].alive {
+                                outbox.push_back((
+                                    j,
+                                    Inbound::DirectResolutionProposal(message.clone()),
+                                ));
+                            }
                         }
                     }
-                }
-                Effect::BroadcastControlCommit(round) => {
-                    let sender = nodes[idx].name;
-                    for j in 0..n {
-                        if j != idx && nodes[j].alive {
-                            outbox.push_back((j, Inbound::ControlCommit(sender, round)));
+                    DirectResolutionEffect::BroadcastStatement(message) => {
+                        for j in 0..n {
+                            if j != idx && nodes[j].alive {
+                                outbox.push_back((
+                                    j,
+                                    Inbound::DirectResolutionStatement(message.clone()),
+                                ));
+                            }
                         }
                     }
-                }
-                Effect::BroadcastControlTimeoutVote(round) => {
-                    let sender = nodes[idx].name;
-                    for j in 0..n {
-                        if j != idx && nodes[j].alive {
-                            outbox.push_back((j, Inbound::ControlTimeoutVote(sender, round)));
+                    DirectResolutionEffect::BroadcastWitness(message) => {
+                        for j in 0..n {
+                            if j != idx && nodes[j].alive {
+                                outbox.push_back((
+                                    j,
+                                    Inbound::DirectResolutionWitness(message.clone()),
+                                ));
+                            }
                         }
                     }
-                }
-                Effect::BroadcastControlTimeoutAccept(round) => {
-                    let sender = nodes[idx].name;
-                    for j in 0..n {
-                        if j != idx && nodes[j].alive {
-                            outbox.push_back((j, Inbound::ControlTimeoutAccept(sender, round)));
+                    DirectResolutionEffect::BroadcastDone(message) => {
+                        for j in 0..n {
+                            if j != idx && nodes[j].alive {
+                                outbox
+                                    .push_back((j, Inbound::DirectResolutionDone(message.clone())));
+                            }
                         }
                     }
-                }
-                Effect::ControlFetchTo(peer, view, digest) => {
-                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                        if nodes[j].alive {
-                            outbox.push_back((
-                                j,
-                                Inbound::ControlFetch(view, digest, nodes[idx].name),
-                            ));
+                    DirectResolutionEffect::DoneTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionDone(message)));
+                            }
                         }
                     }
-                }
-                Effect::ControlServeTo(peer, view, proposal) => {
-                    if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
-                        if nodes[j].alive {
-                            outbox.push_back((j, Inbound::ControlServe(view, proposal)));
+                    DirectResolutionEffect::ValueFetchTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionValueFetch(message)));
+                            }
                         }
                     }
-                }
-                Effect::ArmControlTimer(round, deadline) => {
-                    nodes[idx].control_timers.push((deadline, round));
-                }
-
-                Effect::ApplyAnchor(view, outcome, refs) => {
-                    let node = &mut nodes[idx];
-                    for r in refs {
-                        queue.extend(node.rep.authorize(r));
+                    DirectResolutionEffect::ValueServeTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionValueServe(message)));
+                            }
+                        }
                     }
-                    queue.extend(node.agb.submit_anchor(view, outcome));
-                }
+                    DirectResolutionEffect::ArmTimer(target, view, deadline) => {
+                        nodes[idx].resolution_timers.push((deadline, target, view));
+                    }
+                    DirectResolutionEffect::ValidateVote {
+                        target,
+                        view,
+                        value,
+                        entry,
+                        fresh,
+                    } => {
+                        let node = &mut nodes[idx];
+                        for reference in entry.references().cloned() {
+                            queue.extend(node.rep.authorize(reference));
+                        }
+                        let vote = node
+                            .agb
+                            .try_direct_resolution_vote(&entry, fresh, &mut node.lm)
+                            .map_or(DirectResolutionVote::Reject, |origin| {
+                                DirectResolutionVote::Accept { origin }
+                            });
+                        queue.extend(
+                            node.direct_resolver
+                                .on_vote(target, view, value, vote)
+                                .into_iter()
+                                .map(Effect::DirectResolution),
+                        );
+                    }
+                    DirectResolutionEffect::Decide(entry) => {
+                        let target = entry.target_view();
+                        let (outcome, refs) = match entry {
+                            crate::vantage::ResolutionEntry::Full(_, core, tip) => (
+                                crate::vantage::Outcome::Full(core.clone(), tip.clone()),
+                                core.into_iter().chain(tip).collect(),
+                            ),
+                            crate::vantage::ResolutionEntry::Core(_, core, tip) => (
+                                crate::vantage::Outcome::Core(core.clone()),
+                                core.into_iter().chain(tip).collect(),
+                            ),
+                            crate::vantage::ResolutionEntry::Skip(_) => {
+                                (crate::vantage::Outcome::Skip, Vec::new())
+                            }
+                        };
+                        let node = &mut nodes[idx];
+                        for reference in refs {
+                            queue.extend(node.rep.authorize(reference));
+                        }
+                        queue.extend(node.agb.submit_resolution(target, outcome));
+                    }
+                },
 
                 Effect::BodyFetchTo(peer, view, digest) => {
                     if let Some(j) = nodes.iter().position(|nd| nd.name == peer) {
@@ -867,13 +976,12 @@ pub async fn boot(nodes: &mut [Node], now: Instant, outbox: &mut VecDeque<(usize
         }
         let mut effects = nodes[i].enter_view_effects(1, now);
         effects.extend(nodes[i].pacemaker.genesis());
-        effects.extend(nodes[i].control.genesis());
         drain_local(nodes, i, effects, now, outbox);
     }
     run_to_quiescence(nodes, outbox, now).await;
 }
 
-pub async fn boot_without_control(
+pub async fn boot_without_resolution(
     nodes: &mut [Node],
     now: Instant,
     outbox: &mut VecDeque<(usize, Inbound)>,
@@ -889,21 +997,6 @@ pub async fn boot_without_control(
     run_to_quiescence(nodes, outbox, now).await;
 }
 
-pub async fn start_control(
-    nodes: &mut [Node],
-    now: Instant,
-    outbox: &mut VecDeque<(usize, Inbound)>,
-) {
-    for i in 0..nodes.len() {
-        if !nodes[i].alive {
-            continue;
-        }
-        let effects = nodes[i].control.genesis();
-        drain_local(nodes, i, effects, now, outbox);
-    }
-    run_to_quiescence(nodes, outbox, now).await;
-}
-
 pub async fn advance_time(
     nodes: &mut [Node],
     outbox: &mut VecDeque<(usize, Inbound)>,
@@ -914,7 +1007,7 @@ pub async fn advance_time(
             continue;
         }
         let mut effects = nodes[idx].fire_due_timers(now);
-        effects.extend(nodes[idx].fire_due_control_timers(now));
+        effects.extend(nodes[idx].fire_due_resolution_timers(now));
         drain_local(nodes, idx, effects, now, outbox);
         run_to_quiescence(nodes, outbox, now).await;
     }

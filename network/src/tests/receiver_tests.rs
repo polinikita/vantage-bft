@@ -1,22 +1,32 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
 struct TestHandler {
-    deliver: Sender<String>,
+    deliver: Sender<(Option<u8>, String)>,
 }
 
 #[async_trait]
 impl MessageHandler for TestHandler {
-    async fn dispatch(&self, writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(
+        &self,
+        writer: &mut Writer,
+        authenticated_peer: Option<u8>,
+        message: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
         let _ = writer.send(Bytes::from("Ack")).await;
 
         let message = bincode::deserialize(&message).unwrap();
 
-        self.deliver.send(message).await.unwrap();
+        self.deliver
+            .send((authenticated_peer, message))
+            .await
+            .unwrap();
         Ok(())
     }
 }
@@ -36,7 +46,38 @@ async fn receive() {
 
     let message = rx.recv().await;
     assert!(message.is_some());
-    let received = message.unwrap();
+    let (authenticated_peer, received) = message.unwrap();
+    assert_eq!(authenticated_peer, None);
+    assert_eq!(received, sent);
+}
+
+#[tokio::test]
+async fn authenticated_receiver_passes_the_handshake_identity_to_dispatch() {
+    let address = "127.0.0.1:4001".parse::<SocketAddr>().unwrap();
+    let seed = [91; 32];
+    let listener_auth = Arc::new(ChannelAuth::new(&seed, 1, 2, HashMap::new()));
+    let dialer_auth = ChannelAuth::new(&seed, 0, 2, HashMap::from([(address, 1)]));
+    let (tx, mut rx) = channel(1);
+    Receiver::spawn_full(
+        address,
+        TestHandler { deliver: tx },
+        None,
+        false,
+        false,
+        "test",
+        Some(listener_auth),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let sent = "authenticated";
+    let bytes = Bytes::from(bincode::serialize(sent).unwrap());
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let key = dialer_auth.handshake_dialer(&mut stream, 1).await.unwrap();
+    let mut transport = Framed::new(stream, authenticated_frame_codec(key, Role::Dialer));
+    transport.send(bytes).await.unwrap();
+
+    let (authenticated_peer, received) = rx.recv().await.unwrap();
+    assert_eq!(authenticated_peer, Some(0));
     assert_eq!(received, sent);
 }
 
