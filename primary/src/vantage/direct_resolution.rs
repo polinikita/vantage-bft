@@ -24,6 +24,8 @@ pub type DirectResolverView = u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DirectResolutionTimerKind {
+    /// Retransmit the initial WISH until this locally justified target enters.
+    Entry,
     /// Abandon a view whose primary has not delivered a proposal.
     Proposal,
     /// Abandon a proposed view whose agreement phases did not finish.
@@ -355,16 +357,6 @@ impl DirectResolver {
         effects
     }
 
-    fn ensure_instance(&mut self, target: View) -> bool {
-        if target == 0 || self.decisions.contains_key(&target) || self.terminals.contains(&target) {
-            return false;
-        }
-        self.instances
-            .entry(target)
-            .or_insert_with(|| DirectInstance::new(target));
-        true
-    }
-
     /// Phase traffic may race one resolver view ahead of local WISH entry,
     /// but a Byzantine member cannot allocate arbitrary future view maps.
     fn admits_phase_view(&self, target: View, view: DirectResolverView) -> bool {
@@ -383,6 +375,7 @@ impl DirectResolver {
         target: View,
         view: DirectResolverView,
     ) -> Vec<DirectResolutionEffect> {
+        let retry_delay = self.proposal_timeout();
         let Some(instance) = self.instances.get_mut(&target) else {
             return Vec::new();
         };
@@ -391,13 +384,23 @@ impl DirectResolver {
         }
         instance.own_wish = view;
         instance.wishes.insert(self.name, view);
-        vec![DirectResolutionEffect::BroadcastWish(
+        let waiting_for_initial_entry = instance.current_view == 0;
+        let mut effects = vec![DirectResolutionEffect::BroadcastWish(
             DirectResolutionWish {
                 target,
                 view,
                 sender: self.name,
             },
-        )]
+        )];
+        if waiting_for_initial_entry {
+            effects.push(DirectResolutionEffect::ArmTimer(
+                target,
+                view,
+                DirectResolutionTimerKind::Entry,
+                Instant::now() + retry_delay,
+            ));
+        }
+        effects
     }
 
     pub fn on_wish(&mut self, wish: DirectResolutionWish) -> Vec<DirectResolutionEffect> {
@@ -418,8 +421,13 @@ impl DirectResolver {
         if self.terminals.contains(&wish.target) {
             return Vec::new();
         }
-        self.ensure_instance(wish.target);
-        let instance = self.instances.get_mut(&wish.target).unwrap();
+        // Only local AGB evidence may allocate a target.  Correct parties
+        // retransmit their initial WISH until all peers have created the same
+        // locally justified instance, so dropping an early unsolicited WISH
+        // does not weaken liveness.
+        let Some(instance) = self.instances.get_mut(&wish.target) else {
+            return Vec::new();
+        };
         let slot = instance.wishes.entry(wish.sender).or_default();
         if wish.view <= *slot {
             return Vec::new();
@@ -555,6 +563,24 @@ impl DirectResolver {
         let Some(instance) = self.instances.get(&target) else {
             return Vec::new();
         };
+        if kind == DirectResolutionTimerKind::Entry {
+            if instance.current_view != 0 || instance.own_wish != view {
+                return Vec::new();
+            }
+            return vec![
+                DirectResolutionEffect::BroadcastWish(DirectResolutionWish {
+                    target,
+                    view,
+                    sender: self.name,
+                }),
+                DirectResolutionEffect::ArmTimer(
+                    target,
+                    view,
+                    DirectResolutionTimerKind::Entry,
+                    Instant::now() + self.proposal_timeout(),
+                ),
+            ];
+        }
         if instance.current_view != view {
             return Vec::new();
         }
@@ -576,10 +602,10 @@ impl DirectResolver {
             || suggest.target == 0
             || suggest.view == 0
             || self.decisions.contains_key(&suggest.target)
+            || !self.instances.contains_key(&suggest.target)
         {
             return Vec::new();
         }
-        self.ensure_instance(suggest.target);
         if !self.admits_phase_view(suggest.target, suggest.view)
             || self
                 .instances
@@ -622,10 +648,10 @@ impl DirectResolver {
             || proof.target == 0
             || proof.view == 0
             || self.decisions.contains_key(&proof.target)
+            || !self.instances.contains_key(&proof.target)
         {
             return Vec::new();
         }
-        self.ensure_instance(proof.target);
         if !self.admits_phase_view(proof.target, proof.view)
             || self
                 .instances
@@ -765,10 +791,10 @@ impl DirectResolver {
             || witness.view == 0
             || self.decisions.contains_key(&witness.target)
             || self.value_digest(&witness.entry) != witness.value
+            || !self.instances.contains_key(&witness.target)
         {
             return Vec::new();
         }
-        self.ensure_instance(witness.target);
         if !self.admits_phase_view(witness.target, witness.view) {
             return Vec::new();
         }
@@ -892,10 +918,10 @@ impl DirectResolver {
             || proposal.key_view >= proposal.view
             || proposal.sender != self.resolution_leader(proposal.target, proposal.view)
             || self.decisions.contains_key(&proposal.target)
+            || !self.instances.contains_key(&proposal.target)
         {
             return Vec::new();
         }
-        self.ensure_instance(proposal.target);
         if !self.admits_phase_view(proposal.target, proposal.view)
             || self
                 .instances
@@ -1109,10 +1135,10 @@ impl DirectResolver {
             || statement.origin.is_some_and(|bit| bit > 1)
             || (statement.phase != DirectResolutionPhase::Echo && statement.origin.is_some())
             || self.decisions.contains_key(&statement.target)
+            || !self.instances.contains_key(&statement.target)
         {
             return Vec::new();
         }
-        self.ensure_instance(statement.target);
         if !self.admits_phase_view(statement.target, statement.view) {
             return Vec::new();
         }
@@ -1397,7 +1423,9 @@ impl DirectResolver {
         if self.decisions.contains_key(&done.target) || self.terminals.contains(&done.target) {
             return Vec::new();
         }
-        self.ensure_instance(done.target);
+        if !self.instances.contains_key(&done.target) {
+            return Vec::new();
+        }
         if self
             .instances
             .get(&done.target)
