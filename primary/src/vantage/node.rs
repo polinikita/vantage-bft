@@ -2201,8 +2201,17 @@ impl VantageCore {
         if !self.mixed_open_fault_active(now) {
             return false;
         }
-        !self.mixed_open_single_target
-            || (self.mixed_open_single_target_injector && !self.mixed_open_single_target_used)
+        if !self.mixed_open_single_target {
+            return true;
+        }
+        let publication_window_settled = self
+            .mixed_open_stress_window
+            .as_deref()
+            .and_then(OnceLock::get)
+            .is_some_and(|(start, _)| now >= *start + Duration::from_secs(2));
+        publication_window_settled
+            && self.mixed_open_single_target_injector
+            && !self.mixed_open_single_target_used
     }
 
     /// Starts every locally justified per-target resolver through the current
