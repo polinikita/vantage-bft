@@ -22,6 +22,14 @@ use std::time::{Duration, Instant};
 
 pub type DirectResolverView = u64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DirectResolutionTimerKind {
+    /// Abandon a view whose primary has not delivered a proposal.
+    Proposal,
+    /// Abandon a proposed view whose agreement phases did not finish.
+    View,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectResolutionWish {
     pub target: View,
@@ -136,7 +144,7 @@ pub enum DirectResolutionEffect {
     DoneTo(PublicKey, DirectResolutionDone),
     ValueFetchTo(PublicKey, DirectResolutionValueFetch),
     ValueServeTo(PublicKey, DirectResolutionValueServe),
-    ArmTimer(View, DirectResolverView, Instant),
+    ArmTimer(View, DirectResolverView, DirectResolutionTimerKind, Instant),
     ValidateVote {
         target: View,
         view: DirectResolverView,
@@ -267,11 +275,19 @@ impl DirectResolver {
         self.delta * 11
     }
 
+    /// From the first correct entry, all correct parties enter within `2Delta`,
+    /// their suggestions reach a correct primary within one more delay, and
+    /// its proposal reaches every correct party within another.  The extra
+    /// delay avoids relying on a deadline tie in the runtime scheduler.
+    pub fn proposal_timeout(&self) -> Duration {
+        self.delta * 5
+    }
+
     pub fn resolution_leader(&self, target: View, view: DirectResolverView) -> PublicKey {
-        one_based_authority(
-            &self.committee,
-            target.saturating_add(view).saturating_sub(1),
-        )
+        // View 1 deliberately starts after the unresolved AGB proposer.  A
+        // faulty proposer is therefore not guaranteed the first resolver turn;
+        // subsequent views still visit every committee member in order.
+        one_based_authority(&self.committee, target.saturating_add(view))
     }
 
     pub fn value_digest(&self, entry: &ResolutionEntry) -> Digest {
@@ -446,7 +462,8 @@ impl DirectResolver {
         target: View,
         view: DirectResolverView,
     ) -> Vec<DirectResolutionEffect> {
-        let timeout = self.resolver_timeout();
+        let proposal_timeout = self.proposal_timeout();
+        let view_timeout = self.resolver_timeout();
         let (
             key3_view,
             key3_value,
@@ -504,8 +521,20 @@ impl DirectResolver {
         let state = instance.views.get_mut(&view).unwrap();
         state.suggestions.insert(self.name, suggest.clone());
         state.proofs.insert(self.name, proof.clone());
+        let now = Instant::now();
         let mut effects = vec![
-            DirectResolutionEffect::ArmTimer(target, view, Instant::now() + timeout),
+            DirectResolutionEffect::ArmTimer(
+                target,
+                view,
+                DirectResolutionTimerKind::Proposal,
+                now + proposal_timeout,
+            ),
+            DirectResolutionEffect::ArmTimer(
+                target,
+                view,
+                DirectResolutionTimerKind::View,
+                now + view_timeout,
+            ),
             DirectResolutionEffect::BroadcastProof(proof),
         ];
         if leader != self.name {
@@ -521,11 +550,20 @@ impl DirectResolver {
         &mut self,
         target: View,
         view: DirectResolverView,
+        kind: DirectResolutionTimerKind,
     ) -> Vec<DirectResolutionEffect> {
         let Some(instance) = self.instances.get(&target) else {
             return Vec::new();
         };
         if instance.current_view != view {
+            return Vec::new();
+        }
+        if kind == DirectResolutionTimerKind::Proposal
+            && instance
+                .views
+                .get(&view)
+                .is_some_and(|state| state.proposal.is_some())
+        {
             return Vec::new();
         }
         let mut effects = self.raise_own_wish(target, view.saturating_add(1));

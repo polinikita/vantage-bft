@@ -32,8 +32,9 @@ pub use cursor::Cursor;
 pub use direct_resolution::{
     DirectResolutionDone, DirectResolutionEffect, DirectResolutionPhase, DirectResolutionProof,
     DirectResolutionProposal, DirectResolutionStatement, DirectResolutionSuggest,
-    DirectResolutionValueFetch, DirectResolutionValueServe, DirectResolutionVote,
-    DirectResolutionWish, DirectResolutionWitness, DirectResolver, DirectResolverView,
+    DirectResolutionTimerKind, DirectResolutionValueFetch, DirectResolutionValueServe,
+    DirectResolutionVote, DirectResolutionWish, DirectResolutionWitness, DirectResolver,
+    DirectResolverView,
 };
 pub use frontier::Frontier;
 pub use lanes::{AvailEntry, BlockCache, BlockEntry, LaneManager, SharedBlocks};

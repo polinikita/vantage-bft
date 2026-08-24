@@ -2,8 +2,8 @@ use super::common::*;
 use crate::primary::View;
 use crate::vantage::{
     DirectResolutionEffect, DirectResolutionPhase, DirectResolutionProposal,
-    DirectResolutionStatement, DirectResolutionVote, DirectResolutionWish, DirectResolutionWitness,
-    DirectResolver, ResolutionEntry,
+    DirectResolutionStatement, DirectResolutionTimerKind, DirectResolutionVote,
+    DirectResolutionWish, DirectResolutionWitness, DirectResolver, ResolutionEntry,
 };
 use crypto::{Digest, PublicKey};
 use std::collections::VecDeque;
@@ -176,6 +176,78 @@ fn enter_view(
     }
     assert_eq!(resolver.current_view(target), view);
     effects
+}
+
+#[test]
+fn resolver_starts_after_the_target_proposer_and_cycles_the_committee() {
+    let committee = test_committee();
+    let names: Vec<_> = committee.authorities.keys().copied().collect();
+    let resolver = DirectResolver::new(names[0], committee, test_sid(), TEST_DELTA_MS);
+    let target = 11;
+
+    assert_ne!(
+        resolver.resolution_leader(target, 1),
+        crate::leader::one_based_authority(&test_committee(), target)
+    );
+    let leaders: std::collections::BTreeSet<_> = (1..=names.len() as u64)
+        .map(|view| resolver.resolution_leader(target, view))
+        .collect();
+    assert_eq!(leaders.len(), names.len());
+}
+
+#[test]
+fn proposal_deadline_rotates_only_if_no_proposal_arrived() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 8;
+    let leader = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS)
+        .resolution_leader(target, 1);
+    let follower = names.iter().copied().find(|name| *name != leader).unwrap();
+
+    let mut silent = DirectResolver::new(follower, test_committee(), test_sid(), TEST_DELTA_MS);
+    silent.update_candidates(target, [ResolutionEntry::Skip(target)]);
+    enter_view(&mut silent, &names, target, 1);
+    let effects = silent.on_timer(target, 1, DirectResolutionTimerKind::Proposal);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::BroadcastWish(wish) if wish.view == 2
+    )));
+
+    let entry = ResolutionEntry::Skip(target);
+    let mut proposed = DirectResolver::new(follower, test_committee(), test_sid(), TEST_DELTA_MS);
+    proposed.update_candidates(target, [entry.clone()]);
+    enter_view(&mut proposed, &names, target, 1);
+    let value = proposed.value_digest(&entry);
+    proposed.on_proposal(DirectResolutionProposal {
+        target,
+        view: 1,
+        key_view: 0,
+        value,
+        entry,
+        sender: leader,
+    });
+    assert!(proposed
+        .on_timer(target, 1, DirectResolutionTimerKind::Proposal)
+        .is_empty());
+    assert!(proposed
+        .on_timer(target, 1, DirectResolutionTimerKind::View)
+        .iter()
+        .any(|effect| matches!(
+            effect,
+            DirectResolutionEffect::BroadcastWish(wish) if wish.view == 2
+        )));
+}
+
+#[test]
+fn resolver_timer_budgets_keep_the_full_view_bound() {
+    let resolver = DirectResolver::new(authors()[0].0, test_committee(), test_sid(), TEST_DELTA_MS);
+    assert_eq!(
+        resolver.proposal_timeout().as_millis(),
+        5 * TEST_DELTA_MS as u128
+    );
+    assert_eq!(
+        resolver.resolver_timeout().as_millis(),
+        11 * TEST_DELTA_MS as u128
+    );
 }
 
 #[test]
