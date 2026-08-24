@@ -6,19 +6,17 @@ pub struct Thresholds {
     pub n: usize,
     pub f_parties: usize,
     pub f_plus_1_parties: usize,
-    pub two_f_plus_1_parties: usize,
     pub n_minus_f_parties: usize,
 }
 
 impl Thresholds {
-    /// Computes `f`, `f + 1`, `2f + 1`, and `n - f` for a party count.
+    /// Computes `f`, `f + 1`, and the protocol quorum `Q = n - f`.
     pub fn from_party_count(n: usize) -> Self {
         let f_parties = (n - 1) / 3;
         Self {
             n,
             f_parties,
             f_plus_1_parties: f_parties + 1,
-            two_f_plus_1_parties: 2 * f_parties + 1,
             n_minus_f_parties: n - f_parties,
         }
     }

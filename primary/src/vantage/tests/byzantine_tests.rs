@@ -128,7 +128,6 @@ async fn scenario_1_silent_proposer_sealed_via_grounded_skip_vote() {
             "node {} must have sealed gskip for the dead view via the grounded skip-vote quorum",
             i
         );
-        assert!(!nodes[i].direct_resolver.is_decided(dead_view));
         assert!(
             nodes[i].cursor.next_view() > dead_view,
             "node {} cursor must have advanced past the dead view",

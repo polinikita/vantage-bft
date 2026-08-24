@@ -10,7 +10,7 @@ pub struct Pacemaker {
     index_of: HashMap<PublicKey, usize>,
     own_index: usize,
     f_plus_1_parties: usize,
-    two_f_plus_1_parties: usize,
+    quorum_parties: usize,
     own_watermark: View,
     entry_target: View,
     largest_entered_view: View,
@@ -22,7 +22,7 @@ impl Pacemaker {
         let n = names.len();
         let thresholds = Thresholds::from_party_count(n);
         let f_plus_1_parties = thresholds.f_plus_1_parties;
-        let two_f_plus_1_parties = thresholds.two_f_plus_1_parties;
+        let quorum_parties = thresholds.n_minus_f_parties;
         let index_of: HashMap<PublicKey, usize> =
             names.iter().enumerate().map(|(i, pk)| (*pk, i)).collect();
         let own_index = *index_of
@@ -33,7 +33,7 @@ impl Pacemaker {
             index_of,
             own_index,
             f_plus_1_parties,
-            two_f_plus_1_parties,
+            quorum_parties,
             own_watermark: 0,
             entry_target: 0,
             largest_entered_view: 0,
@@ -53,7 +53,7 @@ impl Pacemaker {
     }
 
     pub fn omega_q(&self) -> View {
-        self.kth_largest(self.two_f_plus_1_parties)
+        self.kth_largest(self.quorum_parties)
     }
 
     pub fn entered_view(&self) -> View {
@@ -76,7 +76,7 @@ impl Pacemaker {
         effects
     }
 
-    /// Records a first-hand wish, amplifies at `f + 1`, then advances entry at `2f + 1`.
+    /// Records a first-hand wish, amplifies at `f + 1`, then advances entry at `Q = n - f`.
     pub fn on_wish(&mut self, sender: PublicKey, x: View) -> Vec<Effect> {
         let mut effects = Vec::new();
         let Some(&idx) = self.index_of.get(&sender) else {
@@ -92,7 +92,7 @@ impl Pacemaker {
             self.omega[self.own_index] = omega_plus;
             self.own_watermark = omega_plus;
         }
-        let omega_q = self.kth_largest(self.two_f_plus_1_parties);
+        let omega_q = self.kth_largest(self.quorum_parties);
         effects.extend(self.advance_entry_target(omega_q));
         effects
     }
@@ -103,7 +103,7 @@ impl Pacemaker {
         }
         self.omega[self.own_index] = x;
         self.own_watermark = x;
-        let omega_q = self.kth_largest(self.two_f_plus_1_parties);
+        let omega_q = self.kth_largest(self.quorum_parties);
         self.advance_entry_target(omega_q)
     }
 

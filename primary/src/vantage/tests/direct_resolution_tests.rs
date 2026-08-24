@@ -2,8 +2,9 @@ use super::common::*;
 use crate::primary::View;
 use crate::vantage::{
     DirectResolutionEffect, DirectResolutionPhase, DirectResolutionProposal,
-    DirectResolutionStatement, DirectResolutionTimerKind, DirectResolutionVote,
-    DirectResolutionWish, DirectResolutionWitness, DirectResolver, ResolutionEntry,
+    DirectResolutionStatement, DirectResolutionSuggest, DirectResolutionTimerKind,
+    DirectResolutionVote, DirectResolutionWish, DirectResolutionWitness, DirectResolver,
+    ResolutionEntry,
 };
 use crypto::{Digest, PublicKey};
 use std::collections::VecDeque;
@@ -193,6 +194,54 @@ fn resolver_starts_after_the_target_proposer_and_cycles_the_committee() {
         .map(|view| resolver.resolution_leader(target, view))
         .collect();
     assert_eq!(leaders.len(), names.len());
+}
+
+#[test]
+fn repeated_primary_turns_cycle_candidates_independently_of_view_modulus() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 11;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let leader = probe.resolution_leader(target, 1);
+    assert_eq!(leader, probe.resolution_leader(target, 5));
+
+    let first = ResolutionEntry::Core(target, Vec::new(), Vec::new());
+    let second = ResolutionEntry::Skip(target);
+    let mut resolver = DirectResolver::new(leader, test_committee(), test_sid(), TEST_DELTA_MS);
+    resolver.update_candidates(target, [first, second]);
+
+    let mut proposed = Vec::new();
+    for view in [1, 5] {
+        enter_view(&mut resolver, &names, target, view);
+        for sender in names
+            .iter()
+            .copied()
+            .filter(|sender| *sender != leader)
+            .take(2)
+        {
+            proposed.extend(
+                resolver
+                    .on_suggest(DirectResolutionSuggest {
+                        target,
+                        view,
+                        sender,
+                        key3_view: 0,
+                        key3_value: Digest::default(),
+                        key2_view: 0,
+                        key2_value: Digest::default(),
+                        prev_key2: 0,
+                        entry: None,
+                    })
+                    .into_iter()
+                    .filter_map(|effect| match effect {
+                        DirectResolutionEffect::BroadcastProposal(proposal) => Some(proposal.entry),
+                        _ => None,
+                    }),
+            );
+        }
+    }
+
+    assert_eq!(proposed.len(), 2);
+    assert_ne!(proposed[0], proposed[1]);
 }
 
 #[test]
@@ -509,26 +558,55 @@ fn unsolicited_resolver_traffic_cannot_allocate_targets() {
 }
 
 #[test]
-fn an_external_terminal_seal_cancels_only_that_target_instance() {
+fn f_plus_one_wishes_activate_and_enter_with_the_own_relay() {
     let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 17;
     let mut resolver = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
-    resolver.update_candidates(17, [ResolutionEntry::Skip(17)]);
-    resolver.update_candidates(18, [ResolutionEntry::Skip(18)]);
-    assert_eq!(resolver.active_len(), 2);
-
-    resolver.note_terminal(17);
-
-    assert_eq!(resolver.active_len(), 1);
-    assert_eq!(resolver.current_view(17), 0);
-    assert!(!resolver.is_decided(17));
-
-    let stale = resolver.on_wish(DirectResolutionWish {
-        target: 17,
-        view: 2,
+    resolver.on_wish(DirectResolutionWish {
+        target,
+        view: 1,
         sender: names[1],
     });
-    assert!(stale.is_empty());
-    assert_eq!(resolver.current_view(17), 0);
+    assert_eq!(resolver.active_len(), 0);
+
+    resolver.on_wish(DirectResolutionWish {
+        target,
+        view: 1,
+        sender: names[2],
+    });
+    assert_eq!(resolver.active_len(), 1);
+    assert_eq!(resolver.current_view(target), 1);
+
+    resolver.update_candidates(target, [ResolutionEntry::Skip(target)]);
+    assert_eq!(resolver.current_view(target), 1);
+}
+
+#[test]
+fn a_local_terminal_activates_and_relays_after_one_peer_wish() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 19;
+    let mut resolver = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+
+    let effects = resolver.activate_with_local_terminal(target);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::BroadcastWish(wish)
+            if wish.target == target && wish.view == 1 && wish.sender == names[0]
+    )));
+    assert_eq!(resolver.current_view(target), 0);
+
+    resolver.on_wish(DirectResolutionWish {
+        target,
+        view: 1,
+        sender: names[1],
+    });
+    assert_eq!(resolver.current_view(target), 0);
+    resolver.on_wish(DirectResolutionWish {
+        target,
+        view: 1,
+        sender: names[2],
+    });
+    assert_eq!(resolver.current_view(target), 1);
 }
 
 #[test]

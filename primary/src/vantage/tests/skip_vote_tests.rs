@@ -153,16 +153,42 @@ async fn vote_gate_requires_echo_skip_quorum() {
     let e2 = agb.on_echo_skip(1, others[1].0);
     assert!(
         !e2.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(_))),
-        "2 < 2f+1=3 -- the vote must not fire yet"
+        "2 < Q=3 -- the vote must not fire yet"
     );
     assert_eq!(agb.stance_for_test(1), Stance::Free);
 
     let e3 = agb.on_echo_skip(1, others[2].0);
     assert!(
         e3.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(1))),
-        "completing the 2f+1=3 census (with own no-ready already durable) must fire the vote"
+        "completing the Q=3 census (with own no-ready already durable) must fire the vote"
     );
     assert_eq!(agb.stance_for_test(1), Stance::SkipVoted);
+}
+
+#[tokio::test]
+async fn vote_gate_uses_n_minus_f_for_a_non_tight_committee() {
+    let (committee, keys) = Committee::local_benchmark(20, 1, 9510);
+    let self_name = keys[0].name;
+    let (lm, _store) = new_lane_manager_with_committee(
+        self_name,
+        ".db_test_skipvote_n20_quorum",
+        committee.clone(),
+    );
+    let mut rep = new_repairer_with_committee(self_name, &lm, committee.clone());
+    let mut agb = new_agb_engine_with_committee(self_name, committee);
+    let others: Vec<_> = keys.iter().skip(1).map(|key| key.name).collect();
+
+    agb.on_ready_timer(1, &mut rep);
+    for &sender in &others[..13] {
+        let effects = agb.on_echo_skip(1, sender);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BroadcastSkipVote(_))));
+    }
+    let effects = agb.on_echo_skip(1, others[13]);
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::BroadcastSkipVote(1))));
 }
 
 #[tokio::test]
@@ -189,7 +215,7 @@ async fn vote_sent_at_most_once_per_target() {
     let e5 = agb.on_echo_skip(1, others[4]);
     assert!(
         e5.iter().any(|e| matches!(e, Effect::BroadcastSkipVote(1))),
-        "the 5th distinct echo-skip completes 2f+1=5 -- the vote must fire"
+        "the 5th distinct echo-skip completes Q=5 -- the vote must fire"
     );
     let e6 = agb.on_echo_skip(1, others[5]);
     assert!(
@@ -381,7 +407,7 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
 }
 
 #[tokio::test]
-async fn integration_silent_proposer_view_seals_via_votes_without_resolver_application() {
+async fn integration_silent_proposer_view_seals_via_grounded_votes() {
     let all = authors();
     let mut nodes: Vec<Node> = all
         .iter()
@@ -437,7 +463,6 @@ async fn integration_silent_proposer_view_seals_via_votes_without_resolver_appli
             "node {} must seal gskip via the grounded vote quorum",
             i
         );
-        assert!(!nodes[i].direct_resolver.is_decided(dead_view));
         assert!(
             nodes[i]
                 .metrics

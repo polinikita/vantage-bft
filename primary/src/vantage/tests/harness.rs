@@ -159,7 +159,9 @@ impl Node {
             return effects;
         }
         for target in start..=scan_limit {
-            if self.agb.is_sealed(target) || self.direct_resolver.is_decided(target) {
+            if self.direct_resolver.is_decided(target)
+                || (self.agb.is_sealed(target) && !self.direct_resolver.has_instance(target))
+            {
                 continue;
             }
             let candidates = self
@@ -735,7 +737,6 @@ pub fn drain_local(
                     queue.extend(nodes[idx].cursor.on_completed(view, c, t));
                 }
                 Effect::Sealed(view, outcome) => {
-                    nodes[idx].direct_resolver.note_terminal(view);
                     queue.extend(nodes[idx].cursor.on_sealed(view, outcome));
                 }
                 Effect::ArmTimer(view, kind, deadline) => {

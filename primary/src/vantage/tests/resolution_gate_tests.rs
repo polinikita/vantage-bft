@@ -1,6 +1,6 @@
 use super::common::*;
 use crate::vantage::agb::{
-    Echo, EchoOut, Ready, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal,
+    Echo, EchoOut, Outcome, Ready, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal,
 };
 use crate::vantage::Effect;
 
@@ -718,6 +718,53 @@ async fn direct_resolver_fresh_vote_reuses_meta_ok_and_reports_origin() {
         agb.try_direct_resolution_vote(&entry, true, &mut lm),
         Some(Some(1)),
         "fresh direct ECHO must use the same target-local checks and origin as carrier MetaOK"
+    );
+}
+
+#[tokio::test]
+async fn a_locally_sealed_party_votes_only_for_the_compatible_fresh_value() {
+    let (self_name, _) = authors()[3];
+    let (author_c, _) = authors()[0];
+    let (mut lm, _store) = new_lane_manager(self_name, ".db_test_terminal_resolver_vote");
+    let mut rep = new_repairer(self_name, &lm);
+    let mut agb = new_agb_engine(self_name);
+    let now = std::time::Instant::now();
+
+    let (c_ref, proposal) =
+        drive_own_positive_echo(&mut agb, &mut lm, &mut rep, 1, author_c, now).await;
+    for (sender, _) in authors()
+        .into_iter()
+        .filter(|(sender, _)| *sender != self_name)
+        .take(2)
+    {
+        agb.on_echo(
+            Echo {
+                proposal: proposal.clone(),
+                grade: 1,
+                sender,
+                wish: 0,
+                origin: None,
+                avail: None,
+            },
+            &mut rep,
+        );
+    }
+    let compatible = ResolutionEntry::Full(1, vec![c_ref.clone()], Vec::new());
+    agb.submit_resolution(1, Outcome::Full(vec![c_ref], Vec::new()));
+
+    assert_eq!(
+        agb.try_direct_resolution_vote(&compatible, true, &mut lm),
+        Some(Some(1)),
+        "a local terminal must still help peers decide its exact outcome"
+    );
+    assert_eq!(
+        agb.try_direct_resolution_vote(
+            &ResolutionEntry::Core(1, Vec::new(), Vec::new()),
+            true,
+            &mut lm,
+        ),
+        None,
+        "a local terminal must reject an incompatible fresh outcome"
     );
 }
 
