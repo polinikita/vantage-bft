@@ -91,6 +91,7 @@ impl MessageHandler for SimpleItReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         let message: PrimaryMessage = bincode::deserialize(&serialized)?;
@@ -789,18 +790,7 @@ impl SimpleItCore {
                 | Effect::RaiseWish(_)
                 | Effect::SequenceFinalized { .. }
                 | Effect::RecoverOwnLane(_)
-                | Effect::CompletionReportable(_, _)
-                | Effect::BroadcastCompReport(_, _)
-                | Effect::BroadcastControlInit(_, _)
-                | Effect::BroadcastControlEcho(_)
-                | Effect::BroadcastControlReady(_)
-                | Effect::BroadcastControlCommit(_)
-                | Effect::BroadcastControlTimeoutVote(_)
-                | Effect::BroadcastControlTimeoutAccept(_)
-                | Effect::ControlFetchTo(_, _, _)
-                | Effect::ControlServeTo(_, _, _)
-                | Effect::ArmControlTimer(_, _)
-                | Effect::ApplyAnchor(_, _, _)
+                | Effect::DirectResolution(_)
                 | Effect::BodyFetchTo(_, _, _)
                 | Effect::BodyServeTo(_, _, _)
                 // Vantage handles availability claims.

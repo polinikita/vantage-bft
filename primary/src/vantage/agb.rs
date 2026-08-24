@@ -34,6 +34,16 @@ impl ResolutionEntry {
             | ResolutionEntry::Skip(u) => *u,
         }
     }
+
+    pub fn references(&self) -> impl Iterator<Item = &BlockRef> {
+        let (core, tip): (&[BlockRef], &[BlockRef]) = match self {
+            ResolutionEntry::Full(_, core, tip) | ResolutionEntry::Core(_, core, tip) => {
+                (core, tip)
+            }
+            ResolutionEntry::Skip(_) => (&[], &[]),
+        };
+        core.iter().chain(tip)
+    }
 }
 
 /// Wire proposal with at most one resolution entry.
@@ -439,6 +449,14 @@ fn formed_entry(committee: &Committee, view: View, entry: &ResolutionEntry) -> b
     if u < 1 || u > view.saturating_sub(3) {
         return false;
     }
+    formed_resolution_entry(committee, entry)
+}
+
+/// Validates a standalone resolver value without imposing a carrier-view delay.
+pub fn formed_resolution_entry(committee: &Committee, entry: &ResolutionEntry) -> bool {
+    if entry.target_view() < 1 {
+        return false;
+    }
     match entry {
         ResolutionEntry::Full(_, c_u, t_u) | ResolutionEntry::Core(_, c_u, t_u) => {
             if !strictly_sorted_and_staked(committee, c_u)
@@ -487,13 +505,7 @@ fn distinct_hashes(m1: &Manifest, m2: &Manifest) -> bool {
 /// Returns manifests from non-skip resolution entries.
 /// These references are authorized with the carrying proposal.
 fn aux_refs_entries(entries: &[ResolutionEntry]) -> impl Iterator<Item = &BlockRef> {
-    entries.iter().flat_map(|entry| {
-        let (c, t): (&[BlockRef], &[BlockRef]) = match entry {
-            ResolutionEntry::Full(_, c, t) | ResolutionEntry::Core(_, c, t) => (c, t),
-            ResolutionEntry::Skip(_) => (&[], &[]),
-        };
-        c.iter().chain(t)
-    })
+    entries.iter().flat_map(ResolutionEntry::references)
 }
 
 /// Returns the round-robin proposer using the committee's sorted authority order.
@@ -566,6 +578,8 @@ struct ViewState {
     /// homogeneous grade. Provisional mix cannot authorize resolution metadata.
     ready_mix_open: bool,
     completed: Option<(Manifest, Manifest)>,
+    /// True exactly while a completed-open view still lacks a terminal seal.
+    completed_open_unsealed: bool,
     directed: Option<Outcome>,
     sealed: Option<Outcome>,
     fastsealed: bool,
@@ -600,6 +614,7 @@ impl Default for ViewState {
             ready_sent: false,
             ready_mix_open: false,
             completed: None,
+            completed_open_unsealed: false,
             directed: None,
             sealed: None,
             fastsealed: false,
@@ -747,6 +762,16 @@ impl AgbEngine {
         if floor <= self.min_live_view {
             return;
         }
+        let pruned_open = self
+            .views
+            .range(..floor)
+            .filter(|(_, state)| state.completed_open_unsealed)
+            .count();
+        if pruned_open > 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.vantage_open_unsealed_views.sub(pruned_open as i64);
+            }
+        }
         self.views = self.views.split_off(&floor);
         self.pending_gate = self.pending_gate.split_off(&floor);
         self.min_live_view = floor;
@@ -886,15 +911,16 @@ impl AgbEngine {
         }
     }
 
-    pub fn submit_anchor(&mut self, view: View, outcome: Outcome) -> Vec<Effect> {
+    /// Submits a terminal outcome decided by the target-local resolver.
+    pub fn submit_resolution(&mut self, view: View, outcome: Outcome) -> Vec<Effect> {
         let mut effects = Vec::new();
         if self.is_pruned(view) {
             return effects;
         }
         let route = match &outcome {
-            Outcome::Full(..) => "anchor_full",
-            Outcome::Core(..) => "anchor_core",
-            Outcome::Skip => "anchor_skip",
+            Outcome::Full(..) => "resolver_full",
+            Outcome::Core(..) => "resolver_core",
+            Outcome::Skip => "resolver_skip",
         };
         self.try_seal(view, outcome, route, &mut effects);
         effects
@@ -1351,6 +1377,48 @@ impl AgbEngine {
         self.views.get(&u).is_some_and(|s| {
             s.stance == Stance::SkipVoted || matches!(s.sealed, Some(Outcome::Skip))
         })
+    }
+
+    /// Validates one direct per-target resolver vote.
+    ///
+    /// A fresh value performs the former metadata gate and claims the
+    /// persistent non-skip stance before the caller emits ECHO.  A carried
+    /// positive-key value has already reached the resolver's stable Backed
+    /// predicate: the underlying fresh-ECHO quorum excludes a skip-vote
+    /// quorum, so an individual earlier skip stance must not strand view
+    /// change.  A terminal target needs no second agreement path and is not
+    /// voted again.
+    pub fn try_direct_resolution_vote(
+        &mut self,
+        entry: &ResolutionEntry,
+        fresh: bool,
+        lm: &mut LaneManager,
+    ) -> Option<Option<u8>> {
+        let target = entry.target_view();
+        if self.is_pruned(target)
+            || self
+                .views
+                .get(&target)
+                .is_some_and(|state| state.sealed.is_some())
+        {
+            return None;
+        }
+        if !fresh {
+            return Some(None);
+        }
+        if self.stance_excludes(entry) {
+            return None;
+        }
+        if !self.meta_ok_entry(entry, lm) {
+            return None;
+        }
+        if matches!(entry, ResolutionEntry::Full(..) | ResolutionEntry::Core(..)) {
+            let state = self.state_mut(target);
+            if state.stance == Stance::Free {
+                state.stance = Stance::NonSkip;
+            }
+        }
+        Some(self.compute_origin_entry(entry))
     }
 
     /// Counts echo-skip responses toward the `2f + 1` skip-vote threshold.
@@ -2013,14 +2081,25 @@ impl AgbEngine {
         if any_stake >= self.quorum && self.state_mut(view).completed.is_none() {
             let c = proposal.c().clone();
             let t = proposal.t().clone();
-            self.state_mut(view).completed = Some((c.clone(), t.clone()));
+            let is_open = g1_stake < self.quorum && g0_stake < self.quorum && !t.is_empty();
+            let open_unsealed = {
+                let state = self.state_mut(view);
+                state.completed = Some((c.clone(), t.clone()));
+                state.completed_open_unsealed = is_open && state.sealed.is_none();
+                state.completed_open_unsealed
+            };
+            if is_open {
+                if let Some(metrics) = &self.metrics {
+                    metrics.vantage_completed_open_total.inc();
+                    if open_unsealed {
+                        metrics.vantage_open_unsealed_views.inc();
+                    }
+                }
+            }
             for r in c.iter().chain(aux_refs_entries(proposal.entries())) {
                 effects.extend(rep.authorize(r.clone()));
             }
-            if !proposal.entries().is_empty() {
-                effects.push(Effect::CompletionReportable(view, (*proposal).clone()));
-            }
-            if g1_stake < self.quorum && g0_stake < self.quorum && !t.is_empty() {
+            if is_open {
                 effects.push(Effect::QuarantineTips(t.clone()));
             }
             effects.push(Effect::Completed(view, c, t));
@@ -2049,29 +2128,40 @@ impl AgbEngine {
         if self.is_pruned(view) {
             return;
         }
-        let state = self.state_mut(view);
-        if let Some(existing) = &state.sealed {
-            debug_assert!(
-                Self::outcomes_compatible(existing, &outcome),
-                "try-seal arbiter: incompatible outcomes submitted for view {}: {:?} vs {:?}",
-                view,
-                existing,
-                outcome
-            );
-            return;
-        }
         #[cfg(feature = "pipeline-tracing")]
-        let proposal_start = state.first_proposal_instant;
-        state.sealed = Some(outcome.clone());
+        let now = Instant::now();
+        let (proposal_start, decrement_open) = {
+            let state = self.state_mut(view);
+            if let Some(existing) = &state.sealed {
+                debug_assert!(
+                    Self::outcomes_compatible(existing, &outcome),
+                    "try-seal arbiter: incompatible outcomes submitted for view {}: {:?} vs {:?}",
+                    view,
+                    existing,
+                    outcome
+                );
+                return;
+            }
+            let decrement_open = state.completed_open_unsealed;
+            state.completed_open_unsealed = false;
+            let proposal_start = state.first_proposal_instant;
+            state.sealed = Some(outcome.clone());
+            (proposal_start, decrement_open)
+        };
+        #[cfg(not(feature = "pipeline-tracing"))]
+        let _ = proposal_start;
         effects.push(Effect::Sealed(view, outcome));
         if let Some(metrics) = &self.metrics {
             metrics.vantage_seals.with_label_values(&[route]).inc();
+            if decrement_open {
+                metrics.vantage_open_unsealed_views.dec();
+            }
             #[cfg(feature = "pipeline-tracing")]
             if let Some(start) = proposal_start {
                 metrics
                     .pipeline
                     .vantage_proposal_to_seal_latency
-                    .observe(start.elapsed());
+                    .observe(now.saturating_duration_since(start));
             }
         }
     }

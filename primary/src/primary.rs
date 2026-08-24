@@ -88,18 +88,24 @@ pub enum PrimaryMessage {
     VantageNoReady(View, /* sender */ PublicKey, /* wish */ View),
     // Keep WISH variants appended for bincode compatibility.
     VantageWish(View, /* sender */ PublicKey),
-    // Vantage resolution messages.
+    // Obsolete Vantage control-log variants retained at their original indices.
     CompReport(View, Digest, /* sender */ PublicKey),
-    ControlInit(crate::vantage::ControlProposal, Option<ViewProposal>),
-    ControlEcho(crate::vantage::ControlProposal, /* sender */ PublicKey),
-    ControlReady(crate::vantage::ControlProposal, /* sender */ PublicKey),
+    ControlInit(crate::vantage::LegacyControlProposal, Option<ViewProposal>),
+    ControlEcho(
+        crate::vantage::LegacyControlProposal,
+        /* sender */ PublicKey,
+    ),
+    ControlReady(
+        crate::vantage::LegacyControlProposal,
+        /* sender */ PublicKey,
+    ),
     ControlFetch(View, Digest, /* requester */ PublicKey),
     ControlServe(View, ViewProposal),
     // Keep control commit messages appended for wire compatibility.
-    ControlCommit(crate::vantage::Round, /* sender */ PublicKey),
+    ControlCommit(u64, /* sender */ PublicKey),
     // Keep Simple-IT timeout messages appended for wire compatibility.
-    ControlTimeoutVote(crate::vantage::Round, /* sender */ PublicKey),
-    ControlTimeoutAccept(crate::vantage::Round, /* sender */ PublicKey),
+    ControlTimeoutVote(u64, /* sender */ PublicKey),
+    ControlTimeoutAccept(u64, /* sender */ PublicKey),
     // Keep Simple-IT cut messages appended for wire compatibility.
     SimpleItCutProposal(crate::simpleit::CutProposal),
     SimpleItCutVote(crate::simpleit::CutVote),
@@ -120,7 +126,7 @@ pub enum PrimaryMessage {
     VantageEchoBatch(crate::vantage::EchoBatch),
     VantageReadyBatch(crate::vantage::ReadyBatch),
     ControlInitBatch(
-        crate::vantage::ControlProposal,
+        crate::vantage::LegacyControlProposal,
         Option<crate::vantage::BatchViewProposal>,
     ),
     ControlServeBatch(View, crate::vantage::BatchViewProposal),
@@ -169,6 +175,17 @@ pub enum PrimaryMessage {
     PrepareHeadersRequest(Vec<Digest>, /* requestor */ PublicKey),
     // Autobahn whole-suffix response; appended for bincode compatibility.
     ProposalHeaders(Vec<Header>),
+
+    // Direct per-target resolver messages. Keep appended for bincode compatibility.
+    VantageDirectResolutionWish(crate::vantage::DirectResolutionWish),
+    VantageDirectResolutionSuggest(crate::vantage::DirectResolutionSuggest),
+    VantageDirectResolutionProof(crate::vantage::DirectResolutionProof),
+    VantageDirectResolutionProposal(crate::vantage::DirectResolutionProposal),
+    VantageDirectResolutionStatement(crate::vantage::DirectResolutionStatement),
+    VantageDirectResolutionDone(crate::vantage::DirectResolutionDone),
+    VantageDirectResolutionValueFetch(crate::vantage::DirectResolutionValueFetch),
+    VantageDirectResolutionValueServe(crate::vantage::DirectResolutionValueServe),
+    VantageDirectResolutionWitness(crate::vantage::DirectResolutionWitness),
 }
 
 impl PrimaryMessage {
@@ -244,6 +261,23 @@ impl PrimaryMessage {
             PrimaryMessage::VantageSequenceAnnounceBatch(..) => "VantageSequenceAnnounceBatch",
             PrimaryMessage::PrepareHeadersRequest(..) => "PrepareHeadersRequest",
             PrimaryMessage::ProposalHeaders(..) => "ProposalHeaders",
+            PrimaryMessage::VantageDirectResolutionWish(..) => "VantageDirectResolutionWish",
+            PrimaryMessage::VantageDirectResolutionSuggest(..) => "VantageDirectResolutionSuggest",
+            PrimaryMessage::VantageDirectResolutionProof(..) => "VantageDirectResolutionProof",
+            PrimaryMessage::VantageDirectResolutionProposal(..) => {
+                "VantageDirectResolutionProposal"
+            }
+            PrimaryMessage::VantageDirectResolutionStatement(..) => {
+                "VantageDirectResolutionStatement"
+            }
+            PrimaryMessage::VantageDirectResolutionDone(..) => "VantageDirectResolutionDone",
+            PrimaryMessage::VantageDirectResolutionValueFetch(..) => {
+                "VantageDirectResolutionValueFetch"
+            }
+            PrimaryMessage::VantageDirectResolutionValueServe(..) => {
+                "VantageDirectResolutionValueServe"
+            }
+            PrimaryMessage::VantageDirectResolutionWitness(..) => "VantageDirectResolutionWitness",
         }
     }
 }
@@ -475,6 +509,7 @@ impl Primary {
                         .unwrap_or_else(|error| {
                             panic!("invalid Vantage wire configuration: {error}")
                         }),
+                        committee: committee.clone(),
                         tx_bulk: tx_vantage_bulk,
                         tx_sequence: tx_vantage_sequence,
                         sequence_large_gap_drop,
@@ -932,6 +967,7 @@ impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         // The receiver sends one acknowledgement per frame.
@@ -1019,6 +1055,7 @@ impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.

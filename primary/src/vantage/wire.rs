@@ -128,13 +128,14 @@ impl DeclaredSender for Inbound {
             Inbound::SequenceUnavailable(_, s) => Some(*s),
             Inbound::SequenceHeadersRequest(_, s) => Some(*s),
             Inbound::SequenceHeaders(_, s) => Some(*s),
-            Inbound::CompReport(_, _, s) => Some(*s),
-            Inbound::ControlEcho(s, _) => Some(*s),
-            Inbound::ControlReady(s, _) => Some(*s),
-            Inbound::ControlCommit(s, _) => Some(*s),
-            Inbound::ControlTimeoutVote(s, _) => Some(*s),
-            Inbound::ControlTimeoutAccept(s, _) => Some(*s),
-            Inbound::ControlFetch(_, _, s) => Some(*s),
+            Inbound::DirectResolutionWish(message) => Some(message.sender),
+            Inbound::DirectResolutionSuggest(message) => Some(message.sender),
+            Inbound::DirectResolutionProof(message) => Some(message.sender),
+            Inbound::DirectResolutionProposal(message) => Some(message.sender),
+            Inbound::DirectResolutionStatement(message) => Some(message.sender),
+            Inbound::DirectResolutionWitness(message) => Some(message.sender),
+            Inbound::DirectResolutionDone(message) => Some(message.sender),
+            Inbound::DirectResolutionValueFetch(message) => Some(message.requester),
             Inbound::SkipVote(_, s) => Some(*s),
             Inbound::EchoDigest(d) => Some(d.sender),
             Inbound::ReadyDigest(d) => Some(d.sender),
@@ -146,8 +147,7 @@ impl DeclaredSender for Inbound {
             Inbound::Serve(_)
             | Inbound::AckAvailability(_)
             | Inbound::Propose(_)
-            | Inbound::ControlInit(_, _)
-            | Inbound::ControlServe(_, _)
+            | Inbound::DirectResolutionValueServe(_)
             | Inbound::BodyServe(_, _) => None,
         }
     }
@@ -864,6 +864,33 @@ mod tests {
                     panic!("decoded the wrong message variant");
                 };
                 assert_eq!(decoded, proposal);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_codec_roundtrips_direct_resolution_messages_and_reads_legacy_frames() {
+        let committee = crate::common::committee();
+        let sender = *committee.authorities.keys().next().unwrap();
+        let compact = VantageWireCodec::new(&committee, true).unwrap();
+        let legacy = VantageWireCodec::new(&committee, false).unwrap();
+        let witness = crate::vantage::DirectResolutionWitness {
+            target: 17,
+            view: 2,
+            value: Digest([4; 32]),
+            entry: crate::vantage::ResolutionEntry::Skip(17),
+            sender,
+        };
+        let message = PrimaryMessage::VantageDirectResolutionWitness(witness.clone());
+        for encoder in [&compact, &legacy] {
+            let bytes = encoder.serialize(&message).unwrap();
+            for decoder in [&compact, &legacy] {
+                let PrimaryMessage::VantageDirectResolutionWitness(decoded) =
+                    decoder.deserialize(&bytes).unwrap()
+                else {
+                    panic!("decoded the wrong direct-resolution message variant");
+                };
+                assert_eq!(decoded, witness);
             }
         }
     }

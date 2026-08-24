@@ -1198,8 +1198,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "quantile(0.5, rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route=~\"anchor.*\"}[1m]))",
-          "legendFormat": "anchor seals/s (median validator)",
+          "expr": "quantile(0.5, rate(vantage_seals{node=~\"$node\",node=~\".*-primary$\",route=~\"resolver.*\"}[1m]))",
+          "legendFormat": "resolver seals/s (median validator)",
           "refId": "C"
         },
         {
@@ -1207,13 +1207,13 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "rate(vantage_control_round{node=~\"$node\",node=~\".*-primary$\"}[1m])",
-          "legendFormat": "{{node}} control rounds/s",
+          "expr": "rate(vantage_resolved_through_view{node=~\"$node\",node=~\".*-primary$\"}[1m])",
+          "legendFormat": "{{node}} resolved prefix/s",
           "refId": "D"
         }
       ],
-      "description": "Per-second view rates. Entry and seal rates should match; anchor activity indicates fallback recovery.",
-      "title": "View entry / seal / anchor rates",
+      "description": "Per-second view rates. Resolver seals identify target-local fallback decisions.",
+      "title": "View entry / seal / direct resolver rates",
       "type": "timeseries"
     },
     {
@@ -1272,14 +1272,14 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "clamp_min(vantage_control_delivered_len{node=~\"$node\",node=~\".*-primary$\"} - on(node) vantage_control_consume_pos{node=~\"$node\",node=~\".*-primary$\"}, 0)",
-          "legendFormat": "{{node}} control-log gap",
+          "expr": "vantage_direct_resolver_active_targets{node=~\"$node\",node=~\".*-primary$\"}",
+          "legendFormat": "{{node}} active resolver targets",
           "refId": "C"
         }
       ],
-      "title": "View lag: cursor / wish / control-log (views)",
+      "title": "View lag and active resolver targets",
       "type": "timeseries",
-      "description": "Clamped view gaps. Persistent cursor, wish, or control-log gaps indicate stalled progress."
+      "description": "Clamped data-view gaps and target-local resolver instances awaiting a terminal decision."
     },
     {
       "datasource": {
@@ -2319,8 +2319,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch\"}[1m]))",
-          "legendFormat": "control",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"VantageDirectResolution.*\"}[1m]))",
+          "legendFormat": "resolution",
           "refId": "G"
         },
         {
@@ -2373,7 +2373,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|VantageSequence.*|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
+          "expr": "sum(rate(network_messages_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_messages_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|VantageSequence.*|VantageDirectResolution.*|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
           "legendFormat": "uncategorized (BUG if >0)",
           "refId": "Z"
         }
@@ -2481,8 +2481,8 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch\"}[1m]))",
-          "legendFormat": "control",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"VantageDirectResolution.*\"}[1m]))",
+          "legendFormat": "resolution",
           "refId": "G"
         },
         {
@@ -2535,7 +2535,7 @@
             "type": "prometheus",
             "uid": "Fixed-UID-vantage"
           },
-          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|VantageSequence.*|CompReport|ControlInit|ControlInitBatch|ControlEcho|ControlReady|ControlTimeoutVote|ControlTimeoutAccept|ControlCommit|ControlFetch|ControlServe|ControlServeBatch|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
+          "expr": "sum(rate(network_bytes_sent_total{node=~\"$node\"}[1m])) - sum(rate(network_bytes_sent_total{node=~\"$node\",type=~\"Header|Batch|VantageAck|VantageWish|VantagePropose|VantageEcho|VantageEchoSkip|VantageReady|VantageNoReady|VantageSkipVote|VantageEchoDigest|VantageReadyDigest|VantageProposeBatch|VantageEchoBatch|VantageReadyBatch|HeadersRequest|BatchRequest|VantageAvail|VantageBodyFetch|VantageBodyServe|VantageLaneResume|VantageResumeHello|Replay|VantageReplayDone|VantageSequence.*|VantageDirectResolution.*|SimpleItCutProposal|SimpleItCutVote|SimpleItCutReady|SimpleItDecide|SimpleItTimeout|SimpleItTimeoutAccept|SimpleItCutFetch|SimpleItCutServe|Vote|Certificate|ConsensusMessage|ConsensusRequest|ConsensusVote|Timeout|TC|CertificatesRequest|ProposalHeadersRequest|Committed|OurBatch|OthersBatch|Synchronize|Cleanup\"}[1m]))",
           "legendFormat": "uncategorized (BUG if >0)",
           "refId": "Z"
         }

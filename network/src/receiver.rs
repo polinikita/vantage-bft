@@ -29,7 +29,14 @@ pub type Writer = SplitSink<Framed<TcpStream, AuthCodec>, Bytes>;
 #[async_trait]
 pub trait MessageHandler: Clone + Send + Sync + 'static {
     /// Handles one decoded message and may write a response on `writer`.
-    async fn dispatch(&self, writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>>;
+    /// `authenticated_peer` is the committee index established by the channel
+    /// handshake, or `None` for an unauthenticated listener.
+    async fn dispatch(
+        &self,
+        writer: &mut Writer,
+        authenticated_peer: Option<u8>,
+        message: Bytes,
+    ) -> Result<(), Box<dyn Error>>;
 }
 
 /// Accepts connections and dispatches their messages to a handler.
@@ -152,11 +159,11 @@ impl<Handler: MessageHandler> Receiver<Handler> {
 
             // Bind the connection to a committee identity before dispatching anything from
             // it. A peer that cannot produce a valid tag never reaches the handler.
-            let codec = match &config.auth {
+            let (codec, authenticated_peer) = match &config.auth {
                 Some(auth) => match auth.handshake_listener(&mut socket).await {
                     Ok((index, key)) => {
                         debug!("Authenticated connection from committee member {}", index);
-                        authenticated_frame_codec(key, Role::Listener)
+                        (authenticated_frame_codec(key, Role::Listener), Some(index))
                     }
                     Err(e) => {
                         warn!("{}", NetworkError::ChannelAuthFailed(peer, e));
@@ -164,7 +171,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                         return;
                     }
                 },
-                None => frame_codec(),
+                None => (frame_codec(), None),
             };
             let authenticated = codec.is_authenticated();
             let (mut writer, mut reader) = Framed::new(socket, codec).split();
@@ -193,8 +200,9 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                             match decode_bundle(&payload) {
                                 Ok(messages) => {
                                     for sub_message in messages {
-                                        if let Err(e) =
-                                            handler.dispatch(&mut writer, sub_message).await
+                                        if let Err(e) = handler
+                                            .dispatch(&mut writer, authenticated_peer, sub_message)
+                                            .await
                                         {
                                             warn!("{}", e);
                                             return;
@@ -206,7 +214,10 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                                     return;
                                 }
                             }
-                        } else if let Err(e) = handler.dispatch(&mut writer, payload).await {
+                        } else if let Err(e) = handler
+                            .dispatch(&mut writer, authenticated_peer, payload)
+                            .await
+                        {
                             warn!("{}", e);
                             return;
                         }

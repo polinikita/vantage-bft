@@ -85,34 +85,8 @@ async fn crash_fault_dead_proposer_view_seals_via_grounded_skip_vote() {
             "node {} must have sealed gskip for the dead view via the grounded skip-vote quorum",
             i
         );
-        assert!(
-            !nodes[i].control.is_anchor_resolved(dead_view),
-            "node {} must NOT have anchored the dead view -- the vote quorum sealed it directly",
-            i
-        );
+        assert!(!nodes[i].direct_resolver.is_decided(dead_view));
     }
-
-    let carrying_view: crate::primary::View = 1000;
-    let carrier_name = crate::vantage::agb::proposer(&test_committee(), carrying_view);
-    let carrier_idx = live
-        .iter()
-        .find(|&&i| nodes[i].name == carrier_name)
-        .copied()
-        .expect("a live party must lead the carrying view");
-    let m = {
-        let node = &mut nodes[carrier_idx];
-        let agb = &node.agb;
-        let control = &node.control;
-        let resolved = |u: crate::primary::View| agb.is_sealed(u) || control.is_anchor_resolved(u);
-        node.resolver
-            .decide(agb, carrying_view, entry_instant, resolved);
-        node.resolver
-            .decide(agb, carrying_view, entry_instant, resolved)
-    };
-    assert_eq!(
-        m, None,
-        "the dead view is already sealed via the vote quorum -- no carrying proposal is needed"
-    );
 
     run_to_quiescence(
         &mut nodes,

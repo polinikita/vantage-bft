@@ -235,10 +235,10 @@ async fn quorum_seal_via_votes_first_per_author_duplicates_ignored_idempotent_wi
         "the duplicate from others[0] must never have double-counted"
     );
 
-    let after = agb.submit_anchor(1, Outcome::Skip);
+    let after = agb.submit_resolution(1, Outcome::Skip);
     assert!(
         after.is_empty(),
-        "a later compatible anchor submission for an already-sealed view produces no new effect"
+        "a later compatible resolver submission for an already-sealed view produces no new effect"
     );
 }
 
@@ -381,7 +381,7 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
 }
 
 #[tokio::test]
-async fn integration_silent_proposer_view_seals_via_votes_with_zero_control_log_applications() {
+async fn integration_silent_proposer_view_seals_via_votes_without_resolver_application() {
     let all = authors();
     let mut nodes: Vec<Node> = all
         .iter()
@@ -437,11 +437,7 @@ async fn integration_silent_proposer_view_seals_via_votes_with_zero_control_log_
             "node {} must seal gskip via the grounded vote quorum",
             i
         );
-        assert!(
-            !nodes[i].control.is_anchor_resolved(dead_view),
-            "node {} must show ZERO control-log applications for the dead view",
-            i
-        );
+        assert!(!nodes[i].direct_resolver.is_decided(dead_view));
         assert!(
             nodes[i]
                 .metrics
@@ -456,10 +452,10 @@ async fn integration_silent_proposer_view_seals_via_votes_with_zero_control_log_
             nodes[i]
                 .metrics
                 .vantage_seals
-                .with_label_values(&["anchor_skip"])
+                .with_label_values(&["resolver_skip"])
                 .get(),
             0,
-            "node {} must show zero anchor_skip route increments -- no anchor ever ran",
+            "node {} must show zero resolver_skip increments -- no resolver ran",
             i
         );
         assert!(

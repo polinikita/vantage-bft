@@ -508,7 +508,12 @@ const TX_YIELD_EVERY: u64 = 128;
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(
+        &self,
+        _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
+        message: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
         // Forward the owned frame without copying.
         self.tx_batch_maker
             .send(message)
@@ -541,6 +546,7 @@ impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         match route_worker_message(&serialized) {
@@ -624,6 +630,7 @@ impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize::<PrimaryWorkerMessage>(&serialized) {
