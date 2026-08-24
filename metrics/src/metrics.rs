@@ -360,12 +360,12 @@ pub struct Metrics {
     pub vantage_cursor_next_view: IntGauge,
     /// Entries dropped because an author's lane contradicted delivered output.
     pub vantage_cursor_forked_entries_dropped: IntGauge,
-    /// Current control-log round.
-    pub vantage_control_round: IntGauge,
-    /// Control-log entries delivered by reliable broadcast.
-    pub vantage_control_delivered_len: IntGauge,
-    /// Number of delivered control-log entries consumed.
-    pub vantage_control_consume_pos: IntGauge,
+    /// Current resolver view, or zero while the resolver is idle.
+    pub vantage_resolution_view: IntGauge,
+    /// Number of decided resolution-chain blocks.
+    pub vantage_resolution_height: IntGauge,
+    /// Eligible carrier anchors not yet included in the decided chain.
+    pub vantage_resolution_pending_anchors: IntGauge,
     /// Active and fixed views waiting for an echo.
     pub vantage_pending_gate_len: IntGauge,
     /// Outstanding AGB body fetches. Bounded by `agb::MAX_PENDING_FETCH`.
@@ -540,7 +540,7 @@ pub struct Metrics {
     pub vantage_sequence_install_completed_total: IntCounter,
     /// Highest view installed from verified checkpoint state.
     pub vantage_sequence_install_completed_view: IntGauge,
-    /// Consensus, control, and service messages discarded while sequence recovery is active.
+    /// Consensus, resolver, and service messages discarded while sequence recovery is active.
     pub vantage_sequence_install_obsolete_inbound_dropped_total: IntCounter,
 
     /// `SimpleSender` frames discarded while waiting for a connection.
@@ -1119,21 +1119,21 @@ impl Metrics {
                 registry,
             )
             .unwrap(),
-            vantage_control_round: register_int_gauge_with_registry!(
-                "vantage_control_round",
-                "Current control-log round",
+            vantage_resolution_view: register_int_gauge_with_registry!(
+                "vantage_resolution_view",
+                "Current resolver view, or zero while idle",
                 registry,
             )
             .unwrap(),
-            vantage_control_delivered_len: register_int_gauge_with_registry!(
-                "vantage_control_delivered_len",
-                "Control-log entries delivered by reliable broadcast",
+            vantage_resolution_height: register_int_gauge_with_registry!(
+                "vantage_resolution_height",
+                "Decided resolution-chain blocks",
                 registry,
             )
             .unwrap(),
-            vantage_control_consume_pos: register_int_gauge_with_registry!(
-                "vantage_control_consume_pos",
-                "Delivered control-log entries consumed",
+            vantage_resolution_pending_anchors: register_int_gauge_with_registry!(
+                "vantage_resolution_pending_anchors",
+                "Eligible carrier anchors awaiting a resolution-chain decision",
                 registry,
             )
             .unwrap(),
@@ -1628,7 +1628,7 @@ impl Metrics {
             vantage_sequence_install_obsolete_inbound_dropped_total:
                 register_int_counter_with_registry!(
                     "vantage_sequence_install_obsolete_inbound_dropped_total",
-                    "Consensus/control/service messages discarded while a sequence install makes them stale",
+                    "Consensus/resolver/service messages discarded while a sequence install makes them stale",
                     registry,
                 )
                 .unwrap(),

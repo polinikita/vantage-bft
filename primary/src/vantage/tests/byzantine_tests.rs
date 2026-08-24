@@ -2,15 +2,14 @@
 
 use super::common::*;
 use super::harness::{
-    advance_time, boot, boot_without_control, deliver_only_to, drain_local, run_to_quiescence,
-    start_control, Node,
+    advance_time, boot, boot_without_resolution, deliver_only_to, drain_local, run_to_quiescence,
+    Node,
 };
 use crate::messages::Header;
 use crate::primary::View;
 use crate::vantage::agb::{
     self, Echo, EchoOut, Outcome, ProposalOut, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal,
 };
-use crate::vantage::control::{ControlLog, ControlProposal};
 use crate::vantage::node::Inbound;
 use crate::vantage::Effect;
 use std::collections::{BTreeMap, VecDeque};
@@ -19,21 +18,21 @@ use std::time::{Duration, Instant};
 const MAX_VIEWS: crate::primary::View = 12;
 const MAX_VIEWS_NO_ORGANIC: crate::primary::View = 1;
 
-async fn drive_control_rounds(
+async fn drive_resolution_views(
     nodes: &mut [Node],
     outbox: &mut VecDeque<(usize, Inbound)>,
     now: Instant,
     rounds: usize,
 ) {
-    let control_timeout = nodes
+    let resolution_timeout = nodes
         .iter()
         .find(|n| n.alive)
         .unwrap()
-        .control
-        .control_round_timeout();
+        .resolution_chain
+        .resolver_timeout();
     let mut ct = now;
     for _ in 0..rounds {
-        ct += control_timeout + Duration::from_millis(1);
+        ct += resolution_timeout + Duration::from_millis(1);
         advance_time(nodes, outbox, ct).await;
         run_to_quiescence(nodes, outbox, ct).await;
     }
@@ -50,18 +49,18 @@ fn resolve_carrying_entry(
     let first = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
-        let control = &node.control;
+        let resolution_chain = &node.resolution_chain;
         node.resolver.decide(agb, carrying_view, now, |u| {
-            agb.is_sealed(u) || control.is_anchor_resolved(u)
+            agb.is_sealed(u) || resolution_chain.is_anchor_resolved(u)
         })
     };
     assert_eq!(first, None, "the next-turn bit starts data-only");
     let m = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
-        let control = &node.control;
+        let resolution_chain = &node.resolution_chain;
         node.resolver.decide(agb, carrying_view, now, |u| {
-            agb.is_sealed(u) || control.is_anchor_resolved(u)
+            agb.is_sealed(u) || resolution_chain.is_anchor_resolved(u)
         })
     };
     let entry = m.expect("the target view must be justified for recovery");
@@ -89,8 +88,7 @@ async fn drive_carrying_proposal_to_anchor(
         Inbound::Propose(ProposalOut::Single(proposal)),
     );
     run_to_quiescence(nodes, outbox, now).await;
-    start_control(nodes, now, outbox).await;
-    drive_control_rounds(nodes, outbox, now, 6).await;
+    drive_resolution_views(nodes, outbox, now, 6).await;
 }
 
 #[tokio::test]
@@ -164,7 +162,7 @@ async fn scenario_1_silent_proposer_sealed_via_grounded_skip_vote() {
             i
         );
         assert!(
-            !nodes[i].control.is_anchor_resolved(dead_view),
+            !nodes[i].resolution_chain.is_anchor_resolved(dead_view),
             "node {} must NOT have anchored the dead view -- the vote quorum sealed it directly",
             i
         );
@@ -255,7 +253,7 @@ async fn scenario_2_withheld_tip_author_mixed_grades_resolved_via_anchor() {
         drain_local(&mut nodes, i, effects, now, &mut outbox);
     }
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
-    boot_without_control(&mut nodes, now, &mut outbox).await;
+    boot_without_resolution(&mut nodes, now, &mut outbox).await;
 
     let view: View = 2;
     let (tip_author, _) = all[1];
@@ -435,7 +433,7 @@ async fn scenario_3_equivocating_leader_disjoint_halves_resolution_settles_it() 
         drain_local(&mut nodes, i, effects, now, &mut outbox);
     }
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
-    boot_without_control(&mut nodes, now, &mut outbox).await;
+    boot_without_resolution(&mut nodes, now, &mut outbox).await;
 
     let view: View = 2;
     let (author0, _) = all[0];
@@ -578,7 +576,7 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
         drain_local(&mut nodes, i, effects, now, &mut outbox);
     }
     run_to_quiescence(&mut nodes, &mut outbox, now).await;
-    boot_without_control(&mut nodes, now, &mut outbox).await;
+    boot_without_resolution(&mut nodes, now, &mut outbox).await;
 
     let view: View = 2;
     let (fork_author, _) = all[3];
@@ -755,153 +753,6 @@ async fn scenario_4_forked_author_chain_kept_branch_wins_identical_outputs() {
             !nodes[i].cursor.output_log().contains(&losing_branch_id),
             "node {} output must NEVER contain the orphaned/losing fork branch",
             i
-        );
-    }
-}
-
-fn drain_control(
-    controls: &mut [ControlLog],
-    names: &[crypto::PublicKey],
-    initial: Vec<(usize, Effect)>,
-) {
-    let n = controls.len();
-    let mut queue: VecDeque<(usize, Effect)> = initial.into();
-    while let Some((origin, effect)) = queue.pop_front() {
-        match effect {
-            Effect::BroadcastControlEcho(p) => {
-                for j in 0..n {
-                    if j != origin {
-                        let out = controls[j].on_control_echo(names[origin], p.clone());
-                        queue.extend(out.into_iter().map(|e| (j, e)));
-                    }
-                }
-            }
-            Effect::BroadcastControlReady(p) => {
-                for j in 0..n {
-                    if j != origin {
-                        let out = controls[j].on_control_ready(names[origin], p.clone());
-                        queue.extend(out.into_iter().map(|e| (j, e)));
-                    }
-                }
-            }
-            Effect::ControlFetchTo(peer, w, h) => {
-                if let Some(j) = names.iter().position(|nm| *nm == peer) {
-                    let out = controls[j].on_control_fetch(names[origin], w, h);
-                    queue.extend(out.into_iter().map(|e| (j, e)));
-                }
-            }
-            Effect::ControlServeTo(peer, w, proposal) => {
-                if let Some(j) = names.iter().position(|nm| *nm == peer) {
-                    let out = controls[j].on_control_serve(w, proposal);
-                    queue.extend(out.into_iter().map(|e| (j, e)));
-                }
-            }
-            _ => {} // This scenario keeps `curr_round` at zero.
-        }
-    }
-}
-
-#[tokio::test]
-async fn scenario_5_byzantine_control_leader_totality_via_fetch_and_invalid_pair_unreachable() {
-    let all = authors();
-    let names: Vec<crypto::PublicKey> = all.iter().map(|(pk, _)| *pk).collect();
-    let sid = test_sid();
-
-    let mut controls: Vec<ControlLog> = names
-        .iter()
-        .map(|pk| ControlLog::new(*pk, test_committee(), sid.clone(), TEST_DELTA_MS))
-        .collect();
-    let b_w = ProposalOut::Single(ViewProposal {
-        view: 4,
-        c: Vec::new(),
-        t: Vec::new(),
-        m: Some(ResolutionEntry::Skip(1)),
-    });
-    let digest = b_w.digest(&sid);
-    let leader = controls[0].control_leader(1);
-
-    for i in 0..3 {
-        controls[i].on_completion_reportable(4, b_w.clone());
-    }
-    for i in 0..3 {
-        for j in 0..3 {
-            controls[i].on_comp_report(4, digest.clone(), names[j]);
-        }
-    }
-
-    let proposal1 = ControlProposal {
-        round: 1,
-        parent: 0,
-        value: Some((4, digest.clone())),
-    };
-    let mut initial: Vec<(usize, Effect)> = Vec::new();
-    for i in 0..4 {
-        let b_w_variant = if i < 3 { Some(b_w.clone()) } else { None }; // Party 3 lacks B_w.
-        let effects = controls[i].on_control_init(leader, proposal1.clone(), b_w_variant);
-        let echoed = effects
-            .iter()
-            .any(|e| matches!(e, Effect::BroadcastControlEcho(_)));
-        if i < 3 {
-            assert!(
-                echoed,
-                "party {} legitimately holds reports + B_w -- must ECHO immediately",
-                i
-            );
-        } else {
-            assert!(
-                !echoed,
-                "party 3 lacks B_w entirely -- must NOT ECHO (validity gate blocks it)"
-            );
-        }
-        initial.extend(effects.into_iter().map(|e| (i, e)));
-    }
-
-    drain_control(&mut controls, &names, initial);
-
-    assert!(
-        controls[3].holds_block_for_test(4),
-        "party 3 must have obtained B_w via fetch (totality), despite never validating it directly"
-    );
-    for i in 0..4 {
-        assert!(
-            controls[i].is_safe_for_test(1),
-            "round 1 must be marked safe for every party once delivered (parent=0 is always safe)"
-        );
-    }
-
-    let mut controls_b: Vec<ControlLog> = names
-        .iter()
-        .map(|pk| ControlLog::new(*pk, test_committee(), sid.clone(), TEST_DELTA_MS))
-        .collect();
-    let bogus_digest = crypto::Digest([0xEEu8; 32]);
-    let bogus_view: View = 99;
-    let leader_b = controls_b[0].control_leader(1);
-    let proposal_bogus = ControlProposal {
-        round: 1,
-        parent: 0,
-        value: Some((bogus_view, bogus_digest.clone())),
-    };
-    let mut any_echo = false;
-    for i in 0..4 {
-        assert_eq!(
-            controls_b[i].report_count_for(bogus_view, &bogus_digest),
-            0,
-            "no legitimate reports exist anywhere for the fictional pair"
-        );
-        let effects = controls_b[i].on_control_init(leader_b, proposal_bogus.clone(), None);
-        any_echo |= effects
-            .iter()
-            .any(|e| matches!(e, Effect::BroadcastControlEcho(_)));
-    }
-    assert!(!any_echo, "an invalid pair with no real backing must never be validated by anyone -- no 2f+1 ECHOs, ever");
-    for i in 0..4 {
-        assert!(
-            !controls_b[i].is_safe_for_test(1),
-            "round 1 must never become safe for the invalid pair"
-        );
-        assert!(
-            controls_b[i].delivered_log_for_test().is_empty(),
-            "nothing may ever be delivered for the invalid pair"
         );
     }
 }

@@ -7,7 +7,11 @@ use crate::vantage::agb::{
     TimerKind, ViewProposal,
 };
 use crate::vantage::block::{self, BlockRef};
-use crate::vantage::control::{ControlLog, ControlProposal, Round};
+use crate::vantage::resolution_chain::{
+    ResolutionBlock, ResolutionChain, ResolutionDone, ResolutionHeight, ResolutionProof,
+    ResolutionProposal, ResolutionStatement, ResolutionSuggest, ResolutionWish, ResolutionWitness,
+    ResolverView,
+};
 
 /// Maximum retained certified checkpoint candidates.
 const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
@@ -131,18 +135,19 @@ pub enum Inbound {
 
     Wish(View, PublicKey),
 
-    CompReport(View, Digest, PublicKey),
-
-    /// The sender is derived from the control round because the frame has no sender field.
-    ControlInit(ControlProposal, Option<ProposalOut>),
-    ControlEcho(PublicKey, ControlProposal),
-    ControlReady(PublicKey, ControlProposal),
-    ControlCommit(PublicKey, Round),
-    ControlTimeoutVote(PublicKey, Round),
-    ControlTimeoutAccept(PublicKey, Round),
-    ControlFetch(View, Digest, PublicKey),
-
-    ControlServe(View, ProposalOut),
+    ResolutionWitness(ResolutionWitness),
+    ResolutionWish(ResolutionWish),
+    ResolutionSuggest(ResolutionSuggest),
+    ResolutionProof(ResolutionProof),
+    /// The sender is the designated primary for the embedded resolver coordinate.
+    ResolutionProposal(ResolutionProposal),
+    ResolutionStatement(ResolutionStatement),
+    ResolutionDone(ResolutionDone),
+    ResolutionCarrierFetch(View, Digest, PublicKey),
+    ResolutionCarrierServe(View, ProposalOut),
+    ResolutionBlockFetch(ResolutionHeight, Digest, PublicKey),
+    ResolutionBlockServe(ResolutionBlock),
+    ResolutionDecisionRequest(ResolutionHeight, PublicKey),
 
     /// Skip votes do not carry a wish watermark.
     SkipVote(View, PublicKey),
@@ -187,7 +192,7 @@ const INBOUND_FAMILY_LABELS: [&str; 8] = [
     "in_ready",
     "in_avail",
     "in_propose",
-    "in_control",
+    "in_resolver",
     "in_serve",
     "in_sync",
 ];
@@ -203,18 +208,20 @@ impl Inbound {
             Inbound::Ready(_) | Inbound::NoReady(_, _, _) | Inbound::ReadyDigest(_) => 2,
             Inbound::Ack(_) | Inbound::AckAvailability(_) | Inbound::Avail(_, _) => 3,
             Inbound::Propose(_) => 4,
-            Inbound::ControlInit(_, _)
-            | Inbound::ControlEcho(_, _)
-            | Inbound::ControlReady(_, _)
-            | Inbound::ControlCommit(_, _)
-            | Inbound::ControlTimeoutVote(_, _)
-            | Inbound::ControlTimeoutAccept(_, _)
+            Inbound::ResolutionWitness(_)
+            | Inbound::ResolutionWish(_)
+            | Inbound::ResolutionSuggest(_)
+            | Inbound::ResolutionProof(_)
+            | Inbound::ResolutionProposal(_)
+            | Inbound::ResolutionStatement(_)
+            | Inbound::ResolutionDone(_)
             | Inbound::Wish(_, _)
-            | Inbound::CompReport(_, _, _)
             | Inbound::SkipVote(_, _) => 5,
             Inbound::HeadersRequest(_, _)
             | Inbound::LaneResume(_, _, _)
-            | Inbound::ControlFetch(_, _, _)
+            | Inbound::ResolutionCarrierFetch(_, _, _)
+            | Inbound::ResolutionBlockFetch(_, _, _)
+            | Inbound::ResolutionDecisionRequest(_, _)
             | Inbound::BodyFetch(_, _, _)
             | Inbound::SequenceRequest(_, _)
             | Inbound::SequenceDeltaRequest(_, _)
@@ -222,7 +229,8 @@ impl Inbound {
             | Inbound::SequenceOutcomeRequest(_, _)
             | Inbound::SequenceHeadersRequest(_, _) => 6,
             Inbound::Serve(_)
-            | Inbound::ControlServe(_, _)
+            | Inbound::ResolutionCarrierServe(_, _)
+            | Inbound::ResolutionBlockServe(_)
             | Inbound::BodyServe(_, _)
             | Inbound::ResumeHello(_, _)
             | Inbound::ReplayDone(_, _, _, _)
@@ -242,7 +250,6 @@ impl Inbound {
         matches!(
             self,
             Inbound::HeadersRequest(_, _)
-                | Inbound::ControlFetch(_, _, _)
                 | Inbound::BodyFetch(_, _, _)
                 | Inbound::LaneResume(_, _, _)
                 | Inbound::ResumeHello(_, _)
@@ -294,12 +301,9 @@ impl Inbound {
             Inbound::Ready(r) => Some(r.proposal_view()),
             Inbound::NoReady(view, _, _) => Some(*view),
             Inbound::Wish(view, _) => Some(*view),
-            Inbound::CompReport(view, _, _) => Some(*view),
-            Inbound::ControlInit(proposal, _) => proposal.value.as_ref().map(|(view, _)| *view),
-            Inbound::ControlEcho(_, proposal) => proposal.value.as_ref().map(|(view, _)| *view),
-            Inbound::ControlReady(_, proposal) => proposal.value.as_ref().map(|(view, _)| *view),
-            Inbound::ControlFetch(view, _, _) => Some(*view),
-            Inbound::ControlServe(view, _) => Some(*view),
+            Inbound::ResolutionWitness(witness) => Some(witness.carrier_view),
+            Inbound::ResolutionCarrierFetch(view, _, _) => Some(*view),
+            Inbound::ResolutionCarrierServe(view, _) => Some(*view),
             Inbound::SkipVote(view, _) => Some(*view),
             Inbound::EchoDigest(msg) => Some(msg.view),
             Inbound::ReadyDigest(msg) => Some(msg.view),
@@ -331,6 +335,7 @@ fn author_label(author: &PublicKey) -> String {
 pub struct VantageReceiverHandler {
     pub tx: Sender<Inbound>,
     pub(crate) codec: wire::VantageWireCodec,
+    pub committee: Committee,
 
     /// Full bulk queues drop requests that the requester can retry.
     pub tx_bulk: Sender<Inbound>,
@@ -359,17 +364,100 @@ impl VantageReceiverHandler {
     }
 }
 
+/// Returns the first-hand sender a Vantage wire message must arrive from.
+/// Sender-less repair responses are validated against local request state instead.
+fn expected_vantage_sender(committee: &Committee, message: &PrimaryMessage) -> Option<PublicKey> {
+    match message {
+        PrimaryMessage::Header(header, false) => Some(header.author),
+        PrimaryMessage::HeadersRequest(_, requester) => Some(*requester),
+        PrimaryMessage::VantageAck(ack) => Some(ack.sender),
+        PrimaryMessage::VantageAvail(_, sender)
+        | PrimaryMessage::VantageEchoSkip(_, sender, _)
+        | PrimaryMessage::VantageNoReady(_, sender, _)
+        | PrimaryMessage::VantageWish(_, sender)
+        | PrimaryMessage::VantageSkipVote(_, sender)
+        | PrimaryMessage::VantageResumeHello(_, sender)
+        | PrimaryMessage::VantageReplayDone(_, _, _, sender)
+        | PrimaryMessage::VantageSequenceAnnounceBatch(_, sender)
+        | PrimaryMessage::VantageSequenceHeaders(_, sender) => Some(*sender),
+        PrimaryMessage::VantagePropose(proposal) => {
+            Some(crate::vantage::agb::proposer(committee, proposal.view))
+        }
+        PrimaryMessage::VantageProposeBatch(proposal) => {
+            Some(crate::vantage::agb::proposer(committee, proposal.view))
+        }
+        PrimaryMessage::VantageEcho(echo) => Some(echo.sender),
+        PrimaryMessage::VantageReady(ready) => Some(ready.sender),
+        PrimaryMessage::VantageEchoBatch(echo) => Some(echo.sender),
+        PrimaryMessage::VantageReadyBatch(ready) => Some(ready.sender),
+        PrimaryMessage::VantageEchoDigest(message) => Some(message.sender),
+        PrimaryMessage::VantageReadyDigest(message) => Some(message.sender),
+        PrimaryMessage::VantageBodyFetch(_, _, requester)
+        | PrimaryMessage::VantageLaneResume(_, _, requester)
+        | PrimaryMessage::VantageSequenceHeadersRequest(_, requester)
+        | PrimaryMessage::VantageResolutionCarrierFetch(_, _, requester)
+        | PrimaryMessage::VantageResolutionBlockFetch(_, _, requester)
+        | PrimaryMessage::VantageResolutionDecisionRequest(_, requester) => Some(*requester),
+        PrimaryMessage::VantageSequenceAnnounce(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceRecords(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceDeltaRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceDelta(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceDeltaRangeRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceDeltaRange(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceOutcomeRequest(message) => Some(message.requester),
+        PrimaryMessage::VantageSequenceOutcome(message) => Some(message.sender),
+        PrimaryMessage::VantageSequenceUnavailable(message) => Some(message.sender),
+        PrimaryMessage::VantageResolutionWitness(message) => Some(message.sender),
+        PrimaryMessage::VantageResolutionWish(message) => Some(message.sender),
+        PrimaryMessage::VantageResolutionSuggest(message) => Some(message.sender),
+        PrimaryMessage::VantageResolutionProof(message) => Some(message.sender),
+        PrimaryMessage::VantageResolutionProposal(message) => Some(message.sender),
+        PrimaryMessage::VantageResolutionStatement(message) => Some(message.sender),
+        PrimaryMessage::VantageResolutionDone(message) => Some(message.sender),
+        _ => None,
+    }
+}
+
+fn authenticated_vantage_sender_matches(
+    committee: &Committee,
+    peer_index: u8,
+    message: &PrimaryMessage,
+) -> bool {
+    let Some(peer) = committee
+        .authorities
+        .keys()
+        .nth(peer_index as usize)
+        .copied()
+    else {
+        return false;
+    };
+    expected_vantage_sender(committee, message).is_none_or(|sender| sender == peer)
+}
+
 #[async_trait]
 impl MessageHandler for VantageReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         let message = self.codec.deserialize(&serialized)?;
 
         if let Some(metrics) = &self.metrics {
             crate::primary::record_typed_received(metrics, message.type_name(), serialized.len());
+        }
+        if authenticated_peer.is_some_and(|index| {
+            !authenticated_vantage_sender_matches(&self.committee, index, &message)
+        }) {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .primary_ingress_verify_failures_total
+                    .with_label_values(&[message.type_name()])
+                    .inc();
+            }
+            return Ok(());
         }
         let inbound = match message {
             PrimaryMessage::Header(h, false) => Inbound::Publish(h.author, h),
@@ -392,27 +480,9 @@ impl MessageHandler for VantageReceiverHandler {
             PrimaryMessage::VantageReady(r) => Inbound::Ready(ReadyOut::Single(r)),
             PrimaryMessage::VantageNoReady(v, s, w) => Inbound::NoReady(v, s, w),
             PrimaryMessage::VantageWish(v, s) => Inbound::Wish(v, s),
-            PrimaryMessage::CompReport(v, d, s) => Inbound::CompReport(v, d, s),
-            PrimaryMessage::ControlInit(p, b) => {
-                Inbound::ControlInit(p, b.map(ProposalOut::Single))
-            }
-            PrimaryMessage::ControlEcho(p, s) => Inbound::ControlEcho(s, p),
-            PrimaryMessage::ControlReady(p, s) => Inbound::ControlReady(s, p),
-            PrimaryMessage::ControlCommit(r, s) => Inbound::ControlCommit(s, r),
-            PrimaryMessage::ControlTimeoutVote(r, s) => Inbound::ControlTimeoutVote(s, r),
-            PrimaryMessage::ControlTimeoutAccept(r, s) => Inbound::ControlTimeoutAccept(s, r),
-            PrimaryMessage::ControlFetch(v, d, s) => Inbound::ControlFetch(v, d, s),
-            PrimaryMessage::ControlServe(v, p) => Inbound::ControlServe(v, ProposalOut::Single(p)),
-
             PrimaryMessage::VantageProposeBatch(p) => Inbound::Propose(ProposalOut::Batch(p)),
             PrimaryMessage::VantageEchoBatch(e) => Inbound::Echo(EchoOut::Batch(e)),
             PrimaryMessage::VantageReadyBatch(r) => Inbound::Ready(ReadyOut::Batch(r)),
-            PrimaryMessage::ControlInitBatch(p, b) => {
-                Inbound::ControlInit(p, b.map(ProposalOut::Batch))
-            }
-            PrimaryMessage::ControlServeBatch(v, p) => {
-                Inbound::ControlServe(v, ProposalOut::Batch(p))
-            }
             PrimaryMessage::VantageSkipVote(v, s) => Inbound::SkipVote(v, s),
 
             PrimaryMessage::VantageEchoDigest(d) => Inbound::EchoDigest(d),
@@ -479,6 +549,40 @@ impl MessageHandler for VantageReceiverHandler {
             }
             PrimaryMessage::VantageSequenceHeaders(headers, sender) => {
                 Inbound::SequenceHeaders(headers, sender)
+            }
+
+            PrimaryMessage::VantageResolutionWitness(witness) => {
+                Inbound::ResolutionWitness(witness)
+            }
+            PrimaryMessage::VantageResolutionWish(wish) => Inbound::ResolutionWish(wish),
+            PrimaryMessage::VantageResolutionSuggest(suggest) => {
+                Inbound::ResolutionSuggest(suggest)
+            }
+            PrimaryMessage::VantageResolutionProof(proof) => Inbound::ResolutionProof(proof),
+            PrimaryMessage::VantageResolutionProposal(proposal) => {
+                Inbound::ResolutionProposal(proposal)
+            }
+            PrimaryMessage::VantageResolutionStatement(statement) => {
+                Inbound::ResolutionStatement(statement)
+            }
+            PrimaryMessage::VantageResolutionDone(done) => Inbound::ResolutionDone(done),
+            PrimaryMessage::VantageResolutionCarrierFetch(view, digest, requester) => {
+                Inbound::ResolutionCarrierFetch(view, digest, requester)
+            }
+            PrimaryMessage::VantageResolutionCarrierServe(view, proposal) => {
+                Inbound::ResolutionCarrierServe(view, ProposalOut::Single(proposal))
+            }
+            PrimaryMessage::VantageResolutionCarrierServeBatch(view, proposal) => {
+                Inbound::ResolutionCarrierServe(view, ProposalOut::Batch(proposal))
+            }
+            PrimaryMessage::VantageResolutionBlockFetch(height, digest, requester) => {
+                Inbound::ResolutionBlockFetch(height, digest, requester)
+            }
+            PrimaryMessage::VantageResolutionBlockServe(block) => {
+                Inbound::ResolutionBlockServe(block)
+            }
+            PrimaryMessage::VantageResolutionDecisionRequest(height, requester) => {
+                Inbound::ResolutionDecisionRequest(height, requester)
             }
 
             _ => return Ok(()),
@@ -611,7 +715,7 @@ pub struct VantageCore {
     last_announced: Option<(View, Instant)>,
     pacemaker: Pacemaker,
     resolver: Resolver,
-    control: ControlLog,
+    resolution_chain: ResolutionChain,
 
     /// Translates digest statements into the by-value AGB representation.
     digest_stmts: DigestStatements,
@@ -679,8 +783,8 @@ pub struct VantageCore {
     /// AGB timers ordered by earliest deadline.
     timers: BinaryHeap<Reverse<(Instant, View, TimerKind)>>,
 
-    /// Control timers ordered by earliest deadline.
-    control_timers: BinaryHeap<Reverse<(Instant, Round)>>,
+    /// Resolver-view timers ordered by earliest deadline.
+    resolution_timers: BinaryHeap<Reverse<(Instant, ResolutionHeight, ResolverView)>>,
 
     payload: PayloadIo,
 
@@ -858,7 +962,8 @@ impl VantageCore {
             // Certification still requires matching members.
             CheckpointCollector::new(f + 1, SEQUENCE_CANDIDATE_WINDOWS, View::MAX)
         });
-        let control = ControlLog::new(name, committee.clone(), sid, parameters.delta_ms);
+        let resolution_chain =
+            ResolutionChain::new(name, committee.clone(), sid, parameters.delta_ms);
 
         let other_primaries: Vec<(PublicKey, SocketAddr)> = committee
             .others_primaries(&name)
@@ -1014,7 +1119,7 @@ impl VantageCore {
             last_announced: None,
             pacemaker,
             resolver,
-            control,
+            resolution_chain,
             digest_stmts,
             wire: Wire {
                 codec: wire_codec,
@@ -1097,7 +1202,7 @@ impl VantageCore {
             replay_serve_max_bytes: parameters.replay_serve_max_bytes,
             replay_episode_max_ms: parameters.replay_episode_max_ms,
             timers: BinaryHeap::new(),
-            control_timers: BinaryHeap::new(),
+            resolution_timers: BinaryHeap::new(),
             payload: PayloadIo::new(store, tx_payload_ready, tx_output, core_metrics.clone()),
 
             // Keep state for the current view when the window is zero.
@@ -1159,7 +1264,7 @@ impl VantageCore {
         effects.extend(self.enter_view_effects(1, boot));
         effects.extend(self.pacemaker.genesis());
 
-        effects.extend(self.control.genesis());
+        effects.extend(self.resolution_chain.genesis());
         self.execute(effects, boot).await;
 
         let header_timer = tokio::time::sleep(Duration::from_millis(self.max_header_delay));
@@ -1208,14 +1313,15 @@ impl VantageCore {
             };
             tokio::pin!(agb_sleep);
 
-            let next_control_deadline = self.control_timers.peek().map(|Reverse((d, _))| *d);
-            let control_sleep = async {
-                match next_control_deadline {
+            let next_resolution_deadline =
+                self.resolution_timers.peek().map(|Reverse((d, _, _))| *d);
+            let resolution_sleep = async {
+                match next_resolution_deadline {
                     Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
                     None => std::future::pending::<()>().await,
                 }
             };
-            tokio::pin!(control_sleep);
+            tokio::pin!(resolution_sleep);
 
             self.queue_len_peak = self.queue_len_peak.max(rx_vantage.len());
 
@@ -1262,10 +1368,10 @@ impl VantageCore {
                     self.execute(effects, now).await;
                 }
 
-                () = &mut control_sleep, if next_control_deadline.is_some() => {
+                () = &mut resolution_sleep, if next_resolution_deadline.is_some() => {
                     let now = Instant::now();
                     let timer_firing_timer = Self::cached_utilization_timer(&self.metrics, &mut self.ut_timer_firing, "timer_firing");
-                    let effects = self.fire_control_timers(now);
+                    let effects = self.fire_resolution_timers(now);
                     drop(timer_firing_timer);
                     self.execute(effects, now).await;
                 }
@@ -1786,18 +1892,15 @@ impl VantageCore {
         effects
     }
 
-    /// Fires due control timers in deadline order and discards obsolete rounds.
-    fn fire_control_timers(&mut self, now: Instant) -> Vec<Effect> {
+    /// Fires due resolver timers in deadline order and discards obsolete views.
+    fn fire_resolution_timers(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
-        while let Some(&Reverse((d, round))) = self.control_timers.peek() {
-            if d > now {
+        while let Some(&Reverse((deadline, height, view))) = self.resolution_timers.peek() {
+            if deadline > now {
                 break;
             }
-            self.control_timers.pop();
-            if round != self.control.curr_round() || self.control.voted() {
-                continue;
-            }
-            effects.extend(self.control.on_control_round_timer(round));
+            self.resolution_timers.pop();
+            effects.extend(self.resolution_chain.on_resolution_timer(height, view));
         }
         effects
     }
@@ -1901,19 +2004,19 @@ impl VantageCore {
             metrics.vantage_sequence_install_blocks_awaited.set(0);
         }
         metrics
-            .vantage_control_round
-            .set(self.control.curr_round() as i64);
+            .vantage_resolution_view
+            .set(self.resolution_chain.current_resolver_view() as i64);
         metrics
-            .vantage_control_delivered_len
-            .set(self.control.delivered_log_len() as i64);
+            .vantage_resolution_height
+            .set(self.resolution_chain.decided_height() as i64);
         metrics
-            .vantage_control_consume_pos
-            .set(self.control.consume_pos() as i64);
+            .vantage_resolution_pending_anchors
+            .set(self.resolution_chain.pending_anchor_count() as i64);
 
         log::debug!(
-            "vantage node: timers.len()={} control_timers.len()={} cancel_handlers.len()={}",
+            "vantage node: timers.len()={} resolution_timers.len()={} cancel_handlers.len()={}",
             self.timers.len(),
-            self.control_timers.len(),
+            self.resolution_timers.len(),
             self.wire.cancel_handlers.len()
         );
     }
@@ -1939,26 +2042,19 @@ impl VantageCore {
             return;
         }
 
-        let serve_floor = floor
-            .saturating_sub(
-                self.gc_window
-                    .saturating_mul(ControlLog::SERVE_MARGIN_WINDOWS),
-            )
-            .max(1);
         self.agb.gc_below(floor);
         self.digest_stmts.gc_below(floor);
         self.frontier.gc_below(floor);
 
-        self.control.gc_below(floor, serve_floor);
+        self.resolution_chain.advance_resolved_target_floor(floor);
         self.resolver.gc_below(floor);
         self.timers.retain(|Reverse((_, view, _))| *view >= floor);
         #[cfg(feature = "pipeline-tracing")]
         self.pipeline.gc_below(floor);
         self.last_gc_floor = floor;
         log::debug!(
-            "vantage node: internal GC floor advanced to {} (serve floor {}, resolved_watermark={}, gc_window={})",
+            "vantage node: internal GC floor advanced to {} (resolved_watermark={}, gc_window={})",
             floor,
-            serve_floor,
             self.resolver.resolved_watermark(),
             self.gc_window
         );
@@ -1983,8 +2079,8 @@ impl VantageCore {
 
             let entries: Vec<crate::vantage::ResolutionEntry> = {
                 let agb = &self.agb;
-                let control = &self.control;
-                let resolved = |u: View| agb.is_sealed(u) || control.is_anchor_resolved(u);
+                let resolution_chain = &self.resolution_chain;
+                let resolved = |u: View| agb.is_sealed(u) || resolution_chain.is_anchor_resolved(u);
                 self.resolver.decide_prefix(agb, view, now, resolved)
             };
             let proposal = match entries.len() {
@@ -2999,7 +3095,7 @@ impl VantageCore {
 
     /// Serves verified headers retained by the sequence or live block cache.
     fn serve_sequence_headers(&mut self, digests: &[Digest], to: &PublicKey) {
-        // Header transfer is lane repair, not control-log synchronization. A
+        // Header transfer is lane repair, not resolution-chain synchronization. A
         // selected Byzantine holder still serves sequence records and outcomes.
         if self.wire.repair_suppressed_for(to) {
             return;
@@ -3263,31 +3359,36 @@ impl VantageCore {
                 effects
             }
 
-            Inbound::CompReport(view, digest, sender) => {
-                self.control.on_comp_report(view, digest, sender)
+            Inbound::ResolutionWitness(witness) => {
+                self.resolution_chain.on_resolution_witness(witness)
             }
-            Inbound::ControlInit(proposal, b_w) => {
-                // Sender-less control proposals are attributed to the designated round leader.
-                let claimed_sender = self.control.control_leader(proposal.round);
-                self.control.on_control_init(claimed_sender, proposal, b_w)
+            Inbound::ResolutionWish(wish) => self.resolution_chain.on_resolution_wish(wish),
+            Inbound::ResolutionSuggest(suggest) => {
+                self.resolution_chain.on_resolution_suggest(suggest)
             }
-            Inbound::ControlEcho(sender, proposal) => {
-                self.control.on_control_echo(sender, proposal)
+            Inbound::ResolutionProof(proof) => self.resolution_chain.on_resolution_proof(proof),
+            Inbound::ResolutionProposal(proposal) => {
+                self.resolution_chain.on_resolution_proposal(proposal)
             }
-            Inbound::ControlReady(sender, proposal) => {
-                self.control.on_control_ready(sender, proposal)
+            Inbound::ResolutionStatement(statement) => {
+                self.resolution_chain.on_resolution_statement(statement)
             }
-            Inbound::ControlCommit(sender, round) => self.control.on_control_commit(sender, round),
-            Inbound::ControlTimeoutVote(sender, round) => {
-                self.control.on_control_timeout_vote(sender, round)
+            Inbound::ResolutionDone(done) => self.resolution_chain.on_resolution_done(done),
+            Inbound::ResolutionCarrierFetch(view, digest, requester) => self
+                .resolution_chain
+                .on_carrier_fetch(requester, view, digest),
+            Inbound::ResolutionCarrierServe(view, proposal) => {
+                self.resolution_chain.on_carrier_serve(view, proposal)
             }
-            Inbound::ControlTimeoutAccept(sender, round) => {
-                self.control.on_control_timeout_accept(sender, round)
+            Inbound::ResolutionBlockFetch(height, digest, requester) => self
+                .resolution_chain
+                .on_resolution_block_fetch(requester, height, digest),
+            Inbound::ResolutionBlockServe(block) => {
+                self.resolution_chain.on_resolution_block_serve(block)
             }
-            Inbound::ControlFetch(view, digest, requester) => {
-                self.control.on_control_fetch(requester, view, digest)
+            Inbound::ResolutionDecisionRequest(height, requester) => {
+                self.resolution_chain.on_decision_request(height, requester)
             }
-            Inbound::ControlServe(view, proposal) => self.control.on_control_serve(view, proposal),
 
             Inbound::SkipVote(view, sender) => {
                 // A skip vote only adds an exclusion and cannot unblock a pending gate.
@@ -3911,79 +4012,95 @@ impl VantageCore {
                         for entry in proposal.entries() {
                             self.resolver.note_carrier_report(entry.target_view(), now);
                         }
-                        queue.extend(self.control.on_completion_reportable(view, proposal));
+                        queue.extend(
+                            self.resolution_chain
+                                .on_completion_reportable(view, proposal),
+                        );
                     }
 
-                    Effect::BroadcastCompReport(view, digest) => {
-                        self.broadcast_recorded(PrimaryMessage::CompReport(
-                            view, digest, self.name,
+                    Effect::BroadcastResolutionWitness(witness) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageResolutionWitness(witness))
+                            .await;
+                    }
+                    Effect::BroadcastResolutionWish(wish) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageResolutionWish(wish))
+                            .await;
+                    }
+                    Effect::ResolutionSuggestTo(peer, suggest) => {
+                        self.wire
+                            .send_message(peer, PrimaryMessage::VantageResolutionSuggest(suggest))
+                            .await;
+                    }
+                    Effect::BroadcastResolutionProof(proof) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageResolutionProof(proof))
+                            .await;
+                    }
+                    Effect::BroadcastResolutionProposal(proposal) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageResolutionProposal(
+                            proposal,
                         ))
                         .await;
                     }
-
-                    Effect::BroadcastControlInit(proposal, b_w) => match b_w {
-                        None => {
-                            self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, None))
-                                .await
-                        }
-                        Some(ProposalOut::Single(p)) => {
-                            self.broadcast_recorded(PrimaryMessage::ControlInit(proposal, Some(p)))
-                                .await
-                        }
-                        Some(ProposalOut::Batch(p)) => {
-                            self.broadcast_recorded(PrimaryMessage::ControlInitBatch(
-                                proposal,
-                                Some(p),
-                            ))
-                            .await
-                        }
-                    },
-                    Effect::BroadcastControlEcho(proposal) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlEcho(proposal, self.name))
-                            .await;
-                    }
-                    Effect::BroadcastControlReady(proposal) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlReady(proposal, self.name))
-                            .await;
-                    }
-                    Effect::BroadcastControlCommit(round) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlCommit(round, self.name))
-                            .await;
-                    }
-                    Effect::BroadcastControlTimeoutVote(round) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlTimeoutVote(
-                            round, self.name,
+                    Effect::BroadcastResolutionStatement(statement) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageResolutionStatement(
+                            statement,
                         ))
                         .await;
                     }
-                    Effect::BroadcastControlTimeoutAccept(round) => {
-                        self.broadcast_recorded(PrimaryMessage::ControlTimeoutAccept(
-                            round, self.name,
-                        ))
-                        .await;
+                    Effect::BroadcastResolutionDone(done) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageResolutionDone(done))
+                            .await;
                     }
-                    Effect::ControlFetchTo(peer, view, digest) => {
+                    Effect::ResolutionDoneTo(peer, done) => {
+                        self.wire
+                            .send_message(peer, PrimaryMessage::VantageResolutionDone(done))
+                            .await;
+                    }
+                    Effect::ResolutionCarrierFetchTo(peer, view, digest) => {
                         self.wire
                             .send_message(
                                 peer,
-                                PrimaryMessage::ControlFetch(view, digest, self.name),
+                                PrimaryMessage::VantageResolutionCarrierFetch(
+                                    view, digest, self.name,
+                                ),
                             )
                             .await;
                     }
-
-                    Effect::ControlServeTo(peer, view, proposal) => {
-                        // A dropped enqueue must release the at-most-once mark, or the
-                        // requester's repeat fetch is refused and the hole is permanent.
+                    Effect::ResolutionCarrierServeTo(peer, view, proposal) => {
                         let message = match proposal {
-                            ProposalOut::Single(p) => PrimaryMessage::ControlServe(view, p),
-                            ProposalOut::Batch(p) => PrimaryMessage::ControlServeBatch(view, p),
+                            ProposalOut::Single(p) => {
+                                PrimaryMessage::VantageResolutionCarrierServe(view, p)
+                            }
+                            ProposalOut::Batch(p) => {
+                                PrimaryMessage::VantageResolutionCarrierServeBatch(view, p)
+                            }
                         };
-                        if !self.wire.try_enqueue_serve(peer, message) {
-                            self.control.unanswer_fetch(&peer, view);
-                        }
+                        self.wire.send_message(peer, message).await;
                     }
-                    Effect::ArmControlTimer(round, deadline) => {
-                        self.control_timers.push(Reverse((deadline, round)));
+                    Effect::ResolutionBlockFetchTo(peer, height, digest) => {
+                        self.wire
+                            .send_message(
+                                peer,
+                                PrimaryMessage::VantageResolutionBlockFetch(
+                                    height, digest, self.name,
+                                ),
+                            )
+                            .await;
+                    }
+                    Effect::ResolutionBlockServeTo(peer, block) => {
+                        self.wire
+                            .send_message(peer, PrimaryMessage::VantageResolutionBlockServe(block))
+                            .await;
+                    }
+                    Effect::BroadcastResolutionDecisionRequest(height, requester) => {
+                        self.broadcast_recorded(PrimaryMessage::VantageResolutionDecisionRequest(
+                            height, requester,
+                        ))
+                        .await;
+                    }
+                    Effect::ArmResolutionTimer(height, view, deadline) => {
+                        self.resolution_timers
+                            .push(Reverse((deadline, height, view)));
                     }
 
                     Effect::ApplyAnchor(view, outcome, refs) => {
@@ -4052,7 +4169,6 @@ mod tests {
 
         for inbound in [
             Inbound::HeadersRequest(vec![d.clone()], k),
-            Inbound::ControlFetch(1, d.clone(), k),
             Inbound::BodyFetch(1, d.clone(), k),
             Inbound::LaneResume(k, 1, k),
             Inbound::ResumeHello(1, k),
@@ -4078,10 +4194,12 @@ mod tests {
             Inbound::EchoSkip(1, k, 1),
             Inbound::NoReady(1, k, 1),
             Inbound::Wish(1, k),
-            Inbound::CompReport(1, d.clone(), k),
-            Inbound::ControlCommit(k, 1),
-            Inbound::ControlTimeoutVote(k, 1),
-            Inbound::ControlTimeoutAccept(k, 1),
+            Inbound::ResolutionCarrierFetch(1, d.clone(), k),
+            Inbound::ResolutionWitness(ResolutionWitness {
+                carrier_view: 1,
+                carrier_digest: d.clone(),
+                sender: k,
+            }),
             Inbound::SkipVote(1, k),
         ] {
             assert!(!inbound.is_bulk(), "must stay consensus-class: {inbound:?}");
@@ -4123,7 +4241,6 @@ mod tests {
 
     use super::*;
     use crate::vantage::agb::{Echo, Ready, ReadyGrade, ViewProposal};
-    use crate::vantage::control::ControlProposal;
     use crypto::{generate_keypair, Hash as _};
     use rand::rngs::StdRng;
     use rand::SeedableRng as _;
@@ -4300,17 +4417,15 @@ mod tests {
         );
         assert!(ingress_replaces_inbound(&future_echo, true, 0));
 
-        let control = Inbound::ControlEcho(
-            member,
-            ControlProposal {
-                round: 1,
-                parent: 0,
-                value: None,
-            },
-        );
+        let resolution = Inbound::ResolutionWish(ResolutionWish {
+            height: 1,
+            parent: core.resolution_chain.head().clone(),
+            view: 1,
+            sender: member,
+        });
         assert!(
-            core.install_replaces_inbound(&control),
-            "large-gap install must not park viewless control-round traffic"
+            core.install_replaces_inbound(&resolution),
+            "large-gap install must not park resolver traffic"
         );
 
         let sequence_request = Inbound::SequenceRequest(
@@ -5272,6 +5387,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authenticated_ingress_binds_first_hand_sender_and_designated_proposer() {
+        let committee = crate::common::committee();
+        let members: Vec<_> = committee.authorities.keys().copied().collect();
+        let witness = PrimaryMessage::VantageResolutionWitness(ResolutionWitness {
+            carrier_view: 9,
+            carrier_digest: Digest::default(),
+            sender: members[1],
+        });
+        assert!(authenticated_vantage_sender_matches(
+            &committee, 1, &witness
+        ));
+        assert!(!authenticated_vantage_sender_matches(
+            &committee, 0, &witness
+        ));
+
+        let proposal = dummy_proposal();
+        let proposer = crate::vantage::agb::proposer(&committee, proposal.view);
+        let proposer_index = members
+            .iter()
+            .position(|member| *member == proposer)
+            .unwrap() as u8;
+        let wrong_index = (proposer_index + 1) % members.len() as u8;
+        let proposal = PrimaryMessage::VantagePropose(proposal);
+        assert!(authenticated_vantage_sender_matches(
+            &committee,
+            proposer_index,
+            &proposal,
+        ));
+        assert!(!authenticated_vantage_sender_matches(
+            &committee,
+            wrong_index,
+            &proposal,
+        ));
+        assert!(!authenticated_vantage_sender_matches(
+            &committee,
+            members.len() as u8,
+            &proposal,
+        ));
+    }
+
     #[tokio::test]
     async fn dispatch_drops_echo_from_nonmember_sender() {
         let mut core = test_core(0, "echo_nonmember");
@@ -5320,22 +5476,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_drops_control_echo_from_nonmember_sender() {
-        let mut core = test_core(0, "control_echo_nonmember");
+    async fn dispatch_drops_resolution_witness_from_nonmember_sender() {
+        let mut core = test_core(0, "resolution_witness_nonmember");
         let fake = fabricated_key();
-        let proposal = ControlProposal {
-            round: 1,
-            parent: 0,
-            value: None,
+        let witness = ResolutionWitness {
+            carrier_view: 1,
+            carrier_digest: Digest::default(),
+            sender: fake,
         };
 
         let effects = core
-            .dispatch_inbound(Inbound::ControlEcho(fake, proposal), Instant::now())
+            .dispatch_inbound(Inbound::ResolutionWitness(witness), Instant::now())
             .await;
 
         assert!(
             effects.is_empty(),
-            "a fabricated non-member ControlEcho must be dropped with no effects"
+            "a fabricated non-member resolution witness must be dropped with no effects"
         );
         assert_eq!(rejected_count(&core), 1);
     }
@@ -5383,6 +5539,7 @@ mod tests {
         let handler = VantageReceiverHandler {
             tx: tx_vantage,
             codec: codec.clone(),
+            committee: committee.clone(),
             tx_bulk,
             tx_sequence,
             sequence_large_gap_drop: Arc::new(AtomicBool::new(false)),

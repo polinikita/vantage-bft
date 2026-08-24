@@ -91,6 +91,7 @@ impl MessageHandler for SimpleItReceiverHandler {
     async fn dispatch(
         &self,
         _writer: &mut Writer,
+        _authenticated_peer: Option<u8>,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         let message: PrimaryMessage = bincode::deserialize(&serialized)?;
@@ -790,16 +791,20 @@ impl SimpleItCore {
                 | Effect::SequenceFinalized { .. }
                 | Effect::RecoverOwnLane(_)
                 | Effect::CompletionReportable(_, _)
-                | Effect::BroadcastCompReport(_, _)
-                | Effect::BroadcastControlInit(_, _)
-                | Effect::BroadcastControlEcho(_)
-                | Effect::BroadcastControlReady(_)
-                | Effect::BroadcastControlCommit(_)
-                | Effect::BroadcastControlTimeoutVote(_)
-                | Effect::BroadcastControlTimeoutAccept(_)
-                | Effect::ControlFetchTo(_, _, _)
-                | Effect::ControlServeTo(_, _, _)
-                | Effect::ArmControlTimer(_, _)
+                | Effect::BroadcastResolutionWitness(_)
+                | Effect::BroadcastResolutionWish(_)
+                | Effect::ResolutionSuggestTo(_, _)
+                | Effect::BroadcastResolutionProof(_)
+                | Effect::BroadcastResolutionProposal(_)
+                | Effect::BroadcastResolutionStatement(_)
+                | Effect::BroadcastResolutionDone(_)
+                | Effect::ResolutionDoneTo(_, _)
+                | Effect::ResolutionCarrierFetchTo(_, _, _)
+                | Effect::ResolutionCarrierServeTo(_, _, _)
+                | Effect::ResolutionBlockFetchTo(_, _, _)
+                | Effect::ResolutionBlockServeTo(_, _)
+                | Effect::BroadcastResolutionDecisionRequest(_, _)
+                | Effect::ArmResolutionTimer(_, _, _)
                 | Effect::ApplyAnchor(_, _, _)
                 | Effect::BodyFetchTo(_, _, _)
                 | Effect::BodyServeTo(_, _, _)

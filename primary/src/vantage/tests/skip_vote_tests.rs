@@ -381,7 +381,7 @@ async fn vote_gate_structurally_excludes_a_party_that_went_ready() {
 }
 
 #[tokio::test]
-async fn integration_silent_proposer_view_seals_via_votes_with_zero_control_log_applications() {
+async fn integration_silent_proposer_view_seals_via_votes_without_resolution_chain_application() {
     let all = authors();
     let mut nodes: Vec<Node> = all
         .iter()
@@ -438,8 +438,8 @@ async fn integration_silent_proposer_view_seals_via_votes_with_zero_control_log_
             i
         );
         assert!(
-            !nodes[i].control.is_anchor_resolved(dead_view),
-            "node {} must show ZERO control-log applications for the dead view",
+            !nodes[i].resolution_chain.is_anchor_resolved(dead_view),
+            "node {} must show zero resolution-chain applications for the dead view",
             i
         );
         assert!(

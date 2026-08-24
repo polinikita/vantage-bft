@@ -86,7 +86,7 @@ async fn crash_fault_dead_proposer_view_seals_via_grounded_skip_vote() {
             i
         );
         assert!(
-            !nodes[i].control.is_anchor_resolved(dead_view),
+            !nodes[i].resolution_chain.is_anchor_resolved(dead_view),
             "node {} must NOT have anchored the dead view -- the vote quorum sealed it directly",
             i
         );
@@ -102,8 +102,9 @@ async fn crash_fault_dead_proposer_view_seals_via_grounded_skip_vote() {
     let m = {
         let node = &mut nodes[carrier_idx];
         let agb = &node.agb;
-        let control = &node.control;
-        let resolved = |u: crate::primary::View| agb.is_sealed(u) || control.is_anchor_resolved(u);
+        let resolution_chain = &node.resolution_chain;
+        let resolved =
+            |u: crate::primary::View| agb.is_sealed(u) || resolution_chain.is_anchor_resolved(u);
         node.resolver
             .decide(agb, carrying_view, entry_instant, resolved);
         node.resolver

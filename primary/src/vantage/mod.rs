@@ -14,6 +14,7 @@ pub mod payload;
 #[cfg(feature = "pipeline-tracing")]
 mod pipeline;
 pub mod repair;
+pub mod resolution_chain;
 pub mod resolve;
 pub mod resume;
 pub mod sequence;
@@ -32,6 +33,11 @@ pub use lanes::{AvailEntry, BlockCache, BlockEntry, LaneManager, SharedBlocks};
 pub use node::VantageCore;
 pub use pacemaker::Pacemaker;
 pub use repair::Repairer;
+pub use resolution_chain::{
+    AnchorRef, LegacyControlProposal, ResolutionBlock, ResolutionChain, ResolutionDone,
+    ResolutionHeight, ResolutionPhase, ResolutionProof, ResolutionProposal, ResolutionStatement,
+    ResolutionSuggest, ResolutionWish, ResolutionWitness, ResolverView,
+};
 pub use resolve::Resolver;
 pub use threshold::Thresholds;
 
@@ -100,19 +106,22 @@ pub enum Effect {
 
     /// Reports the first genuine completion of a proposal carrying recovery entries.
     CompletionReportable(View, ProposalOut),
-    BroadcastCompReport(View, Digest),
-    BroadcastControlInit(control::ControlProposal, Option<ProposalOut>),
-    BroadcastControlEcho(control::ControlProposal),
-    BroadcastControlReady(control::ControlProposal),
-    /// Broadcasts the control protocol's commit vote.
-    BroadcastControlCommit(Round),
-    BroadcastControlTimeoutVote(Round),
-    BroadcastControlTimeoutAccept(Round),
-    ControlFetchTo(PublicKey, View, Digest),
-    /// Serves a held, verified control proposal body.
-    ControlServeTo(PublicKey, View, ProposalOut),
-    /// Arms a control-round timer at an absolute deadline.
-    ArmControlTimer(Round, Instant),
+    BroadcastResolutionWitness(ResolutionWitness),
+    BroadcastResolutionWish(ResolutionWish),
+    ResolutionSuggestTo(PublicKey, ResolutionSuggest),
+    BroadcastResolutionProof(ResolutionProof),
+    BroadcastResolutionProposal(ResolutionProposal),
+    BroadcastResolutionStatement(ResolutionStatement),
+    BroadcastResolutionDone(ResolutionDone),
+    ResolutionDoneTo(PublicKey, ResolutionDone),
+    ResolutionCarrierFetchTo(PublicKey, View, Digest),
+    /// Serves a held, verified carrier proposal body.
+    ResolutionCarrierServeTo(PublicKey, View, ProposalOut),
+    ResolutionBlockFetchTo(PublicKey, ResolutionHeight, Digest),
+    ResolutionBlockServeTo(PublicKey, ResolutionBlock),
+    BroadcastResolutionDecisionRequest(ResolutionHeight, PublicKey),
+    /// Arms a resolver-view timer at an absolute deadline.
+    ArmResolutionTimer(ResolutionHeight, ResolverView, Instant),
 
     /// Applies an anchor outcome and its authorized non-skip block references.
     ApplyAnchor(View, Outcome, Vec<BlockRef>),
@@ -126,9 +135,6 @@ pub enum Effect {
     /// Carries authenticated positional claims for local ancestry resolution.
     AvailClaimed(PublicKey, Vec<claim::ClaimRef>),
 }
-
-pub mod control;
-pub use control::{ControlLog, ControlProposal, Round};
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]

@@ -128,13 +128,16 @@ impl DeclaredSender for Inbound {
             Inbound::SequenceUnavailable(_, s) => Some(*s),
             Inbound::SequenceHeadersRequest(_, s) => Some(*s),
             Inbound::SequenceHeaders(_, s) => Some(*s),
-            Inbound::CompReport(_, _, s) => Some(*s),
-            Inbound::ControlEcho(s, _) => Some(*s),
-            Inbound::ControlReady(s, _) => Some(*s),
-            Inbound::ControlCommit(s, _) => Some(*s),
-            Inbound::ControlTimeoutVote(s, _) => Some(*s),
-            Inbound::ControlTimeoutAccept(s, _) => Some(*s),
-            Inbound::ControlFetch(_, _, s) => Some(*s),
+            Inbound::ResolutionWitness(w) => Some(w.sender),
+            Inbound::ResolutionWish(w) => Some(w.sender),
+            Inbound::ResolutionSuggest(s) => Some(s.sender),
+            Inbound::ResolutionProof(p) => Some(p.sender),
+            Inbound::ResolutionProposal(p) => Some(p.sender),
+            Inbound::ResolutionStatement(s) => Some(s.sender),
+            Inbound::ResolutionDone(d) => Some(d.sender),
+            Inbound::ResolutionCarrierFetch(_, _, requester) => Some(*requester),
+            Inbound::ResolutionBlockFetch(_, _, requester) => Some(*requester),
+            Inbound::ResolutionDecisionRequest(_, requester) => Some(*requester),
             Inbound::SkipVote(_, s) => Some(*s),
             Inbound::EchoDigest(d) => Some(d.sender),
             Inbound::ReadyDigest(d) => Some(d.sender),
@@ -146,8 +149,8 @@ impl DeclaredSender for Inbound {
             Inbound::Serve(_)
             | Inbound::AckAvailability(_)
             | Inbound::Propose(_)
-            | Inbound::ControlInit(_, _)
-            | Inbound::ControlServe(_, _)
+            | Inbound::ResolutionCarrierServe(_, _)
+            | Inbound::ResolutionBlockServe(_)
             | Inbound::BodyServe(_, _) => None,
         }
     }
@@ -864,6 +867,46 @@ mod tests {
                     panic!("decoded the wrong message variant");
                 };
                 assert_eq!(decoded, proposal);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_codec_roundtrips_resolution_messages_and_reads_legacy_frames() {
+        let committee = crate::common::committee();
+        let sender = *committee.authorities.keys().next().unwrap();
+        let block = crate::vantage::ResolutionBlock {
+            height: 3,
+            parent: Digest([1; 32]),
+            anchors: vec![crate::vantage::AnchorRef {
+                view: 17,
+                digest: Digest([2; 32]),
+            }],
+        };
+        let value = block.digest(&Digest([3; 32]));
+        let done = crate::vantage::ResolutionDone {
+            height: block.height,
+            parent: block.parent.clone(),
+            value,
+            block,
+            sender,
+        };
+        let message = PrimaryMessage::VantageResolutionDone(done.clone());
+        let compact = VantageWireCodec::new(&committee, true).unwrap();
+        let legacy = VantageWireCodec::new(&committee, false).unwrap();
+        let compact_bytes = compact.serialize(&message).unwrap();
+        let legacy_bytes = legacy.serialize(&message).unwrap();
+
+        assert!(compact_bytes.starts_with(COMPACT_ID_PREFIX));
+        assert_eq!(legacy_bytes, bincode::serialize(&message).unwrap());
+        for decoder in [&compact, &legacy] {
+            for bytes in [&compact_bytes, &legacy_bytes] {
+                let PrimaryMessage::VantageResolutionDone(decoded) =
+                    decoder.deserialize(bytes).unwrap()
+                else {
+                    panic!("decoded the wrong message variant");
+                };
+                assert_eq!(decoded, done);
             }
         }
     }

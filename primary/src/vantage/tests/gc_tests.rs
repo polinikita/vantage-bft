@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::vantage::control::ControlLog;
+use crate::vantage::resolution_chain::{ResolutionChain, ResolutionWitness};
 use crate::vantage::Frontier;
 use crypto::Digest;
 use std::time::Instant;
@@ -43,19 +43,30 @@ fn frontier_gc_drops_old_view_state() {
 }
 
 #[test]
-fn control_gc_drops_old_view_census_and_resolves_old_anchors() {
+fn data_gc_resolves_old_targets_but_retains_resolver_evidence() {
     let all = authors();
     let (name, _) = all[0];
     let (sender, _) = all[1];
-    let mut control = ControlLog::new(name, test_committee(), test_sid(), TEST_DELTA_MS);
+    let (later_sender, _) = all[2];
+    let mut resolution = ResolutionChain::new(name, test_committee(), test_sid(), TEST_DELTA_MS);
     let digest = Digest([7; 32]);
 
-    control.on_comp_report(1, digest.clone(), sender);
-    assert_eq!(control.report_count_for(1, &digest), 1);
+    assert!(!resolution
+        .on_resolution_witness(ResolutionWitness {
+            carrier_view: 1,
+            carrier_digest: digest.clone(),
+            sender,
+        })
+        .is_empty());
 
-    control.gc_below(2, 2);
+    resolution.advance_resolved_target_floor(2);
 
-    assert_eq!(control.report_count_for(1, &digest), 0);
-    assert!(control.is_anchor_resolved(1));
-    assert!(control.on_comp_report(1, digest, sender).is_empty());
+    assert!(resolution.is_anchor_resolved(1));
+    assert!(!resolution
+        .on_resolution_witness(ResolutionWitness {
+            carrier_view: 1,
+            carrier_digest: digest,
+            sender: later_sender,
+        })
+        .is_empty());
 }

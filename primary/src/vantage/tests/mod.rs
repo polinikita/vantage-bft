@@ -30,7 +30,7 @@ mod resolution_gate_tests;
 
 mod resolve_tests;
 
-mod control_tests;
+mod resolution_chain_tests;
 
 mod byzantine_tests;
 
