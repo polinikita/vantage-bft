@@ -867,6 +867,13 @@ impl AgbEngine {
         self.is_pruned(view) || self.views.get(&view).is_some_and(|s| s.sealed.is_some())
     }
 
+    /// Returns true only while the concrete terminal seal is still retained.
+    pub fn has_terminal_seal(&self, view: View) -> bool {
+        self.views
+            .get(&view)
+            .is_some_and(|state| state.sealed.is_some())
+    }
+
     pub fn echo_sent(&self, view: View) -> bool {
         self.is_pruned(view) || self.views.get(&view).is_some_and(|s| s.echo_sent)
     }

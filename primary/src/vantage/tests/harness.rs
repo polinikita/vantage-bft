@@ -148,6 +148,7 @@ impl Node {
 
     pub fn refresh_direct_resolution(&mut self, through: View) -> Vec<Effect> {
         let scan_limit = through.saturating_sub(3);
+        self.direct_resolver.admit_targets_through(scan_limit);
         let start = self.resolution_evidence.resolved_watermark();
         let mut effects: Vec<_> = self
             .direct_resolver
@@ -761,6 +762,13 @@ pub fn drain_local(
                             }
                         }
                     }
+                    DirectResolutionEffect::WishTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionWish(message)));
+                            }
+                        }
+                    }
                     DirectResolutionEffect::SuggestTo(peer, message) => {
                         if let Some(j) = nodes.iter().position(|node| node.name == peer) {
                             if nodes[j].alive {
@@ -778,6 +786,13 @@ pub fn drain_local(
                             }
                         }
                     }
+                    DirectResolutionEffect::ProofTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionProof(message)));
+                            }
+                        }
+                    }
                     DirectResolutionEffect::BroadcastProposal(message) => {
                         for j in 0..n {
                             if j != idx && nodes[j].alive {
@@ -785,6 +800,13 @@ pub fn drain_local(
                                     j,
                                     Inbound::DirectResolutionProposal(message.clone()),
                                 ));
+                            }
+                        }
+                    }
+                    DirectResolutionEffect::ProposalTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionProposal(message)));
                             }
                         }
                     }
@@ -798,6 +820,13 @@ pub fn drain_local(
                             }
                         }
                     }
+                    DirectResolutionEffect::StatementTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionStatement(message)));
+                            }
+                        }
+                    }
                     DirectResolutionEffect::BroadcastWitness(message) => {
                         for j in 0..n {
                             if j != idx && nodes[j].alive {
@@ -805,6 +834,13 @@ pub fn drain_local(
                                     j,
                                     Inbound::DirectResolutionWitness(message.clone()),
                                 ));
+                            }
+                        }
+                    }
+                    DirectResolutionEffect::WitnessTo(peer, message) => {
+                        if let Some(j) = nodes.iter().position(|node| node.name == peer) {
+                            if nodes[j].alive {
+                                outbox.push_back((j, Inbound::DirectResolutionWitness(message)));
                             }
                         }
                     }

@@ -148,10 +148,16 @@ async fn provisional_mix_refines_when_grade_one_later_reaches_quorum() {
     let effects = agb.on_echo(echo(proposal.clone(), 1, all[2].0), &mut rep);
     assert_eq!(ready_effect(&effects).unwrap().grade, ReadyGrade::Mix);
     assert!(agb.ready_mix_open_for_test(1));
+    assert_eq!(agb.ready_stage_non_grade1_count(1), 1);
 
     let effects = agb.on_echo(echo(proposal, 1, all[3].0), &mut rep);
     assert_eq!(ready_effect(&effects).unwrap().grade, ReadyGrade::One);
     assert!(!agb.ready_mix_open_for_test(1));
+    assert_eq!(
+        agb.ready_stage_non_grade1_count(1),
+        1,
+        "an initial MIX remains historical resolver evidence after refinement"
+    );
 }
 
 #[tokio::test]
