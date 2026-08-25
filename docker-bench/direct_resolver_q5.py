@@ -36,7 +36,22 @@ def load_prometheus(path: Path, active_at_ms: int, duration: int) -> np.ndarray:
         raise ValueError(f"expected one successful Prometheus series in {path}")
     output = np.full(duration + 1, np.nan)
     start_s = active_at_ms / 1_000.0
-    for timestamp, value in result[0]["values"]:
+    values = result[0]["values"]
+    offsets = [float(timestamp) - start_s for timestamp, _ in values]
+    sample_seconds = [int(round(offset)) for offset in offsets]
+    if (
+        len(values) < 2
+        or any(
+            abs(offset - second) > 1e-6
+            for offset, second in zip(offsets, sample_seconds)
+        )
+        or any(
+            later <= earlier
+            for earlier, later in zip(sample_seconds, sample_seconds[1:])
+        )
+    ):
+        raise ValueError(f"expected an ordered one-second Prometheus grid in {path}")
+    for timestamp, value in values:
         second = int(round(float(timestamp) - start_s))
         if 0 <= second <= duration:
             output[second] = float(value)
@@ -156,6 +171,7 @@ def load_run(
         or int(manifest["honest_offered_tps"]) != 1_000
         or int(manifest["adversarial_rate"]) != 600
         or not manifest["latency"]
+        or int(parameters.get("metrics_report_interval_ms", 0)) != 1_000
         or int(manifest["netem_limit_pkts"]) != 100_000
         or manifest["sequence_install_enabled"]
         or bool(parameters.get("vantage_mixed_open_single_target", False))
@@ -164,6 +180,24 @@ def load_run(
         raise ValueError(f"unexpected Q5 configuration in {path}")
 
     correct_nodes = [int(node) for node in report["correct_nodes"]]
+    query_config = dict(
+        line.split("=", 1)
+        for line in (path / "prometheus-queries.txt").read_text().splitlines()
+    )
+    if query_config.get("scrape_interval") != "1s" or query_config.get(
+        "query_step"
+    ) != "1s":
+        raise ValueError(
+            f"Prometheus was not configured on a one-second grid in {path}"
+        )
+    for query_name in ("throughput", "latency"):
+        query = query_config.get(query_name, "")
+        for node in range(n):
+            label = f"node-{node}-worker-0"
+            if (node in correct_nodes) != (label in query):
+                raise ValueError(
+                    f"{query_name} population does not match correct validators in {path}"
+                )
     correct_events = {
         node: parse_events(data / f"node-{node}" / "logs" / "primary.log")
         for node in correct_nodes
@@ -217,7 +251,7 @@ def load_run(
             data / "prometheus-throughput.json", active_at_ms, duration
         ),
         "latency_series": load_prometheus(
-            data / "prometheus-latency.json", active_at_ms, duration
+            data / "prometheus-latency-window.json", active_at_ms, duration
         ),
         "backlog_series": backlog,
         "record": {
@@ -442,7 +476,6 @@ def main(argv=None) -> None:
     backlog_axis.set_ylabel("Unresolved views")
     backlog_axis.set_title("(b) Fault-cohort resolver backlog")
     backlog_axis.set_ylim(bottom=0)
-    backlog_axis.legend(loc="upper right", frameon=False)
 
     plot_band(
         latency_axis,
@@ -452,10 +485,9 @@ def main(argv=None) -> None:
         "Median; min–max band",
     )
     latency_axis.set_xlabel("Time since measurement start (s)")
-    latency_axis.set_ylabel("Materialization p50 (ms)")
-    latency_axis.set_title("(c) Cumulative output latency")
-    latency_axis.set_yscale("log")
-    latency_axis.legend(loc="upper right", frameon=False)
+    latency_axis.set_ylabel("Materialization p50\n(latest 1-s window, ms)")
+    latency_axis.set_title("(c) Correct-validator output latency")
+    latency_axis.set_ylim(bottom=0)
 
     figure.savefig(
         args.output_dir / f"{output_stem}.pdf", bbox_inches="tight", dpi=300
@@ -473,6 +505,11 @@ def main(argv=None) -> None:
     }
     latency_peak_index = int(np.nanargmax(bands["materialised_p50_ms"]["median"]))
     throughput_peak_index = int(np.nanargmax(bands["throughput_tps"]["median"]))
+    median_latency_curve = bands["materialised_p50_ms"]["median"]
+
+    def latency_median(start_s: int, end_s: int) -> float:
+        return float(np.nanmedian(median_latency_curve[start_s : end_s + 1]))
+
     timeline_summary = {
         "median_curve_peak_unresolved_views": float(
             np.nanmax(bands["unresolved_views"]["median"])
@@ -485,6 +522,15 @@ def main(argv=None) -> None:
             bands["throughput_tps"]["median"][throughput_peak_index]
         ),
         "median_curve_peak_committed_tps_at_s": int(seconds[throughput_peak_index]),
+        "median_curve_pre_materialised_p50_ms": latency_median(
+            5, int(fault_start_s) - 2
+        ),
+        "median_curve_attack_materialised_p50_ms": latency_median(
+            int(fault_start_s) + 10, int(fault_end_s) - 2
+        ),
+        "median_curve_final_materialised_p50_ms": latency_median(
+            int(fault_end_s) + 30, duration_s
+        ),
     }
     summary = {
         "campaign_root": str(args.campaign_root),
@@ -503,6 +549,8 @@ def main(argv=None) -> None:
             "netem_limit_pkts": 100_000,
             "state_sync": False,
             "prometheus_step_s": 1,
+            "latency_window_s": 1,
+            "latency_population": "correct validators only",
             "single_target": single_target,
         },
         "per_repetition": records,

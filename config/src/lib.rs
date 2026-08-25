@@ -189,6 +189,10 @@ pub struct Parameters {
     #[serde(default)]
     pub metrics_active_at_ms: Option<u64>,
 
+    /// Period between exact latency-histogram reports, in milliseconds.
+    #[serde(default = "default_metrics_report_interval_ms")]
+    pub metrics_report_interval_ms: u64,
+
     /// Vantage views retained behind the resolved prefix before garbage collection.
     #[serde(default = "default_vantage_gc_window_views")]
     pub vantage_gc_window_views: u64,
@@ -588,6 +592,10 @@ fn default_delta_ms() -> u64 {
     200
 }
 
+fn default_metrics_report_interval_ms() -> u64 {
+    10_000
+}
+
 /// Default Vantage retention window, in views.
 fn default_vantage_gc_window_views() -> u64 {
     200
@@ -860,6 +868,7 @@ impl Default for Parameters {
             delta_ms: default_delta_ms(),
             // Count every observation by default.
             metrics_active_at_ms: None,
+            metrics_report_interval_ms: default_metrics_report_interval_ms(),
             latency_table: None,
             mimic_latency_ms: None,
             batch_messages: true,
@@ -1014,6 +1023,10 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Batch size set to {} B", self.batch_size);
         info!("Max batch delay set to {} ms", self.max_batch_delay);
+        info!(
+            "Metrics report interval set to {} ms",
+            self.metrics_report_interval_ms
+        );
 
         info!(
             "Fast path enabled? {}. Fast timeout: {}",
@@ -2586,6 +2599,22 @@ mod tests {
         assert_eq!(params.sequence_sync_rearm_gap_views, 300);
         assert_eq!(params.sequence_sync_request_timeout_ms, 1_000);
         assert_eq!(params.sequence_sync_inbound_capacity, 1_024);
+    }
+
+    #[test]
+    fn metrics_report_interval_defaults_for_legacy_parameters() {
+        let defaults = Parameters::default();
+        assert_eq!(defaults.metrics_report_interval_ms, 10_000);
+
+        let encoded = serde_json::to_value(defaults).expect("parameters serialize");
+        let mut object = encoded
+            .as_object()
+            .expect("parameters are an object")
+            .clone();
+        object.remove("metrics_report_interval_ms");
+        let decoded: Parameters =
+            serde_json::from_value(object.into()).expect("legacy parameters deserialize");
+        assert_eq!(decoded.metrics_report_interval_ms, 10_000);
     }
 
     #[test]

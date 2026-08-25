@@ -157,7 +157,9 @@ impl Worker {
             metrics.set_transaction_mode_info(mode);
         }
         metrics.set_active_from_millis(parameters.metrics_active_at_ms);
-        reporter.clone().start();
+        reporter.clone().start(Duration::from_millis(
+            parameters.metrics_report_interval_ms.max(1),
+        ));
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Worker {} metrics listening on {}", id, metrics_address);
 

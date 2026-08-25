@@ -72,7 +72,9 @@ export_prometheus() {
         | join("|")
     ' "$manifest")"
     throughput_query="quantile(0.5, rate(committed_transactions{node=~\"(${matcher})\"}[5s]))"
-    latency_query="quantile(0.5, transaction_materialised_latency{v=\"p50\",node=~\"(${matcher})\"}) / 1000"
+    latency_query="quantile(0.5, (transaction_materialised_latency_window{v=\"p50\",node=~\"(${matcher})\"} and on(node) transaction_materialised_latency_window{v=\"count\",node=~\"(${matcher})\"} > 0)) / 1000"
+    printf 'throughput=%s\nlatency=%s\nscrape_interval=1s\nquery_step=1s\n' \
+        "$throughput_query" "$latency_query" >"$destination/prometheus-queries.txt"
     curl --fail --silent --show-error --get \
         --data-urlencode "query=$throughput_query" \
         --data-urlencode "start=$start_s" \
@@ -86,7 +88,7 @@ export_prometheus() {
         --data-urlencode "end=$end_s" \
         --data-urlencode "step=1s" \
         http://127.0.0.1:9095/api/v1/query_range \
-        >"$destination/data/prometheus-latency.json"
+        >"$destination/data/prometheus-latency-window.json"
 }
 
 mkdir -p "$RUN_ROOT"
@@ -104,6 +106,7 @@ for repetition in $(seq 1 "$REPETITIONS"); do
         --host-primary-metrics-base "$PRIMARY_METRICS_BASE"
         --host-worker-metrics-base "$WORKER_METRICS_BASE"
         --delta-ms 200
+        --metrics-report-interval-ms 1000
         --netem-limit-pkts "$NETEM_LIMIT_PKTS"
         --no-state-sync
         --vantage-gc-window-views 10000

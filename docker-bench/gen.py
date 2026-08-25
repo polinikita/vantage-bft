@@ -220,6 +220,7 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         # their certified/available cuts.
         "max_block_payload": 16,
         "delta_ms": args.delta_ms,
+        "metrics_report_interval_ms": args.metrics_report_interval_ms,
         "channel_auth": not args.no_channel_auth,
         # One seed per generated run: every node reads the same document, so all pairs
         # expand the same key material. Stands in for out-of-band provisioning.
@@ -375,6 +376,19 @@ def distribute_rate(total: int, node_indices: list[int]) -> dict[int, int]:
     }
 
 
+def parse_node_indices(value: str) -> list[int]:
+    """Parse a comma-separated node-index list for argparse."""
+    if not value:
+        return []
+    try:
+        indices = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected comma-separated integer indices") from error
+    if len(indices) != len(set(indices)):
+        raise argparse.ArgumentTypeError("node indices must not repeat")
+    return indices
+
+
 def render_compose(
     n: int,
     args: argparse.Namespace,
@@ -486,6 +500,7 @@ def write_manifest(
         "tx_size": args.tx_size,
         "mode": args.mode,
         "latency": args.latency,
+        "metrics_report_interval_ms": args.metrics_report_interval_ms,
         "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
@@ -531,6 +546,7 @@ def write_manifest(
             args.nodes - 2 * ((args.nodes - 1) // 3) if args.mixed_open_stress else 0
         ),
         "correct_load_only": args.correct_load_only,
+        "load_excluded_node_indices": args.load_exclude,
         "load_node_indices": load_node_indices,
         "uncounted_load_node_indices": uncounted_load_indices,
         "honest_offered_tps": honest_offered_tps,
@@ -558,6 +574,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--crash", type=int, default=0,
                    help="first N validators remain absent; load is spread over live nodes")
     p.add_argument("--rate", type=int, default=200, help="aggregate input rate, tx/s (default 200)")
+    p.add_argument(
+        "--load-exclude",
+        type=parse_node_indices,
+        default=[],
+        metavar="I,J,...",
+        help="keep counted client load off these live validators while retaining them "
+             "in consensus",
+    )
     p.add_argument("--duration", type=int, default=60, help="benchmark duration, s (default 60; "
                     "informational only here -- run.sh/results.py are what actually enforce it)")
     p.add_argument("--protocol", choices=PROTOCOL_CHOICES, default="vantage")
@@ -586,6 +610,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="first host port for worker metrics (default 9100)")
     # Match local-benchmark parameter names.
     p.add_argument("--delta-ms", type=int, default=200)
+    p.add_argument(
+        "--metrics-report-interval-ms",
+        type=int,
+        default=10_000,
+        help="exact latency-histogram reporter interval (default 10000 ms)",
+    )
     p.add_argument("--timeout-delay-ms", type=int, default=None,
                    help="override the proof-calibrated round timeout: Autobahn "
                         "10*Delta, Simple-IT Opt 8*Delta, Bracha 5*Delta")
@@ -699,6 +729,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     fault_budget = (args.nodes - 1) // 3
     if not (0 <= args.crash <= fault_budget):
         p.error(f"--crash must be between 0 and {fault_budget} for n={args.nodes}")
+    live_indices = set(range(args.crash, args.nodes))
+    invalid_load_exclusions = sorted(set(args.load_exclude) - live_indices)
+    if invalid_load_exclusions:
+        p.error(
+            "--load-exclude must name live validators; invalid indices: "
+            f"{invalid_load_exclusions}"
+        )
+    if args.rate > 0 and set(args.load_exclude) == live_indices:
+        p.error("--load-exclude cannot remove every live validator when --rate is positive")
     if args.withhold_publisher_stride < 1:
         p.error("--withhold-publisher-stride must be positive")
     if (args.withhold > 0 and
@@ -774,6 +813,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--egress-mbps must be non-negative")
     if args.netem_limit_pkts < 1:
         p.error("--netem-limit-pkts must be positive")
+    if args.metrics_report_interval_ms < 1:
+        p.error("--metrics-report-interval-ms must be positive")
     if args.withhold_at is not None and args.withhold == 0:
         p.error("--withhold-at requires --withhold > 0")
     if args.sequence_checkpoint_interval < 1:
@@ -857,6 +898,10 @@ def main(argv=None) -> None:
         if args.correct_load_only
         else live_node_indices
     )
+    load_excluded = set(args.load_exclude)
+    load_node_indices = [index for index in load_node_indices if index not in load_excluded]
+    if args.rate > 0 and not load_node_indices:
+        raise SystemExit("gen.py: no validators remain for counted client load")
     adversarial_node_indices = (
         [index for index in withholding_indices if index in live_node_indices]
         if args.adversarial_rate
@@ -915,6 +960,11 @@ def main(argv=None) -> None:
           f"latency={'on' if args.latency else 'off'}")
     if args.correct_load_only:
         print(f"   counted client load placed on correct node(s): {load_node_indices}")
+    elif args.load_exclude:
+        print(
+            "   counted client load excludes validator(s) "
+            f"{args.load_exclude}: {load_node_indices} carry the full aggregate rate"
+        )
     elif args.crash:
         print(f"   aggregate client load placed on live node(s): {load_node_indices}")
     if args.adversarial_rate:

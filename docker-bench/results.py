@@ -131,6 +131,7 @@ class NodeSnapshot:
     __slots__ = ("reachable", "committed_transactions",
                  "committed_uncounted_transactions", "submitted_transactions",
                  "count", "p50", "p90", "p99", "m50", "m90", "m99",
+                 "p50_window", "m50_window",
                  "wire_bytes_sent", "optimistic_batch_bytes_sent",
                  "process_cpu_seconds",
                  "prepare_sync_events", "prepare_missing_headers",
@@ -144,6 +145,7 @@ class NodeSnapshot:
         self.count = 0
         self.p50 = self.p90 = self.p99 = None
         self.m50 = self.m90 = self.m99 = None
+        self.p50_window = self.m50_window = None
         self.wire_bytes_sent = 0
         self.optimistic_batch_bytes_sent = 0
         self.process_cpu_seconds = 0.0
@@ -184,6 +186,18 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         s.m50 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p50")
         s.m90 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p90")
         s.m99 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p99")
+    if gauge_by_label(
+        worker_samples, "transaction_committed_latency_window", "v", "count"
+    ):
+        s.p50_window = gauge_by_label(
+            worker_samples, "transaction_committed_latency_window", "v", "p50"
+        )
+    if gauge_by_label(
+        worker_samples, "transaction_materialised_latency_window", "v", "count"
+    ):
+        s.m50_window = gauge_by_label(
+            worker_samples, "transaction_materialised_latency_window", "v", "p50"
+        )
 
     primary_samples = scrape(primary_url(manifest, i), timeout=1.0)
     if primary_samples is None:
@@ -271,7 +285,8 @@ def latency_line(snapshots: list[NodeSnapshot]) -> str:
     max_count = max(s.count for s in with_latency)
     return (
         f" Real transaction latency: p50/p90/p99 {p50 / 1000:.2f}/{p90 / 1000:.2f}/"
-        f"{p99 / 1000:.2f} ms ({max_count} txs; gauges refresh every 10s, may be stale)"
+        f"{p99 / 1000:.2f} ms ({max_count} txs; cumulative gauge, which may lag "
+        "by one reporter interval)"
     )
 
 
@@ -284,7 +299,7 @@ def materialised_line(snapshots: list[NodeSnapshot]) -> str:
     m99 = median([s.m99 for s in with_latency])
     return (
         f" Materialised transaction latency: p50/p90/p99 {m50 / 1000:.2f}/"
-        f"{m90 / 1000:.2f}/{m99 / 1000:.2f} ms (same refresh caveat)"
+        f"{m90 / 1000:.2f}/{m99 / 1000:.2f} ms (same cumulative-gauge caveat)"
     )
 
 
@@ -366,7 +381,9 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
                 f"TIMELINE: sec={elapsed:.1f} committed_total={total} "
                 f"committed_delta={delta} tps={delta / sample_window:.0f} "
                 f"p50_ms={median_p50_ms(snapshots, 'p50')} "
-                f"mat_p50_ms={median_p50_ms(snapshots, 'm50')}"
+                f"mat_p50_ms={median_p50_ms(snapshots, 'm50')} "
+                f"p50_window_ms={median_p50_ms(snapshots, 'p50_window')} "
+                f"mat_p50_window_ms={median_p50_ms(snapshots, 'm50_window')}"
             )
             sys.stdout.flush()
             prev_total = total
@@ -486,7 +503,9 @@ def main(argv=None) -> None:
                     help="poll every --interval seconds, printing a TIMELINE: line "
                     "per sample (committed total/delta/tps plus committee-median "
                     "p50 committed and materialised latency), then a SUMMARY with a "
-                    "TPS rate self-baselined from this watch's own first/last "
+                    "TPS rate. The *_window_ms fields cover each process's latest "
+                    "configured reporter interval; unsuffixed latency remains "
+                    "cumulative. The SUMMARY is self-baselined from this watch's own first/last "
                     "samples. Without --watch, prints a point-in-time snapshot only "
                     "(no derived rate -- see print_summary's own doc comment for why)")
     p.add_argument("--duration", type=float, default=None,

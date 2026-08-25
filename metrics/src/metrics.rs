@@ -223,10 +223,14 @@ pub struct Metrics {
     pub pipeline: PipelineMetrics,
     /// Submit-to-commit latency observations.
     pub transaction_committed_latency: HistogramSender<Duration>,
+    /// Submit-to-commit observations since the preceding reporter tick.
+    pub transaction_committed_latency_window: HistogramSender<Duration>,
     /// Sum of squared submit-to-commit latencies in microseconds.
     pub transaction_committed_latency_squared_micros: IntCounter,
     /// Submit-to-materialized latency. It ends when the worker has the batch locally.
     pub transaction_materialised_latency: HistogramSender<Duration>,
+    /// Submit-to-materialized observations since the preceding reporter tick.
+    pub transaction_materialised_latency_window: HistogramSender<Duration>,
     /// Sum of squared submit-to-materialized latencies in microseconds.
     pub transaction_materialised_latency_squared_micros: IntCounter,
     /// Total transactions whose latency was successfully observed.
@@ -633,7 +637,9 @@ pub struct MetricReporter {
     #[cfg(feature = "pipeline-tracing")]
     pipeline: PipelineReporter,
     transaction_committed_latency: Mutex<HistogramReporter<Duration>>,
+    transaction_committed_latency_window: Mutex<HistogramReporter<Duration>>,
     transaction_materialised_latency: Mutex<HistogramReporter<Duration>>,
+    transaction_materialised_latency_window: Mutex<HistogramReporter<Duration>>,
     proposed_block_size_bytes: Mutex<HistogramReporter<usize>>,
     proposed_header_size_bytes: Mutex<HistogramReporter<usize>>,
     proposed_transaction_size_bytes: Mutex<HistogramReporter<usize>>,
@@ -718,6 +724,18 @@ impl<T: Ord + AddAssign + DivUsize + MulUsize + Copy + Default + AsPrometheusMet
     pub fn receive_all(&mut self) {
         self.histogram.receive_all();
     }
+
+    /// Publish observations received since the preceding report and clear the
+    /// private histogram. A zero count invalidates a stale percentile gauge.
+    pub fn report_and_clear(&mut self) {
+        self.histogram.receive_all();
+        if self.histogram.total_count() == 0 {
+            self.gauge.with_label_values(&["count"]).set(0);
+        } else {
+            self.report();
+        }
+        self.histogram.clear();
+    }
 }
 
 impl Metrics {
@@ -735,7 +753,11 @@ impl Metrics {
         #[cfg(feature = "pipeline-tracing")]
         let (pipeline, pipeline_reporter) = PipelineMetrics::new(registry);
         let (transaction_committed_latency_hist, transaction_committed_latency) = histogram();
+        let (transaction_committed_latency_window_hist, transaction_committed_latency_window) =
+            histogram();
         let (transaction_materialised_latency_hist, transaction_materialised_latency) = histogram();
+        let (transaction_materialised_latency_window_hist, transaction_materialised_latency_window) =
+            histogram();
         let (proposed_block_size_bytes_hist, proposed_block_size_bytes) = histogram();
         let (proposed_header_size_bytes_hist, proposed_header_size_bytes) = histogram();
         let (proposed_transaction_size_bytes_hist, proposed_transaction_size_bytes) = histogram();
@@ -748,11 +770,23 @@ impl Metrics {
                 registry,
                 "transaction_committed_latency",
             )),
+            transaction_committed_latency_window: Mutex::new(HistogramReporter::new_in_registry(
+                transaction_committed_latency_window_hist,
+                registry,
+                "transaction_committed_latency_window",
+            )),
             transaction_materialised_latency: Mutex::new(HistogramReporter::new_in_registry(
                 transaction_materialised_latency_hist,
                 registry,
                 "transaction_materialised_latency",
             )),
+            transaction_materialised_latency_window: Mutex::new(
+                HistogramReporter::new_in_registry(
+                    transaction_materialised_latency_window_hist,
+                    registry,
+                    "transaction_materialised_latency_window",
+                ),
+            ),
             proposed_block_size_bytes: Mutex::new(HistogramReporter::new_in_registry(
                 proposed_block_size_bytes_hist,
                 registry,
@@ -774,6 +808,7 @@ impl Metrics {
             #[cfg(feature = "pipeline-tracing")]
             pipeline,
             transaction_committed_latency,
+            transaction_committed_latency_window,
             transaction_committed_latency_squared_micros: register_int_counter_with_registry!(
                 "transaction_committed_latency_squared_micros",
                 "Sum of (transaction commit latency in microseconds)^2, for exact stddev",
@@ -781,6 +816,7 @@ impl Metrics {
             )
             .unwrap(),
             transaction_materialised_latency,
+            transaction_materialised_latency_window,
             transaction_materialised_latency_squared_micros: register_int_counter_with_registry!(
                 "transaction_materialised_latency_squared_micros",
                 "Sum of (transaction materialised latency in microseconds)^2, for exact stddev",
@@ -1909,15 +1945,14 @@ impl Metrics {
 
 impl MetricReporter {
     /// Spawn the periodic reporter task on the caller's (already-running) tokio runtime.
-    pub fn start(self: Arc<Self>) {
-        tokio::spawn(self.run());
+    pub fn start(self: Arc<Self>, report_interval: Duration) {
+        tokio::spawn(self.run(report_interval));
     }
 
-    async fn run(self: Arc<Self>) {
-        const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+    async fn run(self: Arc<Self>, report_interval: Duration) {
         let mut deadline = Instant::now();
         loop {
-            deadline += REPORT_INTERVAL;
+            deadline += report_interval;
             tokio::time::sleep_until(deadline).await;
             self.force_report();
         }
@@ -1932,9 +1967,16 @@ impl MetricReporter {
         latency.receive_all();
         latency.report();
 
+        let mut latency_window = self.transaction_committed_latency_window.lock().unwrap();
+        latency_window.report_and_clear();
+
         let mut materialised_latency = self.transaction_materialised_latency.lock().unwrap();
         materialised_latency.receive_all();
         materialised_latency.report();
+
+        let mut materialised_latency_window =
+            self.transaction_materialised_latency_window.lock().unwrap();
+        materialised_latency_window.report_and_clear();
 
         let mut block_size = self.proposed_block_size_bytes.lock().unwrap();
         block_size.receive_all();
@@ -1953,6 +1995,24 @@ impl MetricReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn histogram_gauge(registry: &Registry, family: &str, label: &str) -> Option<usize> {
+        registry
+            .gather()
+            .into_iter()
+            .find(|metric_family| metric_family.get_name() == family)
+            .and_then(|metric_family| {
+                metric_family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        metric.get_label().iter().any(|metric_label| {
+                            metric_label.get_name() == "v" && metric_label.get_value() == label
+                        })
+                    })
+                    .map(|metric| metric.get_gauge().get_value() as usize)
+            })
+    }
 
     fn active_seconds(registry: &Registry) -> Option<f64> {
         registry
@@ -2029,24 +2089,29 @@ mod tests {
         reporter.receive_all();
         reporter.report();
 
-        let p95 = registry
-            .gather()
-            .into_iter()
-            .find(|family| family.get_name() == "latency")
-            .and_then(|family| {
-                family
-                    .get_metric()
-                    .iter()
-                    .find(|metric| {
-                        metric
-                            .get_label()
-                            .iter()
-                            .any(|label| label.get_name() == "v" && label.get_value() == "p95")
-                    })
-                    .map(|metric| metric.get_gauge().get_value() as usize)
-            });
+        assert_eq!(histogram_gauge(&registry, "latency", "p95"), Some(96));
+    }
 
-        assert_eq!(p95, Some(96));
+    #[test]
+    fn interval_histogram_invalidates_an_empty_window() {
+        let registry = Registry::new();
+        let (histogram, sender) = histogram();
+        let mut reporter =
+            HistogramReporter::new_in_registry(histogram, &registry, "window_latency");
+
+        sender.observe(7usize);
+        reporter.report_and_clear();
+        assert_eq!(
+            histogram_gauge(&registry, "window_latency", "count"),
+            Some(1)
+        );
+        assert_eq!(histogram_gauge(&registry, "window_latency", "p50"), Some(7));
+
+        reporter.report_and_clear();
+        assert_eq!(
+            histogram_gauge(&registry, "window_latency", "count"),
+            Some(0)
+        );
     }
 
     #[cfg(not(feature = "pipeline-tracing"))]

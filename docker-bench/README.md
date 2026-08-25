@@ -94,6 +94,14 @@ current checkout. The qualification uses host port ranges 19000--19019 and
 19100--19119 for validator metrics, avoiding the common node-exporter port
 9100; override them with `PRIMARY_METRICS_BASE` and `WORKER_METRICS_BASE`.
 
+The paper's Q5 timelines use the integrated target-local resolver at
+`n=10,f=3`. Run the three-repetition mixed-open profile with
+`DURATION=240 FAULT_DURATION=90 REPETITIONS=3 ./direct_resolver_q5.sh`, and
+the one-run crash/restart profile with `./transient_crash_q5.sh`. Both use
+one-second Prometheus reads and exact latest-one-second latency histograms;
+the plotting queries include only correct/non-victim validators. Throughput
+remains a trailing-five-second rate evaluated once per second.
+
 ## Options
 
 `run.sh` handles these options directly:
@@ -115,7 +123,8 @@ python3 docker-bench/gen.py --help
 ```
 
 Common options include `--tx-size`, `--mode`, `--no-latency`,
-`--delta-ms`, `--max-header-delay-ms`, and the state-sync controls.
+`--delta-ms`, `--metrics-report-interval-ms`, `--load-exclude`,
+`--max-header-delay-ms`, and the state-sync controls.
 Use `--withhold N --withhold-count K` to make the first `N` validators omit
 each payload broadcast to `K` staggered peers.
 Use `--withhold-publisher-stride S` to spread those Byzantine publishers over
