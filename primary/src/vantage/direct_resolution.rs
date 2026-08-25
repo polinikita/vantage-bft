@@ -8,6 +8,14 @@
 //! value becomes valid at every correct party before it enters KEY1.  This
 //! stable `Backed` predicate is reused during view change.  No later AGB
 //! proposal, carrier quorum, or global resolver height lies on this path.
+//! A WISH also elicits this party's current own WISH watermark and one targeted
+//! replay of every applicable earlier view-scoped send and DONE.  This is the
+//! IT-HS send-upon-join rule needed to close non-FIFO activation races.
+//! Passive WISH state is admitted only through the caller's observed eligible
+//! data-plane horizon; locally justified and terminal targets bypass that gate.
+//! Dropping earlier WISHes cannot strand an unresolved target: reliable AGB
+//! responses eventually create its common locally justified candidate, which
+//! starts a fresh WISH and obtains retained witness/DONE replay.
 
 use crate::leader::one_based_authority;
 use crate::primary::View;
@@ -133,16 +141,20 @@ pub enum DirectResolutionVote {
     Accept { origin: Option<u8> },
 }
 
-/// Effects are deliberately local to this module until the experimental path
-/// is selected by the Vantage runtime.
+/// Effects emitted by one target-local resolver instance for the Vantage runtime.
 #[derive(Clone, Debug)]
 pub enum DirectResolutionEffect {
     BroadcastWish(DirectResolutionWish),
+    WishTo(PublicKey, DirectResolutionWish),
     SuggestTo(PublicKey, DirectResolutionSuggest),
     BroadcastProof(DirectResolutionProof),
+    ProofTo(PublicKey, DirectResolutionProof),
     BroadcastWitness(DirectResolutionWitness),
+    WitnessTo(PublicKey, DirectResolutionWitness),
     BroadcastProposal(DirectResolutionProposal),
+    ProposalTo(PublicKey, DirectResolutionProposal),
     BroadcastStatement(DirectResolutionStatement),
+    StatementTo(PublicKey, DirectResolutionStatement),
     BroadcastDone(DirectResolutionDone),
     DoneTo(PublicKey, DirectResolutionDone),
     ValueFetchTo(PublicKey, DirectResolutionValueFetch),
@@ -173,6 +185,31 @@ enum VoteStatus {
     Accepted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DirectReplayKind {
+    Suggest,
+    Proof,
+    Proposal,
+    Echo,
+    Key1,
+    Key2,
+    Key3,
+    Lock,
+    Witness,
+}
+
+impl DirectReplayKind {
+    fn statement(phase: DirectResolutionPhase) -> Self {
+        match phase {
+            DirectResolutionPhase::Echo => Self::Echo,
+            DirectResolutionPhase::Key1 => Self::Key1,
+            DirectResolutionPhase::Key2 => Self::Key2,
+            DirectResolutionPhase::Key3 => Self::Key3,
+            DirectResolutionPhase::Lock => Self::Lock,
+        }
+    }
+}
+
 #[derive(Default)]
 struct DirectViewState {
     suggestions: HashMap<PublicKey, DirectResolutionSuggest>,
@@ -180,6 +217,7 @@ struct DirectViewState {
     proposal: Option<DirectResolutionProposal>,
     backing_sent: Option<Digest>,
     backing_witnesses: HashMap<PublicKey, Digest>,
+    replayed_to: BTreeSet<(DirectReplayKind, PublicKey)>,
     vote_status: VoteStatus,
     vote_origin: Option<u8>,
     sent: HashMap<DirectResolutionPhase, Digest>,
@@ -188,6 +226,7 @@ struct DirectViewState {
 
 struct DirectInstance {
     own_wish: DirectResolverView,
+    wish_replayed_through: HashMap<PublicKey, DirectResolverView>,
     entered_through: DirectResolverView,
     current_view: DirectResolverView,
     wishes: HashMap<PublicKey, DirectResolverView>,
@@ -218,6 +257,7 @@ impl DirectInstance {
         debug_assert!(target > 0);
         Self {
             own_wish: 0,
+            wish_replayed_through: HashMap::new(),
             entered_through: 0,
             current_view: 0,
             wishes: HashMap::new(),
@@ -251,6 +291,14 @@ pub struct DirectResolver {
     instances: BTreeMap<View, DirectInstance>,
     values: BTreeMap<(View, Digest), ResolutionEntry>,
     decisions: BTreeMap<View, (Digest, ResolutionEntry)>,
+    /// An own DONE is replayed at most once per target and WISH sender,
+    /// including across the transition from an active instance to a decision.
+    done_replayed_to: BTreeMap<View, BTreeSet<PublicKey>>,
+    /// The locally observed data-plane horizon bounds which unresolved targets
+    /// may consume passive WISH state. Locally justified and terminal targets
+    /// advance this bound directly.
+    admitted_through: View,
+    retained_floor: View,
     /// WISHes for a target that has not locally needed resolution. Without a
     /// local terminal seal, `f + 1` distinct members are required before an
     /// instance is created, so one Byzantine member cannot activate arbitrary
@@ -274,6 +322,9 @@ impl DirectResolver {
             instances: BTreeMap::new(),
             values: BTreeMap::new(),
             decisions: BTreeMap::new(),
+            done_replayed_to: BTreeMap::new(),
+            admitted_through: 0,
+            retained_floor: 1,
             passive_wishes: BTreeMap::new(),
             pending_fetch: BTreeMap::new(),
             fetch_requested: BTreeMap::new(),
@@ -326,8 +377,16 @@ impl DirectResolver {
         self.values.get(&(target, value.clone()))
     }
 
-    fn canonical_entry_key(entry: &ResolutionEntry) -> Vec<u8> {
-        bincode::serialize(entry).expect("ResolutionEntry always serializes")
+    fn canonical_entry_key(entry: &ResolutionEntry) -> (bool, Vec<u8>, u8) {
+        match entry {
+            ResolutionEntry::Full(_, c, t) => {
+                (false, bincode::serialize(&(c, t)).expect("serializes"), 0)
+            }
+            ResolutionEntry::Core(_, c, t) => {
+                (false, bincode::serialize(&(c, t)).expect("serializes"), 1)
+            }
+            ResolutionEntry::Skip(_) => (true, Vec::new(), 2),
+        }
     }
 
     /// Selects one fresh candidate and advances this party's target-local
@@ -358,9 +417,10 @@ impl DirectResolver {
         target: View,
         candidates: impl IntoIterator<Item = ResolutionEntry>,
     ) -> Vec<DirectResolutionEffect> {
-        if target == 0 || self.decisions.contains_key(&target) {
+        if target == 0 || target < self.retained_floor || self.decisions.contains_key(&target) {
             return Vec::new();
         }
+        self.admitted_through = self.admitted_through.max(target);
         let mut accepted = Vec::new();
         for entry in candidates {
             if !self.valid_entry(target, &entry) {
@@ -390,20 +450,23 @@ impl DirectResolver {
         instance.candidates.sort_by_key(Self::canonical_entry_key);
         let mut effects = self.raise_own_wish(target, 1);
         effects.extend(self.recheck_wishes(target));
+        effects.extend(self.try_primary_propose(target, self.current_view(target)));
         effects
     }
 
     /// Activates a target for which the caller already holds a terminal AGB
-    /// seal. The local seal establishes that the target is real, so the party
-    /// may relay WISH without waiting for `f + 1` peers; otherwise a seal
-    /// delivered to all but one correct party could strand that last party.
+    /// seal.  The local seal is sufficient evidence that the target is real,
+    /// so one peer's WISH may make us relay our own WISH; waiting for `f + 1`
+    /// peers here could strand the last correct party that missed the seal.
     pub fn activate_with_local_terminal(&mut self, target: View) -> Vec<DirectResolutionEffect> {
         if target == 0
+            || target < self.retained_floor
             || self.decisions.contains_key(&target)
             || self.instances.contains_key(&target)
         {
             return Vec::new();
         }
+        self.admitted_through = self.admitted_through.max(target);
         let mut instance = DirectInstance::new(target);
         if let Some(wishes) = self.passive_wishes.remove(&target) {
             instance.wishes = wishes;
@@ -464,16 +527,29 @@ impl DirectResolver {
         if !self.is_member(&wish.sender) || wish.target == 0 || wish.view == 0 {
             return Vec::new();
         }
-        if let Some((value, entry)) = self.decisions.get(&wish.target) {
+        if let Some((value, entry)) = self.decisions.get(&wish.target).cloned() {
+            if !self
+                .done_replayed_to
+                .entry(wish.target)
+                .or_default()
+                .insert(wish.sender)
+            {
+                return Vec::new();
+            }
             return vec![DirectResolutionEffect::DoneTo(
                 wish.sender,
                 DirectResolutionDone {
                     target: wish.target,
-                    value: value.clone(),
-                    entry: entry.clone(),
+                    value,
+                    entry,
                     sender: self.name,
                 },
             )];
+        }
+        if !self.instances.contains_key(&wish.target)
+            && (wish.target < self.retained_floor || wish.target > self.admitted_through)
+        {
+            return Vec::new();
         }
         if !self.instances.contains_key(&wish.target) {
             let pending = self.passive_wishes.entry(wish.target).or_default();
@@ -489,7 +565,9 @@ impl DirectResolver {
             let mut instance = DirectInstance::new(wish.target);
             instance.wishes = wishes;
             self.instances.insert(wish.target, instance);
-            return self.recheck_wishes(wish.target);
+            let mut effects = self.recheck_wishes(wish.target);
+            effects.extend(self.replay_progress_to(wish.target, wish.sender, wish.view));
+            return effects;
         }
         let instance = self.instances.get_mut(&wish.target).unwrap();
         let slot = instance.wishes.entry(wish.sender).or_default();
@@ -497,7 +575,196 @@ impl DirectResolver {
             return Vec::new();
         }
         *slot = wish.view;
-        self.recheck_wishes(wish.target)
+        let mut effects = self.recheck_wishes(wish.target);
+        effects.extend(self.replay_progress_to(wish.target, wish.sender, wish.view));
+        effects
+    }
+
+    /// Replays this party's own WISH watermark and view-scoped sends to a
+    /// requester that may have activated after their original transmission.
+    /// Each retained coordinate is sent at most once per requester, so
+    /// catch-up cannot turn one repeated WISH into unbounded amplification.
+    fn replay_progress_to(
+        &mut self,
+        target: View,
+        requester: PublicKey,
+        through: DirectResolverView,
+    ) -> Vec<DirectResolutionEffect> {
+        let mut effects = Vec::new();
+        let name = self.name;
+        if let Some(instance) = self.instances.get_mut(&target) {
+            let replayed = instance.wish_replayed_through.entry(requester).or_default();
+            if instance.own_wish > *replayed {
+                *replayed = instance.own_wish;
+                effects.push(DirectResolutionEffect::WishTo(
+                    requester,
+                    DirectResolutionWish {
+                        target,
+                        view: instance.own_wish,
+                        sender: name,
+                    },
+                ));
+            }
+        }
+
+        enum ReplayItem {
+            Suggest(DirectResolutionSuggest),
+            Proof(DirectResolutionProof),
+            Proposal(DirectResolutionProposal),
+            Statement(DirectResolutionStatement),
+            Witness(DirectResolverView, Digest),
+        }
+
+        let views: Vec<_> = self
+            .instances
+            .get(&target)
+            .into_iter()
+            .flat_map(|instance| {
+                instance
+                    .views
+                    .range(..=through.saturating_add(1))
+                    .map(|(view, _)| *view)
+            })
+            .collect();
+        let mut replay = Vec::new();
+        for view in views {
+            let leader = self.resolution_leader(target, view);
+            let state = self
+                .instances
+                .get_mut(&target)
+                .and_then(|instance| instance.views.get_mut(&view))
+                .expect("a retained resolver view remains present during replay");
+
+            if requester == leader {
+                if let Some(message) = state.suggestions.get(&name).cloned() {
+                    if state
+                        .replayed_to
+                        .insert((DirectReplayKind::Suggest, requester))
+                    {
+                        replay.push(ReplayItem::Suggest(message));
+                    }
+                }
+            }
+            if let Some(message) = state.proofs.get(&name).cloned() {
+                if state
+                    .replayed_to
+                    .insert((DirectReplayKind::Proof, requester))
+                {
+                    replay.push(ReplayItem::Proof(message));
+                }
+            }
+            if let Some(message) = state
+                .proposal
+                .as_ref()
+                .filter(|proposal| proposal.sender == name)
+                .cloned()
+            {
+                if state
+                    .replayed_to
+                    .insert((DirectReplayKind::Proposal, requester))
+                {
+                    replay.push(ReplayItem::Proposal(message));
+                }
+            }
+            for phase in [
+                DirectResolutionPhase::Echo,
+                DirectResolutionPhase::Key1,
+                DirectResolutionPhase::Key2,
+                DirectResolutionPhase::Key3,
+                DirectResolutionPhase::Lock,
+            ] {
+                let Some(statement) = state
+                    .statements
+                    .get(&phase)
+                    .and_then(|statements| statements.get(&name))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if state
+                    .replayed_to
+                    .insert((DirectReplayKind::statement(phase), requester))
+                {
+                    replay.push(ReplayItem::Statement(DirectResolutionStatement {
+                        target,
+                        view,
+                        value: statement.value,
+                        phase,
+                        origin: statement.origin,
+                        sender: name,
+                    }));
+                }
+            }
+            if let Some(value) = state.backing_sent.clone() {
+                if state
+                    .replayed_to
+                    .insert((DirectReplayKind::Witness, requester))
+                {
+                    replay.push(ReplayItem::Witness(view, value));
+                }
+            }
+        }
+
+        for item in replay {
+            match item {
+                ReplayItem::Suggest(message) => {
+                    effects.push(DirectResolutionEffect::SuggestTo(requester, message));
+                }
+                ReplayItem::Proof(message) => {
+                    effects.push(DirectResolutionEffect::ProofTo(requester, message));
+                }
+                ReplayItem::Proposal(message) => {
+                    effects.push(DirectResolutionEffect::ProposalTo(requester, message));
+                }
+                ReplayItem::Statement(message) => {
+                    effects.push(DirectResolutionEffect::StatementTo(requester, message));
+                }
+                ReplayItem::Witness(view, value) => {
+                    let entry = self
+                        .entry(target, &value)
+                        .cloned()
+                        .expect("an own backing witness retains its value");
+                    effects.push(DirectResolutionEffect::WitnessTo(
+                        requester,
+                        DirectResolutionWitness {
+                            target,
+                            view,
+                            value,
+                            entry,
+                            sender: name,
+                        },
+                    ));
+                }
+            }
+        }
+
+        let done_value = self
+            .instances
+            .get(&target)
+            .and_then(|instance| instance.done_sent.clone());
+        if let Some(value) = done_value {
+            if self
+                .done_replayed_to
+                .entry(target)
+                .or_default()
+                .insert(requester)
+            {
+                let entry = self
+                    .entry(target, &value)
+                    .cloned()
+                    .expect("an own DONE retains its value");
+                effects.push(DirectResolutionEffect::DoneTo(
+                    requester,
+                    DirectResolutionDone {
+                        target,
+                        value,
+                        entry,
+                        sender: self.name,
+                    },
+                ));
+            }
+        }
+        effects
     }
 
     fn kth_largest(
@@ -1122,7 +1389,9 @@ impl DirectResolver {
                 }
                 state.vote_status = VoteStatus::Accepted;
                 state.vote_origin = origin;
-                self.try_echo(target, view)
+                let mut effects = self.try_echo(target, view);
+                effects.extend(self.advance_view(target, view));
+                effects
             }
         }
     }
@@ -1520,20 +1789,24 @@ impl DirectResolver {
             .is_none()
         {
             if let Some(value) = self.done_winner(target, self.f_plus_1) {
-                if let Some(entry) = self.entry(target, &value).cloned() {
-                    effects.extend(self.emit_done(target, value, entry));
-                }
+                let entry = self
+                    .entry(target, &value)
+                    .cloned()
+                    .expect("a counted DONE retains its value");
+                effects.extend(self.emit_done(target, value, entry));
             }
         }
         if let Some(value) = self.done_winner(target, self.quorum) {
-            if let Some(entry) = self.entry(target, &value).cloned() {
-                self.decisions.insert(target, (value, entry.clone()));
-                self.instances.remove(&target);
-                self.pending_fetch.remove(&target);
-                self.fetch_requested.remove(&target);
-                self.fetch_answered.remove(&target);
-                effects.push(DirectResolutionEffect::Decide(entry));
-            }
+            let entry = self
+                .entry(target, &value)
+                .cloned()
+                .expect("a DONE quorum retains its value");
+            self.decisions.insert(target, (value, entry.clone()));
+            self.instances.remove(&target);
+            self.pending_fetch.remove(&target);
+            self.fetch_requested.remove(&target);
+            self.fetch_answered.remove(&target);
+            effects.push(DirectResolutionEffect::Decide(entry));
         }
         effects
     }
@@ -1638,6 +1911,17 @@ impl DirectResolver {
         self.instances.contains_key(&target)
     }
 
+    pub fn retained_floor(&self) -> View {
+        self.retained_floor
+    }
+
+    /// Admits passive WISHes only for targets made plausible by the local
+    /// data-plane proposal horizon. This prevents one member from allocating
+    /// a map entry for every arbitrary future target.
+    pub fn admit_targets_through(&mut self, through: View) {
+        self.admitted_through = self.admitted_through.max(through);
+    }
+
     /// Drops target-local resolver history below the caller's retained
     /// sequence floor.  Decisions below that floor are recovered through the
     /// existing sequence checkpoint path, not by replaying ancient DONEs.
@@ -1645,9 +1929,11 @@ impl DirectResolver {
         if floor == 0 {
             return;
         }
+        self.retained_floor = self.retained_floor.max(floor);
         self.instances = self.instances.split_off(&floor);
         self.values = self.values.split_off(&(floor, Digest::default()));
         self.decisions = self.decisions.split_off(&floor);
+        self.done_replayed_to = self.done_replayed_to.split_off(&floor);
         self.passive_wishes = self.passive_wishes.split_off(&floor);
         self.pending_fetch = self.pending_fetch.split_off(&floor);
         self.fetch_requested = self.fetch_requested.split_off(&floor);
@@ -1664,5 +1950,10 @@ impl DirectResolver {
         self.instances
             .get(&target)
             .map_or(0, |instance| instance.views.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn passive_target_len_for_test(&self) -> usize {
+        self.passive_wishes.len()
     }
 }

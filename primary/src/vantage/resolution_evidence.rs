@@ -56,8 +56,10 @@ impl ResolutionEvidence {
 
     /// Returns candidates in canonical payload order, with full before core and skip last.
     ///
-    /// Every candidate requires `Q = n - f` ready-stage statements. Full and core
-    /// candidates additionally require their respective `f + 1` ECHO predicates.
+    /// Every candidate requires `Q = n - f` initial ready-stage statements.
+    /// A MIX counted first remains historical non-grade-1 evidence after a
+    /// refinement. Full and core candidates additionally require their
+    /// respective `f + 1` ECHO predicates.
     pub fn justified_candidates(&self, agb: &AgbEngine, target: View) -> Vec<ResolutionEntry> {
         if agb.ready_stage_total(target) < self.quorum_parties {
             return Vec::new();

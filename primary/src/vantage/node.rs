@@ -2222,6 +2222,7 @@ impl VantageCore {
     /// height or carrier selection serializes this scan.
     fn refresh_direct_resolution(&mut self, through: View) -> Vec<Effect> {
         let scan_limit = through.saturating_sub(3);
+        self.direct_resolver.admit_targets_through(scan_limit);
         let start = self.resolution_evidence.resolved_watermark();
         let mut effects: Vec<_> = self
             .direct_resolver
@@ -3450,7 +3451,7 @@ impl VantageCore {
         }
         if let Some(target) = inbound.direct_resolution_target() {
             let frontier = std::cmp::max(self.frontier.a_i() + 1, self.pacemaker.omega_plus());
-            if target < self.resolution_evidence.resolved_watermark()
+            if target < self.direct_resolver.retained_floor()
                 || target > frontier.saturating_add(DIRECT_RESOLUTION_FUTURE_TARGET_WINDOW)
             {
                 return Vec::new();
@@ -3573,7 +3574,7 @@ impl VantageCore {
             Inbound::DirectResolutionWish(message) => {
                 let target = message.target;
                 let mut effects: Vec<_> = Vec::new();
-                if self.agb.is_sealed(target) && !self.direct_resolver.is_decided(target) {
+                if self.agb.has_terminal_seal(target) && !self.direct_resolver.is_decided(target) {
                     effects.extend(
                         self.direct_resolver
                             .activate_with_local_terminal(target)
@@ -4303,6 +4304,17 @@ impl VantageCore {
                             ))
                             .await;
                         }
+                        DirectResolutionEffect::WishTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-wish") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionWish(message),
+                                )
+                                .await;
+                        }
                         DirectResolutionEffect::SuggestTo(peer, message) => {
                             if self.suppress_mixed_open_response("direct-resolution-suggest") {
                                 continue;
@@ -4323,6 +4335,17 @@ impl VantageCore {
                             ))
                             .await;
                         }
+                        DirectResolutionEffect::ProofTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proof") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionProof(message),
+                                )
+                                .await;
+                        }
                         DirectResolutionEffect::BroadcastProposal(message) => {
                             if self.suppress_mixed_open_response("direct-resolution-proposal") {
                                 continue;
@@ -4331,6 +4354,17 @@ impl VantageCore {
                                 PrimaryMessage::VantageDirectResolutionProposal(message),
                             )
                             .await;
+                        }
+                        DirectResolutionEffect::ProposalTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proposal") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionProposal(message),
+                                )
+                                .await;
                         }
                         DirectResolutionEffect::BroadcastStatement(message) => {
                             if self.suppress_mixed_open_response("direct-resolution-statement") {
@@ -4341,6 +4375,17 @@ impl VantageCore {
                             )
                             .await;
                         }
+                        DirectResolutionEffect::StatementTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-statement") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionStatement(message),
+                                )
+                                .await;
+                        }
                         DirectResolutionEffect::BroadcastWitness(message) => {
                             if self.suppress_mixed_open_response("direct-resolution-witness") {
                                 continue;
@@ -4349,6 +4394,17 @@ impl VantageCore {
                                 PrimaryMessage::VantageDirectResolutionWitness(message),
                             )
                             .await;
+                        }
+                        DirectResolutionEffect::WitnessTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-witness") {
+                                continue;
+                            }
+                            self.wire
+                                .send_message(
+                                    peer,
+                                    PrimaryMessage::VantageDirectResolutionWitness(message),
+                                )
+                                .await;
                         }
                         DirectResolutionEffect::BroadcastDone(message) => {
                             if self.suppress_mixed_open_response("direct-resolution-done") {
@@ -6657,9 +6713,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_resolver_rejects_targets_below_the_resolved_prefix() {
-        let mut core = test_core(0, "direct_resolver_past_target_bound");
-        core.resolution_evidence.note_resolved_through(12);
+    async fn a_retained_terminal_target_still_relays_wish_after_local_output() {
+        let mut core = test_core(0, "direct_resolver_retained_terminal");
+        core.agb.submit_resolution(1, crate::vantage::Outcome::Skip);
+        core.resolution_evidence.note_resolved_through(1);
+        let (sender, _) = crate::common::keys()[1];
+        let effects = core
+            .dispatch_inbound(
+                Inbound::DirectResolutionWish(DirectResolutionWish {
+                    target: 1,
+                    view: 1,
+                    sender,
+                }),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DirectResolution(DirectResolutionEffect::BroadcastWish(wish))
+                if wish.target == 1 && wish.view == 1
+        )));
+        assert_eq!(core.direct_resolver.active_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_resolver_rejects_targets_below_the_retained_floor() {
+        let mut core = test_core(0, "direct_resolver_past_retained_floor");
+        core.agb.gc_below(13);
+        core.direct_resolver.gc_below(13);
         let (sender, _) = crate::common::keys()[1];
         let effects = core
             .dispatch_inbound(
