@@ -107,6 +107,9 @@ pub struct DirectResolutionStatement {
     pub view: DirectResolverView,
     pub value: Digest,
     pub phase: DirectResolutionPhase,
+    /// An ECHO binds the exact proposal key: `Some(0)` is fresh and
+    /// `Some(q > 0)` is carried. Later phases carry `None`.
+    pub proposal_key_view: Option<DirectResolverView>,
     /// Only a fresh non-skip ECHO carries an origin bit.
     pub origin: Option<u8>,
     pub sender: PublicKey,
@@ -173,6 +176,7 @@ pub enum DirectResolutionEffect {
 #[derive(Clone, Debug)]
 struct StatementRecord {
     value: Digest,
+    proposal_key_view: Option<DirectResolverView>,
     origin: Option<u8>,
 }
 
@@ -690,6 +694,7 @@ impl DirectResolver {
                         view,
                         value: statement.value,
                         phase,
+                        proposal_key_view: statement.proposal_key_view,
                         origin: statement.origin,
                         sender: name,
                     }));
@@ -1334,6 +1339,7 @@ impl DirectResolver {
                     view,
                     DirectResolutionPhase::Echo,
                     proposal.value,
+                    Some(proposal.key_view),
                     state.vote_origin,
                 );
             }
@@ -1424,8 +1430,16 @@ impl DirectResolver {
         view: DirectResolverView,
         phase: DirectResolutionPhase,
         value: Digest,
+        proposal_key_view: Option<DirectResolverView>,
         origin: Option<u8>,
     ) -> Vec<DirectResolutionEffect> {
+        let binding_is_valid = match phase {
+            DirectResolutionPhase::Echo => proposal_key_view.is_some_and(|key| key < view),
+            _ => proposal_key_view.is_none(),
+        };
+        if !binding_is_valid || proposal_key_view.is_some_and(|key| key > 0) && origin.is_some() {
+            return Vec::new();
+        }
         let Some(instance) = self.instances.get_mut(&target) else {
             return Vec::new();
         };
@@ -1441,6 +1455,7 @@ impl DirectResolver {
             self.name,
             StatementRecord {
                 value: value.clone(),
+                proposal_key_view,
                 origin,
             },
         );
@@ -1450,6 +1465,7 @@ impl DirectResolver {
                 view,
                 value,
                 phase,
+                proposal_key_view,
                 origin,
                 sender: self.name,
             },
@@ -1464,7 +1480,17 @@ impl DirectResolver {
             || statement.target == 0
             || statement.view == 0
             || statement.origin.is_some_and(|bit| bit > 1)
-            || (statement.phase != DirectResolutionPhase::Echo && statement.origin.is_some())
+            || match statement.phase {
+                DirectResolutionPhase::Echo => {
+                    statement
+                        .proposal_key_view
+                        .is_none_or(|key| key >= statement.view)
+                        || statement
+                            .proposal_key_view
+                            .is_some_and(|key| key > 0 && statement.origin.is_some())
+                }
+                _ => statement.proposal_key_view.is_some() || statement.origin.is_some(),
+            }
             || self.decisions.contains_key(&statement.target)
             || !self.instances.contains_key(&statement.target)
         {
@@ -1487,6 +1513,7 @@ impl DirectResolver {
             statement.sender,
             StatementRecord {
                 value: statement.value,
+                proposal_key_view: statement.proposal_key_view,
                 origin: statement.origin,
             },
         );
@@ -1507,21 +1534,36 @@ impl DirectResolver {
         view: DirectResolverView,
         phase: DirectResolutionPhase,
         threshold: usize,
-    ) -> Option<Digest> {
-        let statements = self
-            .instances
-            .get(&target)?
-            .views
-            .get(&view)?
-            .statements
-            .get(&phase)?;
-        let mut counts: BTreeMap<Digest, usize> = BTreeMap::new();
+    ) -> Option<(Digest, Option<DirectResolverView>)> {
+        let state = self.instances.get(&target)?.views.get(&view)?;
+        let statements = state.statements.get(&phase)?;
+        let expected_echo = (phase == DirectResolutionPhase::Echo)
+            .then(|| {
+                state
+                    .proposal
+                    .as_ref()
+                    .map(|proposal| (proposal.key_view, &proposal.value))
+            })
+            .flatten();
+        let mut counts: BTreeMap<(Option<DirectResolverView>, Digest), usize> = BTreeMap::new();
         for statement in statements.values() {
-            *counts.entry(statement.value.clone()).or_default() += 1;
+            if let Some((key_view, value)) = expected_echo {
+                if statement.proposal_key_view != Some(key_view) || statement.value != *value {
+                    continue;
+                }
+            }
+            let proposal_key_view = (phase == DirectResolutionPhase::Echo)
+                .then_some(statement.proposal_key_view)
+                .flatten();
+            *counts
+                .entry((proposal_key_view, statement.value.clone()))
+                .or_default() += 1;
         }
         counts
             .into_iter()
-            .find_map(|(value, count)| (count >= threshold).then_some(value))
+            .find_map(|((proposal_key_view, value), count)| {
+                (count >= threshold).then_some((value, proposal_key_view))
+            })
     }
 
     fn phase_authors(
@@ -1530,6 +1572,7 @@ impl DirectResolver {
         view: DirectResolverView,
         phase: DirectResolutionPhase,
         value: &Digest,
+        proposal_key_view: Option<DirectResolverView>,
     ) -> Vec<PublicKey> {
         self.instances
             .get(&target)
@@ -1537,7 +1580,10 @@ impl DirectResolver {
             .and_then(|state| state.statements.get(&phase))
             .into_iter()
             .flat_map(|statements| statements.iter())
-            .filter_map(|(sender, statement)| (&statement.value == value).then_some(*sender))
+            .filter_map(|(sender, statement)| {
+                (&statement.value == value && statement.proposal_key_view == proposal_key_view)
+                    .then_some(*sender)
+            })
             .collect()
     }
 
@@ -1563,7 +1609,11 @@ impl DirectResolver {
             .map_or(0, |statements| {
                 statements
                     .values()
-                    .filter(|statement| statement.value == *value && statement.origin == Some(1))
+                    .filter(|statement| {
+                        statement.value == *value
+                            && statement.proposal_key_view == Some(0)
+                            && statement.origin == Some(1)
+                    })
                     .count()
             })
             >= self.f_plus_1
@@ -1624,7 +1674,9 @@ impl DirectResolver {
                 (DirectResolutionPhase::Key2, DirectResolutionPhase::Key3),
                 (DirectResolutionPhase::Key3, DirectResolutionPhase::Lock),
             ] {
-                let Some(value) = self.phase_winner(target, view, from, self.quorum) else {
+                let Some((value, proposal_key_view)) =
+                    self.phase_winner(target, view, from, self.quorum)
+                else {
                     continue;
                 };
                 let already = self
@@ -1639,7 +1691,7 @@ impl DirectResolver {
                     .entry(target, &value)
                     .is_none_or(|entry| !self.valid_entry(target, entry))
                 {
-                    let peers = self.phase_authors(target, view, from, &value);
+                    let peers = self.phase_authors(target, view, from, &value, proposal_key_view);
                     effects.extend(self.ensure_value_fetch(target, value, peers));
                     return effects;
                 }
@@ -1686,11 +1738,11 @@ impl DirectResolver {
                         DirectResolutionPhase::Echo => unreachable!(),
                     }
                 }
-                effects.extend(self.emit_statement(target, view, to, value, None));
+                effects.extend(self.emit_statement(target, view, to, value, None, None));
                 progressed = true;
             }
 
-            if let Some(value) =
+            if let Some((value, proposal_key_view)) =
                 self.phase_winner(target, view, DirectResolutionPhase::Lock, self.quorum)
             {
                 let sent = self
@@ -1699,8 +1751,13 @@ impl DirectResolver {
                     .and_then(|instance| instance.done_sent.clone());
                 if sent.is_none() {
                     let Some(entry) = self.entry(target, &value).cloned() else {
-                        let peers =
-                            self.phase_authors(target, view, DirectResolutionPhase::Lock, &value);
+                        let peers = self.phase_authors(
+                            target,
+                            view,
+                            DirectResolutionPhase::Lock,
+                            &value,
+                            proposal_key_view,
+                        );
                         effects.extend(self.ensure_value_fetch(target, value, peers));
                         return effects;
                     };

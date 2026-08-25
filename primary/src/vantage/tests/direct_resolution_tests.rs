@@ -1,7 +1,7 @@
 use super::common::*;
 use crate::primary::View;
 use crate::vantage::{
-    DirectResolutionEffect, DirectResolutionPhase, DirectResolutionProposal,
+    DirectResolutionEffect, DirectResolutionPhase, DirectResolutionProof, DirectResolutionProposal,
     DirectResolutionStatement, DirectResolutionSuggest, DirectResolutionTimerKind,
     DirectResolutionValueFetch, DirectResolutionValueServe, DirectResolutionVote,
     DirectResolutionWish, DirectResolutionWitness, DirectResolver, ResolutionEntry,
@@ -518,6 +518,7 @@ fn fresh_non_skip_is_backed_only_after_origins_and_a_witness_quorum() {
             view: 1,
             value: value.clone(),
             phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(0),
             origin: (index == 0).then_some(1),
             sender,
         }));
@@ -532,6 +533,7 @@ fn fresh_non_skip_is_backed_only_after_origins_and_a_witness_quorum() {
         view: 1,
         value,
         phase: DirectResolutionPhase::Echo,
+        proposal_key_view: Some(0),
         origin: Some(1),
         sender: last,
     });
@@ -583,6 +585,7 @@ fn accepting_a_late_proposal_rechecks_an_already_received_echo_quorum() {
             view: 1,
             value: value.clone(),
             phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(0),
             origin: None,
             sender,
         });
@@ -611,6 +614,142 @@ fn accepting_a_late_proposal_rechecks_an_already_received_echo_quorum() {
         DirectResolutionEffect::BroadcastWitness(witness)
             if witness.target == target && witness.view == 1
     )));
+}
+
+#[test]
+fn fresh_and_carried_echoes_for_the_same_value_never_merge_into_one_quorum() {
+    // A Byzantine primary can equivocate only in the proposal key here: q=0
+    // asks for a fresh vote, while q=1 carries the same digest from an earlier
+    // resolver view. The ECHO coordinate must keep those votes disjoint.
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 11;
+    let view = 2;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let leader = probe.resolution_leader(target, view);
+    let follower = names.iter().copied().find(|name| *name != leader).unwrap();
+    let mut resolver = DirectResolver::new(follower, test_committee(), test_sid(), TEST_DELTA_MS);
+    let entry = ResolutionEntry::Skip(target);
+    resolver.update_candidates(target, [entry.clone()]);
+    enter_view(&mut resolver, &names, target, view);
+    let value = resolver.value_digest(&entry);
+
+    resolver.on_proposal(DirectResolutionProposal {
+        target,
+        view,
+        key_view: 0,
+        value: value.clone(),
+        entry,
+        sender: leader,
+    });
+    let own = resolver.on_vote(
+        target,
+        view,
+        value.clone(),
+        DirectResolutionVote::Accept { origin: None },
+    );
+    assert!(own.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::BroadcastStatement(statement)
+            if statement.phase == DirectResolutionPhase::Echo
+                && statement.proposal_key_view == Some(0)
+    )));
+
+    let mut effects = Vec::new();
+    for sender in names
+        .iter()
+        .copied()
+        .filter(|sender| *sender != follower)
+        .take(2)
+    {
+        effects.extend(resolver.on_statement(DirectResolutionStatement {
+            target,
+            view,
+            value: value.clone(),
+            phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(1),
+            origin: None,
+            sender,
+        }));
+    }
+
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, DirectResolutionEffect::BroadcastWitness(_))));
+    assert!(!resolver.backed_for_test(target, &value));
+}
+
+#[test]
+fn malformed_echo_bindings_are_rejected_without_consuming_the_sender_slot() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 12;
+    let view = 2;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let leader = probe.resolution_leader(target, view);
+    let follower = names.iter().copied().find(|name| *name != leader).unwrap();
+    let mut resolver = DirectResolver::new(follower, test_committee(), test_sid(), TEST_DELTA_MS);
+    let entry = ResolutionEntry::Skip(target);
+    resolver.update_candidates(target, [entry.clone()]);
+    enter_view(&mut resolver, &names, target, view);
+    let value = resolver.value_digest(&entry);
+    resolver.on_proposal(DirectResolutionProposal {
+        target,
+        view,
+        key_view: 0,
+        value: value.clone(),
+        entry,
+        sender: leader,
+    });
+    resolver.on_vote(
+        target,
+        view,
+        value.clone(),
+        DirectResolutionVote::Accept { origin: None },
+    );
+
+    let senders: Vec<_> = names
+        .iter()
+        .copied()
+        .filter(|sender| *sender != follower)
+        .take(2)
+        .collect();
+    assert!(resolver
+        .on_statement(DirectResolutionStatement {
+            target,
+            view,
+            value: value.clone(),
+            phase: DirectResolutionPhase::Echo,
+            proposal_key_view: None,
+            origin: None,
+            sender: senders[0],
+        })
+        .is_empty());
+    assert!(resolver
+        .on_statement(DirectResolutionStatement {
+            target,
+            view,
+            value: value.clone(),
+            phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(1),
+            origin: Some(1),
+            sender: senders[1],
+        })
+        .is_empty());
+
+    let mut effects = Vec::new();
+    for sender in senders {
+        effects.extend(resolver.on_statement(DirectResolutionStatement {
+            target,
+            view,
+            value: value.clone(),
+            phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(0),
+            origin: None,
+            sender,
+        }));
+    }
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, DirectResolutionEffect::BroadcastWitness(_))));
 }
 
 #[test]
@@ -701,6 +840,7 @@ fn one_member_cannot_allocate_arbitrary_future_resolver_views() {
         view: 1_000_000,
         value: Digest([9; 32]),
         phase: DirectResolutionPhase::Key1,
+        proposal_key_view: None,
         origin: None,
         sender: names[1],
     });
@@ -730,6 +870,7 @@ fn unsolicited_resolver_traffic_cannot_allocate_targets() {
             view: 1,
             value: value.clone(),
             phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(0),
             origin: None,
             sender: names[1],
         })
@@ -805,6 +946,7 @@ fn value_serve_requires_a_pending_digest_and_answers_each_requester_once() {
             view: 1,
             value: value.clone(),
             phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(0),
             origin: None,
             sender,
         }));
@@ -893,6 +1035,53 @@ fn a_local_terminal_activates_and_relays_after_one_peer_wish() {
         sender: names[2],
     });
     assert_eq!(resolver.current_view(target), 1);
+}
+
+#[test]
+fn terminal_participants_let_the_only_unresolved_party_enter_without_byzantine_help() {
+    // n=4, f=1, Q=3. Node 0 missed a selectively delivered terminal seal;
+    // nodes 1 and 2 hold it, while node 3 is Byzantine and sends nothing.
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 21;
+    let mut nodes = resolvers(&names);
+
+    let unresolved_effects = nodes[0].update_candidates(target, [ResolutionEntry::Skip(target)]);
+    let unresolved_wish = unresolved_effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            DirectResolutionEffect::BroadcastWish(wish) => Some(wish),
+            _ => None,
+        })
+        .expect("the unresolved correct party broadcasts its initial WISH");
+
+    let mut terminal_wishes = Vec::new();
+    for terminal in [1usize, 2usize] {
+        // This is the node composition order: terminal activation precedes
+        // delivery of the peer WISH to the resolver state machine.
+        let mut effects = nodes[terminal].activate_with_local_terminal(target);
+        effects.extend(nodes[terminal].on_wish(unresolved_wish.clone()));
+        let own_wish = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                DirectResolutionEffect::BroadcastWish(wish) => Some(wish),
+                _ => None,
+            })
+            .expect("a retained terminal seal relays an own WISH after one peer WISH");
+        assert_eq!(own_wish.view, 1);
+        terminal_wishes.push(own_wish);
+    }
+
+    assert_eq!(nodes[0].current_view(target), 0);
+    for wish in terminal_wishes {
+        for node in nodes.iter_mut().take(3) {
+            node.on_wish(wish.clone());
+        }
+    }
+
+    assert!(nodes[..3]
+        .iter()
+        .all(|resolver| resolver.current_view(target) == 1));
+    assert_eq!(nodes[3].current_view(target), 0);
 }
 
 #[test]
@@ -1161,6 +1350,7 @@ fn lock_value_in_view_one(
             view: 1,
             value: value.clone(),
             phase: DirectResolutionPhase::Echo,
+            proposal_key_view: Some(0),
             origin: None,
             sender,
         }));
@@ -1208,6 +1398,7 @@ fn lock_value_in_view_one(
                 view: 1,
                 value: value.clone(),
                 phase,
+                proposal_key_view: None,
                 origin: None,
                 sender,
             }));
@@ -1247,6 +1438,7 @@ fn resolver_with_done(
             view: 1,
             value: value.clone(),
             phase: DirectResolutionPhase::Lock,
+            proposal_key_view: None,
             origin: None,
             sender,
         }));
@@ -1356,4 +1548,122 @@ fn view_change_carries_the_locked_value_and_rejects_a_fresh_conflict() {
     assert!(!conflict_effects
         .iter()
         .any(|effect| matches!(effect, DirectResolutionEffect::ValidateVote { .. })));
+}
+
+#[test]
+fn accept_key_selects_a_positive_suggestion_with_persistent_key2_support() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 23;
+    let view = 3;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let primary = probe.resolution_leader(target, view);
+    let mut resolver = DirectResolver::new(primary, test_committee(), test_sid(), TEST_DELTA_MS);
+    resolver.update_candidates(target, [ResolutionEntry::Skip(target)]);
+    enter_view(&mut resolver, &names, target, view);
+
+    let carried = ResolutionEntry::Core(target, Vec::new(), Vec::new());
+    let value = resolver.value_digest(&carried);
+    for sender in names.iter().copied().take(3) {
+        resolver.on_witness(DirectResolutionWitness {
+            target,
+            view: 2,
+            value: value.clone(),
+            entry: carried.clone(),
+            sender,
+        });
+    }
+    assert!(resolver.backed_for_test(target, &value));
+
+    let external: Vec<_> = names
+        .iter()
+        .copied()
+        .filter(|sender| *sender != primary)
+        .take(2)
+        .collect();
+    resolver.on_suggest(DirectResolutionSuggest {
+        target,
+        view,
+        sender: external[0],
+        key3_view: 0,
+        key3_value: Digest::default(),
+        key2_view: 2,
+        key2_value: value.clone(),
+        prev_key2: 0,
+        entry: None,
+    });
+    let effects = resolver.on_suggest(DirectResolutionSuggest {
+        target,
+        view,
+        sender: external[1],
+        key3_view: 2,
+        key3_value: value.clone(),
+        key2_view: 2,
+        key2_value: value.clone(),
+        prev_key2: 0,
+        entry: Some(carried.clone()),
+    });
+
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::BroadcastProposal(proposal)
+            if proposal.key_view == 2
+                && proposal.value == value
+                && proposal.entry == carried
+    )));
+}
+
+#[test]
+fn open_lock_accepts_a_carried_conflict_after_f_plus_one_key1_proofs() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 24;
+    let view = 3;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let primary = probe.resolution_leader(target, view);
+    let follower = names.iter().copied().find(|name| *name != primary).unwrap();
+    let locked = ResolutionEntry::Skip(target);
+    let (mut resolver, locked_value) = lock_value_in_view_one(&names, follower, target, locked);
+    enter_view(&mut resolver, &names, target, view);
+
+    let carried = ResolutionEntry::Core(target, Vec::new(), Vec::new());
+    let carried_value = resolver.value_digest(&carried);
+    assert_ne!(carried_value, locked_value);
+    for sender in names.iter().copied().take(3) {
+        resolver.on_witness(DirectResolutionWitness {
+            target,
+            view: 2,
+            value: carried_value.clone(),
+            entry: carried.clone(),
+            sender,
+        });
+    }
+    assert!(resolver.backed_for_test(target, &carried_value));
+
+    for sender in names
+        .iter()
+        .copied()
+        .filter(|sender| *sender != follower)
+        .take(2)
+    {
+        resolver.on_proof(DirectResolutionProof {
+            target,
+            view,
+            sender,
+            key1_view: 2,
+            key1_value: carried_value.clone(),
+            prev_key1: 0,
+        });
+    }
+    let effects = resolver.on_proposal(DirectResolutionProposal {
+        target,
+        view,
+        key_view: 2,
+        value: carried_value,
+        entry: carried,
+        sender: primary,
+    });
+
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        DirectResolutionEffect::ValidateVote { fresh: false, .. }
+    )));
 }

@@ -3470,6 +3470,10 @@ impl VantageCore {
             Inbound::DirectResolutionWish(message) => {
                 let target = message.target;
                 let mut effects: Vec<_> = Vec::new();
+                // A terminal seal must not remove this correct party from the
+                // WISH quorum needed by a peer that missed the seal.  Activate
+                // first so the very first peer WISH broadcasts our own WISH;
+                // `on_wish` then records the peer watermark and rechecks entry.
                 if self.agb.has_terminal_seal(target) && !self.direct_resolver.is_decided(target) {
                     effects.extend(
                         self.direct_resolver

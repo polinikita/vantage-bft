@@ -893,6 +893,28 @@ mod tests {
                 assert_eq!(decoded, witness);
             }
         }
+
+        let statement = crate::vantage::DirectResolutionStatement {
+            target: 17,
+            view: 3,
+            value: Digest([5; 32]),
+            phase: crate::vantage::DirectResolutionPhase::Echo,
+            proposal_key_view: Some(2),
+            origin: None,
+            sender,
+        };
+        let message = PrimaryMessage::VantageDirectResolutionStatement(statement.clone());
+        for encoder in [&compact, &legacy] {
+            let bytes = encoder.serialize(&message).unwrap();
+            for decoder in [&compact, &legacy] {
+                let PrimaryMessage::VantageDirectResolutionStatement(decoded) =
+                    decoder.deserialize(&bytes).unwrap()
+                else {
+                    panic!("decoded the wrong direct-resolution message variant");
+                };
+                assert_eq!(decoded, statement);
+            }
+        }
     }
 
     #[test]
