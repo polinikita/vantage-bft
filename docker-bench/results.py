@@ -138,6 +138,7 @@ CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
 # Resolved once per process: container id and cgroup paths never change within
 # a run, so the per-sample cost stays two small file reads per validator.
 _CPU_PROBES: dict[int, dict | None] = {}
+_CPU_PROBES_RESOLVED = False
 
 
 def container_name(manifest: dict, i: int) -> str:
@@ -145,31 +146,49 @@ def container_name(manifest: dict, i: int) -> str:
     return f"{prefix}{i}"
 
 
-def _cpu_probe(manifest: dict, i: int) -> dict | None:
-    """Locate this validator's cgroup, or None when it cannot be read.
+def _resolve_cpu_probes(manifest: dict) -> None:
+    """Locate every validator's cgroup, with one `docker inspect` for the lot.
 
     The node process exports `process_cpu_seconds_total` with whole-second
-    resolution, which deltas to zero over a short window at moderate load.
-    The cgroup exposes `usage_usec`, and `/proc/<pid>/stat` exposes per-process
+    resolution, which deltas to zero over a short window at moderate load. The
+    cgroup exposes `usage_usec`, and `/proc/<pid>/stat` exposes per-process
     ticks, so both are read directly instead.
+
+    Container ids are stable for a run, so they are resolved once and together:
+    at n=40 a call per validator would add dozens of subprocess round trips to
+    the first sample and skew the start of the measurement window.
     """
-    if i in _CPU_PROBES:
-        return _CPU_PROBES[i]
-    probe: dict | None = None
-    name = container_name(manifest, i)
+    global _CPU_PROBES_RESOLVED
+    if _CPU_PROBES_RESOLVED:
+        return
+    _CPU_PROBES_RESOLVED = True
+    names = [container_name(manifest, i) for i in range(manifest["nodes"])]
     try:
-        cid = subprocess.run(
-            ["docker", "inspect", "-f", "{{.Id}}", name],
-            capture_output=True, text=True, timeout=15,
-        ).stdout.strip()
+        # A missing container makes this exit non-zero while still printing the
+        # others, so the output is parsed regardless of the status.
+        output = subprocess.run(
+            ["docker", "inspect", "-f", "{{.Name}} {{.Id}}", *names],
+            capture_output=True, text=True, timeout=120,
+        ).stdout
     except (OSError, subprocess.SubprocessError):
-        cid = ""
-    if cid:
+        return
+    ids: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            ids[parts[0].lstrip("/")] = parts[1]
+    for i, name in enumerate(names):
+        cid = ids.get(name)
+        if not cid:
+            continue
         scope = CGROUP_ROOT / "system.slice" / f"docker-{cid}.scope"
         if (scope / "cpu.stat").is_file():
-            probe = {"scope": scope}
-    _CPU_PROBES[i] = probe
-    return probe
+            _CPU_PROBES[i] = {"scope": scope}
+
+
+def _cpu_probe(manifest: dict, i: int) -> dict | None:
+    _resolve_cpu_probes(manifest)
+    return _CPU_PROBES.get(i)
 
 
 def _read_usage_usec(scope: Path) -> float:
