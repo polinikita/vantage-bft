@@ -8,6 +8,8 @@ use futures::sink::SinkExt as _;
 use log::{debug, info, warn};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -192,12 +194,17 @@ impl Client {
                 // an already-running node about as fast as the old loop while
                 // staying gentle once a large committee is still coming up,
                 // and the address-derived jitter keeps the probes from
-                // staying in lockstep.
+                // staying in lockstep. The jitter hashes the whole address:
+                // a deployment gives every peer the same transaction port on a
+                // different host, so deriving it from the port alone would hand
+                // every client the same offset and defeat the purpose.
                 //
                 // This runs once, before the first transaction: `send` then
                 // holds a single connection open, so none of this is on the
                 // steady-state submission path.
-                let jitter = u64::from(address.port() % 64);
+                let mut hasher = DefaultHasher::new();
+                address.hash(&mut hasher);
+                let jitter = hasher.finish() % 64;
                 let mut delay = 50;
                 while TcpStream::connect(address).await.is_err() {
                     sleep(Duration::from_millis(delay + jitter)).await;
