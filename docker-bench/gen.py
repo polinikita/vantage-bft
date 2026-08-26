@@ -41,7 +41,26 @@ HOST_WORKER_METRICS_BASE = int(os.environ.get("HOST_WORKER_METRICS_BASE", "9100"
 MAX_NODES = 40  # Local resource limit.
 
 # AWS RTT values are milliseconds; tc applies half as one-way delay.
+# Per-peer-class netem queue, in packets. Each class must hold everything in
+# flight to that peer for a whole one-way delay, so the requirement grows with
+# both the committee and the offered load; overflowing it silently drops
+# packets, which the protocol cannot distinguish from a lossy link. Overridden
+# per run by `--netem-limit` (see `netem_limit_packets`).
 NETEM_LIMIT_PKTS = 100_000
+
+
+def netem_limit_packets(nodes: int, override: int | None) -> int:
+    """Per-class netem queue depth, overridable per run.
+
+    The default is deliberately left at `NETEM_LIMIT_PKTS` for every committee
+    size: raising it was tried against an n=40 startup failure and did not
+    change the outcome, so there is no evidence for a size-dependent default,
+    and a larger queue only defers drops at the cost of memory. `--netem-limit`
+    exists so a host that is known to need a deeper queue can be given one
+    without changing anyone else's runs.
+    """
+    del nodes
+    return NETEM_LIMIT_PKTS if override is None else override
 
 RTT_LATENCY_TABLE = [
     [1, 14, 104, 112, 198, 65, 68, 110, 201, 146],
@@ -354,7 +373,12 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
 
 # Build one tc netem delay class per peer.
 def render_tc_script(
-    i: int, n: int, iface_hint: str, enabled: bool, egress_mbps: int = 0
+    i: int,
+    n: int,
+    iface_hint: str,
+    enabled: bool,
+    egress_mbps: int = 0,
+    netem_limit: int = NETEM_LIMIT_PKTS,
 ) -> str:
     lines = [
         "#!/usr/bin/env bash",
@@ -408,7 +432,7 @@ def render_tc_script(
         )
         # Set a large queue for high-RTT links.
         lines.append(f'tc qdisc add dev "$IFACE" parent 1:{mid} handle {mid}: '
-                     f'netem limit {NETEM_LIMIT_PKTS} delay {delay:.1f}ms')
+                     f'netem limit {netem_limit} delay {delay:.1f}ms')
         lines.append(
             f'tc filter add dev "$IFACE" protocol ip parent 1:0 prio 1 u32 '
             f'match ip dst {peer_ip}/32 flowid 1:{mid}'
@@ -643,6 +667,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                     "172.28, per spec); override only if that address space collides "
                     "with another docker-compose project already on this host")
     # Match local-benchmark parameter names.
+    p.add_argument(
+        "--netem-limit",
+        type=int,
+        default=None,
+        help="netem queue limit in packets for each per-peer delay class "
+        f"(default: {NETEM_LIMIT_PKTS:,})",
+    )
     p.add_argument("--delta-ms", type=int, default=200)
     p.add_argument("--timeout-delay-ms", type=int, default=None,
                    help="override the proof-calibrated round timeout: Autobahn "
@@ -876,7 +907,11 @@ def main(argv=None) -> None:
         else []
     )
 
-    print("-- writing per-node tc netem scripts")
+    netem_limit = netem_limit_packets(n, args.netem_limit)
+    print(
+        f"-- writing per-node tc netem scripts "
+        f"(queue {netem_limit:,} packets per peer class)"
+    )
     for i in range(n):
         script = render_tc_script(
             i,
@@ -884,6 +919,7 @@ def main(argv=None) -> None:
             iface_hint="eth0",
             enabled=args.latency,
             egress_mbps=args.egress_mbps,
+            netem_limit=netem_limit,
         )
         script_path = DATA_DIR / f"node-{i}" / "tc-setup.sh"
         script_path.write_text(script)
