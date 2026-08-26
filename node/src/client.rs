@@ -182,8 +182,26 @@ impl Client {
         info!("Waiting for all nodes to be online...");
         join_all(self.nodes.iter().cloned().map(|address| {
             tokio::spawn(async move {
+                // Back off, out of phase. Every client probes every node
+                // here, so the attempt rate grows with the square of the
+                // committee: at n=40 the original 10 ms loop issued roughly
+                // 1,600 SYNs per 10 ms across the cluster, which overflowed
+                // the listen queues of the nodes already up (visible as
+                // TcpExtListenOverflows) and made legitimate connections to
+                // them time out. Doubling from 50 ms to a 1 s ceiling detects
+                // an already-running node about as fast as the old loop while
+                // staying gentle once a large committee is still coming up,
+                // and the address-derived jitter keeps the probes from
+                // staying in lockstep.
+                //
+                // This runs once, before the first transaction: `send` then
+                // holds a single connection open, so none of this is on the
+                // steady-state submission path.
+                let jitter = u64::from(address.port() % 64);
+                let mut delay = 50;
                 while TcpStream::connect(address).await.is_err() {
-                    sleep(Duration::from_millis(10)).await;
+                    sleep(Duration::from_millis(delay + jitter)).await;
+                    delay = (delay * 2).min(1_000);
                 }
             })
         }))

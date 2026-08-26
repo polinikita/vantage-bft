@@ -21,7 +21,8 @@ PROMETHEUS_CONFIG_PATH="$SCRIPT_DIR/data/prometheus.yaml"
 MONITORING_NETWORK="vantage-bench_vantage_net"
 PROMETHEUS_CONTAINER_ID=""
 BENCHMARK_RUNNING=0
-READY_TIMEOUT=180
+# 0 selects a committee-scaled default once --nodes is known.
+READY_TIMEOUT=${READY_TIMEOUT:-0}
 
 NODES=4
 RATE=200
@@ -51,6 +52,12 @@ case "$NODES" in
     ''|*[!0-9]*) echo "run.sh: --nodes must be a positive integer" >&2; exit 2 ;;
 esac
 [ "$NODES" -gt 0 ] || { echo "run.sh: --nodes must be positive" >&2; exit 2; }
+
+if [ "$READY_TIMEOUT" -eq 0 ]; then
+    # Startup grows with the committee: every validator installs one netem
+    # class per peer, and Prometheus must see two targets per validator.
+    READY_TIMEOUT=$((120 + NODES * 6))
+fi
 case "$CRASH" in
     ''|*[!0-9]*) echo "run.sh: --crash must be a non-negative integer" >&2; exit 2 ;;
 esac
