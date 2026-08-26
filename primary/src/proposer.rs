@@ -211,7 +211,14 @@ impl Proposer {
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                 }
-                () = &mut timer => {
+                // Disabled once elapsed: an elapsed `Sleep` polls `Ready`
+                // immediately, so leaving this arm armed spins the loop at
+                // full speed for as long as the propose condition at the top
+                // is blocked on a parent. With the arm disabled the loop
+                // parks on the channels instead, and the proposal still fires
+                // the moment the parent lands because the top of the loop
+                // re-checks `timer.is_elapsed()`.
+                () = &mut timer, if !timer.is_elapsed() => {
                     // Timer expiration is handled at the top of the loop.
                 }
             }
