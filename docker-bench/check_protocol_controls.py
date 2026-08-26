@@ -309,6 +309,20 @@ def run_point(
             "materialised_p50_ms": materialised["p50"],
             "materialised_p90_ms": materialised["p90"],
             "materialised_p99_ms": materialised["p99"],
+            # Cost side of the comparison: CPU time and wire bytes actually
+            # spent to reach the throughput above.
+            "cpu_cores_total": result_payload.get("cpu_cores_total"),
+            "mean_node_cpu_cores": result_payload.get("mean_node_cpu_cores"),
+            "max_node_cpu_cores": result_payload.get("max_node_cpu_cores"),
+            "cpu_ms_per_committed_tx": result_payload.get("cpu_ms_per_committed_tx"),
+            "wire_mbps_total": result_payload.get("wire_mbps_total"),
+            "mean_node_wire_mbps": result_payload.get("mean_node_wire_mbps"),
+            "max_node_wire_mbps": result_payload.get("max_node_wire_mbps"),
+            "wire_bytes_per_committed_tx": result_payload.get(
+                "wire_bytes_per_committed_tx"
+            ),
+            "mean_node_rss_mib": result_payload.get("mean_node_rss_mib"),
+            "max_node_rss_mib": result_payload.get("max_node_rss_mib"),
         }
     )
     return record
@@ -378,6 +392,16 @@ CSV_FIELDS = (
     "materialised_p90_ms",
     "materialised_p99_ms",
     "materialised_p50_vs_clean",
+    "cpu_cores_total",
+    "mean_node_cpu_cores",
+    "max_node_cpu_cores",
+    "cpu_ms_per_committed_tx",
+    "wire_mbps_total",
+    "mean_node_wire_mbps",
+    "max_node_wire_mbps",
+    "wire_bytes_per_committed_tx",
+    "mean_node_rss_mib",
+    "max_node_rss_mib",
     "panics",
     "passed",
     "log",
@@ -410,8 +434,11 @@ def save(
         f"Commit: `{metadata['commit']}`",
         "",
         "| Scenario | Protocol | Committed TPS | Reachable target | Target % | "
-        "Materialized p50 / p99 | p50 vs clean | Panics | Result |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "Materialized p50 / p99 | CPU cores (agg / node) | CPU-ms/tx | "
+        "Wire Mbit/s (agg / node) | Wire B/tx | RSS MiB/node | p50 vs clean | "
+        "Panics | Result |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "---: | ---: | ---: | --- |",
     ]
     for record in records:
         result = "PASS" if record.get("passed") else "FAIL"
@@ -425,6 +452,13 @@ def save(
             f"{fmt(record.get('reachable_throughput_pct'))}% | "
             f"{fmt(record.get('materialised_p50_ms'))} / "
             f"{fmt(record.get('materialised_p99_ms'))} ms | "
+            f"{fmt(record.get('cpu_cores_total'), 2)} / "
+            f"{fmt(record.get('mean_node_cpu_cores'), 3)} | "
+            f"{fmt(record.get('cpu_ms_per_committed_tx'), 3)} | "
+            f"{fmt(record.get('wire_mbps_total'), 2)} / "
+            f"{fmt(record.get('mean_node_wire_mbps'), 2)} | "
+            f"{fmt(record.get('wire_bytes_per_committed_tx'), 0)} | "
+            f"{fmt(record.get('mean_node_rss_mib'), 0)} | "
             f"{('-' if ratio is None else f'{ratio:.2f}x')} | "
             f"{record['panics']} | {result} |"
         )

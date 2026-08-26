@@ -428,6 +428,17 @@ macro_rules! consensus_signature_schemes {
             pub fn to_bytes(&self) -> Vec<u8> {
                 match self { $( Self::$variant(k) => k.to_bytes(), )+ }
             }
+
+            /// The canonical `"<scheme>:<base64>"` form used in committee
+            /// files. Shared with this type's `Serialize` implementation so a
+            /// committee generator and the node always agree.
+            pub fn encode_config(&self) -> String {
+                format!(
+                    "{}:{}",
+                    self.scheme(),
+                    BASE64_STANDARD.encode(self.to_bytes())
+                )
+            }
             fn verify_pq(&self, message: &[u8; 32], signature: &[u8]) -> bool {
                 match self { $( Self::$variant(k) => k.verify(message, signature), )+ }
             }
@@ -712,7 +723,7 @@ fn parse_scheme_key<E: de::Error>(value: &str) -> Result<(ConsensusSignatureSche
 
 impl Serialize for ConsensusPublicKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serialize_scheme_key(self.scheme(), &self.to_bytes(), serializer)
+        serializer.serialize_str(&self.encode_config())
     }
 }
 

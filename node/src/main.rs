@@ -56,6 +56,21 @@ async fn main() -> Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("consensus_public_key")
+                .about(
+                    "Print the consensus public key of a key file in the \
+                     committee-file form, or nothing for an ed25519 key file",
+                )
+                .arg(
+                    Arg::new("keys")
+                        .long("keys")
+                        .value_name("FILE")
+                        .required(true)
+                        .action(ArgAction::Set)
+                        .help("The file containing the node keys"),
+                ),
+        )
+        .subcommand(
             Command::new("run")
                 .about("Run a node")
                 .arg(
@@ -480,6 +495,13 @@ async fn main() -> Result<()> {
         )
         .export(sub_matches.get_one::<String>("filename").unwrap())
         .context("Failed to generate key pair")?,
+        Some(("consensus_public_key", sub_matches)) => {
+            let keypair = KeyPair::import(sub_matches.get_one::<String>("keys").unwrap())
+                .context("Failed to load the node's keypair")?;
+            if let Some(secret) = keypair.consensus_secret.as_ref() {
+                println!("{}", secret.public_key().encode_config());
+            }
+        }
         Some(("run", sub_matches)) => run(sub_matches).await?,
         Some(("local-benchmark", sub_matches)) => {
             #[cfg(feature = "benchmark")]

@@ -33,8 +33,11 @@ PORTS = {
     "worker_to_worker": 6006,
     "worker_metrics": 6007,
 }
-HOST_PRIMARY_METRICS_BASE = 9000
-HOST_WORKER_METRICS_BASE = 9100
+# Host-side metrics port bases. Overridable so a shared machine whose ports
+# are already taken (e.g. a node-exporter on 9100) can host a run without
+# disturbing the existing services.
+HOST_PRIMARY_METRICS_BASE = int(os.environ.get("HOST_PRIMARY_METRICS_BASE", "9000"))
+HOST_WORKER_METRICS_BASE = int(os.environ.get("HOST_WORKER_METRICS_BASE", "9100"))
 MAX_NODES = 40  # Local resource limit.
 
 # AWS RTT values are milliseconds; tc applies half as one-way delay.
@@ -123,24 +126,96 @@ def ensure_node_binary(explicit: str | None) -> Path:
     return native
 
 
-def generate_keys(node_bin: Path, out_dir: Path, n: int) -> list[str]:
-    """Run `node generate_keys` once per node and return public keys in index order."""
-    pubkeys = []
+def reclaim_data_dir_ownership() -> None:
+    """Make the previous run's artifacts deletable by this user.
+
+    Validator containers run as root because the AWS RTT matrix needs
+    NET_ADMIN for `tc netem`, so the logs and stores they leave behind in the
+    bind-mounted data directory are root-owned. Without sudo the next
+    generation cannot wipe them, which would break any back-to-back sweep
+    (`check_protocol_controls.py`) at its second run. Hand ownership back with
+    a short-lived privileged container instead of requiring sudo.
+    """
+    if not DATA_DIR.exists():
+        return
+    uid, gid = os.getuid(), os.getgid()
+    try:
+        foreign = any(
+            path.stat().st_uid != uid for path in DATA_DIR.rglob("*")
+        )
+    except OSError:
+        foreign = True
+    if not foreign:
+        return
+    image = os.environ.get("DOCKER_BENCH_IMAGE", "vantage-docker-bench:latest")
+    print("-- reclaiming ownership of the previous run's data directory")
+    result = subprocess.run(
+        [
+            "docker", "run", "--rm", "--entrypoint", "chown",
+            "-v", f"{DATA_DIR}:/data", image,
+            "-R", f"{uid}:{gid}", "/data",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.exit(
+            "failed to reclaim ownership of "
+            f"{DATA_DIR}: {result.stderr.strip()}\n"
+            "Remove it manually (it is owned by root from the previous run)."
+        )
+
+
+def generate_keys(
+    node_bin: Path, out_dir: Path, n: int, consensus_scheme: str = "ed25519"
+) -> tuple[list[str], list[str | None]]:
+    """Run `node generate_keys` once per node.
+
+    Returns the identity public keys and, for a post-quantum consensus scheme,
+    the matching consensus public keys (both in node-index order). The
+    consensus public half is derived by the node binary, which owns the
+    canonical encoding, rather than re-implemented here.
+    """
+    pubkeys: list[str] = []
+    consensus_keys: list[str | None] = []
     for i in range(n):
         node_dir = out_dir / f"node-{i}"
         node_dir.mkdir(parents=True, exist_ok=True)
         key_path = node_dir / "key.json"
         subprocess.run(
-            [str(node_bin), "generate_keys", "--filename", str(key_path)],
+            [
+                str(node_bin), "generate_keys",
+                "--filename", str(key_path),
+                "--consensus-scheme", consensus_scheme,
+            ],
             check=True,
             stdout=subprocess.DEVNULL,
         )
         pubkeys.append(json.loads(key_path.read_text())["name"])
-    return pubkeys
+        if consensus_scheme == "ed25519":
+            consensus_keys.append(None)
+            continue
+        printed = subprocess.run(
+            [str(node_bin), "consensus_public_key", "--keys", str(key_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if not printed:
+            sys.exit(
+                f"node generate_keys produced no {consensus_scheme} consensus key "
+                f"for node {i}"
+            )
+        consensus_keys.append(printed)
+    return pubkeys, consensus_keys
 
 
 # Build committee.json and parameters.json data.
-def build_committee(pubkeys: list[str]) -> dict:
+def build_committee(
+    pubkeys: list[str],
+    consensus_scheme: str = "ed25519",
+    consensus_keys: list[str | None] | None = None,
+) -> dict:
     authorities = {}
     for i, pubkey in enumerate(pubkeys):
         ip = node_ip(i)
@@ -161,7 +236,13 @@ def build_committee(pubkeys: list[str]) -> dict:
                 }
             },
         }
-    return {"authorities": authorities}
+        consensus_key = (consensus_keys or [None] * len(pubkeys))[i]
+        if consensus_key is not None:
+            authorities[pubkey]["consensus_key"] = consensus_key
+    committee: dict = {"authorities": authorities}
+    if consensus_scheme != "ed25519":
+        committee["consensus_signature_scheme"] = consensus_scheme
+    return committee
 
 
 def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
@@ -387,7 +468,7 @@ def render_compose(
         adversarial_node_rate = adversarial_rates.get(i, 0)
         out += [
             f"  node-{i}:",
-            "    image: vantage-docker-bench:latest",
+            f"    image: {os.environ.get('DOCKER_BENCH_IMAGE', 'vantage-docker-bench:latest')}",
             f"    container_name: {container_name(i)}",
             f"    hostname: node-{i}",
             "    cap_add:",
@@ -473,6 +554,7 @@ def write_manifest(
         "duration": args.duration,
         "tx_size": args.tx_size,
         "mode": args.mode,
+        "consensus_signature_scheme": args.consensus_signature_scheme,
         "latency": args.latency,
         "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
@@ -538,6 +620,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--duration", type=int, default=60, help="benchmark duration, s (default 60; "
                     "informational only here -- run.sh/results.py are what actually enforce it)")
     p.add_argument("--protocol", choices=PROTOCOL_CHOICES, default="vantage")
+    p.add_argument(
+        "--consensus-signature-scheme",
+        default="ed25519",
+        help="signature scheme for the Autobahn consensus/ordering path: "
+        "ed25519 (default) | ml-dsa-44 | ml-dsa-65 | ml-dsa-87 | "
+        "slh-dsa-sha2-{128,192,256}{s,f}. Post-quantum schemes generate one "
+        "consensus keypair per authority and publish the public half in "
+        "committee.json.",
+    )
     p.add_argument("--tx-size", type=int, default=512, help="transaction size, bytes (default 512)")
     p.add_argument("--mode", choices=["all_zero", "all-zero", "random"], default="random")
     p.add_argument("--no-latency", dest="latency", action="store_false",
@@ -732,6 +823,7 @@ def main(argv=None) -> None:
     NODE_IP_PREFIX = f"{args.subnet_base}.1."
 
     # Keep the bind-mount root stable across back-to-back Docker Desktop runs.
+    reclaim_data_dir_ownership()
     # Removing and recreating the root can race the host file-sharing layer,
     # which then reports a generated file such as committee.json as missing
     # while Compose starts containers in parallel.
@@ -754,10 +846,14 @@ def main(argv=None) -> None:
     print(f"-- using node binary: {node_bin}")
 
     print(f"-- generating {n} keypair(s)")
-    pubkeys = generate_keys(node_bin, DATA_DIR, n)
+    pubkeys, consensus_keys = generate_keys(
+        node_bin, DATA_DIR, n, args.consensus_signature_scheme
+    )
 
     print("-- writing committee.json / parameters.json")
-    committee = build_committee(pubkeys)
+    committee = build_committee(
+        pubkeys, args.consensus_signature_scheme, consensus_keys
+    )
     (DATA_DIR / "committee.json").write_text(json.dumps(committee, indent=2) + "\n")
     parameters = build_parameters(args, pubkeys)
     (DATA_DIR / "parameters.json").write_text(json.dumps(parameters, indent=2) + "\n")

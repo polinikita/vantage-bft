@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import statistics
+import subprocess
 import sys
 import time
 import urllib.error
@@ -61,6 +64,12 @@ def counter(samples: dict, name: str) -> int:
     return int(vals[0][1]) if vals else 0
 
 
+def counter_f(samples: dict, name: str) -> float:
+    """Float-preserving counter read. CPU seconds are fractional."""
+    vals = samples.get(name)
+    return float(vals[0][1]) if vals else 0.0
+
+
 def gauge_by_label(samples: dict, name: str, label: str, value: str) -> int | None:
     for labels, v in samples.get(name, []):
         if labels.get(label) == value:
@@ -99,7 +108,8 @@ class NodeSnapshot:
                  "count", "p50", "p90", "p99", "m50", "m90", "m99",
                  "wire_bytes_sent", "optimistic_batch_bytes_sent",
                  "prepare_sync_events", "prepare_missing_headers",
-                 "prepare_sync_completed", "prepare_sync_wait_micros")
+                 "prepare_sync_completed", "prepare_sync_wait_micros",
+                 "cpu_seconds", "cpu_seconds_container", "rss_bytes")
 
     def __init__(self):
         self.reachable = False
@@ -115,6 +125,89 @@ class NodeSnapshot:
         self.prepare_missing_headers = 0
         self.prepare_sync_completed = 0
         self.prepare_sync_wait_micros = 0
+        # Consensus CPU: this validator's primary + worker only.
+        self.cpu_seconds = 0.0
+        # Whole-container CPU, which also includes the co-located load
+        # generator. Kept as an independent cross-check of the number above.
+        self.cpu_seconds_container = 0.0
+        self.rss_bytes = 0
+
+
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
+# Resolved once per process: container id and cgroup paths never change within
+# a run, so the per-sample cost stays two small file reads per validator.
+_CPU_PROBES: dict[int, dict | None] = {}
+
+
+def container_name(manifest: dict, i: int) -> str:
+    prefix = manifest.get("container_name_prefix", "vantage-node-")
+    return f"{prefix}{i}"
+
+
+def _cpu_probe(manifest: dict, i: int) -> dict | None:
+    """Locate this validator's cgroup, or None when it cannot be read.
+
+    The node process exports `process_cpu_seconds_total` with whole-second
+    resolution, which deltas to zero over a short window at moderate load.
+    The cgroup exposes `usage_usec`, and `/proc/<pid>/stat` exposes per-process
+    ticks, so both are read directly instead.
+    """
+    if i in _CPU_PROBES:
+        return _CPU_PROBES[i]
+    probe: dict | None = None
+    name = container_name(manifest, i)
+    try:
+        cid = subprocess.run(
+            ["docker", "inspect", "-f", "{{.Id}}", name],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        cid = ""
+    if cid:
+        scope = CGROUP_ROOT / "system.slice" / f"docker-{cid}.scope"
+        if (scope / "cpu.stat").is_file():
+            probe = {"scope": scope}
+    _CPU_PROBES[i] = probe
+    return probe
+
+
+def _read_usage_usec(scope: Path) -> float:
+    try:
+        for line in (scope / "cpu.stat").read_text().splitlines():
+            if line.startswith("usage_usec "):
+                return float(line.split()[1])
+    except OSError:
+        pass
+    return 0.0
+
+
+def _read_role_cpu_seconds(scope: Path) -> float:
+    """CPU seconds of the primary and worker processes in this cgroup.
+
+    The container also runs the benchmark client; attributing its CPU to the
+    protocol would overstate consensus cost, so processes are classified by
+    their command line and the client is excluded.
+    """
+    total_ticks = 0
+    try:
+        pids = (scope / "cgroup.procs").read_text().split()
+    except OSError:
+        return 0.0
+    for pid in pids:
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            argv = [part.decode("utf-8", "replace") for part in cmdline if part]
+            if not argv or "benchmark_client" in argv[0]:
+                continue
+            if not any(role in argv for role in ("primary", "worker")):
+                continue
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+            # utime and stime, fields 14 and 15 of proc(5), 1-indexed.
+            total_ticks += int(fields[11]) + int(fields[12])
+        except (OSError, ValueError, IndexError):
+            continue
+    return total_ticks / CLOCK_TICKS
 
 
 def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
@@ -129,6 +222,7 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
     )
     s.submitted_transactions = counter(worker_samples, "submitted_transactions")
     s.wire_bytes_sent = counter(worker_samples, "bytes_sent_total")
+    s.rss_bytes = counter(worker_samples, "process_resident_memory_bytes")
     s.optimistic_batch_bytes_sent = counter_by_label(
         worker_samples, "network_bytes_sent_total", "type", "OptimisticBatch"
     )
@@ -144,9 +238,15 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         s.m90 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p90")
         s.m99 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p99")
 
+    probe = _cpu_probe(manifest, i)
+    if probe is not None:
+        s.cpu_seconds = _read_role_cpu_seconds(probe["scope"])
+        s.cpu_seconds_container = _read_usage_usec(probe["scope"]) / 1e6
+
     primary_samples = scrape(primary_url(manifest, i))
     if primary_samples is not None:
         s.wire_bytes_sent += counter(primary_samples, "bytes_sent_total")
+        s.rss_bytes += counter(primary_samples, "process_resident_memory_bytes")
         s.prepare_sync_events = counter(
             primary_samples, "autobahn_prepare_sync_events_total"
         )
@@ -167,6 +267,17 @@ def counter_deltas(
 ) -> list[int]:
     return [
         max(0, int(getattr(after, field)) - int(getattr(before, field)))
+        for before, after in zip(first, last)
+        if after.reachable
+    ]
+
+
+def float_deltas(
+    first: list[NodeSnapshot], last: list[NodeSnapshot], field: str
+) -> list[float]:
+    """`counter_deltas` for fractional counters (CPU seconds)."""
+    return [
+        max(0.0, float(getattr(after, field)) - float(getattr(before, field)))
         for before, after in zip(first, last)
         if after.reachable
     ]
@@ -313,6 +424,17 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     sync_wait_micros = counter_deltas(
         first_snapshots, last_snapshots, "prepare_sync_wait_micros"
     )
+    # Per-validator CPU time consumed inside the measurement window
+    # (primary + worker). Divided by the window it reads as "cores busy".
+    cpu_deltas = float_deltas(first_snapshots, last_snapshots, "cpu_seconds")
+    cpu_container_deltas = float_deltas(
+        first_snapshots, last_snapshots, "cpu_seconds_container"
+    )
+    live = len(cpu_deltas) or 1
+    cpu_seconds_total = sum(cpu_deltas)
+    cpu_cores_total = cpu_seconds_total / window
+    cpu_container_cores_total = sum(cpu_container_deltas) / window
+    rss_values = [s.rss_bytes for s in last_snapshots if s.reachable]
     total_sync_events = sum(sync_events)
     total_sync_completed = sum(sync_completed)
     total_sync_wait_micros = sum(sync_wait_micros)
@@ -333,6 +455,35 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             " Optimistic leader batch relay: "
             f"{sum(relay_bytes) / window / 1_000_000:.2f} MB/s aggregate, "
             f"peak node {max(relay_bytes) * 8 / window / 1_000_000:.2f} Mbit/s"
+        )
+    print(
+        f" CPU: {cpu_cores_total:.2f} cores aggregate "
+        f"({cpu_cores_total / live:.3f} cores/node, "
+        f"peak node {max(cpu_deltas, default=0.0) / window:.3f}), "
+        + (
+            f"{cpu_seconds_total * 1000 / committed_delta:.3f} CPU-ms per committed tx"
+            if committed_delta
+            else "no commits"
+        )
+    )
+    print(
+        f"      (whole container incl. load generator: "
+        f"{cpu_container_cores_total:.2f} cores aggregate)"
+    )
+    print(
+        f" Wire out: {sum(wire_bytes) * 8 / window / 1_000_000:.2f} Mbit/s aggregate "
+        f"({sum(wire_bytes) * 8 / window / 1_000_000 / live:.2f} /node, "
+        f"peak node {max(wire_bytes, default=0) * 8 / window / 1_000_000:.2f}), "
+        + (
+            f"{sum(wire_bytes) / committed_delta:.0f} B per committed tx"
+            if committed_delta
+            else "no commits"
+        )
+    )
+    if rss_values:
+        print(
+            f" Memory: {statistics.mean(rss_values) / 2**20:.0f} MiB mean/node, "
+            f"peak node {max(rss_values) / 2**20:.0f} MiB"
         )
     print("-----------------------------------------")
     result = {
@@ -361,6 +512,24 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             max(relay_bytes, default=0) * 8 / window / 1_000_000
         ),
         "max_node_wire_mbps": max(wire_bytes, default=0) * 8 / window / 1_000_000,
+        "wire_bytes_total": sum(wire_bytes),
+        "wire_mbps_total": sum(wire_bytes) * 8 / window / 1_000_000,
+        "mean_node_wire_mbps": sum(wire_bytes) * 8 / window / 1_000_000 / live,
+        "wire_bytes_per_committed_tx": (
+            sum(wire_bytes) / committed_delta if committed_delta else None
+        ),
+        "cpu_seconds_total": cpu_seconds_total,
+        "cpu_cores_total": cpu_cores_total,
+        "mean_node_cpu_cores": cpu_cores_total / live,
+        "max_node_cpu_cores": max(cpu_deltas, default=0.0) / window,
+        "cpu_cores_total_container": cpu_container_cores_total,
+        "cpu_ms_per_committed_tx": (
+            cpu_seconds_total * 1000 / committed_delta if committed_delta else None
+        ),
+        "mean_node_rss_mib": (
+            statistics.mean(rss_values) / 2**20 if rss_values else None
+        ),
+        "max_node_rss_mib": (max(rss_values) / 2**20 if rss_values else None),
         "real_latency_ms": latency_quantiles_ms(last_snapshots, materialised=False),
         "materialised_latency_ms": latency_quantiles_ms(
             last_snapshots, materialised=True
