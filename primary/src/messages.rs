@@ -3,6 +3,7 @@
 use crate::error::{ConsensusError, ConsensusResult, DagError, DagResult};
 use crate::primary::{Height, Slot, View};
 use config::{Committee, Stake, WorkerId};
+use crypto::consensus_auth::{verify_quorum, ConsensusSecretKey, ConsensusSignature};
 use crypto::{Blake3Hasher, Digest, Hash, PublicKey, SecretKey, Signature, SignatureService};
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -724,7 +725,7 @@ impl fmt::Display for Ack {
 pub struct ConsensusRequest {
     pub author: PublicKey,
     pub message: ConsensusMessage,
-    pub sig: Signature,
+    pub sig: ConsensusSignature,
 }
 impl ConsensusRequest {
     pub async fn new(
@@ -735,10 +736,10 @@ impl ConsensusRequest {
         let req = Self {
             author,
             message,
-            sig: Signature::default(),
+            sig: ConsensusSignature::default(),
         };
         let sig = signature_service
-            .request_signature(req.message.digest())
+            .request_consensus_signature(req.message.digest())
             .await;
         Self { sig, ..req }
     }
@@ -749,7 +750,12 @@ impl ConsensusRequest {
             DagError::UnknownAuthority(self.author)
         );
         self.sig
-            .verify(&self.message.digest(), &self.author)
+            .verify(
+                &self.message.digest(),
+                &self.author,
+                committee.consensus_signature_scheme,
+                committee.consensus_public_key(&self.author),
+            )
             .map_err(DagError::from)
     }
 }
@@ -766,7 +772,7 @@ pub struct ConsensusVote {
     pub slot: Slot,
     /// Digest of the voted consensus message.
     pub digest: Digest,
-    pub sig: Signature,
+    pub sig: ConsensusSignature,
 }
 impl ConsensusVote {
     pub async fn new(
@@ -779,10 +785,10 @@ impl ConsensusVote {
             author,
             slot,
             digest,
-            sig: Signature::default(),
+            sig: ConsensusSignature::default(),
         };
         let sig = signature_service
-            .request_signature(vote.digest.clone())
+            .request_consensus_signature(vote.digest.clone())
             .await;
         Self { sig, ..vote }
     }
@@ -793,7 +799,12 @@ impl ConsensusVote {
             DagError::UnknownAuthority(self.author)
         );
         self.sig
-            .verify(&self.digest, &self.author)
+            .verify(
+                &self.digest,
+                &self.author,
+                committee.consensus_signature_scheme,
+                committee.consensus_public_key(&self.author),
+            )
             .map_err(DagError::from)
     }
 }
@@ -811,7 +822,10 @@ pub struct Vote {
     pub origin: PublicKey,
     pub author: PublicKey,
     pub signature: Signature,
-    pub consensus_votes: Vec<(Slot, Digest, Signature)>,
+    /// Piggybacked ordering-path votes, signed with the committee's consensus
+    /// signature scheme (the car vote itself stays on the Ed25519 identity
+    /// key: it certifies data availability, not ordering).
+    pub consensus_votes: Vec<(Slot, Digest, ConsensusSignature)>,
 }
 
 impl Vote {
@@ -819,7 +833,7 @@ impl Vote {
         header: &Header,
         author: &PublicKey,
         signature_service: &mut SignatureService,
-        consensus_votes: Vec<(Slot, Digest, Signature)>,
+        consensus_votes: Vec<(Slot, Digest, ConsensusSignature)>,
     ) -> Self {
         let vote = Self {
             id: header.id.clone(),
@@ -875,7 +889,7 @@ impl fmt::Debug for Vote {
 impl Vote {
     pub fn new_from_key(
         header: Header,
-        consensus_votes: Vec<(Slot, Digest, Signature)>,
+        consensus_votes: Vec<(Slot, Digest, ConsensusSignature)>,
         author: PublicKey,
         secret: &SecretKey,
     ) -> Self {
@@ -1046,7 +1060,7 @@ impl Eq for Certificate {}
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct QC {
     pub id: Digest,
-    pub votes: Vec<(PublicKey, Signature)>,
+    pub votes: Vec<(PublicKey, ConsensusSignature)>,
     /// Memoized content digest; `votes` must not be mutated after `digest()`.
     #[serde(skip)]
     pub(crate) digest_memo: OnceLock<Digest>,
@@ -1079,7 +1093,13 @@ impl QC {
         }
         ensure!(weight >= threshold, ConsensusError::QCRequiresQuorum);
 
-        Signature::verify_batch(&self.id, &self.votes).map_err(ConsensusError::from)
+        verify_quorum(
+            &self.id,
+            committee.consensus_signature_scheme,
+            &self.votes,
+            |name| committee.consensus_public_key(name),
+        )
+        .map_err(ConsensusError::from)
     }
 }
 
@@ -1095,8 +1115,9 @@ impl Hash for QC {
                 hasher.update(&(votes.len() as u64).to_le_bytes());
                 for (author, signature) in votes {
                     hasher.update(&author.0);
-                    // Raw 64 bytes == the bincode encoding; digest unchanged.
-                    let encoded = signature.to_bytes();
+                    // Canonical `tag || payload` encoding binds the scheme
+                    // and the exact signature bytes.
+                    let encoded = signature.to_canonical_bytes();
                     hasher.update(&(encoded.len() as u64).to_le_bytes());
                     hasher.update(&encoded);
                 }
@@ -1128,7 +1149,7 @@ pub struct Timeout {
     pub high_prop: Option<ConsensusMessage>,
 
     pub author: PublicKey,
-    pub signature: Signature,
+    pub signature: ConsensusSignature,
 }
 
 impl Timeout {
@@ -1146,10 +1167,12 @@ impl Timeout {
             high_qc,
             high_prop,
             author,
-            signature: Signature::default(),
+            signature: ConsensusSignature::default(),
         };
 
-        let signature = signature_service.request_signature(timeout.digest()).await;
+        let signature = signature_service
+            .request_consensus_signature(timeout.digest())
+            .await;
         Self {
             signature,
             ..timeout
@@ -1172,7 +1195,12 @@ impl Timeout {
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
         );
-        self.signature.verify(&self.digest(), &self.author)?;
+        self.signature.verify(
+            &self.digest(),
+            &self.author,
+            committee.consensus_signature_scheme,
+            committee.consensus_public_key(&self.author),
+        )?;
 
         if let Some(high_qc) = &self.high_qc {
             let well_formed = match high_qc {
@@ -1240,6 +1268,7 @@ impl Timeout {
         view: View,
         author: PublicKey,
         secret: &SecretKey,
+        consensus_secret: Option<&ConsensusSecretKey>,
     ) -> Self {
         let timeout = Timeout {
             high_prop,
@@ -1247,9 +1276,9 @@ impl Timeout {
             slot,
             view,
             author,
-            signature: Signature::default(),
+            signature: ConsensusSignature::default(),
         };
-        let signature = Signature::new(&timeout.digest(), secret);
+        let signature = ConsensusSignature::sign(&timeout.digest(), secret, consensus_secret);
         Self {
             signature,
             ..timeout
@@ -1578,7 +1607,7 @@ struct TimeoutWire {
     slot: Slot,
     view: View,
     author: PublicKey,
-    signature: Signature,
+    signature: ConsensusSignature,
     cuts: Vec<Cut>,
     high_qc: Option<ConsensusMessageWire>,
     high_prop: Option<ConsensusMessageWire>,
@@ -1645,7 +1674,7 @@ struct TimeoutLite {
     slot: Slot,
     view: View,
     author: PublicKey,
-    signature: Signature,
+    signature: ConsensusSignature,
     high_qc: Option<u16>,
     high_prop: Option<u16>,
 }
@@ -1759,6 +1788,89 @@ impl<'de> Deserialize<'de> for TC {
 mod autobahn_alignment_tests {
     use super::*;
 
+    /// Ordering-path messages sign and verify under a post-quantum committee,
+    /// and Ed25519 proofs are rejected once the committee scheme is upgraded.
+    #[test]
+    fn ordering_messages_verify_under_a_post_quantum_committee() {
+        use crypto::consensus_auth::{benchmark_seed, ConsensusSignatureScheme};
+
+        let scheme = ConsensusSignatureScheme::MlDsa44;
+        let mut committee = crate::common::committee();
+        let keys = crate::common::keys();
+        committee.consensus_signature_scheme = scheme;
+        let mut consensus_secrets = std::collections::HashMap::new();
+        for (index, (name, _)) in keys.iter().enumerate() {
+            let secret =
+                ConsensusSecretKey::from_seed(scheme, &benchmark_seed(scheme, index as u64))
+                    .unwrap();
+            committee.authorities.get_mut(name).unwrap().consensus_key = Some(secret.public_key());
+            consensus_secrets.insert(*name, secret);
+        }
+        committee.validate_consensus_keys().unwrap();
+
+        // Direct consensus vote round-trip.
+        let digest = Digest([3; 32]);
+        let (name0, secret0) = &keys[0];
+        let vote = ConsensusVote {
+            author: *name0,
+            slot: 1,
+            digest: digest.clone(),
+            sig: ConsensusSignature::sign(&digest, secret0, consensus_secrets.get(name0)),
+        };
+        vote.verify(&committee).unwrap();
+
+        // An Ed25519 proof must not satisfy the upgraded committee.
+        let downgraded = ConsensusVote {
+            sig: ConsensusSignature::sign(&digest, secret0, None),
+            ..vote.clone()
+        };
+        assert!(downgraded.verify(&committee).is_err());
+
+        // Quorum certificate over one prepare digest.
+        let cut = Header::genesis_proposals(&committee);
+        let prepare_id = prepare_digest(5, 1, &cut);
+        let votes: Vec<_> = keys
+            .iter()
+            .take(committee.quorum_threshold() as usize)
+            .map(|(name, secret)| {
+                (
+                    *name,
+                    ConsensusSignature::sign(&prepare_id, secret, consensus_secrets.get(name)),
+                )
+            })
+            .collect();
+        let qc = QC {
+            id: prepare_id.clone(),
+            votes,
+            ..Default::default()
+        };
+        qc.verify(&committee).unwrap();
+
+        // One vote signed by another authority's key breaks the QC.
+        let mut forged = QC {
+            id: qc.id.clone(),
+            votes: qc.votes.clone(),
+            ..Default::default()
+        };
+        forged.votes[0].1 =
+            ConsensusSignature::sign(&prepare_id, secret0, consensus_secrets.get(&keys[1].0));
+        assert!(forged.verify(&committee).is_err());
+
+        // Timeouts carry the consensus scheme as well.
+        let timeout = Timeout::new_from_key(
+            None,
+            None,
+            5,
+            1,
+            *name0,
+            secret0,
+            consensus_secrets.get(name0),
+        );
+        timeout.verify(&committee).unwrap();
+        let downgraded = Timeout::new_from_key(None, None, 5, 1, *name0, secret0, None);
+        assert!(downgraded.verify(&committee).is_err());
+    }
+
     fn poa_with_votes(count: usize) -> (Committee, Certificate) {
         let committee = crate::common::committee();
         let header = crate::common::header();
@@ -1812,7 +1924,7 @@ mod autobahn_alignment_tests {
         let votes: Vec<_> = keys
             .iter()
             .take(committee.quorum_threshold() as usize)
-            .map(|(author, secret)| (*author, Signature::new(&prepare_id, secret)))
+            .map(|(author, secret)| (*author, ConsensusSignature::sign(&prepare_id, secret, None)))
             .collect();
         let high_prop = ConsensusMessage::Prepare {
             slot,
@@ -1832,7 +1944,15 @@ mod autobahn_alignment_tests {
             proposals: cut,
         };
         let (author, secret) = &keys[author_index];
-        Timeout::new_from_key(Some(high_prop), Some(high_qc), slot, view, *author, secret)
+        Timeout::new_from_key(
+            Some(high_prop),
+            Some(high_qc),
+            slot,
+            view,
+            *author,
+            secret,
+            None,
+        )
     }
 
     #[test]
@@ -1891,7 +2011,7 @@ mod autobahn_alignment_tests {
             slot: Slot,
             view: View,
             author: PublicKey,
-            signature: Signature,
+            signature: ConsensusSignature,
             high_qc: Option<u16>,
             high_prop: Option<u16>,
         }
@@ -1913,7 +2033,7 @@ mod autobahn_alignment_tests {
                 slot: 7,
                 view: 2,
                 author: PublicKey::default(),
-                signature: Signature::default(),
+                signature: ConsensusSignature::default(),
                 high_qc: Some(3),
                 high_prop: None,
             }],
@@ -1958,7 +2078,13 @@ mod autobahn_alignment_tests {
 
         let qc = QC {
             id: Digest([5; 32]),
-            votes: certificate.votes.clone(),
+            votes: certificate
+                .votes
+                .iter()
+                .map(|(author, signature)| {
+                    (*author, ConsensusSignature::Ed25519(signature.clone()))
+                })
+                .collect(),
             ..Default::default()
         };
         let mut votes: Vec<_> = qc.votes.iter().collect();
@@ -1969,7 +2095,8 @@ mod autobahn_alignment_tests {
         hasher.update(&(votes.len() as u64).to_le_bytes());
         for (author, signature) in &votes {
             hasher.update(&author.0);
-            let encoded = bincode::serialize(signature).unwrap();
+            // QC votes hash their canonical `tag || payload` encoding.
+            let encoded = signature.to_canonical_bytes();
             hasher.update(&(encoded.len() as u64).to_le_bytes());
             hasher.update(&encoded);
         }
@@ -2008,7 +2135,7 @@ mod autobahn_alignment_tests {
             author: PublicKey([91; 32]),
             slot: 3,
             digest: Digest([27; 32]),
-            sig: Signature::default(),
+            sig: ConsensusSignature::default(),
         };
         assert!(vote.verify(&committee).is_err());
     }
@@ -2022,7 +2149,7 @@ mod autobahn_alignment_tests {
         let votes = keys
             .iter()
             .take(committee.quorum_threshold() as usize)
-            .map(|(author, secret)| (*author, Signature::new(&prepare_id, secret)))
+            .map(|(author, secret)| (*author, ConsensusSignature::sign(&prepare_id, secret, None)))
             .collect();
         let qc = QC {
             id: prepare_id,
@@ -2120,7 +2247,7 @@ mod autobahn_alignment_tests {
             qc: QC::default(),
             proposals: Header::genesis_proposals(&committee),
         };
-        let timeout = Timeout::new_from_key(None, Some(commit), 4, 2, author, &secret);
+        let timeout = Timeout::new_from_key(None, Some(commit), 4, 2, author, &secret, None);
         assert!(timeout.verify(&committee).is_err());
     }
 
@@ -2145,7 +2272,7 @@ mod autobahn_alignment_tests {
                 high_qc: None,
                 high_prop: Some(prepare.clone()),
                 author: *author,
-                signature: Signature::default(),
+                signature: ConsensusSignature::default(),
             })
             .collect();
         let tc = TC::new(&committee, 9, 4, timeouts);
@@ -2190,7 +2317,7 @@ mod autobahn_alignment_tests {
                         high_qc: (index == 0).then(|| high_qc(qc_view)),
                         high_prop: Some(high_prepare.clone()),
                         author: *author,
-                        signature: Signature::default(),
+                        signature: ConsensusSignature::default(),
                     })
                     .collect(),
             )
@@ -2210,7 +2337,7 @@ mod autobahn_alignment_tests {
             high_qc: None,
             high_prop: None,
             author,
-            signature: Signature::default(),
+            signature: ConsensusSignature::default(),
         };
         let baseline = first.digest();
         first.high_prop = Some(ConsensusMessage::Prepare {

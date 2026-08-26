@@ -19,6 +19,8 @@ use tokio::sync::oneshot;
 #[path = "tests/crypto_tests.rs"]
 pub mod crypto_tests;
 
+pub mod consensus_auth;
+
 pub type CryptoError = ed25519::Error;
 
 /// The hasher used for all content digests. Blake3 produces a
@@ -371,6 +373,13 @@ impl Signature {
         self.flatten()
     }
 
+    /// Reconstruct from the canonical 64-byte encoding.
+    pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        let part1 = bytes[..32].try_into().expect("Unexpected signature length");
+        let part2 = bytes[32..].try_into().expect("Unexpected signature length");
+        Signature { part1, part2 }
+    }
+
     pub fn verify(&self, digest: &Digest, public_key: &PublicKey) -> Result<(), CryptoError> {
         let signature = dalek::Signature::from_bytes(&self.flatten());
         let key = dalek::VerifyingKey::from_bytes(&public_key.0)?;
@@ -408,20 +417,43 @@ impl Signature {
     }
 }
 
-/// This service holds the node's private key. It takes digests as input and returns a signature
-/// over the digest (through a oneshot channel).
+enum SignatureRequest {
+    /// Ed25519 identity signature (DAG/data path: headers, car votes).
+    Identity(Digest, oneshot::Sender<Signature>),
+    /// Scheme-selectable consensus signature (Autobahn ordering path).
+    Consensus(Digest, oneshot::Sender<consensus_auth::ConsensusSignature>),
+}
+
+/// This service holds the node's private key material. It takes digests as
+/// input and returns signatures over them (through oneshot channels). The
+/// Ed25519 identity key always signs the DAG/data path; the ordering path is
+/// signed with the committee-selected consensus scheme (Ed25519 unless a
+/// post-quantum consensus secret is configured).
 #[derive(Clone)]
 pub struct SignatureService {
-    channel: Sender<(Digest, oneshot::Sender<Signature>)>,
+    channel: Sender<SignatureRequest>,
 }
 
 impl SignatureService {
-    pub fn new(secret: SecretKey) -> Self {
-        let (tx, mut rx): (Sender<(_, oneshot::Sender<_>)>, _) = channel(100);
+    pub fn new(
+        secret: SecretKey,
+        consensus_secret: Option<consensus_auth::ConsensusSecretKey>,
+    ) -> Self {
+        let (tx, mut rx): (Sender<SignatureRequest>, _) = channel(100);
         tokio::spawn(async move {
-            while let Some((digest, sender)) = rx.recv().await {
-                let signature = Signature::new(&digest, &secret);
-                let _ = sender.send(signature);
+            while let Some(request) = rx.recv().await {
+                match request {
+                    SignatureRequest::Identity(digest, sender) => {
+                        let _ = sender.send(Signature::new(&digest, &secret));
+                    }
+                    SignatureRequest::Consensus(digest, sender) => {
+                        let _ = sender.send(consensus_auth::ConsensusSignature::sign(
+                            &digest,
+                            &secret,
+                            consensus_secret.as_ref(),
+                        ));
+                    }
+                }
             }
         });
         Self { channel: tx }
@@ -429,7 +461,28 @@ impl SignatureService {
 
     pub async fn request_signature(&mut self, digest: Digest) -> Signature {
         let (sender, receiver): (oneshot::Sender<_>, oneshot::Receiver<_>) = oneshot::channel();
-        if let Err(e) = self.channel.send((digest, sender)).await {
+        if let Err(e) = self
+            .channel
+            .send(SignatureRequest::Identity(digest, sender))
+            .await
+        {
+            panic!("Failed to send message Signature Service: {}", e);
+        }
+        receiver
+            .await
+            .expect("Failed to receive signature from Signature Service")
+    }
+
+    pub async fn request_consensus_signature(
+        &mut self,
+        digest: Digest,
+    ) -> consensus_auth::ConsensusSignature {
+        let (sender, receiver): (oneshot::Sender<_>, oneshot::Receiver<_>) = oneshot::channel();
+        if let Err(e) = self
+            .channel
+            .send(SignatureRequest::Consensus(digest, sender))
+            .await
+        {
             panic!("Failed to send message Signature Service: {}", e);
         }
         receiver

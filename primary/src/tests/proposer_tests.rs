@@ -11,7 +11,7 @@ use tokio::sync::mpsc::channel;
 #[serial]
 async fn propose_empty() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_parents, rx_parents) = channel(1);
     let (_tx_our_digests, rx_our_digests) = channel(1);
@@ -49,7 +49,7 @@ async fn propose_empty() {
 #[serial]
 async fn propose_payload() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
@@ -96,7 +96,7 @@ async fn propose_payload() {
 #[serial]
 async fn queued_payload_digests_share_the_next_lane_block() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(3);
@@ -138,7 +138,7 @@ async fn queued_payload_digests_share_the_next_lane_block() {
 #[serial]
 async fn propose_normal() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
@@ -216,7 +216,7 @@ async fn propose_normal() {
 #[serial]
 async fn propose_special_ticket_first() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
@@ -266,7 +266,7 @@ async fn propose_special_ticket_first() {
 #[serial]
 async fn propose_confirm_message() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
@@ -316,7 +316,7 @@ async fn propose_confirm_message() {
 #[serial]
 async fn duplicate_consensus_info_is_counted_once() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);

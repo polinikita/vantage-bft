@@ -1,4 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crypto::consensus_auth::{
+    generate_consensus_keypair, ConsensusPublicKey, ConsensusSecretKey, ConsensusSignatureScheme,
+};
 use crypto::{decode_base64_key, generate_production_keypair, PublicKey, SecretKey};
 use log::{info, warn};
 use serde::de::DeserializeOwned;
@@ -1283,6 +1286,10 @@ pub struct WorkerAddresses {
 pub struct Authority {
     /// The voting power of this authority.
     pub stake: Stake,
+    /// Public key for the committee's consensus signature scheme. `None` when
+    /// the committee orders with the Ed25519 identity keys (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consensus_key: Option<ConsensusPublicKey>,
     /// The network addresses of the consensus protocol.
     pub consensus: ConsensusAddresses,
     /// The network addresses of the primary.
@@ -1294,6 +1301,11 @@ pub struct Authority {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
+    /// Signature scheme for the Autobahn consensus/ordering path (car
+    /// consensus votes, QCs, timeouts). The DAG/data path always uses the
+    /// Ed25519 identity keys.
+    #[serde(default)]
+    pub consensus_signature_scheme: ConsensusSignatureScheme,
 }
 
 impl Import for Committee {}
@@ -1307,6 +1319,7 @@ impl Committee {
                 .map(|(name, stake, address)| {
                     let authority = Authority {
                         stake,
+                        consensus_key: None,
                         consensus: ConsensusAddresses {
                             consensus_to_consensus: address,
                         },
@@ -1320,17 +1333,34 @@ impl Committee {
                     (name, authority)
                 })
                 .collect(),
+            consensus_signature_scheme: ConsensusSignatureScheme::default(),
         }
     }
 
     /// Generates an in-memory committee for `node local-benchmark`.
     pub fn local_benchmark(nodes: usize, workers: usize, base_port: u16) -> (Self, Vec<KeyPair>) {
+        Self::local_benchmark_with_scheme(
+            nodes,
+            workers,
+            base_port,
+            ConsensusSignatureScheme::default(),
+        )
+    }
+
+    /// [`Self::local_benchmark`] with an explicit consensus signature scheme;
+    /// post-quantum schemes generate one consensus keypair per authority.
+    pub fn local_benchmark_with_scheme(
+        nodes: usize,
+        workers: usize,
+        base_port: u16,
+        consensus_signature_scheme: ConsensusSignatureScheme,
+    ) -> (Self, Vec<KeyPair>) {
         let mut authorities = BTreeMap::new();
         let mut keypairs = Vec::with_capacity(nodes);
         let mut port = base_port;
 
         for _ in 0..nodes {
-            let keypair = KeyPair::new();
+            let keypair = KeyPair::new_with_scheme(consensus_signature_scheme);
 
             let consensus = ConsensusAddresses {
                 consensus_to_consensus: format!("127.0.0.1:{}", port).parse().unwrap(),
@@ -1362,6 +1392,10 @@ impl Committee {
                 keypair.name,
                 Authority {
                     stake: 1,
+                    consensus_key: keypair
+                        .consensus_secret
+                        .as_ref()
+                        .map(ConsensusSecretKey::public_key),
                     consensus,
                     primary,
                     workers: worker_addresses,
@@ -1373,7 +1407,47 @@ impl Committee {
         // Match committee index order.
         keypairs.sort_by_key(|k| k.name);
 
-        (Self { authorities }, keypairs)
+        (
+            Self {
+                authorities,
+                consensus_signature_scheme,
+            },
+            keypairs,
+        )
+    }
+
+    /// Public key of `name` for the consensus signature scheme, when the
+    /// committee runs a post-quantum scheme.
+    pub fn consensus_public_key(&self, name: &PublicKey) -> Option<&ConsensusPublicKey> {
+        self.authorities
+            .get(name)
+            .and_then(|authority| authority.consensus_key.as_ref())
+    }
+
+    /// Checks that every authority carries a key for the committee's
+    /// consensus signature scheme (trivially true for Ed25519).
+    pub fn validate_consensus_keys(&self) -> Result<(), String> {
+        let scheme = self.consensus_signature_scheme;
+        if !scheme.is_post_quantum() {
+            return Ok(());
+        }
+        for (name, authority) in &self.authorities {
+            match &authority.consensus_key {
+                Some(key) if key.scheme() == scheme => {}
+                Some(key) => {
+                    return Err(format!(
+                        "authority {name} lists a {} consensus key but the committee runs {scheme}",
+                        key.scheme()
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "authority {name} has no consensus key for scheme {scheme}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the number of authorities.
@@ -1736,6 +1810,10 @@ pub struct KeyPair {
     pub name: PublicKey,
     /// The node's secret key.
     pub secret: SecretKey,
+    /// Secret key for a post-quantum consensus signature scheme, when one is
+    /// selected for the committee. `None` for Ed25519 committees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consensus_secret: Option<ConsensusSecretKey>,
 }
 
 impl Import for KeyPair {}
@@ -1743,8 +1821,19 @@ impl Export for KeyPair {}
 
 impl KeyPair {
     pub fn new() -> Self {
+        Self::new_with_scheme(ConsensusSignatureScheme::default())
+    }
+
+    /// A fresh identity keypair, plus a consensus keypair when `scheme` is
+    /// post-quantum.
+    pub fn new_with_scheme(scheme: ConsensusSignatureScheme) -> Self {
         let (name, secret) = generate_production_keypair();
-        Self { name, secret }
+        let consensus_secret = generate_consensus_keypair(scheme).map(|(_, secret)| secret);
+        Self {
+            name,
+            secret,
+            consensus_secret,
+        }
     }
 }
 

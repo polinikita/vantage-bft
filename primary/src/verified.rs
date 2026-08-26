@@ -235,7 +235,7 @@ impl VerifiedCache {
         hasher.update(b"consensus-vote-verified-v1");
         hasher.update(&vote.digest.0);
         hasher.update(&vote.author.0);
-        hasher.update(&vote.sig.to_bytes());
+        hasher.update(&vote.sig.to_canonical_bytes());
         let key = Digest(hasher.finalize().into());
         if self.lookup(&key).is_some() {
             return Ok(());
@@ -257,7 +257,7 @@ impl VerifiedCache {
         hasher.update(b"consensus-request-verified-v1");
         hasher.update(&request.message.digest().0);
         hasher.update(&request.author.0);
-        hasher.update(&request.sig.to_bytes());
+        hasher.update(&request.sig.to_canonical_bytes());
         let key = Digest(hasher.finalize().into());
         if self.lookup(&key).is_some() {
             return Ok(());

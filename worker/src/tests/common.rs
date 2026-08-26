@@ -20,6 +20,7 @@ pub fn keys() -> Vec<(PublicKey, SecretKey)> {
 
 pub fn committee() -> Committee {
     Committee {
+        consensus_signature_scheme: Default::default(),
         authorities: keys()
             .iter()
             .enumerate()
@@ -48,6 +49,7 @@ pub fn committee() -> Committee {
                     *id,
                     Authority {
                         stake: 1,
+                        consensus_key: None,
                         consensus,
                         primary,
                         workers,

@@ -41,6 +41,18 @@ async fn main() -> Result<()> {
                         .required(true)
                         .action(ArgAction::Set)
                         .help("The file where to print the new key pair"),
+                )
+                .arg(
+                    Arg::new("consensus-scheme")
+                        .long("consensus-scheme")
+                        .value_name("SCHEME")
+                        .default_value("ed25519")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Consensus signature scheme to generate key material for \
+                             (ed25519 | ml-dsa-44 | ml-dsa-65 | ml-dsa-87 | \
+                             slh-dsa-sha2-{128,192,256}{s,f})",
+                        ),
                 ),
         )
         .subcommand(
@@ -126,6 +138,18 @@ async fn main() -> Result<()> {
                         .default_value("512")
                         .action(ArgAction::Set)
                         .help("Transaction size in bytes"),
+                )
+                .arg(
+                    Arg::new("consensus-signature-scheme")
+                        .long("consensus-signature-scheme")
+                        .value_name("SCHEME")
+                        .default_value("ed25519")
+                        .action(ArgAction::Set)
+                        .help(
+                            "Signature scheme for the Autobahn consensus/ordering path \
+                             (ed25519 | ml-dsa-44 | ml-dsa-65 | ml-dsa-87 | \
+                             slh-dsa-sha2-{128,192,256}{s,f})",
+                        ),
                 )
                 .arg(
                     Arg::new("protocol")
@@ -447,9 +471,15 @@ async fn main() -> Result<()> {
     logger.init();
 
     match matches.subcommand() {
-        Some(("generate_keys", sub_matches)) => KeyPair::new()
-            .export(sub_matches.get_one::<String>("filename").unwrap())
-            .context("Failed to generate key pair")?,
+        Some(("generate_keys", sub_matches)) => KeyPair::new_with_scheme(
+            sub_matches
+                .get_one::<String>("consensus-scheme")
+                .unwrap()
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?,
+        )
+        .export(sub_matches.get_one::<String>("filename").unwrap())
+        .context("Failed to generate key pair")?,
         Some(("run", sub_matches)) => run(sub_matches).await?,
         Some(("local-benchmark", sub_matches)) => {
             #[cfg(feature = "benchmark")]
@@ -495,7 +525,29 @@ async fn run(matches: &ArgMatches) -> Result<()> {
         }));
     }
 
-    let signature_service = SignatureService::new(keypair.secret);
+    // Consensus signature scheme: fixed committee-wide; validate this node's
+    // key material against it before starting.
+    let consensus_scheme = committee.consensus_signature_scheme;
+    committee
+        .validate_consensus_keys()
+        .map_err(|e| anyhow::anyhow!("Invalid committee consensus keys: {e}"))?;
+    let consensus_secret = keypair.consensus_secret;
+    if consensus_scheme.is_post_quantum() {
+        let secret = consensus_secret
+            .as_ref()
+            .context("Key file has no consensus secret for the committee's scheme")?;
+        anyhow::ensure!(
+            secret.scheme() == consensus_scheme,
+            "Key file consensus secret is {}, committee runs {consensus_scheme}",
+            secret.scheme()
+        );
+        anyhow::ensure!(
+            committee.consensus_public_key(&name) == Some(&secret.public_key()),
+            "Consensus secret does not match this node's committee entry"
+        );
+        log::info!("Consensus signature scheme: {consensus_scheme}");
+    }
+    let signature_service = SignatureService::new(keypair.secret, consensus_secret);
 
     let store_profile = match matches.subcommand_name() {
         Some("worker") => StoreProfile::Data,

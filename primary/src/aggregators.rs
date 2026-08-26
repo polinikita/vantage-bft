@@ -2,6 +2,7 @@
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Timeout, Vote, QC, TC};
 use config::{Committee, Stake};
+use crypto::consensus_auth::ConsensusSignature;
 use crypto::{Digest, PublicKey, Signature};
 use std::collections::HashSet;
 
@@ -85,7 +86,7 @@ impl VotesAggregator {
 /// Aggregates consensus votes and checks quorum thresholds.
 pub struct QCMaker {
     weight: Stake,
-    pub votes: Vec<(PublicKey, Signature)>,
+    pub votes: Vec<(PublicKey, ConsensusSignature)>,
     used: HashSet<PublicKey>,
 
     pub try_fast: bool,
@@ -112,7 +113,7 @@ impl QCMaker {
     pub fn append(
         &mut self,
         author: PublicKey,
-        vote: (Digest, Signature),
+        vote: (Digest, ConsensusSignature),
         committee: &Committee,
     ) -> DagResult<(bool, Option<QC>)> {
         let voting_rights = committee.stake(&author);

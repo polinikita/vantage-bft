@@ -685,6 +685,7 @@ mod alignment_tests {
                     1,
                     *author,
                     secret,
+                    None,
                 )
             })
             .collect();

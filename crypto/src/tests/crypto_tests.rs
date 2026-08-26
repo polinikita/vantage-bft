@@ -205,7 +205,7 @@ async fn signature_service() {
     let (public_key, secret_key) = keys().pop().unwrap();
 
     // Spawn the signature service.
-    let mut service = SignatureService::new(secret_key);
+    let mut service = SignatureService::new(secret_key, None);
 
     // Request signature from the service.
     let message: &[u8] = b"Hello, world!";

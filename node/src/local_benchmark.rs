@@ -494,7 +494,17 @@ pub async fn run(matches: &ArgMatches) -> Result<()> {
     let _ = fs::remove_dir_all(&data_dir);
     fs::create_dir_all(&data_dir).context("Failed to create --data-dir")?;
 
-    let (committee, keypairs) = Committee::local_benchmark(nodes, workers, base_port);
+    let consensus_scheme: crypto::consensus_auth::ConsensusSignatureScheme = matches
+        .get_one::<String>("consensus-signature-scheme")
+        .map(|s| s.as_str())
+        .unwrap_or("ed25519")
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+    if consensus_scheme.is_post_quantum() {
+        println!("Consensus signature scheme: {consensus_scheme}");
+    }
+    let (committee, keypairs) =
+        Committee::local_benchmark_with_scheme(nodes, workers, base_port, consensus_scheme);
     committee
         .export(data_dir.join("committee.json").to_str().unwrap())
         .context("Failed to write committee.json")?;
@@ -1006,7 +1016,7 @@ fn spawn_node_primary(
     shutdown_stores: &mut Vec<Store>,
 ) -> Result<NodeMetricsHandle> {
     let name = keypair.name;
-    let signature_service = SignatureService::new(keypair.secret);
+    let signature_service = SignatureService::new(keypair.secret, keypair.consensus_secret);
 
     let primary_store = Store::new_with_profile(
         node_dir.join("primary-db").to_str().unwrap(),

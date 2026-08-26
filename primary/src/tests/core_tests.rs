@@ -21,7 +21,7 @@ async fn process_header_missing_parent() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let committee = committee_with_base_port(13_000);
 
@@ -121,7 +121,7 @@ async fn process_header_missing_parent() {
 #[serial]
 async fn process_header_invalid_height() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
@@ -211,7 +211,7 @@ async fn process_header_invalid_height() {
 #[serial]
 async fn process_header_missing_payload() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
@@ -298,7 +298,7 @@ async fn process_header_missing_payload() {
 #[serial]
 async fn process_votes() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let committee = committee_with_base_port(13_100);
 
@@ -395,7 +395,7 @@ async fn process_votes() {
 #[serial]
 async fn process_certificates() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(3);
@@ -496,7 +496,7 @@ async fn local_timeout_view() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
     let (name, secret) = keys.pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let signature_service = SignatureService::new(secret, None);
 
     let committee = committee_with_base_port(13_000);
 

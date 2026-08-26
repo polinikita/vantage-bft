@@ -34,3 +34,14 @@ parking_lot = "0.12"
 libc = "0.2"
 axum = "0.7"
 fdlimit = "0.3"
+
+# Post-quantum signature crates are ~10x slower unoptimized; keep them fast in
+# dev/test builds.
+[profile.dev.package.ml-dsa]
+opt-level = 3
+[profile.dev.package.slh-dsa]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.sha3]
+opt-level = 3

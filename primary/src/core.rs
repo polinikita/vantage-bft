@@ -15,6 +15,7 @@ use async_recursion::async_recursion;
 use bytes::Bytes;
 use config::Committee;
 use core::panic;
+use crypto::consensus_auth::ConsensusSignature;
 use crypto::{Digest, PublicKey, SignatureService};
 use crypto::{Hash as _, Signature};
 use futures::stream::FuturesUnordered;
@@ -685,7 +686,12 @@ impl Core {
             let current_instance = opt_curr_instance.unwrap();
 
             if !is_loopback && vote.author != self.name {
-                sig.verify(&current_instance.digest(), &vote.author)?;
+                sig.verify(
+                    &current_instance.digest(),
+                    &vote.author,
+                    self.committee.consensus_signature_scheme,
+                    self.committee.consensus_public_key(&vote.author),
+                )?;
             }
 
             let qc_maker = self
@@ -724,7 +730,11 @@ impl Core {
                         origin: PublicKey::default(),
                         author: PublicKey::default(),
                         signature: Signature::default(),
-                        consensus_votes: vec![(*slot, digest.clone(), Signature::default())],
+                        consensus_votes: vec![(
+                            *slot,
+                            digest.clone(),
+                            ConsensusSignature::default(),
+                        )],
                     };
                     let fast_timer = CarTimer::new(t_vote, self.fast_path_timeout);
                     self.car_timer_futures.push(Box::pin(fast_timer));
@@ -1069,7 +1079,7 @@ impl Core {
 
         let sig = self
             .signature_service
-            .request_signature(confirm_digest.clone())
+            .request_consensus_signature(confirm_digest.clone())
             .await;
         let confirm_vote = ConsensusVote {
             author: self.name,
@@ -1639,8 +1649,8 @@ impl Core {
     async fn process_consensus_messages(
         &mut self,
         header: &Header,
-    ) -> DagResult<Vec<(Slot, Digest, Signature)>> {
-        let mut consensus_votes: Vec<(Slot, Digest, Signature)> = Vec::new();
+    ) -> DagResult<Vec<(Slot, Digest, ConsensusSignature)>> {
+        let mut consensus_votes: Vec<(Slot, Digest, ConsensusSignature)> = Vec::new();
 
         for consensus_message in header.consensus_messages.values() {
             debug!("processing instance");
@@ -1805,7 +1815,7 @@ impl Core {
         consensus_message: ConsensusMessage,
         author: PublicKey,
     ) -> DagResult<()> {
-        let mut consensus_votes: Vec<(Slot, Digest, Signature)> = Vec::new();
+        let mut consensus_votes: Vec<(Slot, Digest, ConsensusSignature)> = Vec::new();
 
         debug!("processing consensus msg");
 
@@ -1939,7 +1949,7 @@ impl Core {
     async fn process_prepare_message(
         &mut self,
         prepare_message: &ConsensusMessage,
-        consensus_sigs: &mut Vec<(Slot, Digest, Signature)>,
+        consensus_sigs: &mut Vec<(Slot, Digest, ConsensusSignature)>,
     ) {
         if let ConsensusMessage::Prepare {
             slot,
@@ -1983,7 +1993,7 @@ impl Core {
 
             let sig = self
                 .signature_service
-                .request_signature(prepare_message.digest())
+                .request_consensus_signature(prepare_message.digest())
                 .await;
             consensus_sigs.push((*slot, prepare_message.digest(), sig));
             debug!(
@@ -1998,7 +2008,7 @@ impl Core {
     async fn process_confirm_message(
         &mut self,
         confirm_message: &ConsensusMessage,
-        consensus_sigs: &mut Vec<(Slot, Digest, Signature)>,
+        consensus_sigs: &mut Vec<(Slot, Digest, ConsensusSignature)>,
     ) {
         if let ConsensusMessage::Confirm {
             slot,
@@ -2018,7 +2028,7 @@ impl Core {
 
             let sig = self
                 .signature_service
-                .request_signature(confirm_message.digest())
+                .request_consensus_signature(confirm_message.digest())
                 .await;
             consensus_sigs.push((*slot, confirm_message.digest(), sig));
             debug!(

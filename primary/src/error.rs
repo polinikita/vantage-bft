@@ -30,6 +30,9 @@ pub enum DagError {
     #[error("Invalid signature")]
     InvalidSignature(#[from] CryptoError),
 
+    #[error("Consensus signature rejected: {0}")]
+    ConsensusAuth(#[from] crypto::consensus_auth::ConsensusVerifyError),
+
     #[error("Storage failure: {0}")]
     StoreError(#[from] StoreError),
 
@@ -110,6 +113,9 @@ pub enum ConsensusError {
 
     #[error("Invalid signature")]
     InvalidSignature(#[from] CryptoError),
+
+    #[error("Consensus signature rejected: {0}")]
+    ConsensusAuth(#[from] crypto::consensus_auth::ConsensusVerifyError),
 
     #[error("Received more than one vote from {0}")]
     AuthorityReuse(PublicKey),
