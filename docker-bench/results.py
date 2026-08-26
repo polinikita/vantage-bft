@@ -109,7 +109,8 @@ class NodeSnapshot:
                  "wire_bytes_sent", "optimistic_batch_bytes_sent",
                  "prepare_sync_events", "prepare_missing_headers",
                  "prepare_sync_completed", "prepare_sync_wait_micros",
-                 "cpu_seconds", "cpu_seconds_container", "rss_bytes")
+                 "cpu_seconds", "cpu_seconds_container", "rss_bytes",
+                 "cpu_source")
 
     def __init__(self):
         self.reachable = False
@@ -131,6 +132,9 @@ class NodeSnapshot:
         # generator. Kept as an independent cross-check of the number above.
         self.cpu_seconds_container = 0.0
         self.rss_bytes = 0
+        # "cgroup" when read from this host's cgroups, "process" when only the
+        # node's own exported counter was available (a remote fleet).
+        self.cpu_source = "none"
 
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -261,11 +265,23 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
     if probe is not None:
         s.cpu_seconds = _read_role_cpu_seconds(probe["scope"])
         s.cpu_seconds_container = _read_usage_usec(probe["scope"]) / 1e6
+        s.cpu_source = "cgroup"
+    else:
+        # No local cgroup for this validator, so it is not a container on this
+        # host: a remote fleet driven by an out-of-tree harness, for example.
+        # Fall back to the counter the node exports about itself rather than
+        # silently reporting no CPU at all. That counter has whole-second
+        # resolution, which is useless at low load but immaterial once a node
+        # burns several CPU-seconds per measurement window.
+        s.cpu_seconds = counter_f(worker_samples, "process_cpu_seconds_total")
+        s.cpu_source = "process"
 
     primary_samples = scrape(primary_url(manifest, i))
     if primary_samples is not None:
         s.wire_bytes_sent += counter(primary_samples, "bytes_sent_total")
         s.rss_bytes += counter(primary_samples, "process_resident_memory_bytes")
+        if s.cpu_source == "process":
+            s.cpu_seconds += counter_f(primary_samples, "process_cpu_seconds_total")
         s.prepare_sync_events = counter(
             primary_samples, "autobahn_prepare_sync_events_total"
         )
@@ -485,10 +501,18 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
             else "no commits"
         )
     )
-    print(
-        f"      (whole container incl. load generator: "
-        f"{cpu_container_cores_total:.2f} cores aggregate)"
-    )
+    cpu_sources = {s.cpu_source for s in last_snapshots if s.reachable}
+    if "cgroup" in cpu_sources:
+        print(
+            f"      (whole container incl. load generator: "
+            f"{cpu_container_cores_total:.2f} cores aggregate)"
+        )
+    if "process" in cpu_sources:
+        print(
+            "      (from the nodes' own process counters, whole-second "
+            "resolution: treat as unreliable below a few CPU-seconds per node "
+            "per window)"
+        )
     print(
         f" Wire out: {sum(wire_bytes) * 8 / window / 1_000_000:.2f} Mbit/s aggregate "
         f"({sum(wire_bytes) * 8 / window / 1_000_000 / live:.2f} /node, "
@@ -542,6 +566,9 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         "mean_node_cpu_cores": cpu_cores_total / live,
         "max_node_cpu_cores": max(cpu_deltas, default=0.0) / window,
         "cpu_cores_total_container": cpu_container_cores_total,
+        "cpu_sources": sorted(
+            {s.cpu_source for s in last_snapshots if s.reachable}
+        ),
         "cpu_ms_per_committed_tx": (
             cpu_seconds_total * 1000 / committed_delta if committed_delta else None
         ),
