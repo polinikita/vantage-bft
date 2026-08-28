@@ -966,6 +966,11 @@ fn print_pipeline_latencies(
             primary_metrics,
         ),
         (
+            "block publication -> first tip naming (proposal send)",
+            "vantage_block_publish_to_tip_naming_latency",
+            primary_metrics,
+        ),
+        (
             "proposal receipt -> local AGB seal",
             "vantage_proposal_to_seal_latency",
             primary_metrics,

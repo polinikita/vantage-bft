@@ -1582,6 +1582,7 @@ impl VantageCore {
         #[cfg(feature = "pipeline-tracing")]
         if let Some(metrics) = &self.metrics {
             self.pipeline.note_publish(&header, &metrics.pipeline);
+            crate::vantage::pipeline::note_publish_global(self.name, header.height);
         }
         #[cfg(not(feature = "pipeline-tracing"))]
         let _ = header;
@@ -3973,16 +3974,22 @@ impl VantageCore {
                         queue.extend(self.refresh_direct_resolution(through));
                     }
 
-                    Effect::BroadcastPropose(p) => match p {
-                        ProposalOut::Single(p) => {
-                            self.broadcast_recorded(PrimaryMessage::VantagePropose(p))
-                                .await
+                    Effect::BroadcastPropose(p) => {
+                        #[cfg(feature = "pipeline-tracing")]
+                        if let Some(metrics) = &self.metrics {
+                            crate::vantage::pipeline::note_tip_naming_global(&p, &metrics.pipeline);
                         }
-                        ProposalOut::Batch(p) => {
-                            self.broadcast_recorded(PrimaryMessage::VantageProposeBatch(p))
-                                .await
+                        match p {
+                            ProposalOut::Single(p) => {
+                                self.broadcast_recorded(PrimaryMessage::VantagePropose(p))
+                                    .await
+                            }
+                            ProposalOut::Batch(p) => {
+                                self.broadcast_recorded(PrimaryMessage::VantageProposeBatch(p))
+                                    .await
+                            }
                         }
-                    },
+                    }
 
                     Effect::BroadcastEcho(mut e) => {
                         // Stamp mutable protocol metadata at the serialization boundary.

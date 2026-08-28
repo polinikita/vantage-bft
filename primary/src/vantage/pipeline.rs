@@ -3,10 +3,16 @@ use crate::primary::{Height, View};
 use crate::vantage::{BlockRef, ProposalOut, ResolutionEntry};
 use crypto::PublicKey;
 use metrics::PipelineMetrics;
-use std::collections::BTreeMap;
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const BLOCK_LIMIT: usize = 4096;
+
+/// Publication instants are retained across every lane in the process, so this bound
+/// is a whole-committee one rather than the per-lane `BLOCK_LIMIT`.
+const GLOBAL_BLOCK_LIMIT: usize = 65_536;
 
 #[derive(Clone, Copy)]
 struct BlockTiming {
@@ -132,6 +138,78 @@ impl PipelineTrace {
     }
 }
 
+/// Publication instants of lane blocks, keyed by lane, shared by every validator
+/// running in the current process.
+///
+/// The per-validator [`PipelineTrace`] can only time an author's own blocks against
+/// its own proposals. This trace instead pairs an author's publication with the
+/// proposal send of whichever validator first names that block, which is a
+/// cross-validator measurement and therefore sound only while all of the validators
+/// involved share one clock, i.e. in the single-process local benchmark.
+#[derive(Default)]
+struct GlobalTipNamingTrace {
+    published_at: BTreeMap<(PublicKey, Height), Instant>,
+    /// Insertion order of the keys above, used to bound the trace.
+    inserted: VecDeque<(PublicKey, Height)>,
+}
+
+impl GlobalTipNamingTrace {
+    /// Removes the entries of `author`'s lane at or below `height`, returning the
+    /// publication instant of each.
+    fn take_prefix(&mut self, author: PublicKey, height: Height) -> Vec<Instant> {
+        let covered: Vec<_> = self
+            .published_at
+            .range((author, Height::MIN)..=(author, height))
+            .map(|(key, _)| *key)
+            .collect();
+        covered
+            .into_iter()
+            .filter_map(|key| self.published_at.remove(&key))
+            .collect()
+    }
+}
+
+fn global_tip_naming() -> &'static Mutex<GlobalTipNamingTrace> {
+    static TRACE: OnceLock<Mutex<GlobalTipNamingTrace>> = OnceLock::new();
+    TRACE.get_or_init(|| Mutex::new(GlobalTipNamingTrace::default()))
+}
+
+/// Records that `author` published the block at `height`.
+pub fn note_publish_global(author: PublicKey, height: Height) {
+    let mut trace = global_tip_naming().lock();
+    let key = (author, height);
+    if trace.published_at.insert(key, Instant::now()).is_none() {
+        trace.inserted.push_back(key);
+    }
+    // `published_at` never holds a key absent from `inserted`, so bounding the queue
+    // bounds the map as well.
+    while trace.inserted.len() > GLOBAL_BLOCK_LIMIT {
+        let Some(oldest) = trace.inserted.pop_front() else {
+            break;
+        };
+        trace.published_at.remove(&oldest);
+    }
+}
+
+/// Observes, for every block whose lane prefix this proposal is the first to name in
+/// `T`, the delay from its publication to this proposal's send.
+pub fn note_tip_naming_global(proposal: &ProposalOut, metrics: &PipelineMetrics) {
+    let mut trace = global_tip_naming().lock();
+    for (author, height, _) in proposal.t() {
+        for published_at in trace.take_prefix(*author, *height) {
+            metrics
+                .vantage_block_publish_to_tip_naming_latency
+                .observe(published_at.elapsed());
+        }
+    }
+    // A proposal's first coverage of a block is always through a tip entry, so a core
+    // entry above a block still waiting here means this process never saw that block
+    // named as a tip. Drop it unobserved instead of charging it a later naming.
+    for (author, height, _) in proposal.c() {
+        trace.take_prefix(*author, *height);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +253,33 @@ mod tests {
             metrics::read_duration_snapshot(&registry, "vantage_block_publish_to_proposal_latency")
                 .unwrap();
         assert_eq!(snapshot.count, 3);
+    }
+
+    #[test]
+    fn global_tip_naming_observes_each_published_block_once() {
+        let registry = Registry::new();
+        let (metrics, reporter) = metrics::Metrics::new(&registry);
+        // A lane no other test publishes into keeps the process-wide trace isolated.
+        let author = PublicKey([7; 32]);
+        note_publish_global(author, 1);
+        note_publish_global(author, 2);
+        let proposal = ProposalOut::Single(crate::vantage::ViewProposal {
+            view: 1,
+            c: Vec::new(),
+            t: vec![reference(author, 2, 2)],
+            m: None,
+        });
+
+        note_tip_naming_global(&proposal, &metrics.pipeline);
+        note_tip_naming_global(&proposal, &metrics.pipeline);
+        reporter.force_report();
+
+        let snapshot = metrics::read_duration_snapshot(
+            &registry,
+            "vantage_block_publish_to_tip_naming_latency",
+        )
+        .unwrap();
+        assert_eq!(snapshot.count, 2);
     }
 
     #[test]

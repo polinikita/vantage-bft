@@ -11,6 +11,10 @@ pub struct PipelineMetrics {
     pub vantage_digest_to_block_publish_latency: HistogramSender<Duration>,
     pub vantage_block_publish_to_quorum_latency: HistogramSender<Duration>,
     pub vantage_block_publish_to_proposal_latency: HistogramSender<Duration>,
+    /// Publication of a lane block to the send of the first proposal naming its lane
+    /// prefix in `T`. This is measured across validators on one clock, so it is
+    /// meaningful only in the single-process local benchmark.
+    pub vantage_block_publish_to_tip_naming_latency: HistogramSender<Duration>,
     pub vantage_block_publish_to_commit_latency: HistogramSender<Duration>,
     pub vantage_proposal_to_seal_latency: HistogramSender<Duration>,
     pub vantage_seal_to_finalize_latency: HistogramSender<Duration>,
@@ -48,6 +52,9 @@ impl PipelineMetrics {
             ),
             vantage_block_publish_to_proposal_latency: metric!(
                 "vantage_block_publish_to_proposal_latency"
+            ),
+            vantage_block_publish_to_tip_naming_latency: metric!(
+                "vantage_block_publish_to_tip_naming_latency"
             ),
             vantage_block_publish_to_commit_latency: metric!(
                 "vantage_block_publish_to_commit_latency"
