@@ -140,7 +140,9 @@ pub struct DirectResolutionValueServe {
 /// The caller's result for a target-local external-validity request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectResolutionVote {
-    Reject,
+    /// A permanent reject is memoized: the caller's immutable state
+    /// forecloses the value, so it is never re-validated.
+    Reject { permanent: bool },
     Accept { origin: Option<u8> },
 }
 
@@ -186,6 +188,9 @@ enum VoteStatus {
     Unknown,
     Requested,
     Rejected,
+    /// The caller's immutable state forecloses this view's proposal; the
+    /// external-validity retry deliberately skips this terminal status.
+    RejectedPermanently,
     Accepted,
 }
 
@@ -295,6 +300,10 @@ pub struct DirectResolver {
     instances: BTreeMap<View, DirectInstance>,
     values: BTreeMap<(View, Digest), ResolutionEntry>,
     decisions: BTreeMap<View, (Digest, ResolutionEntry)>,
+    /// Targets whose full values are provably undecidable as fresh proposals.
+    /// The caller derives this monotone bar from its first-hand AGB evidence;
+    /// barred values stay valid for voting, backing, and key carrying.
+    full_barred: BTreeSet<View>,
     /// An own DONE is replayed at most once per target and WISH sender,
     /// including across the transition from an active instance to a decision.
     done_replayed_to: BTreeMap<View, BTreeSet<PublicKey>>,
@@ -326,6 +335,7 @@ impl DirectResolver {
             instances: BTreeMap::new(),
             values: BTreeMap::new(),
             decisions: BTreeMap::new(),
+            full_barred: BTreeSet::new(),
             done_replayed_to: BTreeMap::new(),
             admitted_through: 0,
             retained_floor: 1,
@@ -394,24 +404,39 @@ impl DirectResolver {
     }
 
     /// Selects one fresh candidate and advances this party's target-local
-    /// cursor.  Advancing on our own primary turns, rather than indexing by the
-    /// global resolver view, guarantees that every stable candidate is retried
-    /// even when the committee size and candidate count share a divisor.
-    fn take_next_candidate(&mut self, target: View) -> Option<ResolutionEntry> {
+    /// cursor.  Barred full values are skipped: the caller has proved from
+    /// its first-hand evidence that they can never gather a fresh ECHO
+    /// quorum, so proposing them fresh only spends resolver views.  The
+    /// first selection is indexed by the proposing resolver view, so the
+    /// first turns of consecutive primaries sweep the whole candidate set
+    /// instead of each starting a rotation lap at the same canonical
+    /// position.  The cursor then advances on our own primary turns, rather
+    /// than indexing by the global resolver view, which guarantees that
+    /// every stable candidate is retried even when the committee size and
+    /// candidate count share a divisor.
+    fn take_next_candidate(
+        &mut self,
+        target: View,
+        view: DirectResolverView,
+    ) -> Option<ResolutionEntry> {
+        let barred = self.full_barred.contains(&target);
         let instance = self.instances.get_mut(&target)?;
+        let eligible: Vec<&ResolutionEntry> = instance
+            .candidates
+            .iter()
+            .filter(|entry| !(barred && matches!(entry, ResolutionEntry::Full(..))))
+            .collect();
+        if eligible.is_empty() {
+            return None;
+        }
         let selected = instance
             .next_candidate
             .as_ref()
-            .and_then(|candidate| {
-                instance
-                    .candidates
-                    .iter()
-                    .position(|entry| entry == candidate)
-            })
-            .unwrap_or(0);
-        let entry = instance.candidates.get(selected)?.clone();
-        let next = selected.saturating_add(1) % instance.candidates.len();
-        instance.next_candidate = Some(instance.candidates[next].clone());
+            .and_then(|candidate| eligible.iter().position(|entry| *entry == candidate))
+            .unwrap_or((view.saturating_sub(1) % eligible.len() as u64) as usize);
+        let entry = eligible[selected].clone();
+        let next = selected.saturating_add(1) % eligible.len();
+        instance.next_candidate = Some(eligible[next].clone());
         Some(entry)
     }
 
@@ -456,6 +481,21 @@ impl DirectResolver {
         effects.extend(self.recheck_wishes(target));
         effects.extend(self.try_primary_propose(target, self.current_view(target)));
         effects
+    }
+
+    /// Marks the target's full values as unselectable for fresh proposals.
+    /// The caller derives the bar from `Q` closed grade-0 or no-ready
+    /// first-hand ready-stage responses: such a quorum contains `f + 1`
+    /// correct parties whose immutable responses permanently reject every
+    /// fresh full value, so no full value can ever gather the `Q` fresh
+    /// ECHOs a decision needs.  The evidence is monotone, so the bar never
+    /// lifts.  Barred values remain valid for voting, backing, and key
+    /// carrying; only this party's fresh selection skips them.
+    pub fn bar_full_selection(&mut self, target: View) {
+        if target == 0 || target < self.retained_floor || self.decisions.contains_key(&target) {
+            return;
+        }
+        self.full_barred.insert(target);
     }
 
     /// Activates a target for which the caller already holds a terminal AGB
@@ -1223,7 +1263,7 @@ impl DirectResolver {
             };
             (max.key3_view, entry)
         } else {
-            let Some(entry) = self.take_next_candidate(target) else {
+            let Some(entry) = self.take_next_candidate(target, view) else {
                 return Vec::new();
             };
             (0, entry)
@@ -1343,7 +1383,9 @@ impl DirectResolver {
                     state.vote_origin,
                 );
             }
-            VoteStatus::Requested | VoteStatus::Rejected => return Vec::new(),
+            VoteStatus::Requested | VoteStatus::Rejected | VoteStatus::RejectedPermanently => {
+                return Vec::new()
+            }
             VoteStatus::Unknown => {}
         }
         self.instances
@@ -1384,8 +1426,12 @@ impl DirectResolver {
             return Vec::new();
         }
         match vote {
-            DirectResolutionVote::Reject => {
-                state.vote_status = VoteStatus::Rejected;
+            DirectResolutionVote::Reject { permanent } => {
+                state.vote_status = if permanent {
+                    VoteStatus::RejectedPermanently
+                } else {
+                    VoteStatus::Rejected
+                };
                 Vec::new()
             }
             DirectResolutionVote::Accept { origin } => {
@@ -1402,8 +1448,12 @@ impl DirectResolver {
         }
     }
 
-    /// Retries only previously rejected external-validity checks.  Callers use
-    /// this after AGB or lane state changes, never in a direct-message loop.
+    /// Retries only previously rejected external-validity checks whose
+    /// verdict can still change.  A permanent reject stays memoized: the
+    /// caller's immutable state forecloses that exact proposal, so
+    /// re-validating it can never succeed and would only spend CPU on every
+    /// refresh.  Callers use this after AGB or lane state changes, never in
+    /// a direct-message loop.
     pub fn retry_external_validity(&mut self) -> Vec<DirectResolutionEffect> {
         let coordinates: Vec<_> = self
             .instances
@@ -1990,6 +2040,7 @@ impl DirectResolver {
         self.instances = self.instances.split_off(&floor);
         self.values = self.values.split_off(&(floor, Digest::default()));
         self.decisions = self.decisions.split_off(&floor);
+        self.full_barred = self.full_barred.split_off(&floor);
         self.done_replayed_to = self.done_replayed_to.split_off(&floor);
         self.passive_wishes = self.passive_wishes.split_off(&floor);
         self.pending_fetch = self.pending_fetch.split_off(&floor);

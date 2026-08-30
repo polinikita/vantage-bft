@@ -139,3 +139,43 @@ async fn canonical_order_places_non_skip_values_before_skip() {
         Some(ResolutionEntry::Full(..))
     ));
 }
+
+#[tokio::test]
+async fn full_selection_bar_ignores_refinable_mix_responses() {
+    let name = authors()[3].0;
+    let mut agb = new_agb_engine(name);
+    let mut rep = repairer(name, ".db_test_resolve_full_bar");
+    let resolver = ResolutionEvidence::new(4, 0);
+    let (core, tip) = payload(3);
+    let all = authors();
+
+    let ready = |grade, sender| crate::vantage::Ready {
+        proposal: crate::vantage::ViewProposal {
+            view: 1,
+            c: core.clone(),
+            t: tip.clone(),
+            m: None,
+        },
+        grade,
+        sender,
+        wish: 0,
+    };
+
+    agb.on_noready(1, all[0].0);
+    agb.on_ready(ready(crate::vantage::ReadyGrade::Zero, all[1].0), &mut rep);
+    agb.on_ready(ready(crate::vantage::ReadyGrade::Mix, all[2].0), &mut rep);
+    assert_eq!(agb.ready_stage_non_grade1_count(1), 3);
+    assert_eq!(
+        agb.ready_stage_zero_or_noready_count(1),
+        2,
+        "a provisional MIX may still refine to grade 1 and must not count"
+    );
+    assert!(!resolver.full_selection_barred(&agb, 1));
+
+    agb.on_ready(ready(crate::vantage::ReadyGrade::Zero, all[2].0), &mut rep);
+    assert_eq!(agb.ready_stage_zero_or_noready_count(1), 3);
+    assert!(
+        resolver.full_selection_barred(&agb, 1),
+        "a refined grade-0 closes the response and joins the permanent-rejecter census"
+    );
+}

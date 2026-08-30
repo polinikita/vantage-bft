@@ -3,8 +3,8 @@
 use crate::messages::{Ack, Header};
 use crate::primary::{Height, PrimaryMessage, View, CHANNEL_CAPACITY};
 use crate::vantage::agb::{
-    AgbEngine, DigestStatements, EchoDigest, EchoOut, ProposalOut, ReadyDigest, ReadyOut,
-    ResolutionEntry, TimerKind, ViewProposal,
+    AgbEngine, DigestStatements, DirectVoteDecision, EchoDigest, EchoOut, ProposalOut, ReadyDigest,
+    ReadyOut, ResolutionEntry, TimerKind, ViewProposal,
 };
 use crate::vantage::block::{self, BlockRef};
 use crate::vantage::direct_resolution::{
@@ -2155,6 +2155,12 @@ impl VantageCore {
             {
                 continue;
             }
+            if self
+                .resolution_evidence
+                .full_selection_barred(&self.agb, target)
+            {
+                self.direct_resolver.bar_full_selection(target);
+            }
             let candidates = self
                 .resolution_evidence
                 .justified_candidates(&self.agb, target);
@@ -3492,6 +3498,12 @@ impl VantageCore {
                 if self.direct_resolver.has_instance(target)
                     && !self.direct_resolver.is_decided(target)
                 {
+                    if self
+                        .resolution_evidence
+                        .full_selection_barred(&self.agb, target)
+                    {
+                        self.direct_resolver.bar_full_selection(target);
+                    }
                     let candidates = self
                         .resolution_evidence
                         .justified_candidates(&self.agb, target);
@@ -4303,12 +4315,20 @@ impl VantageCore {
                             for reference in entry.references().cloned() {
                                 queue.extend(self.rep.authorize(reference));
                             }
-                            let vote = self
+                            let vote = match self
                                 .agb
                                 .try_direct_resolution_vote(&entry, fresh, &mut self.lm)
-                                .map_or(DirectResolutionVote::Reject, |origin| {
+                            {
+                                DirectVoteDecision::Accept(origin) => {
                                     DirectResolutionVote::Accept { origin }
-                                });
+                                }
+                                DirectVoteDecision::NotYet => {
+                                    DirectResolutionVote::Reject { permanent: false }
+                                }
+                                DirectVoteDecision::Never => {
+                                    DirectResolutionVote::Reject { permanent: true }
+                                }
+                            };
                             queue.extend(
                                 self.direct_resolver
                                     .on_vote(target, view, value, vote)

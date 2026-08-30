@@ -568,6 +568,29 @@ pub(crate) enum Stance {
     SkipVoted,
 }
 
+/// One entry's metadata verdict, distinguishing retriable failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaEntryStatus {
+    Ok,
+    /// Local state is missing or provisional; re-evaluate after AGB, lock,
+    /// or lane changes.
+    NotYet,
+    /// An immutable local fact contradicts the entry; no retry can pass.
+    Never,
+}
+
+/// The engine's verdict on one direct per-target resolver vote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectVoteDecision {
+    /// Endorse the value; a fresh non-skip value carries its origin bit.
+    Accept(Option<u8>),
+    /// Evidence is missing or provisional; retry after AGB or lane changes.
+    NotYet,
+    /// The own immutable response, stance, or terminal seal forecloses the
+    /// value at this party; re-validating it can never succeed.
+    Never,
+}
+
 #[derive(Debug)]
 struct ViewState {
     fixed: Fixed,
@@ -593,6 +616,10 @@ struct ViewState {
     ready_statements: HashMap<PublicKey, ReadyStatement>,
     ready_tallies: HashMap<Digest, ReadyTally>,
     ready_non_grade_one_parties: usize,
+    /// Counts parties whose closed ready-stage response is grade-0 or
+    /// no-ready.  Unlike the non-grade-1 census, a READY-mix is excluded
+    /// until it refines to grade 0: a mix may still refine to grade 1.
+    ready_zero_or_noready_parties: usize,
     noready_parties: usize,
     lock: Option<Lock>,
     /// Caches canonical proposal bodies and digests by content within this view.
@@ -628,6 +655,7 @@ impl Default for ViewState {
             ready_statements: HashMap::new(),
             ready_tallies: HashMap::new(),
             ready_non_grade_one_parties: 0,
+            ready_zero_or_noready_parties: 0,
             noready_parties: 0,
             lock: None,
             digest_cache: Vec::new(),
@@ -817,6 +845,17 @@ impl AgbEngine {
         self.views
             .get(&view)
             .map_or(0, |s| s.ready_non_grade_one_parties)
+    }
+
+    /// Counts ready-stage responses whose closed form is grade-0 or no-ready.
+    /// Each counted correct sender permanently rejects every fresh full value
+    /// for the target, so `Q` counted senders contain `f + 1` such rejecters
+    /// and a full value can never gather the `Q` fresh resolver ECHOs a
+    /// decision needs.
+    pub fn ready_stage_zero_or_noready_count(&self, view: View) -> usize {
+        self.views
+            .get(&view)
+            .map_or(0, |s| s.ready_zero_or_noready_parties)
     }
 
     pub fn noready_count(&self, view: View) -> usize {
@@ -1271,32 +1310,46 @@ impl AgbEngine {
     }
 
     fn meta_ok_entry(&self, entry: &ResolutionEntry, lm: &mut LaneManager) -> bool {
+        self.meta_entry_status(entry, lm) == MetaEntryStatus::Ok
+    }
+
+    /// Evaluates one entry and reports whether a failure is retriable.
+    ///
+    /// `Never` is returned only when an immutable local fact contradicts the
+    /// entry: a closed own READY of the excluded grade or a different payload,
+    /// a graded own READY against a skip value, or a pruned target.  Missing
+    /// state, a provisional MIX, an active optimistic lock, and unavailable
+    /// lane data are all `NotYet`: later evidence can flip them.
+    fn meta_entry_status(&self, entry: &ResolutionEntry, lm: &mut LaneManager) -> MetaEntryStatus {
         let u = entry.target_view();
         if self.is_pruned(u) {
             // A pruned target lacks the evidence required to evaluate MetaOK.
-            return false;
+            return MetaEntryStatus::Never;
         }
         let Some(state_u) = self.views.get(&u) else {
-            return false; // Metadata requires local echo and ready state.
+            // Metadata requires local echo and ready state.
+            return MetaEntryStatus::NotYet;
         };
         let Some(own_echo) = state_u.echo_statements.get(&self.name) else {
-            return false;
+            return MetaEntryStatus::NotYet;
         };
         let Some(own_ready) = state_u.ready_statements.get(&self.name) else {
-            return false;
+            return MetaEntryStatus::NotYet;
         };
         if state_u.ready_mix_open {
             // A provisional MIX may still refine to the grade incompatible
             // with this entry. It becomes resolution evidence only after it
             // refines or is finalized by closure/deadline.
-            return false;
+            return MetaEntryStatus::NotYet;
         }
         if let Some(lock) = &state_u.lock {
             if lock.active {
                 match entry {
                     ResolutionEntry::Full(_, c, t)
                         if lock.proposal.c() == c && lock.proposal.t() == t => {}
-                    _ => return false,
+                    // An active lock may still release once `f + 1`
+                    // non-grade-1 responses arrive.
+                    _ => return MetaEntryStatus::NotYet,
                 }
             }
         }
@@ -1308,40 +1361,54 @@ impl AgbEngine {
                 match own_ready {
                     ReadyStatement::Graded(p, _, grade) => {
                         if *grade == ReadyGrade::Zero {
-                            return false;
+                            return MetaEntryStatus::Never;
                         }
                         if p.c() != c_u || p.t() != t_u {
-                            return false;
+                            return MetaEntryStatus::Never;
                         }
                     }
                     ReadyStatement::NoReady => {}
                 }
                 if !c_u.iter().all(|r| lm.locally_available(r)) {
-                    return false;
+                    return MetaEntryStatus::NotYet;
                 }
                 if !t_u.iter().all(|r| lm.locally_available(r)) {
-                    return false;
+                    return MetaEntryStatus::NotYet;
                 }
-                Self::tip_ok(c_u, t_u, lm)
+                if Self::tip_ok(c_u, t_u, lm) {
+                    MetaEntryStatus::Ok
+                } else {
+                    MetaEntryStatus::NotYet
+                }
             }
             ResolutionEntry::Core(_, c_u, t_u) => {
                 match own_ready {
                     ReadyStatement::Graded(p, _, grade) => {
                         if *grade == ReadyGrade::One {
-                            return false;
+                            return MetaEntryStatus::Never;
                         }
                         if p.c() != c_u || p.t() != t_u {
-                            return false;
+                            return MetaEntryStatus::Never;
                         }
                     }
                     ReadyStatement::NoReady => {}
                 }
                 let _ = own_echo;
-                c_u.iter().all(|r| lm.locally_available(r))
+                if c_u.iter().all(|r| lm.locally_available(r)) {
+                    MetaEntryStatus::Ok
+                } else {
+                    MetaEntryStatus::NotYet
+                }
             }
             ResolutionEntry::Skip(_) => {
                 let _ = own_echo;
-                matches!(own_ready, ReadyStatement::NoReady)
+                if matches!(own_ready, ReadyStatement::NoReady) {
+                    MetaEntryStatus::Ok
+                } else {
+                    // A closed graded READY is immutable and can never
+                    // support a skip value.
+                    MetaEntryStatus::Never
+                }
             }
         }
     }
@@ -1396,18 +1463,22 @@ impl AgbEngine {
     /// change.  A locally terminal target may still vote for the exact
     /// compatible fresh value when `f + 1` peers need resolution; otherwise a
     /// selectively delivered local seal could remove a correct participant.
+    ///
+    /// `Never` is final for the proposal that triggered the check: seals,
+    /// claimed stances, and closed own responses cannot revert, so the
+    /// caller may stop re-validating that exact value.
     pub fn try_direct_resolution_vote(
         &mut self,
         entry: &ResolutionEntry,
         fresh: bool,
         lm: &mut LaneManager,
-    ) -> Option<Option<u8>> {
+    ) -> DirectVoteDecision {
         let target = entry.target_view();
         if self.is_pruned(target) {
-            return None;
+            return DirectVoteDecision::Never;
         }
         if !fresh {
-            return Some(None);
+            return DirectVoteDecision::Accept(None);
         }
         if let Some(sealed) = self
             .views
@@ -1423,14 +1494,16 @@ impl AgbEngine {
                 _ => false,
             };
             if !compatible {
-                return None;
+                return DirectVoteDecision::Never;
             }
         }
         if self.stance_excludes(entry) {
-            return None;
+            return DirectVoteDecision::Never;
         }
-        if !self.meta_ok_entry(entry, lm) {
-            return None;
+        match self.meta_entry_status(entry, lm) {
+            MetaEntryStatus::Never => return DirectVoteDecision::Never,
+            MetaEntryStatus::NotYet => return DirectVoteDecision::NotYet,
+            MetaEntryStatus::Ok => {}
         }
         if matches!(entry, ResolutionEntry::Full(..) | ResolutionEntry::Core(..)) {
             let state = self.state_mut(target);
@@ -1438,7 +1511,7 @@ impl AgbEngine {
                 state.stance = Stance::NonSkip;
             }
         }
-        Some(self.compute_origin_entry(entry))
+        DirectVoteDecision::Accept(self.compute_origin_entry(entry))
     }
 
     /// Counts echo-skip responses toward the `Q = n - f` skip-vote threshold.
@@ -1828,7 +1901,12 @@ impl AgbEngine {
             };
             match grade {
                 ReadyGrade::One => tally.grade_one += stake,
-                ReadyGrade::Zero => tally.grade_zero += stake,
+                ReadyGrade::Zero => {
+                    tally.grade_zero += stake;
+                    // The initial READY-mix was not a permanent full
+                    // rejecter; its refined closed form is.
+                    state.ready_zero_or_noready_parties += 1;
+                }
                 ReadyGrade::Mix => unreachable!("READY-mix cannot refine to READY-mix"),
             }
             // `any` and the historical non-grade-1 census already counted this
@@ -1853,12 +1931,14 @@ impl AgbEngine {
                     ReadyGrade::Zero => {
                         tally.grade_zero += stake;
                         state.ready_non_grade_one_parties += 1;
+                        state.ready_zero_or_noready_parties += 1;
                     }
                     ReadyGrade::Mix => state.ready_non_grade_one_parties += 1,
                 }
             }
             ReadyStatement::NoReady => {
                 state.ready_non_grade_one_parties += 1;
+                state.ready_zero_or_noready_parties += 1;
                 state.noready_parties += 1;
             }
         }

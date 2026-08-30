@@ -889,12 +889,20 @@ pub fn drain_local(
                         for reference in entry.references().cloned() {
                             queue.extend(node.rep.authorize(reference));
                         }
-                        let vote = node
+                        let vote = match node
                             .agb
                             .try_direct_resolution_vote(&entry, fresh, &mut node.lm)
-                            .map_or(DirectResolutionVote::Reject, |origin| {
+                        {
+                            crate::vantage::DirectVoteDecision::Accept(origin) => {
                                 DirectResolutionVote::Accept { origin }
-                            });
+                            }
+                            crate::vantage::DirectVoteDecision::NotYet => {
+                                DirectResolutionVote::Reject { permanent: false }
+                            }
+                            crate::vantage::DirectVoteDecision::Never => {
+                                DirectResolutionVote::Reject { permanent: true }
+                            }
+                        };
                         queue.extend(
                             node.direct_resolver
                                 .on_vote(target, view, value, vote)

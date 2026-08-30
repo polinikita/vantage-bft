@@ -23,9 +23,9 @@ pub mod threshold;
 pub mod wire;
 
 pub use agb::{
-    AgbEngine, BatchViewProposal, DigestStatements, Echo, EchoBatch, EchoDigest, EchoOut, Manifest,
-    Outcome, ProposalOut, Ready, ReadyBatch, ReadyDigest, ReadyGrade, ReadyOut, ResolutionEntry,
-    TimerKind, ViewProposal,
+    AgbEngine, BatchViewProposal, DigestStatements, DirectVoteDecision, Echo, EchoBatch,
+    EchoDigest, EchoOut, Manifest, Outcome, ProposalOut, Ready, ReadyBatch, ReadyDigest,
+    ReadyGrade, ReadyOut, ResolutionEntry, TimerKind, ViewProposal,
 };
 pub use block::BlockRef;
 pub use cursor::Cursor;

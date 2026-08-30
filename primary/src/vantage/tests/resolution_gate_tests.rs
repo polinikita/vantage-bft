@@ -1,6 +1,7 @@
 use super::common::*;
 use crate::vantage::agb::{
-    Echo, EchoOut, Outcome, Ready, ReadyGrade, ReadyOut, ResolutionEntry, ViewProposal,
+    DirectVoteDecision, Echo, EchoOut, Outcome, Ready, ReadyGrade, ReadyOut, ResolutionEntry,
+    ViewProposal,
 };
 use crate::vantage::Effect;
 
@@ -716,7 +717,7 @@ async fn direct_resolver_fresh_vote_reuses_meta_ok_and_reports_origin() {
     let entry = ResolutionEntry::Full(1, vec![c_ref], Vec::new());
     assert_eq!(
         agb.try_direct_resolution_vote(&entry, true, &mut lm),
-        Some(Some(1)),
+        DirectVoteDecision::Accept(Some(1)),
         "fresh direct ECHO must use the same target-local checks and origin as carrier MetaOK"
     );
 }
@@ -754,7 +755,7 @@ async fn a_locally_sealed_party_votes_only_for_the_compatible_fresh_value() {
 
     assert_eq!(
         agb.try_direct_resolution_vote(&compatible, true, &mut lm),
-        Some(Some(1)),
+        DirectVoteDecision::Accept(Some(1)),
         "a local terminal must still help peers decide its exact outcome"
     );
     assert_eq!(
@@ -763,8 +764,8 @@ async fn a_locally_sealed_party_votes_only_for_the_compatible_fresh_value() {
             true,
             &mut lm,
         ),
-        None,
-        "a local terminal must reject an incompatible fresh outcome"
+        DirectVoteDecision::Never,
+        "a local terminal must permanently reject an incompatible fresh outcome"
     );
 }
 
@@ -797,12 +798,17 @@ async fn direct_resolver_fresh_vote_waits_for_provisional_mix_to_close() {
         );
     }
     let entry = ResolutionEntry::Full(1, vec![c_ref], Vec::new());
-    assert_eq!(agb.try_direct_resolution_vote(&entry, true, &mut lm), None);
+    assert_eq!(
+        agb.try_direct_resolution_vote(&entry, true, &mut lm),
+        DirectVoteDecision::NotYet,
+        "a provisional MIX defers rather than forecloses the fresh vote"
+    );
     agb.on_ready_timer(1, &mut rep);
     assert!(agb.ready_finalized(1));
-    assert!(agb
-        .try_direct_resolution_vote(&entry, true, &mut lm)
-        .is_some());
+    assert!(matches!(
+        agb.try_direct_resolution_vote(&entry, true, &mut lm),
+        DirectVoteDecision::Accept(_)
+    ));
 }
 
 #[tokio::test]
@@ -824,7 +830,7 @@ async fn stable_backed_view_change_can_cross_one_local_skip_vote_stance() {
     }
     assert_eq!(
         agb.try_direct_resolution_vote(&entry, false, &mut lm),
-        Some(None),
+        DirectVoteDecision::Accept(None),
         "a stable Backed value proves that the conflicting skip-vote quorum cannot exist"
     );
 }

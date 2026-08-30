@@ -1667,3 +1667,159 @@ fn open_lock_accepts_a_carried_conflict_after_f_plus_one_key1_proofs() {
         DirectResolutionEffect::ValidateVote { fresh: false, .. }
     )));
 }
+
+#[test]
+fn a_leaders_first_selection_is_indexed_by_the_resolver_view() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 13;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let leader = probe.resolution_leader(target, 2);
+    assert_ne!(leader, probe.resolution_leader(target, 1));
+
+    let full = ResolutionEntry::Full(target, Vec::new(), Vec::new());
+    let core = ResolutionEntry::Core(target, Vec::new(), Vec::new());
+    let mut resolver = DirectResolver::new(leader, test_committee(), test_sid(), TEST_DELTA_MS);
+    resolver.update_candidates(target, [full, core.clone()]);
+    enter_view(&mut resolver, &names, target, 2);
+
+    let mut proposed = Vec::new();
+    for sender in names
+        .iter()
+        .copied()
+        .filter(|sender| *sender != leader)
+        .take(2)
+    {
+        proposed.extend(
+            resolver
+                .on_suggest(DirectResolutionSuggest {
+                    target,
+                    view: 2,
+                    sender,
+                    key3_view: 0,
+                    key3_value: Digest::default(),
+                    key2_view: 0,
+                    key2_value: Digest::default(),
+                    prev_key2: 0,
+                    entry: None,
+                })
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    DirectResolutionEffect::BroadcastProposal(proposal) => Some(proposal.entry),
+                    _ => None,
+                }),
+        );
+    }
+    assert_eq!(
+        proposed,
+        vec![core],
+        "a first selection in view 2 starts at the second canonical candidate"
+    );
+}
+
+#[test]
+fn barred_full_values_are_skipped_for_fresh_selection() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 14;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let leader = probe.resolution_leader(target, 1);
+
+    let full = ResolutionEntry::Full(target, Vec::new(), Vec::new());
+    let core = ResolutionEntry::Core(target, Vec::new(), Vec::new());
+    let mut resolver = DirectResolver::new(leader, test_committee(), test_sid(), TEST_DELTA_MS);
+    resolver.update_candidates(target, [full, core.clone()]);
+    resolver.bar_full_selection(target);
+    enter_view(&mut resolver, &names, target, 1);
+
+    let mut proposed = Vec::new();
+    for sender in names
+        .iter()
+        .copied()
+        .filter(|sender| *sender != leader)
+        .take(2)
+    {
+        proposed.extend(
+            resolver
+                .on_suggest(DirectResolutionSuggest {
+                    target,
+                    view: 1,
+                    sender,
+                    key3_view: 0,
+                    key3_value: Digest::default(),
+                    key2_view: 0,
+                    key2_value: Digest::default(),
+                    prev_key2: 0,
+                    entry: None,
+                })
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    DirectResolutionEffect::BroadcastProposal(proposal) => Some(proposal.entry),
+                    _ => None,
+                }),
+        );
+    }
+    assert_eq!(
+        proposed,
+        vec![core],
+        "an unendorsable full value must not spend the first resolver view"
+    );
+}
+
+#[test]
+fn a_permanent_vote_reject_is_not_retried() {
+    let names: Vec<_> = authors().into_iter().map(|(name, _)| name).collect();
+    let target = 9;
+    let probe = DirectResolver::new(names[0], test_committee(), test_sid(), TEST_DELTA_MS);
+    let leader = probe.resolution_leader(target, 1);
+    let follower = names.iter().copied().find(|name| *name != leader).unwrap();
+    let entry = ResolutionEntry::Skip(target);
+
+    let proposal = |value: Digest| DirectResolutionProposal {
+        target,
+        view: 1,
+        key_view: 0,
+        value,
+        entry: entry.clone(),
+        sender: leader,
+    };
+
+    let mut resolver = DirectResolver::new(follower, test_committee(), test_sid(), TEST_DELTA_MS);
+    resolver.update_candidates(target, [entry.clone()]);
+    enter_view(&mut resolver, &names, target, 1);
+    let value = resolver.value_digest(&entry);
+    let effects = resolver.on_proposal(proposal(value.clone()));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, DirectResolutionEffect::ValidateVote { .. })));
+    resolver.on_vote(
+        target,
+        1,
+        value.clone(),
+        DirectResolutionVote::Reject { permanent: true },
+    );
+    assert!(
+        resolver.retry_external_validity().is_empty(),
+        "a foreclosed value must never be re-validated"
+    );
+
+    let mut retriable =
+        DirectResolver::new(follower, test_committee(), test_sid(), TEST_DELTA_MS);
+    retriable.update_candidates(target, [entry.clone()]);
+    enter_view(&mut retriable, &names, target, 1);
+    let effects = retriable.on_proposal(proposal(value.clone()));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, DirectResolutionEffect::ValidateVote { .. })));
+    retriable.on_vote(
+        target,
+        1,
+        value,
+        DirectResolutionVote::Reject { permanent: false },
+    );
+    assert!(
+        retriable
+            .retry_external_validity()
+            .iter()
+            .any(|effect| matches!(effect, DirectResolutionEffect::ValidateVote { .. })),
+        "a retriable reject is re-validated after AGB or lane changes"
+    );
+}

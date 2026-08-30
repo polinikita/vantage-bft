@@ -54,6 +54,18 @@ impl ResolutionEvidence {
         }
     }
 
+    /// True once `Q = n - f` counted ready-stage responses have closed as
+    /// grade-0 or no-ready.  Such responses are immutable, and by the fresh
+    /// acceptance rules each correct sender permanently rejects every full
+    /// value for the target.  The quorum therefore contains `f + 1` correct
+    /// permanent rejecters, so no full value can ever gather the `Q` fresh
+    /// resolver ECHOs a decision needs: proposing one fresh only spends a
+    /// resolver view.  A READY-mix is deliberately not counted, because it
+    /// may still refine to grade 1 and leave the full value decidable.
+    pub fn full_selection_barred(&self, agb: &AgbEngine, target: View) -> bool {
+        agb.ready_stage_zero_or_noready_count(target) >= self.quorum_parties
+    }
+
     /// Returns candidates in canonical payload order, with full before core and skip last.
     ///
     /// Every candidate requires `Q = n - f` initial ready-stage statements.
