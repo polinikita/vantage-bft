@@ -185,7 +185,7 @@ async fn propose_normal() {
         .iter()
         .take(1)
         .map(|(public_key, secret_key)| {
-            Vote::new_from_key(header.clone(), Vec::new(), *public_key, secret_key)
+            Vote::new_from_key(header.clone(), Vec::new(), *public_key, secret_key, None)
         })
         .map(|x| (x.author, x.signature))
         .collect();

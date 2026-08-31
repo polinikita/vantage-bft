@@ -4,7 +4,7 @@ use crate::error::{ConsensusError, ConsensusResult, DagError, DagResult};
 use crate::primary::{Height, Slot, View};
 use config::{Committee, Stake, WorkerId};
 use crypto::consensus_auth::{verify_quorum, ConsensusSecretKey, ConsensusSignature};
-use crypto::{Blake3Hasher, Digest, Hash, PublicKey, SecretKey, Signature, SignatureService};
+use crypto::{Blake3Hasher, Digest, Hash, PublicKey, SecretKey, SignatureService};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -441,8 +441,10 @@ pub struct Header {
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parent_cert: Certificate,
     pub id: Digest,
-    /// `None` for unsigned Vantage headers.
-    pub signature: Option<Signature>,
+    /// `None` for unsigned Vantage headers. Signed with the committee's
+    /// consensus signature scheme so a post-quantum committee is post-quantum
+    /// on every layer, cars included.
+    pub signature: Option<ConsensusSignature>,
     /// Vantage session identifier.
     pub sid: Option<Digest>,
 
@@ -467,14 +469,16 @@ impl Header {
             payload,
             parent_cert,
             id: Digest::default(),
-            signature: Some(Signature::default()),
+            signature: Some(ConsensusSignature::default()),
             sid: None,
             consensus_messages: consensus_instances,
             num_active_instances,
             special: false,
         };
         let id = header.digest();
-        let signature = signature_service.request_signature(id.clone()).await;
+        let signature = signature_service
+            .request_consensus_signature(id.clone())
+            .await;
         Self {
             id,
             signature: Some(signature),
@@ -584,7 +588,12 @@ impl Header {
         self.signature
             .as_ref()
             .ok_or_else(|| DagError::MalformedHeader(self.id.clone()))?
-            .verify(&self.id, &self.author)
+            .verify(
+                &self.id,
+                &self.author,
+                committee.consensus_signature_scheme,
+                committee.consensus_public_key(&self.author),
+            )
             .map_err(DagError::from)
     }
 
@@ -601,16 +610,17 @@ impl Header {
         _view: View,
         round: Height,
         secret: &SecretKey,
+        consensus_secret: Option<&ConsensusSecretKey>,
         _committee: &Committee,
     ) -> Header {
         let header = Header {
             author,
             height: round,
-            signature: Some(Signature::default()),
+            signature: Some(ConsensusSignature::default()),
             ..Header::default()
         };
         let id = header.digest();
-        let signature = Signature::new(&id, secret);
+        let signature = ConsensusSignature::sign(&id, secret, consensus_secret);
         Self {
             id,
             signature: Some(signature),
@@ -821,10 +831,12 @@ pub struct Vote {
     pub height: Height,
     pub origin: PublicKey,
     pub author: PublicKey,
-    pub signature: Signature,
-    /// Piggybacked ordering-path votes, signed with the committee's consensus
-    /// signature scheme (the car vote itself stays on the Ed25519 identity
-    /// key: it certifies data availability, not ordering).
+    /// Signed with the committee's consensus signature scheme, like every
+    /// other protocol signature: a post-quantum committee must be
+    /// post-quantum on the availability layer too, since a PoA is exactly
+    /// the transferable proof a quantum adversary would forge.
+    pub signature: ConsensusSignature,
+    /// Piggybacked ordering-path votes, signed with the same scheme.
     pub consensus_votes: Vec<(Slot, Digest, ConsensusSignature)>,
 }
 
@@ -840,10 +852,12 @@ impl Vote {
             height: header.height,
             origin: header.author,
             author: *author,
-            signature: Signature::default(),
+            signature: ConsensusSignature::default(),
             consensus_votes,
         };
-        let signature = signature_service.request_signature(vote.digest()).await;
+        let signature = signature_service
+            .request_consensus_signature(vote.digest())
+            .await;
         Self { signature, ..vote }
     }
 
@@ -853,7 +867,12 @@ impl Vote {
             DagError::UnknownAuthority(self.author)
         );
         self.signature
-            .verify(&self.digest(), &self.author)
+            .verify(
+                &self.digest(),
+                &self.author,
+                committee.consensus_signature_scheme,
+                committee.consensus_public_key(&self.author),
+            )
             .map_err(DagError::from)
     }
 }
@@ -892,16 +911,17 @@ impl Vote {
         consensus_votes: Vec<(Slot, Digest, ConsensusSignature)>,
         author: PublicKey,
         secret: &SecretKey,
+        consensus_secret: Option<&ConsensusSecretKey>,
     ) -> Self {
         let vote = Vote {
             id: header.id.clone(),
             height: header.height(),
             origin: header.origin(),
             author,
-            signature: Signature::default(),
+            signature: ConsensusSignature::default(),
             consensus_votes,
         };
-        let signature = Signature::new(&vote.digest(), secret);
+        let signature = ConsensusSignature::sign(&vote.digest(), secret, consensus_secret);
         Self { signature, ..vote }
     }
 }
@@ -917,7 +937,7 @@ pub struct Certificate {
     pub author: PublicKey,
     pub header_digest: Digest,
     pub height: Height,
-    pub votes: Vec<(PublicKey, Signature)>,
+    pub votes: Vec<(PublicKey, ConsensusSignature)>,
     /// Memoized evidence digest; `votes` must not be mutated after
     /// `evidence_digest()`.
     #[serde(skip)]
@@ -990,8 +1010,13 @@ impl Certificate {
         );
 
         let digest = car_vote_digest(self.author, self.height, &self.header_digest);
-        let digests = vec![digest; self.votes.len()];
-        Signature::verify_batch_multi(&digests, &self.votes).map_err(DagError::from)
+        verify_quorum(
+            &digest,
+            committee.consensus_signature_scheme,
+            self.votes.iter(),
+            |author| committee.consensus_public_key(author),
+        )
+        .map_err(DagError::from)
     }
 
     /// Hashes the complete evidence canonically, independent of vote arrival order.
@@ -1008,10 +1033,9 @@ impl Certificate {
                 hasher.update(&(votes.len() as u64).to_le_bytes());
                 for (author, signature) in votes {
                     hasher.update(&author.0);
-                    // The raw 64 bytes are exactly the bincode encoding of the
-                    // signature's two fixed-size parts, so the digest is
-                    // unchanged while skipping the per-vote allocation.
-                    let encoded = signature.to_bytes();
+                    // The canonical tag-prefixed encoding binds the scheme as
+                    // well as the signature bytes.
+                    let encoded = signature.to_canonical_bytes();
                     hasher.update(&(encoded.len() as u64).to_le_bytes());
                     hasher.update(&encoded);
                 }
@@ -2052,8 +2076,8 @@ mod autobahn_alignment_tests {
         assert!(bincode::deserialize::<TC>(&bytes).is_err());
     }
 
-    /// The digests must stay byte-identical to the original formulation that
-    /// hashed each signature through `bincode::serialize`.
+    /// Both digests hash each vote through its canonical length-prefixed
+    /// `tag || payload` encoding, independent of vote arrival order.
     #[test]
     fn evidence_and_qc_digests_match_the_bincode_formulation() {
         let (_, certificate) = poa_with_votes(2);
@@ -2067,7 +2091,7 @@ mod autobahn_alignment_tests {
         hasher.update(&(votes.len() as u64).to_le_bytes());
         for (author, signature) in &votes {
             hasher.update(&author.0);
-            let encoded = bincode::serialize(signature).unwrap();
+            let encoded = signature.to_canonical_bytes();
             hasher.update(&(encoded.len() as u64).to_le_bytes());
             hasher.update(&encoded);
         }
@@ -2078,13 +2102,7 @@ mod autobahn_alignment_tests {
 
         let qc = QC {
             id: Digest([5; 32]),
-            votes: certificate
-                .votes
-                .iter()
-                .map(|(author, signature)| {
-                    (*author, ConsensusSignature::Ed25519(signature.clone()))
-                })
-                .collect(),
+            votes: certificate.votes.clone(),
             ..Default::default()
         };
         let mut votes: Vec<_> = qc.votes.iter().collect();
@@ -2219,11 +2237,11 @@ mod autobahn_alignment_tests {
             height: 1,
             consensus_messages: HashMap::from([(prepare.digest(), prepare.clone())]),
             num_active_instances: 1,
-            signature: Some(Signature::default()),
+            signature: Some(ConsensusSignature::default()),
             ..Header::default()
         };
         header.id = header.digest();
-        header.signature = Some(Signature::new(&header.id, &secret));
+        header.signature = Some(ConsensusSignature::sign(&header.id, &secret, None));
         assert!(header.verify(&committee).is_ok());
 
         header.consensus_messages = HashMap::from([(Digest([88; 32]), prepare)]);
@@ -2233,7 +2251,7 @@ mod autobahn_alignment_tests {
         header.consensus_messages.clear();
         header.num_active_instances = 1;
         header.id = header.digest();
-        header.signature = Some(Signature::new(&header.id, &secret));
+        header.signature = Some(ConsensusSignature::sign(&header.id, &secret, None));
         assert!(header.verify(&committee).is_err());
     }
 

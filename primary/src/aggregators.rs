@@ -3,13 +3,13 @@ use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Timeout, Vote, QC, TC};
 use config::{Committee, Stake};
 use crypto::consensus_auth::ConsensusSignature;
-use crypto::{Digest, PublicKey, Signature};
+use crypto::{Digest, PublicKey};
 use std::collections::HashSet;
 
 /// Aggregates votes for a particular header into a certificate.
 pub struct VotesAggregator {
     dissemination_weight: Stake,
-    pub votes: Vec<(PublicKey, Signature)>,
+    pub votes: Vec<(PublicKey, ConsensusSignature)>,
     used: HashSet<PublicKey>,
     diss_cert: Option<Certificate>,
 

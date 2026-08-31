@@ -17,7 +17,7 @@ use config::Committee;
 use core::panic;
 use crypto::consensus_auth::ConsensusSignature;
 use crypto::{Digest, PublicKey, SignatureService};
-use crypto::{Hash as _, Signature};
+use crypto::Hash as _;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn};
@@ -392,7 +392,7 @@ impl Core {
             header.id = header.digest();
             header.signature = Some(
                 self.signature_service
-                    .request_signature(header.id.clone())
+                    .request_consensus_signature(header.id.clone())
                     .await,
             );
         }
@@ -729,7 +729,7 @@ impl Core {
                         height: 0,
                         origin: PublicKey::default(),
                         author: PublicKey::default(),
-                        signature: Signature::default(),
+                        signature: ConsensusSignature::default(),
                         consensus_votes: vec![(
                             *slot,
                             digest.clone(),
@@ -859,7 +859,7 @@ impl Core {
                 height: 0,
                 origin: PublicKey::default(),
                 author: PublicKey::default(),
-                signature: Signature::default(),
+                signature: ConsensusSignature::default(),
                 consensus_votes: vec![],
             };
             let fast_timer = CarTimer::new(t_vote, self.car_timeout);

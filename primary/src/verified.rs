@@ -105,7 +105,7 @@ impl VerifiedCache {
         hasher.update(b"header-verified-v1");
         hasher.update(&header.id.0);
         match &header.signature {
-            Some(signature) => hasher.update(&signature.to_bytes()),
+            Some(signature) => hasher.update(&signature.to_canonical_bytes()),
             None => return header.verify(committee),
         };
         let key = Digest(hasher.finalize().into());
@@ -215,7 +215,7 @@ impl VerifiedCache {
         hasher.update(b"vote-verified-v1");
         hasher.update(&vote.digest().0);
         hasher.update(&vote.author.0);
-        hasher.update(&vote.signature.to_bytes());
+        hasher.update(&vote.signature.to_canonical_bytes());
         let key = Digest(hasher.finalize().into());
         if self.lookup(&key).is_some() {
             return Ok(());
@@ -330,7 +330,7 @@ mod tests {
             votes: certificate.votes.clone(),
             ..Default::default()
         };
-        forged.votes[0].1 = crypto::Signature::default();
+        forged.votes[0].1 = crypto::consensus_auth::ConsensusSignature::default();
         assert_ne!(forged.evidence_digest(), certificate.evidence_digest());
         assert!(cache.check_certificate(&forged, &committee).is_err());
     }

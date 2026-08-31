@@ -2,8 +2,9 @@
 use crate::messages::{Certificate, Header, Vote};
 use bytes::Bytes;
 use config::{Authority, Committee, ConsensusAddresses, PrimaryAddresses, WorkerAddresses};
+use crypto::consensus_auth::ConsensusSignature;
 use crypto::Hash as _;
-use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
+use crypto::{generate_keypair, PublicKey, SecretKey};
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use rand::rngs::StdRng;
@@ -104,7 +105,7 @@ pub fn header() -> Header {
     };
     Header {
         id: header.digest(),
-        signature: Some(Signature::new(&header.digest(), &secret)),
+        signature: Some(ConsensusSignature::sign(&header.digest(), &secret, None)),
         ..header
     }
 }
@@ -124,7 +125,7 @@ pub fn headers() -> Vec<Header> {
             };
             Header {
                 id: header.digest(),
-                signature: Some(Signature::new(&header.digest(), &secret)),
+                signature: Some(ConsensusSignature::sign(&header.digest(), &secret, None)),
                 ..header
             }
         })
@@ -147,7 +148,7 @@ pub fn header_from_cert(certificate: &Certificate) -> Header {
 
     Header {
         id: header.digest(),
-        signature: Some(Signature::new(&header.digest(), &secret)),
+        signature: Some(ConsensusSignature::sign(&header.digest(), &secret, None)),
         ..header
     }
 }
@@ -161,11 +162,11 @@ pub fn votes(header: &Header) -> Vec<Vote> {
                 height: header.height,
                 origin: header.author,
                 author,
-                signature: Signature::default(),
+                signature: ConsensusSignature::default(),
                 consensus_votes: Vec::new(),
             };
             Vote {
-                signature: Signature::new(&vote.digest(), &secret),
+                signature: ConsensusSignature::sign(&vote.digest(), &secret, None),
                 ..vote
             }
         })

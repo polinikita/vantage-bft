@@ -1,13 +1,14 @@
 // Copyright (c) 2025 IOTA Stiftung
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pluggable signature schemes for the Autobahn consensus/ordering path.
+//! Pluggable signature schemes for every Autobahn protocol signature.
 //!
-//! The DAG/data path (headers, car dissemination) keeps using the Ed25519
-//! identity key ([`crate::Signature`]). The *ordering* messages — car votes,
-//! quorum certificates, PoA certificates, prepare/confirm/commit consensus
-//! messages, and timeouts — instead carry a [`ConsensusSignature`], whose
-//! scheme is fixed committee-wide by [`ConsensusSignatureScheme`].
+//! All signed protocol messages — car headers, car votes, PoA certificates,
+//! quorum certificates, prepare/confirm/commit consensus messages, and
+//! timeouts — carry a [`ConsensusSignature`], whose scheme is fixed
+//! committee-wide by [`ConsensusSignatureScheme`]. A post-quantum committee
+//! is therefore post-quantum on every layer, availability proofs included;
+//! nothing security-relevant stays on the Ed25519 identity key.
 //!
 //! An authority's identity remains its Ed25519 public key. When a post-quantum
 //! scheme is selected, each authority additionally holds a
