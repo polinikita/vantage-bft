@@ -156,8 +156,8 @@ def report(args: argparse.Namespace, records: list[dict[str, Any]]) -> str:
         + (f" {' '.join(args.extra)}" if args.extra else ""),
         f"- Validators: {args.nodes}, offered {args.rate} tx/s, "
         f"{args.duration} s per point",
-        "- Only the ordering path changes scheme; the DAG/data path keeps its "
-        "Ed25519 identity key.",
+        "- Every protocol signature follows the scheme: car headers, car "
+        "votes, PoA certificates, consensus votes, QCs, and timeouts.",
         "",
         "| Metric | " + " | ".join(r["scheme"] for r in ok) + " |",
         "| --- " + "| ---: " * len(ok) + "|",
