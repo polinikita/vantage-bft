@@ -18,5 +18,7 @@ pub use crate::batch::BatchConfig;
 pub use crate::channel_auth::{ChannelAuth, Role};
 pub use crate::codec::{frame_codec, AuthCodec, MAX_FRAME_LENGTH, TAG_LEN};
 pub use crate::receiver::{MessageHandler, Receiver, Writer};
-pub use crate::reliable_sender::{begin_process_shutdown, CancelHandler, DirtyMap, ReliableSender};
+pub use crate::reliable_sender::{
+    begin_process_shutdown, CancelHandler, DirtyMap, LinkEvent, ReliableSender,
+};
 pub use crate::simple_sender::SimpleSender;

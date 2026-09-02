@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and plot the paper's n=10 transient-crash diagnostic."""
+"""Validate and plot the transient-crash diagnostic (n=3f+1 validators, f crashed)."""
 
 from __future__ import annotations
 
@@ -76,6 +76,18 @@ def max_between(
     return max(values) if values else None
 
 
+def quantile_between(
+    series: list[tuple[float, float]], start: float, end: float, q: float
+) -> float | None:
+    values = sorted(interval_values(series, start, end))
+    if not values:
+        return None
+    position = q * (len(values) - 1)
+    low = int(math.floor(position))
+    high = min(low + 1, len(values) - 1)
+    return values[low] + (values[high] - values[low]) * (position - low)
+
+
 def configure_style() -> None:
     plt.rcParams.update(
         {
@@ -106,14 +118,15 @@ def main(argv: list[str] | None = None) -> None:
     parameters = json.loads((data / "parameters.json").read_text())
     timeline = json.loads((data / "chaos-timeline.json").read_text())
     victims = {int(node) for node in timeline["victims"]}
-    expected_faults = (int(manifest["nodes"]) - 1) // 3
-    if int(manifest["nodes"]) != 10 or expected_faults != 3 or len(victims) != 3:
-        raise ValueError("paper transient-crash profile must use n=10 and f=3")
+    nodes = int(manifest["nodes"])
+    expected_faults = (nodes - 1) // 3
+    if nodes != 3 * expected_faults + 1 or len(victims) != expected_faults:
+        raise ValueError("transient-crash profile must crash exactly f validators of n=3f+1")
     if victims != {int(node) for node in manifest["load_excluded_node_indices"]}:
         raise ValueError("crash victims must be exactly the zero-load placement set")
     if int(manifest["honest_offered_tps"]) != 1000:
         raise ValueError("counted 1000 tx/s load must stay on non-victims")
-    expected_non_victims = set(range(10)) - victims
+    expected_non_victims = set(range(nodes)) - victims
     if {int(node) for node in manifest["load_node_indices"]} != expected_non_victims:
         raise ValueError("all and only non-victims must carry counted load")
     if not manifest.get("latency") or int(manifest["netem_limit_pkts"]) != 100_000:
@@ -130,9 +143,9 @@ def main(argv: list[str] | None = None) -> None:
         for line in (args.run_root / "run.log").read_text(errors="replace").splitlines()
         if line.startswith(RESULT_PREFIX)
     ]
-    if len(run_results) != 1 or int(run_results[0].get("reachable_workers", 0)) != 10:
-        raise ValueError("the run must end with all ten worker endpoints reachable")
-    for node in range(10):
+    if len(run_results) != 1 or int(run_results[0].get("reachable_workers", 0)) != nodes:
+        raise ValueError("the run must end with every worker endpoint reachable")
+    for node in range(nodes):
         log = data / f"node-{node}" / "logs" / "primary.log"
         if not log.is_file():
             raise ValueError(f"missing primary log for node {node}")
@@ -164,7 +177,7 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("Prometheus was not configured on a one-second grid")
     for query_name in ("throughput", "latency"):
         query = query_config.get(query_name, "")
-        for node in range(10):
+        for node in range(nodes):
             label = f"node-{node}-worker-0"
             if (node in expected_non_victims) != (label in query):
                 raise ValueError(
@@ -214,7 +227,7 @@ def main(argv: list[str] | None = None) -> None:
     bottom.text(
         (fault_start + fault_end) / 2,
         0.96,
-        "3 validators crashed",
+        f"{len(victims)} validators crashed",
         transform=bottom.get_xaxis_transform(),
         ha="center",
         va="top",
@@ -266,6 +279,19 @@ def main(argv: list[str] | None = None) -> None:
         "latency_crash_peak_ms": max_between(
             latency, fault_start, fault_end
         ),
+        "latency_crash_median_ms": median_between(
+            latency, fault_start + 5.0, fault_end
+        ),
+        "latency_crash_mean_ms": mean_between(
+            latency, fault_start + 5.0, fault_end
+        ),
+        "latency_crash_p90_ms": quantile_between(
+            latency, fault_start + 5.0, fault_end, 0.9
+        ),
+        "throughput_crash_min_tps": min(
+            interval_values(throughput, fault_start + 5.0, fault_end), default=None
+        ),
+        "early_refusals": bool(parameters.get("early_refusals", True)),
         "latency_post_restart_peak_ms": max_between(
             latency, fault_end, duration
         ),

@@ -652,3 +652,39 @@ async fn volatile_soft_cap_zero_never_sheds() {
     }
     assert!(drop_map.lock().is_empty());
 }
+
+#[tokio::test]
+async fn link_events_report_loss_and_recovery_once_per_transition() {
+    let address = "127.0.0.1:5390".parse::<SocketAddr>().unwrap();
+    let (link_tx, mut link_rx) = mpsc::channel(16);
+    let mut sender = ReliableSender::new()
+        .with_retry_backoff_max_ms(50)
+        .with_link_events(link_tx);
+
+    async fn next_event(link_rx: &mut mpsc::Receiver<LinkEvent>) -> LinkEvent {
+        tokio::time::timeout(Duration::from_secs(5), link_rx.recv())
+            .await
+            .expect("a link transition within five seconds")
+            .expect("the link channel stays open")
+    }
+
+    // No listener yet: the first attempt fails and the link is reported down once.
+    let _pending = sender.send(address, Bytes::from("first")).await;
+    assert_eq!(next_event(&mut link_rx).await, LinkEvent { address, up: false });
+
+    // A listener appears: the retried session comes up and delivers the payload.
+    let handle = listener(address, "first".to_string());
+    assert_eq!(next_event(&mut link_rx).await, LinkEvent { address, up: true });
+    assert!(handle.await.is_ok());
+
+    // The listener closed the socket after acknowledging; the next frame fails,
+    // the connect attempts fail, and the link is reported down exactly once more.
+    let _again = sender.send(address, Bytes::from("second")).await;
+    assert_eq!(next_event(&mut link_rx).await, LinkEvent { address, up: false });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), link_rx.recv())
+            .await
+            .is_err(),
+        "repeated connect failures must not repeat the down report"
+    );
+}

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "benchmark")]
-fn recovery_epoch_ms() -> u128 {
+pub(crate) fn recovery_epoch_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -376,6 +376,12 @@ pub enum TimerKind {
     EchoAbsolute,
     /// The absolute ready deadline is `e_i + θR`.
     ReadyAbsolute,
+    /// Refuses a view whose proposer's transport link is down and that still has
+    /// no proposal `Δ` after the link loss (or after entry, if later).
+    ProposerDown,
+    /// Abdicates this party's own view if it has formed no proposal `Δ` after
+    /// entering it.
+    OwnProposalDue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1676,6 +1682,59 @@ impl AgbEngine {
         effects.extend(self.recheck_ready(view, rep));
         effects.extend(self.recheck_fastseal_trigger(view));
         effects.extend(self.recheck_skip_vote_trigger(view));
+        effects
+    }
+
+    /// Entered, unsealed views that await a proposal from `proposer` and have
+    /// sent no echo-stage response yet.
+    pub fn views_awaiting_proposal_from(&self, proposer: PublicKey) -> Vec<View> {
+        self.views
+            .iter()
+            .filter(|(view, s)| {
+                s.entered
+                    && s.sealed.is_none()
+                    && !s.echo_sent
+                    && matches!(s.fixed, Fixed::Unset)
+                    && !self.is_pruned(**view)
+                    && self.proposer(**view) == proposer
+            })
+            .map(|(view, _)| *view)
+            .collect()
+    }
+
+    /// Refuses `view` early on a hint that no proposal will come (`reason` is
+    /// `link_down`, `proposer_skip`, or `abdicate`): emits the echo-skip and
+    /// no-ready that the absolute timers would emit later.  A view that already
+    /// fixed a proposal or sent an echo is left to those timers.
+    pub fn refuse_unproposed_view(
+        &mut self,
+        view: View,
+        reason: &'static str,
+        rep: &mut Repairer,
+    ) -> Vec<Effect> {
+        if self.is_pruned(view) {
+            return Vec::new();
+        }
+        let awaiting = self.views.get(&view).is_some_and(|s| {
+            s.entered && s.sealed.is_none() && !s.echo_sent && matches!(s.fixed, Fixed::Unset)
+        });
+        if !awaiting {
+            return Vec::new();
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.vantage_link_down_refusals_total.inc();
+        }
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            "VANTAGE_RECOVERY_EVENT kind=early_refusal reason={} view={} epoch_ms={}",
+            reason,
+            view,
+            recovery_epoch_ms()
+        );
+        #[cfg(not(feature = "benchmark"))]
+        let _ = reason;
+        let mut effects = self.on_echo_absolute_timer(view, rep);
+        effects.extend(self.on_ready_timer(view, rep));
         effects
     }
 

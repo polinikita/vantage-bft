@@ -5,8 +5,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-NODES=10
-VICTIMS="0,1,2"
+NODES="${NODES:-10}"
+FAULT_BUDGET=$(( (NODES - 1) / 3 ))
+# Victims default to the first f validators; they carry no counted load.
+VICTIMS="${VICTIMS:-$(seq -s, 0 $((FAULT_BUDGET - 1)))}"
+# Extra gen.py flags for the arm under test, e.g. --no-link-aware-timeouts.
+GEN_EXTRA_ARGS="${GEN_EXTRA_ARGS:-}"
 DURATION="${DURATION:-130}"
 START_DELAY="${START_DELAY:-60}"
 FAULT_START="${FAULT_START:-20}"
@@ -16,7 +20,7 @@ RATE="${RATE:-1000}"
 NETEM_LIMIT_PKTS="${NETEM_LIMIT_PKTS:-100000}"
 PRIMARY_METRICS_BASE="${PRIMARY_METRICS_BASE:-19000}"
 WORKER_METRICS_BASE="${WORKER_METRICS_BASE:-19100}"
-RUN_ROOT="${RUN_ROOT:-$SCRIPT_DIR/recovery-runs/$(date -u +%Y%m%dT%H%M%SZ)-n10-transient}"
+RUN_ROOT="${RUN_ROOT:-$SCRIPT_DIR/recovery-runs/$(date -u +%Y%m%dT%H%M%SZ)-n${NODES}-transient}"
 NO_BUILD="${NO_BUILD:-0}"
 
 if [ "$FAULT_DURATION" -lt 30 ]; then
@@ -135,6 +139,10 @@ command=(
     --netem-limit-pkts "$NETEM_LIMIT_PKTS"
     --load-exclude "$VICTIMS"
 )
+if [ -n "$GEN_EXTRA_ARGS" ]; then
+    # shellcheck disable=SC2206
+    command+=($GEN_EXTRA_ARGS)
+fi
 if [ "$NO_BUILD" = 1 ]; then
     command+=(--no-build)
 fi

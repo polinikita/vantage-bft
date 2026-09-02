@@ -499,6 +499,16 @@ impl Node {
                 TimerKind::ReadyAbsolute => {
                     effects.extend(self.agb.on_ready_timer(view, &mut self.rep))
                 }
+                TimerKind::ProposerDown => effects.extend(self.agb.refuse_unproposed_view(
+                    view,
+                    "link_down",
+                    &mut self.rep,
+                )),
+                TimerKind::OwnProposalDue => effects.extend(self.agb.refuse_unproposed_view(
+                    view,
+                    "abdicate",
+                    &mut self.rep,
+                )),
             }
         }
         effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));

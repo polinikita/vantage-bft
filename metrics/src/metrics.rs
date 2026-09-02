@@ -328,6 +328,8 @@ pub struct Metrics {
     pub vantage_skip_votes_sent: IntCounter,
     /// `SKIP-VOTE(u)` statements counted first-hand from peers.
     pub vantage_skip_votes_received: IntCounter,
+    /// Views refused early because the proposer's transport link was down.
+    pub vantage_link_down_refusals_total: IntCounter,
 
     // --- Digest-named AGB statements.
     /// `VantageBodyFetch` messages sent by this node.
@@ -1069,6 +1071,12 @@ impl Metrics {
             vantage_skip_votes_sent: register_int_counter_with_registry!(
                 "vantage_skip_votes_sent",
                 "Grounded SKIP-VOTE(u) statements this node broadcast",
+                registry,
+            )
+            .unwrap(),
+            vantage_link_down_refusals_total: register_int_counter_with_registry!(
+                "vantage_link_down_refusals_total",
+                "Views refused early because the proposer's transport link was down",
                 registry,
             )
             .unwrap(),

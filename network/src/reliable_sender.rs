@@ -50,6 +50,25 @@ type BufferedEntry = (Bytes, ReplyTargets, VolatileKey, DetachedType);
 /// Default maximum delay between reconnect attempts, in milliseconds.
 const DEFAULT_RETRY_BACKOFF_MAX_MS: u64 = 2_000;
 
+/// Bound on one TCP connect attempt, in milliseconds.
+///
+/// A destination whose host vanished (no ARP or ICMP answer) would otherwise hold
+/// the connect for the kernel's SYN retry budget; the bound turns that into a
+/// failed attempt so link state moves in bounded time.
+const CONNECT_TIMEOUT_MS: u64 = 1_000;
+
+/// Transport link state change for one destination.
+///
+/// `up` is reported when a session is established, `down` when a session is lost
+/// or a connect attempt fails; only transitions are reported.  The signal is a
+/// local hint: it is never required for safety, and after GST correct peers'
+/// links stay up, so protocol logic may use it only to shorten timeouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkEvent {
+    pub address: SocketAddr,
+    pub up: bool,
+}
+
 /// Set immediately before an embedding process tears down its Tokio runtime.
 ///
 /// Runtime shutdown cancels connection actors and their callers in an arbitrary
@@ -85,6 +104,8 @@ pub struct ReliableSender {
     batch: BatchConfig,
     /// Optional notification sent after a connection recovers from a failure.
     reconnect_events: Option<Sender<SocketAddr>>,
+    /// Optional per-destination link state transitions.
+    link_events: Option<Sender<LinkEvent>>,
     /// Optional map for volatile-drop accounting.
     drop_map: Option<DirtyMap>,
     /// Maximum reconnect backoff, in milliseconds.
@@ -116,6 +137,7 @@ impl ReliableSender {
             metrics: None,
             batch: BatchConfig::default(),
             reconnect_events: None,
+            link_events: None,
             drop_map: None,
             retry_backoff_max_ms: DEFAULT_RETRY_BACKOFF_MAX_MS,
             volatile_soft_cap: 0,
@@ -153,6 +175,12 @@ impl ReliableSender {
     }
 
     /// Attach a recovery notification channel.
+    /// Reports link up/down transitions for every destination this sender dials.
+    pub fn with_link_events(mut self, tx: Sender<LinkEvent>) -> Self {
+        self.link_events = Some(tx);
+        self
+    }
+
     pub fn with_reconnect_events(mut self, tx: Sender<SocketAddr>) -> Self {
         self.reconnect_events = Some(tx);
         self
@@ -196,6 +224,7 @@ impl ReliableSender {
             self.metrics.clone(),
             self.batch,
             self.reconnect_events.clone(),
+            self.link_events.clone(),
             self.drop_map.clone(),
             self.retry_backoff_max_ms,
             self.auth.clone(),
@@ -573,6 +602,10 @@ struct Connection {
     batch: BatchConfig,
     /// Optional recovery notification channel.
     reconnect_events: Option<Sender<SocketAddr>>,
+    /// Optional link transition channel.
+    link_events: Option<Sender<LinkEvent>>,
+    /// Last link state reported on `link_events`; `None` before the first report.
+    link_reported: Option<bool>,
     /// Optional volatile-drop map.
     drop_map: Option<DirtyMap>,
     /// Maximum reconnect backoff, in milliseconds.
@@ -592,6 +625,7 @@ impl Connection {
         metrics: Option<Arc<Metrics>>,
         batch: BatchConfig,
         reconnect_events: Option<Sender<SocketAddr>>,
+        link_events: Option<Sender<LinkEvent>>,
         drop_map: Option<DirtyMap>,
         retry_backoff_max_ms: u64,
         auth: Option<Arc<ChannelAuth>>,
@@ -606,6 +640,8 @@ impl Connection {
                 metrics,
                 batch,
                 reconnect_events,
+                link_events,
+                link_reported: None,
                 drop_map,
                 retry_backoff_max_ms,
                 had_failure: false,
@@ -640,9 +676,19 @@ impl Connection {
     /// The tag is applied by the codec, so a payload requeued from a session that failed
     /// is re-tagged under the new session's key and counter when it goes out again.
     async fn connect(&self, retry: u16) -> Result<(TcpStream, AuthCodec), NetworkError> {
-        let mut stream = TcpStream::connect(self.address)
-            .await
-            .map_err(|e| NetworkError::FailedToConnect(self.address, retry, e))?;
+        let attempt = tokio::time::timeout(
+            Duration::from_millis(CONNECT_TIMEOUT_MS),
+            TcpStream::connect(self.address),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect attempt timed out",
+            ))
+        });
+        let mut stream =
+            attempt.map_err(|e| NetworkError::FailedToConnect(self.address, retry, e))?;
         // Disable Nagle buffering for small protocol frames.
         let _ = stream.set_nodelay(true);
 
@@ -678,6 +724,20 @@ impl Connection {
             .or_insert(key);
     }
 
+    /// Reports a link transition once per state change.
+    fn report_link(&mut self, up: bool) {
+        if self.link_reported == Some(up) {
+            return;
+        }
+        self.link_reported = Some(up);
+        if let Some(tx) = &self.link_events {
+            let _ = tx.try_send(LinkEvent {
+                address: self.address,
+                up,
+            });
+        }
+    }
+
     /// Connects and transmits messages until the session fails.
     async fn run(&mut self) {
         let mut delay = self.retry_delay;
@@ -692,16 +752,19 @@ impl Connection {
                             let _ = tx.try_send(self.address);
                         }
                     }
+                    self.report_link(true);
 
                     delay = self.retry_delay;
                     retry = 0;
 
                     let error = self.keep_alive(stream, codec).await;
                     self.had_failure = true;
+                    self.report_link(false);
                     warn!("{}", error);
                 }
                 Err(e) => {
                     self.had_failure = true;
+                    self.report_link(false);
                     warn!("{}", e);
                     let timer = sleep(Duration::from_millis(delay));
                     tokio::pin!(timer);

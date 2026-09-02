@@ -17,6 +17,10 @@ use crate::vantage::direct_resolution::{
 /// Maximum retained certified checkpoint candidates.
 const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
 
+/// A proposer whose wish watermark trails a view by more than this many views is
+/// treated as unavailable for that view (see `proposer_lagging`).
+const PROPOSER_LAG_VIEWS: View = 10;
+
 /// Maximum checkpoint boundaries in one announcement.
 const SEQUENCE_ANNOUNCE_BOUNDARIES: usize = 8;
 
@@ -86,7 +90,8 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use metrics::{Metrics, UtilizationTimer};
 use network::{
-    BatchConfig, ChannelAuth, DirtyMap, MessageHandler, ReliableSender, SimpleSender, Writer,
+    BatchConfig, ChannelAuth, DirtyMap, LinkEvent, MessageHandler, ReliableSender, SimpleSender,
+    Writer,
 };
 use parking_lot::Mutex;
 use prometheus::IntCounter;
@@ -826,6 +831,14 @@ pub struct VantageCore {
     /// Enables replay of volatile protocol messages independently of lane resume.
     reconnect_replay: bool,
 
+    /// Shortens the proposal wait for a proposer or resolver primary whose
+    /// transport link is down (`Parameters::early_refusals`).
+    early_refusals: bool,
+    /// The synchrony bound used to grace an in-flight proposal after a link loss.
+    delta: Duration,
+    /// Peers whose outbound transport link is currently down, with the loss instant.
+    down_peers: HashMap<PublicKey, Instant>,
+
     /// Stores bounded volatile broadcast history for reconnect replay.
     outbox: Outbox,
 
@@ -912,6 +925,7 @@ type BuildOutput = (
     Arc<AtomicBool>,
     Arc<AtomicU64>,
     Receiver<SocketAddr>,
+    Receiver<LinkEvent>,
 );
 
 pub type VantageSpawnOutput = (
@@ -948,6 +962,7 @@ impl VantageCore {
             sequence_large_gap_drop,
             sequence_install_drop_through,
             reconnect_rx,
+            link_rx,
         ) = Self::build(name, committee, parameters, store, metrics, tx_output, auth);
         tokio::spawn(core.run(
             rx_vantage,
@@ -956,6 +971,7 @@ impl VantageCore {
             rx_our_digests,
             rx_payload_ready,
             reconnect_rx,
+            link_rx,
         ));
         (
             tx_vantage,
@@ -1062,6 +1078,7 @@ impl VantageCore {
         let in_flight: wire::InFlightMap = Arc::new(Mutex::new(HashMap::new()));
 
         let (reconnect_tx, reconnect_rx) = channel(committee.size().max(1));
+        let (link_tx, link_rx) = channel(committee.size().max(1) * 8);
 
         let withholding_publishers = config::withholding_publishers(
             &committee,
@@ -1230,7 +1247,8 @@ impl VantageCore {
                         .with_latency(latency_map.clone())
                         .with_batching(batch)
                         .with_channel_auth(auth.clone())
-                        .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms);
+                        .with_retry_backoff_max_ms(parameters.retry_backoff_max_ms)
+                        .with_link_events(link_tx);
 
                     if parameters.reconnect_replay {
                         s = s
@@ -1292,6 +1310,9 @@ impl VantageCore {
             resume_backoff_ms: parameters.resume_backoff_ms,
             resume_batch: parameters.resume_batch,
             reconnect_replay: parameters.reconnect_replay,
+            early_refusals: parameters.early_refusals,
+            delta: Duration::from_millis(parameters.delta_ms),
+            down_peers: HashMap::new(),
             outbox: Outbox::new(parameters.outbox_max_bytes),
             pending_low: HashMap::new(),
             replay_episodes: ReplayEpisodes::new(),
@@ -1344,6 +1365,7 @@ impl VantageCore {
             sequence_large_gap_drop,
             sequence_install_drop_through,
             reconnect_rx,
+            link_rx,
         )
     }
 
@@ -1355,6 +1377,7 @@ impl VantageCore {
         mut rx_our_digests: Receiver<(Digest, WorkerId)>,
         mut rx_payload_ready: Receiver<(Digest, Digest, WorkerId)>,
         mut reconnect_rx: Receiver<SocketAddr>,
+        mut link_rx: Receiver<LinkEvent>,
     ) {
         let boot = Instant::now();
 
@@ -1545,6 +1568,10 @@ impl VantageCore {
                     }
                 }
 
+                Some(event) = link_rx.recv() => {
+                    self.on_link_event(event).await;
+                }
+
                 // Reconnect events prompt replay; periodic ticks retry it.
                 Some(addr) = reconnect_rx.recv() => {
                     let now = Instant::now();
@@ -1639,6 +1666,7 @@ impl VantageCore {
 
     async fn dispatch_and_execute(&mut self, inbound: Inbound) {
         let now = Instant::now();
+        self.note_inbound_activity(&inbound);
         let dispatch_timer = Self::cached_utilization_timer(
             &self.metrics,
             &mut self.ut_inbound_dispatch,
@@ -1978,6 +2006,15 @@ impl VantageCore {
             let moot = match kind {
                 TimerKind::EchoFallback | TimerKind::EchoAbsolute => self.agb.echo_sent(view),
                 TimerKind::ReadyAbsolute => self.agb.ready_finalized(view),
+                TimerKind::ProposerDown => {
+                    self.agb.echo_sent(view)
+                        || !self.proposer_unavailable(self.agb.proposer(view), view)
+                }
+                TimerKind::OwnProposalDue => {
+                    !self.early_refusals
+                        || self.agb.echo_sent(view)
+                        || self.frontier.already_proposed(view)
+                }
             };
             if moot {
                 continue;
@@ -1994,6 +2031,19 @@ impl VantageCore {
                 TimerKind::ReadyAbsolute => {
                     effects.extend(self.agb.on_ready_timer(view, &mut self.rep))
                 }
+                TimerKind::ProposerDown => {
+                    let reason = if self.peer_link_down(self.agb.proposer(view)) {
+                        "link_down"
+                    } else {
+                        "proposer_lag"
+                    };
+                    effects.extend(self.agb.refuse_unproposed_view(view, reason, &mut self.rep))
+                }
+                TimerKind::OwnProposalDue => effects.extend(self.agb.refuse_unproposed_view(
+                    view,
+                    "abdicate",
+                    &mut self.rep,
+                )),
             }
         }
         effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
@@ -2010,6 +2060,11 @@ impl VantageCore {
                 break;
             }
             self.resolution_timers.pop();
+            if kind == DirectResolutionTimerKind::PrimaryDown
+                && !self.peer_link_down(self.direct_resolver.resolution_leader(height, view))
+            {
+                continue;
+            }
             effects.extend(
                 self.direct_resolver
                     .on_timer(height, view, kind)
@@ -2018,6 +2073,142 @@ impl VantageCore {
             );
         }
         effects
+    }
+
+    /// The committee member a protocol message declares as its sender, when any.
+    fn inbound_sender(&self, inbound: &Inbound) -> Option<PublicKey> {
+        Some(match inbound {
+            Inbound::Publish(author, _) => *author,
+            Inbound::Avail(_, sender) => *sender,
+            Inbound::Propose(proposal) => self.agb.proposer(proposal.view()),
+            Inbound::Echo(echo) => echo.sender(),
+            Inbound::EchoSkip(_, sender, _) => *sender,
+            Inbound::Ready(ready) => ready.sender(),
+            Inbound::NoReady(_, sender, _) => *sender,
+            Inbound::Wish(_, sender) => *sender,
+            Inbound::SkipVote(_, sender) => *sender,
+            Inbound::EchoDigest(digest) => digest.sender,
+            Inbound::ReadyDigest(digest) => digest.sender,
+            Inbound::DirectResolutionWish(message) => message.sender,
+            Inbound::DirectResolutionSuggest(message) => message.sender,
+            Inbound::DirectResolutionProof(message) => message.sender,
+            Inbound::DirectResolutionProposal(message) => message.sender,
+            Inbound::DirectResolutionStatement(message) => message.sender,
+            Inbound::DirectResolutionWitness(message) => message.sender,
+            Inbound::DirectResolutionDone(message) => message.sender,
+            Inbound::ResumeHello(_, sender) => *sender,
+            Inbound::ReplayDone(_, _, _, sender) => *sender,
+            _ => return None,
+        })
+    }
+
+    /// A message from a peer proves it is alive: its down mark, if any, is cleared
+    /// so an asymmetric link (our dial still failing while its dial to us works)
+    /// never refuses a proposer that can deliver.
+    fn note_inbound_activity(&mut self, inbound: &Inbound) {
+        if self.down_peers.is_empty() {
+            return;
+        }
+        if let Some(sender) = self.inbound_sender(inbound) {
+            if self.down_peers.remove(&sender).is_some() {
+                #[cfg(feature = "benchmark")]
+                log::info!(
+                    "VANTAGE_LINK_EVENT kind=inbound_clear peer_index={} epoch_ms={}",
+                    self.wire
+                        .other_primaries
+                        .iter()
+                        .position(|(pk, _)| *pk == sender)
+                        .map_or_else(|| "unmapped".to_string(), |i| i.to_string()),
+                    crate::vantage::agb::recovery_epoch_ms()
+                );
+            }
+        }
+    }
+
+    /// Whether early refusals are on and `peer`'s outbound link is down.
+    fn peer_link_down(&self, peer: PublicKey) -> bool {
+        self.early_refusals && self.down_peers.contains_key(&peer)
+    }
+
+    /// Whether `proposer`'s first-hand wish watermark trails `view` by more than
+    /// `PROPOSER_LAG_VIEWS`.  Every response carries its sender's watermark, so a
+    /// party that has not responded to the last several views (a restarted party
+    /// still working through its backlog) is visible to its peers without any
+    /// extra message.
+    fn proposer_lagging(&self, proposer: PublicKey, view: View) -> bool {
+        self.early_refusals
+            && self
+                .pacemaker
+                .omega_of(proposer)
+                .saturating_add(PROPOSER_LAG_VIEWS)
+                < view
+    }
+
+    /// A proposer whose link is down or whose watermark lags is not expected to
+    /// deliver a proposal; the view may be refused `Δ` after entry (or after the
+    /// link loss, if later) unless one arrives.
+    fn proposer_unavailable(&self, proposer: PublicKey, view: View) -> bool {
+        self.peer_link_down(proposer) || self.proposer_lagging(proposer, view)
+    }
+
+    /// The instant at which a view awaiting a proposal from a down `peer` may be
+    /// refused: `Δ` after the link loss, and never before `now`.
+    fn link_refusal_deadline(&self, peer: PublicKey, now: Instant) -> Option<Instant> {
+        if !self.early_refusals {
+            return None;
+        }
+        self.down_peers
+            .get(&peer)
+            .map(|lost| std::cmp::max(now, *lost + self.delta))
+    }
+
+    /// Records a transport link transition and, on a loss, schedules early
+    /// refusals for every view awaiting a proposal from that peer.
+    async fn on_link_event(&mut self, event: LinkEvent) {
+        let Some(peer) = self.wire.addr_to_peer.get(&event.address).copied() else {
+            return;
+        };
+        let now = Instant::now();
+        if event.up {
+            self.down_peers.remove(&peer);
+        } else {
+            self.down_peers.entry(peer).or_insert(now);
+        }
+        #[cfg(feature = "benchmark")]
+        {
+            let index = self
+                .wire
+                .other_primaries
+                .iter()
+                .position(|(pk, _)| *pk == peer);
+            log::info!(
+                "VANTAGE_LINK_EVENT kind={} peer_index={} epoch_ms={}",
+                if event.up { "up" } else { "down" },
+                index.map_or_else(|| "unmapped".to_string(), |i| i.to_string()),
+                crate::vantage::agb::recovery_epoch_ms()
+            );
+        }
+        if event.up {
+            return;
+        }
+        let Some(deadline) = self.link_refusal_deadline(peer, now) else {
+            return;
+        };
+        let mut effects = Vec::new();
+        for view in self.agb.views_awaiting_proposal_from(peer) {
+            effects.push(Effect::ArmTimer(view, TimerKind::ProposerDown, deadline));
+        }
+        for (target, view) in self.direct_resolver.views_awaiting_proposal_from(peer) {
+            effects.push(Effect::DirectResolution(DirectResolutionEffect::ArmTimer(
+                target,
+                view,
+                DirectResolutionTimerKind::PrimaryDown,
+                deadline,
+            )));
+        }
+        if !effects.is_empty() {
+            self.execute(effects, now).await;
+        }
     }
 
     fn sample_metrics(&mut self) {
@@ -2270,11 +2461,18 @@ impl VantageCore {
             || self.sequence_install.is_some()
             || self.large_sequence_sync_target().is_some()
         {
+            // While state sync or an install is in progress this party proposes
+            // nothing; the own-proposal-due timer abdicates each entered own view
+            // Δ after entry unless the sync finishes first.
             return effects;
         }
         let mut view = self.frontier.a_i() + 1;
         while view <= bound {
-            if self.agb.proposer(view) != self.name || self.frontier.already_proposed(view) {
+            if self.agb.proposer(view) != self.name
+                || self.frontier.already_proposed(view)
+                || self.agb.echo_sent(view)
+            {
+                // A view this party already refused (abdicated) is never proposed.
                 view += 1;
                 continue;
             }
@@ -3550,6 +3748,14 @@ impl VantageCore {
             Inbound::EchoSkip(view, sender, wish) => {
                 let mut effects = self.pacemaker.on_wish(sender, wish);
                 effects.extend(self.agb.on_echo_skip(view, sender));
+                // The proposer's own echo-skip says no proposal is coming.
+                if self.early_refusals && sender == self.agb.proposer(view) {
+                    effects.extend(self.agb.refuse_unproposed_view(
+                        view,
+                        "proposer_skip",
+                        &mut self.rep,
+                    ));
+                }
                 effects.extend(self.agb.recheck_all(&mut self.lm, &mut self.rep));
                 effects.extend(self.try_propose_effects(now));
                 effects
@@ -4245,6 +4451,28 @@ impl VantageCore {
                     }
                     Effect::ArmTimer(view, kind, deadline) => {
                         self.timers.push(Reverse((deadline, view, kind)));
+                        if kind == TimerKind::EchoAbsolute {
+                            // The view was just entered: a proposer already down is
+                            // refused Δ after the loss, or Δ after entry if later.
+                            let proposer = self.agb.proposer(view);
+                            let entered = Instant::now();
+                            let early = self.link_refusal_deadline(proposer, entered).or_else(|| {
+                                self.proposer_lagging(proposer, view)
+                                    .then_some(entered + self.delta)
+                            });
+                            if let Some(early) = early {
+                                self.timers
+                                    .push(Reverse((early, view, TimerKind::ProposerDown)));
+                            }
+                            // Our own view: abdicate if no proposal has formed Δ after entry.
+                            if self.early_refusals && proposer == self.name {
+                                self.timers.push(Reverse((
+                                    entered + self.delta,
+                                    view,
+                                    TimerKind::OwnProposalDue,
+                                )));
+                            }
+                        }
                     }
                     Effect::NotifyCommitted(commit_millis, by_worker, headers) => {
                         #[cfg(feature = "pipeline-tracing")]
@@ -4471,6 +4699,19 @@ impl VantageCore {
                         DirectResolutionEffect::ArmTimer(target, view, kind, deadline) => {
                             self.resolution_timers
                                 .push(Reverse((deadline, target, view, kind)));
+                            if kind == DirectResolutionTimerKind::Proposal {
+                                let leader = self.direct_resolver.resolution_leader(target, view);
+                                if let Some(early) =
+                                    self.link_refusal_deadline(leader, Instant::now())
+                                {
+                                    self.resolution_timers.push(Reverse((
+                                        early,
+                                        target,
+                                        view,
+                                        DirectResolutionTimerKind::PrimaryDown,
+                                    )));
+                                }
+                            }
                         }
                         DirectResolutionEffect::ValidateVote {
                             target,
@@ -4698,6 +4939,7 @@ mod tests {
             _sequence_large_gap_drop,
             _sequence_install_drop_through,
             _reconnect_rx,
+            _link_rx,
         ) = VantageCore::build(
             name,
             committee,

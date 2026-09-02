@@ -38,6 +38,9 @@ pub enum DirectResolutionTimerKind {
     Proposal,
     /// Abandon a proposed view whose agreement phases did not finish.
     View,
+    /// Abandon a view whose primary's transport link is down and that has no
+    /// proposal `Δ` after the link loss (or after entry, if later).
+    PrimaryDown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,6 +359,27 @@ impl DirectResolver {
     /// delay avoids relying on a deadline tie in the runtime scheduler.
     pub fn proposal_timeout(&self) -> Duration {
         self.delta * 5
+    }
+
+    /// Undecided targets whose current resolver view awaits a proposal from
+    /// `primary`, as `(target, resolver view)` pairs.
+    pub fn views_awaiting_proposal_from(
+        &self,
+        primary: PublicKey,
+    ) -> Vec<(View, DirectResolverView)> {
+        self.instances
+            .iter()
+            .filter(|(target, instance)| {
+                instance.current_view > 0
+                    && !self.decisions.contains_key(*target)
+                    && instance
+                        .views
+                        .get(&instance.current_view)
+                        .is_none_or(|state| state.proposal.is_none())
+                    && self.resolution_leader(**target, instance.current_view) == primary
+            })
+            .map(|(target, instance)| (*target, instance.current_view))
+            .collect()
     }
 
     pub fn resolution_leader(&self, target: View, view: DirectResolverView) -> PublicKey {
@@ -959,13 +983,23 @@ impl DirectResolver {
         if instance.current_view != view {
             return Vec::new();
         }
-        if kind == DirectResolutionTimerKind::Proposal
-            && instance
-                .views
-                .get(&view)
-                .is_some_and(|state| state.proposal.is_some())
+        if matches!(
+            kind,
+            DirectResolutionTimerKind::Proposal | DirectResolutionTimerKind::PrimaryDown
+        ) && instance
+            .views
+            .get(&view)
+            .is_some_and(|state| state.proposal.is_some())
         {
             return Vec::new();
+        }
+        #[cfg(feature = "benchmark")]
+        if kind == DirectResolutionTimerKind::PrimaryDown {
+            log::info!(
+                "VANTAGE_RESOLVER_EVENT kind=link_advance target={} view={}",
+                target,
+                view
+            );
         }
         let mut effects = self.raise_own_wish(target, view.saturating_add(1));
         effects.extend(self.recheck_wishes(target));

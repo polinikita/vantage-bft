@@ -430,6 +430,14 @@ pub struct Parameters {
     #[serde(default = "default_reconnect_replay")]
     pub reconnect_replay: bool,
 
+    /// Early refusal hints.  A proposer or resolver primary whose transport
+    /// link is down is treated as timed out one `delta_ms` after the link loss;
+    /// a proposer that cannot propose (state sync in progress) refuses its own
+    /// view at entry, and peers refuse a view as soon as its proposer's own
+    /// echo-skip arrives.  Refusals are always safe; this only shortens them.
+    #[serde(default = "default_early_refusals")]
+    pub early_refusals: bool,
+
     /// Reconnect backoff ceiling, in milliseconds.
     #[serde(default = "default_retry_backoff_max_ms")]
     pub retry_backoff_max_ms: u64,
@@ -649,6 +657,10 @@ fn default_volatile_soft_cap() -> usize {
 
 /// Default reconnect-replay setting.
 fn default_reconnect_replay() -> bool {
+    true
+}
+
+fn default_early_refusals() -> bool {
     true
 }
 
@@ -899,6 +911,7 @@ impl Default for Parameters {
             resume_batch: default_resume_batch(),
             volatile_soft_cap: default_volatile_soft_cap(),
             reconnect_replay: default_reconnect_replay(),
+            early_refusals: default_early_refusals(),
             retry_backoff_max_ms: default_retry_backoff_max_ms(),
             replay_history_views: default_replay_history_views(),
             replay_chunk_bytes: default_replay_chunk_bytes(),

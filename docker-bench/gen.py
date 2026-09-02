@@ -373,6 +373,8 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         # Configure reconnect replay and backoff.
         "reconnect_replay": not args.no_reconnect_replay,
         "retry_backoff_max_ms": args.retry_backoff_max_ms,
+        # Early refusal hints: link loss and proposer abdication.
+        "early_refusals": not args.no_early_refusals,
     }
 
 
@@ -782,6 +784,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="use full Vantage public keys on the primary wire")
     p.add_argument("--no-reconnect-replay", action="store_true",
                    help="disable volatile message replay after reconnect (Vantage only)")
+    p.add_argument("--no-early-refusals", action="store_true",
+                   help="disable early refusal hints: link loss to the proposer, and a "
+                        "syncing proposer's abdication of its own view (Vantage only)")
     p.add_argument("--retry-backoff-max-ms", type=int, default=2000,
                    help="maximum reconnect backoff in milliseconds (default 2000)")
     p.add_argument("--withhold", type=int, default=0)

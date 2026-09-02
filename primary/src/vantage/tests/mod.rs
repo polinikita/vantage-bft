@@ -38,4 +38,6 @@ mod batched_anchors_tests;
 
 mod skip_vote_tests;
 
+mod link_timeout_tests;
+
 mod digest_stmt_tests;
