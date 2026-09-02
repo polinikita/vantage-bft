@@ -145,13 +145,20 @@ def main(argv: list[str] | None = None) -> None:
         for line in (args.run_root / "run.log").read_text(errors="replace").splitlines()
         if line.startswith(RESULT_PREFIX)
     ]
-    reachable = int(run_results[0].get("reachable_workers", 0)) if len(run_results) == 1 else -1
+    # The metrics watcher prints its summary only after a final complete scrape;
+    # baseline victims that abort after their restart leave no summary, so the
+    # figure then relies on the exported Prometheus series alone.
+    reachable = (
+        int(run_results[0].get("reachable_workers", 0)) if len(run_results) == 1 else None
+    )
     dead_victims_allowed = protocol != "vantage"
-    if len(run_results) != 1 or reachable != nodes and not (
-        dead_victims_allowed and reachable >= nodes - expected_faults
-    ):
+    if not dead_victims_allowed and reachable != nodes:
         raise ValueError("the run must end with every worker endpoint reachable")
+    if dead_victims_allowed and reachable is not None and reachable < nodes - expected_faults:
+        raise ValueError("more than f worker endpoints were unreachable at the end")
     for node in range(nodes):
+        if dead_victims_allowed and node in victims:
+            continue  # baseline victims abort after their restart by design of this arm
         log = data / f"node-{node}" / "logs" / "primary.log"
         if not log.is_file():
             raise ValueError(f"missing primary log for node {node}")
@@ -311,9 +318,14 @@ def main(argv: list[str] | None = None) -> None:
         "latency_population": sorted(expected_non_victims),
         "prometheus_step_s": 1,
         "latency_window_s": 1,
-        "overall_committed_tps": float(run_results[0]["committed_tps"]),
+        "overall_committed_tps": (
+            float(run_results[0]["committed_tps"])
+            if run_results
+            else mean_between(throughput, 5.0, duration)
+        ),
         "all_workers_reachable_at_end": reachable == nodes,
         "victims_survived_restart": reachable == nodes,
+        "metrics_summary_present": len(run_results) == 1,
     }
     (args.output_dir / "transient-crash-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
