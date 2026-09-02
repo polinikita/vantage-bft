@@ -15,6 +15,7 @@ set -euo pipefail
 : "${ADVERSARIAL_TX_RATE_SHARE:=0}"
 : "${TX_SIZE:?TX_SIZE must be set}"
 : "${TX_MODE:?TX_MODE must be set}"
+: "${ACTIVATE_AT_MS:=}"
 
 TRANSACTIONS_PORT=6005
 
@@ -69,7 +70,11 @@ WORKER_PID=$!
 
 mapfile -t PEER_ADDRS < <(all_worker_addrs)
 echo "entrypoint: node $NODE_INDEX/$N_NODES starting client -> $(own_addr), rate ${TX_RATE_SHARE} tx/s"
-CLIENT_COUNT_ARGS=()
+CLIENT_START_ARGS=()
+if [ -n "$ACTIVATE_AT_MS" ]; then
+    CLIENT_START_ARGS+=(--activate-at-ms "$ACTIVATE_AT_MS")
+fi
+CLIENT_COUNT_ARGS=("${CLIENT_START_ARGS[@]}")
 if [ "$TX_COUNTED" != "true" ]; then
     CLIENT_COUNT_ARGS+=(--uncounted)
 fi
@@ -85,7 +90,8 @@ if [ "$ADVERSARIAL_TX_RATE_SHARE" -gt 0 ]; then
     echo "entrypoint: node $NODE_INDEX/$N_NODES starting uncounted adversarial client -> $(own_addr), rate ${ADVERSARIAL_TX_RATE_SHARE} tx/s"
     /usr/local/bin/benchmark_client "$(own_addr)" \
         --size "$TX_SIZE" --rate "$ADVERSARIAL_TX_RATE_SHARE" --mode "$TX_MODE" \
-        --uncounted --nodes "${PEER_ADDRS[@]}" \
+        --uncounted "${CLIENT_START_ARGS[@]}" \
+        --nodes "${PEER_ADDRS[@]}" \
         >"$LOGDIR/adversarial-client.log" 2>&1 &
     ADVERSARIAL_CLIENT_PID=$!
 fi

@@ -753,10 +753,16 @@ impl CommitObserver {
             self.metrics
                 .transaction_committed_latency
                 .observe_n(*latency, *count);
+            self.metrics
+                .transaction_committed_latency_window
+                .observe_n(*latency, *count);
         }
         for (latency, count) in &totals.materialised_latency_counts {
             self.metrics
                 .transaction_materialised_latency
+                .observe_n(*latency, *count);
+            self.metrics
+                .transaction_materialised_latency_window
                 .observe_n(*latency, *count);
         }
         #[cfg(feature = "pipeline-tracing")]

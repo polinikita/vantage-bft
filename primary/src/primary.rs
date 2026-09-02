@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -451,7 +452,9 @@ impl Primary {
             },
             metrics.clone(),
         );
-        reporter.clone().start();
+        reporter.clone().start(Duration::from_millis(
+            parameters.metrics_report_interval_ms.max(1),
+        ));
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Primary {} metrics listening on {}", name, metrics_address);
 

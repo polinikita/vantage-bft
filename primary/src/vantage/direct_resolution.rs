@@ -1268,6 +1268,18 @@ impl DirectResolver {
             (0, entry)
         };
         let value = self.value_digest(&entry);
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            "VANTAGE_RESOLVER_EVENT kind=propose target={} view={} keyed={} entry={}",
+            target,
+            view,
+            key_view,
+            match &entry {
+                ResolutionEntry::Full(..) => "full",
+                ResolutionEntry::Core(..) => "core",
+                ResolutionEntry::Skip(..) => "skip",
+            }
+        );
         let proposal = DirectResolutionProposal {
             target,
             view,

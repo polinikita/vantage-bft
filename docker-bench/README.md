@@ -67,6 +67,33 @@ Use `--protocols`, `--scenarios`, or `--duration` for focused diagnostics.
 `--reuse-image` skips the first image build when the current source is already
 present as `vantage-docker-bench:latest`.
 
+## Vantage resolver and recovery qualification
+
+Run the local `n=20,f=6` qualification with:
+
+```bash
+./docker-bench/recovery_local.sh
+```
+
+The command runs one matched fault-free control and two fault experiments.
+The crash experiment leaves six validators absent from genesis and checks each
+commonly observed clean-crash `vote_skip` seal against the configured
+`7*Delta` post-GST bound. The mixed-open experiment gives each of six selected
+Byzantine proposers a tip held directly by only `f` correct validators, suppresses
+the Byzantine AGB/resolver responses for a finite window, and checks that the
+resulting `f`/`n-2f` correct-ECHO split creates multiple completed-open views.
+It then requires those views to be anchor-sealed, finalized in prefix order,
+and fully drained while useful load continues. Checkpoint state sync is
+disabled, and a 10,000-view retained window excludes ordinary view garbage
+collection as a recovery mechanism for these runs.
+
+Human-readable and JSON reports, the exact commands, configuration, and node
+logs are retained under `docker-bench/recovery-runs/` (ignored by Git). Use
+`--reuse-image` only when `vantage-docker-bench:latest` already contains the
+current checkout. The qualification uses host port ranges 19000--19019 and
+19100--19119 for validator metrics, avoiding the common node-exporter port
+9100; override them with `PRIMARY_METRICS_BASE` and `WORKER_METRICS_BASE`.
+
 ## Options
 
 `run.sh` handles these options directly:
@@ -78,6 +105,7 @@ present as `vantage-docker-bench:latest`.
 | `--duration` | `60` | Measurement duration in seconds |
 | `--protocol` | `vantage` | Consensus protocol |
 | `--crash` | `0` | Leave validators `0..N-1` absent from genesis (at most `f`) |
+| `--start-delay` | `30` | Seconds reserved for every validator to become ready before the common client/metrics epoch |
 | `--no-build` | off | Reuse the existing `vantage-docker-bench:latest` image |
 
 All other options are passed to `gen.py`:

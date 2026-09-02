@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -57,6 +58,32 @@ def scrape(url: str, timeout: float = 2.0) -> dict | None:
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
     return parse_prometheus_text(text)
+
+
+def scrape_in_container(manifest: dict, i: int, port: int) -> dict | None:
+    """Bypass an intermittently stalled host-published Docker metrics port."""
+    name = f"{manifest.get('container_name_prefix', 'vantage-node-')}{i}"
+    try:
+        completed = subprocess.run(
+            [
+                "docker",
+                "exec",
+                name,
+                "curl",
+                "-fsS",
+                "--max-time",
+                "2",
+                f"http://127.0.0.1:{port}/metrics",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_prometheus_text(completed.stdout.decode("utf-8", "replace"))
 
 
 def counter(samples: dict, name: str) -> int:
@@ -106,7 +133,9 @@ class NodeSnapshot:
     __slots__ = ("reachable", "committed_transactions",
                  "committed_uncounted_transactions", "submitted_transactions",
                  "count", "p50", "p90", "p99", "m50", "m90", "m99",
+                 "p50_window", "m50_window",
                  "wire_bytes_sent", "optimistic_batch_bytes_sent",
+                 "process_cpu_seconds",
                  "prepare_sync_events", "prepare_missing_headers",
                  "prepare_sync_completed", "prepare_sync_wait_micros",
                  "cpu_seconds", "cpu_seconds_container", "rss_bytes",
@@ -120,8 +149,10 @@ class NodeSnapshot:
         self.count = 0
         self.p50 = self.p90 = self.p99 = None
         self.m50 = self.m90 = self.m99 = None
+        self.p50_window = self.m50_window = None
         self.wire_bytes_sent = 0
         self.optimistic_batch_bytes_sent = 0
+        self.process_cpu_seconds = 0.0
         self.prepare_sync_events = 0
         self.prepare_missing_headers = 0
         self.prepare_sync_completed = 0
@@ -235,7 +266,11 @@ def _read_role_cpu_seconds(scope: Path) -> float:
 
 def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
     s = NodeSnapshot()
-    worker_samples = scrape(worker_url(manifest, i))
+    worker_samples = scrape(worker_url(manifest, i), timeout=3.0)
+    if worker_samples is None:
+        worker_samples = scrape_in_container(
+            manifest, i, int(manifest["ports"]["worker_metrics"])
+        )
     if worker_samples is None:
         return s
     s.reachable = True
@@ -260,6 +295,18 @@ def snapshot_node(manifest: dict, i: int) -> NodeSnapshot:
         s.m50 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p50")
         s.m90 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p90")
         s.m99 = gauge_by_label(worker_samples, "transaction_materialised_latency", "v", "p99")
+    if gauge_by_label(
+        worker_samples, "transaction_committed_latency_window", "v", "count"
+    ):
+        s.p50_window = gauge_by_label(
+            worker_samples, "transaction_committed_latency_window", "v", "p50"
+        )
+    if gauge_by_label(
+        worker_samples, "transaction_materialised_latency_window", "v", "count"
+    ):
+        s.m50_window = gauge_by_label(
+            worker_samples, "transaction_materialised_latency_window", "v", "p50"
+        )
 
     probe = _cpu_probe(manifest, i)
     if probe is not None:
@@ -319,7 +366,12 @@ def float_deltas(
 
 
 def snapshot_all(manifest: dict) -> list[NodeSnapshot]:
-    return [snapshot_node(manifest, i) for i in range(manifest["nodes"])]
+    nodes = manifest["nodes"]
+    # A sequential scrape can take O(n * timeout) and made an n=31 nominal
+    # 10-second sample last roughly a minute. Scrape validators concurrently so
+    # the watch clock and its rate denominator continue to mean wall time.
+    with ThreadPoolExecutor(max_workers=min(nodes, 32)) as executor:
+        return list(executor.map(lambda i: snapshot_node(manifest, i), range(nodes)))
 
 
 def committed_total(snapshots: list[NodeSnapshot]) -> int:
@@ -356,7 +408,8 @@ def latency_line(snapshots: list[NodeSnapshot]) -> str:
     max_count = max(s.count for s in with_latency)
     return (
         f" Real transaction latency: p50/p90/p99 {p50 / 1000:.2f}/{p90 / 1000:.2f}/"
-        f"{p99 / 1000:.2f} ms ({max_count} txs; gauges refresh every 10s, may be stale)"
+        f"{p99 / 1000:.2f} ms ({max_count} txs; cumulative gauge, which may lag "
+        "by one reporter interval)"
     )
 
 
@@ -369,7 +422,7 @@ def materialised_line(snapshots: list[NodeSnapshot]) -> str:
     m99 = median([s.m99 for s in with_latency])
     return (
         f" Materialised transaction latency: p50/p90/p99 {m50 / 1000:.2f}/"
-        f"{m90 / 1000:.2f}/{m99 / 1000:.2f} ms (same refresh caveat)"
+        f"{m90 / 1000:.2f}/{m99 / 1000:.2f} ms (same cumulative-gauge caveat)"
     )
 
 
@@ -401,42 +454,80 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     """Print interval rates and latency gauges, then a watch-window summary."""
     print(f"Grafana dashboard: {GRAFANA_DASHBOARD_URL}")
     sys.stdout.flush()
-    prev_total = 0
+    expected_reachable = manifest["nodes"] - manifest.get("crash", 0)
+    prev_total: int | None = None
     first_total: int | None = None
     first_submitted: int | None = None
     first_snapshots: list[NodeSnapshot] | None = None
-    first_elapsed = 0
-    last_snapshots: list[NodeSnapshot] = []
-    elapsed = 0
+    first_elapsed = 0.0
+    last_complete_snapshots: list[NodeSnapshot] = []
+    last_complete_elapsed = 0.0
+    complete_samples = 0
+    incomplete_samples = 0
+    started_at = time.monotonic()
+    last_complete_sample_at = started_at
+    next_sample_at = started_at + interval
+    deadline = None if duration is None else started_at + duration
+    elapsed = 0.0
     try:
-        while duration is None or elapsed < duration:
-            time.sleep(interval)
-            elapsed += interval
+        while True:
+            target = next_sample_at if deadline is None else min(next_sample_at, deadline)
+            time.sleep(max(0.0, target - time.monotonic()))
             snapshots = snapshot_all(manifest)
-            last_snapshots = snapshots
+            sampled_at = time.monotonic()
+            elapsed = sampled_at - started_at
+            reachable = sum(snapshot.reachable for snapshot in snapshots)
+            if reachable != expected_reachable:
+                incomplete_samples += 1
+                print(
+                    f"TIMELINE: sec={elapsed:.1f} scrape_incomplete="
+                    f"{reachable}/{expected_reachable}"
+                )
+                sys.stdout.flush()
+                if deadline is not None and sampled_at >= deadline:
+                    break
+                next_sample_at += interval
+                while next_sample_at <= sampled_at:
+                    next_sample_at += interval
+                continue
+
+            complete_samples += 1
+            sample_window = max(sampled_at - last_complete_sample_at, 1e-9)
             total = committed_total(snapshots)
             if first_total is None:
                 first_total = total
                 first_submitted = submitted_total(snapshots)
                 first_snapshots = snapshots
                 first_elapsed = elapsed
-            delta = max(0, total - prev_total)
+            delta = total if prev_total is None else max(0, total - prev_total)
             print(
-                f"TIMELINE: sec={elapsed} committed_total={total} "
-                f"committed_delta={delta} tps={delta / interval:.0f} "
+                f"TIMELINE: sec={elapsed:.1f} committed_total={total} "
+                f"committed_delta={delta} tps={delta / sample_window:.0f} "
                 f"p50_ms={median_p50_ms(snapshots, 'p50')} "
-                f"mat_p50_ms={median_p50_ms(snapshots, 'm50')}"
+                f"mat_p50_ms={median_p50_ms(snapshots, 'm50')} "
+                f"p50_window_ms={median_p50_ms(snapshots, 'p50_window')} "
+                f"mat_p50_window_ms={median_p50_ms(snapshots, 'm50_window')}"
             )
             sys.stdout.flush()
             prev_total = total
+            last_complete_snapshots = snapshots
+            last_complete_elapsed = elapsed
+            last_complete_sample_at = sampled_at
+            if deadline is not None and sampled_at >= deadline:
+                break
+            next_sample_at += interval
+            while next_sample_at <= sampled_at:
+                next_sample_at += interval
     except KeyboardInterrupt:
         print()
 
-    if (not last_snapshots or first_total is None or first_submitted is None
+    if (not last_complete_snapshots or first_total is None or first_submitted is None
             or first_snapshots is None
-            or elapsed <= first_elapsed):
+            or last_complete_elapsed <= first_elapsed):
         return  # Too short a window to derive a rate.
-    window = elapsed - first_elapsed
+    window = last_complete_elapsed - first_elapsed
+    last_snapshots = last_complete_snapshots
+    prev_total = committed_total(last_snapshots)
     committed_delta = prev_total - first_total
     uncounted_deltas = counter_deltas(
         first_snapshots, last_snapshots, "committed_uncounted_transactions"
@@ -449,6 +540,8 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         first_snapshots, last_snapshots, "optimistic_batch_bytes_sent"
     )
     wire_bytes = counter_deltas(first_snapshots, last_snapshots, "wire_bytes_sent")
+    cpu_seconds = scalar_deltas(first_snapshots, last_snapshots, "process_cpu_seconds")
+    node_cpu_cores = [seconds / window for seconds in cpu_seconds]
     sync_events = counter_deltas(first_snapshots, last_snapshots, "prepare_sync_events")
     sync_missing = counter_deltas(
         first_snapshots, last_snapshots, "prepare_missing_headers"
@@ -474,9 +567,9 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     total_sync_completed = sum(sync_completed)
     total_sync_wait_micros = sum(sync_wait_micros)
     print("-----------------------------------------")
-    print(f" docker-bench SUMMARY (measured over this {window}s watch window):")
+    print(f" docker-bench SUMMARY (measured over this {window:.1f}s watch window):")
     print("-----------------------------------------")
-    print(f" Consensus TPS: {rate:.0f} tx/s  (delta {committed_delta} tx / {window}s)")
+    print(f" Consensus TPS: {rate:.0f} tx/s  (delta {committed_delta} tx / {window:.1f}s)")
     if uncounted_delta:
         print(
             " Committed adversarial payload: "
@@ -531,6 +624,8 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     print("-----------------------------------------")
     result = {
         "measurement_seconds": window,
+        "complete_scrape_samples": complete_samples,
+        "incomplete_scrape_samples": incomplete_samples,
         "committed_transactions": committed_delta,
         "committed_tps": rate,
         "committed_uncounted_transactions": uncounted_delta,
@@ -565,6 +660,9 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         "cpu_cores_total": cpu_cores_total,
         "mean_node_cpu_cores": cpu_cores_total / live,
         "max_node_cpu_cores": max(cpu_deltas, default=0.0) / window,
+        "median_node_cpu_cores": (
+            statistics.median(cpu_deltas) / window if cpu_deltas else 0.0
+        ),
         "cpu_cores_total_container": cpu_container_cores_total,
         "cpu_sources": sorted(
             {s.cpu_source for s in last_snapshots if s.reachable}
@@ -590,7 +688,9 @@ def main(argv=None) -> None:
                     help="poll every --interval seconds, printing a TIMELINE: line "
                     "per sample (committed total/delta/tps plus committee-median "
                     "p50 committed and materialised latency), then a SUMMARY with a "
-                    "TPS rate self-baselined from this watch's own first/last "
+                    "TPS rate. The *_window_ms fields cover each process's latest "
+                    "configured reporter interval; unsuffixed latency remains "
+                    "cumulative. The SUMMARY is self-baselined from this watch's own first/last "
                     "samples. Without --watch, prints a point-in-time snapshot only "
                     "(no derived rate -- see print_summary's own doc comment for why)")
     p.add_argument("--duration", type=float, default=None,

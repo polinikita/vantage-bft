@@ -320,6 +320,7 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         # their certified/available cuts.
         "max_block_payload": 16,
         "delta_ms": args.delta_ms,
+        "metrics_report_interval_ms": args.metrics_report_interval_ms,
         "channel_auth": not args.no_channel_auth,
         # One seed per generated run: every node reads the same document, so all pairs
         # expand the same key material. Stands in for out-of-band provisioning.
@@ -327,7 +328,7 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
             None if args.no_channel_auth
             else base64.b64encode(os.urandom(32)).decode()
         ),
-        "vantage_gc_window_views": 200,
+        "vantage_gc_window_views": args.vantage_gc_window_views,
         "simpleit_gc_window_rounds": 50,
         "ack_watermarks": not args.no_ack_watermarks,
         "ack_watermark_period_ms": args.ack_watermark_period_ms,
@@ -357,9 +358,13 @@ def build_parameters(args: argparse.Namespace, pubkeys: list[str]) -> dict:
         "withhold_count": withhold_count,
         "withhold_stride": args.withhold_stride,
         "withhold_receivers": fixed_receivers,
-        "withhold_repair": args.withhold_repair or args.leader_relay,
+        "withhold_repair": (
+            args.withhold_repair or args.leader_relay or args.mixed_open_stress
+        ),
         "withhold_headers": not (args.withhold_batches_only or args.leader_relay),
         "leader_relay_attack": args.leader_relay,
+        "vantage_mixed_open_stress": args.mixed_open_stress,
+        "vantage_mixed_open_single_target": args.mixed_open_single_target,
         "withhold_at_ms": None if args.withhold_at is None else args.withhold_at * 1000,
         "withhold_for_ms": args.withhold_for * 1000,
         "resume_check_period_ms": 1000,
@@ -430,7 +435,8 @@ def render_tc_script(
             f'tc class add dev "$IFACE" parent 1:1 classid 1:{mid} htb '
             f'rate {egress_rate} ceil {egress_rate} quantum 60000'
         )
-        # Set a large queue for high-RTT links.
+        # Keep enough queue for high-RTT links without exhausting host kernel
+        # buffers when a diagnostic instantiates many local validators.
         lines.append(f'tc qdisc add dev "$IFACE" parent 1:{mid} handle {mid}: '
                      f'netem limit {netem_limit} delay {delay:.1f}ms')
         lines.append(
@@ -468,6 +474,19 @@ def distribute_rate(total: int, node_indices: list[int]) -> dict[int, int]:
         index: quotient + (offset < remainder)
         for offset, index in enumerate(node_indices)
     }
+
+
+def parse_node_indices(value: str) -> list[int]:
+    """Parse a comma-separated node-index list for argparse."""
+    if not value:
+        return []
+    try:
+        indices = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected comma-separated integer indices") from error
+    if len(indices) != len(set(indices)):
+        raise argparse.ArgumentTypeError("node indices must not repeat")
+    return indices
 
 
 def render_compose(
@@ -513,6 +532,7 @@ def render_compose(
             f"      TX_SIZE: \"{args.tx_size}\"",
             f"      TX_MODE: \"{args.mode}\"",
             f"      PROTOCOL: \"{args.protocol}\"",
+            '      ACTIVATE_AT_MS: "${ACTIVATE_AT_MS:-}"',
             # RUST_LOG overrides the default filter.
             *([f"      RUST_LOG: \"{args.rust_log}\""] if args.rust_log else []),
             "    volumes:",
@@ -564,6 +584,7 @@ def write_manifest(
     load_node_indices: list[int],
     adversarial_node_indices: list[int],
     uncounted_load_indices: list[int],
+    withholding_node_indices: list[int],
 ) -> None:
     load_rates = distribute_rate(args.rate, load_node_indices)
     uncounted_load = set(uncounted_load_indices)
@@ -580,6 +601,7 @@ def write_manifest(
         "mode": args.mode,
         "consensus_signature_scheme": args.consensus_signature_scheme,
         "latency": args.latency,
+        "metrics_report_interval_ms": args.metrics_report_interval_ms,
         "sequence_checkpoints": not args.no_state_sync,
         "sequence_checkpoint_interval_views": args.sequence_checkpoint_interval,
         "sequence_sync_min_gap_views": args.sequence_sync_min_gap_views,
@@ -596,13 +618,17 @@ def write_manifest(
         ),
         "vantage_compact_ids": not args.no_compact_ids,
         "withhold_senders": args.withhold,
+        "withholding_node_indices": withholding_node_indices,
         "withhold_publisher_stride": args.withhold_publisher_stride,
         "withhold_count": args.nodes - 1 if args.leader_relay else args.withhold_count,
         "withhold_stride": args.withhold_stride,
         "withhold_fixed_receivers": args.withhold_fixed_receivers,
         "withhold_batches_only": args.withhold_batches_only or args.leader_relay,
-        "withhold_repair": args.withhold_repair or args.leader_relay,
+        "withhold_repair": (
+            args.withhold_repair or args.leader_relay or args.mixed_open_stress
+        ),
         "leader_relay_attack": args.leader_relay,
+        "vantage_mixed_open_stress": args.mixed_open_stress,
         "leader_relay_batch_interval_ms": args.delta_ms if args.leader_relay else 0,
         "leader_relay_holder_group_mode": (
             "fixed-per-lane" if args.leader_relay else "disabled"
@@ -614,13 +640,21 @@ def write_manifest(
             args.withhold - 1 if args.leader_relay else 0
         ),
         "leader_relay_direct_holders": args.withhold if args.leader_relay else 0,
+        "mixed_open_correct_grade_one": (
+            (args.nodes - 1) // 3 if args.mixed_open_stress else 0
+        ),
+        "mixed_open_correct_grade_zero": (
+            args.nodes - 2 * ((args.nodes - 1) // 3) if args.mixed_open_stress else 0
+        ),
         "correct_load_only": args.correct_load_only,
+        "load_excluded_node_indices": args.load_exclude,
         "load_node_indices": load_node_indices,
         "uncounted_load_node_indices": uncounted_load_indices,
         "honest_offered_tps": honest_offered_tps,
         "adversarial_rate": args.adversarial_rate,
         "adversarial_node_indices": adversarial_node_indices,
         "egress_mbps": args.egress_mbps,
+        "netem_limit_pkts": netem_limit_packets(args.nodes, args.netem_limit),
         "subnet": SUBNET,
         "node_ip_prefix": NODE_IP_PREFIX,
         "node_ip_offset": NODE_IP_OFFSET,
@@ -641,6 +675,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--crash", type=int, default=0,
                    help="first N validators remain absent; load is spread over live nodes")
     p.add_argument("--rate", type=int, default=200, help="aggregate input rate, tx/s (default 200)")
+    p.add_argument(
+        "--load-exclude",
+        type=parse_node_indices,
+        default=[],
+        metavar="I,J,...",
+        help="keep counted client load off these live validators while retaining them "
+             "in consensus",
+    )
     p.add_argument("--duration", type=int, default=60, help="benchmark duration, s (default 60; "
                     "informational only here -- run.sh/results.py are what actually enforce it)")
     p.add_argument("--protocol", choices=PROTOCOL_CHOICES, default="vantage")
@@ -666,15 +708,26 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="first two octets of the /16 docker bridge network (default "
                     "172.28, per spec); override only if that address space collides "
                     "with another docker-compose project already on this host")
+    p.add_argument("--host-primary-metrics-base", type=int, default=9000,
+                   help="first host port for primary metrics (default 9000)")
+    p.add_argument("--host-worker-metrics-base", type=int, default=9100,
+                   help="first host port for worker metrics (default 9100)")
     # Match local-benchmark parameter names.
     p.add_argument(
         "--netem-limit",
+        "--netem-limit-pkts",
         type=int,
         default=None,
         help="netem queue limit in packets for each per-peer delay class "
         f"(default: {NETEM_LIMIT_PKTS:,})",
     )
     p.add_argument("--delta-ms", type=int, default=200)
+    p.add_argument(
+        "--metrics-report-interval-ms",
+        type=int,
+        default=10_000,
+        help="exact latency-histogram reporter interval (default 10000 ms)",
+    )
     p.add_argument("--timeout-delay-ms", type=int, default=None,
                    help="override the proof-calibrated round timeout: Autobahn "
                         "10*Delta, Simple-IT Opt 8*Delta, Bracha 5*Delta")
@@ -695,6 +748,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="use periodic VantageAvail watermarks instead of echo claims")
     p.add_argument("--no-state-sync", action="store_true",
                    help="disable sequence checkpoint state sync and installation")
+    p.add_argument("--vantage-gc-window-views", type=int, default=200,
+                   help="retained Vantage view window (default 200; use a larger value "
+                        "when auditing recovery without state-sync installation)")
     p.add_argument("--sequence-checkpoint-interval", type=int, default=20,
                    help="checkpoint boundary interval K in views; must be small "
                         "enough that the run crosses several boundaries on 2+ nodes")
@@ -748,6 +804,19 @@ def parse_args(argv=None) -> argparse.Namespace:
              "fixed correct group, staggered across Byzantine lanes (f direct holders, one below PoA); implies batch-only "
              "withholding from every other peer and repair refusal",
     )
+    p.add_argument(
+        "--mixed-open-stress",
+        action="store_true",
+        help="Vantage-only finite residual-view stress: each of f Byzantine publishers "
+             "narrowcasts its own tip to f correct holders and withholds AGB/resolver "
+             "responses during --withhold-at/--withhold-for",
+    )
+    p.add_argument(
+        "--mixed-open-single-target",
+        action="store_true",
+        help="with --mixed-open-stress, inject exactly one residual proposal from "
+             "the first selected Byzantine publisher while all f publishers suppress responses",
+    )
     p.add_argument("--correct-load-only", action="store_true",
                    help="distribute counted client load only across non-withholding authors")
     p.add_argument("--adversarial-rate", type=int, default=0,
@@ -772,6 +841,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     fault_budget = (args.nodes - 1) // 3
     if not (0 <= args.crash <= fault_budget):
         p.error(f"--crash must be between 0 and {fault_budget} for n={args.nodes}")
+    live_indices = set(range(args.crash, args.nodes))
+    invalid_load_exclusions = sorted(set(args.load_exclude) - live_indices)
+    if invalid_load_exclusions:
+        p.error(
+            "--load-exclude must name live validators; invalid indices: "
+            f"{invalid_load_exclusions}"
+        )
+    if args.rate > 0 and set(args.load_exclude) == live_indices:
+        p.error("--load-exclude cannot remove every live validator when --rate is positive")
     if args.withhold_publisher_stride < 1:
         p.error("--withhold-publisher-stride must be positive")
     if (args.withhold > 0 and
@@ -812,6 +890,29 @@ def parse_args(argv=None) -> argparse.Namespace:
             "--leader-relay uses one uniform total load and marks the Byzantine share "
             "uncounted; omit --correct-load-only and --adversarial-rate"
         )
+    if args.mixed_open_stress:
+        if args.protocol != "vantage":
+            p.error("--mixed-open-stress requires --protocol vantage")
+        if args.withhold != fault_budget or fault_budget == 0:
+            p.error(
+                f"--mixed-open-stress requires exactly f={fault_budget} withholding publishers"
+            )
+        if args.withhold_at is None or args.withhold_for <= 0:
+            p.error("--mixed-open-stress requires --withhold-at and positive --withhold-for")
+        if args.withhold_count is not None or args.withhold_fixed_receivers:
+            p.error(
+                "--mixed-open-stress derives its holder groups; omit --withhold-count "
+                "and --withhold-fixed-receivers"
+            )
+        if args.withhold_batches_only or args.leader_relay:
+            p.error("--mixed-open-stress cannot be combined with batch-only/leader-relay modes")
+        if not args.correct_load_only or args.adversarial_rate <= 0:
+            p.error(
+                "--mixed-open-stress requires --correct-load-only and positive "
+                "--adversarial-rate so attacked data is uncounted"
+            )
+    if args.mixed_open_single_target and not args.mixed_open_stress:
+        p.error("--mixed-open-single-target requires --mixed-open-stress")
     if args.correct_load_only and args.withhold == 0:
         p.error("--correct-load-only requires --withhold > 0")
     if args.correct_load_only and args.withhold == args.nodes:
@@ -822,10 +923,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--adversarial-rate requires --withhold > 0")
     if args.egress_mbps < 0:
         p.error("--egress-mbps must be non-negative")
+    if args.netem_limit is not None and args.netem_limit < 1:
+        p.error("--netem-limit must be positive")
+    if args.metrics_report_interval_ms < 1:
+        p.error("--metrics-report-interval-ms must be positive")
     if args.withhold_at is not None and args.withhold == 0:
         p.error("--withhold-at requires --withhold > 0")
     if args.sequence_checkpoint_interval < 1:
         p.error("--sequence-checkpoint-interval must be at least 1")
+    if args.vantage_gc_window_views < 1:
+        p.error("--vantage-gc-window-views must be at least 1")
     if args.sequence_sync_min_gap_views < 0:
         p.error("--sequence-sync-min-gap-views must be non-negative")
     if args.sequence_sync_rearm_gap_views < 0:
@@ -843,15 +950,27 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("--sequence-sync-chunk-outcome-items must be at least 1")
     if not re.fullmatch(r"\d{1,3}\.\d{1,3}", args.subnet_base):
         p.error("--subnet-base must look like 'A.B' (e.g. 172.28)")
+    metric_ranges = []
+    for label, base in (
+        ("--host-primary-metrics-base", args.host_primary_metrics_base),
+        ("--host-worker-metrics-base", args.host_worker_metrics_base),
+    ):
+        if base < 1 or base + args.nodes - 1 > 65_535:
+            p.error(f"{label} must leave room for all {args.nodes} host ports")
+        metric_ranges.append(set(range(base, base + args.nodes)))
+    if metric_ranges[0] & metric_ranges[1]:
+        p.error("primary and worker host-metrics port ranges must not overlap")
     return args
 
 
 def main(argv=None) -> None:
-    global SUBNET, NODE_IP_PREFIX
+    global SUBNET, NODE_IP_PREFIX, HOST_PRIMARY_METRICS_BASE, HOST_WORKER_METRICS_BASE
     args = parse_args(argv)
     n = args.nodes
     SUBNET = f"{args.subnet_base}.0.0/16"
     NODE_IP_PREFIX = f"{args.subnet_base}.1."
+    HOST_PRIMARY_METRICS_BASE = args.host_primary_metrics_base
+    HOST_WORKER_METRICS_BASE = args.host_worker_metrics_base
 
     # Keep the bind-mount root stable across back-to-back Docker Desktop runs.
     reclaim_data_dir_ownership()
@@ -896,6 +1015,10 @@ def main(argv=None) -> None:
         if args.correct_load_only
         else live_node_indices
     )
+    load_excluded = set(args.load_exclude)
+    load_node_indices = [index for index in load_node_indices if index not in load_excluded]
+    if args.rate > 0 and not load_node_indices:
+        raise SystemExit("gen.py: no validators remain for counted client load")
     adversarial_node_indices = (
         [index for index in withholding_indices if index in live_node_indices]
         if args.adversarial_rate
@@ -932,6 +1055,7 @@ def main(argv=None) -> None:
         load_node_indices,
         adversarial_node_indices,
         uncounted_load_indices,
+        withholding_indices,
     )
 
     print("-- writing prometheus.yaml")
@@ -957,6 +1081,11 @@ def main(argv=None) -> None:
           f"latency={'on' if args.latency else 'off'}")
     if args.correct_load_only:
         print(f"   counted client load placed on correct node(s): {load_node_indices}")
+    elif args.load_exclude:
+        print(
+            "   counted client load excludes validator(s) "
+            f"{args.load_exclude}: {load_node_indices} carry the full aggregate rate"
+        )
     elif args.crash:
         print(f"   aggregate client load placed on live node(s): {load_node_indices}")
     if args.adversarial_rate:
@@ -970,6 +1099,12 @@ def main(argv=None) -> None:
             f"node(s) {uncounted_load_indices}; author plus an (f-1)-wide correct "
             f"group fixed per lane (f direct holders, one below PoA); lane groups are "
             f"staggered across every correct leader"
+        )
+    if args.mixed_open_stress:
+        fault_budget = (n - 1) // 3
+        print(
+            "   mixed-open stress: Byzantine proposer plus no Byzantine AGB/resolver "
+            f"responses; correct ECHOs split {fault_budget}/{n - 2 * fault_budget}"
         )
     print(f"   data dir: {DATA_DIR}")
     print(f"   compose file: {COMPOSE_PATH}")

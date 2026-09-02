@@ -14,6 +14,14 @@ use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "benchmark")]
+fn recovery_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Entries are ordered strictly by author, with at most one entry per author.
 pub type Manifest = Vec<BlockRef>;
 
@@ -601,6 +609,7 @@ struct ViewState {
     /// homogeneous grade. Provisional mix cannot authorize resolution metadata.
     ready_mix_open: bool,
     completed: Option<(Manifest, Manifest)>,
+    completed_instant: Option<Instant>,
     /// True exactly while a completed-open view still lacks a terminal seal.
     completed_open_unsealed: bool,
     directed: Option<Outcome>,
@@ -641,6 +650,7 @@ impl Default for ViewState {
             ready_sent: false,
             ready_mix_open: false,
             completed: None,
+            completed_instant: None,
             completed_open_unsealed: false,
             directed: None,
             sealed: None,
@@ -1028,6 +1038,12 @@ impl AgbEngine {
             s.entered = true;
             s.entry_instant = Some(now);
         }
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            "VANTAGE_RECOVERY_EVENT kind=enter view={} epoch_ms={}",
+            view,
+            recovery_epoch_ms()
+        );
         effects.push(Effect::ArmTimer(
             view,
             TimerKind::EchoAbsolute,
@@ -2181,10 +2197,17 @@ impl AgbEngine {
         if any_stake >= self.quorum && self.state_mut(view).completed.is_none() {
             let c = proposal.c().clone();
             let t = proposal.t().clone();
+            let now = Instant::now();
             let is_open = g1_stake < self.quorum && g0_stake < self.quorum && !t.is_empty();
+            let (_echo_g1, _echo_g0) = self
+                .views
+                .get(&view)
+                .and_then(|state| state.echo_tallies.get(digest))
+                .map_or((0, 0), |tally| (tally.grade_one, tally.grade_zero));
             let open_unsealed = {
                 let state = self.state_mut(view);
                 state.completed = Some((c.clone(), t.clone()));
+                state.completed_instant = Some(now);
                 state.completed_open_unsealed = is_open && state.sealed.is_none();
                 state.completed_open_unsealed
             };
@@ -2195,6 +2218,18 @@ impl AgbEngine {
                         metrics.vantage_open_unsealed_views.inc();
                     }
                 }
+                #[cfg(feature = "benchmark")]
+                log::info!(
+                    "VANTAGE_RECOVERY_EVENT kind=completed_open view={} epoch_ms={} echo_g1={} echo_g0={} ready_g1={} ready_g0={} quorum={} tips={}",
+                    view,
+                    recovery_epoch_ms(),
+                    _echo_g1,
+                    _echo_g0,
+                    g1_stake,
+                    g0_stake,
+                    self.quorum,
+                    t.len()
+                );
             }
             for r in c.iter().chain(aux_refs_entries(proposal.entries())) {
                 effects.extend(rep.authorize(r.clone()));
@@ -2228,9 +2263,15 @@ impl AgbEngine {
         if self.is_pruned(view) {
             return;
         }
-        #[cfg(feature = "pipeline-tracing")]
         let now = Instant::now();
-        let (proposal_start, decrement_open) = {
+        let (
+            proposal_start,
+            _entry_to_seal_us,
+            _completion_to_seal_us,
+            decrement_open,
+            _echo_g1,
+            _echo_g0,
+        ) = {
             let state = self.state_mut(view);
             if let Some(existing) = &state.sealed {
                 debug_assert!(
@@ -2242,11 +2283,31 @@ impl AgbEngine {
                 );
                 return;
             }
+            let echo = state
+                .echo_tallies
+                .values()
+                .max_by_key(|tally| tally.grade_one + tally.grade_zero)
+                .map_or((0, 0), |tally| (tally.grade_one, tally.grade_zero));
+            let entry_latency = state
+                .entry_instant
+                .map(|start| now.saturating_duration_since(start).as_micros() as i128)
+                .unwrap_or(-1);
+            let completion_latency = state
+                .completed_instant
+                .map(|start| now.saturating_duration_since(start).as_micros() as i128)
+                .unwrap_or(-1);
             let decrement_open = state.completed_open_unsealed;
             state.completed_open_unsealed = false;
             let proposal_start = state.first_proposal_instant;
             state.sealed = Some(outcome.clone());
-            (proposal_start, decrement_open)
+            (
+                proposal_start,
+                entry_latency,
+                completion_latency,
+                decrement_open,
+                echo.0,
+                echo.1,
+            )
         };
         #[cfg(not(feature = "pipeline-tracing"))]
         let _ = proposal_start;
@@ -2264,6 +2325,17 @@ impl AgbEngine {
                     .observe(now.saturating_duration_since(start));
             }
         }
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            "VANTAGE_RECOVERY_EVENT kind=seal view={} epoch_ms={} route={} entry_to_seal_us={} completion_to_seal_us={} echo_g1={} echo_g0={}",
+            view,
+            recovery_epoch_ms(),
+            route,
+            _entry_to_seal_us,
+            _completion_to_seal_us,
+            _echo_g1,
+            _echo_g0
+        );
     }
 
     fn outcomes_compatible(a: &Outcome, b: &Outcome) -> bool {

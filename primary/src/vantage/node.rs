@@ -95,10 +95,18 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+
+#[cfg(feature = "benchmark")]
+fn recovery_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 /// Capacity of the droppable service-request queue.
 const BULK_CHANNEL_CAPACITY: usize = 2048;
@@ -852,6 +860,17 @@ pub struct VantageCore {
     gc_window: View,
     last_gc_floor: View,
 
+    /// True only for one of the benchmark profile's Byzantine publishers.
+    mixed_open_stress_publisher: bool,
+    /// Restricts residual-proposal injection to one designated target.
+    mixed_open_single_target: bool,
+    /// In single-target mode, true only at the first selected Byzantine publisher.
+    mixed_open_single_target_injector: bool,
+    /// Prevents the single-target injector from creating a second residual proposal.
+    mixed_open_single_target_used: bool,
+    /// Common finite benchmark window, armed from one absolute epoch.
+    mixed_open_stress_window: Option<Arc<OnceLock<(Instant, Instant)>>>,
+
     metrics: Option<Arc<Metrics>>,
 
     ut_inbound_dispatch: Option<IntCounter>,
@@ -1044,15 +1063,37 @@ impl VantageCore {
 
         let (reconnect_tx, reconnect_rx) = channel(committee.size().max(1));
 
-        let withholding_dests = config::withheld_destinations(
+        let withholding_publishers = config::withholding_publishers(
             &committee,
-            &name,
             parameters.withhold_senders,
             &parameters.withhold_publishers,
-            parameters.withhold_count,
-            parameters.withhold_stride,
-            &parameters.withhold_receivers,
         );
+        let mixed_open_stress_publisher =
+            parameters.vantage_mixed_open_stress && withholding_publishers.contains(&name);
+        let mixed_open_single_target_injector = parameters.vantage_mixed_open_single_target
+            && committee
+                .authorities
+                .keys()
+                .find(|key| withholding_publishers.contains(*key))
+                .is_some_and(|key| *key == name);
+        let withholding_dests = if parameters.vantage_mixed_open_stress {
+            config::mixed_open_withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+            )
+        } else {
+            config::withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+                parameters.withhold_count,
+                parameters.withhold_stride,
+                &parameters.withhold_receivers,
+            )
+        };
         let withheld_header_dests: wire::WithheldHeaderDests = parameters
             .withhold_headers
             .then(|| withholding_dests.clone())
@@ -1268,6 +1309,11 @@ impl VantageCore {
             // Keep state for the current view when the window is zero.
             gc_window: parameters.vantage_gc_window_views.max(1),
             last_gc_floor: 1,
+            mixed_open_stress_publisher,
+            mixed_open_single_target: parameters.vantage_mixed_open_single_target,
+            mixed_open_single_target_injector,
+            mixed_open_single_target_used: false,
+            mixed_open_stress_window: parameters.withhold_window.clone(),
             metrics: core_metrics,
             ut_inbound_dispatch: None,
             ut_inbound_family: std::array::from_fn(|_| None),
@@ -2133,6 +2179,45 @@ impl VantageCore {
         );
     }
 
+    /// Returns whether this benchmark-only Byzantine fault is currently active.
+    fn mixed_open_fault_active(&self, now: Instant) -> bool {
+        self.mixed_open_stress_publisher
+            && config::withhold_active(self.mixed_open_stress_window.as_deref(), now)
+    }
+
+    fn suppress_mixed_open_response(&self, family: &'static str) -> bool {
+        let suppressed = self.mixed_open_fault_active(Instant::now());
+        if suppressed {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .vantage_mixed_open_suppressed_total
+                    .with_label_values(&[family])
+                    .inc();
+            }
+            log::debug!("mixed-open stress: suppressing outbound {family}");
+        }
+        suppressed
+    }
+
+    /// Selects one benchmark-only residual proposal without shortening the
+    /// interval during which all Byzantine publishers suppress responses.
+    fn mixed_open_proposal_fault_active(&self, now: Instant) -> bool {
+        if !self.mixed_open_fault_active(now) {
+            return false;
+        }
+        if !self.mixed_open_single_target {
+            return true;
+        }
+        let publication_window_settled = self
+            .mixed_open_stress_window
+            .as_deref()
+            .and_then(OnceLock::get)
+            .is_some_and(|(start, _)| now >= *start + Duration::from_secs(2));
+        publication_window_settled
+            && self.mixed_open_single_target_injector
+            && !self.mixed_open_single_target_used
+    }
+
     /// Starts every locally justified per-target resolver through the current
     /// proposal horizon. Instances are independent, so no global resolution
     /// height or carrier selection serializes this scan.
@@ -2194,11 +2279,30 @@ impl VantageCore {
                 continue;
             }
 
-            let proposal = self
-                .frontier
-                .propose_view(view, &self.lm, None)
-                .map(ProposalOut::Single);
+            let mixed_open_fault = self.mixed_open_proposal_fault_active(now);
+            let proposal = if mixed_open_fault {
+                self.frontier
+                    .propose_view_mixed_open(view, &self.lm)
+                    .map(ProposalOut::Single)
+            } else {
+                self.frontier
+                    .propose_view(view, &self.lm, None)
+                    .map(ProposalOut::Single)
+            };
             if let Some(proposal) = proposal {
+                let residual_injected = mixed_open_fault && !proposal.t().is_empty();
+                if residual_injected && self.mixed_open_single_target {
+                    self.mixed_open_single_target_used = true;
+                }
+                #[cfg(feature = "benchmark")]
+                if residual_injected {
+                    log::info!(
+                        "VANTAGE_RECOVERY_EVENT kind=stress_propose view={} epoch_ms={} tips={}",
+                        proposal.view(),
+                        recovery_epoch_ms(),
+                        proposal.t().len()
+                    );
+                }
                 if let Some(metrics) = &self.metrics {
                     metrics.vantage_own_proposals_made_total.inc();
                 }
@@ -4004,6 +4108,9 @@ impl VantageCore {
                     }
 
                     Effect::BroadcastEcho(mut e) => {
+                        if self.suppress_mixed_open_response("echo") {
+                            continue;
+                        }
                         // Stamp mutable protocol metadata at the serialization boundary.
                         e.set_wish(self.pacemaker.own_watermark());
 
@@ -4058,6 +4165,9 @@ impl VantageCore {
                         }
                     }
                     Effect::BroadcastEchoSkip(view) => {
+                        if self.suppress_mixed_open_response("echo-skip") {
+                            continue;
+                        }
                         let wish = self.pacemaker.own_watermark();
                         self.broadcast_recorded(PrimaryMessage::VantageEchoSkip(
                             view, self.name, wish,
@@ -4068,6 +4178,9 @@ impl VantageCore {
                         self.frontier.quarantine_tips(&tips, &self.lm);
                     }
                     Effect::BroadcastReady(mut r) => {
+                        if self.suppress_mixed_open_response("ready") {
+                            continue;
+                        }
                         r.set_wish(self.pacemaker.own_watermark());
                         match r {
                             ReadyOut::Single(r) if self.digest_statements => {
@@ -4086,6 +4199,9 @@ impl VantageCore {
                         }
                     }
                     Effect::BroadcastNoReady(view) => {
+                        if self.suppress_mixed_open_response("no-ready") {
+                            continue;
+                        }
                         let wish = self.pacemaker.own_watermark();
                         self.broadcast_recorded(PrimaryMessage::VantageNoReady(
                             view, self.name, wish,
@@ -4094,6 +4210,9 @@ impl VantageCore {
                     }
 
                     Effect::BroadcastSkipVote(view) => {
+                        if self.suppress_mixed_open_response("skip-vote") {
+                            continue;
+                        }
                         self.broadcast_recorded(PrimaryMessage::VantageSkipVote(view, self.name))
                             .await;
                     }
@@ -4177,6 +4296,12 @@ impl VantageCore {
                         outcome,
                         output_delta,
                     } => {
+                        #[cfg(feature = "benchmark")]
+                        log::info!(
+                            "VANTAGE_RECOVERY_EVENT kind=finalized view={} epoch_ms={}",
+                            view,
+                            recovery_epoch_ms()
+                        );
                         #[cfg(feature = "pipeline-tracing")]
                         if let (Some(metrics), Some(elapsed)) =
                             (&self.metrics, self.pipeline.note_finalized(view))
@@ -4194,12 +4319,18 @@ impl VantageCore {
 
                     Effect::DirectResolution(effect) => match effect {
                         DirectResolutionEffect::BroadcastWish(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-wish") {
+                                continue;
+                            }
                             self.broadcast_recorded(PrimaryMessage::VantageDirectResolutionWish(
                                 message,
                             ))
                             .await;
                         }
                         DirectResolutionEffect::WishTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-wish") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4208,6 +4339,9 @@ impl VantageCore {
                                 .await;
                         }
                         DirectResolutionEffect::SuggestTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-suggest") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4216,12 +4350,18 @@ impl VantageCore {
                                 .await;
                         }
                         DirectResolutionEffect::BroadcastProof(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proof") {
+                                continue;
+                            }
                             self.broadcast_recorded(PrimaryMessage::VantageDirectResolutionProof(
                                 message,
                             ))
                             .await;
                         }
                         DirectResolutionEffect::ProofTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proof") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4230,12 +4370,18 @@ impl VantageCore {
                                 .await;
                         }
                         DirectResolutionEffect::BroadcastProposal(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proposal") {
+                                continue;
+                            }
                             self.broadcast_recorded(
                                 PrimaryMessage::VantageDirectResolutionProposal(message),
                             )
                             .await;
                         }
                         DirectResolutionEffect::ProposalTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-proposal") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4244,12 +4390,18 @@ impl VantageCore {
                                 .await;
                         }
                         DirectResolutionEffect::BroadcastStatement(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-statement") {
+                                continue;
+                            }
                             self.broadcast_recorded(
                                 PrimaryMessage::VantageDirectResolutionStatement(message),
                             )
                             .await;
                         }
                         DirectResolutionEffect::StatementTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-statement") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4258,12 +4410,18 @@ impl VantageCore {
                                 .await;
                         }
                         DirectResolutionEffect::BroadcastWitness(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-witness") {
+                                continue;
+                            }
                             self.broadcast_recorded(
                                 PrimaryMessage::VantageDirectResolutionWitness(message),
                             )
                             .await;
                         }
                         DirectResolutionEffect::WitnessTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-witness") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4272,12 +4430,18 @@ impl VantageCore {
                                 .await;
                         }
                         DirectResolutionEffect::BroadcastDone(message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-done") {
+                                continue;
+                            }
                             self.broadcast_recorded(PrimaryMessage::VantageDirectResolutionDone(
                                 message,
                             ))
                             .await;
                         }
                         DirectResolutionEffect::DoneTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-done") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4294,6 +4458,9 @@ impl VantageCore {
                                 .await;
                         }
                         DirectResolutionEffect::ValueServeTo(peer, message) => {
+                            if self.suppress_mixed_open_response("direct-resolution-serve") {
+                                continue;
+                            }
                             self.wire
                                 .send_message(
                                     peer,
@@ -4329,6 +4496,14 @@ impl VantageCore {
                                     DirectResolutionVote::Reject { permanent: true }
                                 }
                             };
+                            #[cfg(feature = "benchmark")]
+                            log::info!(
+                                "VANTAGE_RESOLVER_EVENT kind=vote target={} view={} accept={} permanent={}",
+                                target,
+                                view,
+                                matches!(vote, DirectResolutionVote::Accept { .. }),
+                                matches!(vote, DirectResolutionVote::Reject { permanent: true })
+                            );
                             queue.extend(
                                 self.direct_resolver
                                     .on_vote(target, view, value, vote)
@@ -4338,6 +4513,13 @@ impl VantageCore {
                         }
                         DirectResolutionEffect::Decide(entry) => {
                             let target = entry.target_view();
+                            #[cfg(feature = "benchmark")]
+                            log::info!(
+                                "VANTAGE_RECOVERY_EVENT kind=direct_resolver_decide view={} epoch_ms={} active={}",
+                                target,
+                                recovery_epoch_ms(),
+                                self.direct_resolver.active_len()
+                            );
                             let (outcome, refs) = match entry {
                                 ResolutionEntry::Full(_, c, t) => (
                                     crate::vantage::Outcome::Full(c.clone(), t.clone()),

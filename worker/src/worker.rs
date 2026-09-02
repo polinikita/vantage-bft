@@ -157,7 +157,9 @@ impl Worker {
             metrics.set_transaction_mode_info(mode);
         }
         metrics.set_active_from_millis(parameters.metrics_active_at_ms);
-        reporter.clone().start();
+        reporter.clone().start(Duration::from_millis(
+            parameters.metrics_report_interval_ms.max(1),
+        ));
         start_prometheus_server(binding_metrics_address, &registry);
         info!("Worker {} metrics listening on {}", id, metrics_address);
 
@@ -167,15 +169,24 @@ impl Worker {
             .map(|table| committee.latency_map(&name, table))
             .unwrap_or_default();
 
-        let withheld_destinations = config::withheld_destinations(
-            &committee,
-            &name,
-            parameters.withhold_senders,
-            &parameters.withhold_publishers,
-            parameters.withhold_count,
-            parameters.withhold_stride,
-            &parameters.withhold_receivers,
-        );
+        let withheld_destinations = if parameters.vantage_mixed_open_stress {
+            config::mixed_open_withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+            )
+        } else {
+            config::withheld_destinations(
+                &committee,
+                &name,
+                parameters.withhold_senders,
+                &parameters.withhold_publishers,
+                parameters.withhold_count,
+                parameters.withhold_stride,
+                &parameters.withhold_receivers,
+            )
+        };
 
         let withhold_window = parameters.withhold_window.clone();
 
