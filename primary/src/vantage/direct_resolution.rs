@@ -359,10 +359,9 @@ impl DirectResolver {
     }
 
     pub fn resolution_leader(&self, target: View, view: DirectResolverView) -> PublicKey {
-        // View 1 deliberately starts after the unresolved AGB proposer.  A
-        // faulty proposer is therefore not guaranteed the first resolver turn;
-        // subsequent views still visit every committee member in order.
-        one_based_authority(&self.committee, target.saturating_add(view))
+        let schedule = resolver_schedule(&self.committee, &self.sid, target);
+        let position = (view.saturating_sub(1) % schedule.len() as u64) as usize;
+        schedule[position]
     }
 
     pub fn value_digest(&self, entry: &ResolutionEntry) -> Digest {
@@ -2064,4 +2063,43 @@ impl DirectResolver {
     pub(crate) fn passive_target_len_for_test(&self) -> usize {
         self.passive_wishes.len()
     }
+}
+
+/// Returns the primary schedule of one resolver target: a pseudorandom
+/// permutation of the committee derived from the session identifier and the
+/// target view, with the target's AGB proposer moved to the last position.
+/// Resolver view `r` uses position `(r - 1) mod n`.
+///
+/// Safety and eventual decision hold for any common deterministic schedule
+/// that visits every member, so the order is free to optimize latency.  Under
+/// plain round robin a static adversary owning f rotation-adjacent members
+/// obtains a run of up to f silent primaries after each of its own proposals,
+/// each costing the no-proposal timer.  A per-target pseudorandom order makes
+/// the expected number of Byzantine primaries before the first correct one at
+/// most f/(n-f) <= 1/2 for a set chosen independently of the schedule, and
+/// keeps the long-run average there for a set chosen with knowledge of it.
+pub(crate) fn resolver_schedule(committee: &Committee, sid: &Digest, target: View) -> Vec<PublicKey> {
+    let names: Vec<PublicKey> = committee.authorities.keys().copied().collect();
+    let n = names.len();
+    debug_assert!(n > 0, "committee must not be empty");
+    let seed = block::domain_hash(b"vantage-resolver-schedule", sid, &target.to_le_bytes());
+    let mut state = u64::from_le_bytes(seed.0[..8].try_into().expect("digest has 32 bytes"));
+    let mut order: Vec<usize> = (0..n).collect();
+    // Fisher-Yates driven by a splitmix64 stream seeded from the hash; the
+    // modulo bias is negligible for committees far below 2^32 members.
+    for i in (1..n).rev() {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let j = (z % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    let proposer = one_based_authority(committee, target);
+    if let Some(position) = order.iter().position(|&k| names[k] == proposer) {
+        let k = order.remove(position);
+        order.push(k);
+    }
+    order.into_iter().map(|k| names[k]).collect()
 }

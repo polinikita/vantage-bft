@@ -255,7 +255,15 @@ async fn scenario_2_withheld_tip_author_mixed_grades_resolved_by_target_agreemen
     .await;
 
     for i in 0..nodes.len() {
-        assert!(nodes[i].agb.sealed_for_test(view).is_none(), "node {} must not seal view {} directly -- quorum intersection forbids either digest from reaching quorum alone", i, view);
+        // The resolver may already have decided the target at quiescence; only a
+        // direct AGB seal is forbidden here, since neither digest can reach a
+        // READY quorum.
+        assert!(
+            nodes[i].agb.sealed_for_test(view).is_none() || nodes[i].direct_resolver.is_decided(view),
+            "node {} must not seal view {} directly -- quorum intersection forbids either digest from reaching quorum alone",
+            i,
+            view
+        );
         assert!(
             nodes[i].agb.completed_for_test(view).is_none(),
             "node {} must not even complete view {} -- neither digest's readies reach quorum",
@@ -402,7 +410,15 @@ async fn scenario_3_equivocating_leader_disjoint_halves_resolution_settles_it() 
     .await;
 
     for i in 0..nodes.len() {
-        assert!(nodes[i].agb.sealed_for_test(view).is_none(), "node {} must not seal view {} directly -- quorum intersection forbids either digest from reaching quorum alone", i, view);
+        // The resolver may already have decided the target at quiescence; only a
+        // direct AGB seal is forbidden here, since neither digest can reach a
+        // READY quorum.
+        assert!(
+            nodes[i].agb.sealed_for_test(view).is_none() || nodes[i].direct_resolver.is_decided(view),
+            "node {} must not seal view {} directly -- quorum intersection forbids either digest from reaching quorum alone",
+            i,
+            view
+        );
         assert!(nodes[i].agb.completed_for_test(view).is_none(), "node {} must not even complete view {} -- neither digest's readies reach quorum, so no ready quorum of ANY digest forms", i, view);
         assert!(
             nodes[i].agb.noready_count(view) >= 3,

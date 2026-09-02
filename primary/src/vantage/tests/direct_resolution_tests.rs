@@ -218,20 +218,36 @@ fn enter_view(
 }
 
 #[test]
-fn resolver_starts_after_the_target_proposer_and_cycles_the_committee() {
+fn resolver_schedule_is_a_permutation_ending_with_the_target_proposer() {
     let committee = test_committee();
     let names: Vec<_> = committee.authorities.keys().copied().collect();
+    let n = names.len() as u64;
     let resolver = DirectResolver::new(names[0], committee, test_sid(), TEST_DELTA_MS);
-    let target = 11;
 
-    assert_ne!(
-        resolver.resolution_leader(target, 1),
-        crate::leader::one_based_authority(&test_committee(), target)
-    );
-    let leaders: std::collections::BTreeSet<_> = (1..=names.len() as u64)
-        .map(|view| resolver.resolution_leader(target, view))
+    for target in 1..=3 * n {
+        let proposer = crate::leader::one_based_authority(&test_committee(), target);
+        assert_ne!(resolver.resolution_leader(target, 1), proposer);
+        let leaders: std::collections::BTreeSet<_> = (1..=n)
+            .map(|view| resolver.resolution_leader(target, view))
+            .collect();
+        assert_eq!(leaders.len(), names.len());
+        assert_eq!(resolver.resolution_leader(target, n), proposer);
+        assert_eq!(
+            resolver.resolution_leader(target, n + 1),
+            resolver.resolution_leader(target, 1)
+        );
+    }
+
+    // Every party of one session derives the same schedule.
+    let twin = DirectResolver::new(names[1], test_committee(), test_sid(), TEST_DELTA_MS);
+    assert_eq!(resolver.resolution_leader(11, 2), twin.resolution_leader(11, 2));
+
+    // Successive targets of one proposer do not keep the same first primary,
+    // so a rotation-adjacent Byzantine set cannot lead every recovery.
+    let firsts: std::collections::BTreeSet<_> = (0..12)
+        .map(|lap| resolver.resolution_leader(1 + lap * n, 1))
         .collect();
-    assert_eq!(leaders.len(), names.len());
+    assert!(firsts.len() > 1);
 }
 
 #[test]
