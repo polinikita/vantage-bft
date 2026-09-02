@@ -540,8 +540,6 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
         first_snapshots, last_snapshots, "optimistic_batch_bytes_sent"
     )
     wire_bytes = counter_deltas(first_snapshots, last_snapshots, "wire_bytes_sent")
-    cpu_seconds = scalar_deltas(first_snapshots, last_snapshots, "process_cpu_seconds")
-    node_cpu_cores = [seconds / window for seconds in cpu_seconds]
     sync_events = counter_deltas(first_snapshots, last_snapshots, "prepare_sync_events")
     sync_missing = counter_deltas(
         first_snapshots, last_snapshots, "prepare_missing_headers"
@@ -555,6 +553,7 @@ def watch(manifest: dict, duration: int | None, interval: int = 10) -> None:
     # Per-validator CPU time consumed inside the measurement window
     # (primary + worker). Divided by the window it reads as "cores busy".
     cpu_deltas = float_deltas(first_snapshots, last_snapshots, "cpu_seconds")
+    node_cpu_cores = [seconds / window for seconds in cpu_deltas]
     cpu_container_deltas = float_deltas(
         first_snapshots, last_snapshots, "cpu_seconds_container"
     )
