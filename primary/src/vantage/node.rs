@@ -21,6 +21,11 @@ const SEQUENCE_CANDIDATE_WINDOWS: usize = 32;
 /// treated as unavailable for that view (see `proposer_lagging`).
 const PROPOSER_LAG_VIEWS: View = 10;
 
+/// Multiples of `delta_ms` after a peer's link comes up during which its stale
+/// watermark is not held against it: a restarted party's first responses have
+/// not arrived yet, and one that proposes promptly must not be refused.
+const LAG_WARMUP_DELTAS: u32 = 15;
+
 /// Maximum checkpoint boundaries in one announcement.
 const SEQUENCE_ANNOUNCE_BOUNDARIES: usize = 8;
 
@@ -838,6 +843,8 @@ pub struct VantageCore {
     delta: Duration,
     /// Peers whose outbound transport link is currently down, with the loss instant.
     down_peers: HashMap<PublicKey, Instant>,
+    /// The instant each peer's outbound link last came up.
+    link_up_at: HashMap<PublicKey, Instant>,
 
     /// Stores bounded volatile broadcast history for reconnect replay.
     outbox: Outbox,
@@ -1313,6 +1320,7 @@ impl VantageCore {
             early_refusals: parameters.early_refusals,
             delta: Duration::from_millis(parameters.delta_ms),
             down_peers: HashMap::new(),
+            link_up_at: HashMap::new(),
             outbox: Outbox::new(parameters.outbox_max_bytes),
             pending_low: HashMap::new(),
             replay_episodes: ReplayEpisodes::new(),
@@ -2136,7 +2144,13 @@ impl VantageCore {
     /// still working through its backlog) is visible to its peers without any
     /// extra message.
     fn proposer_lagging(&self, proposer: PublicKey, view: View) -> bool {
-        self.early_refusals
+        if !self.early_refusals {
+            return false;
+        }
+        let warming_up = self.link_up_at.get(&proposer).is_some_and(|up| {
+            Instant::now().duration_since(*up) < self.delta * LAG_WARMUP_DELTAS
+        });
+        !warming_up
             && self
                 .pacemaker
                 .omega_of(proposer)
@@ -2171,6 +2185,7 @@ impl VantageCore {
         let now = Instant::now();
         if event.up {
             self.down_peers.remove(&peer);
+            self.link_up_at.insert(peer, now);
         } else {
             self.down_peers.entry(peer).or_insert(now);
         }
