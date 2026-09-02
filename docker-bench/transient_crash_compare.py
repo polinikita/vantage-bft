@@ -100,9 +100,9 @@ def main(out_dir, *specs):
     top.set_ylabel("Committed tx/s\n(5-s rate)"); top.set_title("(a) Non-victim throughput"); top.legend(loc="lower left", frameon=False, ncol=3)
     bottom.set_xlim(0, duration); bottom.set_xlabel("Time since measurement start (s)")
     bottom.set_ylabel("Materialization p50\n(latest 1-s window, ms)"); bottom.set_title("(b) Non-victim materialization latency")
-    bottom.legend(loc="lower right", frameon=False)
-    victims = len(json.load(open(next(Path(arms[0][3] and specs[0].split("=", 1)[1]).glob("rep-*")) / "data/chaos-timeline.json"))["victims"])
-    bottom.text((down + up) / 2, 0.96, f"{victims} validators crashed", transform=bottom.get_xaxis_transform(), ha="center", va="top",
+    bottom.legend(loc="upper left", frameon=False)
+    victims = len(json.load(open(next(Path(specs[0].split("=", 1)[1]).glob("rep-*")) / "data/chaos-timeline.json"))["victims"])
+    bottom.text((down + up) / 2, 0.04, f"{victims} validators crashed", transform=bottom.get_xaxis_transform(), ha="center", va="bottom",
                 fontsize=7.5, color="#444444", bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 1.0})
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     for ext in ("pdf", "png"):
