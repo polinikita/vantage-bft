@@ -133,8 +133,10 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("ten-region netem with a 100000-packet limit is required")
     if int(parameters.get("metrics_report_interval_ms", 0)) != 1_000:
         raise ValueError("latency histogram must use one-second reporter windows")
-    if not parameters.get("sequence_checkpoints") or not parameters.get(
-        "sequence_install_enabled"
+    protocol = str(parameters.get("protocol", "vantage"))
+    if protocol == "vantage" and (
+        not parameters.get("sequence_checkpoints")
+        or not parameters.get("sequence_install_enabled")
     ):
         raise ValueError("state sync must be enabled")
 
@@ -143,7 +145,11 @@ def main(argv: list[str] | None = None) -> None:
         for line in (args.run_root / "run.log").read_text(errors="replace").splitlines()
         if line.startswith(RESULT_PREFIX)
     ]
-    if len(run_results) != 1 or int(run_results[0].get("reachable_workers", 0)) != nodes:
+    reachable = int(run_results[0].get("reachable_workers", 0)) if len(run_results) == 1 else -1
+    dead_victims_allowed = protocol != "vantage"
+    if len(run_results) != 1 or reachable != nodes and not (
+        dead_victims_allowed and reachable >= nodes - expected_faults
+    ):
         raise ValueError("the run must end with every worker endpoint reachable")
     for node in range(nodes):
         log = data / f"node-{node}" / "logs" / "primary.log"
@@ -291,7 +297,7 @@ def main(argv: list[str] | None = None) -> None:
         "throughput_crash_min_tps": min(
             interval_values(throughput, fault_start + 5.0, fault_end), default=None
         ),
-        "early_refusals": bool(parameters.get("early_refusals", True)),
+        "early_refusals": protocol == "vantage" and bool(parameters.get("early_refusals", True)),
         "latency_post_restart_peak_ms": max_between(
             latency, fault_end, duration
         ),
@@ -300,12 +306,14 @@ def main(argv: list[str] | None = None) -> None:
         "latency_final_median_ms": median_between(
             latency, final_window_start, duration
         ),
-        "state_sync_enabled": True,
+        "protocol": protocol,
+        "state_sync_enabled": protocol == "vantage",
         "latency_population": sorted(expected_non_victims),
         "prometheus_step_s": 1,
         "latency_window_s": 1,
         "overall_committed_tps": float(run_results[0]["committed_tps"]),
-        "all_workers_reachable_at_end": True,
+        "all_workers_reachable_at_end": reachable == nodes,
+        "victims_survived_restart": reachable == nodes,
     }
     (args.output_dir / "transient-crash-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"

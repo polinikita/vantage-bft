@@ -11,6 +11,11 @@ FAULT_BUDGET=$(( (NODES - 1) / 3 ))
 VICTIMS="${VICTIMS:-$(seq -s, 0 $((FAULT_BUDGET - 1)))}"
 # Extra gen.py flags for the arm under test, e.g. --no-link-aware-timeouts.
 GEN_EXTRA_ARGS="${GEN_EXTRA_ARGS:-}"
+# Protocol under test (any gen.py --protocol choice); the crash is protocol-agnostic.
+PROTOCOL="${PROTOCOL:-vantage}"
+# Accept victims that die again after their restart (baseline primaries abort while
+# catching up); the crash window is unaffected and the run continues with f dead nodes.
+ALLOW_DEAD_VICTIMS="${ALLOW_DEAD_VICTIMS:-0}"
 DURATION="${DURATION:-130}"
 START_DELAY="${START_DELAY:-60}"
 FAULT_START="${FAULT_START:-20}"
@@ -130,7 +135,7 @@ command=(
     --nodes "$NODES"
     --rate "$RATE"
     --duration "$DURATION"
-    --protocol vantage
+    --protocol "$PROTOCOL"
     --start-delay "$START_DELAY"
     --host-primary-metrics-base "$PRIMARY_METRICS_BASE"
     --host-worker-metrics-base "$WORKER_METRICS_BASE"
@@ -157,6 +162,11 @@ wait "$fault_pid"
 fault_status=$?
 set -e
 trap - EXIT INT TERM
+if [ "$fault_status" -ne 0 ] && [ "$ALLOW_DEAD_VICTIMS" = 1 ] \
+    && grep -q "not running at the end" "$RUN_ROOT/blackout.log"; then
+    echo "transient_crash_q5.sh: victims did not survive their restart; continuing (ALLOW_DEAD_VICTIMS=1)" >&2
+    fault_status=0
+fi
 
 if [ "$run_status" -ne 0 ] || [ "$fault_status" -ne 0 ]; then
     echo "transient_crash_q5.sh: run failed (run=$run_status blackout=$fault_status)" >&2
