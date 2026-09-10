@@ -23,6 +23,9 @@ FAULT_DURATION="${FAULT_DURATION:-30}"
 SETTLE_DURATION="${SETTLE_DURATION:-60}"
 RATE="${RATE:-1000}"
 NETEM_LIMIT_PKTS="${NETEM_LIMIT_PKTS:-100000}"
+# Prometheus rate() window for the exported throughput series.  Bursty committers
+# (one batch per view timeout) leave a 5 s window empty at some grid alignments.
+RATE_WINDOW="${RATE_WINDOW:-15s}"
 PRIMARY_METRICS_BASE="${PRIMARY_METRICS_BASE:-19000}"
 WORKER_METRICS_BASE="${WORKER_METRICS_BASE:-19100}"
 RUN_ROOT="${RUN_ROOT:-$SCRIPT_DIR/recovery-runs/$(date -u +%Y%m%dT%H%M%SZ)-n${NODES}-transient}"
@@ -99,11 +102,11 @@ export_prometheus() {
     start_s="$(jq -r '.active_at_ms / 1000' "$manifest")"
     end_s="$(jq -r '(.active_at_ms / 1000) + .duration' "$manifest")"
     matcher="$(jq -r '[.load_node_indices[] | "node-\(.)-worker-0"] | join("|")' "$manifest")"
-    throughput_query="quantile(0.5, rate(committed_transactions{node=~\"(${matcher})\"}[5s]))"
+    throughput_query="quantile(0.5, rate(committed_transactions{node=~\"(${matcher})\"}[${RATE_WINDOW}]))"
     latency_query="quantile(0.5, (transaction_materialised_latency_window{v=\"p50\",node=~\"(${matcher})\"} and on(node) transaction_materialised_latency_window{v=\"count\",node=~\"(${matcher})\"} > 0)) / 1000"
 
-    printf 'throughput=%s\nlatency=%s\nscrape_interval=1s\nquery_step=1s\n' \
-        "$throughput_query" "$latency_query" >"$destination/prometheus-queries.txt"
+    printf 'throughput=%s\nlatency=%s\nscrape_interval=1s\nquery_step=1s\nrate_window=%s\n' \
+        "$throughput_query" "$latency_query" "$RATE_WINDOW" >"$destination/prometheus-queries.txt"
     curl --fail --silent --show-error --get \
         --data-urlencode "query=$throughput_query" \
         --data-urlencode "start=$start_s" \
