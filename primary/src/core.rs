@@ -2751,7 +2751,7 @@ mod slot_gc_tests {
         let optimistic = Proposal {
             header_digest: Digest([99; 32]),
             height: certificate.height + 1,
-            poa: Some(certificate),
+            poa: None,
             ..Default::default()
         };
         let mut cut = Header::genesis_proposals(&committee);
@@ -2761,13 +2761,25 @@ mod slot_gc_tests {
         assert!(!verified.cut_is_valid(&committee, false, &cut));
         assert!(verified.cut_is_valid(&committee, true, &cut));
 
+        // The pre-alignment form, a tip carrying its parent's PoA, is malformed.
+        let mut parent_poa_cut = Header::genesis_proposals(&committee);
+        parent_poa_cut.insert(
+            lane,
+            Proposal {
+                header_digest: Digest([99; 32]),
+                height: certificate.height + 1,
+                poa: Some(certificate),
+                ..Default::default()
+            },
+        );
+        assert!(!verified.cut_is_valid(&committee, false, &parent_poa_cut));
+        assert!(!verified.cut_is_valid(&committee, true, &parent_poa_cut));
+
         let mut leader_cut = Header::genesis_proposals(&committee);
         leader_cut.insert(
             leader,
             Proposal {
-                poa: Some(crate::messages::Certificate::genesis_for(
-                    leader, &committee,
-                )),
+                poa: None,
                 header_digest: Digest([100; 32]),
                 height: 1,
                 ..Default::default()
@@ -2782,7 +2794,7 @@ mod slot_gc_tests {
         let committee = crate::common::committee();
         let lane = *committee.authorities.keys().next().unwrap();
         let optimistic = Proposal {
-            poa: Some(crate::messages::Certificate::genesis_for(lane, &committee)),
+            poa: None,
             header_digest: Digest([101; 32]),
             height: 1,
             ..Default::default()
@@ -2805,6 +2817,27 @@ mod slot_gc_tests {
             &lane,
             false,
             &Proposal::genesis(lane, &committee),
+        ));
+    }
+
+    #[test]
+    fn own_optimistic_tip_is_proof_free() {
+        let committee = crate::common::committee();
+        let header = crate::common::header();
+        let tip = Proposal::optimistic(&header);
+
+        assert!(tip.poa.is_none());
+        assert!(autobahn_own_tip_is_admissible(
+            &committee,
+            &header.author,
+            true,
+            &tip,
+        ));
+        assert!(!autobahn_own_tip_is_admissible(
+            &committee,
+            &header.author,
+            false,
+            &tip,
         ));
     }
 
