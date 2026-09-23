@@ -27,7 +27,7 @@ use std::sync::Arc;
 pub enum CutShape {
     /// Every lane entry is Genesis or Certified.
     AllCertified,
-    /// At least one entry is an optimistic tip (with a verified parent PoA).
+    /// At least one entry is a proof-free optimistic tip reference (dig, pos).
     HasOptimistic,
 }
 
@@ -165,11 +165,9 @@ impl VerifiedCache {
         committee: &Committee,
     ) -> DagResult<ProposalKind> {
         let kind = proposal.classify(lane, committee)?;
-        let poa = proposal
-            .poa
-            .as_ref()
-            .expect("classified proposals carry a PoA");
-        self.check_certificate(poa, committee)?;
+        if let Some(poa) = &proposal.poa {
+            self.check_certificate(poa, committee)?;
+        }
         Ok(kind)
     }
 
@@ -341,11 +339,10 @@ mod tests {
         let cache = VerifiedCache::with_capacity(8);
         let mut cut = Header::genesis_proposals(&committee);
         let lane = *committee.authorities.keys().next().unwrap();
-        let genesis_poa = Certificate::genesis_for(lane, &committee);
         let optimistic = Proposal {
             header_digest: Digest([9; 32]),
             height: 1,
-            poa: Some(genesis_poa),
+            poa: None,
             ..Default::default()
         };
         cut.insert(lane, optimistic);
@@ -359,6 +356,20 @@ mod tests {
         let certified = Header::genesis_proposals(&committee);
         assert!(cache.cut_is_valid(&committee, false, &certified));
         assert!(cache.cut_is_valid(&committee, true, &certified));
+
+        // A tip that ships its parent's PoA is malformed under either allowance.
+        let mut parent_poa_cut = Header::genesis_proposals(&committee);
+        parent_poa_cut.insert(
+            lane,
+            Proposal {
+                header_digest: Digest([9; 32]),
+                height: 1,
+                poa: Some(Certificate::genesis_for(lane, &committee)),
+                ..Default::default()
+            },
+        );
+        assert!(!cache.cut_is_valid(&committee, true, &parent_poa_cut));
+        assert!(!cache.cut_is_valid(&committee, false, &parent_poa_cut));
     }
 
     #[test]

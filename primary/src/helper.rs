@@ -162,20 +162,28 @@ impl Helper {
                             continue;
                         }
                     };
-                    let Some(poa) = proposal.poa.as_ref() else {
-                        warn!("Ignoring proof-free Autobahn suffix request");
-                        continue;
-                    };
-                    let lane = poa.author;
-                    if stop_height >= proposal.height
-                        || self
-                            .verified
-                            .check_proposal(&proposal, &lane, &self.committee)
-                            .is_err()
-                    {
+                    if stop_height >= proposal.height {
                         warn!("Ignoring malformed Autobahn suffix request");
                         continue;
                     }
+                    // A certified coordinate names its lane through its PoA. An
+                    // optimistic tip reference is proof-free: the stored tip
+                    // defines the lane, and the walk below pins it to the
+                    // claimed height and digest.
+                    let mut lane = match &proposal.poa {
+                        Some(poa) => {
+                            if self
+                                .verified
+                                .check_proposal(&proposal, &poa.author, &self.committee)
+                                .is_err()
+                            {
+                                warn!("Ignoring malformed Autobahn suffix request");
+                                continue;
+                            }
+                            Some(poa.author)
+                        }
+                        None => None,
+                    };
                     let mut digest = proposal.header_digest.clone();
                     let mut height = proposal.height;
                     let mut headers = Vec::new();
@@ -195,7 +203,8 @@ impl Helper {
                                 break;
                             }
                         };
-                        if header.author != lane || header.height != height || header.id != digest {
+                        let expected = *lane.get_or_insert(header.author);
+                        if header.author != expected || header.height != height || header.id != digest {
                             warn!("Stored header does not match requested Autobahn suffix");
                             break;
                         }

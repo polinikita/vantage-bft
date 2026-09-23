@@ -370,38 +370,50 @@ impl Synchronizer {
                         certified_repairs.push((*lane, missing, stop_height));
                     }
                 }
+                // An optimistic entry is a bare (dig, pos) reference (Autobahn
+                // §5.5.2). The tip car carries its parent's PoA, verified before
+                // the car was stored, so holding the car is the availability
+                // evidence; a missing car is fetched first.
                 ProposalKind::Optimistic => {
-                    let parent_poa = proposal
-                        .poa
-                        .as_ref()
-                        .expect("verified optimistic proposal has a parent PoA")
-                        .clone();
-                    let parent = Proposal::certified(parent_poa.clone());
-                    if parent.height > stop_height {
-                        if let Some(missing) = self
-                            .first_missing_certified(lane, &parent, stop_height, delivered_header)
-                            .await?
-                        {
-                            commit_wait.push(missing.header_digest.clone());
-                            certified_repairs.push((*lane, missing, stop_height));
-                        }
-                    }
-
-                    let tip = self
+                    match self
                         .read_proposal_header(lane, proposal, delivered_header)
-                        .await?;
-                    let tip_ready = tip.as_ref().is_some_and(|header| {
-                        header.parent_cert.author == *lane
-                            && header.parent_cert.height.checked_add(1) == Some(header.height)
-                            && header.parent_cert == parent_poa
-                    });
-                    if !tip_ready {
-                        if implicit_sources.is_some() {
-                            implicit_repairs.push((*lane, proposal.clone()));
-                        } else {
-                            optimistic_repairs.push((*lane, proposal.clone()));
+                        .await?
+                    {
+                        Some(tip) => {
+                            if tip.parent_cert.author != *lane
+                                || tip.parent_cert.height.checked_add(1) != Some(tip.height)
+                            {
+                                return Err(crate::error::DagError::InvalidProposal(tip.id));
+                            }
+                            self.verified
+                                .check_certificate(&tip.parent_cert, &self.committee)?;
+                            let parent = Proposal::certified(tip.parent_cert);
+                            if parent.height > stop_height {
+                                if let Some(missing) = self
+                                    .first_missing_certified(
+                                        lane,
+                                        &parent,
+                                        stop_height,
+                                        delivered_header,
+                                    )
+                                    .await?
+                                {
+                                    commit_wait.push(missing.header_digest.clone());
+                                    certified_repairs.push((*lane, missing, stop_height));
+                                }
+                            }
                         }
-                        commit_wait.push(proposal.header_digest.clone());
+                        // The parent is unknown until the car arrives, so a
+                        // proof-free entry never reaches certified repair; the
+                        // stored car's own parent PoA drives it instead.
+                        None => {
+                            if implicit_sources.is_some() {
+                                implicit_repairs.push((*lane, proposal.clone()));
+                            } else {
+                                optimistic_repairs.push((*lane, proposal.clone()));
+                            }
+                            commit_wait.push(proposal.header_digest.clone());
+                        }
                     }
                 }
             }
@@ -618,13 +630,45 @@ mod alignment_tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    /// A height-2 tip car whose height-1 parent is certified by f+1 votes.
+    fn optimistic_tip() -> (Committee, PublicKey, Header, Header) {
+        let committee = crate::common::committee();
+        let parent = crate::common::header();
+        let mut parent_cert = crate::common::certificate(&parent);
+        parent_cert
+            .votes
+            .truncate(committee.validity_threshold() as usize);
+        let tip = crate::common::header_from_cert(&parent_cert);
+        (committee, parent.author, parent, tip)
+    }
+
+    async fn store_header(store: &mut Store, header: &Header) {
+        store
+            .write(header.id.to_vec(), bincode::serialize(header).unwrap())
+            .await;
+    }
+
+    fn prepare_with(
+        committee: &Committee,
+        lane: PublicKey,
+        proposal: Proposal,
+    ) -> ConsensusMessage {
+        ConsensusMessage::Prepare {
+            slot: 3,
+            view: 1,
+            tc: None,
+            qc_ticket: None,
+            proposals: cut_with(committee, lane, proposal),
+        }
+    }
+
     #[tokio::test]
     async fn optimistic_miss_is_the_only_prepare_blocker() {
         let (committee, lane, certified_parent) = missing_certified_tip();
         let optimistic = Proposal {
             header_digest: Digest([42; 32]),
             height: certified_parent.height + 1,
-            poa: certified_parent.poa.clone(),
+            poa: None,
             ..Default::default()
         };
         let (tx, mut rx) = channel(4);
@@ -632,26 +676,20 @@ mod alignment_tests {
         let _ = fs::remove_dir_all(path);
         let store = Store::new(path).unwrap();
         let mut synchronizer = Synchronizer::new(lane, &committee, store, tx);
-        let prepare = ConsensusMessage::Prepare {
-            slot: 3,
-            view: 1,
-            tc: None,
-            qc_ticket: None,
-            proposals: cut_with(&committee, lane, optimistic),
-        };
+        let prepare = prepare_with(&committee, lane, optimistic.clone());
 
         assert!(!synchronizer
             .get_proposals(&prepare, &Header::default())
             .await
             .unwrap());
-        assert!(matches!(
-            rx.recv().await,
-            Some(WaiterMessage::SyncCertified(_))
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(WaiterMessage::SyncOptimistic(_, _, Some(_)))
-        ));
+        // Without the car the parent is unknown, so only the tip is fetched.
+        match rx.recv().await {
+            Some(WaiterMessage::SyncOptimistic(repairs, _, Some(_))) => {
+                assert_eq!(repairs, vec![(lane, optimistic)]);
+            }
+            other => panic!("unexpected waiter command: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
         let _ = fs::remove_dir_all(path);
     }
 
@@ -661,7 +699,7 @@ mod alignment_tests {
         let optimistic = Proposal {
             header_digest: Digest([43; 32]),
             height: certified_parent.height + 1,
-            poa: certified_parent.poa.clone(),
+            poa: None,
             ..Default::default()
         };
         let proposals = cut_with(&committee, lane, optimistic);
@@ -708,12 +746,9 @@ mod alignment_tests {
             .unwrap());
         assert!(matches!(
             rx.recv().await,
-            Some(WaiterMessage::SyncCertified(_))
-        ));
-        assert!(matches!(
-            rx.recv().await,
             Some(WaiterMessage::SyncImplicit(_, _))
         ));
+        assert!(rx.try_recv().is_err());
         let _ = fs::remove_dir_all(path);
     }
 
@@ -748,17 +783,144 @@ mod alignment_tests {
     }
 
     #[test]
-    fn optimistic_proposal_shape_uses_the_parent_poa() {
+    fn optimistic_reference_is_poa_free() {
         let (committee, lane, parent) = missing_certified_tip();
-        let proposal = Proposal {
+        let reference = Proposal {
             header_digest: Digest([7; 32]),
             height: parent.height + 1,
-            poa: parent.poa,
+            poa: None,
             ..Default::default()
         };
         assert_eq!(
-            proposal.verify(&lane, &committee).unwrap(),
+            reference.verify(&lane, &committee).unwrap(),
             ProposalKind::Optimistic
         );
+
+        let with_parent_poa = Proposal {
+            header_digest: Digest([7; 32]),
+            height: parent.height + 1,
+            poa: parent.poa.clone(),
+            ..Default::default()
+        };
+        assert!(with_parent_poa.verify(&lane, &committee).is_err());
+
+        let at_genesis = Proposal {
+            header_digest: Digest([7; 32]),
+            height: 0,
+            poa: None,
+            ..Default::default()
+        };
+        assert!(at_genesis.verify(&lane, &committee).is_err());
+    }
+
+    #[tokio::test]
+    async fn held_optimistic_tip_is_ready_and_repairs_parent_asynchronously() {
+        let (committee, lane, _parent, tip) = optimistic_tip();
+        let (tx, mut rx) = channel(4);
+        let path = ".db_test_held_optimistic_tip";
+        let _ = fs::remove_dir_all(path);
+        let mut store = Store::new(path).unwrap();
+        store_header(&mut store, &tip).await;
+        let mut synchronizer = Synchronizer::new(lane, &committee, store, tx);
+        let prepare = prepare_with(&committee, lane, Proposal::optimistic(&tip));
+
+        // Holding the car is enough to vote; its own parent PoA drives the
+        // asynchronous repair of the missing parent.
+        assert!(synchronizer
+            .get_proposals(&prepare, &Header::default())
+            .await
+            .unwrap());
+        match rx.recv().await {
+            Some(WaiterMessage::SyncCertified(repairs)) => {
+                assert_eq!(
+                    repairs,
+                    vec![(lane, Proposal::certified(tip.parent_cert.clone()), 0)]
+                );
+            }
+            other => panic!("unexpected waiter command: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn held_tip_with_complete_suffix_needs_no_repair() {
+        let (committee, lane, parent, tip) = optimistic_tip();
+        let (tx, mut rx) = channel(4);
+        let path = ".db_test_held_tip_complete_suffix";
+        let _ = fs::remove_dir_all(path);
+        let mut store = Store::new(path).unwrap();
+        store_header(&mut store, &parent).await;
+        store_header(&mut store, &tip).await;
+        let mut synchronizer = Synchronizer::new(lane, &committee, store, tx);
+        let prepare = prepare_with(&committee, lane, Proposal::optimistic(&tip));
+
+        assert!(synchronizer
+            .get_proposals(&prepare, &Header::default())
+            .await
+            .unwrap());
+        assert!(rx.try_recv().is_err());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn optimistic_height_mismatch_is_rejected() {
+        let (committee, lane, _parent, tip) = optimistic_tip();
+        let (tx, _rx) = channel(4);
+        let path = ".db_test_optimistic_height_mismatch";
+        let _ = fs::remove_dir_all(path);
+        let mut store = Store::new(path).unwrap();
+        store_header(&mut store, &tip).await;
+        let mut synchronizer = Synchronizer::new(lane, &committee, store, tx);
+        let misplaced = Proposal {
+            header_digest: tip.id.clone(),
+            height: tip.height + 1,
+            poa: None,
+            ..Default::default()
+        };
+
+        assert!(synchronizer
+            .get_proposals(
+                &prepare_with(&committee, lane, misplaced),
+                &Header::default()
+            )
+            .await
+            .is_err());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn commit_waits_for_a_missing_optimistic_tip() {
+        let (committee, lane, _parent, tip) = optimistic_tip();
+        let (tx, mut rx) = channel(4);
+        let path = ".db_test_commit_missing_optimistic_tip";
+        let _ = fs::remove_dir_all(path);
+        let store = Store::new(path).unwrap();
+        let mut synchronizer = Synchronizer::new(lane, &committee, store, tx);
+        let reference = Proposal::optimistic(&tip);
+        let commit = ConsensusMessage::Commit {
+            slot: 3,
+            view: 1,
+            qc: QC::default(),
+            proposals: cut_with(&committee, lane, reference.clone()),
+        };
+
+        assert!(!synchronizer
+            .get_proposals(&commit, &Header::default())
+            .await
+            .unwrap());
+        match rx.recv().await {
+            Some(WaiterMessage::SyncImplicit(repairs, _)) => {
+                assert_eq!(repairs, vec![(lane, reference)]);
+            }
+            other => panic!("unexpected waiter command: {other:?}"),
+        }
+        match rx.recv().await {
+            Some(WaiterMessage::WaitForCommit(digests, _, _)) => {
+                assert_eq!(digests, vec![tip.id.clone()]);
+            }
+            other => panic!("unexpected waiter command: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(path);
     }
 }

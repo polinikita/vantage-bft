@@ -15,9 +15,11 @@ use std::sync::OnceLock;
 pub struct Proposal {
     pub header_digest: Digest,
     pub height: Height,
-    /// Exact PoA for a certified tip, or the parent PoA for an optimistic tip.
-    /// Simple-IT reuses this coordinate type and leaves the field empty because
-    /// it carries availability evidence in its own cut protocol.
+    /// Exact PoA for a genesis or certified tip. `None` is a proof-free
+    /// coordinate: an Autobahn optimistic tip reference (dig, pos), whose
+    /// parent PoA travels in the tip car itself (Autobahn §5.5.2), or a
+    /// Simple-IT cut entry, which carries availability evidence in its own
+    /// cut protocol.
     #[serde(default)]
     pub poa: Option<Certificate>,
     /// Memoized content digest; a proposal must not be mutated after `digest()`.
@@ -51,11 +53,14 @@ impl Proposal {
         }
     }
 
+    /// A reference to an uncertified tip. Voters validate it against the tip
+    /// car they hold, whose parent PoA they verified on receipt.
     pub fn optimistic(header: &Header) -> Self {
+        debug_assert!(header.height > 0, "genesis is never an optimistic tip");
         Self {
             header_digest: header.id.clone(),
             height: header.height,
-            poa: Some(header.parent_cert.clone()),
+            poa: None,
             digest_memo: OnceLock::new(),
         }
     }
@@ -64,42 +69,39 @@ impl Proposal {
         Self::certified(Certificate::genesis_for(author, committee))
     }
 
-    /// Verifies the proof shape and signatures without requiring the tip body.
+    /// Verifies the proof shape and, when present, the PoA signatures. An
+    /// optimistic reference has no proof; possession of its tip is checked
+    /// where the tip is read.
     pub fn verify(&self, lane: &PublicKey, committee: &Committee) -> DagResult<ProposalKind> {
         let kind = self.classify(lane, committee)?;
-        self.poa
-            .as_ref()
-            .expect("classified proposals carry a PoA")
-            .verify(committee)?;
+        if let Some(poa) = &self.poa {
+            poa.verify(committee)?;
+        }
         Ok(kind)
     }
 
     /// The crypto-free part of [`Self::verify`]: shape and coordinate checks
     /// only. The caller is responsible for verifying the PoA signatures.
     pub fn classify(&self, lane: &PublicKey, committee: &Committee) -> DagResult<ProposalKind> {
-        let poa = self
-            .poa
-            .as_ref()
-            .ok_or_else(|| DagError::InvalidProposal(self.header_digest.clone()))?;
-        ensure!(
-            poa.author == *lane,
-            DagError::InvalidProposal(self.header_digest.clone())
-        );
+        let invalid = || DagError::InvalidProposal(self.header_digest.clone());
+        let Some(poa) = self.poa.as_ref() else {
+            ensure!(self.height > 0 && committee.stake(lane) > 0, invalid());
+            return Ok(ProposalKind::Optimistic);
+        };
+        ensure!(poa.author == *lane, invalid());
 
         if self.height == 0 {
             ensure!(
                 poa.is_genesis_for(lane, committee) && self.header_digest == poa.header_digest,
-                DagError::InvalidProposal(self.header_digest.clone())
+                invalid()
             );
             return Ok(ProposalKind::Genesis);
         }
-        if poa.height == self.height && poa.header_digest == self.header_digest {
-            return Ok(ProposalKind::Certified);
-        }
-        if poa.height.checked_add(1) == Some(self.height) {
-            return Ok(ProposalKind::Optimistic);
-        }
-        Err(DagError::InvalidProposal(self.header_digest.clone()))
+        ensure!(
+            poa.height == self.height && poa.header_digest == self.header_digest,
+            invalid()
+        );
+        Ok(ProposalKind::Certified)
     }
 }
 
@@ -128,24 +130,24 @@ impl Hash for Proposal {
         self.digest_memo
             .get_or_init(|| {
                 let mut hasher = Blake3Hasher::new();
-                // Preserve Simple-IT's pre-existing coordinate digest. Autobahn
-                // cuts always carry `Some(PoA)` and use the evidence-bound
-                // domain below.
-                if self.poa.is_none() {
-                    hasher.update(&self.header_digest.0);
-                    hasher.update(&self.height.to_le_bytes());
-                    return Digest(hasher.finalize().into());
-                }
-                hasher.update(b"autobahn-tip-v1");
-                hasher.update(&self.header_digest.0);
-                hasher.update(&self.height.to_le_bytes());
                 match &self.poa {
+                    // A proof-free coordinate hashes (dig, pos) alone: Simple-IT's
+                    // cut entries and Autobahn's optimistic references, as in
+                    // the original Autobahn artifact. Cut digests are always
+                    // taken inside tagged containers, so the untagged form cannot
+                    // be confused with the evidence-bound one below.
+                    None => {
+                        hasher.update(&self.header_digest.0);
+                        hasher.update(&self.height.to_le_bytes());
+                    }
                     Some(poa) => {
+                        hasher.update(b"autobahn-tip-v1");
+                        hasher.update(&self.header_digest.0);
+                        hasher.update(&self.height.to_le_bytes());
                         hasher.update(&[1]);
                         hasher.update(&poa.evidence_digest().0);
                     }
-                    None => unreachable!("proof-free proposals returned above"),
-                };
+                }
                 Digest(hasher.finalize().into())
             })
             .clone()
@@ -2144,6 +2146,55 @@ mod autobahn_alignment_tests {
         expected.update(&proposal.header_digest.0);
         expected.update(&proposal.height.to_le_bytes());
         assert_eq!(proposal.digest(), Digest(expected.finalize().into()));
+    }
+
+    #[test]
+    fn optimistic_reference_is_a_proof_free_coordinate() {
+        let committee = crate::common::committee();
+        let header = crate::common::header();
+        let reference = Proposal::optimistic(&header);
+
+        // (dig, pos) on the wire, as in the Autobahn paper and artifact.
+        assert!(reference.poa.is_none());
+        assert_eq!(bincode::serialized_size(&reference).unwrap(), 41);
+        let mut expected = Blake3Hasher::new();
+        expected.update(&header.id.0);
+        expected.update(&header.height.to_le_bytes());
+        assert_eq!(reference.digest(), Digest(expected.finalize().into()));
+
+        assert_eq!(
+            reference.verify(&header.author, &committee).unwrap(),
+            ProposalKind::Optimistic
+        );
+        assert!(reference.verify(&PublicKey([91; 32]), &committee).is_err());
+    }
+
+    #[test]
+    fn poa_bearing_entry_must_be_genesis_or_exactly_certified() {
+        let (committee, certificate) = poa_with_votes(2);
+        let lane = certificate.author;
+        assert_eq!(
+            Proposal::certified(certificate.clone())
+                .verify(&lane, &committee)
+                .unwrap(),
+            ProposalKind::Certified
+        );
+        // A tip one above its PoA, the pre-alignment optimistic form, is malformed.
+        let with_parent_poa = Proposal {
+            header_digest: Digest([5; 32]),
+            height: certificate.height + 1,
+            poa: Some(certificate.clone()),
+            ..Default::default()
+        };
+        assert!(with_parent_poa.verify(&lane, &committee).is_err());
+        // So is a PoA for another car at the same height.
+        let other_car = Proposal {
+            header_digest: Digest([6; 32]),
+            height: certificate.height,
+            poa: Some(certificate),
+            ..Default::default()
+        };
+        assert!(other_car.verify(&lane, &committee).is_err());
     }
 
     #[test]

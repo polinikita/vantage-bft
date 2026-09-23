@@ -54,6 +54,9 @@ enum BatchSyncSource {
 
 #[derive(Clone, Debug)]
 struct PendingProposalRequest {
+    /// The lane whose suffix is requested. An optimistic tip reference is
+    /// proof-free, so the lane cannot be read off the proposal.
+    lane: PublicKey,
     proposal: Proposal,
     stop_height: Height,
     /// The complete protocol-justified source set; each attempt contacts a
@@ -102,12 +105,14 @@ fn staged_repair_targets(
 
 fn proposal_request_needs_update(
     pending: Option<&PendingProposalRequest>,
+    lane: &PublicKey,
     proposal: &Proposal,
     stop_height: Height,
     sources: &[PublicKey],
 ) -> bool {
     pending.is_none_or(|pending| {
-        pending.proposal != *proposal
+        pending.lane != *lane
+            || pending.proposal != *proposal
             || pending.stop_height > stop_height
             || pending.sources != sources
     })
@@ -404,17 +409,18 @@ impl HeaderWaiter {
 
     async fn send_proposal_suffix_request(
         &mut self,
+        lane: PublicKey,
         proposal: Proposal,
         stop_height: Height,
         mut sources: Vec<PublicKey>,
         attempt: u32,
     ) {
+        debug_assert!(proposal.poa.as_ref().is_none_or(|poa| poa.author == lane));
         sources.sort_unstable();
         sources.dedup();
-        let lane = proposal.poa.as_ref().map(|poa| poa.author);
         let targets = staged_repair_targets(
             &sources,
-            lane.as_ref(),
+            Some(&lane),
             attempt,
             self.sync_retry_nodes,
             &proposal.header_digest,
@@ -448,6 +454,7 @@ impl HeaderWaiter {
         self.proposal_requests.insert(
             proposal.header_digest.clone(),
             PendingProposalRequest {
+                lane,
                 proposal,
                 stop_height,
                 sources,
@@ -462,21 +469,28 @@ impl HeaderWaiter {
     /// request that covers a longer suffix is sufficient.
     async fn ensure_proposal_suffix_request(
         &mut self,
+        lane: PublicKey,
         proposal: Proposal,
         stop_height: Height,
         mut sources: Vec<PublicKey>,
     ) {
+        // An already executed coordinate has no suffix left to fetch; the
+        // helper would reject the request. Its sources are still registered.
+        if stop_height >= proposal.height {
+            return;
+        }
         sources.sort_unstable();
         sources.dedup();
         let needs_request = proposal_request_needs_update(
             self.proposal_requests.get(&proposal.header_digest),
+            &lane,
             &proposal,
             stop_height,
             &sources,
         );
         if needs_request {
             // Fresh or stronger evidence restarts the escalation ladder.
-            self.send_proposal_suffix_request(proposal, stop_height, sources, 0)
+            self.send_proposal_suffix_request(lane, proposal, stop_height, sources, 0)
                 .await;
         }
     }
@@ -664,11 +678,14 @@ impl HeaderWaiter {
                                 sources.clone(),
                                 parent.height,
                             );
-                            self.ensure_proposal_suffix_request(parent, stop_height, sources)
+                            self.ensure_proposal_suffix_request(author, parent, stop_height, sources)
                                 .await;
                         }
                         WaiterMessage::SyncCertified(repairs) => {
                             for (lane, proposal, stop_height) in repairs {
+                                // An empty source set would disable this lane's
+                                // payload fetch; only PoA-backed roots come here.
+                                debug_assert!(proposal.poa.is_some(), "certified repair needs a PoA");
                                 let sources = Self::proposal_sources(&proposal);
                                 record_certified_lane_sources(
                                     &mut self.certified_lane_sources,
@@ -704,6 +721,7 @@ impl HeaderWaiter {
                                 }
 
                                 self.ensure_proposal_suffix_request(
+                                    lane,
                                     proposal,
                                     stop_height,
                                     sources,
@@ -737,8 +755,9 @@ impl HeaderWaiter {
                                 self.send_batch_requests(proposal_leader, requests, true).await;
                             }
 
-                            for (_, proposal) in &missing {
+                            for (lane, proposal) in &missing {
                                 self.ensure_proposal_suffix_request(
+                                    *lane,
                                     proposal.clone(),
                                     proposal.height.saturating_sub(1),
                                     vec![proposal_leader],
@@ -780,7 +799,7 @@ impl HeaderWaiter {
                             sources.sort_unstable();
                             sources.dedup();
                             let mut requests = HashMap::new();
-                            for (_, proposal) in &missing {
+                            for (lane, proposal) in &missing {
                                 // TC/PrepareQC evidence supersedes a fresh
                                 // leader-only fetch and keeps repair asynchronous.
                                 self.optimistic_tip_sources
@@ -801,6 +820,7 @@ impl HeaderWaiter {
                                     );
                                 }
                                 self.ensure_proposal_suffix_request(
+                                    *lane,
                                     proposal.clone(),
                                     proposal.height.saturating_sub(1),
                                     sources.clone(),
@@ -919,6 +939,7 @@ impl HeaderWaiter {
                             continue;
                         }
                         self.send_proposal_suffix_request(
+                            request.lane,
                             request.proposal,
                             request.stop_height,
                             request.sources,
@@ -1071,6 +1092,7 @@ mod tests {
         let keys = crate::common::keys();
         let old_leader = keys[0].0;
         let proof_sources = vec![keys[1].0, keys[2].0];
+        let lane = keys[3].0;
         let proposal = Proposal {
             header_digest: Digest([17; 32]),
             height: 9,
@@ -1078,6 +1100,7 @@ mod tests {
             ..Default::default()
         };
         let pending = PendingProposalRequest {
+            lane,
             proposal: proposal.clone(),
             stop_height: 8,
             sources: vec![old_leader],
@@ -1087,9 +1110,25 @@ mod tests {
 
         assert!(proposal_request_needs_update(
             Some(&pending),
+            &lane,
             &proposal,
             8,
             &proof_sources,
+        ));
+        // The same request is not re-sent; one for another lane is.
+        assert!(!proposal_request_needs_update(
+            Some(&pending),
+            &lane,
+            &proposal,
+            8,
+            &[old_leader],
+        ));
+        assert!(proposal_request_needs_update(
+            Some(&pending),
+            &old_leader,
+            &proposal,
+            8,
+            &[old_leader],
         ));
     }
 
