@@ -474,6 +474,11 @@ impl HeaderWaiter {
         stop_height: Height,
         mut sources: Vec<PublicKey>,
     ) {
+        // An already executed coordinate has no suffix left to fetch; the
+        // helper would reject the request. Its sources are still registered.
+        if stop_height >= proposal.height {
+            return;
+        }
         sources.sort_unstable();
         sources.dedup();
         let needs_request = proposal_request_needs_update(
